@@ -114,6 +114,7 @@ fn context_economy_metadata_survives_reopen_without_rewriting_the_journal() {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4_096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: true,

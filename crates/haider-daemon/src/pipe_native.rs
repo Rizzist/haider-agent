@@ -2588,6 +2588,7 @@ mod tests {
                 provider: "fake".into(),
                 model: "fake-model".into(),
                 max_tokens: 4_096,
+                max_tokens_source: None,
                 permission_overrides: None,
                 effort: None,
                 fast: false,

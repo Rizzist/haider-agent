@@ -773,6 +773,20 @@ fn apply_cwd(model: &mut AppModel) {
 mod policy_tests {
     use super::*;
     #[test]
+    fn live_launcher_waits_for_model_details_before_showing_context_window() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("temporary profile: {error}"));
+        let profile = haider_client::resolve_profile(&haider_client::ProfileEnv {
+            profile_dir: Some(root.path().join("profile")),
+            home: None,
+            user_profile: None,
+            model: None,
+            runtime_dir: None,
+            xdg_runtime_dir: None,
+        })
+        .unwrap_or_else(|error| panic!("resolved profile: {error}"));
+        assert_eq!(live_model(&profile).identity.context_window, 0);
+    }
+    #[test]
     fn interactive_payload_keeps_the_two_worker_multithread_runtime() {
         let runtime = build_runtime().unwrap_or_else(|error| panic!("runtime: {error}"));
         assert_eq!(

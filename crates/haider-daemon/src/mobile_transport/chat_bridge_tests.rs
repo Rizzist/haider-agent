@@ -6,6 +6,21 @@ use haider_core::{MemoryStore, StoreHandle};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::{DeviceId, EventId, ItemId, RunId, SessionId};
 
+#[test]
+fn mobile_chat_creation_derives_the_selected_models_output_budget() {
+    let request = mobile_session_create_request(
+        "mobile-test".into(),
+        "/tmp".into(),
+        "gemini".into(),
+        "gemini-2.0-flash".into(),
+    );
+    assert!(
+        matches!(request, RequestBody::SessionCreateWithPermissionOverrides {
+        max_tokens: 0, provider, model, ..
+    } if provider == "gemini" && model == "gemini-2.0-flash")
+    );
+}
+
 #[tokio::test]
 async fn mobile_transport_text_durably_activates_mobile_use() {
     let store = MemoryStore::new();

@@ -60,6 +60,11 @@ pub struct DiscoveredModel {
     /// The provider's declared context window in tokens; `None` when the
     /// provider does not declare one — never a guess.
     pub context_window: Option<u64>,
+    /// The provider's declared maximum response size in tokens. Catalogs
+    /// frequently omit this even when the inference endpoint enforces it;
+    /// daemon projection fills those gaps from pinned model-family limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     pub description: Option<String>,
     /// The provider's default reasoning effort, when it declares one.
     pub default_effort: Option<String>,
@@ -571,6 +576,16 @@ pub fn compatible_model_id_is_display_safe(id: &str) -> bool {
         .all(|character| UnicodeWidthChar::width(character).is_some_and(|width| width > 0))
 }
 
+/// Reads the first PRESENT field among `keys` as a positive token count. A
+/// present field that is zero, negative, or not an integer declares nothing;
+/// it does not fall through to a later alias.
+fn declared_token_count(entry: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| entry.get(*key))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|tokens| *tokens > 0)
+}
+
 /// Parses either provider's shape. Public so the fake-server tests drive the
 /// same parser production uses.
 pub fn parse_catalog(
@@ -609,10 +624,8 @@ pub fn parse_catalog(
             models.push(DiscoveredModel {
                 slug: slug.to_owned(),
                 display_name: slug.to_owned(),
-                context_window: entry
-                    .get("inputTokenLimit")
-                    .and_then(serde_json::Value::as_u64)
-                    .filter(|window| *window > 0),
+                context_window: declared_token_count(entry, &["inputTokenLimit"]),
+                max_output_tokens: declared_token_count(entry, &["outputTokenLimit"]),
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
@@ -633,11 +646,11 @@ pub fn parse_catalog(
             let Some(raw_slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            if matches!(
+            let user_endpoint = matches!(
                 source,
                 CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
-            ) && !compatible_model_id_is_display_safe(raw_slug)
-            {
+            );
+            if user_endpoint && !compatible_model_id_is_display_safe(raw_slug) {
                 return Err(CatalogError::InvalidBody {
                     reason: "model catalog id contains characters that cannot be displayed safely"
                         .to_owned(),
@@ -656,7 +669,12 @@ pub fn parse_catalog(
             models.push(DiscoveredModel {
                 slug: slug.to_owned(),
                 display_name: slug.to_owned(),
-                context_window: None,
+                context_window: (!user_endpoint)
+                    .then(|| declared_token_count(entry, &["context_window", "context_length"]))
+                    .flatten(),
+                max_output_tokens: (!user_endpoint)
+                    .then(|| declared_token_count(entry, &["max_output_tokens", "max_tokens"]))
+                    .flatten(),
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
@@ -707,26 +725,24 @@ pub fn parse_catalog(
             })
             .unwrap_or_default();
         let context_window = match source {
-            CatalogSource::OpenAiSubscription => entry
-                .get("context_window")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|window| *window > 0),
-            CatalogSource::KimiOAuth => entry
-                .get("context_length")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|window| *window > 0),
-            CatalogSource::GrokOAuth => entry
-                .get("context_window")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|window| *window > 0),
-            CatalogSource::AnthropicSubscription
-            | CatalogSource::GeminiApiKey
+            CatalogSource::OpenAiSubscription | CatalogSource::GrokOAuth => {
+                declared_token_count(entry, &["context_window"])
+            }
+            CatalogSource::KimiOAuth => declared_token_count(entry, &["context_length"]),
+            CatalogSource::AnthropicSubscription => {
+                declared_token_count(entry, &["max_input_tokens"])
+            }
+            CatalogSource::GeminiApiKey
             | CatalogSource::OpenAiCompatible { .. }
             | CatalogSource::AnthropicCompatible { .. }
             | CatalogSource::DeepSeekApi
             | CatalogSource::HaiderCodeApi
             | CatalogSource::XaiApi => None,
         };
+        let max_output_tokens = declared_token_count(
+            entry,
+            &["max_output_tokens", "max_tokens", "outputTokenLimit"],
+        );
         let kimi_extensions =
             matches!(source, CatalogSource::KimiOAuth).then(|| DiscoveredModelExtensions {
                 protocol: entry
@@ -786,6 +802,7 @@ pub fn parse_catalog(
             slug: slug.to_owned(),
             display_name,
             context_window,
+            max_output_tokens,
             description: entry
                 .get("description")
                 .and_then(serde_json::Value::as_str)

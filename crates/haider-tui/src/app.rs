@@ -1269,6 +1269,20 @@ impl ProvidersState {
     /// the caller keeps its current figure rather than inventing a number.
     #[must_use]
     pub fn declared_window(&self, provider: &str, model: &str) -> Option<u64> {
+        self.model_detail(provider, model)
+            .and_then(|detail| detail.context_window)
+    }
+
+    /// Maximum output budget for this exact provider/model row. New daemons
+    /// always project a declared or pinned fallback value; `None` preserves
+    /// compatibility with older daemons.
+    #[must_use]
+    pub fn declared_output_limit(&self, provider: &str, model: &str) -> Option<u64> {
+        self.model_detail(provider, model)
+            .and_then(|detail| detail.max_output_tokens)
+    }
+
+    fn model_detail(&self, provider: &str, model: &str) -> Option<&haider_rpc::ModelDetailWire> {
         self.providers
             .iter()
             .find(|summary| summary.provider == provider)
@@ -1278,22 +1292,13 @@ impl ProvidersState {
                     .iter()
                     .find(|detail| detail.name == model)
             })
-            .and_then(|detail| detail.context_window)
     }
 
     /// Whether the catalog carries a detail row for `model` at all — then
     /// its (possibly absent) window is the catalog's authoritative answer.
     #[must_use]
     pub fn model_listed(&self, provider: &str, model: &str) -> bool {
-        self.providers
-            .iter()
-            .filter(|summary| summary.provider == provider)
-            .any(|summary| {
-                summary
-                    .model_details
-                    .iter()
-                    .any(|detail| detail.name == model)
-            })
+        self.model_detail(provider, model).is_some()
     }
 }
 
@@ -7117,15 +7122,7 @@ impl AppModel {
     #[must_use]
     pub fn current_pair_detail(&self) -> Option<&haider_rpc::ModelDetailWire> {
         self.providers
-            .providers
-            .iter()
-            .find(|summary| summary.provider == self.identity.provider)
-            .and_then(|summary| {
-                summary
-                    .model_details
-                    .iter()
-                    .find(|detail| detail.name == self.identity.model_short)
-            })
+            .model_detail(&self.identity.provider, &self.identity.model_short)
     }
 
     /// Whether the session's CURRENT pair accepts image attachments, as the
@@ -11785,7 +11782,13 @@ impl AppModel {
             self.projection.context_tokens(),
             self.identity.context_window,
             snapshot_window_allowed,
-            crate::live::session_output_cap,
+            |window| {
+                crate::context_meter::derived_reserved_output(
+                    self.providers
+                        .declared_output_limit(&self.identity.provider, &self.identity.model_short),
+                    window,
+                )
+            },
         )
     }
 
@@ -20829,6 +20832,20 @@ impl AppModel {
         // Model retention: a COMMITTED pick is what the next boot opens on.
         self.model_commits += 1;
         self.flash = Some(format!("· model → {model} · {provider}"));
+        self.dirty = true;
+    }
+
+    /// A user-set output budget did not fit the newly selected model: the
+    /// daemon clamped it. Keep the model flash and append the typed notice.
+    pub fn apply_output_budget_clamp(
+        &mut self,
+        clamp: &haider_protocol::output_budget::OutputBudgetClampV1,
+    ) {
+        let notice = clamp.notice();
+        self.flash = Some(match self.flash.take() {
+            Some(flash) => format!("{flash} · {notice}"),
+            None => format!("· {notice}"),
+        });
         self.dirty = true;
     }
 

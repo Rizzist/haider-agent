@@ -226,6 +226,21 @@ impl ContextMeter {
     }
 }
 
+/// The output reservation a session on this model carries when no snapshot
+/// reports the daemon's actual one: the daemon derives `min(default, model
+/// maximum)` for a `session.create` that sends zero (973-output-cap), so the
+/// projected trigger uses the same reservation. Bounded by a known window.
+#[must_use]
+pub fn derived_reserved_output(declared_output_limit: Option<u64>, window: u64) -> u64 {
+    let default = haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT;
+    let reserved = default.min(declared_output_limit.unwrap_or(default));
+    if window == 0 {
+        reserved
+    } else {
+        reserved.min(window)
+    }
+}
+
 /// Whole percent of `window`, rounded half up — the ONE rounding every
 /// context surface uses (the meter, the panel and the compaction note).
 #[must_use]
@@ -263,7 +278,21 @@ mod tests {
     }
 
     fn cap(window: u64) -> u64 {
-        crate::live::session_output_cap(window)
+        derived_reserved_output(None, window)
+    }
+
+    #[test]
+    fn the_projected_reservation_follows_the_derived_output_budget() {
+        assert_eq!(derived_reserved_output(None, 200_000), 30_000);
+        assert_eq!(derived_reserved_output(Some(64_000), 200_000), 30_000);
+        assert_eq!(derived_reserved_output(Some(8_192), 128_000), 8_192);
+        assert_eq!(derived_reserved_output(None, 16_000), 16_000);
+        assert_eq!(derived_reserved_output(Some(8_192), 0), 8_192);
+        // A small-max model projects its trigger at 85% (hard fit is far).
+        let meter = ContextMeter::resolve(None, 0, 128_000, true, |window| {
+            derived_reserved_output(Some(8_192), window)
+        });
+        assert_eq!(meter.auto_compact_at, Some(108_800));
     }
 
     /// The owner's bug: an output budget standing in for the window. The

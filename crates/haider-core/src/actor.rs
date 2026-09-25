@@ -47,6 +47,12 @@ pub use tool_exposure::ToolCapabilityProfile;
 mod task_outcome;
 use task_outcome::{CompletedTool, ToolSettlement};
 
+#[path = "actor_tool_repair.rs"]
+mod actor_tool_repair;
+#[cfg(test)]
+#[path = "actor_tool_repair_tests.rs"]
+mod actor_tool_repair_tests;
+
 use crate::{
     ArtifactReader, InteractionGate, InteractionResolution, InteractionResolutionPolicy,
     PromptHistoryCompiler, ProviderViewAppendRequest, StoreHandle, unix_time_ms,
@@ -3306,7 +3312,8 @@ impl HarnessActor {
         // original spelling from the already-durable provider Start markers
         // only on resume; ordinary turns perform no extra journal reads.
         let mut recovered_names = HashMap::new();
-        let mut malformed_tool_pending_repair = false;
+        let mut tool_call_repair_pending = false;
+        let mut consecutive_output_truncations = 0_u8;
         let recovery_calls: HashSet<&str> =
             checkpoint
                 .iter()
@@ -3324,7 +3331,11 @@ impl HarnessActor {
             || child_wait.is_some()
             || self.config.provider_requests_already_made > 0
         {
-            (recovered_names, malformed_tool_pending_repair) = match self
+            (
+                recovered_names,
+                tool_call_repair_pending,
+                consecutive_output_truncations,
+            ) = match self
                 .recover_tool_repair_state(&run_id, &recovery_calls)
                 .await
             {
@@ -3714,6 +3725,10 @@ impl HarnessActor {
                 .await;
         }
         let mut forced_compaction_used = false;
+        // A provider may reject `max_tokens` as larger than the model allows
+        // and state its maximum. Retry ONCE per turn at that maximum; a
+        // second rejection surfaces normally, so this can never loop.
+        let mut output_limit_retry_used = false;
         // Once an ineffective compaction promotes this turn, later request
         // rounds may use the larger hard budget but must never compact again.
         let mut compaction_guard_consumed = false;
@@ -3825,8 +3840,10 @@ impl HarnessActor {
                     }
                     StreamEvent::ToolCallEnd { call_id } => {
                         if let Some(tool) = completed_tools.remove(call_id) {
-                            let invalid =
-                                tool.result.as_ref().is_some_and(invalid_tool_call_result);
+                            let invalid = tool
+                                .result
+                                .as_ref()
+                                .is_some_and(repairable_tool_call_result);
                             assistant_blocks.push(Block::ToolCall {
                                 call_id: tool.call_id.clone(),
                                 name: tool.name.clone(),
@@ -4938,6 +4955,33 @@ impl HarnessActor {
                         }
                         break stream;
                     }
+                    Err(error)
+                        if !output_limit_retry_used
+                            && haider_provider::provider_stated_output_limit(
+                                &error,
+                                self.config.max_tokens,
+                            )
+                            .is_some() =>
+                    {
+                        output_limit_retry_used = true;
+                        if let Some(stated) = haider_provider::provider_stated_output_limit(
+                            &error,
+                            self.config.max_tokens,
+                        ) {
+                            tracing::info!(
+                                requested = self.config.max_tokens,
+                                provider_maximum = stated,
+                                "provider rejected max_tokens as too large; retrying once at its stated maximum"
+                            );
+                            self.config.max_tokens = stated;
+                        }
+                        provider_attempt = 0;
+                        replay.reset_for_next_request();
+                        refusal_reason.clear();
+                        assistant_blocks.clear();
+                        tool_results.clear();
+                        continue 'requests;
+                    }
                     Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {
                         let compacted = if request_projection_compacted || compaction_guard_consumed
                         {
@@ -5400,6 +5444,54 @@ impl HarnessActor {
                             provider_content_seen = true;
                         }
                         event
+                    }
+                    Err(error)
+                        if !output_limit_retry_used
+                            && !provider_content_seen
+                            && haider_provider::provider_stated_output_limit(
+                                &error,
+                                self.config.max_tokens,
+                            )
+                            .is_some() =>
+                    {
+                        if let Err(error) = release_provider_budget_request(
+                            self.config.provider_budget_guard.as_ref(),
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            request_usage.is_some(),
+                            &mut provider_budget_permit,
+                        )
+                        .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::from(error),
+                                )
+                                .await;
+                        }
+                        output_limit_retry_used = true;
+                        if let Some(stated) = haider_provider::provider_stated_output_limit(
+                            &error,
+                            self.config.max_tokens,
+                        ) {
+                            tracing::info!(
+                                requested = self.config.max_tokens,
+                                provider_maximum = stated,
+                                "provider rejected max_tokens as too large; retrying once at its stated maximum"
+                            );
+                            self.config.max_tokens = stated;
+                        }
+                        provider_attempt = 0;
+                        replay.reset_for_next_request();
+                        refusal_reason.clear();
+                        assistant_blocks.clear();
+                        tool_results.clear();
+                        continue 'requests;
                     }
                     Err(error)
                         if error.kind == ProviderErrorKind::ContextExceeded
@@ -5969,7 +6061,7 @@ impl HarnessActor {
                                 // Persist the reset before dispatch, including deferred tools.
                                 // Their results may arrive after a later malformed frame, so
                                 // result-completion order cannot reconstruct frame validity.
-                                if malformed_tool_pending_repair {
+                                if tool_call_repair_pending {
                                     if let Err(error) = self
                                         .commit_hidden_extension_marker(
                                             &run_id,
@@ -5988,7 +6080,7 @@ impl HarnessActor {
                                             )
                                             .await;
                                     }
-                                    malformed_tool_pending_repair = false;
+                                    tool_call_repair_pending = false;
                                 }
                                 assistant_blocks.push(block);
                                 let is_script = tools.iter().any(|tool| {
@@ -6176,7 +6268,7 @@ impl HarnessActor {
                                         &mut tools,
                                         &call_id,
                                         &error,
-                                        !malformed_tool_pending_repair,
+                                        !tool_call_repair_pending,
                                     )
                                     .await
                                 {
@@ -6193,7 +6285,7 @@ impl HarnessActor {
                                             .await;
                                     }
                                 };
-                                if malformed_tool_pending_repair {
+                                if tool_call_repair_pending {
                                     return self
                                         .provider_failure_outcome_with_items(
                                             &run_id,
@@ -6204,7 +6296,7 @@ impl HarnessActor {
                                         )
                                         .await;
                                 }
-                                malformed_tool_pending_repair = true;
+                                tool_call_repair_pending = true;
                                 assistant_blocks.push(block);
                                 Ok(Some(result))
                             }
@@ -6583,6 +6675,93 @@ impl HarnessActor {
                                     )
                                     .await;
                             }
+                        }
+                        if reason == FinishReason::MaxTokens {
+                            match self
+                                .close_output_limited_tool_calls(
+                                    &run_id,
+                                    &mut tools,
+                                    &mut assistant_blocks,
+                                    &mut tool_results,
+                                    actor_tool_repair::repeated_output_truncation_on_next(
+                                        consecutive_output_truncations,
+                                    ),
+                                )
+                                .await
+                            {
+                                Ok(false) => {
+                                    if consecutive_output_truncations != 0 {
+                                        if let Err(error) = self
+                                            .commit_hidden_extension_marker(
+                                                &run_id,
+                                                OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND,
+                                                serde_json::json!({ "count": 0 }),
+                                            )
+                                            .await
+                                        {
+                                            return self
+                                                .drive_error_outcome_with_items(
+                                                    &run_id,
+                                                    &mut message,
+                                                    &mut reasoning,
+                                                    &mut tools,
+                                                    DriveError::Store(error),
+                                                )
+                                                .await;
+                                        }
+                                        consecutive_output_truncations = 0;
+                                    }
+                                }
+                                Ok(true) => {
+                                    consecutive_output_truncations =
+                                        actor_tool_repair::advance_output_truncation_count(
+                                            consecutive_output_truncations,
+                                        );
+                                    if let Err(error) = self.commit_hidden_extension_marker(
+                                        &run_id,
+                                        OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND,
+                                        serde_json::json!({ "count": consecutive_output_truncations }),
+                                    ).await {
+                                        return self.drive_error_outcome_with_items(
+                                            &run_id, &mut message, &mut reasoning, &mut tools,
+                                            DriveError::Store(error),
+                                        ).await;
+                                    }
+                                }
+                                Err(error) => {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        if reason != FinishReason::MaxTokens && consecutive_output_truncations != 0
+                        {
+                            if let Err(error) = self
+                                .commit_hidden_extension_marker(
+                                    &run_id,
+                                    OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND,
+                                    serde_json::json!({ "count": 0 }),
+                                )
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await;
+                            }
+                            consecutive_output_truncations = 0;
                         }
                         if !buffered_script_calls.is_empty() {
                             let local_call_count = assistant_blocks
@@ -8563,9 +8742,11 @@ impl HarnessActor {
         &self,
         run_id: &RunId,
         calls: &HashSet<&str>,
-    ) -> Result<(HashMap<String, String>, bool), HaiderError> {
+    ) -> Result<(HashMap<String, String>, bool, u8), HaiderError> {
         let mut names = HashMap::new();
         let mut pending_repair = false;
+        let mut consecutive_output_truncations = 0_u8;
+        let mut unmarked_output_truncation = false;
         let mut cursor = 0;
         loop {
             let page = self
@@ -8580,7 +8761,13 @@ impl HarnessActor {
                 )
                 .await?;
             if page.is_empty() {
-                return Ok((names, pending_repair));
+                if unmarked_output_truncation {
+                    consecutive_output_truncations =
+                        actor_tool_repair::advance_output_truncation_count(
+                            consecutive_output_truncations,
+                        );
+                }
+                return Ok((names, pending_repair, consecutive_output_truncations));
             }
             for event in page {
                 cursor = event.seq;
@@ -8592,14 +8779,35 @@ impl HarnessActor {
                 };
                 match payload {
                     EventPayload::ToolResult { result, .. }
-                        if invalid_tool_call_result(&result) =>
+                        if consumes_malformed_tool_strike(&result) =>
                     {
                         pending_repair = true
+                    }
+                    EventPayload::ToolResult { result, .. }
+                        if matches!(
+                            result.data,
+                            Some(
+                                haider_protocol::tool::ToolResultData::OutputLimitTruncation { .. }
+                            )
+                        ) =>
+                    {
+                        unmarked_output_truncation = true;
                     }
                     EventPayload::Item(ItemEvent::Completed {
                         item: TurnItem::Extension { kind, .. },
                         ..
                     }) if kind == TOOL_CALL_REPAIR_RESET_EXTENSION_KIND => pending_repair = false,
+                    EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { kind, data },
+                        ..
+                    }) if kind == OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND => {
+                        consecutive_output_truncations = data
+                            .get("count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                            .min(3) as u8;
+                        unmarked_output_truncation = false;
+                    }
                     EventPayload::Item(ItemEvent::Completed {
                         item: TurnItem::Extension { kind, data },
                         ..
@@ -8795,68 +9003,6 @@ impl HarnessActor {
             .await?;
         tools.remove(index);
         Ok(Message::tool_result(call_id, result.preview, false))
-    }
-
-    /// Closes a provider-authored tool call whose streamed argument buffer is
-    /// not a JSON object. Commit the failed call/result pair before permitting
-    /// one repair continuation. Raw arguments remain in the journal; the model
-    /// receives an empty object paired with an explicit invalid-call result.
-    async fn close_malformed_tool_failure(
-        &mut self,
-        run_id: &RunId,
-        tools: &mut Vec<ToolAccumulator>,
-        call_id: &str,
-        error: &ProviderError,
-        repaired: bool,
-    ) -> Result<(Block, Message), DriveError> {
-        let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
-            return Err(DriveError::Provider(provider_protocol_error(format!(
-                "provider ended unknown tool call `{call_id}`",
-            ))));
-        };
-        let tool = &tools[index];
-        let diagnostic = serde_json::json!({
-            "status": "failed",
-            "error": {
-                "kind": "invalid_tool_call",
-                "tool": tool.name,
-                "message": error.message,
-                "repair": "Resend the tool call with valid JSON object arguments matching its schema. A second consecutive malformed call terminates the run.",
-            },
-        });
-        let result = BoundedResult {
-            preview: diagnostic.to_string(),
-            truncated: false,
-            truncation: None,
-            effects: Vec::new(),
-            data: Some(haider_protocol::tool::ToolResultData::InvalidToolCall {
-                tool: tool.name.clone(),
-                message: error.message.clone(),
-                repaired: Some(repaired),
-            }),
-            artifact: None,
-            images: Vec::new(),
-            cursor: None,
-            status: ToolResultStatus::Failed,
-            reason: Some(error.message.clone()),
-            presentation: Some(tool_error_presentation(
-                "invalid-tool-call",
-                "Invalid tool call",
-                &error.message,
-            )),
-            orchestration: None,
-        };
-        let result = tool.correct_result(result);
-        self.commit_tool_result_and_completion(run_id, tool, &result)
-            .await?;
-        let block = Block::ToolCall {
-            call_id: tool.call_id.clone(),
-            name: tool.name.clone(),
-            args: serde_json::json!({}),
-        };
-        let message = Message::tool_result(tool.call_id.clone(), result.preview, false);
-        tools.remove(index);
-        Ok((block, message))
     }
 
     /// Closes the matching tool item for a provider `ToolCallEnd`.
@@ -12939,6 +13085,7 @@ impl ToolAccumulator {
 }
 
 const TOOL_CALL_REPAIR_RESET_EXTENSION_KIND: &str = "tool_call_repair_reset";
+const OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND: &str = "output_truncation_count";
 
 fn repaired_tool_name(definitions: &[ToolDefinition], requested: &str) -> Option<String> {
     if definitions.iter().any(|tool| tool.name == requested) {
@@ -12958,11 +13105,31 @@ fn repaired_tool_name(definitions: &[ToolDefinition], requested: &str) -> Option
     matches.next().is_none().then(|| matched.name.clone())
 }
 
+/// A malformed provider tool call (`InvalidToolCall`). The AX-2
+/// malformed-call strike predicate matches exactly this; an output-limit
+/// truncation is not a malformed call and must stay outside it.
 pub(crate) fn invalid_tool_call_result(result: &BoundedResult) -> bool {
+    consumes_malformed_tool_strike(result)
+}
+
+/// AX-2 strike seam: output truncation stays outside the malformed allowance
+/// in both the live path and recovery after a restart.
+fn consumes_malformed_tool_strike(result: &BoundedResult) -> bool {
     matches!(
         result.data,
         Some(haider_protocol::tool::ToolResultData::InvalidToolCall { .. })
     )
+}
+
+/// Any unexecuted call whose arguments must be replaced with an empty object
+/// in provider history. Only `invalid_tool_call_result` consumes the malformed
+/// strike; truncation streaks use a separate durable extension marker.
+pub(crate) fn repairable_tool_call_result(result: &BoundedResult) -> bool {
+    invalid_tool_call_result(result)
+        || matches!(
+            result.data,
+            Some(haider_protocol::tool::ToolResultData::OutputLimitTruncation { .. })
+        )
 }
 
 struct RequestInputResolutionContext {

@@ -1019,6 +1019,7 @@ fn run_custom_model_wire_case(
             slug: (*slug).to_owned(),
             display_name: (*slug).to_owned(),
             context_window: None,
+            max_output_tokens: None,
             description: None,
             default_effort: None,
             supported_efforts: Vec::new(),
@@ -1843,6 +1844,37 @@ fn unknown_lifecycle_run_is_a_machine_readable_error() {
     assert_eq!(value["schema"], "haider.run.status.v1");
     assert!(value["result"].is_null());
     assert_eq!(value["error"]["code"], "not_found");
+}
+
+#[test]
+fn headless_output_limit_defaults_above_4096_and_honors_override() {
+    for (extra, expected) in [
+        (Vec::<&str>::new(), 30_000),
+        (vec!["--max-output-tokens", "12345"], 12_345),
+    ] {
+        let mut command = haider();
+        command.args(["run", "--provider", "fake", "--json"]);
+        command.args(extra);
+        command
+            .args(["-p", "output limit pin"])
+            .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
+            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+        let output = output_with_boot_retry(&mut command);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("headless JSON");
+        let configured = result["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .find(|event| event["payload"]["type"] == "headless_run_configured")
+            .expect("headless configuration event");
+        assert_eq!(configured["payload"]["max_output_tokens"], expected);
+    }
 }
 
 #[test]
@@ -4841,6 +4873,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
             provider: None,
             model: None,
             attachments: Vec::new(),
+            max_output_tokens: None,
             budget: haider_protocol::headless::RunBudgetV1::default(),
             seed: None,
         })
@@ -4951,6 +4984,38 @@ fn empty_prompt_flag_and_stdin_share_invalid_usage_exit() {
     }
 }
 
+/// B1 (973 output cap): the run flag contract. `--max-tokens` is the
+/// cumulative run token budget exactly as in 0.0.972 (never a per-response
+/// cap), `--max-output-tokens` is the per-response output budget, each is
+/// single-valued, and the never-shipped `--max-total-tokens` spelling is not
+/// accepted.
+#[test]
+fn run_parser_keeps_max_tokens_as_the_run_budget() {
+    let parsed = parse_run_options(&["--max-tokens".into(), "1".into(), "-p".into(), "x".into()])
+        .expect("run budget");
+    assert_eq!(parsed.budget.max_tokens, Some(1));
+    assert_eq!(parsed.max_output_tokens, None);
+    let parsed = parse_run_options(&[
+        "--max-output-tokens".into(),
+        "12000".into(),
+        "-p".into(),
+        "x".into(),
+    ])
+    .expect("output budget");
+    assert_eq!(parsed.budget.max_tokens, None);
+    assert_eq!(parsed.max_output_tokens, Some(12_000));
+    for args in [
+        vec!["--max-output-tokens", "1", "--max-output-tokens", "2"],
+        vec!["--max-tokens", "1", "--max-tokens", "2"],
+        vec!["--max-output-tokens", "0"],
+        vec!["--max-total-tokens", "1000"],
+    ] {
+        let mut args: Vec<String> = args.into_iter().map(String::from).collect();
+        args.extend(["-p".to_owned(), "x".to_owned()]);
+        assert!(parse_run_options(&args).is_err(), "{args:?}");
+    }
+}
+
 #[test]
 fn run_parser_pins_budgets_seed_and_lifecycle() {
     let parsed = parse_run_options(&[
@@ -4958,6 +5023,8 @@ fn run_parser_pins_budgets_seed_and_lifecycle() {
         "--start".into(),
         "--max-tokens".into(),
         "123".into(),
+        "--max-output-tokens".into(),
+        "456".into(),
         "--max-cost".into(),
         "0.125001".into(),
         "--max-time".into(),
@@ -4970,7 +5037,10 @@ fn run_parser_pins_budgets_seed_and_lifecycle() {
     .expect("headless controls");
     assert_eq!(parsed.action, RunAction::Start);
     assert_eq!(parsed.output, RunOutput::Json);
+    // B1: `--max-tokens` keeps its 0.0.972 meaning (cumulative run budget);
+    // the per-response output budget is `--max-output-tokens`.
     assert_eq!(parsed.budget.max_tokens, Some(123));
+    assert_eq!(parsed.max_output_tokens, Some(456));
     assert_eq!(parsed.budget.max_cost_microusd, Some(125_001));
     assert_eq!(parsed.budget.max_time_ms, Some(120_000));
     assert_eq!(parsed.seed, Some(0));
@@ -5539,6 +5609,7 @@ fn ordinary_session_submission_is_separate_from_budget_resume() {
         vec!["--read-only"],
         vec!["--allow-exec"],
         vec!["--max-tokens", "10"],
+        vec!["--max-output-tokens", "10"],
         vec!["--seed", "42"],
         vec!["--session", "duplicate"],
     ] {

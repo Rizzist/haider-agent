@@ -35,6 +35,7 @@ fn create_session(store: &Store, name: &str) -> SessionId {
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,

@@ -61,6 +61,7 @@ fn summary(
                 name: (*slug).to_owned(),
                 display_name: None,
                 context_window: *window,
+                max_output_tokens: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),

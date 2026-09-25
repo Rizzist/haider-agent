@@ -62,6 +62,7 @@ struct ProviderView {
 struct ModelView {
     model: String,
     context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
     supported_efforts: Vec<String>,
     default_effort: Option<String>,
     supported_speeds: Vec<String>,
@@ -454,6 +455,7 @@ fn model_view(model: String) -> ModelView {
     ModelView {
         model,
         context_window: None,
+        max_output_tokens: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),
@@ -465,6 +467,7 @@ fn model_detail_view(detail: ModelDetailWire) -> ModelView {
     ModelView {
         model: detail.name,
         context_window: detail.context_window,
+        max_output_tokens: detail.max_output_tokens,
         supported_efforts: detail.supported_efforts,
         default_effort: detail.default_effort,
         supported_speeds: detail.supported_speeds,
@@ -520,7 +523,13 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
             let context = model
                 .context_window
                 .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string());
-            text.push_str(&format!("  {}  context_window={}\n", model.model, context));
+            let output = model
+                .max_output_tokens
+                .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string());
+            text.push_str(&format!(
+                "  {}  context_window={}  max_output_tokens={}\n",
+                model.model, context, output
+            ));
         }
     }
     let stdout = io::stdout();

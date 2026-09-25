@@ -7473,7 +7473,14 @@ fn render_token_panel(
             chip.tokens,
             declared,
             true,
-            crate::live::session_output_cap,
+            |window| {
+                crate::context_meter::derived_reserved_output(
+                    model
+                        .providers
+                        .declared_output_limit(&identity.provider, &chip.model),
+                    window,
+                )
+            },
         );
         rows.push((
             format!("└ {} · {}", chip.name, chip.model),

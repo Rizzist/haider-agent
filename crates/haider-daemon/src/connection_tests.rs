@@ -299,6 +299,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `FEATURE_MODELS_LIST_V1`. Expected RUNTIME failure: the ADE cannot sniff
 /// the headless session-config door / model-library enumeration (W-CFG).
 ///
+/// MUTATION CHECK: remove `FEATURE_MODEL_OUTPUT_LIMITS_V1`. Expected RUNTIME
+/// failure: headless clients cannot safely use the model-derived zero sentinel
+/// and may reconnect to an older daemon that still rejects it.
+///
 /// MUTATION CHECK: remove `FEATURE_SESSION_RUN_ID_V1`. Expected RUNTIME
 /// failure: clients cannot discover that observation surfaces report the
 /// active run id, leaving every session started elsewhere uncancellable
@@ -362,9 +366,9 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        121,
-        "session launch-origin registration adds one feature to the \
-         existing 120-feature set"
+        122,
+        "model output limits add one feature to the existing \
+         121-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -426,6 +430,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_LAUNCH_ORIGIN_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),
+            haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
             haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),

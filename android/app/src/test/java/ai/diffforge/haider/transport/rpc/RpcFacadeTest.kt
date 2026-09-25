@@ -155,7 +155,7 @@ class RpcFacadeTest {
                 permission.value = granted to permanentlyDenied
             }
         }
-        val service = RpcDaemonService(owner, binder, directory, "/private/workspaces", "p", "m", 4096, client)
+        val service = RpcDaemonService(owner, binder, directory, "/private/workspaces", "p", "m", 0, client)
         val ui: DaemonService = service
         try {
             withTimeout(5000) { ui.sessions.first { it.size == 2 } }
@@ -252,6 +252,7 @@ class RpcFacadeTest {
             val fork = daemon.requests.last { it.string("method") == "session.fork" }
             assertEquals("actual-node", fork.string("fork_node_id")); assertEquals(2L, fork.number("fork_seq"))
             assertEquals("child", ui.createSession())
+            assertEquals(0L, daemon.requests.last { it.string("method") == "session.create" }.number("max_tokens"))
             binder.snapshots.value = null
             withTimeout(3000) { client.state.first { it == RpcConnectionState.DISCONNECTED } }
             assertEquals(DaemonStatus.Stopped, withTimeout(3000) { ui.status.first { it == DaemonStatus.Stopped } })
