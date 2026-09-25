@@ -1036,12 +1036,21 @@ impl AnthropicProvider {
         &self,
         prepared: &crate::PreparedWire,
     ) -> Result<(reqwest::Request, crate::RequestUploadBoundary, Duration), ProviderError> {
-        // Endpoint validation and OAuth credential work inside the builder
-        // stay on the logical idle clock; only the upload itself pauses it.
+        // Endpoint validation and OAuth credential refresh inside the builder
+        // are network work that stays on the logical idle clock. The pause
+        // starts right after it: serializing a multi-megabyte body (e.g. a
+        // screenshot) is local CPU work and, like the upload itself, is not
+        // provider silence.
         let request = self.request_builder(&prepared.payload).await?;
-        let body = crate::serialize_prepared_json_body_ref(prepared)?;
-        let upload_budget = crate::request_upload::request_upload_budget(body.len());
         let boundary = crate::RequestUploadBoundary::new();
+        let body = match crate::serialize_prepared_json_body_ref(prepared) {
+            Ok(body) => body,
+            Err(error) => {
+                boundary.complete();
+                return Err(error);
+            }
+        };
+        let upload_budget = crate::request_upload::request_upload_budget(body.len());
         match request
             .header(CONTENT_LENGTH, body.len())
             .body(boundary.body(body))

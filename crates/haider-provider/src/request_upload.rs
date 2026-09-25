@@ -2,9 +2,10 @@
 //!
 //! A large request (for example one carrying a screenshot) can take longer to
 //! upload than the provider takes to answer. Upload is transport work, not
-//! provider silence, so the logical idle clock is paused from request
-//! construction until the body producer reaches EOF, and adapters start their
-//! response-open clock only after [`RequestUploadBoundary::wait`] returns.
+//! provider silence, so the logical idle clock is paused from body
+//! serialization (after credential and endpoint work in the request builder,
+//! which stays on the clock) until the body producer reaches EOF, and adapters
+//! start their response-open clock only after [`RequestUploadBoundary::wait`] returns.
 
 use std::convert::Infallible;
 use std::pin::Pin;
