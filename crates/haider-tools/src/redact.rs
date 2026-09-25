@@ -1037,16 +1037,17 @@ fn push_secret_lines(
 ) {
     // Preserve physical line numbering for fs_read, including empty lines.
     // Newlines count toward the quote window even though they remain visible.
+    // Every line of the value renders its marker, an empty one included (a
+    // zero-length span): otherwise an empty interior line would stay a blank
+    // visible line and reveal where the value contains `\n\n`.
     let mut cursor = start;
     for line in input[start..end].split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
-        if !content.is_empty() {
-            spans.push(Span {
-                start: cursor,
-                end: cursor + content.len(),
-                kind,
-            });
-        }
+        spans.push(Span {
+            start: cursor,
+            end: cursor + content.len(),
+            kind,
+        });
         cursor += line.len();
     }
 }

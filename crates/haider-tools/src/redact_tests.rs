@@ -897,6 +897,9 @@ fn explicit_read_spans_reproduce_the_read_rendering() {
         "key: \"-----BEGIN\x20PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----\"\nafter\n",
         "no trailing newline password=violet-sunrise",
         "éé password=ünïcode-välue-1234 ü\n",
+        "password=\"first\n\nthird\"\nPUBLIC_AFTER\n",
+        "secret='first\r\n\r\nthird'\r\nPUBLIC_AFTER\r\n",
+        "password=\"\n\n\"\nafter\n",
     ] {
         let rendered = super::ExplicitReadPaths::new(path).redact(path, input).text;
         let spans = super::explicit_read_redacted_spans(path, input);
@@ -918,4 +921,40 @@ fn explicit_read_spans_reproduce_the_read_rendering() {
     assert!(env.whole_file);
     assert_eq!(env.spans.len(), 1);
     assert_eq!(env.spans[0].raw, 0..4);
+}
+
+/// An empty interior line of a multi-line secret renders its marker like
+/// any other line: two values that differ only in where their empty lines
+/// fall (same physical line count) render byte-identically, for LF and CRLF,
+/// on the read, whole-text and line-stream paths.
+#[test]
+fn empty_interior_lines_of_a_multiline_secret_are_not_visible() {
+    let path = Path::new("fixture.conf");
+    for (open, close, eol) in [
+        ("password=\"", "\"", "\n"),
+        ("secret='", "'", "\n"),
+        ("password=\"", "\"", "\r\n"),
+        ("secret='", "'", "\r\n"),
+    ] {
+        let value =
+            |lines: &[&str]| format!("{open}{}{close}{eol}PUBLIC_AFTER{eol}", lines.join(eol));
+        let early = value(&["alpha", "", "beta", "gamma"]);
+        let late = value(&["alpha", "beta", "", "gamma"]);
+        let none = value(&["alpha", "beta", "delta", "gamma"]);
+        let read = |input: &str| super::ExplicitReadPaths::new(path).redact(path, input).text;
+        assert_eq!(read(&early), read(&late), "{early:?}");
+        assert_eq!(read(&early), read(&none), "{early:?}");
+        assert_eq!(redact_text(&early).text, redact_text(&late).text);
+        assert_eq!(
+            redact_private_key_lines(&early).text,
+            redact_private_key_lines(&late).text
+        );
+        let rendered = read(&early);
+        assert!(!rendered.contains("alpha") && !rendered.contains("beta"));
+        assert!(rendered.contains("PUBLIC_AFTER"));
+        // Line numbering is unchanged: one output line per physical line.
+        assert_eq!(rendered.matches('\n').count(), early.matches('\n').count());
+        let spans = super::explicit_read_redacted_spans(path, &early);
+        assert_eq!(super::render_raw_redactions(&early, &spans.spans), rendered);
+    }
 }
