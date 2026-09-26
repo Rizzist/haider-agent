@@ -86,7 +86,8 @@ impl MeterTokenSource for CredentialBroker {
         }
         // The broker's own message may name vault/refresh internals; the
         // report carries only the bounded classification.
-        self.resolve(descriptor).await.map_err(|error| {
+        // The meter endpoint is the provider's real one.
+        self.resolve_remote(descriptor).await.map_err(|error| {
             let reason = if error.code == ErrorCode::CredentialMissing {
                 "credential_source_gone"
             } else {

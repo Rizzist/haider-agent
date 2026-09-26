@@ -1571,8 +1571,25 @@ pub(crate) struct AccountActorConfig {
     pub source_snapshot: AccountSourcesSnapshot,
 }
 
+/// Where a model discoverer sends the catalog credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatalogDestination {
+    /// Never leaves the process (in-process fakes).
+    InProcess,
+    /// The provider's real network endpoint.
+    Remote,
+    /// A numeric-loopback stand-in (the debug fake-OAuth data plane).
+    Loopback(url::Url),
+}
+
 #[async_trait::async_trait]
 trait ProviderModelDiscoverer: Send + Sync {
+    /// Where `discover` sends the credential for `source`. The default is
+    /// in-process; a discoverer that performs network I/O must override it.
+    fn destination(&self, _source: &CatalogSource) -> CatalogDestination {
+        CatalogDestination::InProcess
+    }
+
     async fn discover(
         &self,
         source: CatalogSource,
@@ -1585,14 +1602,103 @@ struct ProductionProviderModelDiscoverer;
 
 #[async_trait::async_trait]
 impl ProviderModelDiscoverer for ProductionProviderModelDiscoverer {
+    fn destination(&self, source: &CatalogSource) -> CatalogDestination {
+        #[cfg(debug_assertions)]
+        if let Some(url) = fake_catalog_url(source) {
+            return CatalogDestination::Loopback(url);
+        }
+        let _ = source;
+        CatalogDestination::Remote
+    }
+
     async fn discover(
         &self,
         source: CatalogSource,
         access_token: Option<&str>,
         etag: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError> {
+        #[cfg(debug_assertions)]
+        if let Some(url) = fake_catalog_url(&source) {
+            return discover_fake_catalog(&url, source, access_token).await;
+        }
         discover_models(source, access_token, etag).await
     }
+}
+
+/// DEBUG/TEST BUILDS ONLY: the debug fake-OAuth hook's loopback stand-in for
+/// the Claude subscription catalog (`<origin>/v1/models`).
+#[cfg(debug_assertions)]
+fn fake_catalog_url(source: &CatalogSource) -> Option<url::Url> {
+    matches!(source, CatalogSource::AnthropicSubscription)
+        .then(|| crate::oauth::debug_fake_oauth::catalog_url(ANTHROPIC_OAUTH_PROVIDER_NAME))
+        .flatten()
+}
+
+/// DEBUG/TEST BUILDS ONLY: fetches the fake catalog from a numeric-loopback
+/// URL (no proxy, no redirects, bounded) and parses it with the production
+/// parser.
+#[cfg(debug_assertions)]
+async fn discover_fake_catalog(
+    url: &url::Url,
+    source: CatalogSource,
+    access_token: Option<&str>,
+) -> Result<DiscoveredCatalog, CatalogError> {
+    let unavailable = |reason: String| CatalogError::Unavailable { reason };
+    let loopback = url.scheme() == "http"
+        && matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback());
+    if !loopback {
+        return Err(unavailable(
+            "fake catalog must be numeric loopback".to_owned(),
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| unavailable("fake catalog transport is unavailable".to_owned()))?;
+    let mut request = client
+        .get(url.clone())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONNECTION, "close");
+    if let Some(token) = access_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| CatalogError::Transport {
+            reason: format!("fake catalog request failed: {error}"),
+        })?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(CatalogError::Unauthorized);
+    }
+    if !response.status().is_success() {
+        return Err(unavailable(format!(
+            "fake catalog returned {}",
+            response.status().as_u16()
+        )));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| CatalogError::Transport {
+            reason: format!("fake catalog body failed: {error}"),
+        })?;
+    if bytes.len() > 1 << 20 {
+        return Err(unavailable(
+            "fake catalog response exceeded its bound".to_owned(),
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| CatalogError::InvalidBody {
+            reason: format!("fake catalog response is not JSON: {error}"),
+        })?;
+    let models = haider_provider::parse_catalog(source, &value)?;
+    if models.is_empty() {
+        return Err(CatalogError::Empty);
+    }
+    Ok(DiscoveredCatalog { models, etag: None })
 }
 
 pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHandle {
@@ -11067,7 +11173,8 @@ impl AccountsProviderFactory {
         descriptor: &CredentialDescriptor,
     ) -> Result<haider_accounts::SecretHandle, HaiderError> {
         if let Some(broker) = &self.broker {
-            broker.resolve(descriptor).await
+            // The adapter sends this to the provider's real endpoint.
+            broker.resolve_remote(descriptor).await
         } else if descriptor.auth_method == AuthMethod::OAuth {
             Err(HaiderError::new(
                 ErrorCode::Unauthorized,
@@ -11421,7 +11528,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                         return Ok(haider_core::ProviderAttemptDecision::Stop);
                     };
                     match broker
-                        .refresh_after_auth_failure(&current, self.oauth_access_fingerprint)
+                        .refresh_after_auth_failure_remote(&current, self.oauth_access_fingerprint)
                         .await
                     {
                         Ok(credential) => {

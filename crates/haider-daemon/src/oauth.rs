@@ -982,6 +982,16 @@ pub(crate) mod debug_fake_oauth {
         FAKEABLE_PROVIDERS.contains(&provider) && std::env::var_os(ORIGIN_ENV).is_some()
     }
 
+    /// The loopback model-catalog URL standing in for `provider`'s live
+    /// subscription catalog, when this process fakes it.
+    pub(crate) fn catalog_url(provider: &str) -> Option<Url> {
+        if !FAKEABLE_PROVIDERS.contains(&provider) {
+            return None;
+        }
+        let value = std::env::var_os(ORIGIN_ENV)?;
+        parse_origin(value.to_str()?)?.join("/v1/models").ok()
+    }
+
     pub(super) fn apply(
         registration: OAuthProviderRegistration,
     ) -> Option<OAuthProviderRegistration> {
@@ -1019,6 +1029,37 @@ pub(crate) mod debug_fake_oauth {
             );
         });
         Some(registration)
+    }
+}
+
+/// The issuer the RELEASED sanctioned registration uses for `provider`
+/// (never the debug fake's). `None` for providers without one (test-only
+/// registrations, API-key providers).
+pub(crate) fn live_issuer(provider: &str) -> Option<&'static str> {
+    SANCTIONED_PROVIDER_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.provider_id == provider)
+        .map(|registration| registration.issuer)
+}
+
+/// Data-plane guard, every build: an OAuth token whose bundle was minted by
+/// anything other than the provider's live issuer (e.g. the debug fake OAuth
+/// server) is never sent to a non-loopback host: catalog, inference or
+/// usage. Only [`CredentialBroker::resolve_to_loopback`] may hand one out.
+fn ensure_live_issuer_for_remote(
+    descriptor: &CredentialDescriptor,
+    bundle: &OAuthTokenBundleV1,
+) -> Result<(), HaiderError> {
+    match live_issuer(&descriptor.provider) {
+        Some(live) if bundle.issuer != live => Err(HaiderError::new(
+            ErrorCode::Unauthorized,
+            format!(
+                "OAuth credential `{}` was issued by {} rather than the live {} issuer; it is never sent to a non-loopback endpoint",
+                descriptor.alias, bundle.issuer, descriptor.provider
+            ),
+            false,
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -5779,6 +5820,57 @@ impl CredentialBroker {
         Ok(self)
     }
 
+    /// Resolves a credential for a request to the provider's REAL (network)
+    /// endpoint: inference, usage, catalog. An OAuth token not minted by the
+    /// live issuer is refused (typed) before it can leave the process; see
+    /// [`ensure_live_issuer_for_remote`]. Every data-plane send point uses
+    /// this or [`Self::resolve_to_loopback`], never bare [`Self::resolve`].
+    pub(crate) async fn resolve_remote(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, HaiderError> {
+        self.ensure_remote_issuer(descriptor).await?;
+        self.resolve(descriptor).await
+    }
+
+    /// Resolves a credential for a request to a numeric-loopback `destination`
+    /// (the debug fake data plane). Any other destination is refused.
+    pub(crate) async fn resolve_to_loopback(
+        &self,
+        descriptor: &CredentialDescriptor,
+        destination: &Url,
+    ) -> Result<SecretHandle, HaiderError> {
+        if !is_numeric_loopback_http(destination) {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "a loopback credential resolution requires a numeric-loopback http destination",
+                false,
+            ));
+        }
+        self.resolve(descriptor).await
+    }
+
+    async fn ensure_remote_issuer(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Result<(), HaiderError> {
+        if descriptor.auth_method != AuthMethod::OAuth
+            || live_issuer(&descriptor.provider).is_none()
+        {
+            return Ok(());
+        }
+        // An unreadable bundle is left to the ordinary path's own error.
+        let Ok(stored) = self.resolve_vault(&descriptor.alias).await else {
+            return Ok(());
+        };
+        let Ok(bundle) = OAuthTokenBundleV1::decode(stored.expose_secret()) else {
+            return Ok(());
+        };
+        ensure_live_issuer_for_remote(descriptor, &bundle)
+    }
+
+    /// Destination-agnostic resolution for in-process consumers (tests and
+    /// fakes that never send the token anywhere).
     pub(crate) async fn resolve(
         &self,
         descriptor: &CredentialDescriptor,
@@ -5811,6 +5903,18 @@ impl CredentialBroker {
                 }
             },
         }
+    }
+
+    /// [`Self::refresh_after_auth_failure`] for a token headed back to the
+    /// provider's real endpoint (the inference retry): live-issued only.
+    pub(crate) async fn refresh_after_auth_failure_remote(
+        &self,
+        descriptor: &CredentialDescriptor,
+        failed_access_fingerprint: Option<[u8; 32]>,
+    ) -> Result<SecretHandle, HaiderError> {
+        self.ensure_remote_issuer(descriptor).await?;
+        self.refresh_after_auth_failure(descriptor, failed_access_fingerprint)
+            .await
     }
 
     pub(crate) async fn refresh_after_auth_failure(

@@ -13,6 +13,8 @@ login and its `/api/oauth/profile` identity document:
                                 refresh_token grants, JSON or form bodies
   GET  /api/oauth/profile    -> identity bound to the bearer token, after
                                 any scripted failure statuses
+  GET  /v1/models            -> the Claude subscription model catalog stand-in
+                                (bearer must be a token this server minted)
   GET  /__state, POST /__control  -> inspect / change the script
   GET  /__log                -> request log (paths + statuses, no tokens)
 
@@ -156,6 +158,8 @@ def make_handler(state: FakeOAuthState):
                 return self._authorize(query)
             if url.path == "/api/oauth/profile":
                 return self._profile()
+            if url.path == "/v1/models":
+                return self._models()
             if url.path == "/__state":
                 with state.lock:
                     snapshot = dict(state.script)
@@ -236,6 +240,16 @@ def make_handler(state: FakeOAuthState):
                     response, status, note = {"error": "unsupported_grant_type"}, 400, "bad grant"
             return self._send(status, response, note=note)
 
+        def _models(self):
+            auth = self.headers.get("Authorization") or ""
+            token = auth[7:] if auth.startswith("Bearer ") else ""
+            with state.lock:
+                known = token in state.access
+                models = list(state.script.get("models") or DEFAULT_MODELS)
+            if not known:
+                return self._send(401, {"error": "invalid_token"}, note="catalog: unknown bearer")
+            return self._send(200, {"data": models, "has_more": False}, note=f"catalog: {len(models)} models")
+
         def _profile(self):
             auth = self.headers.get("Authorization") or ""
             token = auth[7:] if auth.startswith("Bearer ") else ""
@@ -253,6 +267,15 @@ def make_handler(state: FakeOAuthState):
             return self._send(200, profile_document(grant["identity"]), note=f"account={account}")
 
     return Handler
+
+
+# A small, stable Claude catalog (the `{"data": [...]}` shape the production
+# parser reads). Override with "models" in the script.
+DEFAULT_MODELS = [
+    {"type": "model", "id": "claude-opus-4-8", "display_name": "Claude Opus 4.8"},
+    {"type": "model", "id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6"},
+    {"type": "model", "id": "claude-haiku-4-5", "display_name": "Claude Haiku 4.5"},
+]
 
 
 def serve(host: str, port: int, script: dict | None = None):

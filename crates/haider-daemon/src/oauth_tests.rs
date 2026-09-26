@@ -6696,3 +6696,80 @@ fn v2_imports_stamp_the_live_issuer_and_the_gate_is_open_without_the_hook() {
     assert!(!body.contains("OAuthProviderCatalog::default()"));
     assert!(body.contains("require_live_oauth_provider(spec.provider)?"));
 }
+
+/// Repair 6 data-plane guard (every build): a token whose bundle was minted
+/// by anything other than the provider's LIVE issuer never goes to a
+/// non-loopback endpoint. Only a numeric-loopback destination may receive it.
+#[tokio::test]
+async fn v2_non_live_issued_tokens_only_ever_reach_loopback() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let mut bundle = oauth_bundle_for_test(&server, u64::MAX - 1);
+    bundle.provider_id = descriptor.provider.clone();
+    assert_ne!(
+        Some(bundle.issuer.as_str()),
+        live_issuer(&descriptor.provider)
+    );
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("encode"))
+        .expect("seed");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        Arc::clone(&vault),
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor(&snapshot, Arc::clone(&vault)),
+    )
+    .expect("broker");
+
+    // Real endpoints (inference, usage, catalog): refused, typed, before any send.
+    let error = broker
+        .resolve_remote(&descriptor)
+        .await
+        .expect_err("a non-live-issued token must not reach a real endpoint");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert!(
+        error
+            .message
+            .contains("never sent to a non-loopback endpoint")
+    );
+    let error = broker
+        .refresh_after_auth_failure_remote(&descriptor, None)
+        .await
+        .expect_err("nor after an auth failure");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    // The loopback data plane may receive it; a live URL may not pose as one.
+    let loopback = Url::parse("http://127.0.0.1:9/v1/models").expect("url");
+    assert!(
+        broker
+            .resolve_to_loopback(&descriptor, &loopback)
+            .await
+            .is_ok()
+    );
+    for fake_loopback in [
+        "https://api.anthropic.com/v1/models",
+        "http://localhost:9/v1/models",
+        "https://127.0.0.1:9/v1/models",
+    ] {
+        let url = Url::parse(fake_loopback).expect("url");
+        assert!(
+            broker.resolve_to_loopback(&descriptor, &url).await.is_err(),
+            "{fake_loopback}"
+        );
+    }
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
+
+    // A live-issued bundle is unaffected.
+    let mut live = bundle.clone();
+    live.issuer = "https://claude.ai".to_owned();
+    assert!(ensure_live_issuer_for_remote(&descriptor, &live).is_ok());
+    // Providers without a sanctioned registration are out of scope.
+    let mut test_only = descriptor.clone();
+    test_only.provider = "fake-oauth".to_owned();
+    assert!(ensure_live_issuer_for_remote(&test_only, &bundle).is_ok());
+    assert!(broker.shutdown().await);
+}

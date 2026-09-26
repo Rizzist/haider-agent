@@ -163,7 +163,15 @@ pub(super) async fn discover_models_with_account(
     source: CatalogSource,
     etag: Option<&str>,
 ) -> ProviderModelsRefreshResult {
-    match broker.resolve(descriptor).await {
+    // The discoverer names where the credential goes: a real endpoint only
+    // ever receives a live-issued token; the debug fake data plane is
+    // numeric loopback.
+    let resolved = match model_discoverer.destination(&source) {
+        CatalogDestination::InProcess => broker.resolve(descriptor).await,
+        CatalogDestination::Remote => broker.resolve_remote(descriptor).await,
+        CatalogDestination::Loopback(url) => broker.resolve_to_loopback(descriptor, &url).await,
+    };
+    match resolved {
         Ok(access_token) => {
             let access_token = std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
                 let message = if descriptor.auth_method == AuthMethod::OAuth {

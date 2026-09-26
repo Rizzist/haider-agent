@@ -148,6 +148,14 @@ class FakeOAuthServerTests(unittest.TestCase):
         response.read()
         connection.close()
 
+    def test_model_catalog_requires_a_minted_token(self):
+        token = json.loads(self.login()[2])["access_token"]
+        status, _, raw = call(f"{self.origin}/v1/models", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(status, 200)
+        ids = [model["id"] for model in json.loads(raw)["data"]]
+        self.assertIn("claude-sonnet-4-6", ids)
+        self.assertEqual(call(f"{self.origin}/v1/models", headers={"Authorization": "Bearer nope"})[0], 401)
+
     def test_non_loopback_bind_is_refused(self):
         with self.assertRaises(SystemExit):
             fake_oauth_server.serve("0.0.0.0", 0)

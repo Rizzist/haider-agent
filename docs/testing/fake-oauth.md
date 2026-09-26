@@ -14,6 +14,17 @@ real provider.
 | Browser driver | `scripts/test-support/fake_oauth_browser.sh` | `$BROWSER` stand-in: follows the authorize hop to the daemon callback; refuses any URL not on the fake origin |
 | Daemon hook | `crates/haider-daemon/src/oauth.rs`, `debug_fake_oauth` | `HAIDER_TEST_FAKE_OAUTH_ORIGIN` points the `anthropic-oauth` registration at the fake |
 | Self-test | `scripts/tests/test_fake_oauth_server.py` | Server contract (CI runs it) |
+| Sandbox | `scripts/test-support/loopback-only.sb` | `sandbox-exec` profile that denies every non-loopback connect |
+
+## Standing rule: always run fake-mode binaries in the loopback-only sandbox
+
+Every real-binary run with `HAIDER_TEST_FAKE_OAUTH_ORIGIN` set MUST run under
+`sandbox-exec -f scripts/test-support/loopback-only.sb …`. Proxy egress
+traps are NOT evidence: provider and control clients are built with
+`.no_proxy()` and never consult `HTTPS_PROXY`/`ALL_PROXY`, so a proxy trap
+cannot see catalog, inference or OAuth traffic. A run script should prove it
+is sandboxed before it starts. A connect to the never-routed TEST-NET address
+`192.0.2.1` must fail locally with EPERM ("Operation not permitted"), not time out.
 
 ## Safety rules (enforced in code)
 
@@ -44,6 +55,16 @@ real provider.
   credential is read (`require_live_oauth_provider`). Imports always stamp
   the issuer from the never-faked live catalog, so even an imported
   credential could not pass the fake registration's issuer guards.
+- **Fake data plane, and a data-plane guard in every build.**
+  - Under the hook, the Claude subscription model catalog also goes to the
+    fake (`<origin>/v1/models`), so `session.create` and `haider models
+    --refresh` work offline.
+  - In every build, an OAuth token whose bundle was not minted by the
+    provider's live issuer is never sent to a non-loopback host: catalog,
+    inference, usage and the inference auth-failure refresh are refused with
+    a typed `unauthorized` error before any request is made.
+  - Inference and usage therefore fail closed in fake mode. For a turn, use
+    `HAIDER_TEST_FAKE_PROVIDER`.
 - **Isolated profile.** Always use a private `HOME`, `HAIDER_PROFILE_DIR`
   and `HAIDER_RUNTIME_DIR` (the vault is a per-profile file vault), and
   `HAIDER_TEST_CLAUDE_CREDENTIAL_STORE=unavailable`. Never point it at an
@@ -58,7 +79,8 @@ export HAIDER_TEST_FAKE_OAUTH_ORIGIN=$origin
 export BROWSER=$PWD/scripts/test-support/fake_oauth_browser.sh
 export HOME=$(mktemp -d) HAIDER_PROFILE_DIR=$(mktemp -d) HAIDER_RUNTIME_DIR=$(mktemp -d)
 export HAIDER_TEST_CLAUDE_CREDENTIAL_STORE=unavailable HAIDER_DISCOVERY_DISABLED=1
-target/debug/haider-tui     # /accounts -> + Anthropic (OAuth): the login completes by itself
+sandbox-exec -f scripts/test-support/loopback-only.sb \
+  target/debug/haider-tui   # /accounts -> + Anthropic (OAuth): the login completes by itself
 ```
 
 Use `/__control` to choose which account the next sign-in authenticates, or

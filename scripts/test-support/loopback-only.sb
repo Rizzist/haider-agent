@@ -1,0 +1,7 @@
+;; macOS sandbox-exec profile for fake-OAuth e2e runs (TEST SUPPORT ONLY).
+;; Every network connect is denied except to loopback, so nothing a run does can leave the machine.
+;; Usage: sandbox-exec -f scripts/test-support/loopback-only.sb <command>   (see docs/testing/fake-oauth.md)
+(version 1)
+(allow default)
+(deny network-outbound (remote ip "*:*"))
+(allow network-outbound (remote ip "localhost:*"))
