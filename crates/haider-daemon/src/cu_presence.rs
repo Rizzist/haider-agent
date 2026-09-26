@@ -125,6 +125,7 @@ impl CuPresence {
 
     /// Starts one CU action. On success returns an optional acknowledgement
     /// the caller should await (bounded) before posting pointer input.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         &self,
         key: &str,
@@ -133,12 +134,17 @@ impl CuPresence {
         point: Option<PresencePoint>,
         stop: StopHook,
         in_flight: StopHook,
+        actor: Option<haider_tools::presence::PresenceActor>,
     ) -> Result<Option<oneshot::Receiver<()>>, PresenceRefusal> {
         let mut state = lock(&self.state);
-        let (seq, commands) =
-            state
-                .machine
-                .begin_action(key.to_owned(), surface, mark, point, Instant::now())?;
+        let (seq, commands) = state.machine.begin_action_as(
+            key.to_owned(),
+            surface,
+            mark,
+            point,
+            Instant::now(),
+            actor,
+        )?;
         state.hooks.insert(
             key.to_owned(),
             LeaseHooks {
@@ -395,6 +401,10 @@ pub(crate) struct PresenceLease {
     presence: Arc<CuPresence>,
     stop: StopHook,
     ended: AtomicBool,
+    /// 973-activity-icons: the subagent driving this run, named on the
+    /// overlay badge (`🖥️ Ammar is using your screen`). `None` for the main
+    /// thread, which keeps the generic badge.
+    actor: Option<haider_tools::presence::PresenceActor>,
 }
 
 /// Finishes the action when dropped, including on cancellation.
@@ -415,7 +425,23 @@ impl PresenceLease {
             presence,
             stop,
             ended: AtomicBool::new(false),
+            actor: None,
         }
+    }
+
+    /// Name the subagent driving this run on any badge it raises. The
+    /// activity glyph leads unless `HAIDER_ACTIVITY_ICONS` asks for text or
+    /// no icons.
+    #[must_use]
+    pub(crate) fn with_actor(mut self, name: Option<String>) -> Self {
+        let emoji = std::env::var("HAIDER_ACTIVITY_ICONS")
+            .ok()
+            .and_then(|value| haider_protocol::activity::ActivityDisplay::parse(&value))
+            .is_none_or(|display| display == haider_protocol::activity::ActivityDisplay::Emoji);
+        self.actor = name
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| haider_tools::presence::PresenceActor { name, emoji });
+        self
     }
 
     /// Lease on `presence` (the daemon-wide [`global`] in production) whose Stop cancels `run_id`
@@ -446,6 +472,7 @@ impl PresenceLease {
             point,
             Arc::clone(&self.stop),
             in_flight,
+            self.actor.clone(),
         )?;
         let guard = ActionGuard { lease: self };
         if let Some(ack) = ack {

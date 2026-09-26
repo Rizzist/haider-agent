@@ -490,3 +490,51 @@ fn linux_notification_plan_offers_stop_only_when_the_server_draws_actions() {
         );
     }
 }
+
+#[test]
+fn a_named_subagent_raises_the_activity_badge_for_each_surface() {
+    let mut machine = PresenceMachine::<String>::default();
+    let now = Instant::now();
+    let actor = Some(PresenceActor {
+        name: "Ammar".into(),
+        emoji: true,
+    });
+    let (_, commands) = machine
+        .begin_action_as(
+            key("sub"),
+            PresenceSurface::Screen,
+            PresenceMark::Observe,
+            None,
+            now,
+            actor,
+        )
+        .expect("not stopped");
+    assert_eq!(
+        commands.first(),
+        Some(&PresenceCommand::Show {
+            surface: PresenceSurface::Screen,
+            label: "\u{1F5A5}\u{FE0F} Ammar is using your screen".into(),
+        })
+    );
+    // The same run on the phone keeps its name with the phone glyph.
+    let (_, commands) = machine
+        .begin_action(
+            key("sub"),
+            PresenceSurface::Phone,
+            PresenceMark::Click,
+            None,
+            now,
+        )
+        .expect("not stopped");
+    assert_eq!(
+        commands.first(),
+        Some(&PresenceCommand::Show {
+            surface: PresenceSurface::Phone,
+            label: "\u{1F4F1} Ammar is using your phone".into(),
+        })
+    );
+    assert_eq!(
+        PresenceSurface::Browser.actor_label("Ammar", false),
+        "Ammar is using this browser"
+    );
+}

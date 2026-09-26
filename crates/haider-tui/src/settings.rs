@@ -57,6 +57,11 @@ struct SettingsDto {
     /// still loads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     tool_rows: BTreeMap<String, ToolRowsDto>,
+    /// 973-activity-icons: subagent activity glyphs (`emoji` · `text` ·
+    /// `off`). Additive — absent means "not chosen": boot then follows
+    /// `HAIDER_ACTIVITY_ICONS`, `NO_COLOR` and `TERM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity_icons: Option<String>,
 }
 
 /// One session's persisted disclosure state.
@@ -122,6 +127,9 @@ pub struct SettingsStore {
     /// Per-session disclosure mirrored into every write (F3), so a theme,
     /// model or verbosity save never drops it. Seeded from the file at boot.
     tool_rows: BTreeMap<String, ToolRowsRecord>,
+    /// 973-activity-icons: the explicitly chosen activity display, mirrored
+    /// into every write. `None` = never chosen.
+    activity_icons: Option<haider_protocol::activity::ActivityDisplay>,
 }
 
 impl SettingsStore {
@@ -137,6 +145,40 @@ impl SettingsStore {
             verbosity: Verbosity::default(),
             last_saved_verbosity: None,
             tool_rows: BTreeMap::new(),
+            activity_icons: None,
+        }
+    }
+
+    /// 973-activity-icons: the persisted activity display choice, `None`
+    /// when never chosen (or on a missing/corrupt/foreign file or an
+    /// unknown name — defaults, never damage).
+    #[must_use]
+    pub fn load_activity_icons(&self) -> Option<haider_protocol::activity::ActivityDisplay> {
+        self.load_dto()?
+            .activity_icons
+            .as_deref()
+            .and_then(haider_protocol::activity::ActivityDisplay::parse)
+    }
+
+    /// Seed the tracked choice (boot-time load) so other saves preserve it.
+    pub fn set_activity_icons(&mut self, mode: Option<haider_protocol::activity::ActivityDisplay>) {
+        self.activity_icons = mode;
+    }
+
+    /// Persist an `/icons` choice, carrying everything else.
+    pub fn save_activity_icons_if_changed(
+        &mut self,
+        theme: ThemeChoice,
+        mode: haider_protocol::activity::ActivityDisplay,
+    ) {
+        if self.activity_icons == Some(mode) {
+            return;
+        }
+        self.activity_icons = Some(mode);
+        if self.write_dto(theme, self.notifications) {
+            self.last_saved = Some(theme);
+            self.last_saved_notifications = Some(self.notifications);
+            self.last_saved_verbosity = Some(self.verbosity);
         }
     }
 
@@ -396,6 +438,7 @@ impl SettingsStore {
                     )
                 })
                 .collect(),
+            activity_icons: self.activity_icons.map(|mode| mode.name().to_owned()),
         };
         let Ok(json) = serde_json::to_string(&dto) else {
             return false;

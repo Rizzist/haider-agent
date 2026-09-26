@@ -575,3 +575,47 @@ async fn first_capture_is_concealed_before_the_helper_reports_ready() {
     assert!(show < conceal && conceal < reveal, "{text}");
     lease.end(false);
 }
+
+#[tokio::test]
+async fn a_subagent_lease_names_itself_on_the_overlay_badge() {
+    // 973-activity-icons, dry-run backend: the recording renderer stands in
+    // for the real overlay, so no real screen is driven.
+    let (presence, recorded) = presence_with(PresenceSurface::Screen, false);
+    let (stop, _stops) = counting_hook();
+    let lease = PresenceLease::new(Arc::clone(&presence), "s/sub".into(), stop)
+        .with_actor(Some("Ammar".into()));
+    let cancel = haider_tools::ComputerCancelToken::new();
+    {
+        let _guard = lease
+            .begin_computer(&ComputerAction::Screenshot, None, &cancel)
+            .await
+            .expect("begin");
+    }
+    lease.end(false);
+    let commands = recorded.commands.lock().unwrap().clone();
+    let expected_label = if std::env::var("HAIDER_ACTIVITY_ICONS")
+        .is_ok_and(|value| matches!(value.as_str(), "text" | "off"))
+    {
+        "Ammar is using your screen".to_owned()
+    } else {
+        "\u{1F5A5}\u{FE0F} Ammar is using your screen".to_owned()
+    };
+    assert!(
+        matches!(commands.first(), Some(PresenceCommand::Show { label, .. }) if *label == expected_label),
+        "{commands:?}"
+    );
+    // An empty name keeps the generic badge.
+    let (stop, _stops) = counting_hook();
+    let generic = PresenceLease::new(Arc::clone(&presence), "s/main".into(), stop)
+        .with_actor(Some("  ".into()));
+    {
+        let _guard = generic
+            .begin_computer(&ComputerAction::Screenshot, None, &cancel)
+            .await
+            .expect("begin");
+    }
+    generic.end(false);
+    let commands = recorded.commands.lock().unwrap().clone();
+    assert!(commands.iter().any(|command| matches!(command,
+        PresenceCommand::Show { label, .. } if label == "Haider is controlling this screen")));
+}

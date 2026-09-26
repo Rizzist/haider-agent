@@ -6615,6 +6615,42 @@ async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capabil
         live_node.children[0].parent_agent_id.as_ref(),
         Some(&live.agent_id)
     );
+    // 973-activity-icons: each child's typed `fs_read` call is still open,
+    // so live/waiting nodes are reading; terminal nodes show no current
+    // activity but keep their history; a parent with children lists
+    // orchestrating in its history.
+    {
+        use haider_protocol::activity::ActivityKind;
+        assert_eq!(live_node.activity, Some(ActivityKind::Read));
+        assert_eq!(
+            live_node.activities,
+            vec![ActivityKind::Read, ActivityKind::Orchestrate]
+        );
+        assert_eq!(live_node.children[0].activity, Some(ActivityKind::Read));
+        for node in &snapshot.roots {
+            if matches!(
+                node.state,
+                FleetAgentStateWire::Done
+                    | FleetAgentStateWire::Failed
+                    | FleetAgentStateWire::Cancelled
+            ) {
+                assert_eq!(node.activity, None, "{}", node.agent_id);
+                assert_eq!(node.activities, vec![ActivityKind::Read]);
+            }
+        }
+        let json = serde_json::to_value(&snapshot).expect("fleet json");
+        let live_json = json["roots"]
+            .as_array()
+            .expect("roots")
+            .iter()
+            .find(|node| node["agent_id"] == "fleet-agent-live")
+            .expect("live json node");
+        assert_eq!(live_json["activity"], "read");
+        assert_eq!(
+            live_json["activities"],
+            serde_json::json!(["read", "orchestrate"])
+        );
+    }
 
     let denied_sink = Arc::new(CollectSink::default());
     let denied = hub

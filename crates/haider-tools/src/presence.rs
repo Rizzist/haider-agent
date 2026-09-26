@@ -33,6 +33,7 @@ mod overlay_windows;
 #[path = "presence/overlay_linux.rs"]
 mod overlay_linux;
 
+use haider_protocol::activity::ActivityKind;
 use haider_protocol::computer::{CU_PRESENCE_IDLE_SECS, ComputerAction};
 use haider_protocol::mobile::MobileAction;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,24 @@ impl PresenceSurface {
         }
     }
 
+    /// 973-activity-icons: the badge when a named SUBAGENT drives this
+    /// surface — `🖥️ Ammar is using your screen`. The activity glyph leads
+    /// (the same vocabulary as the fleet rows); `emoji: false` drops it for
+    /// displays configured for text/no icons.
+    #[must_use]
+    pub fn actor_label(self, actor: &str, emoji: bool) -> String {
+        let (kind, object) = match self {
+            Self::Screen => (ActivityKind::Computer, "your screen"),
+            Self::Phone => (ActivityKind::Mobile, "your phone"),
+            Self::Browser => (ActivityKind::Web, "this browser"),
+        };
+        if emoji {
+            format!("{} {actor} is using {object}", kind.emoji())
+        } else {
+            format!("{actor} is using {object}")
+        }
+    }
+
     /// Short noun used by the TUI header chip.
     #[must_use]
     pub const fn noun(self) -> &'static str {
@@ -110,6 +129,15 @@ impl PresenceSurface {
             Self::Browser => "browser",
         }
     }
+}
+
+/// The named subagent driving a surface (973-activity-icons badge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceActor {
+    /// Display name (the subagent's callsign).
+    pub name: String,
+    /// Lead the badge with the activity emoji.
+    pub emoji: bool,
 }
 
 /// How the agent pointer marks one action.
@@ -309,6 +337,9 @@ struct Lease {
     surfaces: BTreeMap<PresenceSurface, Instant>,
     /// Surface of the action most recently begun (what `finish` refreshes).
     current: PresenceSurface,
+    /// The acting subagent, when one is named (`None` = the generic
+    /// "Haider is controlling …" badge).
+    actor: Option<PresenceActor>,
     in_flight: u32,
     stopped_at: Option<Instant>,
 }
@@ -358,24 +389,45 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         point: Option<PresencePoint>,
         now: Instant,
     ) -> Result<(u64, Vec<PresenceCommand>), PresenceRefusal> {
+        self.begin_action_as(key, surface, mark, point, now, None)
+    }
+
+    /// [`Self::begin_action`] naming the acting subagent: a `Show` this
+    /// action raises carries [`PresenceSurface::actor_label`]
+    /// (973-activity-icons). A surface already shown keeps the label it was
+    /// raised with.
+    pub fn begin_action_as(
+        &mut self,
+        key: K,
+        surface: PresenceSurface,
+        mark: PresenceMark,
+        point: Option<PresencePoint>,
+        now: Instant,
+        actor: Option<PresenceActor>,
+    ) -> Result<(u64, Vec<PresenceCommand>), PresenceRefusal> {
         if self.leases.get(&key).is_some_and(Lease::stopped) {
             return Err(PresenceRefusal::Stopped);
         }
         let lease = self.leases.entry(key).or_insert_with(|| Lease {
             surfaces: BTreeMap::new(),
             current: surface,
+            actor: None,
             in_flight: 0,
             stopped_at: None,
         });
+        if actor.is_some() {
+            lease.actor = actor;
+        }
         lease.surfaces.insert(surface, now);
         lease.current = surface;
         lease.in_flight = lease.in_flight.saturating_add(1);
         let mut commands = Vec::with_capacity(2);
+        let label = lease.actor.as_ref().map_or_else(
+            || surface.badge_label().to_owned(),
+            |actor| surface.actor_label(&actor.name, actor.emoji),
+        );
         if self.shown.insert(surface) {
-            commands.push(PresenceCommand::Show {
-                surface,
-                label: surface.badge_label().to_owned(),
-            });
+            commands.push(PresenceCommand::Show { surface, label });
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1).max(1);

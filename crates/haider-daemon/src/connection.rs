@@ -967,6 +967,10 @@ fn omit_fleet_node_identity(nodes: &mut [haider_rpc::FleetNodeWire]) {
     for node in nodes {
         node.model = None;
         node.provider = None;
+        // 973-activity-icons fields postdate X1 too: a tight legacy peer
+        // keeps its exact pre-X1 payload.
+        node.activity = None;
+        node.activities.clear();
         omit_fleet_node_identity(&mut node.children);
     }
 }

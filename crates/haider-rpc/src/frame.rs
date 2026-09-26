@@ -2584,6 +2584,17 @@ pub struct FleetNodeWire {
     /// `(terminal_at_ms | snapshot.generated_at_ms) - started_at_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<AgentMetricsSnapshot>,
+    /// 973-activity-icons: what this agent is DOING at `generated_at_ms`
+    /// (not its state), derived from typed tool identity in its own journal
+    /// by [`haider_protocol::activity::ActivityTracker`]. Absent when it is
+    /// quiet, terminal, or the daemon predates the field; old clients ignore
+    /// it. Unknown future kinds decode as `unknown` and render nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<haider_protocol::activity::ActivityKind>,
+    /// Every activity this agent has used so far, highest priority first
+    /// (the detail view's history). Empty when none or when not reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activities: Vec<haider_protocol::activity::ActivityKind>,
     /// Exact number of this node's direct durable children omitted by the
     /// snapshot bounds. Zero means the empty `children` list is a real leaf.
     #[serde(default, skip_serializing_if = "is_zero_u32")]

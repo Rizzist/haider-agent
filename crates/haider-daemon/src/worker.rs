@@ -16954,12 +16954,28 @@ async fn create_broker_tool_dispatcher(
         device_id: context.device_id.clone(),
         event_ids: Arc::clone(&context.event_ids),
     };
+    // 973-activity-icons: a SUBAGENT names itself on any presence badge it
+    // raises. Best-effort and read-only: a missing record or callsign keeps
+    // the generic badge rather than failing the run.
+    let presence_actor = if context.agent_id.is_some() {
+        context
+            .store
+            .hub()
+            .delegation_for_child_session(session_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.manifest.callsign)
+    } else {
+        None
+    };
     let cu_presence = crate::cu_presence::PresenceLease::for_run(
         presence,
         context.store.hub().clone(),
         session_id.clone(),
         context.run_id.clone(),
-    );
+    )
+    .with_actor(presence_actor);
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
         pending_workspace: Mutex::new(pending_workspace),

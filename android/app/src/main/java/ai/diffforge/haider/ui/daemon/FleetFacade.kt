@@ -107,6 +107,27 @@ data class FleetNodeMetrics(
     }
 }
 
+/**
+ * 973-activity-icons: `haider_protocol::activity::ActivityKind` — what an agent
+ * is DOING (not its state), highest priority first. The daemon derives it from
+ * typed tool identity; the phone only renders it. An unknown future kind is
+ * dropped (no glyph), never coerced onto a known one.
+ */
+enum class FleetActivity(val wire: String, val emoji: String, val label: String, val description: String) {
+    Computer("computer", "\uD83D\uDDA5\uFE0F", "[screen]", "using the computer"),
+    Mobile("mobile", "\uD83D\uDCF1", "[phone]", "using the phone"),
+    Web("web", "\uD83C\uDF10", "[web]", "on the web"),
+    Remote("remote", "\uD83D\uDD0C", "[remote]", "working remotely"),
+    Edit("edit", "\u270F\uFE0F", "[edit]", "editing files"),
+    Run("run", "\u2699\uFE0F", "[run]", "running commands"),
+    Read("read", "\uD83D\uDD0D", "[read]", "reading"),
+    Orchestrate("orchestrate", "\uD83E\uDDED", "[orch]", "orchestrating");
+
+    companion object {
+        fun of(raw: String?): FleetActivity? = values().firstOrNull { it.wire == raw }
+    }
+}
+
 /** One recursively nested descendant — `FleetNodeWire` (frame.rs:2321). */
 data class FleetNode(
     val agentId: String,
@@ -120,9 +141,16 @@ data class FleetNode(
     val parentAgentId: String? = null,
     val state: FleetStateView = FleetStateView.of(null),
     val metrics: FleetNodeMetrics? = null,
+    /** 973-activity-icons: current activity; absent = quiet/terminal/older daemon. */
+    val activity: FleetActivity? = null,
+    /** Every activity used so far, highest priority first. */
+    val activities: List<FleetActivity> = emptyList(),
     val foldedChildren: Int = 0,
     val children: List<FleetNode> = emptyList(),
 ) {
+    /** The activity to render now: never on a terminal node. */
+    val currentActivity: FleetActivity? get() = activity?.takeUnless { state.terminal }
+
     /** The daemon said there are more children than it returned. */
     val bounded: Boolean get() = foldedChildren > 0
 
@@ -351,6 +379,11 @@ object FleetRpcAdapter {
         // not a daemon claim — it stays unknown with no raw word.
         state = FleetStateView.of(node.stringOrNull("state")),
         metrics = node.optJSONObject("metrics")?.let(::parseMetrics),
+        // 973-activity-icons: both fields are skipped when empty/absent.
+        activity = FleetActivity.of(node.stringOrNull("activity")),
+        activities = node.optJSONArray("activities")?.let { array ->
+            (0 until array.length()).mapNotNull { FleetActivity.of(array.optString(it, "")) }
+        }.orEmpty(),
         // `folded_children` is skipped when zero (`is_zero_u32`), so absence
         // really is zero here — the one place a default is the wire's own.
         foldedChildren = node.intOrNull("folded_children") ?: 0,

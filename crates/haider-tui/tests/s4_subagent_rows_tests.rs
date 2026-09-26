@@ -165,6 +165,7 @@ fn snapshot(
         started_at_ms: SPAWN_MS,
         terminal_at_ms: (!live).then_some(SPAWN_MS + RUN_MS),
         live,
+        activity: None,
         tool_attempts: 3,
         usage: Some(usage(auth, cost_microusd)),
     }

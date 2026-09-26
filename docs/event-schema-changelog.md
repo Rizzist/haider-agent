@@ -21,6 +21,28 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.973 — subagent activity on fleet nodes
+
+`FleetNodeWire` (`session.fleet`, `haider agent list --json`) gains two
+additive, absence-preserving fields: `activity` (one of `computer`, `mobile`,
+`web`, `remote`, `edit`, `run`, `read`, `orchestrate`) — what the child is
+DOING at `generated_at_ms`, distinct from its `state` — and `activities`, every
+activity used so far in priority order. Both are derived by
+`haider_protocol::activity::ActivityTracker` from typed journal facts only
+(`ToolCall` tool identity, `CommandExecution`, `FileChange`, `ChildSpawn`,
+`RunState`), never from free text. Priority (highest first) is the order
+above. Timing: an open call is active until it completes; a finished call
+stays hot for 8 s (hot kinds compete on priority); a quiet agent then shows
+its most recent activity until 60 s of quiet, then none; a node with live
+children is orchestrating; terminal nodes carry no current activity. The
+enum is `#[serde(other)]`-tolerant (`unknown`), no event shape changes, and a
+peer that did not negotiate `session_fleet_identity_v1` receives the exact
+pre-field payload. Clients render emoji (`🖥️ 📱 🌐 🔌 ✏️ ⚙️ 🔍 🧭`, VS16 where
+the base defaults to text presentation, two columns each) or the text
+fallbacks `[screen] [phone] [web] [remote] [edit] [run] [read] [orch]`;
+`HAIDER_ACTIVITY_ICONS=emoji|text|off`, the TUI `/icons` setting, `NO_COLOR`
+and limited `TERM` values select the form.
+
 ### v0.0.973 — provider-request budgets become opt-in
 
 Omitting `RunBudgetV1.request_budget` or a delegated child's request policy now

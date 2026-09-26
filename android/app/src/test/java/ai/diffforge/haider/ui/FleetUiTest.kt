@@ -5,7 +5,12 @@ import ai.diffforge.haider.ui.daemon.DaemonInfo
 import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.daemon.FakeDaemonService
 import ai.diffforge.haider.ui.daemon.FakeScenario
+import ai.diffforge.haider.ui.daemon.FleetActivity
 import ai.diffforge.haider.ui.daemon.FleetLoad
+import ai.diffforge.haider.ui.daemon.FleetNode
+import ai.diffforge.haider.ui.daemon.FleetRollup
+import ai.diffforge.haider.ui.daemon.FleetSnapshot
+import ai.diffforge.haider.ui.daemon.FleetStateView
 import ai.diffforge.haider.ui.daemon.NeedsInput
 import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.SessionVisualState
@@ -13,13 +18,16 @@ import ai.diffforge.haider.ui.drawer.FAMILY_TOGGLE_TAG
 import ai.diffforge.haider.ui.drawer.SessionDrawer
 import ai.diffforge.haider.ui.fleet.CHILD_TRANSCRIPT_TAG
 import ai.diffforge.haider.ui.fleet.SUBAGENT_STRIP_TAG
+import ai.diffforge.haider.ui.fleet.fleetActivityTag
 import ai.diffforge.haider.ui.fleet.fleetRowTag
 import ai.diffforge.haider.ui.fleet.subagentChipTag
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.theme.ForgeTheme
 import ai.diffforge.haider.ui.theme.ThemeMode
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -317,6 +325,58 @@ class FleetUiTest {
             service.calls.contains("activate:s-swarm-1"),
         )
         assertEquals(Overlay.None, viewModel.state.value.overlay)
+    }
+
+    @Test
+    fun `973 a live row wears its activity emoji left of the name`() {
+        val service = app()
+        fun node(id: String, state: String) = FleetNode(
+            agentId = id,
+            sessionId = "s-$id",
+            callsign = id.removePrefix("agent-"),
+            task = "activity proof",
+            depth = 1,
+            parentSessionId = "s-fleet",
+            state = FleetStateView.of(state),
+            activity = FleetActivity.Edit,
+            activities = listOf(FleetActivity.Edit, FleetActivity.Read),
+        )
+        service.fleetOverride = { session ->
+            if (session == "s-fleet") {
+                FleetLoad.Snapshot(
+                    FleetSnapshot(
+                        sessionId = "s-fleet",
+                        generatedAtMs = FakeDaemonService.FIXED_NOW,
+                        nodeLimit = 64,
+                        depthLimit = 4,
+                        roots = listOf(node("agent-editor", "live"), node("agent-finished", "done")),
+                        rollup = FleetRollup(
+                            nodeCount = 2,
+                            maxDepth = 1,
+                            metricsComplete = true,
+                            complete = true,
+                        ),
+                        truncated = false,
+                    ),
+                )
+            } else {
+                null
+            }
+        }
+        viewModel.openFleet()
+        rule.waitForIdle()
+        rule.onNodeWithTag(fleetActivityTag("agent-editor"), useUnmergedTree = true).assertExists()
+        rule.onNodeWithTag(fleetActivityTag("agent-editor"), useUnmergedTree = true)
+            .assertTextEquals(FleetActivity.Edit.emoji)
+        // The row's spoken description names the activity for screen readers.
+        rule.onNodeWithTag(fleetRowTag("agent-editor"))
+            .assert(
+                androidx.compose.ui.test.SemanticsMatcher("activity spoken") { semantics ->
+                    semantics.config
+                        .getOrElse(androidx.compose.ui.semantics.SemanticsProperties.ContentDescription) { emptyList() }
+                        .any { it.contains("editing files") }
+                },
+            )
     }
 
     @Test

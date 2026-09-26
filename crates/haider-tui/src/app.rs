@@ -1691,6 +1691,10 @@ pub struct ChipModel {
     /// (`agent_graph_rollup_v1`). `None` = the child runs no pinned
     /// workflow (or an older daemon) — the row keeps plain activity.
     pub graph: Option<haider_protocol::agent::AgentGraphRollupV1>,
+    /// 973-activity-icons: live ACTIVITY (what the child is doing, not its
+    /// state), folded from the typed items this chip applies — see
+    /// [`haider_protocol::activity`] for the priority and timing contract.
+    pub activity: haider_protocol::activity::ActivityTracker,
     pub closed: bool,
     pub removing: bool,
     pub children: Vec<ChipModel>,
@@ -1759,6 +1763,7 @@ impl ChipModel {
             metrics: None,
             question: None,
             graph: None,
+            activity: haider_protocol::activity::ActivityTracker::new(),
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -1827,6 +1832,7 @@ impl ChipModel {
             metrics: None,
             question: None,
             graph: None,
+            activity: haider_protocol::activity::ActivityTracker::new(),
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -5555,6 +5561,12 @@ pub struct AppModel {
     /// commit counter the runtime watches to persist a change.
     pub notifications_enabled: bool,
     pub notification_commits: u64,
+    /// 973-activity-icons: how subagent ACTIVITY renders (emoji · text ·
+    /// off). `AppModel::new` defaults to emoji; boot resolves the persisted
+    /// setting, `HAIDER_ACTIVITY_ICONS`, `NO_COLOR` and `TERM`. `/icons`
+    /// changes it and bumps the commit counter the runtime persists.
+    pub activity_display: haider_protocol::activity::ActivityDisplay,
+    pub activity_display_commits: u64,
     /// Model retention (owner 2026-08-15): bumped on every COMMITTED model
     /// pick so the runtime persists the pair and the next boot opens on it.
     pub model_commits: u64,
@@ -6038,6 +6050,8 @@ impl Default for AppModel {
             focus_reported: false,
             notifications_enabled: true,
             notification_commits: 0,
+            activity_display: haider_protocol::activity::ActivityDisplay::Emoji,
+            activity_display_commits: 0,
             model_commits: 0,
             notification_run_state: None,
             background_notification_states: std::collections::HashMap::new(),
@@ -7034,6 +7048,132 @@ impl AppModel {
     /// W-C M2: seed the notification toggle from persisted settings.
     pub fn set_notifications_enabled(&mut self, enabled: bool) {
         self.notifications_enabled = enabled;
+    }
+
+    /// 973-activity-icons: set the activity display mode from `/icons`,
+    /// bumping the commit counter the runtime watches to persist it.
+    /// `None` cycles emoji → text → off → emoji.
+    pub fn set_activity_display(
+        &mut self,
+        mode: Option<haider_protocol::activity::ActivityDisplay>,
+    ) {
+        use haider_protocol::activity::ActivityDisplay as D;
+        let next = mode.unwrap_or(match self.activity_display {
+            D::Emoji => D::Text,
+            D::Text => D::Off,
+            D::Off => D::Emoji,
+        });
+        if next != self.activity_display {
+            self.activity_display = next;
+            self.activity_display_commits += 1;
+        }
+        self.flash = Some(format!("· activity icons {}", next.name()));
+        self.dirty = true;
+    }
+
+    /// 973-activity-icons: one chip's CURRENT activity at the model clock.
+    /// Terminal and closing chips show none; a chip with live children is
+    /// orchestrating when otherwise quiet.
+    #[must_use]
+    pub fn chip_activity(
+        &self,
+        chip: &ChipModel,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        use crate::script::ChipDisplayState as S;
+        if chip.closed || matches!(chip.display_state(), S::Done | S::Error) {
+            return None;
+        }
+        let live_children = chip
+            .children
+            .iter()
+            .any(|child| !child.closed && !matches!(child.display_state(), S::Done | S::Error));
+        if !chip.activity.is_empty() {
+            return chip.activity.current(self.clock_ms, live_children);
+        }
+        // Live mode: the child's typed tool items live in ITS session; the
+        // daemon publishes their activity state inside the child's agent
+        // metrics (session summaries), evaluated here on our clock.
+        self.chip_metrics(chip)
+            .and_then(|metrics| metrics.activity.as_ref())
+            .map(haider_protocol::activity::ActivityTracker::from_state)
+            .map_or_else(
+                || live_children.then_some(haider_protocol::activity::ActivityKind::Orchestrate),
+                |tracker| tracker.current(self.clock_ms, live_children),
+            )
+    }
+
+    /// 973-activity-icons: a fleet node's current activity — the local chip's
+    /// live tracker when this session holds the chip (fresher than any
+    /// snapshot), else the daemon snapshot's figure.
+    #[must_use]
+    pub fn node_activity(
+        &self,
+        node: &haider_rpc::FleetNodeWire,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        use haider_rpc::FleetAgentStateWire as F;
+        if matches!(node.state, F::Done | F::Failed | F::Cancelled) {
+            return None;
+        }
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            return self.chip_activity(chip);
+        }
+        let live_children = node
+            .children
+            .iter()
+            .any(|child| !matches!(child.state, F::Done | F::Failed | F::Cancelled));
+        // A deeper member has no chip; its own session summary carries the
+        // live activity state (fresher than the snapshot's instant).
+        // Freshest of the two daemon projections (replace-by-head law):
+        // the session summary and the fleet snapshot's own metrics.
+        let freshest = [
+            self.session_metrics.get(&node.session_id),
+            node.metrics.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|metrics| metrics.activity.is_some())
+        .max_by_key(|metrics| metrics.head_seq);
+        match freshest.and_then(|metrics| metrics.activity.as_ref()) {
+            Some(state) => haider_protocol::activity::ActivityTracker::from_state(state)
+                .current(self.clock_ms, live_children),
+            None => node.activity,
+        }
+    }
+
+    /// 973-activity-icons: every activity a node used so far (detail view),
+    /// merging the snapshot history with the local chip tracker.
+    #[must_use]
+    pub fn node_activities(
+        &self,
+        node: &haider_rpc::FleetNodeWire,
+    ) -> Vec<haider_protocol::activity::ActivityKind> {
+        let mut used = node.activities.clone();
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            used.extend(chip.activity.used());
+            if !chip.children.is_empty() {
+                used.push(haider_protocol::activity::ActivityKind::Orchestrate);
+            }
+            if let Some(state) = self
+                .chip_metrics(chip)
+                .and_then(|metrics| metrics.activity.as_ref())
+            {
+                used.extend(state.touched.iter().map(|touch| touch.kind));
+            }
+        }
+        if let Some(state) = self
+            .session_metrics
+            .get(&node.session_id)
+            .and_then(|metrics| metrics.activity.as_ref())
+        {
+            used.extend(state.touched.iter().map(|touch| touch.kind));
+        }
+        if !node.children.is_empty() || node.folded_children > 0 {
+            used.push(haider_protocol::activity::ActivityKind::Orchestrate);
+        }
+        used.retain(|kind| *kind != haider_protocol::activity::ActivityKind::Unknown);
+        used.sort_by_key(|kind| kind.rank());
+        used.dedup();
+        used
     }
 
     /// W-C M2: flip (or set) the desktop-notification toggle and bump the
@@ -15434,6 +15574,19 @@ impl AppModel {
             // a display preference, not a session command); bare `/notifications`
             // flips it, `on`/`off` set it explicitly, and the runtime persists
             // the change to the TUI settings file.
+            // 973-activity-icons: subagent activity glyphs — `/icons emoji`,
+            // `/icons text` (bracketed labels for terminals without emoji
+            // fonts / screen readers), `/icons off`; bare cycles. Display
+            // preference only; the runtime persists it.
+            "icons" | "activity-icons" => match arg.as_deref() {
+                None | Some("toggle") => self.set_activity_display(None),
+                Some(value) => match haider_protocol::activity::ActivityDisplay::parse(value) {
+                    Some(mode) => self.set_activity_display(Some(mode)),
+                    None => {
+                        self.flash = Some(format!("· /icons {value} — try emoji · text · off"));
+                    }
+                },
+            },
             "notifications" | "notify" => match arg.as_deref() {
                 Some("on") => self.toggle_notifications(Some(true)),
                 Some("off") => self.toggle_notifications(Some(false)),

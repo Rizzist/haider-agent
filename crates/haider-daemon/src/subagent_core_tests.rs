@@ -1016,6 +1016,7 @@ fn delegation_parent_projection_is_pinned_to_the_spawn_branch() {
         started_at_ms: 100,
         terminal_at_ms: None,
         live: true,
+        activity: None,
         tool_attempts: 2,
         usage: None,
     };

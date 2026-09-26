@@ -420,6 +420,38 @@ pub fn sync_notification_persistence(
     }
 }
 
+/// 973-activity-icons: persist an `/icons` choice (mirrors the notification
+/// sync).
+pub fn sync_activity_icons_persistence(
+    model: &crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.activity_display_commits == *seen_commits {
+        return;
+    }
+    *seen_commits = model.activity_display_commits;
+    if let Some(store) = settings.as_mut() {
+        store.save_activity_icons_if_changed(model.theme_choice, model.activity_display);
+    }
+}
+
+/// 973-activity-icons: boot-time activity display — the persisted `/icons`
+/// choice, overridden by `HAIDER_ACTIVITY_ICONS`, else `NO_COLOR`/`TERM`
+/// heuristics. Mirrors the explicit choice into the store.
+pub fn seed_activity_display(
+    model: &mut crate::app::AppModel,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    let chosen = settings
+        .as_ref()
+        .and_then(crate::settings::SettingsStore::load_activity_icons);
+    model.activity_display = haider_client::fleet::activity_display_from_env(chosen);
+    if let Some(store) = settings.as_mut() {
+        store.set_activity_icons(chosen);
+    }
+}
+
 /// Model retention (owner 2026-08-15): persist a committed model pick so the
 /// next boot opens the harness on it (mirrors the theme/notification sync).
 pub fn sync_model_persistence(
@@ -685,6 +717,8 @@ pub async fn run_demo(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 973-activity-icons: persisted `/icons` choice, env override, NO_COLOR.
+    seed_activity_display(&mut model, &mut settings);
     // 971-tui-collapse: seed the tool-output verbosity from the persisted
     // setting (default `normal`) so a prior ⌥V survives a restart, and
     // mirror it into the store so a later theme save never drops it. The
@@ -721,6 +755,7 @@ pub async fn run_demo(
     let mut seen_terms_commits = model.terms_ack_commits;
     let mut seen_theme_commits = model.theme_commits;
     let mut seen_verbosity_commits = model.verbosity_commits;
+    let mut seen_activity_commits = model.activity_display_commits;
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
@@ -898,6 +933,7 @@ pub async fn run_demo(
         sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
         sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        sync_activity_icons_persistence(&model, &mut seen_activity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
         // 971-tui-collapse: observe tool start/finish against the shared
         // clock, so a collapsed row can carry an honest duration (the
@@ -2557,7 +2593,9 @@ impl DemoDriver {
             }
             DemoEvent::ChipEmit { agent, payload } => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut model.chips, &agent) {
-                    chip.note_event_at(now_epoch_ms());
+                    let now = now_epoch_ms();
+                    chip.note_event_at(now);
+                    chip.activity.observe(&payload, now);
                     chip.transcript.apply(&payload);
                     model.dirty = true;
                 }
@@ -2810,7 +2848,9 @@ pub fn absorb_demo_event(state: &mut crate::session::SessionState, event: DemoEv
         }
         DemoEvent::ChipEmit { agent, payload } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
-                chip.note_event_at(now_epoch_ms());
+                let now = now_epoch_ms();
+                chip.note_event_at(now);
+                chip.activity.observe(&payload, now);
                 chip.transcript.apply(&payload);
             }
         }
@@ -3801,6 +3841,8 @@ pub async fn run_live(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 973-activity-icons: persisted `/icons` choice, env override, NO_COLOR.
+    seed_activity_display(&mut model, &mut settings);
     // 971-tui-collapse: seed the tool-output verbosity from the persisted
     // setting (default `normal`) so a prior ⌥V survives a restart, and
     // mirror it into the store so a later theme save never drops it. The
@@ -3863,6 +3905,7 @@ pub async fn run_live(
     let mut seen_notification_commits = model.notification_commits;
     let mut seen_model_commits = model.model_commits;
     let mut seen_verbosity_commits = model.verbosity_commits;
+    let mut seen_activity_commits = model.activity_display_commits;
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
@@ -4158,6 +4201,7 @@ pub async fn run_live(
         sync_notification_persistence(&model, &mut seen_notification_commits, &mut settings);
         sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        sync_activity_icons_persistence(&model, &mut seen_activity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
         // 971-tui-collapse: see the demo loop.
         model.note_tool_timings();

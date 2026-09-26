@@ -50,6 +50,9 @@ import androidx.compose.ui.text.style.TextOverflow
 /** One panel row; the tag carries the agent id it was drawn for. */
 fun fleetRowTag(agentId: String): String = "fleet_row_$agentId"
 
+/** 973-activity-icons: the activity glyph beside a fleet row's name. */
+fun fleetActivityTag(agentId: String): String = "fleet_activity_$agentId"
+
 const val FLEET_PANEL_TAG = "fleet_panel"
 
 /**
@@ -261,13 +264,14 @@ private fun FleetEntryRow(
     val stateWord = FleetTone.label(node.state)
     val parent = entry.parentTitle ?: entry.parentSessionId
     val jumpable = node.sessionId.isNotEmpty()
+    val activity = node.currentActivity
     val spoken = stringResource(
         R.string.cd_fleet_jump,
         label.text,
         node.task,
         stateWord,
         parent,
-    )
+    ).let { base -> if (activity == null) base else "$base, ${activity.description}" }
     Row(
         modifier = Modifier.fillMaxWidth().heightIn(min = ForgeSize.touch),
         verticalAlignment = Alignment.CenterVertically,
@@ -293,6 +297,16 @@ private fun FleetEntryRow(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
                 ) {
+                    // 973-activity-icons: the activity emoji LEFT of the name
+                    // (activity, not state — the StateDot keeps state).
+                    if (activity != null) {
+                        Text(
+                            activity.emoji,
+                            style = type.sessionTitle,
+                            maxLines = 1,
+                            modifier = Modifier.testTag(fleetActivityTag(node.agentId)),
+                        )
+                    }
                     if (label.fallback) {
                         // mono: the agent id, standing in for a callsign the
                         // daemon has not assigned — an identifier, marked as one.

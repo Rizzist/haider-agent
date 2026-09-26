@@ -834,6 +834,12 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                     parent_agent_id: None,
                     state: haider_rpc::FleetAgentStateWire::Live,
                     metrics: None,
+                    // 973-activity-icons: the legacy sink omits these too.
+                    activity: Some(haider_protocol::activity::ActivityKind::Edit),
+                    activities: vec![
+                        haider_protocol::activity::ActivityKind::Edit,
+                        haider_protocol::activity::ActivityKind::Read,
+                    ],
                     folded_children: 0,
                     children: Vec::new(),
                 }],
@@ -918,6 +924,8 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                 } => {
                     snapshot.roots[0].model = None;
                     snapshot.roots[0].provider = None;
+                    snapshot.roots[0].activity = None;
+                    snapshot.roots[0].activities.clear();
                 }
                 WireFrame::Response {
                     body: ResponseBody::SessionDescendantsAttach { baseline, .. },

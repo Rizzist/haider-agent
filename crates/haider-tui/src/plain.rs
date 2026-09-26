@@ -525,12 +525,21 @@ pub fn agent_metrics_plain(model: &crate::app::AppModel) -> String {
     out.push_str(&row("main", main));
     out.push('\n');
     for (chip, metrics) in children {
-        let label = if chip.callsign.is_empty() {
+        let name = if chip.callsign.is_empty() {
             chip.agent.as_str()
         } else {
             chip.callsign.as_str()
         };
-        out.push_str(&row(label, metrics));
+        // 973-activity-icons: plain rows carry the TEXT activity label.
+        let label = match model.chip_activity(chip).and_then(|kind| {
+            (model.activity_display != haider_protocol::activity::ActivityDisplay::Off)
+                .then(|| haider_protocol::activity::ActivityDisplay::Text.glyph(kind))
+                .flatten()
+        }) {
+            Some(activity) => format!("{activity} {name}"),
+            None => name.to_owned(),
+        };
+        out.push_str(&row(&label, metrics));
         out.push('\n');
     }
     if model.screen == crate::app::Screen::Subagent

@@ -369,4 +369,45 @@ class FleetWireShapeTest {
         assertTrue(SubagentLoad.Unread.subagents.isEmpty())
         assertTrue(SubagentLoad.Unavailable(SUBAGENTS_NOT_WIRED).subagents.isEmpty())
     }
+
+    // ---------- 973-activity-icons ----------
+
+    @Test
+    fun `activity parses additively and old frames carry none`() {
+        val node = FleetRpcAdapter.parseNode(
+            JSONObject(
+                """
+                {"agent_id":"a","session_id":"s","task":"t","depth":1,
+                 "parent_session_id":"p","state":"live","activity":"edit",
+                 "activities":["edit","run","teleport","read"]}
+                """.trimIndent(),
+            ),
+        )
+        assertEquals(FleetActivity.Edit, node.activity)
+        assertEquals(FleetActivity.Edit, node.currentActivity)
+        // An unknown future kind is dropped, never coerced.
+        assertEquals(
+            listOf(FleetActivity.Edit, FleetActivity.Run, FleetActivity.Read),
+            node.activities,
+        )
+        val legacy = FleetRpcAdapter.parseNode(
+            JSONObject("""{"agent_id":"a","session_id":"s","state":"live"}"""),
+        )
+        assertNull(legacy.activity)
+        assertTrue(legacy.activities.isEmpty())
+        assertNull(FleetRpcAdapter.parseNode(JSONObject("""{"agent_id":"a","state":"live","activity":"teleport"}""")).activity)
+    }
+
+    @Test
+    fun `a terminal node never shows a current activity`() {
+        val done = FleetNode(
+            agentId = "a",
+            sessionId = "s",
+            state = FleetStateView.of("done"),
+            activity = FleetActivity.Computer,
+        )
+        assertNull(done.currentActivity)
+        assertEquals("[screen]", FleetActivity.Computer.label)
+        assertEquals("\uD83D\uDDA5\uFE0F", FleetActivity.Computer.emoji)
+    }
 }

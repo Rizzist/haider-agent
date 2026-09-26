@@ -709,6 +709,8 @@ pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, at_ms: u64) {
     // S4: every child-attributed envelope advances this chip's event
     // clock (the frozen-final measure's far end) before the payload lands.
     chip.note_event_at(at_ms);
+    // 973-activity-icons: typed tool items drive the chip's live activity.
+    chip.activity.observe(payload, at_ms);
     if let EventPayload::UserMessage {
         text, attachments, ..
     } = payload

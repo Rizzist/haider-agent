@@ -1552,6 +1552,8 @@ surface tables above.
 | fleet node `parent_agent_id` | no parent-agent coordinate (the required `parent_session_id` still owns ancestry) |
 | fleet node `metrics` | no direct metric snapshot; `FleetMetricsTotalsWire.usage=None` means at least one returned node lacks durable usage truth |
 | fleet `children=[]`, `folded_children=0` | a real leaf. A positive `folded_children` says bounded children were omitted; the rollup covers only returned nodes |
+| fleet node `activity` | the agent is quiet (no call active or recent), terminal, or the daemon predates 973-activity-icons; never "idle" as a state claim. Values: `computer`, `mobile`, `web`, `remote`, `edit`, `run`, `read`, `orchestrate`; an unknown future value renders nothing |
+| fleet node `activities=[]` | no typed activity was observed (or not reported); otherwise every activity used so far, highest priority first |
 | hook `trust_state` | old daemon; only the legacy `trusted` boolean may be used, with no invented revoked-by-edit state |
 | branch/fork/metafork response `source_branch_id` | source was the implicit main branch |
 | fork response / summary `forked_from` | legacy exact-node fork, non-forked session, or an older daemon; when present its sequence names the selected source prompt returned as the draft, not the copied-history boundary |

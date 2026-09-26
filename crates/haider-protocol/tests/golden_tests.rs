@@ -1907,6 +1907,7 @@ fn golden_agent_metrics_snapshot_fact() {
         started_at_ms: 1_000,
         terminal_at_ms: None,
         live: true,
+        activity: None,
         tool_attempts: 2,
         usage: Some(AgentUsageMetrics {
             logical_input_tokens: 10_000,
