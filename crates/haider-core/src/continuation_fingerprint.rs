@@ -4,9 +4,10 @@
 //! Structural rule (973 loop-guard ruling), not a list of noise formats:
 //! - Unicode NFKC, a Latin fold of look-alike Cyrillic/Greek letters, and
 //!   whitespace collapse everywhere.
-//! - Tool results and assistant text mask every digit run as `#`, so latency,
-//!   clock times, dates, epochs, counters and numeric nonces never look new.
-//!   Digits glued to a preceding letter or `_` stay (they name something, such
+//! - Tool results and assistant text mask every decimal digit run (Unicode
+//!   general category `Nd` after NFKC: ASCII, Arabic-Indic, Persian,
+//!   Devanagari, ...) as `#`, so latency, clock times, dates, epochs, counters
+//!   and numeric nonces never look new. Digits glued to a preceding letter or `_` stay (they name something, such
 //!   as `chunk5`, `mod12`, `v0`), so a new chunk path is progress.
 //! - Letters are never masked: a new git SHA, UUID or base64 token is progress.
 //!   Accepted residual: noise that changes letters (nonces, etags) makes a
@@ -16,12 +17,17 @@
 //!   items are sorted, then lines are sorted, so a reordered list is a repeat.
 //! - Assistant text also folds case; text and argument strings cap runs of one
 //!   punctuation character at [`MAX_PUNCTUATION_RUN`].
+//! - Typed computer/mobile screen steps ([`ui_step`]) compare with
+//!   [`screen_result`] instead: digits are kept and order matters, because a
+//!   numeric list page (prices, IDs, dates) scrolling by is a real screen
+//!   change, while an identical tree still repeats.
 //! - Tool arguments keep canonical JSON (sorted keys, exact numbers); only
 //!   string values are normalized, and their digits are never masked: a call
 //!   with different arguments is a different call.
 
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 /// Longest run of one repeated punctuation character kept in assistant text
 /// and argument strings. Three keeps `...`/`../` intact while `?????` equals
@@ -81,15 +87,23 @@ fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Replaces every digit run with [`DIGIT_MASK`], except runs that continue an
-/// identifier (directly preceded by a letter or `_`).
+/// A decimal digit of any script (general category `Nd`). NFKC has already
+/// folded fullwidth and other compatibility digits to ASCII; native-script
+/// digits such as Arabic-Indic `١` or Persian `۱` have no ASCII decomposition.
+fn is_decimal_digit(ch: char) -> bool {
+    ch.is_ascii_digit()
+        || (!ch.is_ascii() && ch.general_category() == GeneralCategory::DecimalNumber)
+}
+
+/// Replaces every decimal digit run with [`DIGIT_MASK`], except runs that
+/// continue an identifier (directly preceded by a letter or `_`).
 fn mask_digits(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut previous: Option<char> = None;
     let mut keeping = false;
     for ch in input.chars() {
-        if ch.is_ascii_digit() {
-            let starts_run = !previous.is_some_and(|p| p.is_ascii_digit());
+        if is_decimal_digit(ch) {
+            let starts_run = !previous.is_some_and(is_decimal_digit);
             if starts_run {
                 keeping = previous.is_some_and(|p| p.is_alphabetic() || p == '_');
                 if !keeping {
@@ -175,6 +189,15 @@ pub(super) fn result(input: &str) -> String {
     lines.join("\n")
 }
 
+/// Result identity of a typed screen step (see [`ui_step`]): Unicode fold and
+/// whitespace collapse only. Digits are NOT masked and lines are NOT
+/// reordered, so paging through a list whose rows differ only by numbers is
+/// progress; a byte-identical observation (stuck at the end of a list) still
+/// repeats and stays under the result-level guard.
+pub(super) fn screen_result(input: &str) -> String {
+    collapse_whitespace(&unicode_fold(input))
+}
+
 /// A computer-use or mobile-use screen step, recognized by the typed tool
 /// identity (the registered `computer`/`mobile` tool, whose arguments parse
 /// through that tool's own typed operation parser), never by an action string
@@ -231,6 +254,66 @@ mod tests {
         assert_eq!(
             mask_digits("chunk5 mod12/x v0.1.2 id_7"),
             "chunk5 mod12/x v0.#.# id_7"
+        );
+    }
+
+    /// Astra final-review B2: native-script decimal counters (general
+    /// category `Nd`, no ASCII decomposition under NFKC) are masked like
+    /// ASCII ones; the letter/`_` identifier exception still applies.
+    #[test]
+    fn digit_mask_covers_unicode_decimal_digits_but_keeps_identifiers() {
+        // ASCII, Arabic-Indic, Extended Arabic-Indic (Persian), Devanagari.
+        for zero in ['0', '\u{660}', '\u{6f0}', '\u{966}'] {
+            let digit = |n: u32| char::from_u32(zero as u32 + n).unwrap();
+            let one = format!("attempt {}", digit(1));
+            let many = format!("attempt {}{}{}", digit(1), digit(2), digit(9));
+            assert_eq!(mask_digits(&one), "attempt #", "zero {zero:?}");
+            assert_eq!(mask_digits(&many), "attempt #", "zero {zero:?}");
+            assert_eq!(assistant_text(&one), assistant_text(&many));
+            assert_eq!(result(&one), result(&many));
+            // Glued to a letter or `_`: an identifier, kept.
+            let ident = format!("v{}x abc_{}", digit(2), digit(1));
+            assert_eq!(mask_digits(&ident), ident, "zero {zero:?}");
+            assert_ne!(
+                assistant_text(&format!("v{}x", digit(2))),
+                assistant_text(&format!("v{}x", digit(3)))
+            );
+        }
+        assert_eq!(
+            mask_digits("v\u{662}x abc_\u{661}"),
+            "v\u{662}x abc_\u{661}"
+        );
+        // A run mixing scripts is one run.
+        assert_eq!(mask_digits("n 1\u{662}\u{6f3}"), "n #");
+        // Fullwidth digits fold to ASCII under NFKC before masking.
+        assert_eq!(
+            assistant_text("attempt \u{ff17}"),
+            assistant_text("attempt 3")
+        );
+        // Numeric but not decimal (Roman numeral, vulgar fraction) is not a
+        // digit run by itself.
+        assert_eq!(mask_digits("\u{2167} \u{bd}"), "\u{2167} \u{bd}");
+    }
+
+    /// Astra final-review B1: a typed screen observation keeps real numeric
+    /// changes (list pages of prices/IDs) but still repeats when identical;
+    /// ordinary text results keep the digit mask.
+    #[test]
+    fn screen_result_keeps_digits_and_order() {
+        let page = |n: u32| {
+            format!(
+                "{{\"A11yTree\":[{{\"id\":\"row1\",\"text\":\"{}\",\"resource_id\":\"example:id/row\"}}]}}",
+                100_000 + n
+            )
+        };
+        assert_ne!(screen_result(&page(0)), screen_result(&page(1)));
+        assert_eq!(screen_result(&page(7)), screen_result(&page(7)));
+        assert_eq!(result(&page(0)), result(&page(1)));
+        assert_eq!(screen_result("price  $12\n"), screen_result("price $12"));
+        assert_ne!(screen_result("a\nb"), screen_result("b\na"));
+        assert_ne!(
+            screen_result("total \u{661}\u{662}"),
+            screen_result("total \u{661}\u{663}")
         );
     }
 

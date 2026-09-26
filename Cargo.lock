@@ -1823,6 +1823,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "unicode-properties",
  "zeroize",
 ]
 

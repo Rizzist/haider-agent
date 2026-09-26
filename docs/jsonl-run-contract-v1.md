@@ -454,8 +454,10 @@ patterns:
 
 - **All content:** Unicode NFKC, a Latin fold of look-alike Cyrillic/Greek
   letters, and collapsed whitespace.
-- **Tool results and assistant text:** every digit run is masked, so latency,
-  clock times, HTTP dates, epochs, counters, and numeric nonces never look new.
+- **Tool results and assistant text:** every decimal digit run is masked, in
+  any script (Unicode category `Nd` after NFKC: ASCII, Arabic-Indic `١٢٣`,
+  Persian `۱۲۳`, Devanagari, ...), so latency, clock times, HTTP dates, epochs,
+  counters, and numeric nonces never look new.
   Digits directly after a letter or `_` are kept (`chunk5`, `mod12`, `v0`),
   because they name something. Letters are never masked, so a new git SHA, UUID
   or encoded token is a new result.
@@ -463,6 +465,11 @@ patterns:
   line's `,`/`;`/`:`-separated items are sorted, then the lines are sorted. A
   reordered list is therefore a repeat, while an added or removed line is
   new.
+- **Screen steps** (typed `computer`/`mobile` screenshot, accessibility tree,
+  inspect and navigation calls, see below) are the exception: their result
+  keeps its digits and line order. Paging through a list whose rows differ
+  only by numbers (prices, IDs, dates) is a new result for both the screen
+  comparison and the result-level guard; a byte-identical tree still repeats.
 - **Assistant text:** case is folded.
 - **Assistant text and argument strings:** a run of one repeated punctuation
   character is capped at three.
@@ -564,9 +571,10 @@ Accepted residuals:
   changing is never stopped by a call guard, including a stuck app whose
   screen changes only in pixels (a clock or animation). Other tools mixed into
   such a loop are still counted.
-- **Digit-only result changes** on an identical call (`Completed files: N`,
-  `stage N done`) are no new result, indistinguishable from a clock: such a loop
-  stops after eight no-progress continuations or 60 repeated tool calls.
+- **Digit-only result changes** on an identical non-screen call
+  (`Completed files: N`, `stage N done`) are no new result, indistinguishable
+  from a clock: such a loop stops after eight no-progress continuations or 60
+  repeated tool calls.
 - **Repeated identical work that is productive** (for example 200 identical
   `git commit -am step` calls in one turn) is stopped by the action guard.
 - The in-memory streaks restart after daemon recovery.

@@ -918,7 +918,14 @@ impl ContinuationProgress {
                         (step, reading)
                     });
                     let args = crate::continuation_fingerprint::arguments(args);
-                    let preview = crate::continuation_fingerprint::result(preview);
+                    // Typed screen steps keep real numeric changes (a new
+                    // page of prices or IDs) for both the screen comparison
+                    // and the result-level guard; text tools mask digits.
+                    let preview = if ui.is_some() {
+                        crate::continuation_fingerprint::screen_result(preview)
+                    } else {
+                        crate::continuation_fingerprint::result(preview)
+                    };
                     let images = serde_json::to_string(images).unwrap_or_default();
                     self.observe_call(
                         b"local_tool_result",
@@ -1310,6 +1317,51 @@ mod continuation_progress_tests {
             ("provider_repeat", 10),
         ] {
             assert_eq!(simulate(case(kind)), stopped(attempts), "{kind}");
+        }
+    }
+
+    /// Astra final-review B2: a pause_turn/max_tokens counter written in
+    /// ASCII, Arabic-Indic or Persian digits is no fresh text; identifier
+    /// digits (`v٢x`, `abc_١`) still name something new.
+    #[test]
+    fn unicode_decimal_counters_in_continuations_stop() {
+        for zero in [0x30_u32, 0x660, 0x6f0, 0x966] {
+            for finish in [FinishReason::PauseTurn, FinishReason::MaxTokens] {
+                let mut rounds: Vec<_> = (1..=100_u32)
+                    .map(|n| {
+                        let digits: String = n
+                            .to_string()
+                            .chars()
+                            .map(|ch| char::from_u32(zero + ch.to_digit(10).unwrap()).unwrap())
+                            .collect();
+                        text(
+                            format!("Retrying the same operation (attempt {digits})."),
+                            finish,
+                        )
+                    })
+                    .collect();
+                rounds.push(text("UNREACHABLE".into(), FinishReason::EndTurn));
+                assert_eq!(simulate(rounds), stopped(10), "U+{zero:04X} {finish:?}");
+            }
+            // Identifier digits keep going (each is new assistant text).
+            let digit = |n: u32| char::from_u32(zero + n).unwrap();
+            let mut rounds: Vec<_> = (0..10_u32)
+                .map(|n| {
+                    text(
+                        format!("Wrote v{}x and abc_{}", digit(n), digit(9 - n)),
+                        FinishReason::PauseTurn,
+                    )
+                })
+                .collect();
+            rounds.push(text("DONE".into(), FinishReason::EndTurn));
+            assert_eq!(
+                simulate(rounds),
+                Outcome::Completed {
+                    attempts: 11,
+                    suspected: 0
+                },
+                "U+{zero:04X}"
+            );
         }
     }
 
@@ -1912,6 +1964,152 @@ mod continuation_progress_tests {
                 }
             ))
         ));
+    }
+
+    fn a11y_tree_args() -> serde_json::Value {
+        serde_json::json!({"action": "a11y_tree"})
+    }
+
+    /// The daemon's typed `MobileOutput::A11yTree` preview for one list row
+    /// whose visible text is `text` (stable id, resource id and bounds, as
+    /// `mobile_transport` derives node ids from resource id + index).
+    fn numeric_tree(text: &str) -> String {
+        let output: haider_protocol::mobile::MobileOutput =
+            serde_json::from_value(serde_json::json!({"A11yTree": [{
+                "id": "row1", "text": text, "content_desc": null,
+                "class": "android.widget.TextView", "resource_id": "example:id/row",
+                "bounds": {"left": 0, "top": 100, "right": 100, "bottom": 150}
+            }]}))
+            .unwrap();
+        serde_json::to_string(&output).unwrap()
+    }
+
+    /// Astra final-review B1: swipe + accessibility-tree paging through rows
+    /// that differ only by numbers (IDs, prices, dates) is productive: no
+    /// steer and no stop from either the action or the result-level guard.
+    #[test]
+    fn mobile_numeric_a11y_tree_paging_300_pages_completes() {
+        assert_eq!(
+            crate::continuation_fingerprint::ui_step("mobile", &a11y_tree_args()),
+            Some(crate::continuation_fingerprint::UiStep::Observe { screenshot: false })
+        );
+        let renders: [fn(usize) -> String; 3] = [
+            |page| (100_000 + page).to_string(),
+            |page| format!("${}.{:02}", 10 + page, page % 100),
+            |page| format!("2026-09-{:02} 12:{:02} #{page}", 1 + page % 28, page % 60),
+        ];
+        for render in renders {
+            let (stop, steers) = drive(600, |progress, request| {
+                let page = request.div_ceil(2);
+                if request % 2 == 1 {
+                    tool_call(progress, "mobile", swipe_args(), "\"Ack\"", None, request);
+                } else {
+                    tool_call(
+                        progress,
+                        "mobile",
+                        a11y_tree_args(),
+                        &numeric_tree(&render(page)),
+                        None,
+                        request,
+                    );
+                }
+            });
+            assert_eq!(stop, None);
+            assert!(steers.is_empty(), "{steers:?}");
+        }
+    }
+
+    /// A truly identical numeric tree (stuck at the end of the list) still
+    /// repeats: steered before request 32, stopped before request 62; with
+    /// swipes in between the stop comes sooner.
+    #[test]
+    fn identical_numeric_a11y_tree_still_stops_at_61() {
+        let tree = numeric_tree("100042");
+        let (stop, steers) = drive(600, |progress, request| {
+            tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
+        });
+        assert_eq!(
+            stop,
+            Some((
+                62,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        let (stop, _) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"Ack\"", None, request);
+            } else {
+                tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((
+                _,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    /// Ordinary text-tool numeric polling keeps the accepted digit mask: an
+    /// identical call whose result changes only by free-standing numbers is
+    /// no progress, even when the text is the same JSON a tree would carry.
+    #[test]
+    fn ordinary_text_numeric_polling_is_still_masked() {
+        for (tool, args) in [
+            ("fs_read", serde_json::json!({"path": "status.txt"})),
+            (
+                "process_exec",
+                serde_json::json!({"command": "cat rows.json"}),
+            ),
+            ("mobile_screenshot", a11y_tree_args()),
+        ] {
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    args.clone(),
+                    &format!("Completed files: {request}"),
+                    None,
+                    request,
+                );
+            });
+            assert_eq!(
+                stop,
+                Some((
+                    62,
+                    LoopLimitV1::RepeatedToolCalls {
+                        repeated_calls: 60,
+                        suspect_after: 30,
+                        stop_after_suspected: 30,
+                    }
+                )),
+                "{tool}"
+            );
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    args.clone(),
+                    &numeric_tree(&(100_000 + request).to_string()),
+                    None,
+                    request,
+                );
+            });
+            assert!(
+                matches!(stop, Some((62, LoopLimitV1::RepeatedToolCalls { .. }))),
+                "{tool}: {stop:?}"
+            );
+        }
     }
 
     /// A screen-step exemption needs the typed tool identity: the same
