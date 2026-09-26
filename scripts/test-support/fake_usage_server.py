@@ -89,6 +89,10 @@ class Handler(BaseHTTPRequestHandler):
             return "fake-jwt"
         return "FOREIGN"  # a real credential reached the fake: must never happen
 
+    def _account_ok(self):
+        """WHAM is account-scoped: the header must be exactly the raw id."""
+        return self.headers.get("chatgpt-account-id") == ACCOUNT_ID
+
     def _send(self, status, body, note=""):
         data = json.dumps(body).encode()
         self.send_response(status)
@@ -103,7 +107,10 @@ class Handler(BaseHTTPRequestHandler):
                 "path": self.path,
                 "status": status,
                 "bearer": self._bearer_class(),
-                "account_header": bool(self.headers.get("chatgpt-account-id")),
+                # The fake account id is not a secret; logging the exact
+                # value lets e2e catch a malformed (e.g. combined
+                # user/workspace) coordinate in the header.
+                "account_header": self.headers.get("chatgpt-account-id"),
                 "note": note,
             })
 
@@ -132,6 +139,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, body)
         if self._bearer_class() not in ("fake-jwt", "fake-key"):
             return self._send(401, {"error": "unauthorized"}, "refused non-fake bearer")
+        if path.startswith("/backend-api/wham/") and not self._account_ok():
+            return self._send(403, {"error": "account_mismatch"}, "chatgpt-account-id mismatch")
         if path == "/backend-api/wham/usage":
             self._count("wham_usage")
             now = int(time.time())
@@ -198,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
         if self._bearer_class() not in ("fake-jwt", "fake-key"):
             return self._send(401, {"error": "unauthorized"}, "refused non-fake bearer")
+        if path.startswith("/backend-api/wham/") and not self._account_ok():
+            return self._send(403, {"error": "account_mismatch"}, "chatgpt-account-id mismatch")
         if path == "/backend-api/wham/rate-limit-reset-credits/consume":
             body = self._body()
             self._count("consume")

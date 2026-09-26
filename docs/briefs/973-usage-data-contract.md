@@ -43,7 +43,11 @@ session, so the held meter is refreshed at the provider cadence.
 `EffectClass::UsageResetApply` is a sensitive finite-resource class. Ordinary
 allow rules, remembered/session grants, autonomous mode, and `auto_allow`
 cannot approve it. A request opens `MenuKind::DeferredApproval` with only
-approve-once and deny choices. The menu is session-scoped and
+deny (option 0, the default) and approve-once (option 1) choices. Only an
+answer carrying the explicit `approve` key approves; a keyless answer at any
+index declines. The TUI card never captures composer keystrokes: it yields to
+a non-empty composer, ignores digits, and Enter declines unless the user
+moved the selection on that card. The menu is session-scoped and
 `blocking: false`; the initiating RPC/tool immediately returns
 `approval_pending` and the run continues.
 Both entry points apply the same session policy denial before opening a menu;

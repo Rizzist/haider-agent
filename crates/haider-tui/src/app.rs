@@ -5555,6 +5555,10 @@ pub struct AppModel {
     pub demo_requests: Vec<DemoRequest>,
     /// Selected option index while a blocking menu replaces the composer.
     pub menu_selection: usize,
+    /// The menu whose selection the user moved with the arrow keys. A
+    /// spend-approval card honours a non-default selection on Enter only
+    /// for this exact menu, so a stale index can never pre-select `approve`.
+    pub menu_selection_owner: Option<haider_protocol::ids::MenuId>,
     /// D4: scroll offset into the open `plan` proposal document (the plan
     /// menu's markdown body renders full-height in the transcript area).
     /// A Cell because RENDER owns the new-proposal reset (review round 2:
@@ -6012,6 +6016,7 @@ impl Default for AppModel {
             )),
             demo_requests: Vec::new(),
             menu_selection: 0,
+            menu_selection_owner: None,
             plan_scroll: std::cell::Cell::new(0),
             plan_scroll_max: std::cell::Cell::new(0),
             plan_menu_seen: std::cell::RefCell::new(None),
@@ -6829,11 +6834,12 @@ impl AppModel {
             && self
                 .projection
                 .open_menu()
-                .is_some_and(|menu| !menu.options.is_empty())
+                .is_some_and(|menu| !menu.options.is_empty() && !is_deferred_approval(menu))
         {
             // A SELECT menu replaces the composer; a zero-option free-text
             // ask KEEPS it — the composer is the answer line (owner
-            // report: the resistor question rendered unanswerable).
+            // report: the resistor question rendered unanswerable). A
+            // deferred spend-approval card never takes the composer.
             return false;
         }
         !(self.screen == Screen::Subagent
@@ -9283,12 +9289,12 @@ impl AppModel {
             return;
         }
         // A SELECT menu replaces the composer (sim §3 law); a zero-option
-        // free-text ask leaves the keys to the composer.
+        // free-text ask leaves the keys to the composer. A deferred
+        // spend-approval card never steals composer keystrokes: it takes
+        // only its navigation keys, and only while the composer is empty.
         if self.screen == Screen::Session
-            && self
-                .projection
-                .open_menu()
-                .is_some_and(|menu| !menu.options.is_empty())
+            && let Some(menu) = self.select_menu()
+            && (!is_deferred_approval(menu) || deferred_card_key(key.code))
         {
             self.handle_menu_key(key.code);
             return;
@@ -9737,11 +9743,12 @@ impl AppModel {
             && self
                 .projection
                 .open_menu()
-                .is_some_and(|menu| !menu.options.is_empty())
+                .is_some_and(|menu| !menu.options.is_empty() && !is_deferred_approval(menu))
         {
             // A SELECT menu replaces the composer; a zero-option free-text
             // ask KEEPS it — the composer is the answer line (owner
-            // report: the resistor question rendered unanswerable).
+            // report: the resistor question rendered unanswerable). A
+            // deferred spend-approval card never takes the composer.
             return false;
         }
         !(self.screen == Screen::Subagent
@@ -17316,15 +17323,21 @@ impl AppModel {
             self.dirty = true;
             return;
         }
+        let deferred = is_deferred_approval(menu);
+        let menu_id = menu.id.clone();
         match code {
             // Selection wraps around (sim, tui.js:2441-2449).
             KeyCode::Up if option_count > 0 => {
                 self.menu_selection =
                     (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
+                self.menu_selection_owner = Some(menu_id);
             }
             KeyCode::Down if option_count > 0 => {
                 self.menu_selection = (self.menu_selection + 1) % option_count;
+                self.menu_selection_owner = Some(menu_id);
             }
+            // A spend-approval card is never answered by a typed digit.
+            KeyCode::Char('1'..='9') if deferred => {}
             KeyCode::Char(c @ '1'..='9') => {
                 let index = (c as usize) - ('1' as usize);
                 if index < option_count {
@@ -17332,9 +17345,27 @@ impl AppModel {
                     self.submit_menu_answer();
                 }
             }
-            KeyCode::Enter => self.submit_menu_answer(),
+            KeyCode::Enter => {
+                // Enter on a spend-approval card answers the default (deny,
+                // option 0) unless the user moved the selection on THIS card.
+                if deferred && self.menu_selection_owner.as_ref() != Some(&menu_id) {
+                    self.menu_selection = 0;
+                }
+                self.submit_menu_answer();
+            }
             _ => {}
         }
+    }
+
+    /// The SELECT menu that currently replaces the composer. A deferred
+    /// spend-approval card yields to a non-empty composer entirely (neither
+    /// rendered in its place nor fed keys), so text being typed when the
+    /// card arrives — and its Enter — stays a composer message.
+    #[must_use]
+    pub fn select_menu(&self) -> Option<&Menu> {
+        self.projection.open_menu().filter(|menu| {
+            !menu.options.is_empty() && (!is_deferred_approval(menu) || self.composer.is_empty())
+        })
     }
 
     fn submit_menu_answer(&mut self) {
@@ -21301,6 +21332,21 @@ pub fn tools_card(seq: u64) -> Menu {
         ttl_ms: None,
         timeout_option: None,
     }
+}
+
+/// A nonblocking, agent-initiated human decision (e.g. spending a usage
+/// reset credit). Such a card must never capture composer keystrokes.
+pub(crate) fn is_deferred_approval(menu: &Menu) -> bool {
+    matches!(menu.kind, MenuKind::DeferredApproval { .. })
+}
+
+/// Keys a deferred-approval card handles while the composer is empty;
+/// every other key (text, digits) goes to the composer.
+fn deferred_card_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc
+    )
 }
 
 #[cfg(test)]

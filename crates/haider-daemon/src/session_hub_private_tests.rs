@@ -3589,7 +3589,7 @@ async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
             request_seq,
             worker_generation,
             "deny".into(),
-            1,
+            0,
             None,
         )
         .await
@@ -3890,6 +3890,7 @@ struct SlowResetHttp {
     release: tokio::sync::Notify,
     posts: AtomicUsize,
     request_ids: Mutex<Vec<String>>,
+    account_headers: Mutex<Vec<Option<String>>>,
     fail: AtomicBool,
 }
 
@@ -3911,11 +3912,15 @@ impl crate::usage_report::UsageMeterHttp for SlowResetHttp {
         url: &str,
         _bearer: &haider_accounts::SecretHandle,
         _extra_headers: &[(&'static str, &'static str)],
-        _chatgpt_account_id: Option<&str>,
+        chatgpt_account_id: Option<&str>,
         body: &serde_json::Value,
     ) -> Result<crate::usage_report::UsageMeterHttpResponse, haider_provider::MeterUnavailable>
     {
         assert_eq!(url, haider_provider::OPENAI_OAUTH_RESET_CONSUME_URL);
+        self.account_headers
+            .lock()
+            .expect("account headers")
+            .push(chatgpt_account_id.map(str::to_owned));
         self.request_ids.lock().expect("request ids").push(
             body["redeem_request_id"]
                 .as_str()
@@ -4027,7 +4032,7 @@ async fn usage_reset_answer_replies_while_post_waits_and_crash_never_retries() {
             request_seq,
             generation,
             "approve".into(),
-            0,
+            1,
             None,
         ),
     )
@@ -4068,7 +4073,7 @@ async fn usage_reset_answer_replies_while_post_waits_and_crash_never_retries() {
             request_seq,
             generation,
             "approve".into(),
-            0,
+            1,
             None,
         ),
     )
@@ -4291,7 +4296,7 @@ async fn usage_reset_finishes_durably_when_post_completes_during_graceful_drain(
                 request_seq,
                 generation,
                 "approve".into(),
-                0,
+                1,
                 None,
             )
             .await
@@ -4339,6 +4344,212 @@ async fn usage_reset_finishes_durably_when_post_completes_during_graceful_drain(
         assert_eq!(http.posts.load(Ordering::SeqCst), 1);
         reopened.close().await.expect("reopened store closes");
     }
+}
+
+/// Opens one parked reset approval and returns its menu coordinates.
+async fn open_reset_approval(
+    connection: &HubConnection,
+    sink: &CapturingFrameSink,
+    session: &SessionId,
+    account: &haider_protocol::ids::CredentialAlias,
+    command: &str,
+) -> (MenuId, u64, u64) {
+    let request_id = format!("{command}-open");
+    connection
+        .request(
+            haider_rpc::RequestId::new(request_id.clone()),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new(command),
+                session_id: session.clone(),
+                account: account.clone(),
+            },
+        )
+        .await
+        .expect("approval opened");
+    sink.0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id: seen,
+                body:
+                    haider_rpc::ResponseBody::UsageResetApply {
+                        menu_id,
+                        request_seq,
+                        worker_generation,
+                        ..
+                    },
+            } if seen.as_str() == request_id => {
+                Some((menu_id.clone(), *request_seq, *worker_generation))
+            }
+            _ => None,
+        })
+        .expect("pending response")
+}
+
+/// LAW (credit safety): the card's default answer — option 0, which Enter
+/// or a `1` selects — is `deny` and never reaches the provider; only the
+/// explicit `approve` key consumes, exactly once.
+///
+/// MUTATION CHECK: put `approve` back at option 0 (the default answer then
+/// consumes), or approve on a keyless/positional answer.
+#[tokio::test]
+async fn usage_reset_default_card_answer_never_consumes_and_explicit_approve_consumes_once() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("default-answer-usage-reset");
+    hub.create_internal_session(create_command(&session, "default-answer-usage-reset"))
+        .await
+        .expect("session created");
+    let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
+    let http = Arc::new(SlowResetHttp::default());
+    // The accounts-ux user/workspace coordinate form: the consume header must
+    // still carry only the raw workspace id.
+    let mut descriptor = reset_test_descriptor(account.clone());
+    descriptor
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .account_id = Some("user:4:u-01;workspace:17:synthetic-account".into());
+    hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+        Arc::new(Mutex::new(vec![descriptor])),
+        Some(Arc::new(ResetTestTokens)),
+        http.clone(),
+    )))
+    .expect("usage service installs");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("default-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attached");
+
+    // The card's default answer: option 0 with the key the TUI sends for it.
+    let (menu_id, request_seq, generation) =
+        open_reset_approval(&connection, &sink, &session, &account, "default-command").await;
+    let menu = store
+        .read(&session, 0, 64)
+        .await
+        .expect("journal")
+        .into_iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::MenuOpened(menu)) if menu.id == menu_id => Some(menu),
+            _ => None,
+        })
+        .expect("approval menu");
+    let default_key = menu.options[0].key.clone();
+    assert_eq!(default_key, crate::usage_reset::DENY_OPTION_KEY);
+    connection
+        .menu_answer(
+            Some(haider_rpc::RequestId::new("default-answer")),
+            haider_rpc::CommandId::new("default-answer-command"),
+            session.clone(),
+            menu_id,
+            request_seq,
+            generation,
+            default_key,
+            0,
+            None,
+        )
+        .await
+        .expect("default answer commits");
+    let denied = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = store.read(&session, 0, 128).await.expect("journal");
+            if events.iter().any(|event| {
+                matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { ref kind, ref data },
+                        ..
+                    })) if kind == haider_protocol::usage::USAGE_RESET_APPLY_RESULT_EXTENSION
+                        && data["status"] == "denied"
+                )
+            }) {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("default answer settles as denied");
+    assert!(denied);
+    assert_eq!(
+        http.posts.load(Ordering::SeqCst),
+        0,
+        "default answer never consumes"
+    );
+
+    // Explicit approve (option key `approve`, index 1) consumes exactly once.
+    let (menu_id, request_seq, generation) =
+        open_reset_approval(&connection, &sink, &session, &account, "approve-command").await;
+    connection
+        .menu_answer(
+            Some(haider_rpc::RequestId::new("approve-answer")),
+            haider_rpc::CommandId::new("approve-answer-command"),
+            session.clone(),
+            menu_id,
+            request_seq,
+            generation,
+            crate::usage_reset::APPROVE_OPTION_KEY.into(),
+            1,
+            None,
+        )
+        .await
+        .expect("approve commits");
+    tokio::time::timeout(Duration::from_secs(3), http.started.notified())
+        .await
+        .expect("explicit approve reaches the provider");
+    http.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = store.read(&session, 0, 256).await.expect("journal");
+            if events.iter().any(|event| {
+                matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { ref kind, ref data },
+                        ..
+                    })) if kind == haider_protocol::usage::USAGE_RESET_APPLY_RESULT_EXTENSION
+                        && data["status"] == "applied"
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("explicit approve applies");
+    assert_eq!(http.posts.load(Ordering::SeqCst), 1, "exactly one consume");
+    assert_eq!(
+        *http.account_headers.lock().expect("account headers"),
+        vec![Some("synthetic-account".to_owned())],
+        "the consume header carries the raw workspace id, never the coordinate"
+    );
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
 }
 
 /// Raises the drain fence synchronously when the reset authorization batch
@@ -4464,7 +4675,7 @@ async fn usage_reset_claim_fenced_by_drain_records_provider_not_called() {
             request_seq,
             generation,
             "approve".into(),
-            0,
+            1,
             None,
         )
         .await

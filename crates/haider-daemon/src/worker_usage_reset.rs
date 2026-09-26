@@ -157,11 +157,8 @@ impl BrokerToolDispatcher {
                             && answer.via == AnswerVia::Rpc =>
                     {
                         facts.answer = Some(
-                            usage_reset::answered_option_key(
-                                answer.option_key.as_deref(),
-                                answer.option_index,
-                            )
-                            .to_owned(),
+                            usage_reset::answered_option_key(answer.option_key.as_deref())
+                                .to_owned(),
                         );
                         facts.answer_generation = Some(event.worker_generation);
                     }

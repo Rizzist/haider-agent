@@ -3,8 +3,14 @@
 The real debug `haiderd` can read usage meters, consume an OpenAI reset
 credit and poll the Haider Code plan against a local fake server. Use it
 for reset-apply, drain/restart and plan-poller proofs on the real binary.
-It never contacts a real provider. Same safety model as the
-fake-OAuth hook (`docs/testing/fake-oauth.md`, accounts-ux lane).
+
+**Scope: only usage, reset and Haider Code plan requests are rerouted.**
+OAuth token refresh (the credential broker), model/provider inference
+traffic and every other network path still target their normal endpoints.
+A fake-issued account whose access token is expired or unparseable can
+therefore trigger a refresh request to the live issuer (carrying only a
+fake refresh token). Always run the daemon under the loopback-only
+`sandbox-exec` profile below; the hook alone is not a network fence.
 
 ## Pieces
 
@@ -34,9 +40,22 @@ fake-OAuth hook (`docs/testing/fake-oauth.md`, accounts-ux lane).
   also classifies every bearer and logs `FOREIGN` if one ever arrives.
 - **Isolated profile.** Always use a private `HOME`, `HAIDER_PROFILE_DIR`,
   `HAIDER_RUNTIME_DIR`, `HAIDER_CODEX_AUTH_PATH`, and
-  `HAIDER_DISCOVERY_DISABLED=1 HAIDER_DEVICE_DISCOVERY_DISABLED=1`. For a hard
-  network fence, run the daemon under a `sandbox-exec` profile that denies
-  non-loopback `network-outbound`.
+  `HAIDER_DISCOVERY_DISABLED=1 HAIDER_DEVICE_DISCOVERY_DISABLED=1`.
+- **Mandatory network fence.** Because refresh and model traffic are not
+  rerouted, run `haiderd` under a `sandbox-exec` profile that denies all
+  non-loopback `network-outbound`:
+
+  ```
+  (version 1)
+  (allow default)
+  (deny network-outbound)
+  (allow network-outbound (remote ip "localhost:*"))
+  (allow network-outbound (remote unix-socket))
+  ```
+- **Account header check.** WHAM is account-scoped. The fake answers `403
+  account_mismatch` unless `chatgpt-account-id` is exactly the fake raw
+  account id, and `/__log` records the header value (a fake id, not a
+  secret), so a malformed coordinate in the header fails e2e loudly.
 
 ## Run it
 
@@ -46,7 +65,7 @@ python3 scripts/test-support/fake_usage_server.py --ready-file /tmp/fu.json \
 export HAIDER_TEST_FAKE_USAGE_ORIGIN=$(python3 -c 'import json;print(json.load(open("/tmp/fu.json"))["origin"])')
 export HAIDER_TEST_FAKE_PROVIDER='[]'    # required co-opt-in (a fake-provider script)
 export HAIDER_CODEX_AUTH_PATH=$HOME/codex-auth.json
-target/debug/haiderd                     # then account.oauth_import {source:"codex"}
+sandbox-exec -f loopback-only.sb target/debug/haiderd   # then account.oauth_import {source:"codex"}
 ```
 
 - `account.oauth_import` of `codex` yields an `openai-oauth` account whose

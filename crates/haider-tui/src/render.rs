@@ -5850,11 +5850,9 @@ fn render_session(
     } else {
         // A zero-option ask never REPLACES the composer — the composer is
         // its answer line (owner report: select-only chrome rendered an
-        // unanswerable question). Its title/body render above the input.
-        model
-            .projection
-            .open_menu()
-            .filter(|menu| !menu.options.is_empty())
+        // unanswerable question). Its title/body render above the input. A
+        // deferred spend-approval card yields to a composer being typed in.
+        model.select_menu()
     };
     let ask_menu = if model.login.is_some() {
         None

@@ -603,7 +603,7 @@ impl UsageReportService {
             .account_identity
             .as_ref()
             .and_then(|identity| identity.account_id.as_deref())
-            .filter(|account_id| !account_id.is_empty())
+            .and_then(openai_workspace_account_id)
             .ok_or_else(|| MeterUnavailable::new("credential_identity_incomplete"))?;
         let response = self
             .http
@@ -845,7 +845,7 @@ impl UsageReportService {
                 .account_identity
                 .as_ref()
                 .and_then(|identity| identity.account_id.as_deref())
-                .filter(|account_id| !account_id.is_empty())
+                .and_then(openai_workspace_account_id)
             {
                 Some(account_id) => Some(account_id),
                 None => {
@@ -891,6 +891,59 @@ impl UsageReportService {
             reading.previous_resets = previous_resets;
         }
         (outcome, token_identity)
+    }
+}
+
+/// The raw ChatGPT workspace/account id the WHAM endpoints expect in
+/// `chatgpt-account-id`. Accepts both the stored forms:
+/// - a bare workspace id (current descriptors);
+/// - the length-prefixed user/workspace coordinate
+///   `user:<n>:<user>;workspace:<m>:<workspace>` (accounts-ux dedupe key).
+///
+/// Anything malformed yields `None` (typed `credential_identity_incomplete`),
+/// never the whole coordinate. INTEGRATION: equivalent to accounts-ux's
+/// `haider_provider::openai_workspace_from_account_coordinate`; collapse onto
+/// that helper when both lanes land.
+fn openai_workspace_account_id(coordinate: &str) -> Option<&str> {
+    let Some(rest) = coordinate.strip_prefix("user:") else {
+        return (!coordinate.is_empty()).then_some(coordinate);
+    };
+    let (length, rest) = rest.split_once(':')?;
+    let length = length.parse::<usize>().ok()?;
+    let suffix = rest.get(length..)?.strip_prefix(";workspace:")?;
+    let (workspace_length, workspace) = suffix.split_once(':')?;
+    let workspace_length = workspace_length.parse::<usize>().ok()?;
+    (workspace_length == workspace.len() && !workspace.is_empty()).then_some(workspace)
+}
+
+#[cfg(test)]
+mod account_coordinate_tests {
+    use super::openai_workspace_account_id;
+
+    /// MUTATION CHECK: send the raw stored value (drop the parser); the
+    /// combined coordinate then reaches the `chatgpt-account-id` header.
+    #[test]
+    fn workspace_id_is_extracted_from_both_stored_forms() {
+        assert_eq!(openai_workspace_account_id("acct-1"), Some("acct-1"));
+        assert_eq!(
+            openai_workspace_account_id("user:6:user-1;workspace:6:acct-1"),
+            Some("acct-1")
+        );
+        assert_eq!(
+            openai_workspace_account_id("user:3:a;b;workspace:16:shared-workspace"),
+            Some("shared-workspace"),
+            "the user part is length-delimited, so it may contain separators"
+        );
+        for malformed in [
+            "",
+            "user:9:only-user;workspace:0:",
+            "user:x:u;workspace:1:w",
+            "user:1:u;workspace:2:w",
+            "user:1:u",
+            "user:99:u;workspace:1:w",
+        ] {
+            assert_eq!(openai_workspace_account_id(malformed), None, "{malformed}");
+        }
     }
 }
 

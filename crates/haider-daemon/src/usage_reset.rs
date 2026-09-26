@@ -96,18 +96,21 @@ pub(crate) fn approval_menu(approval_id: &str, account: &CredentialAlias) -> Men
             format!("Account: {account}"),
             "This spends one limited provider-issued reset credit. Work continues while this decision is pending.".into(),
         ],
+        // Deny is option 0: the default selection, Enter, a `1` and any
+        // keyless answer all decline. Spending requires the explicit
+        // `approve` key.
         options: vec![
-            MenuOption {
-                key: APPROVE_OPTION_KEY.into(),
-                label: "Apply one reset".into(),
-                detail: Some("Spend one applicable reset credit now.".into()),
-                decision: Some(DecisionKind::AllowOnce),
-            },
             MenuOption {
                 key: DENY_OPTION_KEY.into(),
                 label: "Deny".into(),
                 detail: Some("Do not spend a reset credit.".into()),
                 decision: Some(DecisionKind::RejectOnce),
+            },
+            MenuOption {
+                key: APPROVE_OPTION_KEY.into(),
+                label: "Apply one reset".into(),
+                detail: Some("Spend one applicable reset credit now.".into()),
+                decision: Some(DecisionKind::AllowOnce),
             },
         ],
         blocking: false,
@@ -118,14 +121,11 @@ pub(crate) fn approval_menu(approval_id: &str, account: &CredentialAlias) -> Men
     }
 }
 
-/// The option key a committed answer selected. A keyless answer selects by
-/// index, and only index 0 is the approve option.
-pub(crate) fn answered_option_key(option_key: Option<&str>, option_index: u32) -> &str {
-    option_key.unwrap_or(if option_index == 0 {
-        APPROVE_OPTION_KEY
-    } else {
-        DENY_OPTION_KEY
-    })
+/// The option key a committed answer selected. Only the explicit `approve`
+/// key approves: an answer that names no key is a decline, whatever its
+/// index, so no positional default can ever spend a credit.
+pub(crate) fn answered_option_key(option_key: Option<&str>) -> &str {
+    option_key.unwrap_or(DENY_OPTION_KEY)
 }
 
 pub(crate) fn result(

@@ -65,8 +65,8 @@ fn approval_menu_is_nonblocking_human_only_and_secret_free() {
     assert_eq!(
         options,
         [
-            (APPROVE_OPTION_KEY, Some(DecisionKind::AllowOnce)),
             (DENY_OPTION_KEY, Some(DecisionKind::RejectOnce)),
+            (APPROVE_OPTION_KEY, Some(DecisionKind::AllowOnce)),
         ]
     );
     assert_eq!(menu.body[0], "Account: work-chatgpt");
@@ -94,13 +94,23 @@ fn reset_policy_denial_precedes_a_deferred_menu_even_with_auto_allow() {
     );
 }
 
+/// LAW: only the explicit `approve` key approves. A keyless answer declines
+/// at EVERY index, so a positional default (Enter, `1`, an old client that
+/// answers by index) can never spend a reset credit.
+///
+/// MUTATION CHECK: map a keyless index-0 (or index-1) answer to approve.
 #[test]
-fn answers_select_by_key_then_by_index_zero_only() {
-    assert_eq!(answered_option_key(Some("approve"), 1), APPROVE_OPTION_KEY);
-    assert_eq!(answered_option_key(Some("deny"), 0), DENY_OPTION_KEY);
-    assert_eq!(answered_option_key(None, 0), APPROVE_OPTION_KEY);
-    assert_eq!(answered_option_key(None, 1), DENY_OPTION_KEY);
-    assert_eq!(answered_option_key(Some("other"), 0), "other");
+fn only_the_explicit_approve_key_approves() {
+    assert_eq!(answered_option_key(Some("approve")), APPROVE_OPTION_KEY);
+    assert_eq!(answered_option_key(Some("deny")), DENY_OPTION_KEY);
+    assert_eq!(answered_option_key(None), DENY_OPTION_KEY);
+    assert_eq!(answered_option_key(Some("other")), "other");
+    let menu = approval_menu("usage-reset-abc", &CredentialAlias::new("work-chatgpt"));
+    assert_eq!(
+        menu.options[0].key, DENY_OPTION_KEY,
+        "deny is the default option 0"
+    );
+    assert_eq!(menu.options[1].key, APPROVE_OPTION_KEY);
 }
 
 #[test]

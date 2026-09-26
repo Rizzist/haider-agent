@@ -301,9 +301,8 @@ impl HubConnection {
         approval_id: &str,
         answer: &DurableMenuAnswer,
     ) -> Result<(), SessionHubError> {
-        let approved =
-            usage_reset::answered_option_key(answer.option_key.as_deref(), answer.option_index)
-                == usage_reset::APPROVE_OPTION_KEY;
+        let approved = usage_reset::answered_option_key(answer.option_key.as_deref())
+            == usage_reset::APPROVE_OPTION_KEY;
         let effect = usage_reset::effect_id(approval_id);
         let scope = ResetEventScope::after(answered);
         let final_verdict = if approved {

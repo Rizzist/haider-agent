@@ -1,9 +1,11 @@
-//! Debug/test-only fake usage and reset server hook (same safety model as
-//! `oauth::debug_fake_oauth`; see `docs/testing/fake-usage.md`).
+//! Debug/test-only fake usage and reset server hook (see
+//! `docs/testing/fake-usage.md`).
 //!
 //! It lets the REAL debug `haiderd` exercise usage meters, the reset-credit
-//! consume and the Haider Code plan poller against a local fake server, so
-//! end-to-end proofs never contact a live provider. Rules, enforced here:
+//! consume and the Haider Code plan poller against a local fake server.
+//! Scope: ONLY those usage/reset/plan requests are rerouted; OAuth token
+//! refresh and model traffic are not, so e2e runs must still use a
+//! loopback-only network sandbox. Rules, enforced here:
 //! - compiled only under `cfg(debug_assertions)`: absent from release/ci builds;
 //! - explicit opt-in: nothing changes unless [`ORIGIN_ENV`] is set, and it is
 //!   honoured only while `HAIDER_TEST_FAKE_PROVIDER` is also set;
