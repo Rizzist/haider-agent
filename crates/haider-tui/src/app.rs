@@ -9294,7 +9294,7 @@ impl AppModel {
         // only its navigation keys, and only while the composer is empty.
         if self.screen == Screen::Session
             && let Some(menu) = self.select_menu()
-            && (!is_deferred_approval(menu) || deferred_card_key(key.code))
+            && (!is_deferred_approval(menu) || self.deferred_card_takes(menu, key.code))
         {
             self.handle_menu_key(key.code);
             return;
@@ -15190,7 +15190,25 @@ impl AppModel {
             return;
         };
         let option_count = menu.options.len();
+        let deferred = is_deferred_approval(&menu);
+        let shown = self.menu_display_selection(&menu);
         match code {
+            // A spend-approval card never wraps and ignores digits; Enter
+            // answers option 0 (deny) unless the user moved the selection on
+            // this card — the same rules as the session card.
+            KeyCode::Up if deferred && option_count > 0 => {
+                self.menu_selection = shown.min(option_count - 1).saturating_sub(1);
+                self.menu_selection_owner = Some(menu.id.clone());
+            }
+            KeyCode::Down if deferred && option_count > 0 => {
+                self.menu_selection = (shown + 1).min(option_count - 1);
+                self.menu_selection_owner = Some(menu.id.clone());
+            }
+            KeyCode::Char('1'..='9') if deferred => {}
+            KeyCode::Enter if deferred => {
+                self.menu_selection = shown;
+                self.answer_chip_menu(&menu);
+            }
             KeyCode::Up if option_count > 0 => {
                 self.menu_selection =
                     (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
@@ -17324,8 +17342,20 @@ impl AppModel {
             return;
         }
         let deferred = is_deferred_approval(menu);
+        let shown = self.menu_display_selection(menu);
         let menu_id = menu.id.clone();
         match code {
+            // A spend-approval card never wraps: ↑ stops at `deny`
+            // (option 0) and ↓ stops at the last option, so only an
+            // explicit ↓ can ever reach `approve` (973-usage-data ruling).
+            KeyCode::Up if deferred && option_count > 0 => {
+                self.menu_selection = shown.min(option_count - 1).saturating_sub(1);
+                self.menu_selection_owner = Some(menu_id);
+            }
+            KeyCode::Down if deferred && option_count > 0 => {
+                self.menu_selection = (shown + 1).min(option_count - 1);
+                self.menu_selection_owner = Some(menu_id);
+            }
             // Selection wraps around (sim, tui.js:2441-2449).
             KeyCode::Up if option_count > 0 => {
                 self.menu_selection =
@@ -17348,12 +17378,36 @@ impl AppModel {
             KeyCode::Enter => {
                 // Enter on a spend-approval card answers the default (deny,
                 // option 0) unless the user moved the selection on THIS card.
-                if deferred && self.menu_selection_owner.as_ref() != Some(&menu_id) {
-                    self.menu_selection = 0;
+                if deferred {
+                    self.menu_selection = shown;
                 }
                 self.submit_menu_answer();
             }
             _ => {}
+        }
+    }
+
+    /// The selection a menu shows and Enter answers. On a spend-approval
+    /// card only arrow navigation on THIS card counts; anything else (a
+    /// stale index from an earlier menu) shows and answers option 0, `deny`.
+    #[must_use]
+    pub fn menu_display_selection(&self, menu: &Menu) -> usize {
+        if is_deferred_approval(menu) && self.menu_selection_owner.as_ref() != Some(&menu.id) {
+            0
+        } else {
+            self.menu_selection
+        }
+    }
+
+    /// Whether a key goes to the visible deferred spend-approval card rather
+    /// than the (empty) composer. ↑ belongs to the card only while the user
+    /// has moved THIS card's selection off `deny`; otherwise it keeps its
+    /// composer meaning (history recall), so ↑ then Enter can never approve.
+    fn deferred_card_takes(&self, menu: &Menu, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Up => self.menu_display_selection(menu) > 0,
+            KeyCode::Down | KeyCode::Enter | KeyCode::Esc => true,
+            _ => false,
         }
     }
 
@@ -21338,15 +21392,6 @@ pub fn tools_card(seq: u64) -> Menu {
 /// reset credit). Such a card must never capture composer keystrokes.
 pub(crate) fn is_deferred_approval(menu: &Menu) -> bool {
     matches!(menu.kind, MenuKind::DeferredApproval { .. })
-}
-
-/// Keys a deferred-approval card handles while the composer is empty;
-/// every other key (text, digits) goes to the composer.
-fn deferred_card_key(code: KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc
-    )
 }
 
 #[cfg(test)]

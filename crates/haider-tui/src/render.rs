@@ -7081,7 +7081,18 @@ fn render_session(
             .style(theme.text_style()),
             rule_area,
         );
-        let footer = if crate::app::menu_file_review(menu).is_some() {
+        let footer = if crate::app::is_deferred_approval(menu) {
+            // A spend-approval card takes no digits and never wraps: only an
+            // explicit ↓ reaches the spending option.
+            let default = menu
+                .options
+                .first()
+                .map_or("", |option| option.label.as_str());
+            format!(
+                " ↓↑ choose · ⏎ confirm (default {default}) · esc later · menu {}",
+                menu.id
+            )
+        } else if crate::app::menu_file_review(menu).is_some() {
             format!(
                 " ←→ hunks · ↑↓ scroll · Tab decision · ⏎ apply · 1-{} quick",
                 menu.options.len()
@@ -7096,7 +7107,7 @@ fn render_session(
         };
         let (menu_lines, option_rows) = menu_block(
             menu,
-            model.menu_selection,
+            model.menu_display_selection(menu),
             theme,
             composer_area,
             &footer,
@@ -11122,13 +11133,21 @@ fn render_subagent(
             .style(theme.text_style()),
             rule_area,
         );
-        let footer = format!(
-            " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
-            menu.options.len()
-        );
+        let footer = if crate::app::is_deferred_approval(menu) {
+            let default = menu
+                .options
+                .first()
+                .map_or("", |option| option.label.as_str());
+            format!(" ↓↑ choose · ⏎ confirm (default {default}) · esc back to session")
+        } else {
+            format!(
+                " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
+                menu.options.len()
+            )
+        };
         let (menu_lines, option_rows) = menu_block(
             menu,
-            model.menu_selection,
+            model.menu_display_selection(menu),
             theme,
             composer_area,
             &footer,
