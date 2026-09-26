@@ -3366,7 +3366,14 @@ impl LiveDriver {
                                 .map(|metadata| metadata.cwd.as_str())
                         })
                         .map(workspace_display_path);
+                    model.upsert_live_session(&summary.session_id);
                     if let Some(metadata) = summary.metadata.as_ref() {
+                        model.note_session_metadata(
+                            &summary.session_id,
+                            &metadata.provider,
+                            &metadata.model,
+                            metadata.max_tokens,
+                        );
                         self.workspace_paths
                             .insert(summary.session_id.clone(), metadata.cwd.clone());
                         if metadata.workspace_allocation.is_some() {
@@ -3378,7 +3385,6 @@ impl LiveDriver {
                         }
                     }
                     self.binding_worker_generation = Some(summary.worker_generation);
-                    model.upsert_live_session(&summary.session_id);
                     if let Some(display) = workspace_display {
                         if model.active_session.as_ref() == Some(&summary.session_id) {
                             model.session_dir = display;
@@ -4633,11 +4639,13 @@ impl LiveDriver {
                 {
                     self.pending_model_select = None;
                 }
+                model.apply_session_model_selected(
+                    &session,
+                    &provider,
+                    &model_name,
+                    output_budget.as_ref(),
+                );
                 self.generations.insert(session, worker_generation);
-                model.apply_model_selected(&provider, &model_name);
-                if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
-                    model.apply_output_budget_clamp(&clamp);
-                }
                 Vec::new()
             }
             LiveReply::Renamed {
@@ -6427,15 +6435,26 @@ impl LiveDriver {
     /// land the same values; both writers agree because both are committed
     /// daemon truth.
     fn apply_tuning_fact(&self, model: &mut AppModel, session: &SessionId, envelope: &RawEnvelope) {
-        if model.active_session.as_ref() != Some(session) {
-            return;
-        }
         let Ok(payload) = envelope
             .payload
             .decode::<haider_protocol::session::SessionConfigEventPayload>()
         else {
             return;
         };
+        if model.active_session.as_ref() != Some(session) {
+            // 973-context-meter-fixes B1: a PARKED session's model facts
+            // bind its own meter epoch (never the identity on screen).
+            match payload {
+                haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) => {
+                    model.note_parked_model_selected(session, &selected.provider, &selected.model);
+                }
+                haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(
+                    rebound,
+                ) => model.note_parked_provider_rebound(session, &rebound.provider),
+                _ => {}
+            }
+            return;
+        }
         match payload {
             haider_protocol::session::SessionConfigEventPayload::EffortSelected(selected) => {
                 if model.identity.reasoning != selected.effort {
@@ -6469,6 +6488,7 @@ impl LiveDriver {
                     model.identity.model_short = selected.model.clone();
                     model.refresh_context_window();
                 }
+                model.note_model_selected_fact(&selected.provider, &selected.model);
                 model.projection.push_note(format!(
                     "⇄ model → {} · {}",
                     selected.model, selected.provider

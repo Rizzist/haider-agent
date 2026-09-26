@@ -1659,6 +1659,12 @@ pub struct ChipModel {
     pub full: String,
     pub name: String,
     pub model: String,
+    /// The provider the child's model runs through — the manifest's
+    /// spawn-time provider coordinate. `None` when the manifest carries no
+    /// provenance (older daemon, demo seeds): the child's model is then
+    /// looked up under NO provider, never borrowed from the parent's
+    /// (973-context-meter-fixes B2).
+    pub provider: Option<String>,
     /// Daemon-stamped provider ceiling for this child.
     pub lockdown: bool,
     pub device: String,
@@ -1744,6 +1750,7 @@ impl ChipModel {
             full: seed.full,
             name: seed.name,
             model: seed.model,
+            provider: None,
             lockdown: false,
             device: seed.device,
             state: seed.state,
@@ -1798,6 +1805,7 @@ impl ChipModel {
             // display label (research W6b checklist item 4).
             name: manifest.task.clone(),
             model: manifest.model_profile.clone(),
+            provider: manifest.provider().map(str::to_owned),
             lockdown: manifest
                 .coordinates
                 .as_ref()
@@ -5264,13 +5272,12 @@ pub struct AppModel {
     /// ⌃G / `/tokens` context panel (sim tui.js:2946-2977) — session
     /// surfaces only; esc closes.
     pub token_panel: bool,
-    /// The (provider, model) pair the context meter last resolved against
-    /// (973-context-meter), maintained by [`Self::refresh_context_window`].
-    meter_identity: Option<(String, String)>,
-    /// The latest snapshot at the moment the identity pair last CHANGED:
-    /// while it is still the latest, it describes the previous model, so
-    /// its window may not stand in for the current model's.
-    meter_snapshot_before_switch: Option<haider_protocol::context::ContextFootprint>,
+    /// The VIEWED session's context-meter epoch (973-context-meter-fixes):
+    /// its committed model pair, the snapshot that predates its last model
+    /// or budget change, and its committed output budget. Travels with the
+    /// session on checkout; maintained by [`Self::refresh_context_window`]
+    /// and the model-selection reply/fact paths.
+    meter_epoch: crate::context_meter::MeterEpoch,
     /// `/tree` — selected row (sim treeSel).
     pub tree_sel: usize,
     /// `/tree` — the VIEWED branch (`None` = the root/main branch; sim
@@ -5916,8 +5923,7 @@ impl Default for AppModel {
         Self {
             screen: Screen::Boot,
             token_panel: false,
-            meter_identity: None,
-            meter_snapshot_before_switch: None,
+            meter_epoch: crate::context_meter::MeterEpoch::default(),
             tree_sel: 0,
             tree_view: None,
             pending_jump: std::cell::RefCell::new(None),
@@ -11737,12 +11743,8 @@ impl AppModel {
             self.identity.provider.clone(),
             self.identity.model_short.clone(),
         );
-        if self.meter_identity.as_ref() != Some(&pair) {
-            if self.meter_identity.is_some() {
-                self.meter_snapshot_before_switch = self.projection.latest_footprint().cloned();
-            }
-            self.meter_identity = Some(pair);
-        }
+        self.meter_epoch
+            .bind(pair, self.projection.latest_footprint());
         let declared = self
             .providers
             .declared_window(&self.identity.provider, &self.identity.model_short);
@@ -11767,22 +11769,29 @@ impl AppModel {
         // a model outside it). When the catalog lists the model without a
         // window, "unknown" is the answer — a snapshot window then belongs
         // to a previously selected model.
-        // Nor may a snapshot taken before the last model switch: until the
-        // new model's first request it describes the previous model.
-        let snapshot_predates_model = self.meter_snapshot_before_switch.is_some()
-            && self.projection.latest_footprint() == self.meter_snapshot_before_switch.as_ref();
-        let snapshot_window_allowed = self.mode.fabricates_locally()
-            || !(snapshot_predates_model
-                || self
-                    .providers
-                    .model_listed(&self.identity.provider, &self.identity.model_short));
+        // Nor may a snapshot taken before this session's last model or
+        // output-budget change: until the new epoch's first request it
+        // describes the previous one (window, trigger, turns alike).
+        let latest = self.projection.latest_footprint();
+        let epoch = if self.meter_epoch.snapshot_predates(latest) {
+            crate::context_meter::SnapshotEpoch::Previous
+        } else if !self.mode.fabricates_locally()
+            && self
+                .providers
+                .model_listed(&self.identity.provider, &self.identity.model_short)
+        {
+            crate::context_meter::SnapshotEpoch::CurrentWindowWithheld
+        } else {
+            crate::context_meter::SnapshotEpoch::Current
+        };
         crate::context_meter::ContextMeter::resolve(
-            self.projection.latest_footprint(),
+            latest,
             self.projection.context_tokens(),
             self.identity.context_window,
-            snapshot_window_allowed,
+            epoch,
             |window| {
-                crate::context_meter::derived_reserved_output(
+                crate::context_meter::epoch_reserved_output(
+                    self.meter_epoch.output_budget,
                     self.providers
                         .declared_output_limit(&self.identity.provider, &self.identity.model_short),
                     window,
@@ -18606,8 +18615,19 @@ impl AppModel {
         // Re-judged by the live presence probe for the new surface.
         self.session_workspace_uncreated = false;
         self.launch_origin = slot.launch_origin.take();
+        // 973-context-meter-fixes B1: the session's OWN model pair and meter
+        // epoch come back with its projection — never the identity the
+        // previously viewed session left behind. A session this process has
+        // not bound yet (first open) binds the current pair below.
+        let epoch = std::mem::take(&mut slot.meter_epoch);
+        if let Some((provider, model)) = epoch.pair.clone() {
+            self.identity.provider = provider;
+            self.identity.model_short = model;
+        }
+        self.meter_epoch = epoch;
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
+        self.refresh_context_window();
         self.menu_selection = 0;
         self.view_path.clear();
         // CG-M1: read this session's graph reduction so the strip reflects a
@@ -18739,6 +18759,7 @@ impl AppModel {
             slot.dir = std::mem::replace(&mut self.session_dir, self.launcher_dir.clone());
             slot.workspace_cwd = self.session_workspace_cwd.take();
             slot.launch_origin = self.launch_origin.take();
+            slot.meter_epoch = std::mem::take(&mut self.meter_epoch);
         }
         self.last_detached = Some(active);
         self.toolfold.seed_verbosity(self.default_tool_verbosity);
@@ -20835,6 +20856,112 @@ impl AppModel {
         self.model_commits += 1;
         self.flash = Some(format!("· model → {model} · {provider}"));
         self.dirty = true;
+    }
+
+    /// The `session.select_model` reply for `session` (973-context-meter-
+    /// fixes B1/B3). The VIEWED session renders the resolved pair and
+    /// starts its meter epoch with the daemon's committed effective output
+    /// budget; a reply for a session the user has since left binds that
+    /// session's parked epoch instead of the identity on screen.
+    pub fn apply_session_model_selected(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        output_budget: Option<&haider_protocol::output_budget::SessionOutputBudgetV1>,
+    ) {
+        let pair = (provider.to_owned(), model.to_owned());
+        let budget = output_budget.map(|budget| budget.max_tokens);
+        if self.active_session.as_ref() == Some(session) {
+            self.apply_model_selected(provider, model);
+            self.meter_epoch
+                .commit_selection(pair, self.projection.latest_footprint(), budget);
+        } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
+            entry
+                .meter_epoch
+                .commit_selection(pair, entry.projection.latest_footprint(), budget);
+            entry.model_short = model.to_owned();
+            self.dirty = true;
+        }
+        if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
+            self.apply_output_budget_clamp(&clamp);
+        }
+    }
+
+    /// A committed `ModelSelected` journal fact for the VIEWED session
+    /// (live or replayed), after the identity followed it: snapshots before
+    /// the fact belong to the previous epoch.
+    pub fn note_model_selected_fact(&mut self, provider: &str, model: &str) {
+        self.meter_epoch.note_selected_fact(
+            (provider.to_owned(), model.to_owned()),
+            self.projection.latest_footprint(),
+        );
+    }
+
+    /// A committed `ModelSelected` fact for a PARKED session (a background
+    /// change, e.g. from another client): it binds that session's own
+    /// epoch — the viewed identity is untouched — and lands the same
+    /// transcript note the viewed session gets, so reopening the attached
+    /// session (which replays nothing) shows the model it now runs.
+    pub fn note_parked_model_selected(&mut self, session: &SessionId, provider: &str, model: &str) {
+        let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
+            return;
+        };
+        entry.meter_epoch.note_selected_fact(
+            (provider.to_owned(), model.to_owned()),
+            entry.projection.latest_footprint(),
+        );
+        entry.model_short = model.to_owned();
+        entry
+            .projection
+            .push_note(format!("⇄ model → {model} · {provider}"));
+        self.dirty = true;
+    }
+
+    /// A committed provider rebind for a PARKED session: its epoch's pair
+    /// moves to the new provider (the model is unchanged).
+    pub fn note_parked_provider_rebound(&mut self, session: &SessionId, provider: &str) {
+        let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
+            return;
+        };
+        if let Some((_, model)) = entry.meter_epoch.pair.clone() {
+            entry.meter_epoch.bind(
+                (provider.to_owned(), model),
+                entry.projection.latest_footprint(),
+            );
+            self.dirty = true;
+        }
+    }
+
+    /// The daemon's typed session metadata (`session.list`) for `session`:
+    /// its committed pair and effective output budget. A parked session this
+    /// process has not bound yet is seeded from it, so the FIRST open meters
+    /// the session against its own model, not the one on screen; an epoch
+    /// already on that same pair learns the committed budget (the only
+    /// source of it after a selection made on another surface).
+    pub fn note_session_metadata(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        output_budget: u64,
+    ) {
+        let pair = (provider.to_owned(), model.to_owned());
+        let budget = (output_budget > 0).then_some(output_budget);
+        let epoch = if self.active_session.as_ref() == Some(session) {
+            &mut self.meter_epoch
+        } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
+            if entry.meter_epoch.pair.is_none() {
+                entry.meter_epoch.begin(pair, None, budget);
+                return;
+            }
+            &mut entry.meter_epoch
+        } else {
+            return;
+        };
+        if epoch.pair.as_ref() == Some(&pair) && budget.is_some() {
+            epoch.output_budget = budget;
+        }
     }
 
     /// A user-set output budget did not fit the newly selected model: the

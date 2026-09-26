@@ -89,6 +89,10 @@ pub struct SessionState {
     pub workspace_cwd: Option<String>,
     /// Latest replaceable launch-origin revision and optional sanitised display.
     pub launch_origin: Option<(u64, Option<String>)>,
+    /// This session's context-meter epoch — its committed model pair and
+    /// budget (973-context-meter-fixes B1). Restored with the projection on
+    /// checkout; a parked session's background model change lands here.
+    pub meter_epoch: crate::context_meter::MeterEpoch,
     pub projection: SessionProjection,
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
@@ -203,6 +207,7 @@ impl SessionState {
             dir: String::new(),
             workspace_cwd: None,
             launch_origin: None,
+            meter_epoch: crate::context_meter::MeterEpoch::default(),
             projection: SessionProjection::new(),
             prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),

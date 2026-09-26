@@ -17,10 +17,15 @@
 //!   daemon compares with its compaction thresholds. Never a cumulative
 //!   billing sum.
 //! * **auto-compaction trigger** — the daemon's own threshold from the
-//!   snapshot when that snapshot was taken against the displayed window;
-//!   after a model switch (before the new model's first snapshot) the SAME
-//!   protocol law ([`haider_protocol::context::context_soft_threshold_tokens`])
-//!   projects it, marked as projected.
+//!   snapshot when that snapshot was taken under the CURRENT model/output
+//!   budget epoch against the displayed window; after a model or budget
+//!   change (before the new epoch's first snapshot) the SAME protocol law
+//!   ([`haider_protocol::context::context_soft_threshold_tokens`]) projects
+//!   it from the new epoch's reservation, marked as projected.
+//!
+//! The epoch is SESSION state ([`MeterEpoch`]): it travels with the session
+//! on checkout exactly like its projection, so reopening a session never
+//! meters it against another session's model (973-context-meter-fixes).
 
 use crate::format::{fmt_tok, meter_cells};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
@@ -52,40 +57,151 @@ pub struct ContextMeter {
     pub from_snapshot: bool,
 }
 
+/// How the latest snapshot relates to the session's CURRENT model/output
+/// budget epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotEpoch {
+    /// Taken under the current model and output budget: its trigger and
+    /// turns estimate are daemon truth, and its window may stand in for an
+    /// undeclared one.
+    Current,
+    /// Current, but the catalog lists the model WITHOUT a window: the
+    /// snapshot's window may not stand in (unknown stays unknown).
+    CurrentWindowWithheld,
+    /// Taken before the last model or output-budget change: it describes
+    /// the previous epoch. Its used figure still stands (the context is the
+    /// same), but never its window, trigger, reservation or turns estimate.
+    Previous,
+}
+
+/// The model/output-budget epoch ONE session's meter resolves against
+/// (973-context-meter-fixes B1/B3). The viewed session's lives on the app
+/// model; a parked session's in its slot, and it travels on checkout with
+/// the session's projection — so session A never inherits session B's
+/// model, and a change within a session rebases immediately.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MeterEpoch {
+    /// The session's committed `(provider, model)`; `None` until known.
+    pub pair: Option<(String, String)>,
+    /// The latest snapshot when the epoch last changed: while it is still
+    /// the latest, it describes the previous model/budget.
+    pub snapshot_before_change: Option<ContextFootprint>,
+    /// The committed effective output budget of this epoch (the daemon's
+    /// model-selection reply, or the session's typed metadata); `None` =
+    /// derive it from the model's declared maximum.
+    pub output_budget: Option<u64>,
+}
+
+impl MeterEpoch {
+    /// Starts a new epoch. `latest` is the snapshot in force at the change.
+    pub fn begin(
+        &mut self,
+        pair: (String, String),
+        latest: Option<&ContextFootprint>,
+        output_budget: Option<u64>,
+    ) {
+        self.pair = Some(pair);
+        self.snapshot_before_change = latest.cloned();
+        self.output_budget = output_budget;
+    }
+
+    /// Binds `pair` as the meter's model: a CHANGE of a known pair starts a
+    /// new epoch (reservation unknown until the daemon commits one); the
+    /// first binding does not.
+    pub fn bind(&mut self, pair: (String, String), latest: Option<&ContextFootprint>) {
+        match &self.pair {
+            Some(current) if *current == pair => {}
+            Some(_) => self.begin(pair, latest, None),
+            None => self.pair = Some(pair),
+        }
+    }
+
+    /// A committed model selection with the daemon's effective output
+    /// budget (the `session.select_model` reply). A new pair, or a budget
+    /// that differs from the reservation the latest snapshot carries,
+    /// starts a new epoch; a no-op re-selection keeps the daemon's figures.
+    pub fn commit_selection(
+        &mut self,
+        pair: (String, String),
+        latest: Option<&ContextFootprint>,
+        output_budget: Option<u64>,
+    ) {
+        let unchanged = self.pair.as_ref() == Some(&pair)
+            && !self.snapshot_predates(latest)
+            && latest
+                .is_some_and(|footprint| output_budget == Some(footprint.reserved_output_tokens));
+        if unchanged {
+            self.output_budget = output_budget;
+        } else {
+            self.begin(pair, latest, output_budget);
+        }
+    }
+
+    /// A durable `ModelSelected` journal fact (live or replayed): snapshots
+    /// before it belong to the previous epoch. Idempotent with the reply
+    /// that committed the same selection (no snapshot in between), whose
+    /// budget it then keeps.
+    pub fn note_selected_fact(
+        &mut self,
+        pair: (String, String),
+        latest: Option<&ContextFootprint>,
+    ) {
+        let same_pair = self.pair.as_ref() == Some(&pair);
+        if same_pair && self.snapshot_before_change.as_ref() == latest {
+            return;
+        }
+        let budget = if same_pair { self.output_budget } else { None };
+        self.begin(pair, latest, budget);
+    }
+
+    /// Whether `latest` is still the snapshot that predates the epoch.
+    #[must_use]
+    pub fn snapshot_predates(&self, latest: Option<&ContextFootprint>) -> bool {
+        self.snapshot_before_change.is_some() && latest == self.snapshot_before_change.as_ref()
+    }
+}
+
 impl ContextMeter {
     /// Resolves the meter.
     ///
     /// `identity_window` is the current model's declared window (`0` =
-    /// unknown). `snapshot_window_allowed` lets the latest snapshot's window
-    /// stand in when the identity's is unknown (false when the catalog lists
-    /// the current model without a window). `fallback_used` is only
-    /// consulted without a snapshot.
-    /// `default_reserved_output` is the output budget a session requests,
-    /// used to project a threshold when no snapshot carries the daemon's
-    /// actual reservation.
+    /// unknown). `epoch` says whether the latest snapshot belongs to the
+    /// current model/budget epoch (and whether its window may stand in for
+    /// an undeclared one). `fallback_used` is only consulted without a
+    /// snapshot. `epoch_reserved_output` is the current epoch's output
+    /// reservation (the daemon's committed budget, else the derived one),
+    /// used to project a trigger when no current snapshot carries the
+    /// daemon's own.
     #[must_use]
     pub fn resolve(
         footprint: Option<&ContextFootprint>,
         fallback_used: u64,
         identity_window: u64,
-        snapshot_window_allowed: bool,
-        default_reserved_output: impl Fn(u64) -> u64,
+        epoch: SnapshotEpoch,
+        epoch_reserved_output: impl Fn(u64) -> u64,
     ) -> Self {
         let snapshot_window = footprint
             .and_then(|footprint| footprint.context_window)
             .filter(|window| *window > 0);
         let window = (identity_window > 0)
             .then_some(identity_window)
-            .or(snapshot_window.filter(|_| snapshot_window_allowed));
+            .or(snapshot_window.filter(|_| epoch == SnapshotEpoch::Current));
+        // The daemon's trigger and turns estimate describe the snapshot's
+        // model, budget AND window: they are current only when all three
+        // are. Window equality alone is not proof of the epoch.
+        let snapshot_governs =
+            epoch != SnapshotEpoch::Previous && window.is_some() && snapshot_window == window;
         let (auto_compact_at, threshold_projected) = match (window, footprint) {
-            (Some(window), Some(footprint)) if snapshot_window == Some(window) => {
+            (Some(_), Some(footprint)) if snapshot_governs => {
                 (footprint.soft_threshold_tokens, false)
             }
             (Some(window), footprint) => {
-                let reserved = footprint.map_or_else(
-                    || default_reserved_output(window),
-                    |f| f.reserved_output_tokens,
-                );
+                let reserved = match footprint {
+                    Some(footprint) if epoch != SnapshotEpoch::Previous => {
+                        footprint.reserved_output_tokens
+                    }
+                    _ => epoch_reserved_output(window),
+                };
                 (
                     haider_protocol::context::context_soft_threshold_tokens(window, reserved),
                     true,
@@ -107,10 +223,10 @@ impl ContextMeter {
                 auto_compact_at,
                 threshold_projected,
                 // The daemon's turns estimate is measured against the
-                // SNAPSHOT's window: it applies only while that is the
-                // displayed window (never after a switch, never to an
-                // unknown window).
-                turns_to_threshold: (window.is_some() && snapshot_window == window)
+                // SNAPSHOT's model, budget and window: it applies only while
+                // that snapshot governs (never after a model or budget
+                // change, never to an unknown window).
+                turns_to_threshold: snapshot_governs
                     .then_some(footprint.estimated_turns_to_threshold)
                     .flatten(),
                 estimated: footprint.truth == ContextFootprintTruth::Estimated,
@@ -239,6 +355,19 @@ pub fn derived_reserved_output(declared_output_limit: Option<u64>, window: u64) 
     } else {
         reserved.min(window)
     }
+}
+
+/// The current epoch's output reservation: the daemon's COMMITTED effective
+/// budget when the session's epoch carries one (a user-set budget survives
+/// or is clamped there, which no client derivation can know), else the
+/// derivation from the model's declared maximum.
+#[must_use]
+pub fn epoch_reserved_output(
+    committed: Option<u64>,
+    declared_output_limit: Option<u64>,
+    window: u64,
+) -> u64 {
+    committed.unwrap_or_else(|| derived_reserved_output(declared_output_limit, window))
 }
 
 /// Whole percent of `window`, rounded half up — the ONE rounding every

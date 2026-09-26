@@ -7493,25 +7493,29 @@ fn render_token_panel(
         main_detail,
     )];
     for (_, chip) in crate::app::flatten_chips(&model.chips) {
-        // A child's window is ITS model's: its own snapshot, else the
-        // catalog row for its model — never the parent's figure.
-        let declared = model
-            .providers
-            .declared_window(&identity.provider, &chip.model)
+        // A child's window is ITS model's (973-context-meter-fixes B2): its
+        // own valid snapshot first, else the catalog row for its model
+        // under ITS provider. The same slug on another provider may declare
+        // a different window, so without the child's provider provenance
+        // no catalog row is borrowed — never the parent's.
+        let child_detail = |lookup: fn(&crate::app::ProvidersState, &str, &str) -> Option<u64>| {
+            chip.provider
+                .as_deref()
+                .and_then(|provider| lookup(&model.providers, provider, &chip.model))
+        };
+        let footprint = chip.transcript.latest_footprint();
+        let window = footprint
+            .and_then(|footprint| footprint.context_window)
+            .filter(|window| *window > 0)
+            .or_else(|| child_detail(crate::app::ProvidersState::declared_window))
             .unwrap_or(0);
+        let output_limit = child_detail(crate::app::ProvidersState::declared_output_limit);
         let meter = crate::context_meter::ContextMeter::resolve(
-            chip.transcript.latest_footprint(),
+            footprint,
             chip.tokens,
-            declared,
-            true,
-            |window| {
-                crate::context_meter::derived_reserved_output(
-                    model
-                        .providers
-                        .declared_output_limit(&identity.provider, &chip.model),
-                    window,
-                )
-            },
+            window,
+            crate::context_meter::SnapshotEpoch::Current,
+            |window| crate::context_meter::derived_reserved_output(output_limit, window),
         );
         rows.push((
             format!("└ {} · {}", chip.name, chip.model),

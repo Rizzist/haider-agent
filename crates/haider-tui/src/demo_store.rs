@@ -899,6 +899,7 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
         full: dto.full,
         name: dto.name,
         model: dto.model,
+        provider: None,
         lockdown: false,
         device: dto.device,
         state: chip_state_from_label(&dto.state),
