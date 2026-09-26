@@ -1291,6 +1291,9 @@ pub struct ModelDetailWire {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Origin of this row; older peers omit it and therefore leave it unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ModelDetailSourceWire>,
     /// Maximum response size for this provider/model row. The provider's
     /// catalog declaration wins; the daemon supplies a pinned fallback when
     /// the remote catalog omits the field or cannot be reached.
@@ -1322,6 +1325,34 @@ pub struct ModelDetailWire {
     /// nothing, and a client must then attach and let the daemon answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+}
+
+/// Where the daemon got one [`ModelDetailWire`] row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDetailSourceWire {
+    /// The release's maintained subscription catalog.
+    Static,
+    /// The provider's own model list.
+    Remote,
+    /// An offline catalog or the user's configured deployment list.
+    Configured,
+    /// A source this peer does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ModelDetailSourceWire {
+    /// The wire spelling, for display.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Remote => "remote",
+            Self::Configured => "configured",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// One provider's read-only management projection.
@@ -1439,6 +1470,13 @@ impl ModelInventoryWire {
         }
     }
 
+    /// Whether this state stands behind the summary's rows. `NeverFetched`
+    /// and `Unavailable` carry no list.
+    #[must_use]
+    pub fn lists_models(&self) -> bool {
+        !matches!(self, Self::NeverFetched | Self::Unavailable { .. })
+    }
+
     #[must_use]
     pub fn fetched_at_ms(&self) -> Option<u64> {
         match self {
@@ -1519,20 +1557,45 @@ pub struct ProviderSummaryWire {
 }
 
 impl ProviderSummaryWire {
+    /// Whether a pickable row comes from the maintained static catalog.
+    #[must_use]
+    pub fn has_static_models(&self) -> bool {
+        self.models.iter().any(|model| self.is_static_model(model))
+    }
+
+    /// Whether the pickable rows are known: an inventory list stands behind
+    /// them, or the maintained static catalog supplies them.
+    #[must_use]
+    pub fn has_known_models(&self) -> bool {
+        self.inventory.lists_models() || self.has_static_models()
+    }
+
+    fn is_static_model(&self, model: &str) -> bool {
+        self.model_details.iter().any(|detail| {
+            detail.name == model && detail.source == Some(ModelDetailSourceWire::Static)
+        })
+    }
+
     /// Classifies `model` without changing the advertised/pickable inventory.
     /// In particular, an unlisted custom passthrough id is never appended to
     /// `models` or fabricated as an available [`ModelDetailWire`] row.
     #[must_use]
     pub fn model_inventory_status(&self, model: &str) -> ModelInventoryStatusWire {
-        if matches!(
-            self.inventory,
-            ModelInventoryWire::NeverFetched | ModelInventoryWire::Unavailable { .. }
-        ) {
-            ModelInventoryStatusWire::Unknown
-        } else if self.models.iter().any(|known| known == model) {
+        let listed = self.models.iter().any(|known| known == model);
+        if self.inventory.lists_models() {
+            return if listed {
+                ModelInventoryStatusWire::Listed
+            } else {
+                ModelInventoryStatusWire::Unlisted
+            };
+        }
+        // Without a list, only maintained static rows are known.
+        if listed && self.is_static_model(model) {
             ModelInventoryStatusWire::Listed
-        } else {
+        } else if self.has_static_models() {
             ModelInventoryStatusWire::Unlisted
+        } else {
+            ModelInventoryStatusWire::Unknown
         }
     }
 }

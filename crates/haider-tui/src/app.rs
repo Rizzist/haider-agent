@@ -1160,11 +1160,7 @@ fn normalize_provider_inventory(
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         });
     summary.inventory = summary.inventory.at_time(now);
-    if matches!(
-        summary.inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
-            | haider_rpc::ModelInventoryWire::Unavailable { .. }
-    ) {
+    if !summary.has_known_models() {
         summary.models.clear();
         summary.model_details.clear();
         summary.default_model = None;
@@ -5074,6 +5070,9 @@ pub struct ModelPickerRow {
     /// `oauth` / `api` — what a turn on this row meters.
     pub auth: &'static str,
     pub context_window: Option<u64>,
+    /// Daemon-declared row origin; `None` for placeholders, mixed groups and
+    /// older daemons.
+    pub source: Option<haider_rpc::ModelDetailSourceWire>,
     /// Age in milliseconds of the provider inventory used for this row.
     pub inventory_age_ms: Option<u64>,
     /// Provider availability — unavailable rows render dimmed and refuse
@@ -11972,19 +11971,16 @@ impl AppModel {
         };
         // Adopt only once the provider's MODEL truth is here: a
         // half-adopted identity (right provider, demo-seed model) would
-        // send a foreign slug to the subscription API and 400. The next
-        // snapshot completes the picture; nothing is lost by waiting.
+        // send a foreign slug to the subscription API and 400. Static
+        // catalog rows are model truth even when remote discovery fails.
         let model_known = self
             .providers
             .providers
             .iter()
             .find(|summary| summary.provider == provider)
             .is_some_and(|summary| {
-                !matches!(
-                    summary.inventory,
-                    haider_rpc::ModelInventoryWire::NeverFetched
-                        | haider_rpc::ModelInventoryWire::Unavailable { .. }
-                ) && (summary.default_model.is_some() || !summary.models.is_empty())
+                summary.has_known_models()
+                    && (summary.default_model.is_some() || !summary.models.is_empty())
             });
         if !model_known {
             return;
@@ -20194,16 +20190,10 @@ impl AppModel {
             if !summary.enabled {
                 continue;
             }
-            let known_inventory = !matches!(
-                summary.inventory,
-                haider_rpc::ModelInventoryWire::NeverFetched
-                    | haider_rpc::ModelInventoryWire::Unavailable { .. }
+            let available = matches!(
+                summary.availability,
+                haider_rpc::ProviderAvailabilityWire::Available
             );
-            let available = known_inventory
-                && matches!(
-                    summary.availability,
-                    haider_rpc::ProviderAvailabilityWire::Available
-                );
             let reason = summary
                 .availability_reason
                 .clone()
@@ -20236,7 +20226,7 @@ impl AppModel {
                     _ => "api",
                 }
             };
-            if !known_inventory || summary.models.is_empty() {
+            if !summary.has_known_models() || summary.models.is_empty() {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
                     providers: vec![summary.provider.clone()],
@@ -20252,6 +20242,7 @@ impl AppModel {
                     model: String::new(),
                     auth,
                     context_window: None,
+                    source: None,
                     inventory_age_ms,
                     available,
                     reason: Some(
@@ -20292,6 +20283,11 @@ impl AppModel {
                     model: model.clone(),
                     auth,
                     context_window: self.providers.declared_window(&summary.provider, model),
+                    source: summary
+                        .model_details
+                        .iter()
+                        .find(|detail| detail.name == *model)
+                        .and_then(|detail| detail.source),
                     inventory_age_ms,
                     available,
                     reason: reason.clone(),
@@ -20331,6 +20327,7 @@ impl AppModel {
                     model: self.identity.model_short.clone(),
                     auth,
                     context_window: None,
+                    source: None,
                     inventory_age_ms,
                     available: false,
                     reason: Some("unlisted by advisory provider catalog".to_owned()),
@@ -20459,6 +20456,11 @@ impl AppModel {
             model: first.model.clone(),
             auth: "api",
             context_window,
+            source: group
+                .iter()
+                .all(|row| row.source == first.source)
+                .then_some(first.source)
+                .flatten(),
             inventory_age_ms,
             available: available_providers > 0,
             reason,

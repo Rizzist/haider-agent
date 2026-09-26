@@ -5862,6 +5862,12 @@ fn render_model_picker(
                 theme.dim_style(),
             ),
         ];
+        if let Some(source) = row.source {
+            spans.push(Span::styled(
+                format!("  {}", source.as_str()),
+                theme.dim_style(),
+            ));
+        }
         if row.is_current {
             let current = if is_top_api_group(row) && row.providers.len() > 1 {
                 format!(

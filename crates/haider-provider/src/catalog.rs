@@ -1,8 +1,8 @@
 //! Model discovery from the PROVIDERS' OWN sources (W5e-2).
 //!
-//! The owner requirement is that model choice never comes from a hardcoded
-//! slug table: it comes from the same place the vendors' own CLIs get it,
-//! authorized with the subscription credentials the vault already holds.
+//! Remote discovery is preferred. Subscription credentials may be allowed to
+//! run turns while their `/models` request is forbidden, so a small maintained
+//! static catalog keeps those providers usable on a fresh profile.
 //!
 //! - **OpenAI subscription**: `GET {OPENAI_SUBSCRIPTION_BASE_URL}/models`,
 //!   the endpoint the installed codex CLI uses
@@ -15,10 +15,8 @@
 //!   with the OAuth bearer and the same beta headers W5b.2 already proves
 //!   work for inference.
 //!
-//! DISCOVERY IS NEVER SYNTHESIZED. When a provider will not serve a list,
-//! [`CatalogError::Unavailable`] is returned so the caller can fall back to
-//! its last-known cache or say "unavailable" — this module never invents a
-//! model that the provider did not name.
+//! Discovery never synthesizes a successful response. The maintained rows
+//! live in `subscription_catalog`; the daemon registry merges the two.
 //!
 //! Requests use fixed origins and the same W5a discipline as the token
 //! endpoints: resolve-validate-pin through [`FixedOriginGuard`], proxies
@@ -75,6 +73,10 @@ pub struct DiscoveredModel {
     pub visible: bool,
     /// Picker ordering hint; lower sorts first.
     pub priority: Option<i64>,
+    /// Codex routing declaration. The subscription adapter always sends
+    /// Responses Lite; old cached rows deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_responses_lite: Option<bool>,
     /// Provider-declared capability metadata that is richer than the common
     /// catalog contract. Absent for existing sources so their serialized
     /// cache rows stay byte-identical.
@@ -124,6 +126,13 @@ pub enum CatalogError {
     Empty,
 }
 
+/// Whether a [`CatalogError::Unavailable`] reason records a 403 answer to a
+/// fixed-origin model-list request.
+#[must_use]
+pub fn model_list_forbidden(reason: &str) -> bool {
+    reason.contains("(403)")
+}
+
 impl std::fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -163,8 +172,9 @@ pub enum CatalogSource {
     XaiApi,
 }
 
-/// Release-owned catalog taxonomy. Remote definitions cannot contain a
-/// fallback list. Offline model IDs are the catalog itself.
+/// Release-owned catalog taxonomy. Offline IDs are authoritative. The
+/// subscription fallback lives in `subscription_catalog` so discovery stays
+/// enabled for those providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCatalogDefinition {
     Offline { models: &'static [&'static str] },
@@ -631,6 +641,7 @@ pub fn parse_catalog(
                 supported_efforts: Vec::new(),
                 visible: true,
                 priority: None,
+                use_responses_lite: None,
                 extensions: None,
             });
             continue;
@@ -678,8 +689,9 @@ pub fn parse_catalog(
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
-                visible: true,
+                visible: catalog_entry_visible(&source, entry),
                 priority: None,
+                use_responses_lite: None,
                 extensions: None,
             });
             continue;
@@ -692,6 +704,14 @@ pub fn parse_catalog(
         {
             // Residual documented by B6k: the Anthropic Messages adapter is
             // intentionally not wired for Kimi until a later catalog wave.
+            continue;
+        }
+        if matches!(source, CatalogSource::AnthropicSubscription)
+            && entry
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind != "model")
+        {
             continue;
         }
         // codex names it `slug`; Anthropic names it `id`.
@@ -819,6 +839,13 @@ pub fn parse_catalog(
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(|visibility| visibility == "list"),
             priority: entry.get("priority").and_then(serde_json::Value::as_i64),
+            use_responses_lite: if matches!(source, CatalogSource::OpenAiSubscription) {
+                entry
+                    .get("use_responses_lite")
+                    .and_then(serde_json::Value::as_bool)
+            } else {
+                None
+            },
             extensions: kimi_extensions.or(grok_extensions),
         });
     }
@@ -851,6 +878,19 @@ pub fn parse_catalog(
         }
     }
     Ok(models)
+}
+
+/// Fixed API catalogs can explicitly exclude rows from their serving
+/// endpoint. Custom compatible catalogs remain advisory id lists.
+fn catalog_entry_visible(source: &CatalogSource, entry: &serde_json::Value) -> bool {
+    if !matches!(source, CatalogSource::HaiderCodeApi) {
+        return true;
+    }
+    entry
+        .get("visibility")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|visibility| visibility == "list")
+        && entry.get("supported_in_api") != Some(&serde_json::Value::Bool(false))
 }
 
 pub(crate) fn apply_catalog_credential(
@@ -889,13 +929,21 @@ fn sensitive_credential_header(
     Ok(request.header(name, value))
 }
 
-/// Picker order: provider priority first, then display name. Hidden models
-/// are dropped — the provider said not to list them.
+/// Whether the provider's actual request transport can serve this row.
+/// Both remote and static catalog projections must apply this predicate at
+/// the final picker projection.
 #[must_use]
-pub fn pickable(models: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
+pub fn model_servable_by_endpoint(provider: &str, model: &DiscoveredModel) -> bool {
+    model.visible
+        && (provider != crate::OPENAI_OAUTH_PROVIDER_NAME || model.use_responses_lite == Some(true))
+}
+
+/// Picker order: provider priority first, then display name.
+#[must_use]
+pub fn pickable(provider: &str, models: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
     let mut visible: Vec<DiscoveredModel> = models
         .iter()
-        .filter(|model| model.visible)
+        .filter(|model| model_servable_by_endpoint(provider, model))
         .cloned()
         .collect();
     visible.sort_by(|left, right| {

@@ -180,6 +180,7 @@ data class ModelOption(
     val supportedEfforts: List<String> = emptyList(),
     val defaultEffort: String? = null,
     val contextWindow: Long? = null,
+    val source: String? = null,
 )
 
 /** One provider row from `provider.list`, as the pickers need it. */

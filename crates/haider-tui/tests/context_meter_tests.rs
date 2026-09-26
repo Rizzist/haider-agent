@@ -67,6 +67,7 @@ fn summary(
                 supported_speeds: Vec::new(),
                 supports_thinking_type: None,
                 supports_vision: None,
+                source: None,
             })
             .collect(),
         catalog: haider_rpc::ProviderCatalogKindWire::Unknown,

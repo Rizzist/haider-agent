@@ -42,6 +42,18 @@ fn fixture_path() -> PathBuf {
         .join("wire_transcript.json")
 }
 
+/// Earlier append laws still pin their exact 184-frame history. The new
+/// subscription response is separately pinned by the full golden test.
+fn frozen_pre_subscription_transcript() -> Vec<WireFrame> {
+    let mut frames = transcript();
+    assert!(matches!(
+        frames.pop(),
+        Some(WireFrame::Response { request_id, body: ResponseBody::ProviderList { .. } })
+            if request_id.as_str() == "request-subscription-static-catalog"
+    ));
+    frames
+}
+
 fn contract_methods_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -1367,12 +1379,13 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     // prefix. K1 appends exactly one agent.cancel request/response pair:
     // 180 + 2 = 182. v0.0.970 appends exactly one provider.list response
     // carrying the new `acp_agent` execution family: 182 + 1 = 183. Stage 2
-    // appends the additive dated-workspace create request: 183 + 1 = 184. The 17
+    // appends the additive dated-workspace create request: 183 + 1 = 184. The
+    // fresh subscription fallback appends one provider.list: 184 + 1 = 185. The 17
     // moved method pairs remain absent from the supplemental fixture, so the
     // two sources stay disjoint. K1 adds one request method: 123 + 1 = 124;
     // the later status.snapshot and session.workspace.set methods make the
     // exhaustive count 126.
-    assert_eq!(expected_frames.len(), 184);
+    assert_eq!(expected_frames.len(), 185);
     let expected_bytes: Vec<GoldenWireBytes> = expected_frames
         .iter()
         .map(|frame| {
@@ -1404,6 +1417,21 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     let pinned: Vec<GoldenWireBytes> = serde_json::from_str(&golden).expect("decode fixture");
     assert_eq!(pinned, expected_bytes);
     assert_eq!(pinned.len(), expected_frames.len());
+    let fallback: Value = serde_json::from_str(&pinned.last().expect("fallback frame").ws_body)
+        .expect("fallback JSON");
+    assert_eq!(fallback["body"]["method"], "provider.list");
+    assert_eq!(
+        fallback["body"]["providers"][0]["availability"],
+        "available"
+    );
+    assert_eq!(
+        fallback["body"]["providers"][0]["model_details"][0]["source"],
+        "static"
+    );
+    assert_eq!(
+        fallback["body"]["providers"][0]["model_details"][1]["source"],
+        "static"
+    );
 
     for (bytes, expected_frame) in pinned.into_iter().zip(expected_frames) {
         assert!(!bytes.ws_body.contains('\n'), "WS body must be compact");
@@ -1432,7 +1460,7 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
 /// fail before these appended entries are reached.
 #[test]
 fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     assert_eq!(frames.len(), 184);
     let WireFrame::MonitorDelivery { watch_id, report } = &frames[129] else {
         panic!("monitor delivery must be the first appended stream frame");
@@ -1465,7 +1493,7 @@ fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
 /// exact delta/seal indices or typed field assertions below change.
 #[test]
 fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     assert_eq!(frames.len(), 184);
     let WireFrame::LoomRegistryDelta { watch_id, delta } = &frames[131] else {
         panic!("Loom registry delta must follow every prior golden frame");
@@ -1498,7 +1526,7 @@ fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
 /// additive event, or the external trust label changes these exact positions.
 #[test]
 fn peer_messaging_methods_and_events_are_tail_appended() {
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     assert_eq!(frames.len(), 184);
     assert!(matches!(
         &frames[133],
@@ -1597,7 +1625,7 @@ fn peer_messaging_methods_and_events_are_tail_appended() {
 /// the exact index, count, selector, or typed coordinate assertions below.
 #[test]
 fn prompt_fork_frames_remain_the_exact_four_frame_block() {
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     assert_eq!(
         frames.len(),
         184,
@@ -1699,7 +1727,7 @@ fn fleet_identity_is_the_exact_three_frame_tail_on_both_paths() {
         haider_rpc::FEATURE_SESSION_FLEET_IDENTITY_V1,
         "session_fleet_identity_v1"
     );
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     assert_eq!(
         frames.len(),
         184,
@@ -1747,7 +1775,7 @@ fn fleet_identity_is_the_exact_three_frame_tail_on_both_paths() {
 #[test]
 fn agent_cancel_is_the_exact_two_frame_tail() {
     assert_eq!(haider_rpc::FEATURE_AGENT_CANCEL_V1, "agent_cancel_v1");
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     assert_eq!(
         frames.len(),
         184,
@@ -3935,7 +3963,7 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // entries could not have moved. Later waves (U1) append strictly AFTER
     // the D1 block; the U1 welcome is the fence that re-proves the D1 block
     // is still exactly its original six frames, untouched.
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     let d1_start = frames
         .iter()
         .position(|frame| {
@@ -4303,7 +4331,7 @@ fn session_rename_frames_are_additive_and_golden() {
     // and F1 its three fleet frames strictly AFTER them, followed by L4's two
     // loom-registry stream frames, four prompt-fork frames, three X1
     // fleet-identity frames, and two K1 cancel frames (each pinned by its own law).
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     let g2_start = frames
         .iter()
         .position(|frame| {
@@ -4458,7 +4486,7 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     // and K1's two cancel frames (each later wave's own law pins its append). Anchor the intended block
     // by identity so a later tail append cannot silently slide this sequence
     // window onto unrelated frames.
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     let t1_start = frames
         .iter()
         .position(|frame| {
@@ -4597,7 +4625,7 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
     // four tuning frames, F1 three fleet frames, L4 two loom-registry stream
     // frames, v0.0.966 four prompt-fork frames, X1 three fleet-identity
     // frames, and K1 two cancel frames strictly AFTER them.
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     let u1_start = frames
         .iter()
         .position(|frame| {
@@ -5028,7 +5056,7 @@ fn model_detail_tuning_fields_are_additive_and_skip_empty() {
 fn session_fleet_frames_are_additive_and_unknown_tolerant() {
     assert_eq!(haider_rpc::FEATURE_SESSION_FLEET_V1, "session_fleet_v1");
     assert_eq!(haider_rpc::FLEET_MAX_NODES, 512);
-    let frames = transcript();
+    let frames = frozen_pre_subscription_transcript();
     let fleet_start = frames
         .iter()
         .position(|frame| {

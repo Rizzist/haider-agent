@@ -33,6 +33,7 @@ fn codex_payload() -> serde_json::Value {
                 ],
                 "visibility": "list",
                 "supported_in_api": true,
+                "use_responses_lite": true,
                 "priority": 1,
                 "base_instructions": "You are an agent…"
             },
@@ -41,6 +42,7 @@ fn codex_payload() -> serde_json::Value {
                 "display_name": "Frontier B",
                 "supported_reasoning_levels": [{"effort": "medium"}],
                 "visibility": "list",
+                "use_responses_lite": true,
                 "priority": 3
             },
             {
@@ -208,7 +210,7 @@ fn unusable_declared_token_limit_does_not_fall_back_to_an_alias() {
 fn provider_visibility_and_priority_drive_the_picker() {
     let models =
         parse_catalog(CatalogSource::OpenAiSubscription, &codex_payload()).expect("parses");
-    let listed = pickable(&models);
+    let listed = pickable(haider_provider::OPENAI_OAUTH_PROVIDER_NAME, &models);
     let slugs: Vec<&str> = listed.iter().map(|model| model.slug.as_str()).collect();
     assert_eq!(
         slugs,
@@ -218,6 +220,90 @@ fn provider_visibility_and_priority_drive_the_picker() {
     assert!(
         !slugs.contains(&"internal-only"),
         "a provider-hidden model must never reach a picker"
+    );
+}
+
+/// The subscription adapter always sends the Lite header. A Codex catalog
+/// row may be listed for another client transport while its model rejects
+/// Lite; neither a missing declaration nor an old cache can authorize it.
+#[test]
+fn subscription_picker_requires_provider_declared_lite_support() {
+    let models = parse_catalog(
+        CatalogSource::OpenAiSubscription,
+        &serde_json::json!({"models": [
+            {"slug": "lite-ready", "visibility": "list", "use_responses_lite": true},
+            {"slug": "standard-only", "visibility": "list", "use_responses_lite": false},
+            {"slug": "undeclared", "visibility": "list"},
+            {"slug": "private-lite", "visibility": "hidden", "use_responses_lite": true}
+        ]}),
+    )
+    .expect("redacted Codex catalog");
+    assert_eq!(models.len(), 4, "retain provider rows in the cache");
+    let restored: Vec<DiscoveredModel> =
+        serde_json::from_str(&serde_json::to_string(&models).expect("encode cache"))
+            .expect("restore cache");
+    assert!(haider_provider::model_servable_by_endpoint(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        &restored[0]
+    ));
+    assert!(!haider_provider::model_servable_by_endpoint(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        &restored[1]
+    ));
+    assert!(!haider_provider::model_servable_by_endpoint(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        &restored[2]
+    ));
+    assert_eq!(
+        pickable(haider_provider::OPENAI_OAUTH_PROVIDER_NAME, &restored)
+            .iter()
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["lite-ready"]
+    );
+    let legacy: DiscoveredModel = serde_json::from_value(serde_json::json!({
+        "slug": "old-cache-row", "display_name": "Old Cache Row",
+        "context_window": null, "description": null, "default_effort": null,
+        "supported_efforts": [], "visible": true, "priority": null
+    }))
+    .expect("old cache row");
+    assert!(pickable(haider_provider::OPENAI_OAUTH_PROVIDER_NAME, &[legacy]).is_empty());
+}
+
+#[test]
+fn other_fixed_catalogs_honor_their_own_endpoint_visibility() {
+    let anthropic = parse_catalog(
+        CatalogSource::AnthropicSubscription,
+        &serde_json::json!({"data": [
+            {"id": "claude-ready", "type": "model"},
+            {"id": "claude-hidden", "type": "model", "visibility": "hidden"},
+            {"id": "not-a-model", "type": "other"}
+        ]}),
+    )
+    .expect("redacted Anthropic catalog");
+    assert_eq!(
+        pickable(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME, &anthropic)
+            .iter()
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude-ready"]
+    );
+
+    let haider_code = parse_catalog(
+        CatalogSource::HaiderCodeApi,
+        &serde_json::json!({"data": [
+            {"id": "api-ready"},
+            {"id": "api-disabled", "supported_in_api": false},
+            {"id": "api-hidden", "visibility": "hidden"}
+        ]}),
+    )
+    .expect("redacted public API catalog");
+    assert_eq!(
+        pickable(haider_provider::HAIDER_CODE_PROVIDER_NAME, &haider_code)
+            .iter()
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["api-ready"]
     );
 }
 
@@ -303,6 +389,7 @@ fn openai_compatible_ids_are_models_without_invented_metadata() {
                 supported_efforts: Vec::new(),
                 visible: true,
                 priority: None,
+                use_responses_lite: None,
                 extensions: None,
             },
             DiscoveredModel {
@@ -315,6 +402,7 @@ fn openai_compatible_ids_are_models_without_invented_metadata() {
                 supported_efforts: Vec::new(),
                 visible: true,
                 priority: None,
+                use_responses_lite: None,
                 extensions: None,
             },
         ]
@@ -583,6 +671,7 @@ fn legacy_catalog_rows_serialize_byte_identically() {
         supported_efforts: Vec::new(),
         visible: true,
         priority: None,
+        use_responses_lite: None,
         extensions: None,
     };
     assert_eq!(
@@ -612,6 +701,7 @@ fn display_name_falls_back_to_the_slug() {
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            use_responses_lite: None,
             extensions: None,
         }]
     );

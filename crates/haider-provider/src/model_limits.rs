@@ -132,6 +132,9 @@ fn openai_limits(model: &str) -> StaticModelLimits {
             output_limit_sourced: true,
         }
     } else if [
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
@@ -144,7 +147,14 @@ fn openai_limits(model: &str) -> StaticModelLimits {
     .iter()
     .any(|id| documented_openai_id(model, id))
     {
+        // https://developers.openai.com/api/docs/models/gpt-6-astra
+        // https://developers.openai.com/api/docs/models/gpt-6-sol
+        // https://developers.openai.com/api/docs/models/gpt-6-luna
+        //   (checked 2026-09-25: 1,050,000 context, 128,000 max output)
         // https://developers.openai.com/api/docs/models/gpt-5.6-sol
+        //   (the bare `gpt-5.6` id has no page of its own: its URL
+        //   301-redirects here, so it is the gpt-5.6-sol alias; checked
+        //   2026-09-26)
         // https://developers.openai.com/api/docs/models/gpt-5.6-terra
         // https://developers.openai.com/api/docs/models/gpt-5.6-luna
         // https://developers.openai.com/api/docs/models/gpt-5.5

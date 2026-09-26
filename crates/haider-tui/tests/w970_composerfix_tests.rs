@@ -43,6 +43,7 @@ fn summaries_declaring_vision(vision: Option<bool>) -> Vec<haider_rpc::ProviderS
         .find(|summary| summary.provider == "anthropic")
         .expect("anthropic summary");
     anthropic.model_details = vec![ModelDetailWire {
+        source: None,
         name: "claude-opus-5".into(),
         display_name: None,
         context_window: Some(1_000_000),

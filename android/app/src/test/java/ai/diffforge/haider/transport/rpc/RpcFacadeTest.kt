@@ -79,7 +79,7 @@ class RpcFacadeTest {
         // A router-style catalog: advisory is what licenses a free-text model id.
         "inventory_authority" to "advisory",
         "models" to JsonArray(listOf(JsonPrimitive("m"))), "default_model" to "m", "auth_methods" to JsonArray(listOf("api_key", "oauth").map(::JsonPrimitive)),
-        "model_details" to JsonArray(listOf(obj("name" to "m", "context_window" to 4096, "supported_efforts" to JsonArray(listOf(JsonPrimitive("high")))))))
+        "model_details" to JsonArray(listOf(obj("name" to "m", "context_window" to 4096, "source" to "static", "supported_efforts" to JsonArray(listOf(JsonPrimitive("high")))))))
     private fun account() = obj("alias" to "work", "provider" to "p", "auth_method" to "oauth", "active" to true,
         "identity" to "synthetic", "status" to obj("status" to "ok"))
     private fun summary(id: String = "s") = obj("session_id" to id, "head_seq" to 2, "worker_generation" to 7,
@@ -187,6 +187,7 @@ class RpcFacadeTest {
             assertNotNull(ui.sessions.value.first { it.id == "s" }.needsInput)
             assertEquals(listOf("high"), ui.providers.value.effortsFor("p", "m"))
             assertEquals(4096L, ui.providers.value.model("p", "m")!!.contextWindow)
+            assertEquals("static", ui.providers.value.model("p", "m")!!.source)
             assertTrue(ui.providers.value.effortsFor("p", "absent").isEmpty())
             assertEquals(12L, ui.providers.value.revision)
             assertEquals("m", ui.models.value!!.current.model)

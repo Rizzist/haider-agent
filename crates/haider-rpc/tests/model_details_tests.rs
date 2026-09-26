@@ -39,6 +39,7 @@ fn provider_summary_model_details_round_trip_token_limits() {
         models: vec!["frontier-a".to_owned(), "frontier-b".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "frontier-a".to_owned(),
                 display_name: Some("Frontier A".to_owned()),
                 context_window: Some(200_000),
@@ -50,6 +51,7 @@ fn provider_summary_model_details_round_trip_token_limits() {
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "frontier-b".to_owned(),
                 display_name: None,
                 context_window: None,
@@ -245,4 +247,42 @@ fn provenance_refresh_is_a_state_check_even_for_an_empty_successful_catalog() {
             state
         );
     }
+}
+
+#[test]
+fn static_model_source_preserves_membership_under_a_failed_fetch() {
+    let mut summary: haider_rpc::ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider":"anthropic-oauth", "api_family":"anthropic_messages", "models":["claude-fable-5-1"],
+        "model_details":[{"name":"claude-fable-5-1","source":"static","context_window":1000000}],
+        "inventory":{"state":"unavailable","reason":"403"}, "availability":"available", "enabled":true
+    })).expect("static provider summary");
+    assert!(summary.has_static_models());
+    assert_eq!(
+        summary.model_inventory_status("claude-fable-5-1"),
+        haider_rpc::ModelInventoryStatusWire::Listed
+    );
+    assert_eq!(
+        summary.model_inventory_status("invented"),
+        haider_rpc::ModelInventoryStatusWire::Unlisted
+    );
+    summary.model_details[0].source = None;
+    assert!(!summary.has_static_models());
+    assert_eq!(
+        summary.model_inventory_status("claude-fable-5-1"),
+        haider_rpc::ModelInventoryStatusWire::Unknown
+    );
+}
+
+#[test]
+fn future_model_source_decodes_without_losing_the_row() {
+    let detail: ModelDetailWire = serde_json::from_value(serde_json::json!({
+        "name": "future-model",
+        "source": "future_catalog"
+    }))
+    .expect("future row source decodes");
+    assert_eq!(detail.name, "future-model");
+    assert_eq!(
+        detail.source,
+        Some(haider_rpc::ModelDetailSourceWire::Unknown)
+    );
 }

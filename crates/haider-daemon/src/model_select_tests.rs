@@ -301,6 +301,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
     first.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 900 };
     first.model_details = vec![
         ModelDetailWire {
+            source: None,
             name: "glm-4.7-flashx".into(),
             display_name: Some("ZAI Flash X".into()),
             context_window: Some(128_000),
@@ -312,6 +313,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
             supports_vision: Some(true),
         },
         ModelDetailWire {
+            source: None,
             name: "glm-4.7-air".into(),
             display_name: None,
             context_window: None,
@@ -790,4 +792,38 @@ fn remote_inventory_cannot_admit_an_unresolved_model_after_failed_discovery() {
             .expect("real ID"),
         ("haider-code".into(), "deepseek-v4-flash".into())
     );
+}
+
+#[test]
+fn static_subscription_row_is_selectable_after_catalog_403() {
+    let mut subscription = summary(
+        "anthropic-oauth",
+        &["claude-fable-5-1"],
+        ProviderAvailabilityWire::Available,
+    );
+    subscription.catalog = haider_rpc::ProviderCatalogKindWire::Authenticated;
+    subscription.model_details = vec![ModelDetailWire {
+        source: Some(haider_rpc::ModelDetailSourceWire::Static),
+        name: "claude-fable-5-1".into(),
+        display_name: None,
+        context_window: Some(1_000_000),
+        max_output_tokens: None,
+        supported_efforts: Vec::new(),
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    }];
+    subscription.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "provider does not serve a model list to this credential (403)".into(),
+    };
+    let authority = authority(&["anthropic-oauth"], vec![subscription]);
+    assert_eq!(
+        authority.validate_selection("anthropic-oauth", None, "claude-fable-5-1"),
+        Ok(("anthropic-oauth".into(), "claude-fable-5-1".into()))
+    );
+    assert!(matches!(
+        authority.validate_selection("anthropic-oauth", None, "invented-model"),
+        Err(SelectionRefusal::ModelUnknown { .. })
+    ));
 }

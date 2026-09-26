@@ -314,7 +314,7 @@ class RpcDaemonService(
         inventory.value = ProviderInventory(rows.map { provider -> ProviderOption(provider.id, provider.id,
             provider.models.map { name ->
                 val detail = provider.modelDetails.firstOrNull { it.id == name }
-                ModelOption(name, detail?.supportedEfforts.orEmpty(), detail?.defaultEffort, detail?.contextWindow)
+                ModelOption(name, detail?.supportedEfforts.orEmpty(), detail?.defaultEffort, detail?.contextWindow, detail?.source)
             }, provider.defaultModel, provider.available, provider.unavailableReason,
             // An advisory catalog is what licenses the picker's free-text model
             // id. Constructing the option without it silently removed custom

@@ -40,6 +40,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
         .expect("anthropic summary");
     anthropic.model_details = vec![
         ModelDetailWire {
+            source: None,
             name: "claude-opus-5".into(),
             display_name: None,
             context_window: Some(1_000_000),
@@ -53,6 +54,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             supports_vision: None,
         },
         ModelDetailWire {
+            source: None,
             name: "claude-sonnet-5".into(),
             display_name: None,
             context_window: Some(1_000_000),

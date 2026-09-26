@@ -714,7 +714,8 @@ fn wait_for_provider_snapshot(
 /// End-to-end credential/catalog law through the real CLI, daemon actor,
 /// durable vault/store, production compatible adapter, and recording HTTP
 /// endpoint. MUTATION CHECK: restoring synchronous configure/login discovery
-/// blocks the held 404 add; dropping the post-commit edge leaves NeverFetched;
+/// blocks the held 404 add; dropping the post-commit edge leaves a custom
+/// provider NeverFetched;
 /// dropping per-provider dedupe opens a second held `/models` request.
 #[cfg(unix)]
 #[test]
@@ -743,7 +744,13 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         .iter()
         .find(|row| row["provider"] == "haider-code")
         .expect("Haider Code provider row");
-    assert_eq!(haider_code["inventory"]["state"], "never_fetched");
+    assert_eq!(haider_code["inventory"]["state"], "static");
+    assert!(
+        haider_code["model_details"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["source"] == "static")),
+        "the initial subscription catalog is published: {haider_code}"
+    );
     let daemon = wait_for_daemon_pid(&owner.profile);
     let proxy = CredentialCatalogProxy::start();
 
@@ -810,8 +817,9 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
     assert_eq!(daemon_pid(&owner.profile), Some(daemon));
 
     // Start the second case with a deliberately fabricated catalog, then
-    // replace the credential while the endpoint 404s. The old row may remain
-    // honestly Stale, but it must not remain fresh or Available.
+    // replace the credential while the endpoint 404s. A different key is a
+    // different account identity (973 account-scoped catalogs): the previous
+    // key's rows are cleared at the commit and never reappear as Stale.
     proxy.set_mode(CredentialCatalogMode::Fabricated);
     let fabricated_before = proxy.model_requests.load(Ordering::SeqCst);
     let fabricated = spawn_keyed_account_command(
@@ -857,19 +865,18 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         String::from_utf8_lossy(&stale.stdout),
         String::from_utf8_lossy(&stale.stderr)
     );
-    let stale_row = wait_for_provider_snapshot(&owner.profile, "catalog-main", |row| {
-        row["inventory"]["state"] == "stale"
+    let failed_row = wait_for_provider_snapshot(&owner.profile, "catalog-main", |row| {
+        row["inventory"]["state"] == "unavailable"
     });
-    assert_eq!(stale_row["availability"], "unavailable");
+    assert_eq!(failed_row["availability"], "unavailable");
     assert!(
-        stale_row["inventory"]["reason"]
+        failed_row["inventory"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("404"))
     );
     assert!(
-        stale_row["models"]
-            .as_array()
-            .is_some_and(|models| models.iter().any(|model| model == "fabricated-old"))
+        failed_row["models"].as_array().is_some_and(Vec::is_empty),
+        "the replaced key's catalog must not survive as Stale: {failed_row}"
     );
 
     // Hold the corrected catalog in flight, replace the same credential a
@@ -884,10 +891,20 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         None,
         "fixture-concurrent-key",
     );
-    proxy
+    if proxy
         .held_started
         .recv_timeout(Duration::from_secs(3))
-        .expect("corrected catalog flight starts");
+        .is_err()
+    {
+        let output = first.wait_with_output().expect("first replacement output");
+        panic!(
+            "corrected catalog flight did not start; update exit {:?}; stdout: {}; stderr: {}; row: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            provider_snapshot_json(&owner.profile, "catalog-main")
+        );
+    }
     assert!(
         wait_for_child_exit(&mut first, Duration::from_secs(2)),
         "first replacement waited for its catalog flight"
@@ -1025,6 +1042,7 @@ fn run_custom_model_wire_case(
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            use_responses_lite: None,
             extensions: None,
         })
         .collect::<Vec<_>>();

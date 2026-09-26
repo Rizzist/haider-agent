@@ -62,6 +62,8 @@ struct ProviderView {
 struct ModelView {
     model: String,
     context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<haider_rpc::ModelDetailSourceWire>,
     max_output_tokens: Option<u64>,
     supported_efforts: Vec<String>,
     default_effort: Option<String>,
@@ -377,11 +379,7 @@ fn provider_view(
 ) -> ProviderView {
     let mut provider = provider;
     provider.inventory = provider.inventory.at_time(now_ms);
-    if matches!(
-        provider.inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
-            | haider_rpc::ModelInventoryWire::Unavailable { .. }
-    ) {
+    if !provider.has_known_models() {
         provider.models.clear();
         provider.model_details.clear();
         provider.default_model = None;
@@ -455,6 +453,7 @@ fn model_view(model: String) -> ModelView {
     ModelView {
         model,
         context_window: None,
+        source: None,
         max_output_tokens: None,
         supported_efforts: Vec::new(),
         default_effort: None,
@@ -467,6 +466,7 @@ fn model_detail_view(detail: ModelDetailWire) -> ModelView {
     ModelView {
         model: detail.name,
         context_window: detail.context_window,
+        source: detail.source,
         max_output_tokens: detail.max_output_tokens,
         supported_efforts: detail.supported_efforts,
         default_effort: detail.default_effort,
@@ -526,9 +526,15 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
             let output = model
                 .max_output_tokens
                 .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string());
+            let source = model
+                .source
+                .filter(|source| *source != haider_rpc::ModelDetailSourceWire::Unknown)
+                .map_or_else(String::new, |source| {
+                    format!("  source={}", source.as_str())
+                });
             text.push_str(&format!(
-                "  {}  context_window={}  max_output_tokens={}\n",
-                model.model, context, output
+                "  {}  context_window={}  max_output_tokens={}{}\n",
+                model.model, context, output, source
             ));
         }
     }

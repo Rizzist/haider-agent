@@ -1007,30 +1007,6 @@ async fn session_create_accepts_gemini_when_account_active() {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
     let config = DaemonConfig::new("profile-gemini", root.path().join("store"), root.path());
-    // Authenticated remote catalogs no longer fabricate built-in model rows.
-    // Seed an actually fetched fixture so this test remains about the active
-    // account/session-create wire path, not live Google catalog availability.
-    {
-        let store = haider_store::Store::open(&config.store_dir)
-            .unwrap_or_else(|error| panic!("seed Gemini catalog: {error:?}"));
-        let models = vec![haider_provider::DiscoveredModel {
-            slug: "gemini-2.5-flash".into(),
-            display_name: "Gemini 2.5 Flash".into(),
-            context_window: Some(1_048_576),
-            max_output_tokens: Some(65_536),
-            description: None,
-            default_effort: None,
-            supported_efforts: Vec::new(),
-            visible: true,
-            priority: None,
-            extensions: None,
-        }];
-        let models_json = serde_json::to_string(&models)
-            .unwrap_or_else(|error| panic!("serialize Gemini catalog: {error}"));
-        store
-            .put_provider_models("gemini", &models_json, None, 1)
-            .unwrap_or_else(|error| panic!("write Gemini catalog: {error:?}"));
-    }
     let fixture = AccountFixture::for_provider("gemini", Vec::new());
     let task = ready_with_dependencies(&config, fixture.dependencies()).await;
     let mut client = control_client(&config).await;
@@ -1057,6 +1033,42 @@ async fn session_create_accepts_gemini_when_account_active() {
     );
     assert_eq!(descriptor.provider, "gemini");
     assert!(descriptor.active);
+    drop(client);
+    task.shutdown_handle()
+        .request("seed fetched Gemini catalog");
+    let _ = task.join().await;
+
+    // Seed a fetched row for the committed account, then load it through a
+    // real daemon restart. The validator fixture does not contact Google.
+    {
+        let store = haider_store::Store::open(&config.store_dir)
+            .unwrap_or_else(|error| panic!("seed Gemini catalog: {error:?}"));
+        let models = vec![haider_provider::DiscoveredModel {
+            slug: "gemini-2.5-flash".into(),
+            display_name: "Gemini 2.5 Flash".into(),
+            context_window: Some(1_048_576),
+            max_output_tokens: Some(65_536),
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            use_responses_lite: None,
+            extensions: None,
+        }];
+        let models_json = serde_json::to_string(&models)
+            .unwrap_or_else(|error| panic!("serialize Gemini catalog: {error}"));
+        store
+            .put_provider_models(
+                haider_store::ProviderModelCacheKey::for_account("gemini", &descriptor).as_str(),
+                &models_json,
+                None,
+                1,
+            )
+            .unwrap_or_else(|error| panic!("write Gemini catalog: {error:?}"));
+    }
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
 
     let created = request(
         &mut client,
@@ -1082,13 +1094,14 @@ async fn session_create_accepts_gemini_when_account_active() {
 /// The e2e builder: accounts-backed RESOLUTION (active descriptor → vault
 /// secret) with a fake provider adapter, recording what it was handed.
 struct FakeAccountBuilder {
+    provider_id: &'static str,
     fake: Arc<haider_provider::FakeProvider>,
     built: StdMutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl haider_daemon::AccountProviderBuilder for FakeAccountBuilder {
     fn providers(&self) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::from(["fake".to_owned()])
+        std::collections::BTreeSet::from([self.provider_id.to_owned()])
     }
 
     fn build(
@@ -1108,12 +1121,702 @@ impl haider_daemon::AccountProviderBuilder for FakeAccountBuilder {
     }
 }
 
+#[derive(Default)]
+struct ForbiddenCatalog {
+    requested: StdMutex<Vec<haider_provider::CatalogSource>>,
+}
+
+#[async_trait::async_trait]
+impl haider_daemon::ProviderModelDiscoverer for ForbiddenCatalog {
+    async fn discover(
+        &self,
+        source: haider_provider::CatalogSource,
+        _access_token: Option<&str>,
+        _etag: Option<&str>,
+    ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
+        self.requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(source);
+        Err(haider_provider::CatalogError::Unavailable {
+            reason: "provider does not serve a model list to this credential (403)".into(),
+        })
+    }
+}
+
+struct AccountScopedCatalog;
+
+#[async_trait::async_trait]
+impl haider_daemon::ProviderModelDiscoverer for AccountScopedCatalog {
+    async fn discover(
+        &self,
+        source: haider_provider::CatalogSource,
+        access_token: Option<&str>,
+        _etag: Option<&str>,
+    ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
+        assert_eq!(source, haider_provider::CatalogSource::XaiApi);
+        match access_token {
+            Some("synthetic-account-a") => Ok(haider_provider::DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "a-only".into(),
+                    display_name: "A only".into(),
+                    context_window: None,
+                    max_output_tokens: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    use_responses_lite: None,
+                    extensions: None,
+                }],
+                etag: None,
+            }),
+            Some("synthetic-account-b") => Err(haider_provider::CatalogError::Unavailable {
+                reason: "synthetic account B /v1/models (403)".into(),
+            }),
+            other => panic!("unexpected catalog credential: {other:?}"),
+        }
+    }
+}
+
+/// Catalog cache sweep through the real daemon: the startup sweep drops
+/// rows no reader uses (a legacy bare key for an account-scoped catalog, the
+/// unreleased `account:<len>:` form, an orphan `account-v2:` key), keeps every
+/// live account's row and the PUBLIC Haider Code catalog under its bare key
+/// (Haider Code runs turns with an API key but reads a Public catalog), and
+/// account removal then drops exactly the removed account's row.
+/// MUTATION CHECK: classify providers by the profile's inference auth
+/// instead of the catalog's auth (the F1 bug); the public `haider-code` row
+/// disappears on the first restart.
+#[tokio::test]
+async fn catalog_sweep_keeps_public_and_live_rows_across_startup_and_account_removal() {
+    let root = test_root("hac-sweep-");
+    let config = DaemonConfig::new(
+        "profile-catalog-sweep",
+        root.path().join("store"),
+        root.path(),
+    );
+    let fixture = AccountFixture::for_provider("haider-code", Vec::new());
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+    let stage_a = stage_secret(&mut client, "sweep-a", "synthetic-haider-code-a").await;
+    let a = expect_descriptor(
+        request(
+            &mut client,
+            "login-sweep-a",
+            login_body_for_provider("command-sweep-a", "haider-code", &stage_a, Some("a"), None),
+        )
+        .await,
+    );
+    let stage_b = stage_secret(&mut client, "sweep-b", "synthetic-haider-code-b").await;
+    let b = expect_descriptor(
+        request(
+            &mut client,
+            "login-sweep-b",
+            login_body_for_provider("command-sweep-b", "haider-code", &stage_b, Some("b"), None),
+        )
+        .await,
+    );
+    drop(client);
+    task.shutdown_handle().request("seed catalog rows");
+    let _ = task.join().await;
+
+    let key_a = haider_store::ProviderModelCacheKey::for_account("haider-code", &a);
+    let key_b = haider_store::ProviderModelCacheKey::for_account("haider-code", &b);
+    let public = "haider-code";
+    let unread = [
+        "openai-oauth",
+        "account:12:openai-oauth:legacy",
+        "account-v2:0000000000000000000000000000000000000000000000000000000000000000",
+    ];
+    {
+        let store = haider_store::Store::open(&config.store_dir)
+            .unwrap_or_else(|error| panic!("open store: {error:?}"));
+        for key in [public, key_a.as_str(), key_b.as_str()]
+            .into_iter()
+            .chain(unread)
+        {
+            store
+                .put_provider_models(key, "[]", Some("etag"), 1)
+                .unwrap_or_else(|error| panic!("seed {key}: {error:?}"));
+        }
+    }
+    let present = |key: &str| {
+        haider_store::Store::open(&config.store_dir)
+            .unwrap_or_else(|error| panic!("reopen store: {error:?}"))
+            .provider_models(key)
+            .unwrap_or_else(|error| panic!("read {key}: {error:?}"))
+            .is_some()
+    };
+
+    // Startup sweep.
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    task.shutdown_handle().request("after startup sweep");
+    let _ = task.join().await;
+    assert!(
+        present(public),
+        "the public Haider Code catalog survives startup"
+    );
+    assert!(
+        present(key_a.as_str()) && present(key_b.as_str()),
+        "live accounts keep rows"
+    );
+    for key in unread {
+        assert!(!present(key), "startup sweep removes unread row {key}");
+    }
+
+    // Account change: removing B drops only B's row.
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+    let removed = request(
+        &mut client,
+        "remove-sweep-b",
+        RequestBody::AccountRemove {
+            command_id: CommandId::new("command-remove-sweep-b"),
+            alias: b.alias.as_str().to_owned(),
+            expected_revision: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(removed, ResponseBody::AccountRemove { .. }),
+        "remove B: {removed:?}"
+    );
+    drop(client);
+    task.shutdown_handle().request("after account removal");
+    let _ = task.join().await;
+    assert!(
+        present(public),
+        "the public catalog survives an account change"
+    );
+    assert!(
+        present(key_a.as_str()),
+        "the remaining account keeps its row"
+    );
+    assert!(
+        !present(key_b.as_str()),
+        "the removed account's row is pruned"
+    );
+}
+
+#[tokio::test]
+async fn newly_active_alias_never_projects_previous_account_after_failed_refresh() {
+    let root = test_root("hac-active-catalog-");
+    let config = DaemonConfig::new(
+        "profile-active-catalog",
+        root.path().join("store"),
+        root.path(),
+    );
+    let fixture = AccountFixture::for_provider("xai", Vec::new());
+    let mut dependencies = fixture.dependencies();
+    dependencies.accounts.model_discoverer = Some(Arc::new(AccountScopedCatalog));
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = control_client(&config).await;
+
+    let stage_a = stage_secret(&mut client, "active-a", "synthetic-account-a").await;
+    let a = expect_descriptor(
+        request(
+            &mut client,
+            "login-active-a",
+            login_body_for_provider("command-active-a", "xai", &stage_a, Some("a"), None),
+        )
+        .await,
+    );
+    assert!(a.active);
+    // The RPC harness disables automatic discovery. Explicitly fetch A's
+    // catalog, then exercise the same account-change boundary as production.
+    let refreshed_a = request(
+        &mut client,
+        "refresh-active-a",
+        RequestBody::ProviderModelsRefresh {
+            provider: "xai".into(),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed_a else {
+        panic!("A refresh failed: {refreshed_a:?}");
+    };
+    assert!(provider.models.contains(&"a-only".into()));
+
+    let stage_b = stage_secret(&mut client, "active-b", "synthetic-account-b").await;
+    let b = expect_descriptor(
+        request(
+            &mut client,
+            "login-active-b",
+            login_body_for_provider("command-active-b", "xai", &stage_b, Some("b"), None),
+        )
+        .await,
+    );
+    assert!(b.active);
+    let listed = request(
+        &mut client,
+        "list-active-b",
+        RequestBody::ProviderList {
+            provider: Some("xai".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = listed else {
+        panic!("provider.list after B login: {listed:?}");
+    };
+    assert!(!providers[0].models.contains(&"a-only".into()));
+
+    // The fake catalog returns 403 for B. A's row must stay absent both
+    // before and after this failed refresh.
+    let refreshed_b = request(
+        &mut client,
+        "refresh-active-b",
+        RequestBody::ProviderModelsRefresh {
+            provider: "xai".into(),
+        },
+    )
+    .await;
+    let ResponseBody::Error { .. } = refreshed_b else {
+        panic!("XAI's failed refresh must return a provider error: {refreshed_b:?}");
+    };
+    let after_failure = request(
+        &mut client,
+        "list-after-b-failure",
+        RequestBody::ProviderList {
+            provider: Some("xai".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = after_failure else {
+        panic!("provider.list after B failure: {after_failure:?}");
+    };
+    let provider = &providers[0];
+    assert!(!provider.models.contains(&"a-only".into()));
+    assert!(matches!(
+        provider.inventory,
+        haider_rpc::ModelInventoryWire::Unavailable { .. }
+    ));
+
+    task.shutdown_handle().request("test complete");
+    task.join()
+        .await
+        .unwrap_or_else(|error| panic!("daemon joins: {error:?}"));
+}
+
+/// End to end on the production accounts factory (catalog windows from the
+/// management snapshot): a static-window subscription row (haider-code /
+/// deepseek-v4-flash, whose static catalog row already carries its 128K
+/// window) accumulates history over several turns until the pre-request
+/// estimate crosses the 85% soft threshold; that turn commits
+/// `context_compaction_intent_v1` and still completes. The per-turn
+/// footprint history and any terminal error text are printed for evidence.
+/// The limits-table fallback for rows WITHOUT a declared window is covered
+/// by `undeclared_catalog_windows_still_yield_a_daemon_compaction_threshold`
+/// (haider-daemon accounts_tests), not by this test.
+/// MUTATION CHECK: drop the management snapshot from the `AccountsWith` seam
+/// (the worker gets no window: footprints carry no threshold and no intent
+/// is ever committed).
+#[tokio::test]
+async fn static_window_row_auto_compacts_at_the_soft_threshold_and_completes() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::history::COMPACTION_INTENT_EXTENSION_KIND;
+    use haider_protocol::item::TurnItem;
+    use haider_provider::{FakeProvider, FakeStep};
+
+    let root = test_root("hacC");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
+    let config = DaemonConfig::new("profile-compact", root.path().join("store"), root.path());
+    let segment = |text: &str| {
+        vec![
+            FakeStep::EmitText { text: text.into() },
+            FakeStep::Finish {
+                reason: haider_protocol::provider::FinishReason::EndTurn,
+            },
+        ]
+    };
+    let script = (0..24)
+        .flat_map(|index| segment(&format!("fake reply {index}")))
+        .collect::<Vec<_>>();
+    let fake = Arc::new(FakeProvider::new(script));
+    let builder = Arc::new(FakeAccountBuilder {
+        provider_id: "haider-code",
+        fake: fake.clone(),
+        built: StdMutex::new(Vec::new()),
+    });
+    let dependencies = DaemonDependencies {
+        provider_factory: haider_daemon::ProviderFactoryConfig::AccountsWith(builder.clone()),
+        accounts: AccountsDependencies {
+            vault: VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+            validator: ScriptedValidator::for_provider("haider-code", Vec::new()),
+            descriptor_store: None,
+            model_discoverer: Some(Arc::new(ForbiddenCatalog::default())),
+            ..AccountsDependencies::default()
+        },
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = control_client(&config).await;
+    let reference = stage_secret(&mut client, "stage-compact", "sk-compact-fake-key").await;
+    expect_descriptor(
+        request(
+            &mut client,
+            "req-compact-login",
+            login_body_for_provider(
+                "command-compact-login",
+                "haider-code",
+                &reference,
+                Some("compact"),
+                None,
+            ),
+        )
+        .await,
+    );
+    let created = request(
+        &mut client,
+        "req-compact-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("command-compact-create"),
+            cwd: workspace.display().to_string(),
+            provider: "haider-code".into(),
+            model: "deepseek-v4-flash".into(),
+            max_tokens: 4_096,
+        },
+    )
+    .await;
+    let (session_id, generation) = match created {
+        ResponseBody::SessionCreate {
+            session_id,
+            worker_generation,
+            ..
+        } => (session_id, worker_generation),
+        other => panic!("expected session.create response, got {other:?}"),
+    };
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("req-compact-attach"),
+                body: RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
+                },
+            },
+            LIMIT,
+        )
+        .await;
+    loop {
+        if let WireFrame::Response { request_id, body } = client.next().await {
+            assert_eq!(request_id.as_str(), "req-compact-attach");
+            assert!(matches!(body, ResponseBody::SessionAttach { .. }));
+            break;
+        }
+    }
+
+    // ~24K estimated tokens per prompt (bytes / 4): the 128K window's 85%
+    // line (108,800) is crossed only after several turns of history.
+    let chunk = "context filler for the compaction threshold ".repeat(2_200);
+    let mut history = Vec::new();
+    let mut compacted_turn = None;
+    for turn in 0..8_usize {
+        client
+            .send(
+                &WireFrame::Request {
+                    request_id: RequestId::new(format!("req-compact-submit-{turn}")),
+                    body: RequestBody::TurnSubmit {
+                        command_id: CommandId::new(format!("command-compact-submit-{turn}")),
+                        session_id: session_id.clone(),
+                        worker_generation: generation,
+                        text: format!("turn {turn}: {chunk}"),
+                        attachments: Vec::new(),
+                        mode: haider_protocol::DeliveryMode::Queue,
+                    },
+                },
+                LIMIT,
+            )
+            .await;
+        let mut footprints = Vec::new();
+        let mut intent = false;
+        let mut recent = std::collections::VecDeque::new();
+        let terminal = loop {
+            let WireFrame::Event { envelope, .. } = client.next().await else {
+                continue;
+            };
+            let raw: serde_json::Value = envelope.payload.into();
+            if recent.len() == 6 {
+                recent.pop_front();
+            }
+            recent.push_back(raw.to_string().chars().take(600).collect::<String>());
+            match serde_json::from_value::<EventPayload>(raw) {
+                Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data, .. },
+                    ..
+                })) => {
+                    if kind == COMPACTION_INTENT_EXTENSION_KIND {
+                        intent = true;
+                    } else if kind == "context_footprint_v1" {
+                        footprints.push((
+                            data["used_tokens"].as_u64(),
+                            data["context_window"].as_u64(),
+                            data["soft_threshold_tokens"].as_u64(),
+                        ));
+                    }
+                }
+                Ok(EventPayload::RunState(state)) if state.is_terminal() => break state,
+                _ => {}
+            }
+        };
+        eprintln!(
+            "compaction-e2e turn={turn} terminal={terminal:?} intent={intent} footprints={footprints:?}"
+        );
+        assert_eq!(
+            terminal,
+            haider_protocol::state::RunState::Done,
+            "turn {turn} must complete; footprints {footprints:?}; last events {recent:?}"
+        );
+        assert!(
+            footprints
+                .iter()
+                .all(|(_, window, threshold)| *window == Some(128_000)
+                    && *threshold == Some(108_800)),
+            "the catalog window reaches the worker: {footprints:?}"
+        );
+        history.push((turn, intent, footprints));
+        if intent {
+            compacted_turn = Some(turn);
+            break;
+        }
+    }
+    let compacted_turn = compacted_turn
+        .unwrap_or_else(|| panic!("no turn crossed 85% into compaction: {history:?}"));
+    assert!(
+        compacted_turn >= 2,
+        "compaction follows several prior turns"
+    );
+    let (_, _, footprints) = &history[compacted_turn];
+    assert!(
+        footprints
+            .iter()
+            .any(|(used, _, threshold)| used.zip(*threshold).is_some_and(|(u, t)| u >= t)),
+        "the compacting turn crossed the soft threshold: {footprints:?}"
+    );
+    for (turn, intent, footprints) in &history[..compacted_turn] {
+        assert!(!intent, "turn {turn} stayed under the threshold");
+        assert!(
+            footprints
+                .iter()
+                .all(|(used, _, threshold)| used.zip(*threshold).is_some_and(|(u, t)| u < t)),
+            "turn {turn} was below 85%: {footprints:?}"
+        );
+    }
+
+    drop(client);
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
+}
+
+/// Verifier F2 reproduction (repair 2): one prior turn, then a prompt whose
+/// own estimate (~142K) exceeds the whole 128K window. The window reaches the
+/// worker (threshold 108,800) and the soft line is crossed, but the planner in
+/// `prompt_history::plan_compaction` refuses before committing an intent:
+/// `invalid_argument` "there is not enough older clean-turn history to
+/// compact" (it keeps `COMPACTION_MIN_RECENT_PRIOR_TURNS` recent turns and
+/// needs one more older turn). No provider request is made. This pins the
+/// current compaction-internals behaviour, which belongs to the in-turn
+/// compaction lane; it is not a catalog/window defect.
+#[tokio::test]
+async fn oversized_turn_after_one_prior_turn_is_refused_by_the_compaction_planner() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::history::COMPACTION_INTENT_EXTENSION_KIND;
+    use haider_protocol::item::TurnItem;
+    use haider_provider::{FakeProvider, FakeStep};
+
+    let root = test_root("hacV");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
+    let config = DaemonConfig::new(
+        "profile-compact-probe",
+        root.path().join("store"),
+        root.path(),
+    );
+    let segment = |text: &str| {
+        vec![
+            FakeStep::EmitText { text: text.into() },
+            FakeStep::Finish {
+                reason: haider_protocol::provider::FinishReason::EndTurn,
+            },
+        ]
+    };
+    let script = (0..24)
+        .flat_map(|index| segment(&format!("fake reply {index}")))
+        .collect::<Vec<_>>();
+    let fake = Arc::new(FakeProvider::new(script));
+    let builder = Arc::new(FakeAccountBuilder {
+        provider_id: "haider-code",
+        fake: fake.clone(),
+        built: StdMutex::new(Vec::new()),
+    });
+    let dependencies = DaemonDependencies {
+        provider_factory: haider_daemon::ProviderFactoryConfig::AccountsWith(builder.clone()),
+        accounts: AccountsDependencies {
+            vault: VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+            validator: ScriptedValidator::for_provider("haider-code", Vec::new()),
+            descriptor_store: None,
+            model_discoverer: Some(Arc::new(ForbiddenCatalog::default())),
+            ..AccountsDependencies::default()
+        },
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = control_client(&config).await;
+    let reference = stage_secret(&mut client, "stage-compact", "sk-compact-fake-key").await;
+    expect_descriptor(
+        request(
+            &mut client,
+            "req-compact-login",
+            login_body_for_provider(
+                "command-compact-login",
+                "haider-code",
+                &reference,
+                Some("compact"),
+                None,
+            ),
+        )
+        .await,
+    );
+    let created = request(
+        &mut client,
+        "req-compact-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("command-compact-create"),
+            cwd: workspace.display().to_string(),
+            provider: "haider-code".into(),
+            model: "deepseek-v4-flash".into(),
+            max_tokens: 4_096,
+        },
+    )
+    .await;
+    let (session_id, generation) = match created {
+        ResponseBody::SessionCreate {
+            session_id,
+            worker_generation,
+            ..
+        } => (session_id, worker_generation),
+        other => panic!("expected session.create response, got {other:?}"),
+    };
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("req-compact-attach"),
+                body: RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
+                },
+            },
+            LIMIT,
+        )
+        .await;
+    loop {
+        if let WireFrame::Response { request_id, body } = client.next().await {
+            assert_eq!(request_id.as_str(), "req-compact-attach");
+            assert!(matches!(body, ResponseBody::SessionAttach { .. }));
+            break;
+        }
+    }
+
+    // The verifier's scratch shape: one small prior turn, then a single
+    // prompt whose own estimate (~140K) exceeds the whole 128K window.
+    let mut outcomes = Vec::new();
+    for (turn, text) in [
+        (0_usize, "small prior turn".to_owned()),
+        (1, "oversized ".repeat(56_000)),
+    ] {
+        client
+            .send(
+                &WireFrame::Request {
+                    request_id: RequestId::new(format!("req-probe-submit-{turn}")),
+                    body: RequestBody::TurnSubmit {
+                        command_id: CommandId::new(format!("command-probe-submit-{turn}")),
+                        session_id: session_id.clone(),
+                        worker_generation: generation,
+                        text,
+                        attachments: Vec::new(),
+                        mode: haider_protocol::DeliveryMode::Queue,
+                    },
+                },
+                LIMIT,
+            )
+            .await;
+        let mut footprints = Vec::new();
+        let mut intent = false;
+        let mut errors = Vec::new();
+        let terminal = loop {
+            let WireFrame::Event { envelope, .. } = client.next().await else {
+                continue;
+            };
+            let raw: serde_json::Value = envelope.payload.into();
+            let text = raw.to_string();
+            if text.contains("\"message\"") || text.contains("error") {
+                errors.push(text.chars().take(800).collect::<String>());
+            }
+            match serde_json::from_value::<EventPayload>(raw) {
+                Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data, .. },
+                    ..
+                })) => {
+                    if kind == COMPACTION_INTENT_EXTENSION_KIND {
+                        intent = true;
+                    } else if kind == "context_footprint_v1" {
+                        footprints.push((
+                            data["used_tokens"].as_u64(),
+                            data["soft_threshold_tokens"].as_u64(),
+                        ));
+                    }
+                }
+                Ok(EventPayload::RunState(state)) if state.is_terminal() => break state,
+                _ => {}
+            }
+        };
+        eprintln!(
+            "oversized-probe turn={turn} terminal={terminal:?} intent={intent} footprints={footprints:?} requests={} errors={errors:#?}",
+            fake.requests().len()
+        );
+        outcomes.push((terminal, intent, footprints, errors));
+    }
+    assert_eq!(outcomes[0].0, haider_protocol::state::RunState::Done);
+    let (terminal, intent, footprints, errors) = &outcomes[1];
+    assert_eq!(*terminal, haider_protocol::state::RunState::Errored);
+    assert!(
+        !intent,
+        "the planner refuses before any intent is committed"
+    );
+    assert!(
+        footprints
+            .iter()
+            .any(|(used, threshold)| used.zip(*threshold).is_some_and(|(u, t)| u > t)),
+        "the catalog window reached the worker and the soft line was crossed: {footprints:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("not enough older clean-turn history to compact")),
+        "typed planner refusal: {errors:?}"
+    );
+    assert_eq!(
+        fake.requests().len(),
+        1,
+        "the oversized turn never reached the provider"
+    );
+    drop(client);
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
+}
+
 // MUTATION CHECK (R6/R10 next-turn pickup): make the accounts-backed factory
 // resolve anything but the ACTIVE descriptor's vault secret (or stop
 // stamping `account_alias`). Expected failure: the builder-observed
 // alias/secret assertions or the Usage-envelope account assertion below.
 #[tokio::test]
-async fn committed_login_is_picked_up_by_the_next_fake_turn() {
+async fn fresh_login_survives_forbidden_catalog_and_runs_a_fake_turn() {
     use haider_protocol::EventPayload;
     use haider_provider::{FakeProvider, FakeStep};
 
@@ -1146,17 +1849,20 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
         },
     ]));
     let builder = Arc::new(FakeAccountBuilder {
+        provider_id: "haider-code",
         fake: fake.clone(),
         built: StdMutex::new(Vec::new()),
     });
+    let catalog = Arc::new(ForbiddenCatalog::default());
     let vault = Arc::new(MemoryVault::default());
-    let validator = ScriptedValidator::for_provider("fake", Vec::new());
+    let validator = ScriptedValidator::for_provider("haider-code", Vec::new());
     let dependencies = DaemonDependencies {
         provider_factory: haider_daemon::ProviderFactoryConfig::AccountsWith(builder.clone()),
         accounts: AccountsDependencies {
             vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
             validator: validator.clone(),
             descriptor_store: None,
+            model_discoverer: Some(catalog.clone()),
             ..AccountsDependencies::default()
         },
         ..DaemonDependencies::default()
@@ -1164,8 +1870,8 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
     let task = ready_with_dependencies(&config, dependencies).await;
     let mut client = control_client(&config).await;
 
-    // /login for the fake provider (fake validator success writes the
-    // MemoryVault + descriptor).
+    // A fresh private profile receives an account before any model-list
+    // result; the fake inference adapter records the next turn.
     let reference = stage_secret(&mut client, "stage-e2e", "sk-e2e-fake-key").await;
     let descriptor = expect_descriptor(
         request(
@@ -1173,7 +1879,7 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
             "req-e2e-login",
             RequestBody::AccountLoginApi {
                 command_id: CommandId::new("command-e2e-login"),
-                provider: "fake".into(),
+                provider: "haider-code".into(),
                 alias: Some("e2e".into()),
                 vault_reference: reference,
                 validation_model: None,
@@ -1181,6 +1887,74 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
             },
         )
         .await,
+    );
+
+    let listed = request(
+        &mut client,
+        "req-e2e-list",
+        RequestBody::ProviderList {
+            provider: Some("haider-code".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = listed else {
+        panic!("provider.list after login: {listed:?}");
+    };
+    let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.provider == "haider-code")
+    else {
+        panic!("Haider Code row missing");
+    };
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(
+        provider
+            .models
+            .iter()
+            .any(|model| model == "deepseek-v4-flash")
+    );
+    assert!(
+        provider
+            .model_details
+            .iter()
+            .any(|row| row.name == "deepseek-v4-flash"
+                && row.source == Some(haider_rpc::ModelDetailSourceWire::Static))
+    );
+
+    let refreshed = request(
+        &mut client,
+        "req-e2e-refresh",
+        RequestBody::ProviderModelsRefresh {
+            provider: "haider-code".into(),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed else {
+        panic!("forbidden model list must be informational: {refreshed:?}");
+    };
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(
+        matches!(provider.inventory, haider_rpc::ModelInventoryWire::Unavailable { ref reason } if reason.contains("(403)"))
+    );
+    assert!(
+        provider
+            .models
+            .iter()
+            .any(|model| model == "deepseek-v4-flash")
+    );
+    assert!(
+        catalog
+            .requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|source| source.endpoint().ends_with("/v1/models"))
     );
 
     // Next logical turn: create + attach + submit, then read the run to its
@@ -1192,8 +1966,8 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
         RequestBody::SessionCreate {
             command_id: CommandId::new("command-e2e-create"),
             cwd: workspace_text,
-            provider: "fake".into(),
-            model: "fake-model".into(),
+            provider: "haider-code".into(),
+            model: "deepseek-v4-flash".into(),
             max_tokens: 64,
         },
     )

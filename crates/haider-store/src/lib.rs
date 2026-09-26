@@ -19,6 +19,7 @@ mod cas;
 mod event_store;
 mod migrations;
 mod profile_lock;
+mod provider_model_cache_key;
 mod provider_view_store;
 mod usage_ledger;
 
@@ -68,6 +69,7 @@ pub use event_store::{
     graph_finalization_state_digest,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
+pub use provider_model_cache_key::ProviderModelCacheKey;
 pub use usage_ledger::{
     UsageLedgerCounters, UsageLedgerLane, UsageLedgerSlot, UsageLedgerWriter, UsageSlotAddress,
     read_usage_day, read_usage_range, reduce_journal_usage, slot_address,
