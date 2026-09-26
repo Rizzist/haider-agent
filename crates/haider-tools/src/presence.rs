@@ -29,6 +29,12 @@ mod overlay_macos;
 #[path = "presence/overlay_windows.rs"]
 mod overlay_windows;
 
+/// The Windows overlay's platform-independent state (tested everywhere).
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(all(test, not(target_os = "windows")), allow(dead_code))]
+#[path = "presence/overlay_windows_logic.rs"]
+mod overlay_windows_logic;
+
 #[cfg(target_os = "linux")]
 #[path = "presence/overlay_linux.rs"]
 mod overlay_linux;
@@ -559,7 +565,7 @@ impl LinuxNotificationPlan {
     #[must_use]
     pub fn actions(&self) -> Vec<&'static str> {
         if self.stop_button {
-            vec!["stop", "Stop"]
+            vec![LinuxStopRouter::STOP_ACTION, "Stop"]
         } else {
             Vec::new()
         }
@@ -583,6 +589,80 @@ impl LinuxNotificationPlan {
         } else {
             format!("{base}\n{LINUX_FALLBACK_STOP_HINT}")
         }
+    }
+}
+
+/// Routes the Linux notification's Stop action to the presence it belongs to.
+///
+/// The helper closes its notification around every model-facing capture
+/// (`Conceal`) and posts a new one on `Reveal`, so one presence *generation*
+/// (`Show` .. `Hide`) owns several notification ids. An `ActionInvoked` for
+/// an earlier id can still be queued on the bus when `CloseNotification`
+/// returns (verifier finding B3 on 8c614f6c: matching only the current id
+/// dropped that Stop). Every id posted in the active generation therefore
+/// stays live until `Hide`; `Hide` retires them all, so a late action can
+/// never stop a later generation. Pure so it is unit-tested everywhere.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LinuxStopRouter {
+    active: bool,
+    stopping: bool,
+    live: BTreeSet<u32>,
+}
+
+impl LinuxStopRouter {
+    /// Action key of the notification's Stop button.
+    pub const STOP_ACTION: &'static str = "stop";
+
+    /// `Show`: starts a generation, or refreshes the active one (a label
+    /// change keeps its ids live).
+    pub fn show(&mut self) {
+        if !self.active {
+            self.live.clear();
+        }
+        self.active = true;
+        self.stopping = false;
+    }
+
+    /// The server returned `id` for a notification of this generation.
+    pub fn posted(&mut self, id: u32) {
+        if self.active && id != 0 {
+            self.live.insert(id);
+        }
+    }
+
+    /// The daemon acknowledged a Stop (`Stopping`).
+    pub fn stopping(&mut self) {
+        self.stopping = true;
+    }
+
+    /// `Hide`: the generation ends and every id it posted is retired.
+    pub fn hide(&mut self) {
+        self.active = false;
+        self.stopping = false;
+        self.live.clear();
+    }
+
+    /// Whether a generation is showing (notification updates are allowed).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Whether a Stop is already on its way.
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stopping
+    }
+
+    /// An `ActionInvoked(id, key)` signal: `true` exactly once per
+    /// generation when it is the Stop button of one of its notifications,
+    /// including ones already closed for a capture.
+    pub fn on_action(&mut self, id: u32, key: &str) -> bool {
+        if key != Self::STOP_ACTION || !self.active || self.stopping || !self.live.contains(&id) {
+            return false;
+        }
+        self.stopping = true;
+        true
     }
 }
 

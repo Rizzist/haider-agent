@@ -468,7 +468,6 @@ async fn capturable_indicators_are_concealed_around_model_captures_only() {
             .expect("begin");
         // Nobody acks: the bounded wait elapses, the capture proceeds.
         let guard = lease.conceal_for_capture().await;
-        assert_eq!(guard.is_some(), capturable);
         drop(guard);
         drop(action);
         let commands = recorded.commands.lock().unwrap().clone();
@@ -552,7 +551,6 @@ async fn first_capture_is_concealed_before_the_helper_reports_ready() {
         .expect("begin");
     // No Ready has been (or can be) read yet: the first capture must conceal.
     let guard = lease.conceal_for_capture().await;
-    assert!(guard.is_some(), "the first capture of a run is concealed");
     drop(guard);
     drop(action);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -574,4 +572,142 @@ async fn first_capture_is_concealed_before_the_helper_reports_ready() {
     let reveal = text.find("\"op\":\"reveal\"").expect("reveal sent");
     assert!(show < conceal && conceal < reveal, "{text}");
     lease.end(false);
+}
+
+/// Polls a future once without a runtime wake-up; true while it is pending.
+fn poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> bool {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    future.poll(&mut context).is_pending()
+}
+
+/// Records conceal/reveal only, and whether a Conceal was ever answered.
+fn conceal_log(recorded: &Recorded) -> Vec<&'static str> {
+    recorded
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|command| match command {
+            PresenceCommand::Conceal { .. } => Some("conceal"),
+            PresenceCommand::Reveal { .. } => Some("reveal"),
+            _ => None,
+        })
+        .collect()
+}
+
+fn conceal_seq(recorded: &Recorded) -> u64 {
+    recorded
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|command| match command {
+            PresenceCommand::Conceal { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .expect("a conceal was sent")
+}
+
+/// Verifier finding B2 (8c614f6c), cancellation: a capture cancelled while
+/// waiting for the conceal ack (Esc/Stop) left no guard, so the indicator —
+/// and its Stop control — stayed hidden while ANOTHER session kept the
+/// surface. The hold is now taken before the first await.
+/// MUTATION CHECK: construct the guard after the ack wait. Expected runtime
+/// failure: no "reveal" after the cancelled capture.
+#[tokio::test]
+async fn capture_cancelled_before_the_conceal_ack_still_reveals() {
+    let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
+    // Session B keeps the screen (e.g. a long wait/typing action).
+    let (stop_b, _) = counting_hook();
+    let lease_b = PresenceLease::new(Arc::clone(&presence), "s/b".into(), stop_b);
+    let _b_action = lease_b
+        .begin_computer(
+            &ComputerAction::Wait { ms: 60_000 },
+            None,
+            &haider_tools::ComputerCancelToken::new(),
+        )
+        .await
+        .expect("begin b");
+    // Session A starts a screenshot; nobody acks the conceal.
+    let (stop_a, _) = counting_hook();
+    let lease_a = PresenceLease::new(Arc::clone(&presence), "s/a".into(), stop_a);
+    {
+        let capture = lease_a.conceal_for_capture();
+        tokio::pin!(capture);
+        // Poll once: the Conceal is sent and the future parks on the ack.
+        assert!(poll_once(capture.as_mut()), "waiting for the helper's ack");
+        assert_eq!(conceal_log(&recorded), vec!["conceal"]);
+        // Esc: the capture future is dropped mid-wait.
+    }
+    assert_eq!(
+        conceal_log(&recorded),
+        vec!["conceal", "reveal"],
+        "the cancelled capture releases its hold and reveals"
+    );
+    assert_eq!(presence.capture_holders(PresenceSurface::Screen), 0);
+    lease_a.end(true);
+    assert!(
+        presence.is_shown(PresenceSurface::Screen),
+        "B still controls the screen"
+    );
+}
+
+/// Verifier finding B2 (8c614f6c), overlap: two sessions' captures sent
+/// independent Conceal/Reveal, so the first to finish revealed the surface
+/// while the other capture was still running.
+/// MUTATION CHECK: reveal on every guard drop instead of the last. Expected
+/// runtime failure: a "reveal" while capture B is still held.
+#[tokio::test]
+async fn overlapping_captures_reveal_only_when_the_last_one_retires() {
+    let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
+    let (stop_a, _) = counting_hook();
+    let (stop_b, _) = counting_hook();
+    let lease_a = PresenceLease::new(Arc::clone(&presence), "s/a".into(), stop_a);
+    let lease_b = PresenceLease::new(Arc::clone(&presence), "s/b".into(), stop_b);
+    for lease in [&lease_a, &lease_b] {
+        drop(
+            lease
+                .begin_computer(
+                    &ComputerAction::Screenshot,
+                    None,
+                    &haider_tools::ComputerCancelToken::new(),
+                )
+                .await
+                .expect("begin"),
+        );
+    }
+    let sink = recorded.sink.lock().unwrap().clone().expect("sink");
+    // A's capture starts; the helper acks promptly.
+    let capture_a = lease_a.conceal_for_capture();
+    tokio::pin!(capture_a);
+    assert!(poll_once(capture_a.as_mut()));
+    sink(PresenceEvent::Ack {
+        seq: conceal_seq(&recorded),
+    });
+    let guard_a = capture_a.await;
+    // B's capture overlaps: the surface is already concealed and acked, so
+    // B neither re-conceals nor waits.
+    let started = Instant::now();
+    let guard_b = lease_b.conceal_for_capture().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "no second ack wait"
+    );
+    assert_eq!(
+        conceal_log(&recorded),
+        vec!["conceal"],
+        "one Conceal for both"
+    );
+    assert_eq!(presence.capture_holders(PresenceSurface::Screen), 2);
+    drop(guard_a);
+    assert_eq!(
+        conceal_log(&recorded),
+        vec!["conceal"],
+        "A finishing must not reveal while B is capturing"
+    );
+    drop(guard_b);
+    assert_eq!(conceal_log(&recorded), vec!["conceal", "reveal"]);
+    lease_a.end(false);
+    lease_b.end(false);
 }

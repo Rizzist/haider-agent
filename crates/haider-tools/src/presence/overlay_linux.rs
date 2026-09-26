@@ -20,8 +20,8 @@
 //! into its notification list quickly, where Stop stays available.
 
 use super::{
-    LinuxNotificationPlan, PresenceCommand, PresenceEvent, PresenceMark, encode_event,
-    parse_command_line,
+    LinuxNotificationPlan, LinuxStopRouter, PresenceCommand, PresenceEvent, PresenceMark,
+    encode_event, parse_command_line,
 };
 use futures_util::StreamExt as _;
 use std::collections::HashMap;
@@ -33,8 +33,6 @@ use zbus::zvariant::Value;
 const DESTINATION: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
 const INTERFACE: &str = "org.freedesktop.Notifications";
-/// Action key of the Stop button (see `LinuxNotificationPlan::actions`).
-const STOP_ACTION: &str = "stop";
 /// Body updates are rate-limited so a burst of actions does not spam the bus.
 const UPDATE_INTERVAL: Duration = Duration::from_millis(800);
 
@@ -73,7 +71,9 @@ struct Notifier {
 }
 
 impl Notifier {
-    async fn notify(&mut self, body: &str) {
+    /// Posts (or replaces) the notification and records its id with the
+    /// Stop router of the active generation.
+    async fn notify(&mut self, body: &str, router: &mut LinuxStopRouter) {
         self.last_body = body.to_owned();
         let body = self.plan.body(body);
         let body = body.as_str();
@@ -102,7 +102,10 @@ impl Notifier {
             )
             .await;
         match reply.and_then(|reply| reply.body().deserialize::<u32>()) {
-            Ok(id) => self.id = id,
+            Ok(id) => {
+                self.id = id;
+                router.posted(id);
+            }
             Err(error) => emit(&PresenceEvent::Error {
                 message: format!("desktop notification failed: {error}"),
             }),
@@ -110,6 +113,8 @@ impl Notifier {
         self.last_update = Some(Instant::now());
     }
 
+    /// Closes the current notification. Its id stays live in the router
+    /// until `Hide`: a Stop already queued on the bus still counts.
     async fn close(&mut self) {
         if self.id == 0 {
             return;
@@ -201,8 +206,7 @@ async fn run_async() -> i32 {
         last_body: String::new(),
         plan,
     };
-    let mut visible = false;
-    let mut stopping = false;
+    let mut router = LinuxStopRouter::default();
     loop {
         tokio::select! {
             line = lines.recv() => {
@@ -211,25 +215,24 @@ async fn run_async() -> i32 {
                     Some(Ok(command)) => match command {
                         PresenceCommand::Show { label, .. } => {
                             notifier.label = label;
-                            visible = true;
-                            stopping = false;
+                            router.show();
                             let body = notifier.plan.intro_body();
-                            notifier.notify(body).await;
+                            notifier.notify(body, &mut router).await;
                         }
                         PresenceCommand::Pointer { seq, mark, point, .. } => {
                             emit(&PresenceEvent::Ack { seq });
                             let due = notifier.last_update.is_none_or(|last| last.elapsed() >= UPDATE_INTERVAL);
-                            if visible && due && mark != PresenceMark::Observe {
+                            if router.is_active() && due && mark != PresenceMark::Observe {
                                 let body = point.map_or_else(
                                     || format!("Last action: {}", mark.caption()),
                                     |point| format!("Last action: {} at ({:.0}, {:.0})", mark.caption(), point.x, point.y),
                                 );
-                                notifier.notify(&body).await;
+                                notifier.notify(&body, &mut router).await;
                             }
                         }
-                        PresenceCommand::Stopping { .. } => stopping = true,
+                        PresenceCommand::Stopping { .. } => router.stopping(),
                         PresenceCommand::Hide { .. } => {
-                            visible = false;
+                            router.hide();
                             notifier.close().await;
                         }
                         // The popup is an ordinary window: close it around a
@@ -240,9 +243,9 @@ async fn run_async() -> i32 {
                             emit(&PresenceEvent::Ack { seq });
                         }
                         PresenceCommand::Reveal { .. } => {
-                            if visible && !stopping {
+                            if router.is_active() && !router.is_stopping() {
                                 let body = notifier.last_body.clone();
-                                notifier.notify(&body).await;
+                                notifier.notify(&body, &mut router).await;
                             }
                         }
                     },
@@ -262,13 +265,11 @@ async fn run_async() -> i32 {
                     actions = None;
                     continue;
                 };
+                // Any notification of the active generation — including
+                // one closed for a capture whose Stop was already queued.
                 if let Ok((id, key)) = signal.body().deserialize::<(u32, String)>()
-                    && id == notifier.id
-                    && key == STOP_ACTION
-                    && visible
-                    && !stopping
+                    && router.on_action(id, &key)
                 {
-                    stopping = true;
                     emit(&PresenceEvent::Stop);
                 }
             }

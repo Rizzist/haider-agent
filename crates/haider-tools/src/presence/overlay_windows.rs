@@ -19,20 +19,15 @@
 //! ignored. Every FFI call is confined to the `win` module; each unsafe block
 //! states its invariant.
 
+use super::overlay_windows_logic::{BadgeText, Overlay, OverlayWindow};
 use super::{
-    PresenceCommand, PresenceEvent, PresenceMark, PresencePoint, SYNTHETIC_INPUT_TAG, art,
-    encode_event, parse_command_line,
+    PresenceCommand, PresenceEvent, SYNTHETIC_INPUT_TAG, art, encode_event, parse_command_line,
 };
 use std::collections::VecDeque;
 use std::io::{BufRead as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-const MOVE_DURATION: Duration = Duration::from_millis(160);
-const RING_DURATION: Duration = Duration::from_millis(450);
-const BADGE_MARGIN: f64 = 10.0;
-const BADGE_AVOID_MARGIN: f64 = 28.0;
 
 /// Set by the badge's window procedure; drained by the main loop.
 static STOP_CLICKED: AtomicBool = AtomicBool::new(false);
@@ -66,7 +61,7 @@ pub(super) fn run() -> i32 {
     if spawned.is_err() {
         return 70;
     }
-    let mut overlay = match Overlay::new() {
+    let mut overlay = match create_overlay() {
         Ok(overlay) => overlay,
         Err(message) => {
             emit(&PresenceEvent::Error { message });
@@ -93,11 +88,17 @@ pub(super) fn run() -> i32 {
             .map(|mut queue| queue.drain(..).collect())
             .unwrap_or_default();
         for command in pending {
-            overlay.apply(command);
+            overlay.apply(command, Instant::now());
         }
         overlay.animate(Instant::now());
+        for event in overlay.take_events() {
+            emit(&event);
+        }
         if closed.load(Ordering::Acquire) {
             overlay.hide();
+            for event in overlay.take_events() {
+                emit(&event);
+            }
             return 0;
         }
     }
@@ -109,245 +110,41 @@ fn emit(event: &PresenceEvent) {
     let _ = stdout.flush();
 }
 
-type BadgeText<'a> = (&'a str, (f64, f64, f64, f64), bool);
-
-struct Overlay {
-    scale: f64,
-    pointer: win::Layered,
-    ring: win::Layered,
-    badge: win::Layered,
-    ring_bitmap: art::Bitmap,
-    capture_excluded: bool,
-    visible: bool,
-    stopping: bool,
-    badge_at_top: bool,
-    label: String,
-    position: Option<(f64, f64)>,
-    move_from: (f64, f64),
-    move_to: (f64, f64),
-    move_started: Option<Instant>,
-    ack_on_arrival: Option<u64>,
-    ring_on_arrival: bool,
-    ring_started: Option<Instant>,
+fn create_overlay() -> Result<Overlay<win::Layered>, String> {
+    let scale = win::system_scale();
+    let pointer = win::Layered::create(true)?;
+    let ring = win::Layered::create(true)?;
+    let badge = win::Layered::create(false)?;
+    let capture_excluded = [&pointer, &ring, &badge]
+        .iter()
+        .all(|window| window.exclude_from_capture());
+    Overlay::new(
+        scale,
+        win::work_area,
+        pointer,
+        ring,
+        badge,
+        capture_excluded,
+    )
 }
 
-impl Overlay {
-    fn new() -> Result<Self, String> {
-        let scale = win::system_scale();
-        let pointer = win::Layered::create(true)?;
-        let ring = win::Layered::create(true)?;
-        let badge = win::Layered::create(false)?;
-        let capture_excluded = [&pointer, &ring, &badge]
-            .iter()
-            .all(|window| window.exclude_from_capture());
-        pointer.set_image(&art::pointer(scale), 255)?;
-        let ring_bitmap = art::click_ring(scale);
-        ring.set_image(&ring_bitmap, 255)?;
-        let mut overlay = Self {
-            scale,
-            pointer,
-            ring,
-            badge,
-            ring_bitmap,
-            capture_excluded,
-            visible: false,
-            stopping: false,
-            badge_at_top: true,
-            label: "Haider is controlling this screen".into(),
-            position: None,
-            move_from: (0.0, 0.0),
-            move_to: (0.0, 0.0),
-            move_started: None,
-            ack_on_arrival: None,
-            ring_on_arrival: false,
-            ring_started: None,
-        };
-        overlay.draw_badge("Stop")?;
-        Ok(overlay)
+impl OverlayWindow for win::Layered {
+    fn show_at(&self, x: i32, y: i32) {
+        win::Layered::show_at(self, x, y);
     }
-
-    fn draw_badge(&mut self, stop: &str) -> Result<(), String> {
-        let bitmap = art::badge(self.scale);
-        let (stop_x, stop_y, stop_w, stop_h) = art::BADGE_STOP_RECT;
-        let s = self.scale;
-        let label = self.label.clone();
-        let texts: [BadgeText<'_>; 2] = [
-            (
-                label.as_str(),
-                (32.0 * s, 0.0, 294.0 * s, art::BADGE_SIZE.1 * s),
-                false,
-            ),
-            (
-                stop,
-                (
-                    stop_x * s,
-                    stop_y * s,
-                    (stop_x + stop_w) * s,
-                    (stop_y + stop_h) * s,
-                ),
-                true,
-            ),
-        ];
-        self.badge
-            .set_image_with_text(&bitmap, &texts, (13.0 * s).round() as i32)
+    fn hide(&self) {
+        win::Layered::hide(self);
     }
-
-    fn badge_origin(&self, top: bool) -> (i32, i32) {
-        let work = win::work_area();
-        let width = art::BADGE_SIZE.0 * self.scale;
-        let height = art::BADGE_SIZE.1 * self.scale;
-        let x = f64::from(work.0) + (f64::from(work.2 - work.0) - width) / 2.0;
-        let y = if top {
-            f64::from(work.1) + BADGE_MARGIN * self.scale
-        } else {
-            f64::from(work.3) - height - BADGE_MARGIN * self.scale
-        };
-        (x.round() as i32, y.round() as i32)
+    fn set_image(&self, bitmap: &art::Bitmap, alpha: u8) -> Result<(), String> {
+        win::Layered::set_image(self, bitmap, alpha)
     }
-
-    fn apply(&mut self, command: PresenceCommand) {
-        match command {
-            PresenceCommand::Show { label, .. } => {
-                self.label = label;
-                self.stopping = false;
-                let _ = self.draw_badge("Stop");
-                self.visible = true;
-                let (x, y) = self.badge_origin(self.badge_at_top);
-                self.badge.show_at(x, y);
-                if let Some(position) = self.position {
-                    self.place_pointer(position);
-                }
-            }
-            PresenceCommand::Pointer {
-                seq, mark, point, ..
-            } => self.pointer_to(seq, mark, point),
-            PresenceCommand::Stopping { .. } => {
-                self.stopping = true;
-                let _ = self.draw_badge("…");
-            }
-            PresenceCommand::Hide { .. } => self.hide(),
-            // The daemon also conceals before it has read `Ready`; windows
-            // with WDA_EXCLUDEFROMCAPTURE are already absent from captures.
-            PresenceCommand::Conceal { seq, .. } => {
-                if !self.capture_excluded {
-                    self.pointer.hide();
-                    self.ring.hide();
-                    self.badge.hide();
-                }
-                emit(&PresenceEvent::Ack { seq });
-            }
-            PresenceCommand::Reveal { .. } => {
-                if self.visible && !self.capture_excluded {
-                    let (x, y) = self.badge_origin(self.badge_at_top);
-                    self.badge.show_at(x, y);
-                    if let Some(position) = self.position {
-                        self.place_pointer(position);
-                    }
-                }
-            }
-        }
-    }
-
-    fn pointer_to(&mut self, seq: u64, mark: PresenceMark, point: Option<PresencePoint>) {
-        let Some(target) = point.map(|point| (point.x, point.y)).or(self.position) else {
-            emit(&PresenceEvent::Ack { seq });
-            return;
-        };
-        if mark.posts_pointer_input() {
-            self.avoid_badge(target);
-        }
-        let from = self.position.unwrap_or(target);
-        self.move_from = from;
-        self.move_to = target;
-        self.move_started = Some(Instant::now());
-        self.ring_on_arrival = mark.posts_pointer_input();
-        if mark.posts_pointer_input() && from != target {
-            if let Some(previous) = self.ack_on_arrival.replace(seq) {
-                emit(&PresenceEvent::Ack { seq: previous });
-            }
-        } else {
-            emit(&PresenceEvent::Ack { seq });
-        }
-        self.position = Some(target);
-        self.animate(Instant::now());
-    }
-
-    fn avoid_badge(&mut self, target: (f64, f64)) {
-        let (x, y) = self.badge_origin(self.badge_at_top);
-        let margin = BADGE_AVOID_MARGIN * self.scale;
-        let near = target.0 >= f64::from(x) - margin
-            && target.0 <= f64::from(x) + art::BADGE_SIZE.0 * self.scale + margin
-            && target.1 >= f64::from(y) - margin
-            && target.1 <= f64::from(y) + art::BADGE_SIZE.1 * self.scale + margin;
-        if near {
-            self.badge_at_top = !self.badge_at_top;
-            if self.visible {
-                let (x, y) = self.badge_origin(self.badge_at_top);
-                self.badge.show_at(x, y);
-            }
-        }
-    }
-
-    fn place_pointer(&self, point: (f64, f64)) {
-        if !self.visible {
-            return;
-        }
-        let tip = art::POINTER_TIP * self.scale;
-        self.pointer.show_at(
-            (point.0 - tip).round() as i32,
-            (point.1 - tip).round() as i32,
-        );
-    }
-
-    fn animate(&mut self, now: Instant) {
-        if let Some(started) = self.move_started {
-            let progress = (now.saturating_duration_since(started).as_secs_f64()
-                / MOVE_DURATION.as_secs_f64())
-            .min(1.0);
-            let eased = 1.0 - (1.0 - progress).powi(3);
-            self.place_pointer((
-                self.move_from.0 + (self.move_to.0 - self.move_from.0) * eased,
-                self.move_from.1 + (self.move_to.1 - self.move_from.1) * eased,
-            ));
-            if progress >= 1.0 {
-                self.move_started = None;
-                if let Some(seq) = self.ack_on_arrival.take() {
-                    emit(&PresenceEvent::Ack { seq });
-                }
-                if std::mem::take(&mut self.ring_on_arrival) && self.visible {
-                    let half = art::RING_SIZE * self.scale / 2.0;
-                    self.ring.show_at(
-                        (self.move_to.0 - half).round() as i32,
-                        (self.move_to.1 - half).round() as i32,
-                    );
-                    self.ring_started = Some(now);
-                }
-            }
-        }
-        if let Some(started) = self.ring_started {
-            let progress =
-                now.saturating_duration_since(started).as_secs_f64() / RING_DURATION.as_secs_f64();
-            if progress >= 1.0 {
-                self.ring.hide();
-                self.ring_started = None;
-            } else {
-                let alpha = ((1.0 - progress) * 255.0).round() as u8;
-                let _ = self.ring.set_image(&self.ring_bitmap, alpha);
-            }
-        }
-    }
-
-    fn hide(&mut self) {
-        self.visible = false;
-        self.stopping = false;
-        self.move_started = None;
-        self.ring_started = None;
-        if let Some(seq) = self.ack_on_arrival.take() {
-            emit(&PresenceEvent::Ack { seq });
-        }
-        self.pointer.hide();
-        self.ring.hide();
-        self.badge.hide();
+    fn set_image_with_text(
+        &self,
+        bitmap: &art::Bitmap,
+        texts: &[BadgeText<'_>],
+        font_px: i32,
+    ) -> Result<(), String> {
+        win::Layered::set_image_with_text(self, bitmap, texts, font_px)
     }
 }
 

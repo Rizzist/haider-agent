@@ -62,11 +62,37 @@ struct LeaseHooks {
     in_flight: Option<StopHook>,
 }
 
+/// Shared capture ownership for one surface (verifier finding B2 on
+/// 8c614f6c). Every model-facing capture holds the surface concealed; the
+/// FIRST holder sends Conceal, the LAST one to retire sends Reveal, so
+/// overlapping captures from different sessions never reveal each other's
+/// capture, and a capture cancelled while awaiting its ack still retires.
+struct CaptureConceal {
+    holders: usize,
+    /// A Conceal is in effect on the current renderer (Reveal owed).
+    sent: bool,
+    /// Whether the current Conceal has been acknowledged.
+    acked: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for CaptureConceal {
+    fn default() -> Self {
+        Self {
+            holders: 0,
+            sent: false,
+            acked: tokio::sync::watch::Sender::new(false),
+        }
+    }
+}
+
 struct State {
     machine: PresenceMachine<String>,
     hooks: HashMap<String, LeaseHooks>,
     renderers: BTreeMap<PresenceSurface, Box<dyn PresenceRenderer>>,
     acks: HashMap<u64, oneshot::Sender<()>>,
+    captures: BTreeMap<PresenceSurface, CaptureConceal>,
+    /// Outstanding Conceal sequence numbers and their surface.
+    conceal_acks: HashMap<u64, PresenceSurface>,
 }
 
 /// Process-wide presence controller.
@@ -92,6 +118,8 @@ impl CuPresence {
                 hooks: HashMap::new(),
                 renderers: BTreeMap::new(),
                 acks: HashMap::new(),
+                captures: BTreeMap::new(),
+                conceal_acks: HashMap::new(),
             }),
             factories: StdMutex::new(BTreeMap::new()),
             ticker_running: AtomicBool::new(false),
@@ -208,37 +236,72 @@ impl CuPresence {
         keys.len()
     }
 
-    /// Asks a capturable renderer on `surface` to take its UI off screen
-    /// before a model-facing capture. `None` when nothing needs concealing.
-    pub(crate) fn conceal(&self, surface: PresenceSurface) -> Option<oneshot::Receiver<()>> {
-        let mut state = lock(&self.state);
-        if !state
+    /// Sends Conceal to `surface`'s renderer if it is capturable, and marks
+    /// the Conceal as owed a Reveal. Caller holds the state lock.
+    fn send_conceal(&self, state: &mut State, surface: PresenceSurface) {
+        let capturable = state
             .renderers
             .get(&surface)
-            .is_some_and(|renderer| renderer.capturable())
-        {
-            return None;
+            .is_some_and(|renderer| renderer.capturable());
+        if !capturable {
+            return;
         }
         let seq = self.next_conceal_seq.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = oneshot::channel();
-        state.acks.insert(seq, sender);
         let sent = state
             .renderers
             .get_mut(&surface)
             .is_some_and(|renderer| renderer.send(&PresenceCommand::Conceal { surface, seq }));
-        if !sent {
-            state.acks.remove(&seq);
-            return None;
+        if sent {
+            state.conceal_acks.insert(seq, surface);
+            let capture = state.captures.entry(surface).or_default();
+            capture.sent = true;
+            capture.acked.send_replace(false);
         }
-        Some(receiver)
     }
 
-    /// Restores what [`Self::conceal`] removed.
-    pub(crate) fn reveal(&self, surface: PresenceSurface) {
+    /// Takes one capture hold on `surface`, synchronously (so a caller that
+    /// is cancelled right afterwards still releases it). The first holder
+    /// conceals. Returns a receiver to await the Conceal's ack, if one is
+    /// outstanding.
+    pub(crate) fn begin_capture(
+        &self,
+        surface: PresenceSurface,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
         let mut state = lock(&self.state);
-        if let Some(renderer) = state.renderers.get_mut(&surface) {
+        let first = {
+            let capture = state.captures.entry(surface).or_default();
+            capture.holders += 1;
+            capture.holders == 1
+        };
+        if first {
+            self.send_conceal(&mut state, surface);
+        }
+        let capture = state.captures.entry(surface).or_default();
+        (capture.sent && !*capture.acked.borrow()).then(|| capture.acked.subscribe())
+    }
+
+    /// Releases one capture hold; the last holder reveals.
+    pub(crate) fn end_capture(&self, surface: PresenceSurface) {
+        let mut state = lock(&self.state);
+        let reveal = {
+            let Some(capture) = state.captures.get_mut(&surface) else {
+                return;
+            };
+            capture.holders = capture.holders.saturating_sub(1);
+            capture.holders == 0 && std::mem::take(&mut capture.sent)
+        };
+        if reveal && let Some(renderer) = state.renderers.get_mut(&surface) {
             let _ = renderer.send(&PresenceCommand::Reveal { surface });
         }
+    }
+
+    /// Number of capture holds on `surface` (tests).
+    #[cfg(test)]
+    pub(crate) fn capture_holders(&self, surface: PresenceSurface) -> usize {
+        lock(&self.state)
+            .captures
+            .get(&surface)
+            .map_or(0, |capture| capture.holders)
     }
 
     pub(crate) fn is_stopped(&self, key: &str) -> bool {
@@ -256,8 +319,13 @@ impl CuPresence {
                 self.stop(surface);
             }
             PresenceEvent::Ack { seq } => {
-                if let Some(sender) = lock(&self.state).acks.remove(&seq) {
+                let mut state = lock(&self.state);
+                if let Some(sender) = state.acks.remove(&seq) {
                     let _ = sender.send(());
+                } else if let Some(surface) = state.conceal_acks.remove(&seq)
+                    && let Some(capture) = state.captures.get(&surface)
+                {
+                    capture.acked.send_replace(true);
                 }
             }
             PresenceEvent::Ready {
@@ -337,6 +405,20 @@ impl CuPresence {
                     continue;
                 }
                 slot.insert(renderer);
+                // A renderer (re)created while a capture is in progress must
+                // not appear in it: conceal it right after its Show.
+                if state
+                    .captures
+                    .get(&surface)
+                    .is_some_and(|capture| capture.holders > 0)
+                {
+                    let _ = state
+                        .renderers
+                        .get_mut(&surface)
+                        .map(|renderer| renderer.send(&command));
+                    self.send_conceal(state, surface);
+                    continue;
+                }
             }
             let alive = state
                 .renderers
@@ -346,8 +428,14 @@ impl CuPresence {
                 if let Some(mut renderer) = state.renderers.remove(&surface) {
                     renderer.close();
                 }
-                // Pending acknowledgements can no longer arrive.
+                // Pending acknowledgements can no longer arrive; release any
+                // capture waiting on this renderer's Conceal ack.
                 state.acks.clear();
+                state.conceal_acks.retain(|_, pending| *pending != surface);
+                if let Some(capture) = state.captures.get_mut(&surface) {
+                    capture.sent = false;
+                    capture.acked.send_replace(true);
+                }
             }
         }
     }
@@ -498,14 +586,24 @@ impl PresenceLease {
         .map(Some)
     }
 
-    /// Conceals capturable presence UI (Linux notification popup) for the
-    /// duration of one model-facing screenshot; the guard reveals it again.
-    pub(crate) async fn conceal_for_capture(&self) -> Option<RevealGuard> {
-        let ack = self.presence.conceal(PresenceSurface::Screen)?;
-        let _ = tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack).await;
-        Some(RevealGuard {
+    /// Conceals capturable presence UI (Linux notification popup, refused
+    /// Windows exclusion) for the duration of one model-facing screenshot.
+    ///
+    /// The capture hold — and the guard that releases it — is taken
+    /// synchronously, BEFORE the first await: if the caller is cancelled
+    /// while waiting for the helper's ack (Esc, Stop), dropping this future
+    /// drops the guard and the indicator is revealed (unless another capture
+    /// still holds the surface).
+    pub(crate) async fn conceal_for_capture(&self) -> RevealGuard {
+        let ack = self.presence.begin_capture(PresenceSurface::Screen);
+        let guard = RevealGuard {
             presence: Arc::clone(&self.presence),
-        })
+            surface: PresenceSurface::Screen,
+        };
+        if let Some(mut ack) = ack {
+            let _ = tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack.wait_for(|acked| *acked)).await;
+        }
+        guard
     }
 
     /// Whether the human already stopped this run. Checked right after
@@ -528,14 +626,15 @@ impl PresenceLease {
     }
 }
 
-/// Reveals concealed presence UI when the capture is over.
+/// One capture hold; releasing the last hold reveals the surface.
 pub(crate) struct RevealGuard {
     presence: Arc<CuPresence>,
+    surface: PresenceSurface,
 }
 
 impl Drop for RevealGuard {
     fn drop(&mut self) {
-        self.presence.reveal(PresenceSurface::Screen);
+        self.presence.end_capture(self.surface);
     }
 }
 

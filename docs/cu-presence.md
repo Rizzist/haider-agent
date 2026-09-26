@@ -88,6 +88,17 @@ again.
 * The first capture of a run is concealed too: until a helper's `Ready`
   arrives, the daemon treats its UI as capturable (the Conceal is queued on
   stdin after `Show`; an excluded helper just acks it).
+* Capture conceal is owned per surface, not per call: every model-facing
+  capture takes a hold on the surface (synchronously, before it awaits the
+  helper's ack), the first hold sends `conceal` and the last one to retire
+  sends `reveal`. Overlapping captures from different sessions therefore
+  never reveal each other's capture, and a capture cancelled while waiting
+  for the ack (Esc, Stop) still releases its hold, so another session that
+  keeps the surface gets its indicator and Stop back. A renderer recreated
+  while a capture holds the surface is concealed right after its `Show`.
+* Helpers keep a concealed state until `reveal`: the Windows fallback (and
+  macOS evidence mode) never re-show the pointer, ring or badge from an
+  animation frame, a `Show`, or a badge relocation while concealed.
 * Pre-existing turn-cancel race, fixed at the source: when a cancellation
   (Stop *or* Esc) is committed while a just-finished tool's result is being
   settled, the journal refuses the settlement ("durably cancelling; only
@@ -200,6 +211,11 @@ this and keeps sharing-none.
     slowly, or keeps closed notifications on screen, can still leak it into a
     capture; the model then sees Haider's own notification (not user data).
     The notification is also briefly absent from the list during a capture.
+    Stop still works across that close: the helper keeps every notification
+    id posted since `show` live until `hide`, so a Stop pressed on a popup
+    that was closed for a capture (its `ActionInvoked` still queued on the
+    bus) reaches the run, while an id from an earlier presence never stops a
+    later one (`LinuxStopRouter`).
 * **What Linux guarantees**: a visible "Haider is controlling this screen"
   notification (on a desktop with a notification server), a Stop that reaches
   the run from the notification when the server supports actions and from

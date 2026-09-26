@@ -262,13 +262,33 @@ fn action_name(action: &ComputerAction) -> &'static str {
     }
 }
 
-fn large_png_fixture() -> Vec<u8> {
-    let pixels = image::RgbaImage::from_pixel(3_000, 1_000, image::Rgba([31, 61, 127, 255]));
+fn encode_png_fixture(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+    let pixels = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
     let mut encoded = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(pixels)
         .write_to(&mut encoded, ImageFormat::Png)
         .expect("encode PNG fixture");
     encoded.into_inner()
+}
+
+/// Wider than the delivered bound, so admission must downscale it. Encoded
+/// once per test binary: fake backends hand it out on every capture, and
+/// they run on the async runtime thread.
+fn large_png_fixture() -> Vec<u8> {
+    static PNG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PNG.get_or_init(|| encode_png_fixture(3_000, 1_000, [31, 61, 127, 255]))
+        .clone()
+}
+
+/// A capture for tests about presence, Stop and cancellation timing, which
+/// do not exercise screenshot bounding. The large fixture costs ~1.3 s of
+/// unoptimised decode/resize/encode per capture (measured, debug profile),
+/// which under CI's parallel load pushed these tests' multi-capture runs
+/// past their deadlines (wave-973 CI, 0312d6e8/8ffc5866).
+fn small_png_fixture() -> Vec<u8> {
+    static PNG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PNG.get_or_init(|| encode_png_fixture(320, 200, [31, 61, 127, 255]))
+        .clone()
 }
 
 fn inspect_png_fixture() -> Vec<u8> {
@@ -1883,7 +1903,7 @@ async fn presence_stop_during_a_parked_click_never_clicks_and_cancels_the_run() 
         });
     }
     let provider = Arc::new(FakeProvider::new(steps));
-    let backend = Arc::new(FakeComputerBackend::new(large_png_fixture()));
+    let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
     let presence =
         crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
     let pointers = Arc::new(AtomicUsize::new(0));
@@ -1992,7 +2012,7 @@ async fn cancel_between_rounds(via_presence: bool) {
             reason: FinishReason::ToolUse,
         },
     ]));
-    let backend = Arc::new(FakeComputerBackend::new(large_png_fixture()));
+    let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
     let presence =
         crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
@@ -2113,7 +2133,7 @@ impl ComputerBackend for CancelOnReturnBackend {
             fire();
         }
         Ok(match action {
-            ComputerAction::Screenshot => ComputerOutput::ScreenshotPng(large_png_fixture()),
+            ComputerAction::Screenshot => ComputerOutput::ScreenshotPng(small_png_fixture()),
             _ => ComputerOutput::Confirmed {
                 action: "confirmed".into(),
             },
@@ -2255,7 +2275,7 @@ impl ComputerBackend for LoggingBackend {
                     .lock()
                     .expect("log")
                     .push("capture:screenshot".into());
-                Ok(ComputerOutput::ScreenshotPng(large_png_fixture()))
+                Ok(ComputerOutput::ScreenshotPng(small_png_fixture()))
             }
             ComputerAction::Inspect { .. } => {
                 self.log.lock().expect("log").push("capture:inspect".into());
@@ -2267,7 +2287,7 @@ impl ComputerBackend for LoggingBackend {
                         bounds: None,
                         value: None,
                     },
-                    screenshot_png: large_png_fixture(),
+                    screenshot_png: small_png_fixture(),
                 })
             }
             _ => Ok(ComputerOutput::Confirmed {
@@ -2278,16 +2298,25 @@ impl ComputerBackend for LoggingBackend {
 }
 
 /// A capturable Screen renderer (a Linux notification, or an overlay whose
-/// capture exclusion was refused) that logs conceal/reveal.
+/// capture exclusion was refused) that logs conceal/reveal and, like the
+/// real helpers, acknowledges each Conceal once its UI is off screen — so
+/// the dispatcher's capture follows the ack rather than the 600 ms bound.
 struct CapturableOverlay {
     log: OrderLog,
+    sink: crate::cu_presence::EventSink,
 }
 
 impl crate::cu_presence::PresenceRenderer for CapturableOverlay {
     fn send(&mut self, command: &haider_tools::presence::PresenceCommand) -> bool {
-        use haider_tools::presence::PresenceCommand;
+        use haider_tools::presence::{PresenceCommand, PresenceEvent};
         let entry = match command {
-            PresenceCommand::Conceal { .. } => "conceal",
+            PresenceCommand::Conceal { seq, .. } => {
+                // Acked from the helper's side (a separate task): the
+                // daemon holds its presence state lock while sending.
+                let (sink, seq) = (Arc::clone(&self.sink), *seq);
+                tokio::spawn(async move { sink(PresenceEvent::Ack { seq }) });
+                "conceal"
+            }
             PresenceCommand::Reveal { .. } => "reveal",
             _ => return true,
         };
@@ -2348,9 +2377,10 @@ async fn dispatcher_conceals_capturable_presence_around_screenshot_and_inspect()
         haider_tools::presence::PresenceSurface::Screen,
         Arc::new({
             let log = Arc::clone(&log);
-            move |_sink| {
+            move |sink| {
                 Some(Box::new(CapturableOverlay {
                     log: Arc::clone(&log),
+                    sink,
                 })
                     as Box<dyn crate::cu_presence::PresenceRenderer>)
             }
@@ -2442,7 +2472,7 @@ async fn slow_cancel_commit_still_settles_a_stop_refused_action_as_cancelled() {
         });
     }
     let provider = Arc::new(FakeProvider::new(steps));
-    let backend = Arc::new(FakeComputerBackend::new(large_png_fixture()));
+    let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
     let presence =
         crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
     presence.set_stop_cancel_delay(Duration::from_millis(400));

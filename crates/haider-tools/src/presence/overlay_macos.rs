@@ -248,6 +248,9 @@ struct Overlay {
     ring_on_arrival: bool,
     ring_started: Option<Instant>,
     caption_until: Option<Instant>,
+    /// Between Conceal and Reveal (evidence-capturable mode only): no panel
+    /// may be ordered front, including by animation frames.
+    concealed: bool,
 }
 
 impl Overlay {
@@ -355,6 +358,7 @@ impl Overlay {
             ring_on_arrival: false,
             ring_started: None,
             caption_until: None,
+            concealed: false,
         })
     }
 
@@ -395,9 +399,11 @@ impl Overlay {
                 self.visible = true;
                 self.badge
                     .setFrame_display(self.badge_frame(self.badge_at_top), true);
-                self.badge.orderFrontRegardless();
-                if self.position.is_some() {
-                    self.pointer.orderFrontRegardless();
+                if !self.concealed {
+                    self.badge.orderFrontRegardless();
+                    if self.position.is_some() {
+                        self.pointer.orderFrontRegardless();
+                    }
                 }
             }
             PresenceCommand::Pointer {
@@ -412,6 +418,7 @@ impl Overlay {
             // that are sharing-none are already absent from captures.
             PresenceCommand::Conceal { seq, .. } => {
                 if evidence_capturable() {
+                    self.concealed = true;
                     self.pointer.orderOut(None);
                     self.ring.orderOut(None);
                     self.badge.orderOut(None);
@@ -419,7 +426,7 @@ impl Overlay {
                 emit(&PresenceEvent::Ack { seq });
             }
             PresenceCommand::Reveal { .. } => {
-                if self.visible && evidence_capturable() {
+                if std::mem::take(&mut self.concealed) && self.visible {
                     self.badge.orderFrontRegardless();
                     if self.position.is_some() {
                         self.pointer.orderFrontRegardless();
@@ -447,7 +454,7 @@ impl Overlay {
         self.move_to = target;
         self.move_started = Some(Instant::now());
         self.ring_on_arrival = mark.posts_pointer_input();
-        if self.visible {
+        if self.visible && !self.concealed {
             self.pointer.orderFrontRegardless();
         }
         if mark.posts_pointer_input() && from != target {
@@ -504,7 +511,7 @@ impl Overlay {
                 if let Some(seq) = self.ack_on_arrival.take() {
                     emit(&PresenceEvent::Ack { seq });
                 }
-                if std::mem::take(&mut self.ring_on_arrival) && self.visible {
+                if std::mem::take(&mut self.ring_on_arrival) && self.visible && !self.concealed {
                     let (x, y) = self.cocoa(self.move_to);
                     let half = art::RING_SIZE / 2.0;
                     self.ring.setFrameOrigin(NSPoint::new(x - half, y - half));

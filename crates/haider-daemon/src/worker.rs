@@ -23529,7 +23529,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         haider_protocol::computer::ComputerAction::Screenshot
                             | haider_protocol::computer::ComputerAction::Inspect { .. }
                     ) {
-                        self.cu_presence.conceal_for_capture().await
+                        Some(self.cu_presence.conceal_for_capture().await)
                     } else {
                         None
                     };
