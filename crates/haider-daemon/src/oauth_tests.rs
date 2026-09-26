@@ -6763,13 +6763,12 @@ async fn v2_non_live_issued_tokens_only_ever_reach_loopback() {
     }
     assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
 
-    // A live-issued bundle is unaffected.
-    let mut live = bundle.clone();
-    live.issuer = "https://claude.ai".to_owned();
-    assert!(ensure_live_issuer_for_remote(&descriptor, &live).is_ok());
     // Providers without a sanctioned registration are out of scope.
     let mut test_only = descriptor.clone();
     test_only.provider = "fake-oauth".to_owned();
     assert!(ensure_live_issuer_for_remote(&test_only, &bundle).is_ok());
+    // A live-issued bundle is unaffected (bundles deliberately have no Clone).
+    bundle.issuer = "https://claude.ai".to_owned();
+    assert!(ensure_live_issuer_for_remote(&descriptor, &bundle).is_ok());
     assert!(broker.shutdown().await);
 }
