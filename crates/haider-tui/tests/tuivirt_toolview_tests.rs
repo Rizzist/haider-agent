@@ -1545,3 +1545,270 @@ fn the_boundary_newline_edit_shows_its_measured_numbers() {
     let text = frame.rows.join("\n");
     assert!(frame.contains("3 - c") && frame.contains("2 + C"), "{text}");
 }
+
+// ---- 973-tui-toolview-fixes: the detail view owns the parked composer ----
+//
+// Astra final P2: with the ⌃O view open the composer is covered but its
+// draft is parked underneath. No key, paste, clipboard gesture or stale
+// pointer hit may edit, copy or deselect that draft, and one Esc closes
+// the view whatever the draft's selection state.
+
+const DRAFT: &str = "KEEP_THIS_DRAFT and more words";
+
+fn shift(code: KeyCode) -> AppEvent {
+    AppEvent::Key(KeyEvent::new(code, KeyModifiers::SHIFT))
+}
+
+fn paste(text: &str) -> AppEvent {
+    AppEvent::Paste(haider_tui::app::Pasted::new(text.to_owned()))
+}
+
+/// The owner's transcript with a nonempty draft (caret mid-line, so ⌃K and
+/// ⌃U both have something to kill), the write row focused and its detail
+/// view open.
+fn detail_over_draft() -> AppModel {
+    let mut model = toolview_model();
+    model.composer.set_text(DRAFT);
+    for _ in 0..6 {
+        model.handle(key(KeyCode::Left));
+    }
+    model.toolfold.set_focus(Some("write-lanes"));
+    model.handle(ctrl('o'));
+    assert_eq!(
+        model.tool_detail.as_ref().map(|view| view.item_id.as_str()),
+        Some("write-lanes")
+    );
+    model
+}
+
+#[test]
+fn a_parked_draft_survives_editing_chords_under_the_detail_view() {
+    let mut model = detail_over_draft();
+    let cursor = model.composer.cursor();
+    assert!(
+        !model.accepts_injected_input(),
+        "an embedding client's injected op / mirror cannot reach the covered draft"
+    );
+    for chord in ['u', 'w', 'k', 'a', 'e', 'f', 'g', 'v'] {
+        model.handle(ctrl(chord));
+        assert!(
+            model.tool_detail.is_some(),
+            "⌃{chord} is not one of the view's pass-through chords"
+        );
+    }
+    for code in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Backspace,
+        KeyCode::Delete,
+    ] {
+        model.handle(key(code));
+    }
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::ALT,
+    )));
+    assert_eq!(
+        model.composer.text(),
+        DRAFT,
+        "no chord edits the hidden draft"
+    );
+    assert_eq!(model.composer.cursor(), cursor, "…nor moves its caret");
+    assert!(
+        model.transcript_search.is_none(),
+        "⌃F must not open a search behind the view"
+    );
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|request| matches!(request, haider_tui::app::AppRequest::ClipboardRead)),
+        "⌃V must not read the clipboard for a covered composer"
+    );
+    model.handle(key(KeyCode::Esc));
+    assert!(model.tool_detail.is_none(), "one Esc closes the view");
+    assert_eq!(model.composer.text(), DRAFT);
+    assert_eq!(model.composer.cursor(), cursor);
+    // The composer is live again once the view is gone.
+    model.handle(ctrl('k'));
+    assert_eq!(model.composer.text(), "KEEP_THIS_DRAFT and more");
+}
+
+#[test]
+fn the_views_global_chords_are_exactly_theme_and_navigation() {
+    let mut model = detail_over_draft();
+    let theme = model.theme;
+    model.handle(ctrl('t'));
+    assert_ne!(model.theme, theme, "⌃T still cycles the theme");
+    assert!(model.tool_detail.is_some(), "…and leaves the view open");
+    model.handle(ctrl('c'));
+    assert!(
+        model.tool_detail.is_none(),
+        "⌃C navigates, retiring the view"
+    );
+    assert_eq!(model.screen, haider_tui::app::Screen::Launcher);
+}
+
+#[test]
+fn a_paste_under_the_detail_view_is_discarded_not_inserted() {
+    let mut model = detail_over_draft();
+    let cursor = model.composer.cursor();
+    model.handle(paste("PASTED"));
+    model.handle(paste("one\ntwo\nthree\nfour\nfive\n"));
+    model.handle(paste(&"x".repeat(400)));
+    assert_eq!(
+        model.composer.text(),
+        DRAFT,
+        "a paste never reaches the draft"
+    );
+    assert_eq!(model.composer.cursor(), cursor);
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("paste ignored")),
+        "the discard is said, not silent: {:?}",
+        model.flash
+    );
+    // The right-click / forwarded-chord route never asks for the clipboard.
+    model.request_clipboard_paste();
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|request| matches!(request, haider_tui::app::AppRequest::ClipboardRead))
+    );
+    // Discarded, not buffered: closing the view delivers nothing.
+    model.handle(key(KeyCode::Esc));
+    assert!(model.tool_detail.is_none());
+    assert_eq!(model.composer.text(), DRAFT);
+    // And the composer takes pastes again once it is visible.
+    model.handle(paste("!"));
+    assert_ne!(model.composer.text(), DRAFT);
+}
+
+#[test]
+fn one_esc_closes_the_view_over_a_selected_draft_and_keeps_the_selection() {
+    let mut model = toolview_model();
+    model.composer.set_text(DRAFT);
+    for _ in 0..5 {
+        model.handle(shift(KeyCode::Left));
+    }
+    assert_eq!(model.composer.selected_text(), Some("words"));
+    let frame = draw(&model, 118, 36);
+    let composer_hit = frame
+        .find_hit(|hit| matches!(hit, Hit::ComposerText { .. }))
+        .expect("the composer text row is a press target");
+    model.toolfold.set_focus(Some("write-lanes"));
+    model.handle(ctrl('o'));
+    assert!(model.tool_detail.is_some());
+    // ⌃⇧C and ⌃C would copy a VISIBLE selection; the hidden one is not
+    // theirs (⌃⇧C finds no mouse selection and does nothing).
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('C'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )));
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|request| matches!(request, haider_tui::app::AppRequest::CopyText(_))),
+        "the hidden selection is never copied"
+    );
+    // A one-frame-stale composer hit acts on nothing under the view.
+    let (rect, hit) = composer_hit;
+    haider_tui::runtime::dispatch_input(
+        &mut model,
+        &[(rect, hit)],
+        ratatui::crossterm::event::Event::Mouse(ratatui::crossterm::event::MouseEvent {
+            kind: ratatui::crossterm::event::MouseEventKind::Down(
+                ratatui::crossterm::event::MouseButton::Left,
+            ),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert_eq!(model.composer.selected_text(), Some("words"));
+    model.handle(key(KeyCode::Esc));
+    assert!(
+        model.tool_detail.is_none(),
+        "ONE Esc closes the view — the hidden selection must not eat it"
+    );
+    assert_eq!(
+        model.composer.selected_text(),
+        Some("words"),
+        "the draft's selection is preserved"
+    );
+    assert_eq!(model.composer.text(), DRAFT);
+    // With the composer visible again, Esc is the selection's once more.
+    model.handle(key(KeyCode::Esc));
+    assert!(!model.composer.has_selection());
+}
+
+#[test]
+fn an_approval_arriving_under_the_detail_view_is_not_answered_by_its_keys() {
+    use haider_protocol::ids::MenuId;
+    use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
+    let mut model = detail_over_draft();
+    let option = |key: &str, label: &str| MenuOption {
+        key: key.to_owned(),
+        label: label.to_owned(),
+        detail: None,
+        decision: None,
+    };
+    // Through the reducer's live event route, as the daemon delivers it.
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+        Menu {
+            id: MenuId::new("toolview-approval"),
+            kind: MenuKind::Permission {
+                effect_summary: "run cargo test".to_owned(),
+                file_review: None,
+            },
+            title: "Allow process_exec?".to_owned(),
+            body: vec!["process_exec wants to run cargo test".to_owned()],
+            options: vec![option("allow", "Allow once"), option("deny", "Deny")],
+            blocking: true,
+            scope: MenuScope::Session,
+            origin: "process_exec".to_owned(),
+            ttl_ms: None,
+            timeout_option: None,
+        },
+    ))));
+    assert!(
+        model.tool_detail.is_some(),
+        "an arriving card never yanks the view"
+    );
+    for (width, height) in SIZES {
+        let frame = draw(&model, width, height);
+        assert!(
+            !frame.has_hit(|hit| matches!(hit, Hit::MenuOption { .. })),
+            "the covered card is not clickable at {width}×{height}"
+        );
+    }
+    for code in [
+        KeyCode::Char('1'),
+        KeyCode::Char('2'),
+        KeyCode::Char('y'),
+        KeyCode::Char('n'),
+        KeyCode::Char('a'),
+        KeyCode::Down,
+        KeyCode::Up,
+        KeyCode::Tab,
+    ] {
+        model.handle(key(code));
+    }
+    model.handle(ctrl('u'));
+    model.handle(paste("y\n"));
+    assert!(model.outbox.is_empty(), "no view key answered the card");
+    assert!(model.tool_detail.is_some());
+    // ⏎ is the VIEW's close — it must not also answer the card.
+    model.handle(key(KeyCode::Enter));
+    assert!(model.tool_detail.is_none());
+    assert!(model.outbox.is_empty(), "the closing ⏎ answered nothing");
+    assert_eq!(model.composer.text(), DRAFT);
+    // Now visible, the card answers its own keys as before.
+    model.handle(key(KeyCode::Enter));
+    let answer = model.outbox.pop().expect("the visible card answers ⏎");
+    assert_eq!(answer.option_key.as_deref(), Some("allow"));
+}

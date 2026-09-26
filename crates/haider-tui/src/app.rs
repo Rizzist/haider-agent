@@ -7610,8 +7610,11 @@ impl AppModel {
                 // the state machine owns Esc (cancel), Enter (commit +
                 // submit) and plain typing (commit into the composer and
                 // keep editing — `talk_key` settles the session and
-                // returns false so the char flows the NORMAL path).
-                if self.talk.engaged() && self.talk_key(&key) {
+                // returns false so the char flows the NORMAL path). An open
+                // tool detail view outranks it: Esc/⏎ close the view and a
+                // typed key must not commit the transcript into the hidden
+                // draft (973-tui-toolview-fixes).
+                if self.tool_detail.is_none() && self.talk.engaged() && self.talk_key(&key) {
                     return;
                 }
                 // Windows/Linux copy chord. Handle both case spellings
@@ -7693,6 +7696,19 @@ impl AppModel {
                         }
                         _ => {}
                     }
+                    return;
+                }
+                // The ⌃O tool detail view is read-only and covers the
+                // composer: a paste has no visible target, so it is
+                // DISCARDED (zeroized with `text`) and said so, never
+                // inserted into the parked draft nor held for later
+                // (973-tui-toolview-fixes; UX rationale in the lane record:
+                // a deferred insert would land text the user can no longer
+                // see being chosen, possibly a secret, after the view closes).
+                if self.tool_detail.is_some() {
+                    self.flash = Some(
+                        "· paste ignored — the detail view is read-only (esc to return)".to_owned(),
+                    );
                     return;
                 }
                 // T2: pasting while a talk session is engaged COMMITS the
@@ -7852,6 +7868,11 @@ impl AppModel {
         revision: u64,
         epoch: u64,
     ) {
+        // The detail view covers the composer; a one-frame-stale composer
+        // hit must not move the parked draft's caret or selection.
+        if self.tool_detail.is_some() {
+            return;
+        }
         // TUI6.1 fix 1: the epoch gate joins the surface/revision gates —
         // a hit stamped before a resize (or an older frame) is stale
         // GEOMETRY even when the text never changed.
@@ -7875,7 +7896,7 @@ impl AppModel {
     /// Drag with the button held after a composer press: the caret (the
     /// selection's active end) follows the pointer.
     pub fn composer_drag_to(&mut self, byte: usize) {
-        if !self.composer_drag {
+        if !self.composer_drag || self.tool_detail.is_some() {
             return;
         }
         self.composer.drag_to(byte);
@@ -9790,17 +9811,13 @@ impl AppModel {
         }
     }
 
-    /// The composer is the live input target: no boot screen, no help
-    /// overlay, no blocking menu owning the keys (session card or the
-    /// viewed chip's question). Gates the TUI5 editing keys so ⌃K on a
-    /// menu can never eat a hidden draft.
-    #[must_use]
     /// rev933d finding 4: injection from an embedding client applies only
     /// when the PLAIN session composer is the live Enter target — no card
     /// (login, `/talk` setup, an engaged talk session), no menu, no help,
     /// and never the subagent view (whose composer messages the child).
     /// This mirrors the key-dispatch precedence exactly, so a synthesized
     /// Submit can never activate a card row or answer a question.
+    #[must_use]
     pub fn accepts_injected_input(&self) -> bool {
         self.screen == Screen::Session
             && self.login.is_none()
@@ -9829,8 +9846,18 @@ impl AppModel {
                 .is_some_and(|authoring| self.screen == Screen::Loom && authoring.pending)
     }
 
+    /// The composer is the live input target: no boot screen, no help
+    /// overlay, no tool detail view, no blocking menu owning the keys
+    /// (session card or the viewed chip's question). Gates the TUI5 editing
+    /// keys, the composer selection gate (Esc / ⌃C), ↑/↓ recall and — via
+    /// [`Self::clipboard_composer_visible`] — clipboard paste, image paste
+    /// and ⌃⇧C, so no key can edit, copy or deselect a hidden draft.
+    ///
+    /// 973-tui-toolview-fixes: the ⌃O detail view covers the composer
+    /// while the draft stays parked underneath; ⌃U/⌃W/⌃K used to edit it
+    /// invisibly and a draft selection swallowed the view's closing Esc.
     fn composer_owns_input(&self) -> bool {
-        if self.screen == Screen::Boot || self.help_open {
+        if self.screen == Screen::Boot || self.help_open || self.tool_detail.is_some() {
             return false;
         }
         if self.screen == Screen::Session
@@ -16768,7 +16795,19 @@ impl AppModel {
     }
 
     /// Keys while the full-detail view is open. Answers `true` when the key
-    /// was the view's; chords it does not own (⌃C, ⌃T, …) fall through.
+    /// was the view's. The view owns the keyboard like a modal: every key
+    /// is consumed except the deliberately supported global chords, which
+    /// fall through to their usual meaning:
+    ///
+    /// - ⌃C — navigation/quit (walks back to the launcher, retiring the
+    ///   view with the surface's other overlays);
+    /// - ⌃T — theme cycle (the view repaints in the new theme).
+    ///
+    /// Outside this function, ⌃⇧C still copies a mouse selection, and the
+    /// terminal resize/wheel keep their meanings. Composer editing, the
+    /// composer selection gate, paste (bracketed, ⌃V, right-click) and the
+    /// clipboard are gated by [`Self::composer_owns_input`] and the paste
+    /// arm, not here (973-tui-toolview-fixes).
     fn tool_detail_key(&mut self, key: KeyEvent) -> bool {
         if self.tool_detail.is_none() {
             return false;
@@ -16781,7 +16820,8 @@ impl AppModel {
         let page = isize::try_from(page).unwrap_or(1);
         match key.code {
             KeyCode::Char('o') if control => self.close_tool_detail(),
-            _ if control => return false,
+            KeyCode::Char('c' | 't') if control => return false,
+            _ if control => {}
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close_tool_detail(),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_tool_detail(-1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_tool_detail(1),
