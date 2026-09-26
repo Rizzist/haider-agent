@@ -3,7 +3,6 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use haider_client::notify::mask_text;
 use haider_client::{ObserveClient, ProfileEnv, resolve_profile};
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -13,6 +12,7 @@ use haider_protocol::pipe::{ToolExchangeJoin, TranscriptJoiner};
 use haider_protocol::tool::BoundedResult;
 use serde_json::{Map, Value, json};
 
+use super::export::apply_mask;
 use super::run::{EX_IOERR, EX_PROTOCOL, EX_UNAVAILABLE, EX_USAGE};
 
 const ITEM_SCHEMA: &str = "haider.item.v1";
@@ -338,11 +338,11 @@ fn payload_kind(payload: &Value) -> &str {
 
 fn bounded_result_value(mut result: BoundedResult, masked: bool) -> Value {
     if masked {
-        result.preview = mask_text(&result.preview);
-        result.reason = result.reason.map(|reason| mask_text(&reason));
+        result.preview = apply_mask(&result.preview, true);
+        result.reason = result.reason.map(|reason| apply_mask(&reason, true));
         if let Some(presentation) = result.presentation.as_mut() {
-            presentation.title = mask_text(&presentation.title);
-            presentation.detail = mask_text(&presentation.detail);
+            presentation.title = apply_mask(&presentation.title, true);
+            presentation.detail = apply_mask(&presentation.detail, true);
         }
     }
     json!({
@@ -362,7 +362,7 @@ fn masked_json(value: Value, masked: bool) -> Value {
         return value;
     }
     match value {
-        Value::String(value) => mask_text(&value).into(),
+        Value::String(value) => apply_mask(&value, true).into(),
         Value::Array(values) => Value::Array(
             values
                 .into_iter()
@@ -381,7 +381,7 @@ fn masked_json(value: Value, masked: bool) -> Value {
 
 fn masked_text(value: &str, masked: bool) -> String {
     if masked {
-        mask_text(value)
+        apply_mask(value, true)
     } else {
         value.to_owned()
     }

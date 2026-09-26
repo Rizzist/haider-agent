@@ -412,6 +412,7 @@ fn checkpoint_list_and_record_optional_fields_are_pinned() {
         ],
         post_digest: "blake3:aggregate".into(),
         recorded_at_ms: 1_720_000_000_000,
+        redacted_content: false,
     };
     let event = serde_json::to_value(haider_protocol::EventPayload::CheckpointRecorded(
         record.clone(),

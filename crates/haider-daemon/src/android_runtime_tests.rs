@@ -481,6 +481,7 @@ async fn seed_recovered_checkpoint(
                 truncated_reason: None,
             }],
             post_digest: format!("blake3:{}", blake3::hash(label.as_bytes()).to_hex()),
+            redacted_content: false,
         },
     )
     .await
@@ -512,6 +513,7 @@ async fn seed_recovered_checkpoint(
                 mutation_digest: checkpoint.post_digest.clone(),
                 workspace_revision: None,
                 subject_digest: None,
+                redacted_content: false,
             }),
         }),
         EventPayload::CheckpointRecorded(checkpoint),

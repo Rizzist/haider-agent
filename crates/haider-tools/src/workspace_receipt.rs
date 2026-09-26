@@ -59,6 +59,7 @@ pub enum WorkspaceReceiptUnknownReason {
     EntryReadFailed,
     ReceiptWorkerFailed,
     ConcurrentOrInterleavedMutation,
+    RedactedMaterial,
 }
 
 impl WorkspaceReceiptUnknownReason {
@@ -80,6 +81,7 @@ impl WorkspaceReceiptUnknownReason {
             Self::EntryReadFailed => "entry_read_failed",
             Self::ReceiptWorkerFailed => "receipt_worker_failed",
             Self::ConcurrentOrInterleavedMutation => "concurrent_or_interleaved_mutation",
+            Self::RedactedMaterial => "redacted_material",
         }
     }
 }
@@ -203,6 +205,9 @@ impl ReceiptBuilder {
         if self.entries_visited > WORKSPACE_RECEIPT_MAX_ENTRIES {
             return Err(WorkspaceReceiptUnknownReason::EntryLimit);
         }
+        if crate::redact::workspace_receipt_path_sensitive(relative) {
+            return Err(WorkspaceReceiptUnknownReason::RedactedMaterial);
+        }
         update_path_field(&mut self.hasher, relative);
         let Some(mut file) = reader.open_regular_file(relative)? else {
             self.hasher.update(b"missing");
@@ -215,6 +220,7 @@ impl ReceiptBuilder {
         let observed_len = before.len();
         let permitted = observed_len.min(self.content_budget);
         let mut read_total = 0_u64;
+        let mut detector = crate::OutputRedactor::default();
         let mut buffer = [0_u8; 64 * 1024];
         while read_total < permitted {
             if Instant::now() >= self.deadline {
@@ -229,7 +235,12 @@ impl ReceiptBuilder {
                 return Err(WorkspaceReceiptUnknownReason::EntryChangedDuringRead);
             }
             self.hasher.update(&buffer[..read]);
+            let _ = detector.push_bytes(&buffer[..read]);
             read_total = read_total.saturating_add(read as u64);
+        }
+        let _ = detector.finish_bytes();
+        if detector.redactions_applied() {
+            return Err(WorkspaceReceiptUnknownReason::RedactedMaterial);
         }
         self.content_budget = self.content_budget.saturating_sub(read_total);
         self.content_bytes_read = self.content_bytes_read.saturating_add(read_total);
@@ -401,6 +412,12 @@ async fn compute_workspace_state_receipt_async(
     };
     match git_workspace_receipt(&root, &git_program, deadline, &walked, index).await {
         Ok(receipt) => receipt,
+        Err(WorkspaceReceiptUnknownReason::RedactedMaterial) => {
+            WorkspaceStateReceipt::unknown_unreported(
+                WorkspaceReceiptStrategy::NotEnumerated,
+                WorkspaceReceiptUnknownReason::RedactedMaterial,
+            )
+        }
         // The anchored walk is already complete, so a missing, locked, broken,
         // or slow Git binary is an optimization miss rather than a tool error.
         Err(_) => walked,
@@ -504,12 +521,18 @@ async fn git_workspace_receipt(
     if !status.status.success() {
         return Err(WorkspaceReceiptUnknownReason::GitFailed);
     }
+    let paths = porcelain_v1_paths(&status.bytes)?;
+    if paths
+        .iter()
+        .any(|path| crate::redact::workspace_receipt_path_sensitive(path))
+    {
+        return Err(WorkspaceReceiptUnknownReason::RedactedMaterial);
+    }
     let mut builder = ReceiptBuilder::new(WorkspaceReceiptStrategy::GitStatus, deadline);
     update_field(&mut builder.hasher, b"anchored-repository-walk-v1");
     update_field(&mut builder.hasher, walked.fingerprint.as_bytes());
     update_field(&mut builder.hasher, b"porcelain-v1-z");
     update_field(&mut builder.hasher, &status.bytes);
-    let paths = porcelain_v1_paths(&status.bytes)?;
     if paths.len() > WORKSPACE_RECEIPT_MAX_ENTRIES {
         return Err(WorkspaceReceiptUnknownReason::EntryLimit);
     }
@@ -753,6 +776,15 @@ fn repository_walk_receipt(root: &Path, deadline: Instant) -> WorkspaceStateRece
         }
     }
     if let Some(reason) = walk_failure {
+        if reason == WorkspaceReceiptUnknownReason::RedactedMaterial {
+            // Discard the builder: it may already have hashed earlier raw
+            // entries. The fixed unknown receipt exports no original digest,
+            // path length, or content byte count.
+            return WorkspaceStateReceipt::unknown_unreported(
+                WorkspaceReceiptStrategy::NotEnumerated,
+                reason,
+            );
+        }
         builder.mark_unknown(reason);
     }
     builder.finish()

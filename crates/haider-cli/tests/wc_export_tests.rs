@@ -95,6 +95,109 @@ fn fixture_export() -> SessionExport {
     SessionExport::project(fixture_meta(), &fixture_events())
 }
 
+fn payload_env(seq: u64, payload: EventPayload) -> RawEnvelope {
+    let mut envelope = node_env(
+        seq,
+        CREATED_MS + seq * 1_000,
+        NodeKind::UserTurn {
+            text: String::new(),
+            attachments: Vec::new(),
+        },
+    );
+    envelope.payload = serde_json::to_value(payload).expect("payload").into();
+    envelope
+}
+
+/// Round-4 oracles on the sharing surface. A journal written before the
+/// repair carries a raw-content mutation digest in the model-visible preview;
+/// owner-local checkpoint facts and the human file review carry raw digests.
+/// `--masked` must drop all of them; the unmasked owner view keeps them.
+#[test]
+fn masked_export_withholds_mutation_checkpoint_and_file_review_integrity() {
+    let raw = "blake3:syntheticrawcontent";
+    let mut events = fixture_events();
+    events.push(payload_env(
+        10,
+        EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new("item-copy"),
+            item: haider_protocol::item::TurnItem::ToolCall {
+                name: "fs_path".into(),
+                args: serde_json::json!({"operation": "copy"}),
+                status: haider_protocol::item::ToolStatus::Completed,
+                call_id: "call-copy".into(),
+            },
+        }),
+    ));
+    events.push(node_env(
+        11,
+        CREATED_MS + 11_000,
+        NodeKind::ToolExchange {
+            tool: "fs_path".into(),
+            summary: "copy victim.txt".into(),
+            artifact: None,
+        },
+    ));
+    let mut result: haider_protocol::tool::BoundedResult =
+        serde_json::from_value(serde_json::json!({"preview": "", "truncated": false}))
+            .expect("bounded result");
+    result.preview = format!(
+        "{{\"mutation_digest\":\"{raw}\",\"result\":\"copied\",\"subject_digest\":\"{raw}\"}}"
+    );
+    events.push(payload_env(
+        12,
+        EventPayload::ToolResult {
+            call_id: "call-copy".into(),
+            result,
+        },
+    ));
+    let mut owner_only = node_env(
+        13,
+        CREATED_MS + 13_000,
+        NodeKind::UserTurn {
+            text: String::new(),
+            attachments: Vec::new(),
+        },
+    );
+    owner_only.payload = serde_json::json!({
+        "type": "checkpoint_recorded", "post_digest": raw,
+        "paths": [{"path": "victim.txt", "pre_digest": raw, "pre_artifact": raw}]
+    })
+    .into();
+    events.push(owner_only);
+    let mut review = node_env(
+        14,
+        CREATED_MS + 14_000,
+        NodeKind::UserTurn {
+            text: String::new(),
+            attachments: Vec::new(),
+        },
+    );
+    review.payload = serde_json::json!({
+        "type": "menu_opened", "kind": {"kind": "permission",
+            "file_review": {"old_digest": raw, "new_digest": raw}}
+    })
+    .into();
+    events.push(review);
+
+    let export = SessionExport::project(fixture_meta(), &events);
+    assert!(
+        export.to_json(false).contains(raw),
+        "fixture must reach the unmasked owner view"
+    );
+    for shared in [
+        export.to_json(true),
+        export.to_pipe(true),
+        export.to_markdown(true),
+    ] {
+        assert!(!shared.contains("syntheticraw"), "{shared}");
+    }
+    // The transcript row itself survives; only its integrity digests go.
+    for shared in [export.to_json(true), export.to_pipe(true)] {
+        assert!(shared.contains("copied"), "{shared}");
+        assert!(shared.contains("redacted_integrity"), "{shared}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Native
 // ---------------------------------------------------------------------------

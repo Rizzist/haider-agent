@@ -2026,6 +2026,7 @@ dependencies = [
  "base64",
  "blake3",
  "futures-util",
+ "getrandom 0.3.4",
  "globset",
  "haider-platform",
  "haider-protocol",

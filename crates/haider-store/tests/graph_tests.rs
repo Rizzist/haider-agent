@@ -577,6 +577,7 @@ fn append_workspace_mutation(
                     mutation_digest,
                     workspace_revision: None,
                     subject_digest: None,
+                    redacted_content: false,
                 }),
             }),
         ),
@@ -1435,6 +1436,7 @@ fn workspace_revisions_advance_only_on_mutations_and_rebuild_uniformly() {
                 mutation_digest: "blake3:background-mutation".into(),
                 workspace_revision: None,
                 subject_digest: None,
+                redacted_content: false,
             }),
         };
         let mut background_completion = raw_envelope(
@@ -1576,6 +1578,7 @@ fn read_class_effect_cannot_forge_a_workspace_mutation() {
                     mutation_digest: "blake3:forged-read".into(),
                     workspace_revision: None,
                     subject_digest: None,
+                    redacted_content: false,
                 }),
             }),
         ),

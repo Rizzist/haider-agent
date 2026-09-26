@@ -1892,10 +1892,19 @@ async fn activity_real_interleaved_pipes_cannot_split_pem_redaction() {
         "background":true
     })).await;
     let task = TaskId::new(receipt["task_id"].as_str().expect("task"));
+    let safe_pem_bytes = u64::try_from(
+        "diagnostic\n".len()
+            + haider_tools::redact_output_text("-----BEGIN\x20PRIVATE KEY-----\nAA==\n").len(),
+    )
+    .expect("small safe capture length");
     for (expected_bytes, expected_line, release) in [
         (11, None, "stream-stderr"),
         (22, Some("diagnostic"), "stream-stdout"),
-        (44, Some("[REDACTED:private_key]"), "stream-finish"),
+        (
+            safe_pem_bytes,
+            Some("[REDACTED:private_key]"),
+            "stream-finish",
+        ),
     ] {
         timeout(Duration::from_secs(10), async {
             loop {
@@ -2271,8 +2280,8 @@ fn assert_repair_carriers_present(text: &str) {
         assert!(text.contains(carrier), "carrier {carrier} lost");
     }
     for authority in [
-        "https://owner:[REDACTED:secret_value]@",
-        "postgres://owner:[REDACTED:secret_value]@",
+        "https://owner:[REDACTED:password]@",
+        "postgres://owner:[REDACTED:password]@",
     ] {
         assert!(
             text.contains(authority),

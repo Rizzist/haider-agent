@@ -502,6 +502,7 @@ fn checkpoint_effect_envelopes(
                 mutation_digest,
                 workspace_revision: None,
                 subject_digest: None,
+                redacted_content: checkpoint.redacted_content,
             }),
         }),
         EventPayload::CheckpointRecorded(checkpoint),
@@ -10971,10 +10972,12 @@ impl HubConnection {
             haider_protocol::checkpoint::CheckpointKind::Write,
             |checkpoint| checkpoint.kind,
         );
+        let redacted_content = haider_tools::capture_paths_redacted(&captures);
         let capture = haider_tools::CheckpointCapture {
             kind: checkpoint_kind,
             paths: captures,
             post_digest: mutation_digest.clone(),
+            redacted_content,
         };
         let mut cas = self.hub.inner.store.clone();
         let checkpoint = match haider_tools::freeze_checkpoint(
