@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import hashlib
 import io
@@ -161,6 +162,207 @@ class ChocolateyReleaseTests(unittest.TestCase):
                 release_packaging.verify_chocolatey_against_artifact(
                     package, VERSION, artifact
                 )
+
+
+FIX_VERSION = f"{VERSION}.20260927"
+VCREDIST = ("vcredist140", "14.51.36231")
+
+
+class ChocolateyPackageFixTests(unittest.TestCase):
+    def render_fix(self, root: Path, newline: bytes = b"\r\n", source: Path | None = None):
+        artifact = root / release_packaging._windows_artifact(VERSION)
+        artifact.write_bytes(b"unchanged release artifact")
+        artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        checksum = artifact.with_name(artifact.name + ".sha256")
+        checksum.write_text(f"{artifact_sha} *{artifact.name}\n")
+        output = root / "rendered"
+        release_packaging.render_chocolatey_from_artifact(
+            source or _template(root, newline),
+            output,
+            VERSION,
+            artifact,
+            package_version=FIX_VERSION,
+            dependencies=["=".join(VCREDIST)],
+            checksum=checksum,
+        )
+        return output, artifact, checksum, artifact_sha
+
+    def test_fix_version_keeps_the_original_release_payload_and_adds_dependency(self) -> None:
+        for name, newline in (("LF", b"\n"), ("CRLF", b"\r\n")):
+            with self.subTest(newline=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                output, artifact, checksum, artifact_sha = self.render_fix(root, newline)
+                nuspec = (output / "haider.nuspec").read_bytes()
+                install = (output / "tools" / "chocolateyinstall.ps1").read_text()
+                verification = (output / "tools" / "VERIFICATION.txt").read_text()
+
+                self.assertIn(f"<version>{FIX_VERSION}</version>".encode(), nuspec)
+                self.assertIn(
+                    b'<dependency id="vcredist140" version="14.51.36231" />', nuspec
+                )
+                self.assertNotIn(b"\r\r\n", nuspec)
+                if newline == b"\n":
+                    self.assertNotIn(b"\r\n", nuspec)
+                self.assertIn(f"$version = '{VERSION}'", install)
+                self.assertIn(release_packaging._windows_url(VERSION), install)
+                self.assertNotIn(FIX_VERSION, install)
+                self.assertIn(artifact_sha, install)
+                self.assertIn(f"/releases/tag/v{VERSION}\n", verification)
+                self.assertNotIn(FIX_VERSION, verification)
+
+                package = root / f"haider.{FIX_VERSION}.nupkg"
+                _nupkg(output, package)
+                release_packaging.verify_chocolatey_against_artifact(
+                    package,
+                    VERSION,
+                    artifact,
+                    package_version=FIX_VERSION,
+                    dependencies=[VCREDIST],
+                    checksum=checksum,
+                )
+                # A normal-release verification of the fix package must fail.
+                with self.assertRaisesRegex(
+                    release_packaging.PackagingError, "nupkg filename mismatch"
+                ):
+                    release_packaging.verify_chocolatey_against_artifact(
+                        package, VERSION, artifact
+                    )
+                with self.assertRaisesRegex(
+                    release_packaging.PackagingError, "nuspec dependencies mismatch"
+                ):
+                    release_packaging.verify_chocolatey_nupkg(
+                        package, VERSION, artifact_sha, package_version=FIX_VERSION
+                    )
+                with self.assertRaisesRegex(
+                    release_packaging.PackagingError, "nuspec dependencies mismatch"
+                ):
+                    release_packaging.verify_chocolatey_nupkg(
+                        package,
+                        VERSION,
+                        artifact_sha,
+                        package_version=FIX_VERSION,
+                        dependencies=[("vcredist140", "14.30.30704")],
+                    )
+
+    def test_repository_template_renders_a_fix_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output, *_ = self.render_fix(
+                Path(temporary), source=ROOT / "packaging" / "chocolatey"
+            )
+            root = release_packaging.ET.fromstring((output / "haider.nuspec").read_bytes())
+            dependencies = root.findall(".//{*}dependencies/{*}dependency")
+            self.assertEqual(
+                [(item.get("id"), item.get("version")) for item in dependencies],
+                [VCREDIST],
+            )
+            self.assertEqual(
+                release_packaging._single_xml_text(root, "version", "rendered"),
+                FIX_VERSION,
+            )
+
+    def test_normal_release_rejects_unexpected_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = _template(root, b"\n")
+            output = root / "rendered"
+            release_packaging.render_chocolatey_tree(
+                source, output, VERSION, SHA256, dependencies=["=".join(VCREDIST)]
+            )
+            package = root / f"haider.{VERSION}.nupkg"
+            _nupkg(output, package)
+            with self.assertRaisesRegex(
+                release_packaging.PackagingError, "nuspec dependencies mismatch"
+            ):
+                release_packaging.verify_chocolatey_nupkg(package, VERSION, SHA256)
+
+    def test_invalid_fix_versions_dependencies_and_checksums_fail(self) -> None:
+        for package_version in (
+            "9.8.6.20260927",
+            "9.8.7-20260927",
+            "9.8.7.2026.0927",
+            "9.8.70",
+        ):
+            with self.subTest(package_version=package_version), self.assertRaisesRegex(
+                release_packaging.PackagingError, "invalid package-fix version"
+            ):
+                release_packaging._package_version(VERSION, package_version)
+        for dependency in ("vcredist140", "vcredist140=latest", "bad id=1.0", "x=[1.0,)"):
+            with self.subTest(dependency=dependency), self.assertRaises(
+                release_packaging.PackagingError
+            ):
+                release_packaging._dependencies([dependency])
+        with self.assertRaisesRegex(release_packaging.PackagingError, "duplicate"):
+            release_packaging._dependencies(["a=1.0", "A=2.0"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, artifact, checksum, _ = self.render_fix(root)
+            checksum.write_text(f"{'00' * 32} *{artifact.name}\n")
+            with self.assertRaisesRegex(
+                release_packaging.PackagingError, "does not match"
+            ):
+                release_packaging.published_windows_sha256(artifact, VERSION, checksum)
+
+    def test_cli_renders_and_verifies_a_fix_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, artifact, checksum, _ = self.render_fix(root)
+            output = root / "cli"
+            common = [
+                "--version", VERSION,
+                "--artifact", str(artifact),
+                "--package-version", FIX_VERSION,
+                "--dependency", "=".join(VCREDIST),
+                "--checksum", str(checksum),
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    release_packaging.main(
+                        ["render-chocolatey", "--source", str(_template(root / "t", b"\n")),
+                         "--output", str(output), *common]
+                    ),
+                    0,
+                )
+                package = root / f"haider.{FIX_VERSION}.nupkg"
+                _nupkg(output, package)
+                self.assertEqual(
+                    release_packaging.main(
+                        ["verify-chocolatey", "--nupkg", str(package), *common]
+                    ),
+                    0,
+                )
+            # Omitting the dependency must fail the post-pack gate.
+            without_dependency = [*common[:6], "--checksum", str(checksum)]
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    release_packaging.main(
+                        ["verify-chocolatey", "--nupkg", str(package), *without_dependency]
+                    ),
+                    1,
+                )
+
+    def test_package_fix_workflow_is_dispatch_only_and_pins_the_original_release(self) -> None:
+        workflow = (ROOT / ".github/workflows/chocolatey-package-fix.yml").read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertNotIn("\n  pull_request:", workflow)
+        for fragment in (
+            "release_tag:",
+            "package_version:",
+            "--package-version",
+            "--dependency",
+            "--checksum",
+            "verify-chocolatey",
+            "choco pack",
+            "choco push",
+            "secrets.CHOCO_API_KEY",
+            "vcredist140=",
+            "403|Forbidden",
+            "401|Unauthorized",
+        ):
+            self.assertIn(fragment, workflow)
+        self.assertNotIn("gh release upload", workflow)
+        self.assertNotIn("gh release edit", workflow)
+        self.assertNotIn("git push", workflow)
 
 
 class SiblingPackagerTests(unittest.TestCase):

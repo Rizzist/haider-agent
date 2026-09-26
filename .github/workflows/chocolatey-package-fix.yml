@@ -1,0 +1,177 @@
+name: chocolatey-package-fix
+
+# Publish a Chocolatey package-fix version (for example 0.0.972.20260927) that
+# installs the SAME, unchanged GitHub release zip of an existing release tag.
+# It never touches the GitHub release, its tag or its artifacts: the zip and its
+# published .sha256 record are only downloaded and read.
+#
+# The package adds a dependency on the community vcredist140 package because
+# 0.0.972 binaries import VCRUNTIME140.dll / api-ms-win-crt-* (Chocolatey's
+# verifier failed with 0xC0000135 STATUS_DLL_NOT_FOUND on a clean Windows).
+# The minimum version matches the MSVC 14.51 toolset that linked 0.0.972.
+#
+# Dispatch-only: gh workflow run chocolatey-package-fix.yml \
+#   -f release_tag=v0.0.972 -f package_version=0.0.972.20260927
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing published release tag whose Windows zip is installed (e.g. v0.0.972)
+        required: true
+        type: string
+      package_version:
+        description: Chocolatey package-fix version (<release version>.<YYYYMMDD>, e.g. 0.0.972.20260927)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chocolatey-package-fix-${{ inputs.package_version }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  PACKAGE_VERSION: ${{ inputs.package_version }}
+  VCREDIST_DEPENDENCY: vcredist140=14.51.36231
+
+jobs:
+  package-fix:
+    name: Chocolatey package fix
+    runs-on: windows-latest
+    steps:
+      - name: Validate inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "release_tag must look like v0.0.972, got '$($env:RELEASE_TAG)'"
+          }
+          $Version = $env:RELEASE_TAG.Substring(1)
+          if ($env:PACKAGE_VERSION -notmatch ('^' + [regex]::Escape($Version) + '\.[0-9]+$')) {
+            throw "package_version must be $Version.<number> (e.g. $Version.20260927), got '$($env:PACKAGE_VERSION)'"
+          }
+          "RELEASE_VERSION=$Version" >> $env:GITHUB_ENV
+
+      # Tooling (release_packaging.py) comes from the dispatched ref; the
+      # Chocolatey template comes from the release tag so the install script is
+      # exactly the one that release shipped.
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          path: release-src
+          persist-credentials: false
+
+      - name: Download the unchanged release zip and its published checksum
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Zip = "haider-v$($env:RELEASE_VERSION)-x86_64-pc-windows-msvc-split.zip"
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+            --pattern $Zip --pattern "$Zip.sha256" --dir artifacts
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download $Zip from release $($env:RELEASE_TAG)"
+          }
+          Get-Content "artifacts\$Zip.sha256" | Write-Output
+
+      - name: Render, pack and verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Zip = "haider-v$($env:RELEASE_VERSION)-x86_64-pc-windows-msvc-split.zip"
+          $Common = @(
+            '--version', $env:RELEASE_VERSION,
+            '--artifact', "artifacts\$Zip",
+            '--checksum', "artifacts\$Zip.sha256",
+            '--package-version', $env:PACKAGE_VERSION,
+            '--dependency', $env:VCREDIST_DEPENDENCY
+          )
+          python scripts\release_packaging.py render-chocolatey `
+            --source release-src\packaging\chocolatey `
+            --output dist-choco `
+            @Common
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey template rendering failed with exit code $LASTEXITCODE"
+          }
+          Get-Content dist-choco\haider.nuspec | Write-Output
+
+          choco pack dist-choco\haider.nuspec --outputdirectory dist-choco
+          if ($LASTEXITCODE -ne 0) {
+            throw "choco pack failed with exit code $LASTEXITCODE"
+          }
+
+          python scripts\release_packaging.py verify-chocolatey `
+            --nupkg "dist-choco\haider.$($env:PACKAGE_VERSION).nupkg" `
+            @Common
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey post-pack verification failed with exit code $LASTEXITCODE"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chocolatey-haider-${{ inputs.package_version }}
+          path: dist-choco/*.nupkg
+          if-no-files-found: error
+
+      - name: Check Chocolatey token
+        id: token
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHOCO_API_KEY)) {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Output "::warning::CHOCO_API_KEY is not set; skipping Chocolatey publish"
+            "haider $($env:PACKAGE_VERSION) was NOT pushed: CHOCO_API_KEY is not set." >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Check published Chocolatey version
+        id: package
+        if: steps.token.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $Existing = choco search haider --exact --version $env:PACKAGE_VERSION --source https://community.chocolatey.org/api/v2/ --limit-output
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not query Chocolatey for haider $($env:PACKAGE_VERSION); not pushing blind"
+          }
+          if (@($Existing) -contains "haider|$($env:PACKAGE_VERSION)") {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Output "::warning::haider $($env:PACKAGE_VERSION) is already published; skipping Chocolatey push"
+            "haider $($env:PACKAGE_VERSION) is already on Chocolatey; push skipped." >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Push
+        if: steps.token.outputs.skip != 'true' && steps.package.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          $NupkgPath = "dist-choco\haider.$($env:PACKAGE_VERSION).nupkg"
+          $PushOutput = choco push $NupkgPath --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY 2>&1
+          $PushExit = $LASTEXITCODE
+          $PushOutput | Write-Output
+          if ($PushExit -ne 0) {
+            $PushText = $PushOutput -join "`n"
+            if ($PushText -match '(?i)(already exists|conflict|status code 409)') {
+              Write-Output "::warning::haider $($env:PACKAGE_VERSION) already exists on Chocolatey; treating the push as an idempotent no-op"
+              "haider $($env:PACKAGE_VERSION) already exists on Chocolatey (409); no-op." >> $env:GITHUB_STEP_SUMMARY
+              exit 0
+            }
+            if ($PushText -match '(?i)(403|Forbidden)') {
+              Write-Output "::warning::Chocolatey rejected the CHOCO_API_KEY (403 Forbidden). Regenerate the key at https://community.chocolatey.org/account and update the repository secret CHOCO_API_KEY; the release itself is unaffected."
+              "haider $($env:PACKAGE_VERSION) was NOT pushed: Chocolatey returned 403 Forbidden for CHOCO_API_KEY." >> $env:GITHUB_STEP_SUMMARY
+              exit 0
+            }
+            if ($PushText -match '(?i)(401|Unauthorized)') {
+              Write-Output "::warning::Chocolatey rejected the CHOCO_API_KEY (401 Unauthorized). Regenerate the key at https://community.chocolatey.org/account and update the repository secret CHOCO_API_KEY; the release itself is unaffected."
+              "haider $($env:PACKAGE_VERSION) was NOT pushed: Chocolatey returned 401 Unauthorized for CHOCO_API_KEY." >> $env:GITHUB_STEP_SUMMARY
+              exit 0
+            }
+            exit $PushExit
+          }
+          "Pushed haider $($env:PACKAGE_VERSION) (installs $($env:RELEASE_TAG) zip unchanged; depends on $($env:VCREDIST_DEPENDENCY)) to Chocolatey moderation." >> $env:GITHUB_STEP_SUMMARY
