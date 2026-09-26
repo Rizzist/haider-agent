@@ -2909,23 +2909,36 @@ impl ProviderError {
         )
     }
 
-    /// Marks `message` as carrying provider- or child-controlled text.
+    /// Marks `message` as carrying provider- or child-controlled text. An
+    /// untrusted message that matches no template is recorded once, here, as
+    /// the owner-local raw detail; clearing `provider_raw_detail` (lockdown)
+    /// therefore removes it for good — nothing re-derives it later.
     #[must_use]
     pub fn with_untrusted_message(mut self) -> Self {
         self.message_untrusted = true;
+        if self.provider_raw_detail.is_none()
+            && self.timeout_reason.is_none()
+            && crate::error_templates::render_known_provider_message(&self.message).is_none()
+        {
+            self.provider_raw_detail = Some(crate::error_detail::local_raw_detail(&self.message));
+        }
         self
     }
 
-    /// Owner-local raw text for this error: the unknown provider prose, or
-    /// an untrusted message that matched no template (credential-redacted).
+    /// The provider's own error prose, kept in process memory only (never
+    /// serialized, never published) for local decisions such as parsing a
+    /// stated output-token maximum.
+    #[must_use]
+    pub(crate) fn provider_prose(&self) -> Option<&str> {
+        self.prose_state.as_ref().map(|state| state.prose.as_str())
+    }
+
+    /// Owner-local raw text for this error (unknown provider prose, or an
+    /// untrusted message that matched no template; credential-redacted).
+    /// `None` once a lockdown gate cleared it.
     #[must_use]
     pub fn local_message_detail(&self) -> Option<String> {
-        self.provider_raw_detail.clone().or_else(|| {
-            (self.message_untrusted
-                && self.timeout_reason.is_none()
-                && crate::error_templates::render_known_provider_message(&self.message).is_none())
-            .then(|| crate::error_detail::local_raw_detail(&self.message))
-        })
+        self.provider_raw_detail.clone()
     }
 
     /// A copy safe for serialization into journal extensions and other
@@ -3808,6 +3821,20 @@ pub enum FakeStep {
     ExpectToolResult {
         call_id: String,
     },
+    /// Fails the request with a provider error whose message carries
+    /// provider-controlled text (as adapters' malformed-frame errors do).
+    ErrorUntrustedMessage {
+        kind: ProviderErrorKind,
+        message: String,
+    },
+    /// Fails the request with the error the real adapter classifies from a
+    /// captured HTTP error body (`family`: `anthropic`, `openai` — also
+    /// DeepSeek and other OpenAI-compatible APIs — or `gemini`).
+    ReplayHttpError {
+        family: String,
+        status: u16,
+        body: String,
+    },
     EmitText {
         text: String,
     },
@@ -4075,6 +4102,8 @@ impl FakeProvider {
                 self.script[end - 1],
                 FakeStep::Finish { .. }
                     | FakeStep::Error { .. }
+                    | FakeStep::ErrorUntrustedMessage { .. }
+                    | FakeStep::ReplayHttpError { .. }
                     | FakeStep::ErrorPresented { .. }
                     | FakeStep::Hang
                     | FakeStep::PrematureEof
@@ -4269,6 +4298,27 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 let _ = sender
                     .send(Err(
                         ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+                    ))
+                    .await;
+                return;
+            }
+            FakeStep::ReplayHttpError {
+                family,
+                status,
+                body,
+            } => {
+                let error = match family.as_str() {
+                    "anthropic" => replay_anthropic_http_error(status, None, body.as_bytes()),
+                    "gemini" => replay_gemini_http_error(status, None, body.as_bytes()),
+                    _ => replay_openai_http_error(status, None, body.as_bytes()),
+                };
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            FakeStep::ErrorUntrustedMessage { kind, message } => {
+                let _ = sender
+                    .send(Err(
+                        ProviderError::new(kind, message).with_untrusted_message()
                     ))
                     .await;
                 return;

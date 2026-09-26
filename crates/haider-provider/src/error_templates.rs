@@ -15,7 +15,8 @@
 //! | `{num}`        | decimal number                                           | verbatim             |
 //! | `{param}`      | dotted path: closed-list names, numeric indices <= 4 digits | verbatim          |
 //! | `{url}`        | http(s) URL whose host is in the exact public-host allowlist | `scheme://host`  |
-//! | `{duration}`   | provider retry delay such as `2s`, `1.5s`, `6m0s`, `20ms` | verbatim            |
+//! | `{duration}`   | provider retry delay such as `2s`, `39.844676573s`, `6m0s` (<= 9 fractional digits) | verbatim |
+//! | `{quota_lines}`| 1–8 Gemini `* Quota exceeded for metric: …` lines: closed-list metric, integer limit, corroborated model | verbatim |
 //! | `{rate_unit}`  | closed set of OpenAI rate-limit units                     | verbatim             |
 //! | `{request_id}` | equals the captured request-id header; else `safe_request_id`, <= 64 B | verbatim |
 //! | `{api_version}`| `v1`, `v1beta`, `v1alpha`, `v1beta1`                      | verbatim             |
@@ -89,6 +90,10 @@ const TEMPLATES: &[Template] = &[
     ),
     template("Gemini INTERNAL (HTTP 500)", "Internal error encountered."),
     template(
+        "Gemini UNAVAILABLE (HTTP 503) high demand; discuss.ai.google.dev 503 threads",
+        "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+    ),
+    template(
         "Gemini INTERNAL (HTTP 500)",
         "An internal error has occurred. Please retry or report in https://developers.generativeai.google/guide/troubleshooting",
     ),
@@ -140,6 +145,22 @@ const TEMPLATES: &[Template] = &[
         "Rate limit reached for {model} in project {account_id} on {rate_unit}: Limit {int}, Used {int}, Requested {int}. Please try again in {duration}. Visit {url} to learn more.",
     ),
     template(
+        "Anthropic 429 rate_limit_error, current wording (input tokens, ASCII apostrophe); continuedev/continue#10425, cline#879",
+        "This request would exceed your organization's rate limit of {int} input tokens per minute (org: {account_id}, model: {model}). For details, refer to: {url}. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://www.anthropic.com/contact-sales to discuss your options for a rate limit increase.",
+    ),
+    template(
+        "Anthropic 429 rate_limit_error, current wording (output tokens, ASCII apostrophe); continuedev/continue#10425, cline#879",
+        "This request would exceed your organization's rate limit of {int} output tokens per minute (org: {account_id}, model: {model}). For details, refer to: {url}. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://www.anthropic.com/contact-sales to discuss your options for a rate limit increase.",
+    ),
+    template(
+        "Anthropic 429 rate_limit_error, current wording (input tokens, U+2019 apostrophe); continuedev/continue#10425, cline#879",
+        "This request would exceed your organization’s rate limit of {int} input tokens per minute (org: {account_id}, model: {model}). For details, refer to: {url}. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://www.anthropic.com/contact-sales to discuss your options for a rate limit increase.",
+    ),
+    template(
+        "Anthropic 429 rate_limit_error, current wording (output tokens, U+2019 apostrophe); continuedev/continue#10425, cline#879",
+        "This request would exceed your organization’s rate limit of {int} output tokens per minute (org: {account_id}, model: {model}). For details, refer to: {url}. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://www.anthropic.com/contact-sales to discuss your options for a rate limit increase.",
+    ),
+    template(
         "Anthropic 429 rate_limit_error (output tokens)",
         "This request would exceed the rate limit for your organization ({account_id}) of {int} output tokens per minute. For details, refer to: {url}. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://www.anthropic.com/contact-sales to discuss your options for a rate limit increase.",
     ),
@@ -167,6 +188,10 @@ const TEMPLATES: &[Template] = &[
     template(
         "OpenAI 429 insufficient_quota",
         "You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: {url}.",
+    ),
+    template(
+        "Gemini 429 RESOURCE_EXHAUSTED free-tier/quota; google-gemini/gemini-cli#13112",
+        "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: {url}. To monitor your current usage, head to: {url}. {quota_lines}\nPlease retry in {duration}.",
     ),
     template(
         "Gemini 429 quota",
@@ -445,6 +470,14 @@ const TEMPLATES: &[Template] = &[
         "`max_tokens` must be greater than `thinking.budget_tokens`. Please consult our documentation at https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#max-tokens-and-context-window-size",
     ),
     template(
+        "Anthropic 400 invalid_request_error (thinking budget, docs.claude.com wording)",
+        "`max_tokens` must be greater than `thinking.budget_tokens`. Please consult our documentation at https://docs.claude.com/en/docs/build-with-claude/extended-thinking#max-tokens-and-context-window-size",
+    ),
+    template(
+        "Anthropic 400 invalid_request_error (image too large); anthropics/claude-code 5 MB image issues",
+        "{param}: image exceeds 5 MB maximum: {int} bytes > {int} bytes",
+    ),
+    template(
         "Anthropic 400 invalid_request_error (orphaned tool_use)",
         "messages.{int}: `tool_use` ids were found without `tool_result` blocks immediately after: {tool_call_id}. Each `tool_use` block must have a corresponding `tool_result` block in the next message.",
     ),
@@ -610,6 +643,10 @@ pub(crate) const PARAMETER_NAMES: &[&str] = &[
     "cachedContent",
     "labels",
     "parameters",
+    // Anthropic image content blocks (`messages.N.content.M.image.source.base64`).
+    "image",
+    "source",
+    "base64",
 ];
 
 const RATE_UNITS: &[&str] = &[
@@ -647,6 +684,7 @@ enum Slot {
     AccountId,
     ApiKey,
     ToolCallId,
+    QuotaLines,
 }
 
 impl Slot {
@@ -665,6 +703,7 @@ impl Slot {
             "account_id" => Self::AccountId,
             "api_key" => Self::ApiKey,
             "tool_call_id" => Self::ToolCallId,
+            "quota_lines" => Self::QuotaLines,
             other => panic!("unknown provider error template slot {{{other}}}"),
         }
     }
@@ -678,7 +717,11 @@ impl Slot {
             Self::Param => r"[A-Za-z0-9_.\[\]]{1,96}".to_owned(),
             Self::Url => r#"https?://[^\s<>"'()`]{1,256}?"#.to_owned(),
             Self::Duration => {
-                r"[0-9]{1,6}(?:\.[0-9]{1,6})?(?:ms|s|m|h)(?:[0-9]{1,6}(?:\.[0-9]{1,6})?(?:ms|s|m))?"
+                r"[0-9]{1,6}(?:\.[0-9]{1,9})?(?:ms|s|m|h)(?:[0-9]{1,6}(?:\.[0-9]{1,9})?(?:ms|s|m))?"
+                    .to_owned()
+            }
+            Self::QuotaLines => {
+                r"(?:\n\* Quota exceeded for metric: [a-z0-9_./-]{1,160}, limit: [0-9]{1,12}(?:, model: [A-Za-z0-9._:@/-]{1,128})?){1,8}"
                     .to_owned()
             }
             Self::RateUnit => alternation(RATE_UNITS),
@@ -709,6 +752,7 @@ impl Slot {
                 (value.bytes().filter(u8::is_ascii_digit).count() <= 12).then(|| value.to_owned())
             }
             Self::AccountId => account_id_shape(value).then(|| REDACTED.to_owned()),
+            Self::QuotaLines => quota_lines_render(value, evidence),
             Self::ApiKey => Some(REDACTED.to_owned()),
             Self::Num | Self::Duration | Self::RateUnit | Self::ApiVersion | Self::Method => {
                 Some(value.to_owned())
@@ -770,6 +814,41 @@ fn alternation(options: &[&str]) -> String {
             .collect::<Vec<_>>()
             .join("|")
     )
+}
+
+/// Gemini quota metrics that may appear in a `{quota_lines}` slot. Source:
+/// Gemini API rate-limit docs and google-gemini/gemini-cli#13112.
+const GEMINI_QUOTA_METRICS: &[&str] = &[
+    "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+    "generativelanguage.googleapis.com/generate_content_free_tier_input_token_count",
+    "generativelanguage.googleapis.com/generate_content_paid_tier_requests",
+    "generativelanguage.googleapis.com/generate_content_paid_tier_input_token_count",
+    "generativelanguage.googleapis.com/generate_requests_per_model_per_day",
+    "generativelanguage.googleapis.com/generate_requests_per_model",
+];
+
+/// Renders repeated `* Quota exceeded for metric: M, limit: N[, model: X]`
+/// lines only when every metric is in the closed list, every limit is an
+/// integer and every model is corroborated.
+fn quota_lines_render(value: &str, evidence: &SlotEvidence<'_>) -> Option<String> {
+    for line in value.split('\n').filter(|line| !line.is_empty()) {
+        let rest = line.strip_prefix("* Quota exceeded for metric: ")?;
+        let (metric, rest) = rest.split_once(", limit: ")?;
+        if !GEMINI_QUOTA_METRICS.contains(&metric) {
+            return None;
+        }
+        let (limit, model) = match rest.split_once(", model: ") {
+            Some((limit, model)) => (limit, Some(model)),
+            None => (rest, None),
+        };
+        if limit.is_empty() || limit.len() > 12 || !limit.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if model.is_some_and(|model| !model_corroborated(model, evidence)) {
+            return None;
+        }
+    }
+    Some(value.to_owned())
 }
 
 /// Array indices in a `{param}` path are at most this many digits.

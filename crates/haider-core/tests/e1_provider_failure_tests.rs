@@ -1081,3 +1081,70 @@ async fn e1e_permanent_connection_configuration_does_not_retry() {
     assert_eq!(provider.requests().len(), 1);
     assert!(sleeper.0.lock().expect("sleeper lock").is_empty());
 }
+
+/// Ruling 2 / final-review B1: a lockdown turn shows provider templates only.
+/// An adapter error whose message carries provider-controlled text (every
+/// adapter's malformed-frame error) must journal no owner-local raw text on a
+/// lockdown turn, while an ordinary turn keeps it for the owner's TUI.
+///
+/// MUTATION CHECK: re-derive the raw text in `provider_error_to_haider` (or
+/// drop the lockdown gate in `provider_failure_outcome_with_items`). Expected
+/// runtime failure: the lockdown RunFailed below carries the marker.
+#[tokio::test]
+async fn lockdown_untrusted_malformed_frame_journals_no_raw_provider_text() {
+    for lockdown in [true, false] {
+        let session = if lockdown {
+            "lockdown-untrusted-frame"
+        } else {
+            "open-untrusted-frame"
+        };
+        let mut config =
+            HarnessConfig::for_session(SessionId::new(session), DeviceId::new("e1"), 1, 1);
+        config.retry_sleeper = Arc::new(RecordingSleeper::default());
+        config.provider_lockdown = lockdown;
+        let provider = Arc::new(FakeProvider::new(vec![FakeStep::ErrorUntrustedMessage {
+            kind: ProviderErrorKind::MalformedFrame,
+            message: "Anthropic SSE `quilllockdown7` data is not valid JSON".into(),
+        }]));
+        let store = Arc::new(MemoryStore::new());
+        let handle = HarnessActor::spawn(config, provider, store.clone());
+        let outcome = handle
+            .submit_turn(SubmitTurn::new("malformed"))
+            .await
+            .expect("accepted")
+            .wait()
+            .await
+            .expect("outcome");
+        assert_eq!(outcome.state, RunState::Errored);
+        let failures = store
+            .events(&SessionId::new(session))
+            .await
+            .into_iter()
+            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
+            .filter_map(|payload| match payload {
+                EventPayload::RunFailed {
+                    message,
+                    presentation,
+                    ..
+                } => Some((message, presentation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        let (message, presentation) = &failures[0];
+        let presentation = presentation.as_ref().expect("presentation");
+        assert!(!message.contains("quilllockdown7"), "{message}");
+        assert!(!presentation.detail.contains("quilllockdown7"));
+        if lockdown {
+            assert_eq!(presentation.provider_raw_detail, None, "lockdown keeps raw");
+        } else {
+            assert!(
+                presentation
+                    .provider_raw_detail
+                    .as_deref()
+                    .is_some_and(|raw| raw.contains("quilllockdown7")),
+                "owner-local raw kept on an ordinary turn: {presentation:?}"
+            );
+        }
+    }
+}

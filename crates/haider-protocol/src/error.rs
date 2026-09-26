@@ -20,6 +20,119 @@ pub const PROVIDER_DETAIL_WITHHELD: &str = "details withheld";
 /// projections remove every occurrence with [`strip_local_only_fields`].
 pub const PROVIDER_RAW_DETAIL_FIELD: &str = "provider_raw_detail";
 
+/// Where a consumer of `RunFailed` sends it, for the provider raw-detail
+/// policy (ruling 2). See [`RUN_FAILED_CONSUMERS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFailedSurface {
+    /// Producer or owner-local consumer (journal, TUI, CLI print, owner-UID
+    /// RPC frames): `provider_raw_detail` may be present.
+    OwnerLocal,
+    /// Reads only codes, message or `title`/`detail` (never the raw field),
+    /// including model-/peer-visible projections.
+    PublicFieldsOnly,
+    /// Serializes the presentation to a shareable place; it strips the raw
+    /// field, proven by the named regression test.
+    ShareableStripped(&'static str),
+}
+
+/// Registry of every production file that consumes or produces `RunFailed`
+/// (`EventPayload::RunFailed` or a `"run_failed"` payload tag). A protocol
+/// test scans the workspace and fails when a file is missing here, so a new
+/// surface cannot be added without classifying it; every
+/// `ShareableStripped` entry names an existing regression test.
+pub const RUN_FAILED_CONSUMERS: &[(&str, RunFailedSurface)] = &[
+    (
+        "crates/haider-cli/src/export.rs",
+        RunFailedSurface::ShareableStripped("every_export_format_strips_owner_local_provider_text"),
+    ),
+    (
+        "crates/haider-cli/src/run.rs",
+        RunFailedSurface::ShareableStripped(
+            "owner_local_provider_detail_is_stripped_from_shareable_projections",
+        ),
+    ),
+    (
+        "crates/haider-client/src/headless.rs",
+        RunFailedSurface::ShareableStripped("replay_ledgers_strip_owner_local_provider_detail"),
+    ),
+    (
+        "crates/haider-core/src/actor.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-core/src/task_outcome.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-daemon/src/completion.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-daemon/src/delegation.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-daemon/src/mobile_transport/chat_bridge.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-daemon/src/pipe_native.rs",
+        RunFailedSurface::ShareableStripped(
+            "sidecar_error_rows_never_carry_owner_local_provider_text",
+        ),
+    ),
+    (
+        "crates/haider-daemon/src/runtime.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-daemon/src/session_hub/actor.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-daemon/src/turn_recovery.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-daemon/src/worker.rs",
+        RunFailedSurface::ShareableStripped(
+            "failed_manual_compaction_under_lockdown_journals_templates_only",
+        ),
+    ),
+    (
+        "crates/haider-protocol/src/completion.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-protocol/src/error.rs",
+        RunFailedSurface::ShareableStripped(
+            "provider_raw_detail_is_local_only_and_strippable_everywhere",
+        ),
+    ),
+    (
+        "crates/haider-protocol/src/pipe.rs",
+        RunFailedSurface::ShareableStripped(
+            "sidecar_error_rows_never_carry_owner_local_provider_text",
+        ),
+    ),
+    (
+        "crates/haider-protocol/src/transcript.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-store/src/event_store.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-store/src/usage_ledger.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-tui/src/projection.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+];
+
 /// Human label every owner-local renderer (CLI print, TUI) uses for
 /// [`ErrorPresentation::provider_raw_detail`].
 pub const PROVIDER_RAW_DETAIL_LABEL: &str = "Provider detail (local only)";
@@ -770,6 +883,92 @@ mod tests {
         let long = ErrorPresentation::new("x", "t", "d", ErrorScope::Turn, [ErrorAction::None])
             .with_provider_raw_detail(Some(&"🦀".repeat(4096)));
         assert!(long.provider_raw_detail.expect("bounded").len() <= PROVIDER_RAW_DETAIL_LIMIT);
+    }
+
+    /// Registry guard: every production source file that references
+    /// `RunFailed` is classified in [`RUN_FAILED_CONSUMERS`], and every
+    /// shareable entry's regression test exists in the workspace.
+    #[test]
+    fn run_failed_consumer_registry_is_complete() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let mut sources = Vec::new();
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read dir").flatten() {
+                let path = entry.path();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if path.is_dir() {
+                    if name != "tests" && name != "target" {
+                        stack.push(path);
+                    }
+                } else if name.ends_with(".rs") {
+                    sources.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        let mut all_text = String::new();
+        for path in &sources {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let relative = path
+                .strip_prefix(&root)
+                .expect("under root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if !name.ends_with("_tests.rs")
+                && (text.contains("EventPayload::RunFailed") || text.contains("\"run_failed\""))
+            {
+                found.push(relative);
+            }
+            all_text.push_str(&text);
+        }
+        for path in root.join("crates").read_dir().expect("crates").flatten() {
+            let tests = path.path().join("tests");
+            if let Ok(entries) = std::fs::read_dir(tests) {
+                for entry in entries.flatten() {
+                    all_text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+                }
+            }
+        }
+        found.sort();
+        let registered: Vec<String> = RUN_FAILED_CONSUMERS
+            .iter()
+            .map(|(path, _)| (*path).to_owned())
+            .collect();
+        let missing: Vec<_> = found
+            .iter()
+            .filter(|path| !registered.contains(path))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "classify these RunFailed consumers in RUN_FAILED_CONSUMERS: {missing:?}"
+        );
+        let stale: Vec<_> = registered
+            .iter()
+            .filter(|path| !found.contains(path))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "registry entries no longer reference RunFailed: {stale:?}"
+        );
+        for (path, surface) in RUN_FAILED_CONSUMERS {
+            if let RunFailedSurface::ShareableStripped(test) = surface {
+                assert!(
+                    all_text.contains(&format!("fn {test}(")),
+                    "{path}: regression test `{test}` not found"
+                );
+            }
+        }
     }
 
     #[test]

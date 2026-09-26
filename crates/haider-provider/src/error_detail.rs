@@ -115,6 +115,11 @@ const PUBLIC_PROVIDER_ERROR_TYPES: &[&str] = &[
     "model_context_window_exceeded",
     "prompt_too_long",
     "input_too_large",
+    // Not found / size (Anthropic `not_found_error`, `request_too_large`;
+    // OpenAI `model_not_found` code).
+    "not_found_error",
+    "request_too_large",
+    "model_not_found",
 ];
 
 /// Request ids must start with one of these (Anthropic `request-id` and
@@ -141,10 +146,13 @@ pub(crate) const PUBLIC_PROVIDER_URL_HOSTS: &[&str] = &[
     "api.anthropic.com",
     "console.anthropic.com",
     "docs.anthropic.com",
+    "docs.claude.com",
+    "platform.claude.com",
     "support.anthropic.com",
     "status.anthropic.com",
     "generativelanguage.googleapis.com",
     "ai.google.dev",
+    "ai.dev",
     "status.cloud.google.com",
     "api.deepseek.com",
     "platform.deepseek.com",

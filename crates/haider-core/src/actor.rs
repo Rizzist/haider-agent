@@ -6391,6 +6391,13 @@ impl HarnessActor {
                 if opened.is_err() {
                     drop(provider_budget_permit.take());
                 }
+                // Corroborate template slots with what this request carried
+                // before any consumer (output-limit retry, recovery card,
+                // RunFailed) reads the error.
+                let opened = opened.map_err(|mut error| {
+                    error.corroborate_slots(&self.provider_slot_evidence);
+                    error
+                });
                 match opened {
                     Ok(stream) => {
                         if let (Some(trace), Some(started)) =
@@ -6870,11 +6877,16 @@ impl HarnessActor {
                         )
                         .await;
                 }
-                let next = next.unwrap_or_else(|| {
-                    Err(provider_stream_interrupted(
-                        "provider stream closed before a finish event",
-                    ))
-                });
+                let next = next
+                    .unwrap_or_else(|| {
+                        Err(provider_stream_interrupted(
+                            "provider stream closed before a finish event",
+                        ))
+                    })
+                    .map_err(|mut error| {
+                        error.corroborate_slots(&self.provider_slot_evidence);
+                        error
+                    });
                 let event = match next {
                     Ok(event) => {
                         if !first_provider_event_seen {
@@ -7144,8 +7156,7 @@ impl HarnessActor {
                         }
                         continue 'requests;
                     }
-                    Err(mut error) => {
-                        error.corroborate_slots(&self.provider_slot_evidence);
+                    Err(error) => {
                         if let Err(budget_error) = release_provider_budget_request(
                             self.config.provider_budget_guard.as_ref(),
                             &run_id,
@@ -12729,14 +12740,14 @@ impl HarnessActor {
                 return errored_outcome(error);
             }
         }
-        self.errored_outcome_with_items(
-            run_id,
-            message,
-            reasoning,
-            tools,
-            provider_error_to_haider(provider_error),
-        )
-        .await
+        // Gate again AFTER the conversion: nothing in the mapped failure may
+        // carry owner-local text on a lockdown turn.
+        let mut mapped = provider_error_to_haider(provider_error);
+        if let Some(presentation) = mapped.presentation.as_mut() {
+            apply_provider_detail_lockdown(self.config.provider_lockdown, presentation);
+        }
+        self.errored_outcome_with_items(run_id, message, reasoning, tools, mapped)
+            .await
     }
 
     async fn drive_error_outcome_with_items(

@@ -2515,6 +2515,68 @@ async fn oversized_max_tokens_retries_once_at_the_provider_stated_maximum() {
     assert_eq!(requests[1].max_tokens, 16_384);
 }
 
+/// Final-review B2: the one-shot retry at the provider's stated maximum must
+/// fire for errors classified by the REAL adapters, whose published
+/// detail/message are template-or-withheld text; the stated integer is read
+/// from the owner-local prose and used only locally.
+///
+/// MUTATION CHECK: parse only `presentation.detail`/`message` in
+/// `provider_stated_output_limit`. Expected runtime failure: no second request
+/// for the OpenAI and DeepSeek wordings (no template renders them).
+#[tokio::test]
+async fn output_limit_retry_fires_for_real_adapter_errors() {
+    let body = |message: &str| {
+        serde_json::json!({"error": {"type": "invalid_request_error", "message": message}})
+            .to_string()
+    };
+    for (family, message, stated) in [
+        (
+            "anthropic",
+            "max_tokens: 30000 > 16000, which is the maximum allowed number of output tokens for fixture-model",
+            16_000,
+        ),
+        (
+            "openai",
+            "max_tokens is too large: 30000. This model supports at most 16384 completion tokens, whereas you provided 30000.",
+            16_384,
+        ),
+        (
+            "openai",
+            "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]",
+            8_192,
+        ),
+    ] {
+        let provider = Arc::new(FakeProvider::new(vec![
+            FakeStep::ReplayHttpError {
+                family: family.into(),
+                status: 400,
+                body: body(message),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ]));
+        let mut retry_config = config();
+        retry_config.max_tokens = 30_000;
+        let handle =
+            HarnessActor::spawn(retry_config, provider.clone(), Arc::new(MemoryStore::new()));
+        let outcome = handle
+            .submit_committed_turn(SubmitCommittedTurn {
+                run_id: RunId::new("output-limit-real-adapter"),
+                messages: vec![Message::user_text("write a large file")],
+            })
+            .await
+            .expect("accepted")
+            .wait()
+            .await
+            .expect("outcome");
+        assert_eq!(outcome.state, RunState::Done, "{family}: {message}");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "{family}: {message}");
+        assert_eq!(requests[1].max_tokens, stated, "{family}: {message}");
+    }
+}
+
 /// MUTATION CHECK: route ContextExceeded through generic retry or omit the
 /// one-shot guard. Expected runtime failure: no CompactionIntent is durable,
 /// the retry lacks the summary, or the double-overflow case makes >2 calls.

@@ -284,6 +284,105 @@ fn gemini_stream_error_frames_use_the_template_boundary() {
     );
 }
 
+/// Final-review should-fix templates: real current wording renders (with
+/// corroborated slots) instead of "details withheld". Sources are cited on
+/// each template entry.
+#[test]
+fn current_provider_wordings_render_with_corroborated_slots() {
+    // Anthropic current 429 (continuedev/continue#10425), both apostrophes.
+    for apostrophe in ["'", "\u{2019}"] {
+        let prose = format!(
+            "This request would exceed your organization{apostrophe}s rate limit of 50,000 input tokens per minute (org: f427910e-3b38-4559-b0a8-1ab041e6cbca, model: claude-haiku-4-5-20251001). For details, refer to: https://docs.claude.com/en/api/rate-limits. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://www.anthropic.com/contact-sales to discuss your options for a rate limit increase."
+        );
+        let mut error =
+            replay_anthropic_http_error(429, None, body("rate_limit_error", &prose).as_bytes());
+        error.corroborate_slots(&requested("claude-haiku-4-5-20251001"));
+        let detail = &error.presentation.detail;
+        assert!(
+            detail.starts_with("This request would exceed your organization"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("(org: [REDACTED], model: claude-haiku-4-5-20251001)"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("refer to: https://docs.claude.com."),
+            "{detail}"
+        );
+        assert!(!detail.contains("f427910e"), "{detail}");
+        let mut other =
+            replay_anthropic_http_error(429, None, body("rate_limit_error", &prose).as_bytes());
+        other.corroborate_slots(&requested("claude-sonnet-4-5"));
+        assert!(
+            other.presentation.detail.ends_with(WITHHELD),
+            "uncorroborated model"
+        );
+    }
+    // Gemini free-tier quota 429 (google-gemini/gemini-cli#13112).
+    let quota = "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/usage?tab=rate-limit. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 250000, model: gemini-2.5-flash\nPlease retry in 39.844676573s.";
+    let gemini_429 = |message: &str| {
+        serde_json::json!({"error": {"code": 429, "message": message, "status": "RESOURCE_EXHAUSTED"}})
+            .to_string()
+    };
+    let mut error = replay_gemini_http_error(429, None, gemini_429(quota).as_bytes());
+    error.corroborate_slots(&requested("gemini-2.5-flash"));
+    assert_eq!(
+        error.presentation.detail,
+        "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev. To monitor your current usage, head to: https://ai.dev. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 250000, model: gemini-2.5-flash\nPlease retry in 39.844676573s."
+    );
+    let unknown_metric = quota.replace(
+        "generate_content_free_tier_input_token_count",
+        "quillmetric",
+    );
+    let mut error = replay_gemini_http_error(429, None, gemini_429(&unknown_metric).as_bytes());
+    error.corroborate_slots(&requested("gemini-2.5-flash"));
+    assert!(
+        error.presentation.detail.ends_with(WITHHELD),
+        "unlisted metric"
+    );
+    // Gemini 503 high demand (discuss.ai.google.dev).
+    let demand = "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.";
+    let error = replay_gemini_http_error(
+        503,
+        None,
+        serde_json::json!({"error": {"code": 503, "message": demand, "status": "UNAVAILABLE"}})
+            .to_string()
+            .as_bytes(),
+    );
+    assert_eq!(error.presentation.detail, demand);
+    // Anthropic image too large (anthropics/claude-code 5 MB issues).
+    let image = "messages.2.content.0.image.source.base64: image exceeds 5 MB maximum: 8259148 bytes > 5242880 bytes";
+    let error =
+        replay_anthropic_http_error(400, None, body("invalid_request_error", image).as_bytes());
+    assert_eq!(error.presentation.detail, image);
+    // Anthropic thinking budget, docs.claude.com wording.
+    let thinking = "`max_tokens` must be greater than `thinking.budget_tokens`. Please consult our documentation at https://docs.claude.com/en/docs/build-with-claude/extended-thinking#max-tokens-and-context-window-size";
+    let error = replay_anthropic_http_error(
+        400,
+        None,
+        body("invalid_request_error", thinking).as_bytes(),
+    );
+    assert_eq!(error.presentation.detail, thinking);
+    // Error-type allowlist additions.
+    for (family, error_type) in [
+        ("anthropic", "not_found_error"),
+        ("anthropic", "request_too_large"),
+        ("openai", "model_not_found"),
+    ] {
+        let json = serde_json::json!({"error": {"type": error_type, "message": "x"}}).to_string();
+        let error = if family == "anthropic" {
+            replay_anthropic_http_error(404, None, json.as_bytes())
+        } else {
+            replay_openai_http_error(404, None, json.as_bytes())
+        };
+        assert_eq!(
+            error.presentation.provider_error_type.as_deref(),
+            Some(error_type)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unknown prose: withheld on shareable surfaces, raw only owner-local
 // ---------------------------------------------------------------------------

@@ -361,6 +361,15 @@ only)"**. Surfaces:
 | Lockdown turns, including a failed manual `/compact` | templates only | stripped |
 | Android / mobile chat projection | detail only | not rendered |
 
+**Consumer registry.** `haider_protocol::error::RUN_FAILED_CONSUMERS` classifies
+every production file that reads or writes `RunFailed` (owner-local, public
+fields only, or shareable-and-stripped with the regression test that proves
+it); a protocol test fails when a new consumer is not classified. Lockdown
+turns never carry the raw field, including errors whose adapter message
+embeds provider text (malformed frames). The output-token-limit retry reads
+the provider's stated maximum from the in-memory/owner-local prose and uses
+only the integer locally.
+
 **Raw event-frame surfaces (owner-UID only).** The following deliver journal
 envelopes as the daemon stores them, so they carry `provider_raw_detail`
 verbatim: the RPC `WireFrame::Event` live attach and the descendant stream,
