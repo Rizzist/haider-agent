@@ -976,6 +976,12 @@ pub(crate) mod debug_fake_oauth {
         .then_some(url)
     }
 
+    /// Whether this process opted in to faking `provider` (any value, even an
+    /// invalid one that disabled it, counts: the process is in test mode).
+    pub(crate) fn active_for(provider: &str) -> bool {
+        FAKEABLE_PROVIDERS.contains(&provider) && std::env::var_os(ORIGIN_ENV).is_some()
+    }
+
     pub(super) fn apply(
         registration: OAuthProviderRegistration,
     ) -> Option<OAuthProviderRegistration> {
@@ -1016,13 +1022,32 @@ pub(crate) mod debug_fake_oauth {
     }
 }
 
+/// Refuses credential import, device adoption and import heal for a provider
+/// the debug fake-OAuth hook is faking. Those paths ingest credentials Haider
+/// did not mint through the fake (a real Claude Code login, for instance);
+/// in test mode they must never be read, stored or refreshed. Always `Ok` in
+/// release builds (the hook does not exist there).
+pub(crate) fn require_live_oauth_provider(provider: &str) -> Result<(), HaiderError> {
+    #[cfg(debug_assertions)]
+    if debug_fake_oauth::active_for(provider) {
+        return Err(HaiderError::new(
+            ErrorCode::Unauthorized,
+            format!(
+                "credential import, adoption and heal are disabled for {provider} while {} points it at a fake OAuth server (debug test mode); sign in through the fake instead",
+                debug_fake_oauth::ORIGIN_ENV
+            ),
+            false,
+        ));
+    }
+    let _ = provider;
+    Ok(())
+}
+
 /// The issuer this process's catalog uses for `provider` (the live issuer in
 /// release builds; the fake origin under the debug-only test hook). Legacy
 /// profile probes send a row's token only when its bundle carries it.
 pub(crate) fn catalog_issuer(provider: &str) -> Option<String> {
-    OAuthProviderCatalog::default()
-        .registration(provider)
-        .map(|registration| registration.issuer.clone())
+    OAuthProviderCatalog::default().registration_issuer(provider)
 }
 
 /// One availability authority shared by RPC and the later management view.
@@ -1032,7 +1057,25 @@ pub struct OAuthProviderCatalog {
 }
 
 impl Default for OAuthProviderCatalog {
+    /// The process catalog: the sanctioned table, plus (debug builds only)
+    /// the opt-in fake-OAuth test hook.
     fn default() -> Self {
+        Self::build(true)
+    }
+}
+
+impl OAuthProviderCatalog {
+    /// The sanctioned table exactly as released, NEVER rewritten by the
+    /// debug fake-OAuth hook. Credential imports stamp their issuer from it,
+    /// so a credential Haider did not mint through the fake can never carry
+    /// the fake's issuer (and pass the fake registration's issuer guards).
+    pub(crate) fn live() -> Self {
+        Self::build(false)
+    }
+
+    fn build(apply_test_hook: bool) -> Self {
+        #[cfg(not(debug_assertions))]
+        let _ = apply_test_hook;
         let registrations = SANCTIONED_PROVIDER_REGISTRATIONS
             .iter()
             .filter_map(|metadata| {
@@ -1086,7 +1129,11 @@ impl Default for OAuthProviderCatalog {
                 registration.auth_header_set = metadata.auth_header_set;
                 registration.refresh_policy = metadata.refresh_policy;
                 #[cfg(debug_assertions)]
-                let registration = debug_fake_oauth::apply(registration)?;
+                let registration = if apply_test_hook {
+                    debug_fake_oauth::apply(registration)?
+                } else {
+                    registration
+                };
                 Some((registration.provider_id.clone(), Arc::new(registration)))
             })
             .collect::<HashMap<_, _>>();
@@ -1094,9 +1141,7 @@ impl Default for OAuthProviderCatalog {
             registrations: Arc::new(registrations),
         }
     }
-}
 
-impl OAuthProviderCatalog {
     pub fn with_test_registrations(
         registrations: impl IntoIterator<Item = OAuthProviderRegistration>,
     ) -> Result<Self, OAuthPublicError> {
@@ -1157,6 +1202,12 @@ impl OAuthProviderCatalog {
 
     fn registration(&self, provider: &str) -> Option<Arc<OAuthProviderRegistration>> {
         self.registrations.get(provider).cloned()
+    }
+
+    /// The issuer this catalog's registration for `provider` uses.
+    pub(crate) fn registration_issuer(&self, provider: &str) -> Option<String> {
+        self.registration(provider)
+            .map(|registration| registration.issuer.clone())
     }
 }
 
@@ -2046,6 +2097,7 @@ pub(crate) fn load_oauth_import_material_with_native(
 ) -> Result<OAuthImportMaterial, HaiderError> {
     require_credential_import_available()?;
     let spec = oauth_import_source_spec(source)?;
+    require_live_oauth_provider(spec.provider)?;
     let path = oauth_import_path(source)?;
     let input = if spec.source == "claude-code" {
         load_claude_credential_input(&path, native, event)?
@@ -2075,6 +2127,8 @@ pub(crate) fn load_claude_native_import_material(
     event: ClaudeNativeReadEvent,
 ) -> Result<OAuthImportMaterial, ClaudeNativeImportError> {
     require_credential_import_available().map_err(ClaudeNativeImportError::Invalid)?;
+    require_live_oauth_provider(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)
+        .map_err(ClaudeNativeImportError::Invalid)?;
     let mut input = native
         .read(event)
         .map_err(ClaudeNativeImportError::Access)?;
@@ -2110,11 +2164,14 @@ fn load_oauth_import_material_from_input(
     generation: u64,
     input: ClaudeCredentialInput,
 ) -> Result<OAuthImportMaterial, HaiderError> {
+    require_live_oauth_provider(spec.provider)?;
     let claude_native_owner = input.native_owner;
     let path = input.location;
     let bytes = input.bytes;
     let source_fingerprint = *blake3::hash(&bytes).as_bytes();
-    let registration = OAuthProviderCatalog::default()
+    // Imported credentials always carry the LIVE issuer: never the debug
+    // fake's, whose registration would otherwise accept them.
+    let registration = OAuthProviderCatalog::live()
         .registration(spec.provider)
         .ok_or_else(|| {
             HaiderError::new(

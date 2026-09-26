@@ -6666,3 +6666,33 @@ async fn refresh_never_sends_a_token_to_a_registration_that_did_not_issue_it() {
     assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 0);
     assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
 }
+
+/// Stage-8 depth guard: credential imports stamp the RELEASED issuer from a
+/// catalog the debug hook never rewrites, and the fake-mode gate is open when
+/// the hook is not armed. (Hook-armed refusal runs in an isolated child:
+/// `accounts_tests::v2_fake_oauth_mode_refuses_claude_import_adoption_and_heal`.)
+#[test]
+fn v2_imports_stamp_the_live_issuer_and_the_gate_is_open_without_the_hook() {
+    assert_eq!(
+        OAuthProviderCatalog::live()
+            .registration_issuer(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)
+            .as_deref(),
+        Some("https://claude.ai")
+    );
+    if std::env::var_os("HAIDER_TEST_FAKE_OAUTH_ORIGIN").is_none() {
+        assert!(
+            require_live_oauth_provider(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME).is_ok()
+        );
+    }
+    let source = include_str!("oauth.rs").replace("\r\n", "\n");
+    let start = source
+        .find("fn load_oauth_import_material_from_input(")
+        .expect("import loader");
+    let body = &source[start..start + 1800];
+    assert!(
+        body.contains("OAuthProviderCatalog::live()"),
+        "imports must use the live catalog"
+    );
+    assert!(!body.contains("OAuthProviderCatalog::default()"));
+    assert!(body.contains("require_live_oauth_provider(spec.provider)?"));
+}

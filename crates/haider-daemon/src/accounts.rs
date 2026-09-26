@@ -1951,6 +1951,14 @@ async fn run_account_actor(
                 );
             }
             AccountCommand::ImportOAuth(job) => {
+                // Debug fake-OAuth test mode refuses every import for a faked
+                // provider first, with its own typed reason.
+                if let Err(error) = oauth_import_source_spec(&job.source)
+                    .and_then(|spec| crate::oauth::require_live_oauth_provider(spec.provider))
+                {
+                    respond_management_error(&job.route, &error);
+                    continue;
+                }
                 if job.source == "claude-code" {
                     respond_management_error(
                         &job.route,
@@ -7391,6 +7399,12 @@ async fn handle_device_import(
         );
         return;
     };
+    // Adoption ingests a credential Haider did not mint: never while the debug
+    // fake-OAuth hook fakes that provider.
+    if let Err(error) = crate::oauth::require_live_oauth_provider(&candidate.wire.provider) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
     let expected_source_fingerprint = candidate.content_fingerprint;
     // G4b (LV2): the gcloud candidate imports through the SHELL-OUT source,
     // not an OAuth bundle file — its own arm, before the bundle machinery.
@@ -7673,6 +7687,10 @@ async fn handle_oauth_import_heal(
     if spec.provider != descriptor.provider {
         return Ok(OAuthImportHealResult::NotImported);
     }
+    // Heal re-reads the import source and may fall back to refresh: an error
+    // (not NotImported) so neither happens while the debug fake-OAuth hook
+    // fakes this provider.
+    crate::oauth::require_live_oauth_provider(spec.provider)?;
     let source = identity.source.clone();
     let vault_for_read = Arc::clone(&vault);
     let alias_for_read = descriptor.alias.clone();
@@ -12159,6 +12177,25 @@ async fn reconcile_oauth_add_receipts_from(
                 }
             }
             "pending" if accounts.get(&alias).is_some() && !is_import => {
+                // A staged interactive add (identity match or different-account
+                // retarget) wrote ANOTHER alias; the requested one is untouched.
+                if let VaultProvision::Available(vault) = vault {
+                    match staged_oauth_add_target(
+                        vault.as_ref(),
+                        accounts,
+                        &row.command_id,
+                        &provider,
+                    )? {
+                        StagedOAuthAdd::Wrote(target) => {
+                            finalize_oauth_reconciled(store, accounts, &row.command_id, &target)
+                                .await?;
+                            let _ = vault.delete(&oauth_staging_alias(&row.command_id));
+                            continue;
+                        }
+                        StagedOAuthAdd::NotYetWritten => continue,
+                        StagedOAuthAdd::NotStaged => {}
+                    }
+                }
                 finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
             }
             // A replacement import starts with a live descriptor and bundle,
@@ -12173,6 +12210,23 @@ async fn reconcile_oauth_add_receipts_from(
                 let VaultProvision::Available(vault) = vault else {
                     continue;
                 };
+                if !is_import {
+                    match staged_oauth_add_target(
+                        vault.as_ref(),
+                        accounts,
+                        &row.command_id,
+                        &provider,
+                    )? {
+                        StagedOAuthAdd::Wrote(target) => {
+                            finalize_oauth_reconciled(store, accounts, &row.command_id, &target)
+                                .await?;
+                            let _ = vault.delete(&oauth_staging_alias(&row.command_id));
+                            continue;
+                        }
+                        StagedOAuthAdd::NotYetWritten => continue,
+                        StagedOAuthAdd::NotStaged => {}
+                    }
+                }
                 let Ok(stored) = vault.resolve(&alias) else {
                     // Browser state and ready refs die on restart. The pending
                     // semantic command may resume only with a fresh flow.
@@ -12209,6 +12263,58 @@ async fn reconcile_oauth_add_receipts_from(
         }
     }
     Ok(())
+}
+
+/// Where a pending interactive add that STAGED its bundle actually landed.
+enum StagedOAuthAdd {
+    /// No stage: the add targeted its requested alias.
+    NotStaged,
+    /// Staged, but no row holds the staged bundle yet: leave the receipt
+    /// pending for a same-command replay (the stage sweep bounds it).
+    NotYetWritten,
+    /// Staged and durable in this row.
+    Wrote(CredentialAlias),
+}
+
+/// Finds the row whose vaulted bundle is the one staged for `command_id`
+/// (same provider, constant-time equal access token). Only secret-free
+/// aliases leave this function.
+fn staged_oauth_add_target(
+    vault: &dyn Vault,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    command_id: &str,
+    provider: &str,
+) -> Result<StagedOAuthAdd, HaiderError> {
+    let staged = match vault.resolve(&oauth_staging_alias(command_id)) {
+        Ok(staged) => staged,
+        Err(error) if error.code == ErrorCode::CredentialMissing => {
+            return Ok(StagedOAuthAdd::NotStaged);
+        }
+        Err(error) => return Err(error),
+    };
+    let Ok(staged) =
+        haider_accounts::OAuthTokenBundleV1::decode(oauth_stage_payload(staged.expose_secret()))
+    else {
+        return Ok(StagedOAuthAdd::NotYetWritten);
+    };
+    for row in accounts
+        .list()
+        .iter()
+        .filter(|row| row.provider == provider && row.auth_method == AuthMethod::OAuth)
+    {
+        let Ok(stored) = vault.resolve(&row.alias) else {
+            continue;
+        };
+        let Ok(stored) = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) else {
+            continue;
+        };
+        if stored.provider_id == staged.provider_id
+            && bool::from(stored.access_token().ct_eq(staged.access_token()))
+        {
+            return Ok(StagedOAuthAdd::Wrote(row.alias.clone()));
+        }
+    }
+    Ok(StagedOAuthAdd::NotYetWritten)
 }
 
 async fn reconcile_remove_receipts(

@@ -16879,3 +16879,505 @@ async fn legacy_profile_probe_never_sends_a_token_across_issuers() {
     );
     assert_eq!(profile.0.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+fn v2_actor_with(
+    store: &SqliteStoreHandle,
+    accounts: AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<MemoryVault>,
+) -> (AccountActorHandle, AccountsSnapshot, AccountSourcesSnapshot) {
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let source_snapshot = empty_source_snapshot();
+    let providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        management: Some(management),
+        device_discovery: DeviceDiscoverySnapshot::new(true),
+        profile_id: "v2-accounts-test".into(),
+        default_model: "unused".into(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: Arc::clone(&source_snapshot),
+    });
+    (actor, snapshot, source_snapshot)
+}
+
+/// Seeds `alias` as a verified Claude row holding `bundle` with `status`.
+fn v2_seed_claude_row(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &MemoryVault,
+    alias: &str,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+    status: CredentialStatus,
+    active: bool,
+) {
+    let alias = CredentialAlias::new(alias);
+    vault
+        .put(&alias, &bundle.encode().expect("encode"))
+        .expect("seed vault");
+    let mut descriptor =
+        oauth_descriptor_for(ANTHROPIC_OAUTH_PROVIDER_NAME, &alias, bundle, active);
+    descriptor.status = status;
+    accounts.add(descriptor).expect("seed row");
+}
+
+/// Item 4 (stage 8): an in-place re-login of a revoked row republishes the
+/// derived source line, so it reads "ready" at once instead of "revoked"
+/// until the next restart or scan. Fails without the republish.
+#[tokio::test]
+async fn v2_relogin_of_a_revoked_row_republishes_its_source_line() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let mut accounts = memory_accounts();
+    let account = "account=a;organization=o";
+    v2_seed_claude_row(
+        &mut accounts,
+        &vault,
+        "work",
+        &claude_relogin_bundle(b"old-access", account, u64::MAX - 1),
+        CredentialStatus::Revoked,
+        true,
+    );
+    let (mut actor, _snapshot, sources) = v2_actor_with(&store, accounts, Arc::clone(&vault));
+    let (sink, mut frames) = channel_sink();
+    let saved = claude_relogin(
+        &actor.commands(),
+        &sink,
+        &mut frames,
+        "v2-relogin-revoked",
+        "work",
+        claude_relogin_bundle(b"new-access", account, u64::MAX - 1),
+    )
+    .await;
+    assert_eq!(saved.alias.as_str(), "work");
+    assert_eq!(saved.status, CredentialStatus::Ok);
+    let health = sources
+        .lock()
+        .expect("source snapshot")
+        .iter()
+        .find(|source| source.source_id == "haider_oauth:work")
+        .map(|source| source.health.clone());
+    assert_eq!(health.as_deref(), Some("ready"));
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
+async fn v2_claim_pending_add(store: &SqliteStoreHandle, command_id: &str, alias: &str) {
+    let identity = OAuthAddIdentity {
+        provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+        physical_alias: alias.to_owned(),
+        display_alias: alias.to_owned(),
+        auth_method: "oauth".into(),
+    };
+    let json = identity.canonical_json().expect("coordinates");
+    let digest = blake3::hash(json.as_bytes()).to_hex().to_string();
+    assert!(matches!(
+        store
+            .account_add_claim_receipt(command_id.to_owned(), digest, json)
+            .await
+            .expect("claim"),
+        AccountAddClaim::Fresh
+    ));
+}
+
+/// Same-process resume of an interrupted different-account retarget replays
+/// the staged bundle into the alias it targeted; it must not finalize the
+/// requested alias X (which it never wrote). Fails without `staged_elsewhere`.
+#[tokio::test]
+async fn v2_resume_of_an_interrupted_retarget_replays_the_staged_bundle() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let mut accounts = memory_accounts();
+    v2_seed_claude_row(
+        &mut accounts,
+        &vault,
+        "work",
+        &claude_relogin_bundle(b"a-access", "account=a;organization=o", u64::MAX - 1),
+        CredentialStatus::Revoked,
+        true,
+    );
+    let x_before = vault
+        .resolve(&CredentialAlias::new("work"))
+        .expect("x")
+        .expose_secret()
+        .to_vec();
+    // The interrupted attempt: receipt claimed and the retargeted bundle
+    // staged, then the process stopped before any write.
+    let command = "v2-interrupted-retarget";
+    v2_claim_pending_add(&store, command, "work").await;
+    put_oauth_staging(
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        &oauth_staging_alias(command),
+        &claude_relogin_bundle(b"b-access", "account=b;organization=o", u64::MAX - 1),
+    )
+    .await
+    .expect("stage");
+    let (mut actor, _snapshot, _sources) = v2_actor_with(&store, accounts, Arc::clone(&vault));
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: command.to_owned(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+            display_alias: "work".to_owned(),
+            claim: None,
+            route: LoginRoute {
+                request_id: RequestId::new("v2-resume"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("send resume");
+    let saved = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("resume deadline")
+        .expect("resume response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountAdd { descriptor },
+            ..
+        } => descriptor,
+        other => panic!("unexpected resume response: {other:?}"),
+    };
+    assert_eq!(saved.alias.as_str(), ANTHROPIC_OAUTH_PROVIDER_NAME);
+    assert_eq!(
+        vault
+            .resolve(&CredentialAlias::new("work"))
+            .expect("x")
+            .expose_secret(),
+        x_before.as_slice(),
+        "X is never written by the replay"
+    );
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
+/// Item 1 (stage 8): startup reconciliation of a pending retarget records the
+/// alias the staged bundle was written to, not the untouched requested X,
+/// and drops the stage; a stage no row holds stays pending.
+#[tokio::test]
+async fn v2_restart_reconciles_a_pending_retarget_to_the_alias_it_wrote() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let mut accounts = memory_accounts();
+    let b_bundle = claude_relogin_bundle(b"b-access", "account=b;organization=o", u64::MAX - 1);
+    v2_seed_claude_row(
+        &mut accounts,
+        &vault,
+        "work",
+        &claude_relogin_bundle(b"a-access", "account=a;organization=o", u64::MAX - 1),
+        CredentialStatus::Revoked,
+        false,
+    );
+    v2_seed_claude_row(
+        &mut accounts,
+        &vault,
+        "anthropic-oauth",
+        &b_bundle,
+        CredentialStatus::Ok,
+        true,
+    );
+    let x_before = accounts
+        .get(&CredentialAlias::new("work"))
+        .cloned()
+        .expect("x");
+    // Retarget durable in `anthropic-oauth`, receipt still pending.
+    let wrote = "v2-restart-wrote";
+    v2_claim_pending_add(&store, wrote, "work").await;
+    put_oauth_staging(
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        &oauth_staging_alias(wrote),
+        &b_bundle,
+    )
+    .await
+    .expect("stage");
+    // A second retarget that never reached its write.
+    let unwritten = "v2-restart-unwritten";
+    v2_claim_pending_add(&store, unwritten, "work").await;
+    put_oauth_staging(
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        &oauth_staging_alias(unwritten),
+        &claude_relogin_bundle(b"c-access", "account=c;organization=o", u64::MAX - 1),
+    )
+    .await
+    .expect("stage");
+
+    let provision = VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>);
+    reconcile_oauth_add_receipts(&store, &mut accounts, &provision)
+        .await
+        .expect("reconcile");
+    let receipts = store.account_add_receipts().await.expect("receipts");
+    let row = |command: &str| {
+        receipts
+            .iter()
+            .find(|row| row.command_id == command)
+            .cloned()
+            .expect("receipt row")
+    };
+    let finalized = row(wrote);
+    assert_eq!(finalized.state, "committed");
+    let response: AccountAddReceiptResponse =
+        serde_json::from_str(finalized.response_json.as_deref().expect("response"))
+            .expect("decode response");
+    assert_eq!(response.descriptor.alias.as_str(), "anthropic-oauth");
+    assert!(
+        vault
+            .resolve(&oauth_staging_alias(wrote))
+            .is_err_and(|error| error.code == ErrorCode::CredentialMissing),
+        "a reconciled stage is dropped"
+    );
+    assert_eq!(
+        row(unwritten).state,
+        "pending",
+        "an unwritten retarget stays pending"
+    );
+    assert_eq!(
+        accounts.get(&CredentialAlias::new("work")),
+        Some(&x_before),
+        "X untouched"
+    );
+    store.close().await.expect("close store");
+}
+
+/// Stage-8 blocker: while the debug fake-OAuth hook fakes `anthropic-oauth`,
+/// Claude credential import, device adoption and import heal are refused
+/// with a typed error before any credential is read, and nothing reaches the
+/// fake (0 connections of any kind: token, refresh or profile). The child
+/// process runs with `HAIDER_TEST_FAKE_OAUTH_ORIGIN` pointing at a counting
+/// loopback listener owned by the parent.
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "current_thread")]
+async fn v2_fake_oauth_mode_refuses_claude_import_adoption_and_heal() {
+    const TEST: &str =
+        "accounts::accounts_tests::v2_fake_oauth_mode_refuses_claude_import_adoption_and_heal";
+    if std::env::var_os(OAUTH_IMPORT_ENV_CHILD).is_none() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let counter = {
+            let (hits, stop) = (Arc::clone(&hits), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    if listener.accept().is_ok() {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let home = test_store_dir();
+        let creds = home.path().join("claude-credentials.json");
+        std::fs::write(&creds, CLAUDE_IMPORT_FIXTURE).expect("fixture");
+        assert!(run_oauth_import_env_child(
+            TEST,
+            &[
+                ("HOME", home.path()),
+                ("HAIDER_CLAUDE_CREDS_PATH", &creds),
+                (
+                    crate::oauth::debug_fake_oauth::ORIGIN_ENV,
+                    std::path::Path::new(&origin),
+                ),
+            ],
+        ));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        counter.join().expect("counter");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no token, refresh or profile call may reach the fake"
+        );
+        return;
+    }
+    let refused = |error: &HaiderError| {
+        error.code == ErrorCode::Unauthorized
+            && error
+                .message
+                .contains(crate::oauth::debug_fake_oauth::ORIGIN_ENV)
+    };
+    // The hook really is active here, and imports would stamp the LIVE issuer.
+    let origin = std::env::var(crate::oauth::debug_fake_oauth::ORIGIN_ENV).expect("origin");
+    assert_eq!(
+        crate::oauth::catalog_issuer(ANTHROPIC_OAUTH_PROVIDER_NAME).as_deref(),
+        Some(origin.as_str())
+    );
+    assert_eq!(
+        crate::oauth::OAuthProviderCatalog::live()
+            .registration_issuer(ANTHROPIC_OAUTH_PROVIDER_NAME)
+            .as_deref(),
+        Some("https://claude.ai")
+    );
+    let native = Arc::new(StubAccountClaudeNative::with_bytes(CLAUDE_IMPORT_FIXTURE));
+    reset_oauth_import_read_count();
+
+    // Import (file and owner-store loaders).
+    let error = load_oauth_import_material_with_native(
+        "claude-code",
+        1,
+        native.as_ref(),
+        ClaudeNativeReadEvent::Significant,
+    )
+    .expect_err("Claude import must be refused in fake mode");
+    assert!(refused(&error), "{error:?}");
+    match load_claude_native_import_material(1, native.as_ref(), ClaudeNativeReadEvent::Ordinary) {
+        Err(ClaudeNativeImportError::Invalid(error)) => assert!(refused(&error), "{error:?}"),
+        other => panic!(
+            "owner-store import must be refused: {:?}",
+            other.map(|_| ())
+        ),
+    }
+    // Import through the actor.
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, _management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(&actor.commands(), sink, "v2-fake-import", "claude-code").await;
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("import deadline")
+        .expect("import response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::Error { message, .. },
+            ..
+        } => assert!(
+            message.contains(crate::oauth::debug_fake_oauth::ORIGIN_ENV),
+            "{message}"
+        ),
+        other => panic!("fake-mode import must be refused: {other:?}"),
+    }
+    assert!(snapshot.lock().expect("snapshot").is_empty());
+    actor.shutdown().await;
+
+    // Device adoption (when this build's discovery offers the owner store).
+    let mut accounts = memory_accounts();
+    let adoption =
+        crate::device_discovery::discover_device_candidates_with_native(false, native.as_ref())
+            .into_iter()
+            .find(|candidate| candidate.wire.provider == ANTHROPIC_OAUTH_PROVIDER_NAME);
+    println!("V2 adoption candidate offered: {}", adoption.is_some());
+    if let Some(candidate) = adoption {
+        let providers = test_provider_registry();
+        let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+        let adoption_snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+        let (sink, mut frames) = channel_sink();
+        handle_device_import(
+            &store,
+            &mut accounts,
+            Arc::clone(&vault) as Arc<dyn Vault>,
+            &adoption_snapshot,
+            Some(&management),
+            &providers,
+            &mut AutomaticCatalogDiscoveryQueue::new(false),
+            &HashSet::new(),
+            &RefreshFenceRegistry::default(),
+            &HashSet::new(),
+            Arc::new(UnreachableGcloud),
+            native.clone(),
+            DeviceImportJob {
+                command_id: "v2-fake-adopt".to_owned(),
+                candidate: candidate.wire.candidate,
+                discovery_disabled: false,
+                route: LoginRoute {
+                    request_id: RequestId::new("v2-fake-adopt-request"),
+                    sink,
+                },
+            },
+        )
+        .await;
+        match frames.try_recv().expect("adoption response") {
+            WireFrame::Response {
+                body: ResponseBody::Error { message, .. },
+                ..
+            } => assert!(
+                message.contains(crate::oauth::debug_fake_oauth::ORIGIN_ENV),
+                "{message}"
+            ),
+            other => panic!("fake-mode adoption must be refused: {other:?}"),
+        }
+        assert!(accounts.list().is_empty());
+    }
+
+    // Import heal of a real-issuer (claude.ai) imported row.
+    let alias = CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME);
+    let bundle = claude_relogin_bundle(b"real-access", "account=r;organization=o", 1);
+    assert_eq!(bundle.issuer, "https://claude.ai");
+    let descriptor = oauth_descriptor_for(ANTHROPIC_OAUTH_PROVIDER_NAME, &alias, &bundle, true);
+    accounts.add(descriptor.clone()).expect("seed imported row");
+    vault
+        .put(&alias, &bundle.encode().expect("encode"))
+        .expect("seed vault");
+    let identity = OAuthImportIdentity {
+        source: "claude-code".into(),
+        alias: alias.as_str().into(),
+        provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+        candidate: None,
+    };
+    let coordinates = identity.canonical_json().expect("coordinates");
+    store
+        .account_add_claim_receipt(
+            "v2-imported".into(),
+            blake3::hash(coordinates.as_bytes()).to_hex().to_string(),
+            coordinates,
+        )
+        .await
+        .expect("claim receipt");
+    store
+        .finalize_account_add_receipt(
+            "v2-imported".into(),
+            AccountAddReceiptResponse {
+                descriptor: descriptor.clone(),
+            },
+        )
+        .await
+        .expect("commit receipt");
+    let fences = RefreshFenceRegistry::default();
+    let expected = OAuthRefreshFence {
+        fence_epoch: fences.current(&alias),
+        generation: bundle.generation,
+        issuer: bundle.issuer.clone(),
+        audience: bundle.audience.clone(),
+        resource: bundle.resource.clone(),
+        subject_hash: bundle.identity.subject_hash.clone(),
+    };
+    let heal_snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+    let error = handle_oauth_import_heal(
+        &store,
+        &mut accounts,
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        &heal_snapshot,
+        None,
+        &test_provider_registry(),
+        &mut AutomaticCatalogDiscoveryQueue::new(true),
+        &HashSet::new(),
+        &fences,
+        &HashSet::new(),
+        &descriptor,
+        &expected,
+        native.clone(),
+    )
+    .await
+    .expect_err("fake-mode heal must be refused, not NotImported or re-imported");
+    assert!(refused(&error), "{error:?}");
+
+    assert_eq!(native.reads(), 0, "no Claude credential was read");
+    assert_eq!(oauth_import_read_count(), 0, "no import file was read");
+    store.close().await.expect("close store");
+}

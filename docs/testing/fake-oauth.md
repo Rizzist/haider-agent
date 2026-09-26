@@ -38,6 +38,12 @@ real provider.
   - As a result, a live `https://claude.ai` bundle is never refreshed or
     probed through the fake, and a fake-issued bundle never reaches the
     live endpoints.
+- **No credential ingestion in test mode.** While the hook fakes a
+  provider, credential import, device adoption and import heal for that
+  provider are refused with a typed `unauthorized` error before any
+  credential is read (`require_live_oauth_provider`). Imports always stamp
+  the issuer from the never-faked live catalog, so even an imported
+  credential could not pass the fake registration's issuer guards.
 - **Isolated profile.** Always use a private `HOME`, `HAIDER_PROFILE_DIR`
   and `HAIDER_RUNTIME_DIR` (the vault is a per-profile file vault), and
   `HAIDER_TEST_CLAUDE_CREDENTIAL_STORE=unavailable`. Never point it at an
