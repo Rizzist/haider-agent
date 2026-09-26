@@ -24501,14 +24501,15 @@ const PRESENCE_STOP_CANCEL_GRACE: std::time::Duration = std::time::Duration::fro
 
 /// Settles a CU action refused because the human pressed Stop.
 ///
-/// The core treats an `Err` from the dispatcher as a fatal store error, not
-/// a cancellation; ESC never reaches that path because the turn's cancel
-/// token wins the core's biased select first. Stop, by contrast, refuses the
-/// action before its turn cancellation lands, and returning `Err` then left
-/// the run stuck in `cancelling` (live repro, 973-cu-presence 3-repair). So
-/// wait for the turn cancellation Stop already submitted: the core drops
-/// this future and settles the turn exactly like ESC. Only if it never
-/// arrives, report a `Cancelled` tool result instead of an error.
+/// Stop refuses the action before the turn cancellation it submitted has
+/// committed. Returning the refusal straight away (as `Err(Cancelled)`,
+/// which the route maps to a `Cancelled` tool result) would hand that result
+/// to the provider and start ANOTHER model round — an extra request, and the
+/// model may issue further actions — until the cancellation lands. Instead
+/// wait for that cancellation: the core drops this future and settles the
+/// turn exactly like ESC. Only if it never arrives within the grace, report
+/// the `Cancelled` tool result. (The 3-repair "stuck in `cancelling`" hang
+/// was the journal/actor race fixed in haider-core, not this path.)
 async fn presence_stopped_result(cancel: &CancelToken, cancelled: BoundedResult) -> BoundedResult {
     let _ = tokio::time::timeout(PRESENCE_STOP_CANCEL_GRACE, cancel.cancelled()).await;
     cancelled

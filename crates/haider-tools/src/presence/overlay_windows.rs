@@ -226,15 +226,18 @@ impl Overlay {
                 let _ = self.draw_badge("…");
             }
             PresenceCommand::Hide { .. } => self.hide(),
-            // Only sent when WDA_EXCLUDEFROMCAPTURE was refused.
+            // The daemon also conceals before it has read `Ready`; windows
+            // with WDA_EXCLUDEFROMCAPTURE are already absent from captures.
             PresenceCommand::Conceal { seq, .. } => {
-                self.pointer.hide();
-                self.ring.hide();
-                self.badge.hide();
+                if !self.capture_excluded {
+                    self.pointer.hide();
+                    self.ring.hide();
+                    self.badge.hide();
+                }
                 emit(&PresenceEvent::Ack { seq });
             }
             PresenceCommand::Reveal { .. } => {
-                if self.visible {
+                if self.visible && !self.capture_excluded {
                     let (x, y) = self.badge_origin(self.badge_at_top);
                     self.badge.show_at(x, y);
                     if let Some(position) = self.position {
@@ -546,6 +549,17 @@ mod win {
             let width = i32::try_from(bitmap.width).map_err(|_| "overlay too wide".to_owned())?;
             let height = i32::try_from(bitmap.height).map_err(|_| "overlay too tall".to_owned())?;
             let pixels = bitmap.premultiplied_bgra();
+            // The DIB section below holds exactly `width * height * 4` bytes;
+            // `art::Bitmap`'s fields are public, so check its invariant here
+            // rather than trusting every constructor.
+            let expected = usize::try_from(bitmap.width)
+                .ok()
+                .zip(usize::try_from(bitmap.height).ok())
+                .and_then(|(w, h)| w.checked_mul(h))
+                .and_then(|n| n.checked_mul(4));
+            if expected != Some(pixels.len()) {
+                return Err("overlay bitmap size does not match its dimensions".into());
+            }
             let info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).unwrap_or(40),
@@ -574,10 +588,14 @@ mod win {
                     )
                 })
                 .collect();
-            // SAFETY: every handle created here is null-checked, used on this
-            // thread only and released before returning. `bits` points to
-            // `width * height * 4` bytes owned by the live DIB section, which
-            // is exactly `pixels.len()`; it is written only while alive.
+            // SAFETY: the memory DC, DIB section and `bits` pointer are
+            // null-checked before use; `GetDC(NULL)` and `CreateFontW` are not
+            // (GDI treats a null DC/font as a failed no-op: DrawTextW and
+            // SelectObject return 0, they do not dereference it). Every handle
+            // is used on this thread only and released before returning.
+            // `bits` points to `width * height * 4` bytes owned by the live DIB
+            // section, which equals `pixels.len()` (checked above); it is
+            // written only while the section is alive.
             let updated = unsafe {
                 let screen = GetDC(ptr::null_mut());
                 let memory = CreateCompatibleDC(screen);

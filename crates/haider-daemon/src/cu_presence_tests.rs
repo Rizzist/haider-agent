@@ -481,3 +481,97 @@ async fn capturable_indicators_are_concealed_around_model_captures_only() {
         assert_eq!((concealed, revealed), (capturable, capturable));
     }
 }
+
+/// Verifier finding (0ddd89a0): a freshly spawned overlay helper was treated
+/// as capture-excluded until its `Ready` was read, so the run's first
+/// screenshot was never concealed. "No Ready yet" now means capturable.
+/// MUTATION CHECK: default the ready state to excluded. Expected runtime
+/// failure: the pre-Ready assertion below.
+#[test]
+fn overlay_ready_state_treats_no_ready_as_capturable() {
+    let state = overlay::ReadyState::default();
+    assert!(
+        state.capturable(),
+        "before Ready the helper UI may be on screen"
+    );
+    state.record(&PresenceEvent::Error {
+        message: "noise".into(),
+    });
+    assert!(state.capturable(), "only Ready decides");
+    state.record(&PresenceEvent::Ready {
+        platform: "macos".into(),
+        capture_excluded: true,
+    });
+    assert!(!state.capturable());
+    state.record(&PresenceEvent::Ready {
+        platform: "windows".into(),
+        capture_excluded: false,
+    });
+    assert!(
+        state.capturable(),
+        "Windows with exclusion refused is capturable"
+    );
+}
+
+/// End to end with a real child process standing in for the helper: the
+/// conceal is sent before `Ready`, and a helper that reports exclusion is
+/// not concealed afterwards.
+#[cfg(unix)]
+#[tokio::test]
+async fn first_capture_is_concealed_before_the_helper_reports_ready() {
+    use std::io::Read as _;
+    let dir = tempfile::tempdir().expect("dir");
+    let log = dir.path().join("stdin.log");
+    // A helper that records its stdin and only says Ready when asked to.
+    let script = format!(
+        "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; \
+         case \"$line\" in *'\"op\":\"hide\"'*) printf '%s\\n' '{{\"event\":\"ready\",\"platform\":\"t\",\"capture_excluded\":true}}';; esac; done",
+        log.display()
+    );
+    let presence = CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    presence.register_renderer(
+        PresenceSurface::Screen,
+        Arc::new(move |sink| {
+            overlay::spawn_program(
+                std::path::Path::new("/bin/sh"),
+                &["-c".to_owned(), script.clone()],
+                sink,
+            )
+            .map(|process| Box::new(process) as Box<dyn PresenceRenderer>)
+        }),
+    );
+    let (stop, _) = counting_hook();
+    let lease = PresenceLease::new(Arc::clone(&presence), "s/first".into(), stop);
+    let action = lease
+        .begin_computer(
+            &ComputerAction::Screenshot,
+            None,
+            &haider_tools::ComputerCancelToken::new(),
+        )
+        .await
+        .expect("begin");
+    // No Ready has been (or can be) read yet: the first capture must conceal.
+    let guard = lease.conceal_for_capture().await;
+    assert!(guard.is_some(), "the first capture of a run is concealed");
+    drop(guard);
+    drop(action);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        text.clear();
+        if let Ok(mut file) = std::fs::File::open(&log) {
+            let _ = file.read_to_string(&mut text);
+        }
+        if text.contains("\"op\":\"reveal\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let show = text.find("\"op\":\"show\"").expect("show sent");
+    let conceal = text
+        .find("\"op\":\"conceal\"")
+        .expect("conceal sent before Ready");
+    let reveal = text.find("\"op\":\"reveal\"").expect("reveal sent");
+    assert!(show < conceal && conceal < reveal, "{text}");
+    lease.end(false);
+}

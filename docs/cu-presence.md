@@ -76,10 +76,18 @@ again.
 * Stop flips the in-flight action's cancel token *before* releasing any pending
   pointer acknowledgement, and an action re-checks `is_stopped` after its ack
   wait, so a click parked on its ack can never be posted after Stop.
-* A Stop-refused action does not return an error to the core (an error there
-  is a fatal store error, not a cancellation). It waits, bounded to 10 s, for
-  the turn cancellation Stop submitted, and otherwise settles as a `Cancelled`
-  tool result.
+* A Stop-refused action waits, bounded to 10 s, for the turn cancellation
+  Stop submitted, and only then settles as a `Cancelled` tool result.
+  Returning straight away would hand the provider a `Cancelled` result and
+  start another model round (an extra request, possibly further actions)
+  before a slower cancellation commit lands
+  (`slow_cancel_commit_still_settles_a_stop_refused_action_as_cancelled`).
+  This is not a hang cause: the route already maps `Err(Cancelled)` to a
+  `Cancelled` tool result. (Correction to 3-repair, which misattributed the
+  `cancelling` hang to this path; the hang was the journal/actor race below.)
+* The first capture of a run is concealed too: until a helper's `Ready`
+  arrives, the daemon treats its UI as capturable (the Conceal is queued on
+  stdin after `Show`; an excluded helper just acks it).
 * Pre-existing turn-cancel race, fixed at the source: when a cancellation
   (Stop *or* Esc) is committed while a just-finished tool's result is being
   settled, the journal refuses the settlement ("durably cancelling; only
@@ -257,8 +265,11 @@ remote-debugging launch.**
 
 **Ownership.** This lane ships only the extension's presence half
 (`browser/haider-presence-extension/`: tab group, `chrome.debugger` attach,
-infobar Cancel → `stop`, `nativeMessaging` permission, and a visible red "!"
-badge plus tooltip when the native host cannot be reached). It was exercised
+infobar Cancel → `stop`, `nativeMessaging` permission, and a red "!" badge
+plus tooltip on the extension's toolbar icon when the native host cannot be
+reached — visible only once the user pins the extension; otherwise Chrome
+shows just the puzzle-piece menu, and the error is recorded in the extension's
+diagnostic trail). It was exercised
 in a throwaway Chrome 153 profile through the extension's own self-test; **no
 Haider-driven browser run exists yet**. The native messaging host, the
 daemon-side browser renderer and the dispatcher hook below are
@@ -315,7 +326,10 @@ unchanged.
   server with `actions`; concealing the popup around captures is best effort;
   none of it has run on a real Linux desktop.
 * Browser: presence half only; no native host / browser renderer / dispatcher
-  hook (webextract-2), so no Haider-driven browser run.
+  hook (webextract-2), so no Haider-driven browser run. The host-error badge
+  needs the extension pinned to be seen.
+* The live Stop clicks were synthesised by a separate untagged test process,
+  not a physical mouse.
 * Multi-display: the desktop backends capture the main display; the badge is
   placed on the main screen.
 * Android: controller behaviour is proven by JVM tests and the overlay code

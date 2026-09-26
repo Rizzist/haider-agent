@@ -77,6 +77,10 @@ pub(crate) struct CuPresence {
     tick_interval: Duration,
     /// Conceal acks use their own sequence space, disjoint from pointers.
     next_conceal_seq: std::sync::atomic::AtomicU64,
+    /// Test seam: how long a run's Stop hook waits before submitting its turn
+    /// cancellation (zero in production). Models a slow cancel commit so the
+    /// Stop-refusal path is observable before the cancellation lands.
+    stop_cancel_delay: StdMutex<Duration>,
     me: Weak<CuPresence>,
 }
 
@@ -93,8 +97,15 @@ impl CuPresence {
             ticker_running: AtomicBool::new(false),
             tick_interval,
             next_conceal_seq: std::sync::atomic::AtomicU64::new(1 << 62),
+            stop_cancel_delay: StdMutex::new(Duration::ZERO),
             me: me.clone(),
         })
+    }
+
+    /// Delays every Stop hook's turn cancellation (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_stop_cancel_delay(&self, delay: Duration) {
+        *lock(&self.stop_cancel_delay) = delay;
     }
 
     /// Installs (or replaces) the renderer factory for `surface`. The
@@ -416,7 +427,8 @@ impl PresenceLease {
         run_id: haider_protocol::ids::RunId,
     ) -> Self {
         let key = format!("{session_id}/{run_id}");
-        let stop = run_cancel_hook(hub, session_id, run_id);
+        let delay = *lock(&presence.stop_cancel_delay);
+        let stop = run_cancel_hook(hub, session_id, run_id, delay);
         Self::new(presence, key, stop)
     }
 
@@ -539,6 +551,7 @@ fn run_cancel_hook(
     hub: crate::session_hub::SessionHub,
     session_id: haider_protocol::ids::SessionId,
     run_id: haider_protocol::ids::RunId,
+    delay: Duration,
 ) -> StopHook {
     let runtime = tokio::runtime::Handle::try_current().ok();
     Arc::new(move || {
@@ -549,6 +562,9 @@ fn run_cancel_hook(
         let session_id = session_id.clone();
         let run_id = run_id.clone();
         runtime.spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let request_json = serde_json::json!({
                 "session_id": session_id,
                 "run_id": run_id,
@@ -584,21 +600,68 @@ mod overlay {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::Duration;
+
+    const READY_UNKNOWN: u8 = 0;
+    const READY_EXCLUDED: u8 = 1;
+    const READY_CAPTURABLE: u8 = 2;
+
+    /// What the helper's `Ready` said about capture exclusion.
+    ///
+    /// Until `Ready` arrives the helper's UI is treated as CAPTURABLE: the
+    /// helper is spawned by the run's first action, usually a screenshot,
+    /// and its popup/windows may already be on screen before `Ready` is read.
+    /// The conceal is queued on stdin after `Show`, so the helper handles it
+    /// in order; an excluded helper simply acks it.
+    #[derive(Debug)]
+    pub(super) struct ReadyState(AtomicU8);
+
+    impl Default for ReadyState {
+        fn default() -> Self {
+            Self(AtomicU8::new(READY_UNKNOWN))
+        }
+    }
+
+    impl ReadyState {
+        pub(super) fn record(&self, event: &PresenceEvent) {
+            if let PresenceEvent::Ready {
+                capture_excluded, ..
+            } = event
+            {
+                let state = if *capture_excluded {
+                    READY_EXCLUDED
+                } else {
+                    READY_CAPTURABLE
+                };
+                self.0.store(state, Ordering::Release);
+            }
+        }
+
+        pub(super) fn capturable(&self) -> bool {
+            self.0.load(Ordering::Acquire) != READY_EXCLUDED
+        }
+    }
 
     pub(super) struct OverlayProcess {
         child: Option<Child>,
         stdin: Option<ChildStdin>,
-        /// Set from the helper's `Ready`: its UI can enter screenshots.
-        capturable: Arc<AtomicBool>,
+        ready: Arc<ReadyState>,
     }
 
     pub(super) fn spawn(sink: EventSink) -> Option<OverlayProcess> {
         let (program, args) = presence_helper_command()?;
-        let mut command = Command::new(&program);
+        spawn_program(&program, &args, sink)
+    }
+
+    pub(super) fn spawn_program(
+        program: &std::path::Path,
+        args: &[String],
+        sink: EventSink,
+    ) -> Option<OverlayProcess> {
+        let mut command = Command::new(program);
         command
-            .args(&args)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -617,8 +680,8 @@ mod overlay {
         };
         let stdin = child.stdin.take();
         let stdout = child.stdout.take()?;
-        let capturable = Arc::new(AtomicBool::new(false));
-        let reader_capturable = Arc::clone(&capturable);
+        let ready = Arc::new(ReadyState::default());
+        let reader_ready = Arc::clone(&ready);
         let reader = std::thread::Builder::new()
             .name("cu-presence-events".into())
             .spawn(move || {
@@ -626,12 +689,7 @@ mod overlay {
                     let Ok(line) = line else { break };
                     match serde_json::from_str::<PresenceEvent>(line.trim()) {
                         Ok(event) => {
-                            if let PresenceEvent::Ready {
-                                capture_excluded, ..
-                            } = &event
-                            {
-                                reader_capturable.store(!capture_excluded, Ordering::Release);
-                            }
+                            reader_ready.record(&event);
                             sink(event);
                         }
                         Err(error) => tracing::debug!(?error, "unparseable presence overlay event"),
@@ -646,7 +704,7 @@ mod overlay {
         Some(OverlayProcess {
             child: Some(child),
             stdin,
-            capturable,
+            ready,
         })
     }
 
@@ -668,7 +726,7 @@ mod overlay {
         }
 
         fn capturable(&self) -> bool {
-            self.capturable.load(Ordering::Acquire)
+            self.ready.capturable()
         }
 
         fn close(&mut self) {

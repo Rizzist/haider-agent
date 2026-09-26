@@ -448,3 +448,45 @@ fn badge_art_and_stop_hit_testing_agree() {
     let ring = art::click_ring(1.0);
     assert_eq!(ring.pixel(22, 22)[3], 0, "ring centre is clear");
 }
+
+/// Verifier finding (0ddd89a0): the Linux GetCapabilities fallback had no
+/// test and compiles only on Linux. The decision is pure and runs here on
+/// every platform.
+/// MUTATION CHECK: offer the Stop button without "actions", or drop the
+/// fallback hint. Expected runtime failure: the no-actions assertions.
+#[test]
+fn linux_notification_plan_offers_stop_only_when_the_server_draws_actions() {
+    let with_actions = vec!["body".to_owned(), "actions".to_owned()];
+    let plan = LinuxNotificationPlan::from_capabilities(Some(&with_actions));
+    assert!(plan.stop_button);
+    assert_eq!(plan.actions(), vec!["stop", "Stop"]);
+    assert_eq!(plan.platform, "linux-notification");
+    assert_eq!(plan.degraded_notice, None);
+    assert_eq!(plan.body("Last action: click"), "Last action: click");
+    assert!(plan.intro_body().contains("Choose Stop"));
+
+    for capabilities in [
+        Some(vec!["body".to_owned(), "persistence".to_owned()]),
+        None,
+    ] {
+        let plan = LinuxNotificationPlan::from_capabilities(capabilities.as_deref());
+        assert!(
+            !plan.stop_button,
+            "{capabilities:?}: no Stop button to promise"
+        );
+        assert!(plan.actions().is_empty());
+        assert_eq!(plan.platform, "linux-notification-no-actions");
+        assert!(plan.degraded_notice.is_some());
+        let body = plan.body("Last action: click");
+        assert!(body.starts_with("Last action: click\n"));
+        assert!(body.ends_with(LINUX_FALLBACK_STOP_HINT));
+        assert!(
+            LINUX_FALLBACK_STOP_HINT.contains("Esc")
+                && LINUX_FALLBACK_STOP_HINT.contains("haider run --stop")
+        );
+        assert!(
+            !plan.intro_body().contains("Choose Stop"),
+            "never name a button that is not drawn"
+        );
+    }
+}

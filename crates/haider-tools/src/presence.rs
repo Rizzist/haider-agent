@@ -511,6 +511,81 @@ impl<K: Ord + Clone> PresenceMachine<K> {
     }
 }
 
+/// Where to stop when a freedesktop notification server offers no action
+/// buttons (Linux fallback helper).
+pub const LINUX_FALLBACK_STOP_HINT: &str = "To stop: press Esc in the Haider TUI session, or for a headless run use `haider run --stop <run-id>`.";
+
+/// The Linux notification helper's decision from the server's
+/// `GetCapabilities` reply. Pure so it is unit-tested on every platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxNotificationPlan {
+    /// The notification carries a **Stop** action button.
+    pub stop_button: bool,
+    /// `Ready.platform` reported to the daemon.
+    pub platform: &'static str,
+    /// Logged/reported when Stop is only reachable through the fallback.
+    pub degraded_notice: Option<&'static str>,
+}
+
+impl LinuxNotificationPlan {
+    /// `capabilities` is the server's `GetCapabilities` list, or `None`
+    /// when the call failed (treated as "no actions": never promise a Stop
+    /// button the server may not draw).
+    #[must_use]
+    pub fn from_capabilities(capabilities: Option<&[String]>) -> Self {
+        let stop_button = capabilities.is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == "actions")
+        });
+        if stop_button {
+            Self {
+                stop_button,
+                platform: "linux-notification",
+                degraded_notice: None,
+            }
+        } else {
+            Self {
+                stop_button,
+                platform: "linux-notification-no-actions",
+                degraded_notice: Some(
+                    "notification server has no action buttons; Stop is available only via the Haider TUI (Esc) or `haider run --stop`",
+                ),
+            }
+        }
+    }
+
+    /// The action list passed to `Notify`.
+    #[must_use]
+    pub fn actions(&self) -> Vec<&'static str> {
+        if self.stop_button {
+            vec!["stop", "Stop"]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The notification body for the first post.
+    #[must_use]
+    pub fn intro_body(&self) -> &'static str {
+        if self.stop_button {
+            "Haider is using your mouse and keyboard. Choose Stop to cancel the run."
+        } else {
+            "Haider is using your mouse and keyboard."
+        }
+    }
+
+    /// Appends the fallback Stop hint when there is no Stop button.
+    #[must_use]
+    pub fn body(&self, base: &str) -> String {
+        if self.stop_button {
+            base.to_owned()
+        } else {
+            format!("{base}\n{LINUX_FALLBACK_STOP_HINT}")
+        }
+    }
+}
+
 /// How the daemon should launch the desktop overlay helper, or `None` when
 /// the overlay is disabled or no helper executable is known (for example a
 /// test binary embedding the daemon).
