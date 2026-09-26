@@ -932,13 +932,7 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
         30_000,
         "the conservative derived default is kept"
     );
-    let mut update = select_body(
-        "b1-b-config",
-        &session_b,
-        generation_b,
-        "glm-5.3",
-        None,
-    );
+    let mut update = select_body("b1-b-config", &session_b, generation_b, "glm-5.3", None);
     if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut update {
         *max_tokens = Some(60_000);
     }
@@ -956,13 +950,7 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
     .await;
     assert_eq!(haider_code.requests()[2].max_tokens, 60_000);
     // The known window still bounds explicit budgets (half of 200,000).
-    let mut over = select_body(
-        "b1-b-over",
-        &session_b,
-        generation_b,
-        "glm-5.3",
-        None,
-    );
+    let mut over = select_body("b1-b-over", &session_b, generation_b, "glm-5.3", None);
     if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut over {
         *max_tokens = Some(100_001);
     }
@@ -997,6 +985,114 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
     assert_eq!(budget.clamped, None);
     run_turn(&mut client, &config, &session_b, generation_b, "b1-b-kimi").await;
     assert_eq!(kimi.requests()[1].max_tokens, 60_000);
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// B2: equal projected values do not erase the catalog declaration. Both
+/// rows resolve to 8,192, but only the row that declares it rejects 20,000.
+#[tokio::test]
+async fn declared_8192_refuses_20000_while_equal_fallback_reaches_provider() {
+    let root = test_root("b2-equal-8192-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "b2-equal-8192",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let row = |slug: &str, declared: Option<u64>| haider_provider::DiscoveredModel {
+        slug: slug.into(),
+        display_name: slug.into(),
+        context_window: Some(1_048_576),
+        max_output_tokens: declared,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let models = [
+        row("probe-declared-8192", Some(8_192)),
+        row("probe-fallback-8192", None),
+    ];
+    let models_json = serde_json::to_string(&models).expect("serialize catalog rows");
+    let fetched_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as u64;
+    haider_store::Store::open(&config.store_dir)
+        .expect("open catalog store")
+        .put_provider_models("haider-code", &models_json, None, fetched_at_ms)
+        .expect("seed public Haider Code inventory");
+    let fake = Arc::new(FakeProvider::new(text_turn("fallback accepted")));
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[("haider-code", fake.clone())]),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "b2-equal-client",
+        "b2-equal-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    send(
+        &mut client,
+        &config,
+        "b2-declared-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("b2-declared-command"),
+            cwd: workspace.display().to_string(),
+            provider: "haider-code".into(),
+            model: "probe-declared-8192".into(),
+            max_tokens: 20_000,
+        },
+    )
+    .await;
+    let response = next_response(&mut client).await;
+    assert!(
+        matches!(
+            &response,
+            ResponseBody::Error {
+                data: Some(ErrorData::ModelOutputLimit {
+                    requested: 20_000,
+                    max_output_tokens: 8_192,
+                    ..
+                }),
+                ..
+            }
+        ),
+        "declared catalog maximum must give a typed refusal: {response:?}"
+    );
+    assert!(
+        fake.requests().is_empty(),
+        "refusal precedes provider dispatch"
+    );
+
+    let (session_id, generation) = create_with_budget_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "haider-code",
+        "probe-fallback-8192",
+        20_000,
+    )
+    .await;
+    run_turn(
+        &mut client,
+        &config,
+        &session_id,
+        generation,
+        "b2-fallback-turn",
+    )
+    .await;
+    assert_eq!(fake.requests()[0].max_tokens, 20_000);
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
