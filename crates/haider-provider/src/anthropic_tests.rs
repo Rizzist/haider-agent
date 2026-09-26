@@ -3151,39 +3151,186 @@ async fn binding_rejection_falls_back_once_and_latches_the_route() {
     );
 }
 
-/// Only a 400 naming the binding opt-in triggers the fallback; a
-/// prefix-mismatch rejection or any other invalid request never does.
+/// Anthropic's documented prefix-mismatch 400 (preserved-thinking docs,
+/// "What the API does with an invalid block"). Its remedy text names
+/// `block_binding`, `prefix_mismatch_behavior` and, without the beta header,
+/// the beta itself. It must never read as "the route rejects the opt-in".
+const DOCUMENTED_PREFIX_MISMATCH: &str = "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header. The `system` prompt differs from when the block was created.";
+
+fn error_envelope(message: &str) -> Vec<u8> {
+    serde_json::json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": message},
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Only an explicit unknown-field / unsupported-beta validation error of the
+/// opt-in triggers the fallback. Prefix/signature diagnostics never do, even
+/// when their remedy recommends exactly these settings.
 #[test]
 fn only_binding_opt_in_rejections_trigger_the_fallback() {
-    let envelope = |message: &str| {
-        serde_json::json!({
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": message},
-        })
-        .to_string()
-        .into_bytes()
-    };
     for rejected in [
         format!("Unexpected value(s) `{THINKING_BINDING_BETA}` for the `anthropic-beta` header."),
+        "block_binding: Extra inputs are not permitted".to_owned(),
         "thinking.block_binding: Extra inputs are not permitted".to_owned(),
         "thinking.block_binding.prefix_mismatch_behavior: unsupported".to_owned(),
     ] {
         assert!(
-            crate::anthropic::anthropic_rejects_thinking_binding(&envelope(&rejected)),
+            crate::anthropic::anthropic_rejects_thinking_binding(&error_envelope(&rejected)),
             "{rejected}"
         );
     }
     assert!(crate::anthropic::anthropic_rejects_thinking_binding(
         b"gateway: unknown field block_binding"
     ));
+    let without_beta_sentence = DOCUMENTED_PREFIX_MISMATCH
+        .replace(
+            " That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header.",
+            "",
+        );
     for other in [
+        DOCUMENTED_PREFIX_MISMATCH,
+        without_beta_sentence.as_str(),
+        "messages.1.content.0: Invalid `signature` in `thinking` block. Prefix mismatch; set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\".",
         "messages.2.content.0: Invalid `signature` in `thinking` block.",
+        "thinking.block_binding.prefix_mismatch_behavior: must be one of \"error\" or \"drop_block\"",
         "max_tokens: must be positive",
         "prompt is too long",
     ] {
         assert!(
-            !crate::anthropic::anthropic_rejects_thinking_binding(&envelope(other)),
+            !crate::anthropic::anthropic_rejects_thinking_binding(&error_envelope(other)),
             "{other}"
+        );
+    }
+    // A gateway relaying the documented diagnostic as raw text is excluded too.
+    assert!(!crate::anthropic::anthropic_rejects_thinking_binding(
+        DOCUMENTED_PREFIX_MISMATCH.as_bytes()
+    ));
+}
+
+/// Loopback route answering EVERY request with one fixed 400 body; records
+/// whether each physical request carried the binding policy.
+async fn fixed_error_fake(
+    listener: tokio::net::TcpListener,
+    message: &'static str,
+    requests: usize,
+) -> Vec<bool> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut policies = Vec::new();
+    for _ in 0..requests {
+        let Ok(accepted) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+        else {
+            break;
+        };
+        let (mut socket, _) = accepted.expect("accept wire request");
+        let (_, payload) = read_http_request(&mut socket).await;
+        policies.push(payload.pointer("/thinking/block_binding").is_some());
+        let body = String::from_utf8(error_envelope(message)).expect("UTF-8 envelope");
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write error");
+    }
+    policies
+}
+
+fn two_screenshot_history() -> Vec<Message> {
+    let mut durable = vec![Message::user_text("synthetic screenshot history")];
+    for name in ["a", "b"] {
+        durable.push(Message::assistant(vec![computer_screenshot_call(name)]));
+        durable.push(screenshot_result(name, name));
+    }
+    durable
+}
+
+/// Astra B1 regression: the documented prefix-mismatch 400 (remedy text
+/// included) is returned unchanged after ONE physical request, with no
+/// unsupported-beta resend, and the route keeps its policy for later requests
+/// on the same adapter and for a second session (rebuilt adapter).
+#[tokio::test]
+async fn documented_prefix_mismatch_never_disables_the_binding_policy() {
+    const MODEL: &str = "claude-opus-5-5";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind prefix-mismatch fake");
+    let base_url = format!("http://{}", listener.local_addr().expect("fake address"));
+    let server = tokio::spawn(fixed_error_fake(listener, DOCUMENTED_PREFIX_MISMATCH, 3));
+    let provider = prefix_fake_adapter("prefix-mismatch-first", &base_url);
+    let request = projected_turn(MODEL, &two_screenshot_history());
+
+    let error = drain_turn(&provider, request.clone())
+        .await
+        .expect_err("prefix mismatch is surfaced");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert_eq!(error.presentation.provider_http_status, Some(400));
+    let has_policy = |provider: &AnthropicProvider| {
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding/prefix_mismatch_behavior")
+            .and_then(serde_json::Value::as_str)
+            == Some("drop_block")
+    };
+    assert!(has_policy(&provider), "later request keeps the policy");
+
+    // A later request on the same adapter and a second session on the same
+    // route both still send the policy (one physical request each).
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("second prefix mismatch");
+    let second_session = prefix_fake_adapter("prefix-mismatch-second", &base_url);
+    assert!(
+        has_policy(&second_session),
+        "second session keeps the policy"
+    );
+    drain_turn(&second_session, request.clone())
+        .await
+        .expect_err("third prefix mismatch");
+    assert_eq!(
+        server.await.expect("fake server"),
+        vec![true, true, true],
+        "every request carried the policy and none was an unsupported-beta resend"
+    );
+}
+
+/// An explicit unsupported-beta rejection whose resend ALSO fails must not
+/// latch the route: exactly two physical requests, and the next request (and
+/// a second session) still opt in.
+#[tokio::test]
+async fn failed_fallback_resend_does_not_latch_the_route() {
+    const MODEL: &str = "claude-opus-5-5";
+    const UNSUPPORTED: &str = "Unexpected value(s) `thinking-binding-controls-2026-08-01` for the `anthropic-beta` header.";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind always-rejecting fake");
+    let base_url = format!("http://{}", listener.local_addr().expect("fake address"));
+    let server = tokio::spawn(fixed_error_fake(listener, UNSUPPORTED, 2));
+    let provider = prefix_fake_adapter("failed-resend", &base_url);
+    let request = projected_turn(MODEL, &two_screenshot_history());
+
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("resend is rejected as well");
+    assert_eq!(
+        server.await.expect("fake server"),
+        vec![true, false],
+        "one policy request, one bounded resend without it"
+    );
+    for adapter in [
+        &provider,
+        &prefix_fake_adapter("failed-resend-second", &base_url),
+    ] {
+        assert_eq!(
+            adapter.request_payload(&request).expect("payload")["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block",
+            "an unconfirmed fallback never disables the policy"
         );
     }
 }

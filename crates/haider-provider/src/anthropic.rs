@@ -193,30 +193,73 @@ pub(crate) fn thinking_binding_drop_required(request: &TurnRequest) -> bool {
 }
 
 /// Routes (auth mode, URL, model) whose endpoint rejected the thinking
-/// binding opt-in with a 400 naming `block_binding` or its beta. Process-wide
-/// so a rebuilt adapter for the same route never repeats the rejected
-/// request; see [`AnthropicProvider::send_request_with_binding_fallback`].
+/// binding opt-in as an unknown field or unsupported beta AND then accepted
+/// the same request without it. Process-wide so a rebuilt adapter for the
+/// same route never repeats the rejected request; see
+/// [`AnthropicProvider::send_request_with_binding_fallback`].
 fn thinking_binding_rejected_routes() -> &'static Mutex<HashSet<String>> {
     static ROUTES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     ROUTES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Whether a 400 body rejects exactly Haider's prefix-binding opt-in (the
-/// `thinking.block_binding` field or the binding-controls beta), as an
-/// endpoint without thinking-binding controls answers. A prefix-mismatch
-/// rejection or any other invalid request never matches.
+/// Whether a 400 body is an explicit validation rejection of Haider's
+/// prefix-binding opt-in itself: `block_binding` / `prefix_mismatch_behavior`
+/// as an unknown or forbidden field, or the binding-controls beta as an
+/// unknown or unsupported `anthropic-beta` value. Merely NAMING those settings
+/// is not enough: Anthropic's documented prefix-mismatch error ("Invalid
+/// `signature` in `thinking` block. The block is bound to a different
+/// conversation. Remove the block, or set
+/// `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". That
+/// setting requires the `thinking-binding-controls-2026-08-01` value ...")
+/// recommends exactly these settings as its remedy. Any signature or
+/// prefix-binding diagnostic is therefore never an unsupported-opt-in
+/// rejection, and neither is any other invalid request.
 pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
     let message = serde_json::from_slice::<ErrorEnvelope>(body).map_or_else(
         |_| String::from_utf8_lossy(body).to_ascii_lowercase(),
         |envelope| envelope.error.message.to_ascii_lowercase(),
     );
-    [
-        "block_binding",
-        "prefix_mismatch_behavior",
-        ANTHROPIC_THINKING_BINDING_BETA,
+    let prefix_or_signature_diagnostic = [
+        "signature",
+        "bound to a different conversation",
+        "prefix_binding_mismatch",
+        "prefix mismatch",
+        "remove the block",
     ]
     .iter()
-    .any(|needle| message.contains(needle))
+    .any(|marker| message.contains(marker));
+    if prefix_or_signature_diagnostic {
+        return false;
+    }
+    let names_binding_field =
+        message.contains("block_binding") || message.contains("prefix_mismatch_behavior");
+    let unknown_field = [
+        "extra inputs are not permitted",
+        "extra input is not permitted",
+        "unknown field",
+        "unrecognized field",
+        "unexpected field",
+        "unexpected keyword",
+        "additional properties are not allowed",
+        "not a recognized field",
+        "not supported",
+        ": unsupported",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase));
+    let names_beta = message.contains(ANTHROPIC_THINKING_BINDING_BETA);
+    let unsupported_beta = [
+        "unexpected value",
+        "unknown beta",
+        "unsupported beta",
+        "invalid beta",
+        "is not supported",
+        "not a valid beta",
+        "unrecognized beta",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase));
+    (names_binding_field && unknown_field) || (names_beta && unsupported_beta)
 }
 
 /// Removes the binding opt-in from a rendered payload. The beta header is
@@ -1236,25 +1279,38 @@ impl AnthropicProvider {
                 .with_http_metadata(400, request_id.as_deref())
         })?;
         if !anthropic_rejects_thinking_binding(&body) {
+            // Includes the documented prefix-mismatch error: the route keeps
+            // its policy and the original error is returned unchanged.
             return Err(
                 replay_anthropic_http_error(400, retry_after.as_deref(), &body)
                     .with_http_metadata(400, request_id.as_deref()),
             );
-        }
-        if let Ok(mut routes) = thinking_binding_rejected_routes().lock() {
-            routes.insert(self.thinking_binding_route());
         }
         tracing::warn!(
             target: "haider.provider",
             model = %self.model,
             auth_mode = ?self.auth_mode,
             request_id = request_id.as_deref().unwrap_or(""),
-            "Anthropic route rejected the thinking prefix-binding drop policy; resending once without it and disabling it for this route"
+            "Anthropic route rejected the thinking prefix-binding opt-in as unsupported; resending once without it"
         );
         strip_thinking_binding_drop(&mut prepared.payload);
         let built = self.request_body_prepared_for_send(&prepared).await?;
         drop(prepared);
-        self.execute_prepared_send(built).await
+        let response = self.execute_prepared_send(built).await?;
+        // Latch only once the route has actually accepted the pre-policy
+        // wire; a failed resend leaves the route's policy untouched.
+        if response.status().is_success() {
+            if let Ok(mut routes) = thinking_binding_rejected_routes().lock() {
+                routes.insert(self.thinking_binding_route());
+            }
+            tracing::warn!(
+                target: "haider.provider",
+                model = %self.model,
+                auth_mode = ?self.auth_mode,
+                "Anthropic route accepted the request without the thinking prefix-binding opt-in; disabling it for this route"
+            );
+        }
+        Ok(response)
     }
 
     async fn execute_prepared_send(
