@@ -3176,6 +3176,21 @@ fn only_binding_opt_in_rejections_trigger_the_fallback() {
         "block_binding: Extra inputs are not permitted".to_owned(),
         "thinking.block_binding: Extra inputs are not permitted".to_owned(),
         "thinking.block_binding.prefix_mismatch_behavior: unsupported".to_owned(),
+        // Gateway wordings (verifier F1): Bedrock, Vertex/Google JSON,
+        // OpenAI-compatible proxies, generic validators.
+        "Malformed input request: #/thinking: extraneous key [block_binding] is not permitted, please reformat your input and try again.".to_owned(),
+        "Invalid JSON payload received. Unknown name \"block_binding\" at 'thinking': Cannot find field.".to_owned(),
+        "Unrecognized request argument supplied: block_binding".to_owned(),
+        "Unknown parameter: 'thinking.block_binding'.".to_owned(),
+        "thinking.block_binding: field not allowed".to_owned(),
+        "#/thinking: Additional properties are not allowed ('block_binding' was unexpected)".to_owned(),
+        // The same wordings aimed at the beta header value.
+        format!("anthropic-beta: extraneous value [{THINKING_BINDING_BETA}] is not permitted"),
+        format!("Unknown name \"{THINKING_BINDING_BETA}\" in anthropic-beta: Cannot find field."),
+        format!("Unrecognized request argument supplied: anthropic-beta={THINKING_BINDING_BETA}"),
+        format!("Unknown parameter: anthropic-beta '{THINKING_BINDING_BETA}'."),
+        format!("anthropic-beta `{THINKING_BINDING_BETA}`: value not allowed"),
+        format!("Beta `{THINKING_BINDING_BETA}` is not supported on this route"),
     ] {
         assert!(
             crate::anthropic::anthropic_rejects_thinking_binding(&error_envelope(&rejected)),

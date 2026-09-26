@@ -231,35 +231,41 @@ pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
     if prefix_or_signature_diagnostic {
         return false;
     }
-    let names_binding_field =
-        message.contains("block_binding") || message.contains("prefix_mismatch_behavior");
-    let unknown_field = [
+    // Gateways word an unknown-field / unsupported-parameter rejection in
+    // many ways (Anthropic, Bedrock, Vertex, OpenAI-compatible proxies). Any
+    // such generic wording counts, but ONLY when the message names the
+    // opt-in itself: the binding field or the binding-controls beta value.
+    let names_opt_in = message.contains("block_binding")
+        || message.contains("prefix_mismatch_behavior")
+        || message.contains(ANTHROPIC_THINKING_BINDING_BETA);
+    let rejection_wording = [
         "extra inputs are not permitted",
         "extra input is not permitted",
-        "unknown field",
+        "extraneous key",
+        "is not permitted",
+        "not permitted",
+        "unknown name",
+        "cannot find field",
+        "unrecognized request argument",
         "unrecognized field",
+        "unrecognized",
+        "not recognized",
+        "unknown parameter",
+        "unknown field",
+        "unknown beta",
         "unexpected field",
         "unexpected keyword",
-        "additional properties are not allowed",
-        "not a recognized field",
-        "not supported",
-        ": unsupported",
-    ]
-    .iter()
-    .any(|phrase| message.contains(phrase));
-    let names_beta = message.contains(ANTHROPIC_THINKING_BINDING_BETA);
-    let unsupported_beta = [
         "unexpected value",
-        "unknown beta",
-        "unsupported beta",
+        "additional properties are not allowed",
+        "not allowed",
+        "unsupported",
+        "not supported",
         "invalid beta",
-        "is not supported",
         "not a valid beta",
-        "unrecognized beta",
     ]
     .iter()
     .any(|phrase| message.contains(phrase));
-    (names_binding_field && unknown_field) || (names_beta && unsupported_beta)
+    names_opt_in && rejection_wording
 }
 
 /// Removes the binding opt-in from a rendered payload. The beta header is
