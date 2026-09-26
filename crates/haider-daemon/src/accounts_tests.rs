@@ -17222,13 +17222,15 @@ async fn v2_fake_oauth_mode_refuses_claude_import_adoption_and_heal() {
     reset_oauth_import_read_count();
 
     // Import (file and owner-store loaders).
-    let error = load_oauth_import_material_with_native(
+    // (Import material carries secrets and deliberately has no Debug.)
+    let Err(error) = load_oauth_import_material_with_native(
         "claude-code",
         1,
         native.as_ref(),
         ClaudeNativeReadEvent::Significant,
-    )
-    .expect_err("Claude import must be refused in fake mode");
+    ) else {
+        panic!("Claude import must be refused in fake mode");
+    };
     assert!(refused(&error), "{error:?}");
     match load_claude_native_import_material(1, native.as_ref(), ClaudeNativeReadEvent::Ordinary) {
         Err(ClaudeNativeImportError::Invalid(error)) => assert!(refused(&error), "{error:?}"),
