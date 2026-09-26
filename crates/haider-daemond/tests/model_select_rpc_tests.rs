@@ -842,13 +842,20 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
         .put_provider_models("haider-code", &models_json, None, fetched_at_ms)
         .expect("seed public Haider Code inventory");
     let kimi = Arc::new(FakeProvider::new(
-        [text_turn("kimi one"), text_turn("kimi two")].concat(),
+        [
+            text_turn("kimi one"),
+            text_turn("kimi two"),
+            text_turn("kimi three"),
+            text_turn("kimi four"),
+        ]
+        .concat(),
     ));
     let haider_code = Arc::new(FakeProvider::new(
         [
             text_turn("glm one"),
             text_turn("glm two"),
             text_turn("glm three"),
+            text_turn("glm four"),
         ]
         .concat(),
     ));
@@ -985,6 +992,62 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
     assert_eq!(budget.clamped, None);
     run_turn(&mut client, &config, &session_b, generation_b, "b1-b-kimi").await;
     assert_eq!(kimi.requests()[1].max_tokens, 60_000);
+
+    // Cover the two other provider/operation pairs explicitly: GLM create
+    // with 60,000, and Kimi config update from its 30,000 derived default.
+    let (session_c, generation_c) = create_with_budget_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "haider-code",
+        "glm-5.3",
+        60_000,
+    )
+    .await;
+    run_turn(&mut client, &config, &session_c, generation_c, "b1-c-glm").await;
+    assert_eq!(haider_code.requests()[3].max_tokens, 60_000);
+
+    let (session_d, generation_d) = create_with_budget_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "kimi-oauth",
+        "kimi-for-coding",
+        0,
+    )
+    .await;
+    run_turn(
+        &mut client,
+        &config,
+        &session_d,
+        generation_d,
+        "b1-d-derived",
+    )
+    .await;
+    assert_eq!(kimi.requests()[2].max_tokens, 30_000);
+    let mut update = select_body(
+        "b1-d-config",
+        &session_d,
+        generation_d,
+        "kimi-for-coding",
+        None,
+    );
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut update {
+        *max_tokens = Some(60_000);
+    }
+    let response = select_budget(&mut client, &config, "b1-d-config", update).await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 60_000);
+    assert_eq!(budget.clamped, None);
+    run_turn(
+        &mut client,
+        &config,
+        &session_d,
+        generation_d,
+        "b1-d-explicit",
+    )
+    .await;
+    assert_eq!(kimi.requests()[3].max_tokens, 60_000);
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
