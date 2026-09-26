@@ -18,6 +18,7 @@
 //!   same verified content-addressed store without coupling tools back to core.
 
 mod actor;
+mod continuation_fingerprint;
 mod fake_store;
 mod prompt_history;
 mod recovery;

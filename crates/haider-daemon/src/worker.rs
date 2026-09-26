@@ -314,8 +314,9 @@ pub trait ProviderFactory: Send + Sync {
     /// ephemeral cache resources when a session switches wire families.
     async fn reconcile_cache_scope(&self, _session_id: &SessionId, _provider: &str) {}
 
-    /// Integration-test seam for proving the actor's request-loop budget
-    /// through the real daemon. Production factories keep the core default.
+    /// Integration-test seam for proving an explicit actor request-loop cap
+    /// through the real daemon. Production factories return `None`, leaving
+    /// any run or child pin in force (no pin means unbounded).
     #[doc(hidden)]
     fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
         None
@@ -474,6 +475,10 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             // rev933b finding 7: the automatic switch observed this exact
             // pair; a concurrent explicit selection moves it and must win.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
+            // No validated model row exists on this path: keep the stored
+            // budget. An oversized budget on the fallback model is recovered
+            // by the provider's one-shot `max_tokens too large` retry.
+            output_budget: None,
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
@@ -6706,6 +6711,81 @@ async fn durable_queue_consumed(
     }
 }
 
+/// Agent-visible mutation receipt. A redacted mutation withholds its exact
+/// digests (they would let the agent test guesses of hidden content offline);
+/// the owner-local journal keeps them and `workspace_mutation` still resolves
+/// the durable evidence through `graph_evidence`.
+fn mutation_result_preview(
+    result: String,
+    mutation: WorkspaceMutation,
+    reference: WorkspaceMutationRef,
+) -> String {
+    if mutation.redacted_content {
+        serde_json::json!({
+            "result": result,
+            "redacted_content": true,
+            "workspace_revision": mutation.workspace_revision,
+            "workspace_mutation": reference,
+        })
+    } else {
+        serde_json::json!({
+            "result": result,
+            "mutation_digest": mutation.mutation_digest,
+            "workspace_revision": mutation.workspace_revision,
+            "subject_digest": mutation.subject_digest,
+            "workspace_mutation": reference,
+        })
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod mutation_preview_tests {
+    use super::*;
+
+    fn mutation(redacted_content: bool) -> WorkspaceMutation {
+        WorkspaceMutation {
+            effect_id: EffectId::new("effect-synthetic"),
+            mutation_digest: "blake3:synthetic-raw-content".into(),
+            workspace_revision: Some(haider_protocol::ids::WorkspaceRevision::new(
+                "workspace-revision:7",
+            )),
+            subject_digest: Some("blake3:synthetic-subject".into()),
+            redacted_content,
+        }
+    }
+
+    fn reference() -> WorkspaceMutationRef {
+        WorkspaceMutationRef {
+            run_id: RunId::new("run-synthetic"),
+            effect_id: EffectId::new("effect-synthetic"),
+        }
+    }
+
+    /// Round-4 oracle: a copy of a masked file published a raw-content
+    /// mutation digest (and a subject digest derived from it) to the model.
+    #[test]
+    fn redacted_mutation_preview_withholds_exact_digests() {
+        let preview = mutation_result_preview("copied a to b".into(), mutation(true), reference());
+        assert!(!preview.contains("synthetic-raw-content"), "{preview}");
+        assert!(!preview.contains("synthetic-subject"), "{preview}");
+        let value: serde_json::Value = serde_json::from_str(&preview).expect("json preview");
+        assert_eq!(value["redacted_content"], true);
+        assert_eq!(value["workspace_revision"], "workspace-revision:7");
+        assert_eq!(value["workspace_mutation"]["effect_id"], "effect-synthetic");
+    }
+
+    #[test]
+    fn public_mutation_preview_keeps_provenance() {
+        let preview = mutation_result_preview("copied a to b".into(), mutation(false), reference());
+        let value: serde_json::Value = serde_json::from_str(&preview).expect("json preview");
+        assert_eq!(value["mutation_digest"], "blake3:synthetic-raw-content");
+        assert_eq!(value["subject_digest"], "blake3:synthetic-subject");
+        assert!(value.get("redacted_content").is_none());
+    }
+}
+
 async fn durable_workspace_mutation(
     store: &HubStoreHandle,
     run_id: &RunId,
@@ -7904,6 +7984,7 @@ async fn perform_shell_exec(
             .await;
         }
     };
+    broker.set_freshness_profile_scope(lease.hub().peer_device_id());
     let output_context = HubCommandOutputContext {
         store: lease.clone(),
         branch_id: pending.branch_id.clone(),
@@ -8129,7 +8210,14 @@ async fn perform_shell_exec(
         }
     };
     if let Err(error) = broker.close().await {
-        let _ = shell.add_output(result.output_bytes);
+        // Even a broker-close failure can publish a shell byte count. Derive
+        // it through the same complete-capture redaction boundary; if that
+        // boundary fails too, publish no raw count.
+        let safe_count = crate::tasks::TaskFacade::new(lease.hub().clone())
+            .retain_foreground_capture(lease.session_id(), &mut result)
+            .await
+            .map_or(0, |_| result.output_bytes);
+        let _ = shell.add_output(safe_count);
         let _ = shell.exited(result.exit_code);
         return fail_shell_exec(
             lease,
@@ -8458,6 +8546,25 @@ async fn refresh_context_economy_from_journal(
             .await?;
     }
     Ok(economy)
+}
+
+/// Applies the test-only hard-cap override while preserving a pinned tranche.
+/// Production turns use the pin unchanged and have no request cap when absent.
+fn request_budget_with_test_override(
+    pinned: Option<haider_protocol::request_budget::RequestBudgetV1>,
+    override_limit: Option<usize>,
+) -> Option<haider_protocol::request_budget::RequestBudgetV1> {
+    override_limit
+        .map(|limit| haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: pinned
+                .map_or(
+                    haider_protocol::request_budget::OPT_IN_DEFAULT_TRANCHE,
+                    |pin| pin.tranche,
+                )
+                .min(limit),
+            hard_cap: limit,
+        })
+        .or(pinned)
 }
 
 /// Assembles and starts one accepted turn: provider resolution (R6 pinning —
@@ -9357,38 +9464,43 @@ async fn start_turn(
     config.interaction_policy =
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
-    config.ceiling_workspace = headless
-        .as_ref()
-        .map(|_| std::path::PathBuf::from(&metadata.cwd));
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
     config.turn_ordinal = accepted.turn_ordinal;
     config.provider_request_ordinals = Some(request_ordinals.clone());
     config.provider_request_attempt_recorder = Some(provider_request_attempt_recorder.clone());
     config.recovery_request_local_usage = admission_retry;
-    // A run pin overrides the child's frozen policy; absent both, the core
-    // supplies its ordinary 32-request tranche and 64-request hard ceiling.
+    // A run pin overrides the child's frozen policy. Absent both, provider
+    // requests are unbounded; explicit token, cost, time, cancellation, and
+    // non-request-count loop guards remain independent.
     let child_request_budget = delegation_record
         .as_ref()
         .map(|record| record.manifest.request_budget())
         .transpose()
         .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?
         .flatten();
-    if let Some(budget) = headless
+    let pinned_request_budget = headless
         .as_ref()
         .and_then(|context| context.spec.budget.request_budget)
-        .or(child_request_budget)
-    {
+        .or(child_request_budget);
+    if let Some(budget) = pinned_request_budget {
         budget
             .validate()
             .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
-        config.provider_request_tranche = budget.tranche;
-        config.max_provider_requests_per_turn = budget.hard_cap;
     }
-    if let Some(limit) = dependencies
-        .provider_factory
-        .max_provider_requests_per_turn_override()
-    {
-        config.max_provider_requests_per_turn = limit;
+    // The test-factory override changes the ceiling, preserving a pinned
+    // tranche when possible (the seam's pre-973 behavior).
+    let request_budget = request_budget_with_test_override(
+        pinned_request_budget,
+        dependencies
+            .provider_factory
+            .max_provider_requests_per_turn_override(),
+    );
+    if let Some(budget) = request_budget {
+        config.provider_request_budget = Some(budget);
+        // Hard-cap workspace receipts exist only for capped headless runs.
+        config.ceiling_workspace = headless
+            .as_ref()
+            .map(|_| std::path::PathBuf::from(&metadata.cwd));
     }
     config.reserved_output_tokens = metadata.max_tokens;
     if let Some(window) = config.context_window
@@ -13654,6 +13766,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -13769,6 +13882,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -13880,6 +13994,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -16755,6 +16870,7 @@ async fn create_broker_tool_dispatcher(
             });
         crate::workspace::error(&unavailable)
     })?;
+    broker.set_freshness_profile_scope(context.store.hub().peer_device_id());
     broker
         .restore_freshness(durable_freshness.into_values())
         .map_err(tool_error)?;
@@ -22971,6 +23087,29 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 if let Some(truncation) = outcome.truncation {
                                     result.declare_truncation(truncation);
                                 }
+                                let payload_chunk = haider_tools::ProcessOutputChunk {
+                                    stream: haider_protocol::item::OutputStream::Stdout,
+                                    chunk_b64: base64::engine::general_purpose::STANDARD
+                                        .encode(result.payload_text()),
+                                };
+                                let (safe_payload, masked) =
+                                    haider_tools::redact_process_output_with_redaction(&[
+                                        payload_chunk,
+                                    ])
+                                    .map_err(tool_error)?;
+                                if masked {
+                                    let was_truncated = result.truncated;
+                                    result.preview = safe_payload;
+                                    if was_truncated {
+                                        let safe_provenance =
+                                            haider_protocol::tool::ToolTruncation::from_bytes(
+                                                result.preview.as_bytes(),
+                                                result.preview.len(),
+                                            );
+                                        result.truncation = None;
+                                        result.declare_truncation(safe_provenance);
+                                    }
+                                }
                                 if result.preview.len()
                                     > haider_tools::WEB_FETCH_MODEL_PREVIEW_MAX_BYTES
                                 {
@@ -23728,19 +23867,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             ));
                         }
                     };
-                    let subject_digest = mutation.subject_digest.clone();
-                    let workspace_revision = mutation.workspace_revision.clone();
-                    result.preview = serde_json::json!({
-                        "result": result.preview,
-                        "mutation_digest": mutation.mutation_digest,
-                        "workspace_revision": workspace_revision,
-                        "subject_digest": subject_digest,
-                        "workspace_mutation": WorkspaceMutationRef {
+                    result.preview = mutation_result_preview(
+                        result.preview,
+                        mutation,
+                        WorkspaceMutationRef {
                             run_id: run_id.clone(),
                             effect_id: record.effect.clone(),
                         },
-                    })
-                    .to_string();
+                    );
                     Ok(result)
                 }
                 Err(error) => Err(error),
@@ -24384,6 +24518,9 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         haider_tools::ToolError::WorkspaceBoundary { .. } => ("rejected", "workspace_boundary"),
         haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
         haider_tools::ToolError::UnreadFile { .. } => ("rejected", "unread_file"),
+        haider_tools::ToolError::AnchorInRedactedContent { .. } => {
+            ("rejected", "anchor_in_redacted_content")
+        }
         haider_tools::ToolError::EditAnchor(_) => ("conflict", "edit_anchor_count"),
         haider_tools::ToolError::InvalidArgument { .. } => ("rejected", "invalid_argument"),
         haider_tools::ToolError::InvalidMenuAnswer { .. } => ("rejected", "invalid_menu_answer"),

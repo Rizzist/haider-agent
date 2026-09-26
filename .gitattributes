@@ -16,3 +16,6 @@ crates/**/tests/goldens/** text eol=lf
 packaging/** text eol=lf
 # The owner-supplied Chocolatey icon must never undergo text normalization.
 packaging/**/*.png binary -eol
+# The context-meter render golden is a byte-exact fixed-width screen capture;
+# its trailing spaces are rendered cells, not whitespace errors.
+crates/haider-tui/tests/fixtures/context_meter/*.golden -whitespace

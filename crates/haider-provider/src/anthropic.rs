@@ -1539,22 +1539,21 @@ fn model_capabilities(model: &str) -> ModelCapabilities {
     // the same models — normalize before the family match so a Bedrock or
     // Vertex slug reports its real context window.
     let model = crate::effort::base_model(model);
+    let context_limit = crate::static_model_limits(ANTHROPIC_PROVIDER_NAME, model)
+        .context_window
+        .unwrap_or(100_000);
     if model == "claude-fable-5"
         || model.starts_with("claude-opus-5")
         || model.starts_with("claude-sonnet-5")
+        || model.starts_with("claude-haiku-4-5")
     {
         ModelCapabilities {
-            context_limit: 1_000_000,
-            thinking_visible: FeatureResolve::Native,
-        }
-    } else if model.starts_with("claude-haiku-4-5") {
-        ModelCapabilities {
-            context_limit: 200_000,
+            context_limit,
             thinking_visible: FeatureResolve::Native,
         }
     } else {
         ModelCapabilities {
-            context_limit: 100_000,
+            context_limit,
             thinking_visible: FeatureResolve::Unsupported,
         }
     }

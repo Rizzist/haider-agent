@@ -615,7 +615,7 @@ fn live_model(profile: &haider_client::ResolvedProfile) -> AppModel {
     // would be rejected by the very daemon it just resolved.
     model.identity.provider = profile.default_provider.clone();
     model.identity.model_short = profile.default_model.clone();
-    model.identity.context_window = profile.default_max_tokens;
+    model.identity.context_window = 0; // Unknown until a model detail arrives.
     if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("translit")) {
         model.sanctum_tier = SanctumTier::Translit;
     }
@@ -698,7 +698,15 @@ fn apply_interactive_workspace(
         .to_owned();
     model.cwd = workspace_text;
     model.pending_workspace_allocation = allocation;
-    model.session_dir = abbreviate_path(&workspace, environment.home.as_deref());
+    // The SAME producer the live driver uses for renewed allocations
+    // (sanitised, home-relative, `/`-normalised, identical fallback), so the
+    // first and every later preview spell a path identically everywhere.
+    let display = haider_tui::live::workspace_display_path(&model.cwd);
+    model.pending_workspace_display = model
+        .pending_workspace_allocation
+        .as_ref()
+        .map(|_| display.clone());
+    model.session_dir = display;
 
     Ok(())
 }
@@ -742,14 +750,6 @@ fn apply_launch_origin(model: &mut AppModel) {
     }
 }
 
-fn abbreviate_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
-    match home.and_then(|home| path.strip_prefix(home).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
-}
-
 /// Abbreviate the process cwd into the launcher/session dirs.
 fn apply_cwd(model: &mut AppModel) {
     let Ok(cwd) = std::env::current_dir() else {
@@ -761,7 +761,7 @@ fn apply_cwd(model: &mut AppModel) {
         .flatten()
     {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
         None => cwd.display().to_string(),
     };
     model.launcher_dir = abbreviated.clone();
@@ -772,6 +772,20 @@ fn apply_cwd(model: &mut AppModel) {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    #[test]
+    fn live_launcher_waits_for_model_details_before_showing_context_window() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("temporary profile: {error}"));
+        let profile = haider_client::resolve_profile(&haider_client::ProfileEnv {
+            profile_dir: Some(root.path().join("profile")),
+            home: None,
+            user_profile: None,
+            model: None,
+            runtime_dir: None,
+            xdg_runtime_dir: None,
+        })
+        .unwrap_or_else(|error| panic!("resolved profile: {error}"));
+        assert_eq!(live_model(&profile).identity.context_window, 0);
+    }
     #[test]
     fn interactive_payload_keeps_the_two_worker_multithread_runtime() {
         let runtime = build_runtime().unwrap_or_else(|error| panic!("runtime: {error}"));

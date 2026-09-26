@@ -31,6 +31,24 @@ pub struct CheckpointCapture {
     pub kind: CheckpointKind,
     pub paths: Vec<CheckpointCapturePath>,
     pub post_digest: String,
+    /// Some path or content in this mutation would be redacted in an agent
+    /// view. Exact digests stay owner-local; see [`capture_paths_redacted`].
+    pub redacted_content: bool,
+}
+
+/// Classify captured paths for agent-visible integrity publication. A masked
+/// path name or a pre-image the output redactor would change counts. A
+/// pre-image that was hashed but not retained (oversized) was never
+/// classified, so it fails closed.
+#[must_use]
+pub fn capture_paths_redacted(paths: &[CheckpointCapturePath]) -> bool {
+    paths.iter().any(|captured| {
+        crate::redact::model_path_masked(Path::new(&captured.path))
+            || match captured.pre_bytes.as_deref() {
+                Some(bytes) => crate::redact::content_redaction_affected(bytes),
+                None => captured.pre_digest.is_some(),
+            }
+    })
 }
 
 pub struct FreezeCheckpointInput {
@@ -119,6 +137,7 @@ pub async fn freeze_checkpoint<C: CasSink + ?Sized>(
         paths,
         post_digest: capture.post_digest,
         recorded_at_ms: 0,
+        redacted_content: capture.redacted_content,
     })
 }
 
@@ -137,10 +156,9 @@ pub(crate) fn checkpoint_without_cas(
             post_digest: captured.post_digest,
             truncated_reason: captured
                 .pre_bytes
-                .map(|bytes| {
+                .map(|_| {
                     format!(
-                        "pre-image is {} bytes but no checkpoint artifact was stored: {reason}",
-                        bytes.len(),
+                        "pre-image was captured but no checkpoint artifact was stored: {reason}"
                     )
                 })
                 .or(captured.truncated_reason),
@@ -162,6 +180,7 @@ pub(crate) fn checkpoint_without_cas(
         paths,
         post_digest: capture.post_digest,
         recorded_at_ms: 0,
+        redacted_content: capture.redacted_content,
     }
 }
 

@@ -57,6 +57,15 @@ pub(crate) struct ValidatedModelSelection {
     pub(crate) provider: String,
     pub(crate) model: String,
     pub(crate) inventory_status: ModelInventoryStatusWire,
+    pub(crate) context_window: Option<u64>,
+    /// Projected row maximum: bounds derived budgets and is what `haider
+    /// models` shows.
+    pub(crate) max_output_tokens: u64,
+    /// Largest explicit (user-set) budget admitted: equal to
+    /// `max_output_tokens` for a sourced row, larger when that maximum is
+    /// only the unverified fallback guess
+    /// (`haider_provider::explicit_output_ceiling`).
+    pub(crate) explicit_max_output_tokens: u64,
 }
 
 /// One agent-facing row projected from the same provider summary and model
@@ -79,6 +88,7 @@ pub(crate) struct ModelCatalogCapabilities {
     pub(crate) pdf: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) context_window: Option<u64>,
+    pub(crate) max_output_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -368,6 +378,12 @@ impl ModelSelectionAuthority {
                             haider_protocol::provider::FeatureResolve::Unsupported
                         ),
                         context_window: detail.and_then(|detail| detail.context_window),
+                        max_output_tokens: haider_provider::model_output_limit(
+                            &summary.provider,
+                            model,
+                            detail.and_then(|detail| detail.max_output_tokens),
+                            detail.and_then(|detail| detail.context_window),
+                        ),
                     },
                     aliases,
                 });
@@ -508,10 +524,34 @@ impl ModelSelectionAuthority {
                 suggestions: self.suggestions_for_provider(requested_model, provider),
             });
         }
+        let detail = summary.and_then(|summary| {
+            summary
+                .model_details
+                .iter()
+                .find(|detail| detail.name == resolved_model)
+        });
+        let context_window = detail.and_then(|detail| detail.context_window).or_else(|| {
+            haider_provider::static_model_limits(provider, &resolved_model).context_window
+        });
+        let max_output_tokens = haider_provider::model_output_limit(
+            provider,
+            &resolved_model,
+            detail.and_then(|detail| detail.max_output_tokens),
+            context_window,
+        );
+        let explicit_max_output_tokens = haider_provider::explicit_output_ceiling(
+            provider,
+            &resolved_model,
+            max_output_tokens,
+            context_window,
+        );
         Ok(ValidatedModelSelection {
             provider: provider.to_owned(),
             model: resolved_model,
             inventory_status,
+            context_window,
+            max_output_tokens,
+            explicit_max_output_tokens,
         })
     }
 

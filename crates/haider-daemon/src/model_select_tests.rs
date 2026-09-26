@@ -55,6 +55,26 @@ fn authority(
     ModelSelectionAuthority::new(creatable(creatable_providers), summaries)
 }
 
+#[test]
+fn selection_derives_limits_when_inventory_details_are_incomplete() {
+    let mut anthropic = summary(
+        "anthropic-oauth",
+        &["claude-fable-5-1"],
+        ProviderAvailabilityWire::Available,
+    );
+    anthropic.api_family = ProviderApiFamilyWire::AnthropicMessages;
+    let selection = authority(&["anthropic-oauth"], vec![anthropic])
+        .validate_selection_with_status("anthropic-oauth", None, "claude-fable-5-1")
+        .expect("known model selection");
+    assert_eq!(selection.context_window, Some(1_000_000));
+    assert_eq!(selection.max_output_tokens, 128_000);
+
+    let selection = authority(&["custom"], Vec::new())
+        .validate_selection_with_status("custom", None, "future-model")
+        .expect("unknown inventory permits passthrough");
+    assert!(selection.max_output_tokens > 4_096);
+}
+
 // ───────────────────────────── live-session selection ───────────────────────
 
 /// LAW (absent_provider_keeps_legacy_bytes_and_behavior, behavior half): an
@@ -284,6 +304,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
             name: "glm-4.7-flashx".into(),
             display_name: Some("ZAI Flash X".into()),
             context_window: Some(128_000),
+            max_output_tokens: Some(32_768),
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: vec!["fast".into()],
@@ -294,6 +315,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
             name: "glm-4.7-air".into(),
             display_name: None,
             context_window: None,
+            max_output_tokens: Some(8_192),
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: Vec::new(),
@@ -314,6 +336,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
     assert!(row.capabilities.fast);
     assert!(row.capabilities.pdf);
     assert_eq!(row.capabilities.context_window, Some(128_000));
+    assert_eq!(row.capabilities.max_output_tokens, 32_768);
 
     assert_eq!(
         authority

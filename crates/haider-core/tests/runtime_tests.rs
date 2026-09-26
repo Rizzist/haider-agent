@@ -32,6 +32,9 @@ use haider_protocol::ids::{
     RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, ToolArgumentsFinalizedV1, ToolStatus, TurnItem};
+use haider_protocol::loop_guard::{
+    LOOP_SUSPECTED_EXTENSION_KIND, LoopGuardKindV1, LoopLimitV1, LoopSuspectedV1,
+};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::{RunState, WaitReason};
@@ -618,31 +621,8 @@ async fn full_turn_commits_exact_projected_sequence() {
                 }
             }
         }),
-        // One visible budget item shares the request-attempt append. Keep
-        // both lifecycle halves in the exact projection rather than filtering
-        // the new telemetry out of this journal contract pin.
-        serde_json::json!({
-            "type":"item", "event":"started", "item_id":"<item>",
-            "item":{
-                "item":"extension", "kind":"provider_request_budget_v1",
-                "data":{
-                    "used":1, "budget":{"tranche":32,"hard_cap":64},
-                    "phase":"progress",
-                    "continuation":{"session_id":SESSION,"run_id":correlation_run_id.as_str()}
-                }
-            }
-        }),
-        serde_json::json!({
-            "type":"item", "event":"completed", "item_id":"<item>",
-            "item":{
-                "item":"extension", "kind":"provider_request_budget_v1",
-                "data":{
-                    "used":1, "budget":{"tranche":32,"hard_cap":64},
-                    "phase":"progress",
-                    "continuation":{"session_id":SESSION,"run_id":correlation_run_id.as_str()}
-                }
-            }
-        }),
+        // The unbounded default has no request-budget progress item. The
+        // exact journal pin retains the cache attempt and provider events.
         serde_json::json!({"type":"run_state","state":"streaming"}),
         serde_json::json!({
             "type":"item",
@@ -1037,6 +1017,452 @@ async fn repeated_max_tokens_is_bounded_independently() {
             .filter(|event| completed_extension(event, CONTINUATION_CHECKPOINT_EXTENSION_KIND))
             .count(),
         2
+    );
+}
+
+#[tokio::test]
+async fn nine_empty_pause_turns_stop_at_the_no_progress_limit() {
+    let script = (0..9)
+        .map(|_| FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        })
+        .collect();
+    let (handle, _, provider) = runtime(script);
+    let accepted = handle
+        .submit_turn(SubmitTurn::new("wait for provider progress"))
+        .await
+        .expect("turn accepted");
+    let outcome = timeout(Duration::from_secs(30), accepted.wait())
+        .await
+        .expect("empty continuations must terminate")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("loop error").code,
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(provider.requests().len(), 9);
+}
+
+#[tokio::test]
+async fn a_progressing_pause_does_not_spend_the_empty_continuation_allowance() {
+    let mut script = vec![
+        FakeStep::EmitText {
+            text: "new finding".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+    ];
+    script.extend((0..8).map(|_| FakeStep::Finish {
+        reason: FinishReason::PauseTurn,
+    }));
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (handle, _, provider) = runtime(script);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("continue after new content"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(provider.requests().len(), 10);
+}
+
+#[tokio::test]
+async fn distinct_tool_results_reset_the_continuation_streak() {
+    let mut script = Vec::new();
+    for ordinal in 1..=9 {
+        let call_id = format!("read-{ordinal}");
+        script.extend([
+            FakeStep::EmitToolCall {
+                call_id: call_id.clone(),
+                name: "inspect".into(),
+                args: serde_json::json!({"path": format!("part-{ordinal}.txt")}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult { call_id },
+            FakeStep::Finish {
+                reason: FinishReason::PauseTurn,
+            },
+        ]);
+    }
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 19);
+    assert_eq!(calls, 9);
+}
+
+#[tokio::test]
+async fn repeated_identical_tool_results_do_not_reset_the_continuation_streak() {
+    let mut script = vec![
+        FakeStep::EmitToolCall {
+            call_id: "first".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path": "same.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "first".into(),
+        },
+    ];
+    script.extend((0..8).map(|_| FakeStep::Finish {
+        reason: FinishReason::PauseTurn,
+    }));
+    script.extend([
+        FakeStep::EmitToolCall {
+            call_id: "second".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path": "same.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "second".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+    ]);
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("loop error").code,
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(requests.len(), 11);
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn repeated_identical_provider_tool_results_do_not_reset_the_streak() {
+    let mut script = vec![
+        FakeStep::EmitServerToolUse {
+            call_id: "first".into(),
+            name: "web_search".into(),
+            args: serde_json::json!({"query": "same topic"}),
+        },
+        FakeStep::EmitServerToolResult {
+            call_id: "first".into(),
+            preview: "same result".into(),
+            is_error: false,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+    ];
+    script.extend((0..8).map(|_| FakeStep::Finish {
+        reason: FinishReason::PauseTurn,
+    }));
+    script.extend([
+        FakeStep::EmitServerToolUse {
+            call_id: "second".into(),
+            name: "web_search".into(),
+            args: serde_json::json!({"query": "same topic"}),
+        },
+        FakeStep::EmitServerToolResult {
+            call_id: "second".into(),
+            preview: "same result".into(),
+            is_error: false,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+    ]);
+    let (handle, _, provider) = runtime(script);
+    let accepted = handle
+        .submit_turn(SubmitTurn::new("search for new results"))
+        .await
+        .expect("turn accepted");
+    let outcome = timeout(Duration::from_secs(30), accepted.wait())
+        .await
+        .expect("repeated provider results must terminate")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("loop error").code,
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(provider.requests().len(), 10);
+}
+
+fn identical_inspect_calls(count: usize) -> Vec<FakeStep> {
+    let mut script = Vec::new();
+    for ordinal in 1..=count {
+        if ordinal > 1 {
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("same-{}", ordinal - 1),
+            });
+        }
+        script.extend([
+            FakeStep::EmitToolCall {
+                call_id: format!("same-{ordinal}"),
+                name: "inspect".into(),
+                args: serde_json::json!({"path": "A.txt"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+        ]);
+    }
+    script
+}
+
+/// Ordinary `tool_use` loop of identical calls and results: the typed
+/// `loop_suspected_v1` steer is journaled and sent to the model after the
+/// 30th repeat (before request 32); 30 more repeats end in `loop_limit`
+/// before request 62.
+#[tokio::test]
+async fn identical_tool_use_loop_is_steered_then_stopped_with_loop_limit() {
+    let (outcome, events, requests, calls) =
+        toolrepair_run(config(), identical_inspect_calls(61)).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("loop error");
+    assert_eq!(error.code, ErrorCode::LoopLimit);
+    let details = error.details.expect("loop details");
+    assert_eq!(details["loop"], "repeated_tool_calls");
+    assert_eq!(details["repeated_calls"], 60);
+    assert_eq!(details["suspect_after"], 30);
+    assert_eq!(details["stop_after_suspected"], 30);
+    assert_eq!(requests.len(), 61);
+    assert_eq!(calls, 61);
+
+    let notes: Vec<LoopSuspectedV1> = events
+        .iter()
+        .filter_map(|envelope| match typed(envelope) {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                LoopSuspectedV1::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "exactly one steer per streak");
+    assert_eq!(notes[0].repeated_calls, 30);
+    assert_eq!(notes[0].stop_after, 30);
+    assert_eq!(notes[0].tool.as_deref(), Some("inspect"));
+    let has_note =
+        |request: &TurnRequest| format!("{:?}", request.messages).contains("[loop_suspected_v1]");
+    assert!(!requests[..31].iter().any(has_note));
+    assert!(requests[31..].iter().all(has_note));
+    let presentation = events
+        .iter()
+        .find_map(|envelope| match typed(envelope) {
+            EventPayload::RunFailed {
+                code: ErrorCode::LoopLimit,
+                presentation,
+                ..
+            } => presentation,
+            _ => None,
+        })
+        .expect("run_failed loop_limit with presentation");
+    assert_eq!(
+        presentation.loop_limit,
+        Some(LoopLimitV1::RepeatedToolCalls {
+            repeated_calls: 60,
+            suspect_after: 30,
+            stop_after_suspected: 30,
+        }),
+        "typed details reach run_failed"
+    );
+}
+
+/// Addendum 2: new narration each round does not reset the repeated-call
+/// streak, so an identical call with fresh text is still stopped at 60.
+#[tokio::test]
+async fn narration_between_identical_calls_does_not_unlock_the_loop() {
+    let mut script = Vec::new();
+    for ordinal in 1..=61usize {
+        if ordinal > 1 {
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("same-{}", ordinal - 1),
+            });
+        }
+        let words = [
+            "amber", "basil", "cedar", "delta", "ember", "fable", "garnet",
+        ];
+        script.extend([
+            FakeStep::EmitText {
+                text: format!(
+                    "Retrying with the {} {} idea.",
+                    words[ordinal % 7],
+                    words[(ordinal / 7) % 7]
+                ),
+            },
+            FakeStep::EmitToolCall {
+                call_id: format!("same-{ordinal}"),
+                name: "inspect".into(),
+                args: serde_json::json!({"path": "A.txt"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+        ]);
+    }
+    let (outcome, _events, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("loop error");
+    assert_eq!(error.code, ErrorCode::LoopLimit);
+    assert_eq!(
+        error.details.expect("details")["loop"],
+        "repeated_tool_calls"
+    );
+    assert_eq!(requests.len(), 61);
+    assert_eq!(calls, 61);
+}
+
+/// Addendum 2 action-level guard: an identical call whose result changes
+/// only in letters every time is steered after 100 repeated (tool,
+/// arguments) calls (before request 102) and stopped after 200 (before
+/// request 202), with typed details on run_failed.
+#[tokio::test]
+async fn identical_call_with_letter_noise_results_is_bounded_by_the_action_guard() {
+    let (outcome, events, requests, calls) =
+        toolrepair_run_with(config(), identical_inspect_calls(201), true).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("loop error");
+    assert_eq!(error.code, ErrorCode::LoopLimit);
+    assert_eq!(
+        serde_json::from_value::<LoopLimitV1>(error.details.expect("details")).expect("typed"),
+        LoopLimitV1::RepeatedActions {
+            repeated_calls: 200,
+            suspect_after: 100,
+            stop_after_suspected: 100,
+        }
+    );
+    assert_eq!(requests.len(), 201);
+    assert_eq!(calls, 201);
+    let notes: Vec<LoopSuspectedV1> = events
+        .iter()
+        .filter_map(|envelope| match typed(envelope) {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                LoopSuspectedV1::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "only the action guard steers: {notes:?}");
+    assert_eq!(notes[0].guard, LoopGuardKindV1::RepeatedActions);
+    assert_eq!(notes[0].repeated_calls, 100);
+    assert_eq!(notes[0].stop_after, 100);
+    let has_note =
+        |request: &TurnRequest| format!("{:?}", request.messages).contains("[loop_suspected_v1]");
+    assert!(!requests[..101].iter().any(has_note));
+    assert!(requests[101..].iter().all(has_note));
+    assert!(events.iter().any(|envelope| matches!(
+        typed(envelope),
+        EventPayload::RunFailed {
+            code: ErrorCode::LoopLimit,
+            presentation: Some(presentation),
+            ..
+        } if matches!(presentation.loop_limit, Some(LoopLimitV1::RepeatedActions { .. }))
+    )));
+}
+
+/// A 150-poll of a changing resource with one identical call is steered once
+/// by the action guard and then completes: the steer is not a stop.
+#[tokio::test]
+async fn polling_a_changing_result_150_times_completes() {
+    let mut script = identical_inspect_calls(150);
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "same-150".into(),
+        },
+        FakeStep::EmitText {
+            text: "the job finished".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (outcome, events, requests, calls) = toolrepair_run_with(config(), script, true).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 151);
+    assert_eq!(calls, 150);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| completed_extension(envelope, LOOP_SUSPECTED_EXTENSION_KIND))
+            .count(),
+        1
+    );
+}
+
+/// Explicit opt-out: an embedder that disables the repeated-call guard keeps
+/// the unbounded behavior for identical calls.
+#[tokio::test]
+async fn disabled_tool_loop_guard_allows_identical_calls() {
+    let mut script = identical_inspect_calls(70);
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "same-70".into(),
+        },
+        FakeStep::EmitText {
+            text: "done after seventy identical reads".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let mut cfg = config();
+    cfg.tool_loop_guard = None;
+    let (outcome, events, requests, calls) = toolrepair_run(cfg, script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 71);
+    assert_eq!(calls, 70);
+    assert!(
+        !events
+            .iter()
+            .any(|envelope| completed_extension(envelope, LOOP_SUSPECTED_EXTENSION_KIND))
+    );
+}
+
+/// Distinct productive calls never accumulate toward the repeated-call guard.
+#[tokio::test]
+async fn distinct_tool_calls_run_past_the_repeat_thresholds() {
+    let mut script = Vec::new();
+    for ordinal in 1..=70 {
+        if ordinal > 1 {
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("distinct-{}", ordinal - 1),
+            });
+        }
+        script.extend([
+            FakeStep::EmitToolCall {
+                call_id: format!("distinct-{ordinal}"),
+                name: "inspect".into(),
+                args: serde_json::json!({"path": format!("part-{ordinal}.txt")}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+        ]);
+    }
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "distinct-70".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (outcome, events, requests, _) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 71);
+    assert!(
+        !events
+            .iter()
+            .any(|envelope| completed_extension(envelope, LOOP_SUSPECTED_EXTENSION_KIND))
     );
 }
 
@@ -2004,6 +2430,91 @@ async fn footprint_is_exact_only_for_request_local_provider_usage() {
     assert_ne!(last.used_tokens, 1_020);
 }
 
+/// 973 output cap: a provider that rejects `max_tokens` as too large and
+/// states its maximum gets exactly ONE retry at that maximum. A second
+/// rejection surfaces as the ordinary provider error — never a loop.
+/// MUTATION CHECK: drop the one-shot flag. Expected runtime failure: the
+/// repeated-rejection run makes three requests instead of two.
+#[tokio::test]
+async fn oversized_max_tokens_retries_once_at_the_provider_stated_maximum() {
+    let anthropic_rejection = "max_tokens: 30000 > 16000, which is the maximum allowed number \
+                               of output tokens for claude-test";
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: anthropic_rejection.into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut retry_config = config();
+    retry_config.max_tokens = 30_000;
+    let handle = HarnessActor::spawn(retry_config, provider.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("output-limit-retry"),
+            messages: vec![Message::user_text("write a large file")],
+        })
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].max_tokens, 30_000);
+    assert_eq!(
+        requests[1].max_tokens, 16_000,
+        "retry uses the stated maximum"
+    );
+
+    let repeated = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: "max_tokens is too large: 30000. This model supports at most 16384 \
+                      completion tokens, whereas you provided 30000."
+                .into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]".into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut repeated_config = config();
+    repeated_config.max_tokens = 30_000;
+    let handle = HarnessActor::spawn(
+        repeated_config,
+        repeated.clone(),
+        Arc::new(MemoryStore::new()),
+    );
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("output-limit-repeated"),
+            messages: vec![Message::user_text("write a large file")],
+        })
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(
+        outcome.state,
+        RunState::Errored,
+        "the second rejection surfaces"
+    );
+    let requests = repeated.requests();
+    assert_eq!(requests.len(), 2, "exactly one retry");
+    assert_eq!(requests[1].max_tokens, 16_384);
+}
+
 /// MUTATION CHECK: route ContextExceeded through generic retry or omit the
 /// one-shot guard. Expected runtime failure: no CompactionIntent is durable,
 /// the retry lacks the summary, or the double-overflow case makes >2 calls.
@@ -2379,6 +2890,9 @@ impl ToolDispatcher for CompletingDispatcher {
 
 struct CountingCompletingDispatcher {
     calls: AtomicUsize,
+    /// Each result carries a new letters-only tag (an etag/request-ID-like
+    /// noise the result-level fingerprint cannot mask).
+    letter_noise: bool,
 }
 
 struct PreflightRejectingDispatcher {
@@ -2424,9 +2938,21 @@ impl ToolDispatcher for CountingCompletingDispatcher {
         _args: serde_json::Value,
         _cancel: &haider_core::CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let preview = if self.letter_noise {
+            let tag: String = (0..6)
+                .scan(call, |rest, _| {
+                    let letter = char::from(b'a' + u8::try_from(*rest % 26).unwrap_or(0));
+                    *rest /= 26;
+                    Some(letter)
+                })
+                .collect();
+            format!("status same; etag {tag}")
+        } else {
+            "done once".into()
+        };
         Ok(ToolDispatchResult::Completed(BoundedResult {
-            preview: "done once".into(),
+            preview,
             truncated: false,
             truncation: None,
             effects: Vec::new(),
@@ -2950,9 +3476,38 @@ fn malformed_tool_steps(call_id: &str, arguments: &str) -> Vec<FakeStep> {
     ]
 }
 
+fn output_limited_tool_steps(call_id: &str, arguments: &str) -> Vec<FakeStep> {
+    vec![
+        FakeStep::EmitToolCallStart {
+            call_id: call_id.into(),
+            name: "inspect".into(),
+        },
+        FakeStep::EmitToolArgsDelta {
+            call_id: call_id.into(),
+            fragment: arguments.into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+    ]
+}
+
 async fn toolrepair_run(
     cfg: HarnessConfig,
     script: Vec<FakeStep>,
+) -> (
+    haider_core::TurnOutcome,
+    Vec<RawEnvelope>,
+    Vec<TurnRequest>,
+    usize,
+) {
+    toolrepair_run_with(cfg, script, false).await
+}
+
+async fn toolrepair_run_with(
+    cfg: HarnessConfig,
+    script: Vec<FakeStep>,
+    letter_noise: bool,
 ) -> (
     haider_core::TurnOutcome,
     Vec<RawEnvelope>,
@@ -2963,6 +3518,7 @@ async fn toolrepair_run(
     let store = Arc::new(MemoryStore::new());
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise,
     });
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         cfg,
@@ -3092,6 +3648,198 @@ async fn malformed_tool_json_is_durable_invalid_result_with_one_repair_continuat
             .iter()
             .any(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
     );
+}
+
+#[tokio::test]
+async fn output_limited_tool_is_not_executed_and_gets_one_split_retry() {
+    let partial = format!("{{\"payload\":\"{}", "x".repeat(20_000));
+    let mut script = output_limited_tool_steps("limited-1", &partial);
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "limited-1".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "valid-2".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"chunk": "small"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "valid-2".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+
+    let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(calls, 1, "only the complete retry may dispatch");
+    let result = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::ToolResult { call_id, result } if call_id == "limited-1" => Some(result),
+            _ => None,
+        })
+        .expect("durable output-limit result");
+    let data = serde_json::to_value(result.data.as_ref().expect("typed data"))
+        .expect("serialize output-limit data");
+    assert_eq!(data["kind"], "output_limit_truncation");
+    assert_eq!(data["repaired"], true);
+    assert_eq!(
+        result
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subcode
+            .as_str(),
+        "output-limit-truncation"
+    );
+    assert!(result.preview.contains("not executed"));
+    assert!(result.preview.contains("Split large content"));
+    assert!(!result.preview.contains("malformed"));
+    assert!(events.iter().any(|event| matches!(
+        typed(event),
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::ToolCall { call_id, args, status: ToolStatus::Failed, .. },
+            ..
+        }) if call_id == "limited-1" && args == serde_json::Value::String(partial.clone())
+    )));
+}
+
+#[tokio::test]
+async fn third_consecutive_output_limited_tool_returns_a_typed_error_and_run_continues() {
+    let mut script = output_limited_tool_steps("limited-1", "{\"payload\":");
+    script.extend(output_limited_tool_steps("limited-2", "{\"payload\":"));
+    script.push(FakeStep::EmitToolCall {
+        call_id: "complete-on-third".into(),
+        name: "inspect".into(),
+        args: serde_json::json!({"chunk": "small"}),
+    });
+    script.extend(output_limited_tool_steps("limited-3", "{\"payload\":"));
+    script.push(FakeStep::ExpectToolResult {
+        call_id: "limited-3".into(),
+    });
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        calls, 1,
+        "the completed call in the truncated response executes"
+    );
+    let result = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::ToolResult { call_id, result } if call_id == "limited-3" => Some(result),
+            _ => None,
+        })
+        .expect("typed repeated truncation result");
+    assert_eq!(
+        result
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subcode
+            .as_str(),
+        "output-limit-truncation-repeated"
+    );
+    assert!(result.preview.contains("output_limit_truncation_repeated"));
+    assert!(result.preview.contains("Split large content"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn output_truncation_does_not_consume_the_malformed_call_strike() {
+    let mut script = output_limited_tool_steps("limited-first", "{\"payload\":");
+    script.extend(malformed_tool_steps("bad-second", "{broken"));
+    script.extend([
+        FakeStep::EmitToolCall {
+            call_id: "valid-third".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"chunk": "small"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "valid-third".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn resumed_output_truncation_uses_the_same_third_call_policy() {
+    let mut script = output_limited_tool_steps("limited-before-1", "{");
+    script.extend(output_limited_tool_steps("limited-before-2", "{"));
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (_, events, _, _) = toolrepair_run(config(), script).await;
+    let run_id = events[0].run_id.clone().expect("run id");
+    let attempt = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            completed_extension(event, haider_core::ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND)
+                .then_some(index)
+        })
+        .nth(1)
+        .expect("third request epoch marker");
+    let mut prefix = events[..=attempt].to_vec();
+    let store = Arc::new(MemoryStore::new());
+    StoreHandle::append(store.as_ref(), &mut prefix)
+        .await
+        .expect("restore prefix");
+    let mut replay = output_limited_tool_steps("limited-after-restart", "{");
+    replay.push(FakeStep::ExpectToolResult {
+        call_id: "limited-after-restart".into(),
+    });
+    replay.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let provider = Arc::new(FakeProvider::new(replay));
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let outcome = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id,
+            messages: vec![Message::user_text("continue")],
+            checkpoint: RouteWaitCheckpoint {
+                response_epoch: 2,
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("resume")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(provider.requests().len(), 2);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert!(events.iter().any(|event| matches!(typed(event),
+        EventPayload::ToolResult { call_id, result }
+            if call_id == "limited-after-restart" && result.presentation.as_ref()
+                .is_some_and(|presentation| presentation.subcode.as_str() == "output-limit-truncation-repeated")
+    )));
+    handle.stop().await.expect("stop");
 }
 
 #[tokio::test]
@@ -4119,6 +4867,7 @@ async fn network_break_after_tool_effect_replays_without_redispatch() {
     );
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let store = Arc::new(MemoryStore::new());
     let (actor, handle) = HarnessActor::new_with_dispatcher(
@@ -4397,6 +5146,7 @@ async fn recovered_route_wait_restores_partial_tool_without_duplicate_dispatch()
     );
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let store = Arc::new(MemoryStore::new());
     let (actor, handle) = HarnessActor::new_with_dispatcher(
@@ -4490,6 +5240,7 @@ async fn recovered_route_wait_restores_completed_effect_without_redispatch() {
     );
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let store = Arc::new(MemoryStore::new());
     let (actor, handle) = HarnessActor::new_with_dispatcher(
@@ -6387,10 +7138,10 @@ async fn actor_restarts_do_not_reuse_run_or_item_ids() {
             .iter()
             .any(|id| id.starts_with("run-session-test-24-"))
     );
-    // Each request has a cache diagnostic, request-budget status, assistant
-    // item and paired Finish marker. Eight unique IDs prove none are reused
-    // across restart, including the newly allocated terminal markers.
-    assert_eq!(item_ids.len(), 8);
+    // Each unbounded request has a cache diagnostic, assistant item and
+    // paired Finish marker. Six unique IDs prove none are reused across
+    // restart, including the terminal markers.
+    assert_eq!(item_ids.len(), 6);
     assert!(
         item_ids
             .iter()
@@ -6420,16 +7171,16 @@ async fn memory_store_allocates_and_reads_committed_sequences() {
         StoreHandle::latest_seq(store.as_ref(), &SessionId::new(SESSION))
             .await
             .expect("latest"),
-        // Budget status adds Started + Completed to the former 8 events;
-        // the paired provider Finish marker adds two more: 8 + 2 + 2.
-        12
+        // The unbounded default omits the budget status pair. The paired
+        // provider Finish marker adds two events to the original eight.
+        10
     );
     let tail = StoreHandle::read(store.as_ref(), &SessionId::new(SESSION), 3, 10)
         .await
         .expect("read");
     assert_eq!(
         tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        vec![4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![4, 5, 6, 7, 8, 9, 10]
     );
 }
 
@@ -6687,18 +7438,8 @@ async fn request_start_batches_thinking_with_cache_attempt_in_event_order() {
                 item: TurnItem::Extension { kind: completed, .. },
                 ..
             }),
-            EventPayload::Item(ItemEvent::Started {
-                item: TurnItem::Extension { kind: budget_started, .. },
-                ..
-            }),
-            EventPayload::Item(ItemEvent::Completed {
-                item: TurnItem::Extension { kind: budget_completed, .. },
-                ..
-            }),
         ] if started == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
             && completed == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
-            && budget_started == haider_protocol::request_budget::PROVIDER_REQUEST_BUDGET_EXTENSION_KIND
-            && budget_completed == haider_protocol::request_budget::PROVIDER_REQUEST_BUDGET_EXTENSION_KIND
     ));
 }
 
@@ -6973,6 +7714,7 @@ async fn repair_reset_store_failure_closes_pending_tools_without_dispatch() {
     let provider = Arc::new(FakeProvider::new(script));
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         config(),

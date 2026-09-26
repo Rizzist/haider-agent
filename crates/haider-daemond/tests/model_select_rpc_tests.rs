@@ -113,16 +113,27 @@ async fn create_and_attach(
     provider: &str,
     model: &str,
 ) -> (haider_protocol::ids::SessionId, u64) {
+    create_with_budget_and_attach(client, config, workspace, provider, model, 4096).await
+}
+
+async fn create_with_budget_and_attach(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    workspace: &std::path::Path,
+    provider: &str,
+    model: &str,
+    max_tokens: u64,
+) -> (haider_protocol::ids::SessionId, u64) {
     send(
         client,
         config,
         "create",
         RequestBody::SessionCreate {
-            command_id: CommandId::new("create-command"),
+            command_id: CommandId::new(format!("create-command-{provider}-{max_tokens}")),
             cwd: workspace.to_string_lossy().into_owned(),
             provider: provider.into(),
             model: model.into(),
-            max_tokens: 4096,
+            max_tokens,
         },
     )
     .await;
@@ -200,6 +211,7 @@ fn select_body(
         model: model.into(),
         provider: provider.map(str::to_owned),
         confirm_new_epoch: false,
+        max_tokens: None,
     }
 }
 
@@ -277,6 +289,7 @@ async fn select_model_is_receipted_published_and_next_turn_lands_on_the_new_pair
         model,
         selected_seq,
         worker_generation,
+        ..
     } = first.clone()
     else {
         panic!("expected session.select_model response, got {first:?}");
@@ -406,6 +419,377 @@ async fn absent_provider_selects_in_place_and_unavailable_provider_refuses_typed
     assert_eq!(fake.requests().len(), 2);
     assert_eq!(fake.requests()[1].model, "fake-v2");
     let _ = ERROR_CODE_MODEL_UNKNOWN; // inventory refusals are pinned in-crate
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+async fn select_budget(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    label: &str,
+    body: RequestBody,
+) -> ResponseBody {
+    send(client, config, label, body).await;
+    next_response(client).await
+}
+
+fn committed_budget(
+    response: &ResponseBody,
+) -> haider_protocol::output_budget::SessionOutputBudgetV1 {
+    let ResponseBody::SessionSelectModel {
+        output_budget: Some(budget),
+        ..
+    } = response
+    else {
+        panic!("expected a committed output budget, got {response:?}");
+    };
+    *budget
+}
+
+/// D1 (973 output cap): a DERIVED session budget follows the selected model.
+/// A default session (clients send 0) on a 30,000-budget model switches to
+/// gpt-4o (16,384) and to an unknown custom model (8,192) without a refusal,
+/// and each next turn requests exactly the re-derived budget. Switching back
+/// re-derives the shared default again.
+/// MUTATION CHECK: re-check the stored budget against the new maximum
+/// instead of re-deriving. Expected runtime failure: the gpt-4o switch is
+/// refused with `model_output_limit`.
+#[tokio::test]
+async fn derived_budget_re_derives_on_every_model_switch() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let root = test_root("d1-derived-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "d1-derived",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let fake = Arc::new(FakeProvider::new(text_turn("fake answer")));
+    let openai = Arc::new(FakeProvider::new(text_turn("gpt-4o answer")));
+    let custom = Arc::new(FakeProvider::new(text_turn("custom answer")));
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[
+            ("fake", fake.clone()),
+            ("openai", openai.clone()),
+            ("custom973", custom.clone()),
+        ]),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "d1-derived-client",
+        "d1-derived-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    let (session_id, generation) =
+        create_with_budget_and_attach(&mut client, &config, &workspace, "fake", "fake-v1", 0).await;
+    run_turn(&mut client, &config, &session_id, generation, "turn-fake").await;
+    assert_eq!(fake.requests()[0].max_tokens, 30_000, "derived default");
+
+    let response = select_budget(
+        &mut client,
+        &config,
+        "select-gpt-4o",
+        select_body(
+            "select-gpt-4o",
+            &session_id,
+            generation,
+            "gpt-4o",
+            Some("openai"),
+        ),
+    )
+    .await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 16_384);
+    assert_eq!(budget.source, SessionOutputBudgetSourceV1::Derived);
+    assert_eq!(
+        budget.clamped, None,
+        "a derived budget never produces a notice"
+    );
+    run_turn(&mut client, &config, &session_id, generation, "turn-gpt-4o").await;
+    assert_eq!(openai.requests()[0].max_tokens, 16_384);
+
+    let response = select_budget(
+        &mut client,
+        &config,
+        "select-custom",
+        select_body(
+            "select-custom",
+            &session_id,
+            generation,
+            "custom-unknown",
+            Some("custom973"),
+        ),
+    )
+    .await;
+    assert_eq!(committed_budget(&response).max_tokens, 8_192);
+    run_turn(&mut client, &config, &session_id, generation, "turn-custom").await;
+    assert_eq!(custom.requests()[0].max_tokens, 8_192);
+
+    let response = select_budget(
+        &mut client,
+        &config,
+        "select-back",
+        select_body(
+            "select-back",
+            &session_id,
+            generation,
+            "fake-v1",
+            Some("fake"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        committed_budget(&response).max_tokens,
+        30_000,
+        "switching back re-derives the shared default"
+    );
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// D1 (973 output cap): a USER-SET budget is kept as the user's request and
+/// clamped, with a typed notice, when the selected model's maximum is
+/// smaller; switching back restores it. An explicit `max_tokens` on
+/// `session.select_model` changes the budget (0 returns to derived) and an
+/// explicit value above the model maximum is a typed refusal that mutates
+/// nothing.
+#[tokio::test]
+async fn user_set_budget_clamps_with_notice_and_select_model_sets_budgets() {
+    use haider_protocol::output_budget::{OutputBudgetClampV1, SessionOutputBudgetSourceV1};
+    let root = test_root("d1-user-set-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "d1-user-set",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let fake = Arc::new(FakeProvider::new(text_turn("fake answer")));
+    let openai = Arc::new(FakeProvider::new(
+        [text_turn("clamped answer"), text_turn("explicit answer")].concat(),
+    ));
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[("fake", fake.clone()), ("openai", openai.clone())]),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "d1-user-set-client",
+        "d1-user-set-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    let (session_id, generation) =
+        create_with_budget_and_attach(&mut client, &config, &workspace, "fake", "fake-v1", 30_000)
+            .await;
+
+    let response = select_budget(
+        &mut client,
+        &config,
+        "user-gpt-4o",
+        select_body(
+            "user-gpt-4o",
+            &session_id,
+            generation,
+            "gpt-4o",
+            Some("openai"),
+        ),
+    )
+    .await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 16_384);
+    assert_eq!(
+        budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }
+    );
+    let clamp = budget.clamped.expect("typed clamp notice");
+    assert_eq!(
+        clamp,
+        OutputBudgetClampV1 {
+            requested: 30_000,
+            max_output_tokens: 16_384
+        }
+    );
+    assert!(clamp.notice().contains("30000") && clamp.notice().contains("16384"));
+    run_turn(
+        &mut client,
+        &config,
+        &session_id,
+        generation,
+        "turn-clamped",
+    )
+    .await;
+    assert_eq!(openai.requests()[0].max_tokens, 16_384);
+
+    // An explicit request above this model's maximum is refused typed.
+    let mut over = select_body("explicit-over", &session_id, generation, "gpt-4o", None);
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut over {
+        *max_tokens = Some(20_000);
+    }
+    let response = select_budget(&mut client, &config, "explicit-over", over).await;
+    let ResponseBody::Error { data, .. } = response else {
+        panic!("expected typed refusal, got {response:?}");
+    };
+    assert!(matches!(
+        data,
+        Some(ErrorData::ModelOutputLimit {
+            requested: 20_000,
+            max_output_tokens: 16_384,
+            ..
+        })
+    ));
+
+    // An explicit in-range budget on the CURRENT model changes only the budget.
+    let mut lower = select_body("explicit-lower", &session_id, generation, "gpt-4o", None);
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut lower {
+        *max_tokens = Some(12_000);
+    }
+    let response = select_budget(&mut client, &config, "explicit-lower", lower).await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 12_000);
+    assert_eq!(
+        budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 12_000 }
+    );
+    run_turn(
+        &mut client,
+        &config,
+        &session_id,
+        generation,
+        "turn-explicit",
+    )
+    .await;
+    assert_eq!(openai.requests()[1].max_tokens, 12_000);
+
+    // `0` returns the session to the derived budget.
+    let mut derive = select_body(
+        "explicit-derive",
+        &session_id,
+        generation,
+        "fake-v1",
+        Some("fake"),
+    );
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut derive {
+        *max_tokens = Some(0);
+    }
+    let response = select_budget(&mut client, &config, "explicit-derive", derive).await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 30_000);
+    assert_eq!(budget.source, SessionOutputBudgetSourceV1::Derived);
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// S1 (973 output cap): an unknown custom model's 8,192 maximum is only the
+/// unverified fallback guess. The derived budget follows it, but an explicit
+/// `max_tokens` above it (here 30,000) is admitted as the user's own budget
+/// and the next turn requests exactly that value; only a value above the
+/// adapter maximum is refused. The provider-stated one-shot retry covers a
+/// provider whose real maximum is lower.
+/// MUTATION CHECK: bound explicit requests by `max_output_tokens` instead of
+/// `explicit_max_output_tokens`. Expected runtime failure: the 30,000 select
+/// is refused with `model_output_limit` (max 8,192).
+#[tokio::test]
+async fn explicit_budget_above_unverified_fallback_is_admitted() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let root = test_root("s1-fallback-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "s1-fallback",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let fake = Arc::new(FakeProvider::new(text_turn("fake answer")));
+    let custom = Arc::new(FakeProvider::new(
+        [text_turn("derived answer"), text_turn("explicit answer")].concat(),
+    ));
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[("fake", fake.clone()), ("custom973", custom.clone())]),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "s1-fallback-client",
+        "s1-fallback-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    let (session_id, generation) =
+        create_with_budget_and_attach(&mut client, &config, &workspace, "fake", "fake-v1", 0).await;
+
+    let response = select_budget(
+        &mut client,
+        &config,
+        "s1-select-custom",
+        select_body(
+            "s1-select-custom",
+            &session_id,
+            generation,
+            "custom-unknown",
+            Some("custom973"),
+        ),
+    )
+    .await;
+    assert_eq!(committed_budget(&response).max_tokens, 8_192, "derived");
+    run_turn(&mut client, &config, &session_id, generation, "s1-derived").await;
+    assert_eq!(custom.requests()[0].max_tokens, 8_192);
+
+    let mut explicit = select_body(
+        "s1-explicit",
+        &session_id,
+        generation,
+        "custom-unknown",
+        None,
+    );
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut explicit {
+        *max_tokens = Some(30_000);
+    }
+    let response = select_budget(&mut client, &config, "s1-explicit", explicit).await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 30_000);
+    assert_eq!(
+        budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }
+    );
+    assert_eq!(budget.clamped, None);
+    run_turn(
+        &mut client,
+        &config,
+        &session_id,
+        generation,
+        "s1-explicit-turn",
+    )
+    .await;
+    assert_eq!(custom.requests()[1].max_tokens, 30_000);
+
+    let mut over = select_body("s1-over", &session_id, generation, "custom-unknown", None);
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut over {
+        *max_tokens = Some(haider_provider::MAX_OUTPUT_LIMIT + 1);
+    }
+    let response = select_budget(&mut client, &config, "s1-over", over).await;
+    let ResponseBody::Error { data, .. } = response else {
+        panic!("expected typed refusal, got {response:?}");
+    };
+    assert!(matches!(
+        data,
+        Some(ErrorData::ModelOutputLimit {
+            max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+            ..
+        })
+    ));
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");

@@ -412,6 +412,7 @@ fn checkpoint_list_and_record_optional_fields_are_pinned() {
         ],
         post_digest: "blake3:aggregate".into(),
         recorded_at_ms: 1_720_000_000_000,
+        redacted_content: false,
     };
     let event = serde_json::to_value(haider_protocol::EventPayload::CheckpointRecorded(
         record.clone(),
@@ -4090,6 +4091,7 @@ fn session_select_model_absent_provider_keeps_legacy_bytes() {
             model: "model-next".into(),
             provider: None,
             confirm_new_epoch: false,
+            max_tokens: None,
         },
     };
     let encoded = serde_json::to_string(&frame).expect("encode model-only selection");
@@ -4099,6 +4101,64 @@ fn session_select_model_absent_provider_keeps_legacy_bytes() {
     );
     let decoded: WireFrame = serde_json::from_str(&encoded).expect("decode model-only selection");
     assert_eq!(decoded, frame);
+}
+
+/// `model_output_limits_v1` (973): the optional `max_tokens` request field
+/// and the committed `output_budget` (source + typed clamp notice) are
+/// additive and golden.
+#[test]
+fn session_select_model_output_budget_fields_are_golden() {
+    use haider_rpc::haider_protocol::output_budget::{
+        OutputBudgetClampV1, SessionOutputBudgetSourceV1, SessionOutputBudgetV1,
+    };
+    let request = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-select-budget"),
+        body: RequestBody::SessionSelectModel {
+            command_id: haider_rpc::CommandId::new("command-select-budget"),
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            worker_generation: 7,
+            model: "gpt-4o".into(),
+            provider: Some("openai".into()),
+            confirm_new_epoch: false,
+            max_tokens: Some(0),
+        },
+    };
+    let encoded = serde_json::to_string(&request).expect("encode budget selection");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"request","request_id":"request-select-budget","body":{"method":"session.select_model","command_id":"command-select-budget","session_id":"session-1","worker_generation":7,"model":"gpt-4o","provider":"openai","max_tokens":0}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<WireFrame>(&encoded).expect("decode budget selection"),
+        request
+    );
+    let response = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("request-select-budget"),
+        body: ResponseBody::SessionSelectModel {
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            selected_seq: 43,
+            worker_generation: 7,
+            output_budget: Some(SessionOutputBudgetV1 {
+                max_tokens: 16_384,
+                source: SessionOutputBudgetSourceV1::UserSet { requested: 30_000 },
+                clamped: Some(OutputBudgetClampV1 {
+                    requested: 30_000,
+                    max_output_tokens: 16_384,
+                }),
+            }),
+        },
+    };
+    let encoded = serde_json::to_string(&response).expect("encode budget response");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"response","request_id":"request-select-budget","body":{"method":"session.select_model","session_id":"session-1","provider":"openai","model":"gpt-4o","selected_seq":43,"worker_generation":7,"output_budget":{"max_tokens":16384,"source":{"kind":"user_set","requested":30000},"clamped":{"requested":30000,"max_output_tokens":16384}}}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<WireFrame>(&encoded).expect("decode budget response"),
+        response
+    );
 }
 
 /// The full pair-selection request and its response are golden: the request
@@ -4115,6 +4175,7 @@ fn session_select_model_pair_request_and_response_are_golden() {
             model: "fable-5".into(),
             provider: Some("anthropic-oauth".into()),
             confirm_new_epoch: false,
+            max_tokens: None,
         },
     };
     let encoded = serde_json::to_string(&request).expect("encode pair selection");
@@ -4135,6 +4196,7 @@ fn session_select_model_pair_request_and_response_are_golden() {
             model: "fable-5".into(),
             selected_seq: 42,
             worker_generation: 7,
+            output_budget: None,
         },
     };
     let encoded = serde_json::to_string(&response).expect("encode selection response");

@@ -1019,6 +1019,7 @@ fn run_custom_model_wire_case(
             slug: (*slug).to_owned(),
             display_name: (*slug).to_owned(),
             context_window: None,
+            max_output_tokens: None,
             description: None,
             default_effort: None,
             supported_efforts: Vec::new(),
@@ -1843,6 +1844,37 @@ fn unknown_lifecycle_run_is_a_machine_readable_error() {
     assert_eq!(value["schema"], "haider.run.status.v1");
     assert!(value["result"].is_null());
     assert_eq!(value["error"]["code"], "not_found");
+}
+
+#[test]
+fn headless_output_limit_defaults_above_4096_and_honors_override() {
+    for (extra, expected) in [
+        (Vec::<&str>::new(), 30_000),
+        (vec!["--max-output-tokens", "12345"], 12_345),
+    ] {
+        let mut command = haider();
+        command.args(["run", "--provider", "fake", "--json"]);
+        command.args(extra);
+        command
+            .args(["-p", "output limit pin"])
+            .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
+            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+        let output = output_with_boot_retry(&mut command);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("headless JSON");
+        let configured = result["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .find(|event| event["payload"]["type"] == "headless_run_configured")
+            .expect("headless configuration event");
+        assert_eq!(configured["payload"]["max_output_tokens"], expected);
+    }
 }
 
 #[test]
@@ -4842,6 +4874,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
             provider: None,
             model: None,
             attachments: Vec::new(),
+            max_output_tokens: None,
             budget: haider_protocol::headless::RunBudgetV1::default(),
             seed: None,
         })
@@ -4952,6 +4985,38 @@ fn empty_prompt_flag_and_stdin_share_invalid_usage_exit() {
     }
 }
 
+/// B1 (973 output cap): the run flag contract. `--max-tokens` is the
+/// cumulative run token budget exactly as in 0.0.972 (never a per-response
+/// cap), `--max-output-tokens` is the per-response output budget, each is
+/// single-valued, and the never-shipped `--max-total-tokens` spelling is not
+/// accepted.
+#[test]
+fn run_parser_keeps_max_tokens_as_the_run_budget() {
+    let parsed = parse_run_options(&["--max-tokens".into(), "1".into(), "-p".into(), "x".into()])
+        .expect("run budget");
+    assert_eq!(parsed.budget.max_tokens, Some(1));
+    assert_eq!(parsed.max_output_tokens, None);
+    let parsed = parse_run_options(&[
+        "--max-output-tokens".into(),
+        "12000".into(),
+        "-p".into(),
+        "x".into(),
+    ])
+    .expect("output budget");
+    assert_eq!(parsed.budget.max_tokens, None);
+    assert_eq!(parsed.max_output_tokens, Some(12_000));
+    for args in [
+        vec!["--max-output-tokens", "1", "--max-output-tokens", "2"],
+        vec!["--max-tokens", "1", "--max-tokens", "2"],
+        vec!["--max-output-tokens", "0"],
+        vec!["--max-total-tokens", "1000"],
+    ] {
+        let mut args: Vec<String> = args.into_iter().map(String::from).collect();
+        args.extend(["-p".to_owned(), "x".to_owned()]);
+        assert!(parse_run_options(&args).is_err(), "{args:?}");
+    }
+}
+
 #[test]
 fn run_parser_pins_budgets_seed_and_lifecycle() {
     let parsed = parse_run_options(&[
@@ -4959,6 +5024,8 @@ fn run_parser_pins_budgets_seed_and_lifecycle() {
         "--start".into(),
         "--max-tokens".into(),
         "123".into(),
+        "--max-output-tokens".into(),
+        "456".into(),
         "--max-cost".into(),
         "0.125001".into(),
         "--max-time".into(),
@@ -4971,7 +5038,10 @@ fn run_parser_pins_budgets_seed_and_lifecycle() {
     .expect("headless controls");
     assert_eq!(parsed.action, RunAction::Start);
     assert_eq!(parsed.output, RunOutput::Json);
+    // B1: `--max-tokens` keeps its 0.0.972 meaning (cumulative run budget);
+    // the per-response output budget is `--max-output-tokens`.
     assert_eq!(parsed.budget.max_tokens, Some(123));
+    assert_eq!(parsed.max_output_tokens, Some(456));
     assert_eq!(parsed.budget.max_cost_microusd, Some(125_001));
     assert_eq!(parsed.budget.max_time_ms, Some(120_000));
     assert_eq!(parsed.seed, Some(0));
@@ -5540,6 +5610,7 @@ fn ordinary_session_submission_is_separate_from_budget_resume() {
         vec!["--read-only"],
         vec!["--allow-exec"],
         vec!["--max-tokens", "10"],
+        vec!["--max-output-tokens", "10"],
         vec!["--seed", "42"],
         vec!["--session", "duplicate"],
     ] {
@@ -5560,177 +5631,75 @@ fn ordinary_session_submission_is_separate_from_budget_resume() {
 }
 
 #[test]
-fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
-    let request_budget = haider_protocol::request_budget::RequestBudgetV1::default();
-    let limit = request_budget.hard_cap;
+fn default_request_budget_allows_more_than_sixty_four_provider_requests() {
+    const TOOL_REQUESTS: usize = 65;
     let mut script = Vec::new();
-    for ordinal in 1..=limit {
+    for ordinal in 1..=TOOL_REQUESTS {
         if ordinal > 1 {
             script.push(serde_json::json!({
-                "step": "expect_tool_result", "call_id": format!("ceiling-{}", ordinal - 1)
+                "step": "expect_tool_result", "call_id": format!("unbounded-{}", ordinal - 1)
             }));
         }
         script.push(serde_json::json!({
-            "step": "emit_tool_call", "call_id": format!("ceiling-{ordinal}"),
-            "name": "fs_read", "args": {"path": "continuity.txt"}
+            "step": "emit_tool_call", "call_id": format!("unbounded-{ordinal}"),
+            "name": "fs_read", "args": {"path": format!("part-{ordinal}.txt")}
         }));
         script.push(serde_json::json!({"step": "finish", "reason": "tool_use"}));
     }
-    script.push(serde_json::json!({"step": "emit_text", "text": "UNREACHABLE_REQUEST"}));
+    script.push(serde_json::json!({
+        "step": "expect_tool_result", "call_id": format!("unbounded-{TOOL_REQUESTS}")
+    }));
+    script.push(serde_json::json!({
+        "step": "emit_text", "text": "completed after sixty-six provider requests"
+    }));
     script.push(serde_json::json!({"step": "finish", "reason": "end_turn"}));
-    let ceiling_script = serde_json::to_string(&script).expect("fake ceiling script");
-
-    for output_mode in ["json", "jsonl"] {
-        let fixture = haider();
-        let profile = fixture.profile.clone();
-        let workspace = profile.parent().expect("profile parent").join("workspace");
-        std::fs::write(workspace.join("continuity.txt"), "retained fixture history")
-            .expect("workspace input");
-        let invoke = |args: &[&str],
-                      script: &str,
-                      input: Option<&[u8]>,
-                      expected: i32,
-                      process_deadline: Duration| {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
-            configure_test_home(&mut command, &profile);
+    let script = serde_json::to_string(&script).expect("fake unbounded script");
+    let mut command = haider();
+    // Distinct productive reads: identical repeated calls would (correctly)
+    // meet the repeated-tool-call loop guard instead of an unbounded count.
+    for ordinal in 1..=TOOL_REQUESTS {
+        std::fs::write(
             command
-                .current_dir(&workspace)
-                .env("HAIDER_PROFILE_DIR", &profile)
-                .env("HAIDER_DISCOVERY_DISABLED", "1")
-                // Restart each owned daemon so every phase has its own exact
-                // provider script and the advertised continuation is durable.
-                .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
-                .env("HAIDER_TEST_FAKE_PROVIDER", script)
-                .env_remove("HAIDER_MODEL")
-                .args(args);
-            let output = bounded_output_with_deadline(&mut command, input, process_deadline);
-            assert_eq!(
-                output.status.code(),
-                Some(expected),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            output
-        };
-        let first = invoke(
-            &[
-                "run",
-                "--provider",
-                "fake",
-                "--read-only",
-                "--output",
-                "json",
-                "--timeout",
-                "30s",
-                "initial turn",
-            ],
-            DEFAULT_FAKE_SCRIPT,
-            None,
-            0,
-            CLI_PROCESS_DEADLINE,
-        );
-        let first: serde_json::Value = serde_json::from_slice(&first.stdout).expect("initial JSON");
-        let session_id = first["session_id"].as_str().expect("native session");
-        // Registry #94 BudgetSum: the ordinary ceiling spans two 32-request
-        // tranches, each with the test's existing 30-second CI allowance. Add
-        // the platform startup allowance from the replay timing budget. The
-        // outer harness owns only terminal grace and pipe-drain slack; the
-        // asserted 64-request behavior remains unchanged.
-        let tranche_count = request_budget.hard_cap.div_ceil(request_budget.tranche);
-        let tranche_count = u32::try_from(tranche_count).expect("tranche count fits in u32");
-        let platform_startup_budget = if cfg!(windows) {
-            Duration::from_secs(30)
-        } else {
-            Duration::from_secs(5)
-        };
-        let tranche_budget = Duration::from_secs(30);
-        let pipe_drain_budget = Duration::from_secs(2);
-        let ceiling_run_budget = platform_startup_budget + tranche_budget * tranche_count;
-        let ceiling_process_deadline =
-            ceiling_run_budget + haider_client::DEFAULT_TERMINAL_GRACE + pipe_drain_budget;
-        let ceiling_timeout = format!("{}s", ceiling_run_budget.as_secs());
-        let capped = invoke(
-            &[
-                "run",
-                "--session",
-                session_id,
-                "--output",
-                output_mode,
-                "--timeout",
-                ceiling_timeout.as_str(),
-                "reach the ordinary ceiling",
-            ],
-            &ceiling_script,
-            None,
-            78,
-            ceiling_process_deadline,
-        );
-        let stderr = String::from_utf8(capped.stderr).expect("failure stderr");
-        let advertised = stderr
-            .split('`')
-            .find(|part| part.starts_with("haider session submit "))
-            .expect("ordinary failure advertises a session command");
-        assert!(!stderr.contains("--resume"), "{stderr}");
-        let records: Vec<serde_json::Value> = if output_mode == "json" {
-            let capped: serde_json::Value =
-                serde_json::from_slice(&capped.stdout).expect("ceiling JSON");
-            assert_eq!(capped["error"]["code"], "request_budget_exceeded");
-            for field in [
-                &capped["error"]["message"],
-                &capped["error"]["presentation"]["detail"],
-            ] {
-                let message = field.as_str().expect("failure guidance");
-                assert!(message.contains(advertised), "{message}");
-                assert!(!message.contains("--resume"), "{message}");
-            }
-            capped["events"].as_array().expect("journal").clone()
-        } else {
-            String::from_utf8(capped.stdout)
-                .expect("JSONL")
-                .lines()
-                .map(|line| serde_json::from_str(line).expect("JSONL record"))
-                .collect()
-        };
-        let hard_bound = records
-            .iter()
-            .find_map(|record| {
-                let payload = &record["payload"];
-                (payload["event"] == "completed"
-                    && payload["item"]["kind"] == "provider_request_budget_v1"
-                    && payload["item"]["data"]["phase"] == "hard_bound")
-                    .then_some(&payload["item"]["data"])
-            })
-            .expect("original durable ceiling evidence");
-        assert_eq!(hard_bound["used"], limit);
-        assert_eq!(hard_bound["budget"]["hard_cap"], limit);
-        assert!(
-            !serde_json::to_string(&records)
-                .expect("records")
-                .contains("UNREACHABLE_REQUEST")
-        );
-
-        // Execute the command extracted from the actual CLI error, including
-        // its stdin door, instead of merely comparing an expected hint string.
-        let mut args: Vec<_> = advertised.split_whitespace().skip(1).collect();
-        args.extend(["--output", "json", "--timeout", "30s"]);
-        let continued = invoke(
-            &args,
-            DEFAULT_FAKE_SCRIPT,
-            Some(b"continue with a fresh turn\n"),
-            0,
-            CLI_PROCESS_DEADLINE,
-        );
-        let continued: serde_json::Value =
-            serde_json::from_slice(&continued.stdout).expect("continued JSON");
-        assert_eq!(continued["session_id"], session_id);
-        assert_eq!(continued["outcome"], "done");
-        assert_eq!(continued["run_id"], continued["turn_id"]);
-        assert!(
-            records
-                .iter()
-                .all(|record| record.get("run_id") != Some(&continued["run_id"]))
-        );
+                .profile
+                .parent()
+                .expect("profile parent")
+                .join(format!("workspace/part-{ordinal}.txt")),
+            format!("retained fixture history part {ordinal}"),
+        )
+        .expect("workspace input");
     }
+    command.env("HAIDER_TEST_FAKE_PROVIDER", script).args([
+        "run",
+        "--provider",
+        "fake",
+        "--read-only",
+        "--output",
+        "json",
+        "--timeout",
+        "45s",
+        "complete beyond the retired default request cap",
+    ]);
+    let output = bounded_output_with_deadline(&mut command, None, CLI_PROCESS_DEADLINE);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("unbounded run JSON");
+    assert_eq!(result["outcome"], "done");
+    assert_eq!(
+        result["response"],
+        "completed after sixty-six provider requests"
+    );
+    let records = result["events"].as_array().expect("journal");
+    assert!(
+        !serde_json::to_string(records)
+            .expect("records")
+            .contains("provider_request_budget_v1"),
+        "an omitted request policy must not synthesize budget events"
+    );
 }
 
 /// Real 0.0.971 session/journal rows, read by the candidate daemon. Execute

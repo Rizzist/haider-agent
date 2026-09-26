@@ -2927,11 +2927,10 @@ impl ResponsesDecoder {
         self.pending_tool_events.push(StreamEvent::ToolCallEnd {
             call_id: call.call_id.clone(),
         });
-        if self.open_calls.values().all(|call| call.ended) {
-            Ok(std::mem::take(&mut self.pending_tool_events))
-        } else {
-            Ok(Vec::new())
-        }
+        // The response-level terminal arrives after output-item completion
+        // and is the first point where `completed` can be distinguished from
+        // an output-limit `incomplete`. Keep the executable End buffered.
+        Ok(Vec::new())
     }
 
     fn response_terminal(
@@ -2946,16 +2945,6 @@ impl ResponsesDecoder {
             return Err(malformed(
                 "OpenAI response.completed arrived before a function call was finalized",
             ));
-        }
-        if incomplete {
-            self.pending_tool_events.clear();
-        }
-        let mut events = Vec::new();
-        if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
-            events.push(StreamEvent::UsageUpdate(openai_usage(
-                usage,
-                self.account.clone(),
-            )?));
         }
         let reason = if incomplete {
             match response
@@ -2974,6 +2963,20 @@ impl ResponsesDecoder {
         } else {
             FinishReason::EndTurn
         };
+        let mut events = if reason == FinishReason::MaxTokens {
+            output_limited_tool_events(&mut self.pending_tool_events)
+        } else if incomplete {
+            self.pending_tool_events.clear();
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.pending_tool_events)
+        };
+        if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
+            events.push(StreamEvent::UsageUpdate(openai_usage(
+                usage,
+                self.account.clone(),
+            )?));
+        }
         if let Some(writer) = self.text.take() {
             drop(writer.seal());
         }
@@ -3751,8 +3754,9 @@ impl ChatDecoder {
         // G4a LK8 tolerance: some OSS servers emit tool-call deltas yet
         // close with finish_reason "stop" instead of "tool_calls". The calls
         // are real — complete them and finish as tool use rather than
-        // silently discarding a tool invocation the model asked for. Every
-        // other non-tool reason (max tokens, refusal) still drops partials.
+        // silently discarding a tool invocation the model asked for. A
+        // max-token stop surfaces the partial calls without an End marker;
+        // every other reason drops them.
         let reason = if reason == FinishReason::EndTurn && !self.open_calls.is_empty() {
             FinishReason::ToolUse
         } else {
@@ -3760,6 +3764,8 @@ impl ChatDecoder {
         };
         let mut events = if reason == FinishReason::ToolUse {
             self.close_calls()
+        } else if reason == FinishReason::MaxTokens {
+            output_limited_tool_events(&mut self.pending_tool_events)
         } else {
             self.pending_tool_events.clear();
             Vec::new()
@@ -3778,6 +3784,17 @@ impl ChatDecoder {
         self.terminal = true;
         vec![Err(error)]
     }
+}
+
+/// Drains buffered tool events at an output-limit terminal. Start and argument
+/// deltas cross so the actor can classify each open call as an output-limit
+/// truncation; End markers never do, because partial arguments must not
+/// execute. Shared by the Responses and chat decoders.
+fn output_limited_tool_events(pending: &mut Vec<StreamEvent>) -> Vec<StreamEvent> {
+    std::mem::take(pending)
+        .into_iter()
+        .filter(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }))
+        .collect()
 }
 
 /// Replays native Responses SSE bytes through the live incremental decoder.
@@ -5699,17 +5716,9 @@ fn resolved_attachment<'a>(
 }
 
 fn native_capabilities(model: &str) -> CapabilityDoc {
-    let context_limit = if model.starts_with("gpt-5.4")
-        || model.starts_with("gpt-5.5")
-        || model.starts_with("gpt-5.6")
-        || model.starts_with("gpt-4.1")
-    {
-        1_000_000
-    } else if model.starts_with("gpt-5") {
-        400_000
-    } else {
-        128_000
-    };
+    let context_limit = crate::static_model_limits(OPENAI_PROVIDER_NAME, model)
+        .context_window
+        .unwrap_or(128_000);
     CapabilityDoc {
         provider: OPENAI_PROVIDER_NAME.into(),
         parallel_tools: FeatureResolve::Native,

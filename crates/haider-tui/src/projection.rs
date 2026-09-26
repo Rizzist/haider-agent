@@ -330,6 +330,9 @@ fn is_foldable_tool_item(item: &TurnItem) -> bool {
 /// Session display state, reduced from the envelope stream.
 #[derive(Debug, Default)]
 pub struct SessionProjection {
+    /// The selected turn's explicit request policy, learned from its durable
+    /// progress/checkpoint item. Cleared on the next turn opening.
+    request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
     /// Monotonic view-cache invalidation token. The durable/display reducer
     /// remains the authority; render caches only use this to avoid comparing
     /// an unchanged transcript on every animation frame.
@@ -465,6 +468,12 @@ fn is_screen_control_item(item: &TurnItem) -> bool {
 }
 
 impl SessionProjection {
+    /// The active or most recently completed turn's explicitly pinned cap.
+    #[must_use]
+    pub fn request_budget(&self) -> Option<haider_protocol::request_budget::RequestBudgetV1> {
+        self.request_budget
+    }
+
     /// Apply hidden provenance to an already-visible command block. The
     /// marker is committed after the started item, so no pending side table
     /// is needed; a missing target fails closed as model-origin display.
@@ -747,6 +756,7 @@ impl SessionProjection {
                 // (Streaming → RunningTool → Streaming) must NOT reset it.
                 let was_idle = self.run.as_ref().is_none_or(RunState::is_terminal);
                 if was_idle && !run.is_terminal() {
+                    self.request_budget = None;
                     self.streamed_output_chars = 0;
                     // escretract: the SAME opening edge closes the previous
                     // turn's retraction window. The boundary is per-run daemon
@@ -1502,6 +1512,13 @@ impl SessionProjection {
                     self.duplicate_items += 1;
                     return;
                 }
+                if let Some(status) =
+                    haider_protocol::request_budget::RequestBudgetStatusV1::from_extension_item(
+                        item,
+                    )
+                {
+                    self.request_budget = Some(status.budget);
+                }
                 if let TurnItem::Plan { items } = item {
                     let all_done = items.iter().all(|todo| todo.state == TodoState::Completed);
                     self.todos = Some(TodoPanel {
@@ -2193,7 +2210,7 @@ impl SessionProjection {
                 (window > 0).then(|| {
                     format!(
                         "· context at {}% — compacting · planned cache epoch transition; next turn history cold (summary retained · originals stay in /tree)",
-                        footprint.used_tokens.saturating_mul(100) / window
+                        crate::context_meter::percent_of(footprint.used_tokens, window)
                     )
                 })
             })

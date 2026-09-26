@@ -1112,6 +1112,10 @@ struct StreamState {
     native_computer: bool,
     started: bool,
     open_blocks: BTreeMap<usize, OpenBlock>,
+    /// Client tool blocks that received `content_block_stop` but whose message-level
+    /// finish reason is not known yet. A later `max_tokens` must be able to
+    /// discard their End marker before the actor can dispatch them.
+    closed_tool_blocks: BTreeMap<usize, OpenBlock>,
     seen_blocks: BTreeSet<usize>,
     implicitly_closed_blocks: BTreeSet<usize>,
     message_delta_seen: bool,
@@ -1126,6 +1130,7 @@ impl StreamState {
             native_computer,
             started: false,
             open_blocks: BTreeMap::new(),
+            closed_tool_blocks: BTreeMap::new(),
             seen_blocks: BTreeSet::new(),
             implicitly_closed_blocks: BTreeSet::new(),
             message_delta_seen: false,
@@ -1298,13 +1303,16 @@ impl StreamState {
                         OpenBlock::Tool {
                             call_id,
                             native_computer: false,
-                            ..
+                            input_json,
                         },
                         WireDelta::InputJson { partial_json },
-                    ) => Ok(vec![StreamEvent::ToolCallArgsDelta {
-                        call_id: call_id.clone(),
-                        args_fragment: partial_json,
-                    }]),
+                    ) => {
+                        input_json.push_str(&partial_json);
+                        Ok(vec![StreamEvent::ToolCallArgsDelta {
+                            call_id: call_id.clone(),
+                            args_fragment: partial_json,
+                        }])
+                    }
                     // W-B: a server tool call streams its input exactly like
                     // a client tool call, but into the replay accumulator.
                     (
@@ -1343,7 +1351,17 @@ impl StreamState {
                     return Ok(Vec::new());
                 }
                 self.require_before_message_delta("content_block_stop")?;
-                self.close_block(index)
+                if matches!(self.open_blocks.get(&index), Some(OpenBlock::Tool { .. })) {
+                    let block = self.open_blocks.remove(&index).ok_or_else(|| {
+                        malformed(format!(
+                            "Anthropic stopped unopened content block index {index}"
+                        ))
+                    })?;
+                    self.closed_tool_blocks.insert(index, block);
+                    Ok(Vec::new())
+                } else {
+                    self.close_block(index)
+                }
             }
             WireEvent::MessageDelta { delta, usage } => {
                 self.require_started("message_delta")?;
@@ -1359,14 +1377,13 @@ impl StreamState {
                     }
                     self.stop_reason = Some(normalized);
                 }
-                // A message-level delta ends the content phase even when the
-                // provider omits or delays a block stop. Finalize normally so
-                // tool ends, signed thinking, and citations are not lost.
-                let mut events = Vec::new();
-                while let Some((&index, _)) = self.open_blocks.first_key_value() {
-                    events.extend(self.close_block(index)?);
-                    self.implicitly_closed_blocks.insert(index);
-                }
+                // A usage-only delta does not settle the stop reason. Keep
+                // held tool ends until a definitive reason arrives.
+                let mut events = if self.stop_reason.is_some() {
+                    self.end_content_phase()?
+                } else {
+                    Vec::new()
+                };
                 self.message_delta_seen = true;
                 let Some(usage) = usage else {
                     return Ok(events);
@@ -1396,7 +1413,7 @@ impl StreamState {
             }
             WireEvent::MessageStop => {
                 self.require_started("message_stop")?;
-                if !self.open_blocks.is_empty() {
+                if !self.open_blocks.is_empty() || !self.closed_tool_blocks.is_empty() {
                     return Err(malformed(
                         "Anthropic message_stop arrived while a content block was open",
                     ));
@@ -1409,6 +1426,49 @@ impl StreamState {
             WireEvent::Ping | WireEvent::Unknown => Ok(Vec::new()),
             WireEvent::Error { error } => Err(api_error(error)),
         }
+    }
+
+    /// A message-level delta ends the content phase even when the provider
+    /// omits or delays a block stop: finalize every open block and release
+    /// the tool ends deferred at `content_block_stop`. At a max-token stop,
+    /// only still-open client tools are partial; already closed calls retain
+    /// their ends and the actor validates their complete JSON before dispatch.
+    fn end_content_phase(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
+        let output_limited = self.stop_reason == Some(FinishReason::MaxTokens);
+        let mut events = Vec::new();
+        while let Some((&index, block)) = self.open_blocks.first_key_value() {
+            if output_limited && matches!(block, OpenBlock::Tool { .. }) {
+                self.open_blocks.remove(&index);
+            } else {
+                events.extend(self.close_block(index)?);
+            }
+            self.implicitly_closed_blocks.insert(index);
+        }
+        let closed_tool_blocks = std::mem::take(&mut self.closed_tool_blocks);
+        for (index, mut block) in closed_tool_blocks {
+            if let OpenBlock::Tool {
+                call_id,
+                native_computer: false,
+                input_json,
+            } = &mut block
+                && input_json.is_empty()
+            {
+                input_json.push_str("{}");
+                events.push(StreamEvent::ToolCallArgsDelta {
+                    call_id: call_id.clone(),
+                    args_fragment: "{}".into(),
+                });
+            }
+            if output_limited
+                && matches!(&block, OpenBlock::Tool { input_json, .. }
+                if !serde_json::from_str::<serde_json::Value>(input_json).is_ok_and(|value| value.is_object()))
+            {
+                continue;
+            }
+            self.open_blocks.insert(index, block);
+            events.extend(self.close_block(index)?);
+        }
+        Ok(events)
     }
 
     fn close_block(&mut self, index: usize) -> Result<Vec<StreamEvent>, ProviderError> {

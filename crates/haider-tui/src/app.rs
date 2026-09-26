@@ -1269,6 +1269,20 @@ impl ProvidersState {
     /// the caller keeps its current figure rather than inventing a number.
     #[must_use]
     pub fn declared_window(&self, provider: &str, model: &str) -> Option<u64> {
+        self.model_detail(provider, model)
+            .and_then(|detail| detail.context_window)
+    }
+
+    /// Maximum output budget for this exact provider/model row. New daemons
+    /// always project a declared or pinned fallback value; `None` preserves
+    /// compatibility with older daemons.
+    #[must_use]
+    pub fn declared_output_limit(&self, provider: &str, model: &str) -> Option<u64> {
+        self.model_detail(provider, model)
+            .and_then(|detail| detail.max_output_tokens)
+    }
+
+    fn model_detail(&self, provider: &str, model: &str) -> Option<&haider_rpc::ModelDetailWire> {
         self.providers
             .iter()
             .find(|summary| summary.provider == provider)
@@ -1278,7 +1292,13 @@ impl ProvidersState {
                     .iter()
                     .find(|detail| detail.name == model)
             })
-            .and_then(|detail| detail.context_window)
+    }
+
+    /// Whether the catalog carries a detail row for `model` at all — then
+    /// its (possibly absent) window is the catalog's authoritative answer.
+    #[must_use]
+    pub fn model_listed(&self, provider: &str, model: &str) -> bool {
+        self.model_detail(provider, model).is_some()
     }
 }
 
@@ -5245,6 +5265,13 @@ pub struct AppModel {
     /// ⌃G / `/tokens` context panel (sim tui.js:2946-2977) — session
     /// surfaces only; esc closes.
     pub token_panel: bool,
+    /// The (provider, model) pair the context meter last resolved against
+    /// (973-context-meter), maintained by [`Self::refresh_context_window`].
+    meter_identity: Option<(String, String)>,
+    /// The latest snapshot at the moment the identity pair last CHANGED:
+    /// while it is still the latest, it describes the previous model, so
+    /// its window may not stand in for the current model's.
+    meter_snapshot_before_switch: Option<haider_protocol::context::ContextFootprint>,
     /// `/tree` — selected row (sim treeSel).
     pub tree_sel: usize,
     /// `/tree` — the VIEWED branch (`None` = the root/main branch; sim
@@ -5311,6 +5338,9 @@ pub struct AppModel {
     /// Creation-only dated allocation. The leaf named by `cwd` remains
     /// absent until the daemon brokers the first workspace-writing effect.
     pub pending_workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+    /// Display-only path for the next dated allocation. The launcher uses
+    /// this instead of implying its shell cwd is the new session workspace.
+    pub pending_workspace_display: Option<String>,
     /// Sanitised process launch directory used for TUI-origin registration.
     /// Android and non-local surfaces leave this absent.
     pub launch_origin_path: Option<haider_protocol::session::LaunchOriginPathV1>,
@@ -5319,6 +5349,10 @@ pub struct AppModel {
     /// Canonical workspace of the attached session, learned from
     /// `SessionSummary` or the create response.
     pub session_workspace_cwd: Option<String>,
+    /// The attached session's dated leaf is resolved but not on disk yet
+    /// (it materialises on the first write). Set by the live driver's
+    /// presence probe; the session header and origin line speak it.
+    pub session_workspace_uncreated: bool,
     /// Per-open card counter: `/voice` and `/tools` mint a FRESH menu id
     /// each time, exactly as the sim's `nid()` does (review r2 P1-1 — fixed
     /// ids let a stale answer apply its consequences to a later card).
@@ -5883,6 +5917,8 @@ impl Default for AppModel {
         Self {
             screen: Screen::Boot,
             token_panel: false,
+            meter_identity: None,
+            meter_snapshot_before_switch: None,
             tree_sel: 0,
             tree_view: None,
             pending_jump: std::cell::RefCell::new(None),
@@ -5936,9 +5972,11 @@ impl Default for AppModel {
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
             cwd: "/".to_owned(),
             pending_workspace_allocation: None,
+            pending_workspace_display: None,
             launch_origin_path: None,
             session_dir: "~/dev/enterprise-suite".to_owned(),
             session_workspace_cwd: None,
+            session_workspace_uncreated: false,
             card_seq: 0,
             vfs: vfs_seed(),
             launcher_shellout: None,
@@ -7084,15 +7122,7 @@ impl AppModel {
     #[must_use]
     pub fn current_pair_detail(&self) -> Option<&haider_rpc::ModelDetailWire> {
         self.providers
-            .providers
-            .iter()
-            .find(|summary| summary.provider == self.identity.provider)
-            .and_then(|summary| {
-                summary
-                    .model_details
-                    .iter()
-                    .find(|detail| detail.name == self.identity.model_short)
-            })
+            .model_detail(&self.identity.provider, &self.identity.model_short)
     }
 
     /// Whether the session's CURRENT pair accepts image attachments, as the
@@ -11696,19 +11726,70 @@ impl AppModel {
 
     /// Re-derives the identity's context window from the discovered catalog
     /// (W5g-1: real limits, never guessed). A provider-declared window
-    /// always wins; with none declared the current figure stands — seed
-    /// defaults remain honest fallbacks, not fabrications. Idempotent, so
-    /// catalog arrivals may call it even for a PINNED identity: the pin
-    /// protects the user's provider/model choice, not a stale number.
+    /// always wins. With none declared, a LIVE identity's window becomes
+    /// unknown (`0`): neither the previous model's window nor the profile's
+    /// output budget may stand in for it (973-context-meter — the owner's
+    /// "always 100%" was `used / 4,096`). Only the demo, which fabricates
+    /// locally, keeps its sim seed. Idempotent, so catalog arrivals may call
+    /// it even for a PINNED identity: the pin protects the user's
+    /// provider/model choice, not a stale number.
     pub fn refresh_context_window(&mut self) {
-        if let Some(window) = self
+        let pair = (
+            self.identity.provider.clone(),
+            self.identity.model_short.clone(),
+        );
+        if self.meter_identity.as_ref() != Some(&pair) {
+            if self.meter_identity.is_some() {
+                self.meter_snapshot_before_switch = self.projection.latest_footprint().cloned();
+            }
+            self.meter_identity = Some(pair);
+        }
+        let declared = self
             .providers
-            .declared_window(&self.identity.provider, &self.identity.model_short)
-            && self.identity.context_window != window
-        {
+            .declared_window(&self.identity.provider, &self.identity.model_short);
+        let window = match declared {
+            Some(window) => window,
+            None if self.mode.fabricates_locally() => return,
+            None => 0,
+        };
+        if self.identity.context_window != window {
             self.identity.context_window = window;
             self.dirty = true;
         }
+    }
+
+    /// The session context meter (973-context-meter): the latest durable
+    /// snapshot against the CURRENT model's window, through the one pure
+    /// resolution every surface renders.
+    #[must_use]
+    pub fn context_meter(&self) -> crate::context_meter::ContextMeter {
+        // A snapshot's window may stand in for an undeclared one only while
+        // the catalog has no row for the current model (not yet loaded, or
+        // a model outside it). When the catalog lists the model without a
+        // window, "unknown" is the answer — a snapshot window then belongs
+        // to a previously selected model.
+        // Nor may a snapshot taken before the last model switch: until the
+        // new model's first request it describes the previous model.
+        let snapshot_predates_model = self.meter_snapshot_before_switch.is_some()
+            && self.projection.latest_footprint() == self.meter_snapshot_before_switch.as_ref();
+        let snapshot_window_allowed = self.mode.fabricates_locally()
+            || !(snapshot_predates_model
+                || self
+                    .providers
+                    .model_listed(&self.identity.provider, &self.identity.model_short));
+        crate::context_meter::ContextMeter::resolve(
+            self.projection.latest_footprint(),
+            self.projection.context_tokens(),
+            self.identity.context_window,
+            snapshot_window_allowed,
+            |window| {
+                crate::context_meter::derived_reserved_output(
+                    self.providers
+                        .declared_output_limit(&self.identity.provider, &self.identity.model_short),
+                    window,
+                )
+            },
+        )
     }
 
     /// The auth flavor of the CURRENT identity pair — `oauth` or `api` —
@@ -18306,6 +18387,8 @@ impl AppModel {
         self.session_title = None;
         self.session_name = None;
         self.session_workspace_cwd = None;
+        // Re-judged by the live presence probe for the new surface.
+        self.session_workspace_uncreated = false;
         self.launch_origin = None;
         self.lockdown_provider = None;
         self.lockdown_boundary_known = false;
@@ -18524,6 +18607,8 @@ impl AppModel {
         self.session_head = std::mem::take(&mut slot.head);
         self.session_dir = std::mem::take(&mut slot.dir);
         self.session_workspace_cwd = slot.workspace_cwd.take();
+        // Re-judged by the live presence probe for the new surface.
+        self.session_workspace_uncreated = false;
         self.launch_origin = slot.launch_origin.take();
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
@@ -20747,6 +20832,20 @@ impl AppModel {
         // Model retention: a COMMITTED pick is what the next boot opens on.
         self.model_commits += 1;
         self.flash = Some(format!("· model → {model} · {provider}"));
+        self.dirty = true;
+    }
+
+    /// A user-set output budget did not fit the newly selected model: the
+    /// daemon clamped it. Keep the model flash and append the typed notice.
+    pub fn apply_output_budget_clamp(
+        &mut self,
+        clamp: &haider_protocol::output_budget::OutputBudgetClampV1,
+    ) {
+        let notice = clamp.notice();
+        self.flash = Some(match self.flash.take() {
+            Some(flash) => format!("{flash} · {notice}"),
+            None => format!("· {notice}"),
+        });
         self.dirty = true;
     }
 

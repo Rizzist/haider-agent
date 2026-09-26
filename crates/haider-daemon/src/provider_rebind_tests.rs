@@ -49,6 +49,7 @@ async fn create_rebind_test_session(hub: &SessionHub, session_id: &SessionId) {
         provider: "fake".into(),
         model: "initial-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: Some("low".into()),
         fast: false,
@@ -139,6 +140,7 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
             provider: "fake".into(),
             model: model.into(),
             expected_pair,
+            output_budget: None,
             event_id: EventId::new(format!("selected-{ordinal}")),
             device_id: DeviceId::new("rebind-test-device"),
         })
@@ -427,6 +429,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 worker_generation: store.worker_generation(),
                 provider: "fake".into(),
                 model: "pending-next-turn-model".into(),
+                output_budget: None,
                 expected_pair: None,
                 event_id: EventId::new("pending-model-selected"),
                 device_id: device_id.clone(),

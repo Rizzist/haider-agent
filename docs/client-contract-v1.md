@@ -330,6 +330,7 @@ is §4.1.
 | `session_provider_rebind_v1` | `session.provider.rebind` |
 | `session_account_select_v1` | exact `session.create.account_alias` pin |
 | `session_create_admission_v1` | daemon resolution of create provider/default model and initial tuning |
+| `model_output_limits_v1` | model-row output maxima, `session.create.max_tokens=0` derivation, `session.select_model.max_tokens` and its `output_budget` response |
 | `session_model_select_v1` | `session.select_model` |
 | `session_rename_v1` | `session.rename`, `SessionSummary.title` |
 | `session_workspace_set_v1` | receipt-backed `session.workspace.set`; additive `workspace_unavailable` and `workspace_selected` raw facts |
@@ -1321,8 +1322,11 @@ explicit availability disambiguates it. Provider `endpoint`,
 `availability_reason`, and `default_model` are absent when undeclared/unknown;
 empty `models`, `model_details`, `auth_methods`, effort ladders, or speed lists
 mean the provider declares none in an available snapshot. `context_window`,
-`default_effort`, and `supports_thinking_type` absence means not declared;
-clients hold no replacement capability tables.
+`default_effort`, and `supports_thinking_type` absence means not declared.
+`max_output_tokens` is additive: current daemons project the provider catalog
+declaration or a pinned provider/model fallback, bounded by the known context
+window and adapter maximum; absence means an older daemon. Clients hold no
+replacement capability tables.
 
 `supports_vision` states whether the pair accepts image attachments. It is the
 daemon's projection of the adapter's own `capabilities().vision` — the fact the
@@ -1776,6 +1780,37 @@ and `crates/haider-store/src/event_store.rs:5876-5946`).
 | Request | `session.create` | `command_id: CommandId`, `cwd: String`, `provider: String`, `model: String`, `max_tokens: u64`, `permission_overrides: Option<SessionPermissionOverridesV1>`, `cache_policy: Option<CachePolicySettingsV1>`, `interaction_mode: SessionInteractionModeV1` |
 | Success response | `SessionCreate` (`method: "session.create"`) | `session_id: SessionId`, `created_seq: u64`, `worker_generation: u64`, `metadata: SessionMetadataV1`; the metadata carries the same `interaction_mode: SessionInteractionModeV1` |
 
+When `model_output_limits_v1` is advertised, `max_tokens: 0` is a derivation
+sentinel: after provider/model resolution the daemon persists and returns the
+smaller of its 30,000-token default and the resolved model maximum. Positive
+values remain exact client overrides and values above the row's explicit
+ceiling receive a typed `model_output_limit` error. The explicit ceiling is
+the row maximum when that maximum is sourced (catalog declaration or a cited
+table row); when the row maximum is only the unverified 8,192 fallback, the
+ceiling is 384,000, strictly below a known context window (see
+`docs/output-token-limits.md`). A client must negotiate the feature before
+sending zero.
+
+The created metadata records `max_tokens_source`: `{"kind":"derived"}` for a
+zero request or `{"kind":"user_set","requested":N}` for a positive one
+(absent on metadata written before 973; readers treat the legacy client
+defaults 4,096, 8,192 and 30,000 as derived and any other value as user-set).
+Every `session.select_model` re-applies that source to the newly selected
+model: a derived budget becomes `min(30,000, new maximum)` silently; a
+user-set budget becomes `min(requested, new explicit ceiling)`, and when that clamps
+the response's `output_budget.clamped` carries `{requested,
+max_output_tokens}` for the client to show as a notice. A model switch never
+fails on the output budget. With `model_output_limits_v1`, a
+`session.select_model` request may carry `max_tokens`: `0` returns the
+session to the derived budget, a positive value becomes the user-set budget
+(refused with typed `model_output_limit` when it exceeds the selected model's
+maximum). Selecting the session's current model with `max_tokens` changes
+only the budget. The response's additive `output_budget` is
+`{max_tokens, source, clamped?}`. CLI: `haider session <id> config
+--max-output-tokens <n|auto>`; `haider run --max-output-tokens N` sets it on
+the headless session (`haider run --max-tokens N` is the cumulative run token
+budget, unchanged since 0.0.972).
+
 The exact enum strings are `"interactive"` and `"autonomous"`.
 `interactive` is the serde default and is omitted on the wire; that is a
 source-defined compatibility value, not a client-invented default. When the
@@ -1819,7 +1854,8 @@ provider lockdown or workspace containment. The exact autonomous resolutions in
 
 A changed workflow-state digest is progress, not recurrence. An autonomous
 external turn may therefore continue through every declared stage while its
-run deadline, maximum cost, and provider-request ceiling permit it. The daemon
+run deadline, maximum cost, and any explicitly configured provider-request
+ceiling permit it. The daemon
 rebinds the active typed node and exact CAS inputs at each logical provider
 request. Repeating the same digest remains fail-closed because the journal
 cannot distinguish no progress from an ambiguous crash/replay at that point.
@@ -3015,8 +3051,10 @@ Absence laws:
 
 - A missing `headless_run_v1`, or missing `run_budget_v1` when any limit is
   present, fails feature negotiation before session creation or submission.
-- Omitted token/cost/time budget fields are unbounded. Omitted `request_budget` selects tranche 32 / hard cap 64; a present policy requires `0 < tranche <= hard_cap`. A present zero is invalid. `seed: 0`
-  remains present and is not treated as omission.
+- Omitted token/cost/time budget fields and an omitted `request_budget` are
+  unbounded. A present request policy requires `0 < tranche <= hard_cap`; a
+  present zero is invalid. `seed: 0` remains present and is not treated as
+  omission.
 - A missing budget `decision` means the exhaustion fact was written by an
   older daemon. A present unavailable-pricing or unavailable-usage reason
   carries provider/model identity and never substitutes a zero projection.
@@ -3661,21 +3699,45 @@ quota, toggle-boundary, and subagent rules.
 
 ### Request tranches and continuation (v0.0.970)
 
-The actor counts logical requests, excluding transport retries. Defaults are
-32 for the soft tranche and 64 for the hard cap. `RunBudgetV1.request_budget`
-overrides this per run; `spawn_subagent.request_budget` pins it for each child
-in its durable manifest coordinates. A run pin takes precedence over the child
-pin, then defaults apply. These counts are independent of token/cost/time
-limits and require no provider usage report.
+Request-count limits are opt-in. With no request policy, interactive turns,
+headless runs, delegated children, and workflow continuations may make as many
+logical provider requests as completion requires. `RunBudgetV1.request_budget`
+pins a headless run; `spawn_subagent.request_budget` pins each child in its
+durable manifest coordinates. A run pin takes precedence over the child pin,
+and omission at both levels remains unbounded. The convenience values used
+when only `--max-requests N` is supplied use tranche `min(32, N)`; with only
+`--request-tranche N`, the hard cap is 64. API and manifest policies supply
+both `tranche` and `hard_cap` as a complete `RequestBudgetV1` object; omitting
+the object leaves the request count unbounded.
+Logical counts exclude transport retries, are independent of token/cost/time
+limits, and require no provider usage report.
 
-`provider_request_budget_v1` extension items contain `used`, `budget` (tranche
-and hard cap), `phase` (`progress`, `soft_bound`, `hard_bound`), and a typed
+When a request policy is present, `provider_request_budget_v1` extension items
+contain `used`, `budget` (tranche and hard cap), `phase` (`progress`,
+`soft_bound`, `hard_bound`), and a typed
 `continuation` with session/run/branch/agent coordinates. Progress shares the
 provider-attempt append; the soft note is committed once before the first
 post-tranche logical request and included in actual model input. Hard-bound
 Started/Completed, `run_failed` with `request_budget_exceeded`, and `errored`
 commit in one append. Completed tools and partial text remain journal truth.
 Recovery restores consumed requests and the existing warning from that journal.
+The transcript TUI and plain renderer suppress progress telemetry; bound
+checkpoints remain visible and raw JSON/JSONL retains all opted-in policy facts.
+
+Independently of any request policy, a `loop_suspected_v1` extension item
+(`run_id`, `guard`, `repeated_calls`, `stop_after`, optional `tool`, `label`)
+is a non-terminal, model-visible steer. It is committed once per streak when
+30 consecutive tool calls repeat an earlier call and normalized result of the
+same turn (`guard: "repeated_tool_calls"`), or when 100 consecutive calls
+repeat an earlier (tool, arguments) pair with no new pair in between, whatever
+the results (`guard: "repeated_actions"`). Assistant text resets neither
+streak. Computer-use/mobile-use screen steps (screenshot, UI tree, swipe,
+scroll, tap, key on the registered `computer`/`mobile` tools) are exempt from
+the action-level count while the observed screen changes. It is rendered as a transcript line. After 30 (respectively 100) more
+repeats with no new call, the turn ends with `loop_limit` (CLI exit 70). The
+`run_failed` payload's `presentation.loop_limit` object carries the typed
+details (`loop` tag plus counts); see `docs/jsonl-run-contract-v1.md`, "Loop
+guards", for the fingerprint rules and accepted residuals.
 
 `haider run --resume RUN_ID` requires `request_budget_v1` and starts a new turn
 in the same session with a fresh request allowance. It pins

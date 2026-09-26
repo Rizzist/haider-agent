@@ -1,14 +1,15 @@
 #![allow(clippy::expect_used)]
 
+use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
 use haider_protocol::headless::RunBudgetV1;
-use haider_protocol::ids::{RunId, SessionId};
+use haider_protocol::ids::{AgentId, LeaseId, RunId, SessionId};
 use haider_protocol::request_budget::{
     PROVIDER_REQUEST_BUDGET_EXTENSION_KIND, RequestBudgetContinuationV1, RequestBudgetPhaseV1,
     RequestBudgetStatusV1, RequestBudgetV1,
 };
 
 #[test]
-fn request_budget_defaults_allow_two_tranches_and_validate_order() {
+fn explicit_request_budget_defaults_allow_two_tranches_and_validate_order() {
     let budget = RequestBudgetV1::default();
     assert_eq!((budget.tranche, budget.hard_cap), (32, 64));
     assert!(budget.validate().is_ok());
@@ -23,12 +24,31 @@ fn request_budget_defaults_allow_two_tranches_and_validate_order() {
         .validate()
         .is_ok()
     );
+    // Single-bound opt-ins: an implicit tranche never exceeds the cap; an
+    // explicit tranche is kept verbatim so an invalid pair still fails.
+    for (tranche, hard_cap, expected) in [
+        (None, None, (32, 64)),
+        (None, Some(5), (5, 5)),
+        (None, Some(96), (32, 96)),
+        (Some(40), None, (40, 64)),
+        (Some(8), Some(10), (8, 10)),
+    ] {
+        let budget = RequestBudgetV1::from_opt_in(tranche, hard_cap);
+        assert_eq!((budget.tranche, budget.hard_cap), expected);
+        assert!(budget.validate().is_ok());
+    }
+    assert!(
+        RequestBudgetV1::from_opt_in(Some(65), None)
+            .validate()
+            .is_err()
+    );
 }
 
 #[test]
 fn legacy_run_budget_omits_request_policy_and_new_pin_roundtrips() {
     let legacy: RunBudgetV1 = serde_json::from_str("{}").expect("legacy budget");
     assert!(legacy.is_empty());
+    assert_eq!(legacy.request_budget, None, "omission is unbounded");
     assert_eq!(
         serde_json::to_value(legacy).expect("legacy encodes"),
         serde_json::json!({})
@@ -48,6 +68,50 @@ fn legacy_run_budget_omits_request_policy_and_new_pin_roundtrips() {
             tranche: 40,
             hard_cap: 80
         })
+    );
+    for partial in [
+        serde_json::json!({"request_budget": {"hard_cap": 5}}),
+        serde_json::json!({"request_budget": {"tranche": 5}}),
+    ] {
+        assert!(
+            serde_json::from_value::<RunBudgetV1>(partial).is_err(),
+            "wire policies require both fields instead of CLI convenience defaults"
+        );
+    }
+}
+
+#[test]
+fn legacy_child_manifest_without_request_policy_is_unbounded() {
+    let mut manifest = AgentManifest {
+        agent: AgentId::new("unbounded-child"),
+        role: AgentRole::Subagent,
+        task: "long task".into(),
+        callsign: None,
+        model_profile: "fake-model".into(),
+        grant: Grant {
+            tools: Vec::new(),
+            effect_ceiling: Vec::new(),
+        },
+        budget_tokens: None,
+        placement: Placement::Local,
+        lease: LeaseId::new("unbounded-child-lease"),
+        fencing_epoch: 1,
+        attempt: 0,
+        parent: None,
+        coordinates: None,
+        cli_scope: None,
+    };
+    assert_eq!(
+        manifest.request_budget().expect("legacy manifest"),
+        None,
+        "omitted child request policy is unbounded"
+    );
+    manifest.coordinates = Some(serde_json::json!({
+        "request_budget": {"hard_cap": 5}
+    }));
+    assert!(
+        manifest.request_budget().is_err(),
+        "a partial child policy must not acquire implicit defaults"
     );
 }
 

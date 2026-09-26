@@ -142,6 +142,9 @@ pub struct ErrorPresentation {
     /// Exact local provider transport-phase budget selected for the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_ms: Option<u64>,
+    /// Typed loop-guard details of a `loop_limit` failure (v0.0.973).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_limit: Option<crate::loop_guard::LoopLimitV1>,
     pub scope: ErrorScope,
     pub allowed_actions: Vec<ErrorAction>,
     /// Provider's own error category, when its response supplied one.
@@ -207,6 +210,7 @@ impl ErrorPresentation {
             reset_at_ms: None,
             opened_within_ms: None,
             budget_ms: None,
+            loop_limit: None,
             scope,
             allowed_actions,
             provider_error_type: None,
@@ -266,6 +270,12 @@ impl ErrorPresentation {
         self.budget_ms = Some(budget_ms);
         self
     }
+
+    #[must_use]
+    pub fn with_loop_limit(mut self, loop_limit: crate::loop_guard::LoopLimitV1) -> Self {
+        self.loop_limit = Some(loop_limit);
+        self
+    }
 }
 
 const fn error_action_bit(action: ErrorAction) -> u16 {
@@ -306,6 +316,10 @@ struct RawErrorPresentation {
     opened_within_ms: Option<u64>,
     #[serde(default)]
     budget_ms: Option<u64>,
+    /// Kept raw so an unknown future `loop` kind never rejects the whole
+    /// presentation; it is dropped instead.
+    #[serde(default)]
+    loop_limit: Option<serde_json::Value>,
     #[serde(default)]
     scope: Option<ErrorScope>,
     #[serde(default)]
@@ -340,6 +354,9 @@ impl<'de> Deserialize<'de> for ErrorPresentation {
         presentation.reset_at_ms = raw.reset_at_ms;
         presentation.opened_within_ms = raw.opened_within_ms;
         presentation.budget_ms = raw.budget_ms;
+        presentation.loop_limit = raw
+            .loop_limit
+            .and_then(|value| serde_json::from_value(value).ok());
         Ok(presentation)
     }
 }
@@ -640,6 +657,35 @@ mod tests {
         assert_eq!(presentation.subcode.as_str(), "upper-unsafe-value");
         assert_eq!(presentation.allowed_actions, vec![ErrorAction::Retry]);
         assert!(!presentation.detail.contains('\0'));
+    }
+
+    #[test]
+    fn loop_limit_details_are_typed_additive_and_tolerant() {
+        use crate::loop_guard::LoopLimitV1;
+        let plain = ErrorPresentation::default();
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("loop_limit")
+                .is_none(),
+            "absent details keep the pre-973 shape"
+        );
+        let details = LoopLimitV1::RepeatedActions {
+            repeated_calls: 200,
+            suspect_after: 100,
+            stop_after_suspected: 100,
+        };
+        let presentation = ErrorPresentation::default().with_loop_limit(details);
+        let value = serde_json::to_value(&presentation).unwrap();
+        assert_eq!(value["loop_limit"]["loop"], "repeated_actions");
+        assert_eq!(value["loop_limit"]["repeated_calls"], 200);
+        let back: ErrorPresentation = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(back.loop_limit, Some(details));
+        let mut future = value;
+        future["loop_limit"] = serde_json::json!({"loop": "future_guard", "n": 1});
+        let tolerated: ErrorPresentation = serde_json::from_value(future).unwrap();
+        assert_eq!(tolerated.loop_limit, None);
+        assert_eq!(tolerated.title, presentation.title);
     }
 
     #[test]

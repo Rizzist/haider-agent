@@ -153,6 +153,7 @@ fn welcome(profile: &ResolvedProfile) -> Welcome {
     features.insert(haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned());
     features.insert(haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned());
     features.insert(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned());
+    features.insert(haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1.to_owned());
     Welcome {
         protocol: WIRE_PROTOCOL_VERSION,
         instance_id: "headless-test-peer".into(),
@@ -245,6 +246,7 @@ async fn respond_create_and_attach_with_account(
                 account_alias: account_alias.map(Into::into),
                 model: model.into(),
                 max_tokens: 4096,
+                max_tokens_source: None,
                 permission_overrides: None,
                 interaction_mode: SessionInteractionModeV1::Autonomous,
                 system_prompt_version: Some("test".into()),
@@ -371,6 +373,42 @@ fn request(timeout: Option<Duration>) -> HeadlessRunRequest {
     }
 }
 
+#[tokio::test]
+async fn sdk_headless_zero_budget_reaches_session_create_unchanged() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        let (request_id, body) = peer.request().await;
+        assert!(matches!(
+            body,
+            RequestBody::SessionCreateWithPermissionOverrides { max_tokens: 0, .. }
+        ));
+        peer.respond(
+            request_id,
+            ResponseBody::Error {
+                code: "fixture_stop".into(),
+                message: "create inspected".into(),
+                retryable: false,
+                data: None,
+            },
+        )
+        .await;
+    });
+    let (sender, _receiver) = mpsc::channel(1);
+    let mut run = request(None);
+    run.max_tokens = 0;
+    let error = run_headless(&profile, EnsureOptions::default(), run, sender)
+        .await
+        .expect_err("fixture refuses after inspecting create");
+    peer.await.expect("peer");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Rpc {
+            stage: "session.create",
+            ..
+        }
+    ));
+}
+
 async fn run_with_events(
     profile: ResolvedProfile,
     request: HeadlessRunRequest,
@@ -434,6 +472,7 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
                     account_alias: None,
                     model: "fake-model".into(),
                     max_tokens: 4_096,
+                    max_tokens_source: None,
                     permission_overrides: None,
                     interaction_mode: SessionInteractionModeV1::Autonomous,
                     system_prompt_version: Some("test".into()),

@@ -1310,11 +1310,60 @@ impl<T> OptionalLock<T> for rusqlite::Result<T> {
 // Helpers: masking, slugs, ids, time
 // ---------------------------------------------------------------------------
 
-fn apply_mask(text: &str, masked: bool) -> String {
+pub(crate) fn apply_mask(text: &str, masked: bool) -> String {
     if masked {
-        mask_text(text)
+        mask_text(&scrub_integrity_fields(text))
     } else {
         text.to_owned()
+    }
+}
+
+/// Masked exports are shareable. A mutation receipt preview (from a journal
+/// written before redacted mutations withheld their digests) or a human file
+/// review may carry exact content digests; drop every integrity digest, also
+/// when a bounded preview ends midway through a quoted digest.
+fn scrub_integrity_fields(text: &str) -> String {
+    let mut safe = text.to_owned();
+    for key in [
+        "mutation_digest",
+        "subject_digest",
+        "pre_digest",
+        "post_digest",
+        "pre_artifact",
+        "old_digest",
+        "new_digest",
+    ] {
+        let needle = format!("\"{key}\":\"");
+        while let Some(start) = safe.find(&needle) {
+            let value_start = start + needle.len();
+            let value_end = safe[value_start..]
+                .find('"')
+                .map_or(safe.len(), |offset| value_start + offset);
+            // Replace key and value with one constant: nothing digest-derived,
+            // not even a truncated prefix, survives.
+            let remove_end = if value_end < safe.len() {
+                value_end + 1
+            } else {
+                value_end
+            };
+            safe.replace_range(start..remove_end, "\"redacted_integrity\":null");
+        }
+    }
+    safe
+}
+
+#[cfg(test)]
+mod redaction_oracle_tests {
+    #[test]
+    fn masked_export_omits_complete_and_truncated_mutation_digests() {
+        let complete = r#"{"mutation_digest":"blake3:syntheticsecret","result":"copied"}"#;
+        let truncated = r#"{"mutation_digest":"blake3:synthetic"#;
+        for input in [complete, truncated] {
+            let masked = super::apply_mask(input, true);
+            assert!(!masked.contains("synthetic"));
+            assert!(!masked.contains("mutation_digest"));
+            assert_eq!(super::apply_mask(input, false), input);
+        }
     }
 }
 

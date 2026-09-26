@@ -767,6 +767,7 @@ fn live_selection_is_receipted_and_renders_the_resolved_pair() {
             provider: "openai-oauth".to_owned(),
             model: "o4-mini".to_owned(),
             worker_generation: 7,
+            output_budget: None,
         }),
     );
     assert!(commands.is_empty());
@@ -852,11 +853,58 @@ fn provider_stage_selection_preserves_pending_and_resolved_truth() {
             provider: "resolved-stage".to_owned(),
             model: "stage-model-v2".to_owned(),
             worker_generation: 9,
+            output_budget: None,
         }),
     );
     assert!(model.model_picker.is_none());
     assert_eq!(model.identity.provider, "resolved-stage");
     assert_eq!(model.identity.model_short, "stage-model-v2");
+}
+
+/// D1 (973 output cap): a user-set output budget that does not fit the newly
+/// selected model is clamped by the daemon; the TUI shows the typed notice
+/// next to the model flash instead of refusing the switch.
+#[test]
+fn clamped_user_output_budget_shows_a_notice_on_model_switch() {
+    let mut model = seeded_session();
+    let mut driver = LiveDriver::new("test");
+    run_slash(&mut model, "/model o4-mini");
+    model.handle(key(KeyCode::Enter));
+    let commands = pass(&mut driver, &mut model, None);
+    let command_id = commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::SelectModel { command_id, .. } => Some(command_id.clone()),
+            _ => None,
+        })
+        .expect("session.select_model issued");
+    pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ModelSelected {
+            command_id,
+            session: sid(),
+            provider: "openai".to_owned(),
+            model: "gpt-4o".to_owned(),
+            worker_generation: 8,
+            output_budget: Some(haider_protocol::output_budget::SessionOutputBudgetV1 {
+                max_tokens: 16_384,
+                source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                    requested: 30_000,
+                },
+                clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                    requested: 30_000,
+                    max_output_tokens: 16_384,
+                }),
+            }),
+        }),
+    );
+    assert_eq!(model.identity.model_short, "gpt-4o", "the switch committed");
+    let flash = model.flash.as_deref().unwrap_or_default();
+    assert!(
+        flash.contains("gpt-4o") && flash.contains("30000") && flash.contains("16384"),
+        "the flash names the model and the clamp: {flash:?}"
+    );
 }
 
 /// A typed refusal lands INLINE with the public code; the pending mark

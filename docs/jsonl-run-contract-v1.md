@@ -158,7 +158,7 @@ prefix/suffix or tool-specific projection and ends with exactly this standalone
 line (decimal unsigned integers and lowercase SHA-256):
 
 ```text
-[haider:truncated truncated=true original_bytes=<uint> payload_bytes=<uint> sha256=<64 lowercase hex of the ORIGINAL bytes>]
+[haider:truncated truncated=true original_bytes=<uint> payload_bytes=<uint> sha256=<64 lowercase hex>]
 ```
 
 `/truncation` is its typed mirror:
@@ -167,11 +167,51 @@ line (decimal unsigned integers and lowercase SHA-256):
 {"truncated":true,"original_bytes":1048576,"payload_bytes":1234,"sha256":"<hex64>"}
 ```
 
-`original_bytes` counts the original captured bytes before the preview's
-reduction; `sha256` hashes those bytes, not the retained prefix/suffix, a
-lossy UTF-8 conversion, or the JSON wrapper. For a process, stdout and stderr
-are hashed in capture order. Bytes observed while draining after a process
-limit also count; bytes never read from a terminated producer cannot count.
+For output with no redaction, `original_bytes` counts the original captured
+bytes before the preview's reduction and `sha256` hashes those bytes. For an
+output with any redaction, both fields instead describe the complete redacted
+rendering before paging or head/tail reduction. This includes content-addressed
+artifact references and process transcript digests published with the result.
+Redacted file freshness uses a profile-derived, process-secret keyed digest
+in the owner-local journal; after daemon restart a new read is needed before
+writing that file. Headless run output never carries a redacted freshness
+claim (keyed or not). A file mutation (`fs_write`, `fs_edit`, `fs_path`) whose
+path or content would be redacted is marked `redacted_content: true` on its
+`workspace_mutation` and `checkpoint_recorded` facts. For such a mutation the
+agent-visible result omits `mutation_digest` and `subject_digest` (it keeps
+`workspace_revision` and the `workspace_mutation` reference, which
+`graph_evidence` resolves), and headless run output replaces its mutation
+digest, checkpoint id and checkpoint digests with `withheld:` placeholders,
+drops per-path pre-image references and truncation reasons, and omits the
+tool result's file `effects` (exact byte counts). The exact facts remain in
+`haider events`. Headless `menu_opened` omits `file_review`; its raw diff
+digests belong to the interactive Ask surface only. `haider export --masked`
+drops integrity digests from transcript previews.
+Turn workspace tree receipts and process workspace mutation receipts report
+generic incomplete coverage when a path or file content would be redacted.
+They do not journal raw filenames, content digests, or byte counts for those
+entries. A client may see `workspace tree receipt unavailable: redacted
+material` or `reason=redacted_material` instead of an exact tree receipt.
+For `fs_search` with redaction, `bytes_scanned` describes processed safe text;
+unredacted searches retain their previous source-byte measure. Search matching
+and columns use the redacted line. After a secret that spans lines (an open
+quote or PEM block), the rest of that file reports line `0` (structured) and
+`?` (preview) instead of a physical line number. Paths whose names would be
+redacted appear as `[REDACTED:sensitive_path]` in search, glob and listings;
+glob patterns (`fs_glob`, `fs_search` `glob` and `file_glob`) match that marker,
+not the hidden name. In a file with redacted spans, `fs_edit` anchors match
+only visible text: an anchor with no visible match, or whose match touches a
+redacted span, gets the typed `anchor_in_redacted_content` refusal (every
+anchor does, for a wholly redacted file), and match counts ignore redacted
+bytes, so no edit outcome depends on a guess about a secret. Stale-read
+refusals in headless output, transcripts and exports omit `current_digest` and
+`recorded_digest`, as the provider projection does.
+The historical field name remains for older decoders; clients must not use it
+as an exact size or digest of a secret-bearing original. Old clients that use
+these fields for raw capture integrity checks must treat a redacted result as
+a different byte stream. For unredacted processes, stdout and stderr are
+hashed in capture order. Bytes observed while draining after a process limit
+also count; bytes never read from a terminated producer cannot count.
 Enumeration/execution limits retain their existing separate incompleteness
 facts. For filesystem search/glob, the original is the materialized result
 text, not unvisited files. `payload_bytes` counts UTF-8 bytes of the unchanged
@@ -371,16 +411,167 @@ accepted `haider run --output jsonl` stream.
 
 ## Logical request budgets (v0.0.970)
 
-Every logical provider dispatch carries a durable `provider_request_budget_v1`
-extension status with used requests, soft tranche, and hard cap. The default
-is 32 / 64. The soft-bound note is both model-readable and visible; the hard
-checkpoint commits with `run_failed { code: request_budget_exceeded }` and the
-single `errored` terminal. CLI exit is **78**, the stable dedicated internal
-request-ceiling code (previously shared blocked code 77), with continuation instructions.
-These facts replay unchanged and do not discard prior text or tool results.
+Logical request budgets are opt-in. An omitted policy is unbounded and emits no
+`provider_request_budget_v1` status. With an explicit policy, every logical
+provider dispatch carries that durable extension status with used requests,
+soft tranche, and hard cap. The soft-bound note is both model-readable and
+visible; the hard checkpoint commits with
+`run_failed { code: request_budget_exceeded }` and the single `errored`
+terminal. CLI exit is **78**, the stable dedicated internal request-ceiling
+code (previously shared blocked code 77), with continuation instructions. These
+facts replay unchanged and do not discard prior text or tool results.
+Interactive TUI and plain transcript rendering suppress progress statuses;
+bound checkpoints remain useful, and machine JSON/JSONL retains all facts for
+an explicitly budgeted run.
+Once a capped run emits its first request status, the TUI status strip and
+`haider session <id>` show `request cap N (tranche T)` once; session JSON
+exposes the selected run's optional `request_budget` object. Unbounded runs
+omit both displays and the JSON field.
+
+### Loop guards (`loop_limit`, v0.0.973)
+
+Three turn-local loop guards stop genuinely stuck loops. None counts
+productive work, and none is a request-count cap. They share one fingerprint
+set per turn.
+
+Fresh call IDs, request ordinals, usage updates, transport attempts, opaque
+replay state, and the automatic `max_tokens` nudge are never progress.
+
+The fingerprints are for comparison only. The journal and the model always
+receive the original data. They use structural rules, not per-format noise
+patterns:
+
+- **All content:** Unicode NFKC, a Latin fold of look-alike Cyrillic/Greek
+  letters, and collapsed whitespace.
+- **Tool results and assistant text:** every digit run is masked, so latency,
+  clock times, HTTP dates, epochs, counters, and numeric nonces never look new.
+  Digits directly after a letter or `_` are kept (`chunk5`, `mod12`, `v0`),
+  because they name something. Letters are never masked, so a new git SHA, UUID
+  or encoded token is a new result.
+- **Tool results only:** the result is compared as an unordered multiset. Each
+  line's `,`/`;`/`:`-separated items are sorted, then the lines are sorted. A
+  reordered list is therefore a repeat, while an added or removed line is
+  new.
+- **Assistant text:** case is folded.
+- **Assistant text and argument strings:** a run of one repeated punctuation
+  character is capped at three.
+- **Arguments:** canonical JSON with ordered keys and exact numbers. Digits in
+  argument strings are not masked, so a call with different arguments, such as
+  another file, is a new call.
+
+The three guards:
+
+1. **Continuation guard.** It counts consecutive `max_tokens`/`pause_turn`
+   finishes whose response added no progress. Here progress is new nonblank
+   assistant text, a new (tool, arguments, result) call fingerprint, or a new
+   provider-side tool result. The default allows eight; the ninth ends the turn
+   with `run_failed { code: loop_limit }` (CLI exit 70).
+2. **Repeated-tool-call guard** (result level; any finish reason, including
+   ordinary `tool_use` rounds). It counts consecutive completed calls, local or
+   provider-side, whose (tool name, canonical arguments, normalized result,
+   truncation, images / error status) was already seen in the turn. Only a new
+   call fingerprint resets it; **assistant text never does**.
+   - After 30 such calls, before the next provider request, it commits one
+     non-terminal `loop_suspected_v1` item with `guard: "repeated_tool_calls"`.
+   - After 30 more, the turn ends with `loop_limit` (exit 70).
+   - A pure loop of identical calls, with or without new narration in between,
+     is steered before request 32 and stops before request 62.
+3. **Repeated-action guard** (action level; result independent). It counts
+   consecutive completed calls whose (tool name, canonical arguments) was
+   already seen in the turn, with no new (tool, arguments) in between. A
+   changing result does not reset it; only a new (tool, arguments) does, and
+   assistant text never does.
+   - After 100 such calls it commits one `loop_suspected_v1` item with
+     `guard: "repeated_actions"`; after 100 more the turn ends with
+     `loop_limit` (exit 70).
+   - An identical call is steered before request 102 and stops before request
+     202 even when its result changes every time (etags, request IDs, a
+     growing log). A 150-poll of a changing resource is steered once and
+     keeps going; polling longer than 200 identical calls belongs to a
+     background task or a `monitor` watch, not to a repeated call.
+   - Cycles (A, B, C, A, B, C, ...) and parallel batches count call by call.
+   - **Screen steps are exempt while the screen changes.** A call to the
+     registered `computer` or `mobile` tool whose arguments parse through
+     that tool's typed operation parser is a screen step when it is a
+     screenshot, accessibility tree or inspect (observation) or a swipe,
+     scroll, tap/left-click or key (navigation). An observation whose result
+     (image content address or UI tree) differs from the previous identical
+     observation is not counted, and navigation is not counted while the
+     latest observation was such a change. Exempt steps neither count nor
+     reset the streak. Once an observation repeats the previous identical
+     one, screen steps count again. The result-level guard still counts
+     every screen step, so identical screenshots (stuck at the end of a list)
+     are steered before request 32 and stop before request 62. Unbounded
+     swipe + screenshot paging through changing content (for example 300
+     pages) is not stopped. The same action strings inside any other tool's
+     arguments are ordinary calls.
+
+Both call guards commit their steer before the next provider request. The
+`loop_suspected_v1` item carries `run_id`, `guard` (`repeated_tool_calls` or
+`repeated_actions`; absent in pre-addendum journals, meaning
+`repeated_tool_calls`), `repeated_calls`, `stop_after`, an optional `tool`, and
+`label`. It is visible in JSON/JSONL and as a transcript line in the TUI and
+plain renderers. The same typed note is added to the model's input and replays
+from the journal on every later request, including after a daemon restart. The
+note tells the model that writing text does not change the count, and to change
+tool or arguments, use a background task or wait/monitor tool instead of
+polling, or finish the turn. A new call that resets a streak re-arms its steer.
+The steer always precedes the stop, even when a parallel batch crosses both
+thresholds at once. When one batch crosses both steer thresholds, both steers
+are committed.
+
+**Where the details are.** Every `loop_limit` carries typed details in
+`presentation.loop_limit`: on the `run_failed` event payload (JSONL, replay,
+`session` journal) and on `error.presentation` of the `haider.run.v1` JSON. The
+object is tagged by `loop`:
+
+| `loop` | Fields |
+|---|---|
+| `no_progress_continuations` | `continuation_count`, `continuation_limit` |
+| `repeated_tool_calls` | `repeated_calls`, `suspect_after`, `stop_after_suspected` |
+| `repeated_actions` | `repeated_calls`, `suspect_after`, `stop_after_suspected` |
+
+The field is additive and optional: it is absent on every other error code, and
+readers must ignore unknown `loop` values. The top-level `run_failed` fields
+(`code`, `message`, `retryable`, `presentation`) and `haider.run.v1` `error`
+fields (`code`, `message`, `retryable`, `presentation`) are unchanged. The
+`message` text repeats the counts for humans; do not parse it.
+
+Accepted residuals:
+
+- **Slowly varying arguments.** A call whose arguments change every time, such
+  as `limit=N`, `offset=N` or `page=N` on the same resource, is a new action
+  each time and is never counted by any call guard, even when the result is
+  empty or identical. Only the continuation guard applies, and only across
+  `max_tokens`/`pause_turn` finishes. Explicit request budgets
+  (`--max-requests`) remain the bound for such a model.
+- **Slow drip.** One genuinely new call at least every 100 calls (or every 30,
+  when the repeats also repeat results) keeps resetting the streaks.
+- **Letter-only result noise** on an identical call is a new result, so the
+  result-level guard does not count it; the action guard bounds it at 200.
+- **Changing screens.** Computer-use/mobile-use paging whose screenshots keep
+  changing is never stopped by a call guard, including a stuck app whose
+  screen changes only in pixels (a clock or animation). Other tools mixed into
+  such a loop are still counted.
+- **Digit-only result changes** on an identical call (`Completed files: N`,
+  `stage N done`) are no new result, indistinguishable from a clock: such a loop
+  stops after eight no-progress continuations or 60 repeated tool calls.
+- **Repeated identical work that is productive** (for example 200 identical
+  `git commit -am step` calls in one turn) is stopped by the action guard.
+- The in-memory streaks restart after daemon recovery.
+
+The call guards are on by default. Embedders may disable them or change all
+four thresholds through `HarnessConfig::tool_loop_guard` (`ToolLoopGuardV1`).
+There is no CLI flag. No guard is related to an explicit request budget or its
+`request_budget_exceeded` exit 78.
 
 `haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
-request policy. `haider run --resume RUN_ID --output jsonl` accepts a fresh
+request policy. With only `--max-requests N`, the implicit tranche is
+`min(32, N)`; for example, `--max-requests 5` permits exactly five requests
+without an earlier soft checkpoint. With only `--request-tranche N`, the
+implicit hard cap is 64 (so N must be at most 64). An explicit tranche must
+not exceed an explicit cap. Supplying neither flag leaves the run unbounded.
+`haider run --resume RUN_ID --output jsonl` accepts a fresh
 turn in the original headless root session, restoring tool history and the
 source policy unless explicitly overridden. Its stream correlates the new
 run and retains the ordinary contiguous cursor contract. The source run and

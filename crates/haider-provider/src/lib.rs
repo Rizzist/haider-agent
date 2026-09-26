@@ -28,7 +28,14 @@ mod error_detail;
 mod error_templates;
 mod gemini;
 mod idle;
+mod model_limits;
+mod output_budget;
 pub use idle::{ProviderIdleDeadline, ProviderIdleTimeout};
+pub use model_limits::{StaticModelLimits, UNKNOWN_OUTPUT_LIMIT, static_model_limits};
+pub use output_budget::{
+    DEFAULT_OUTPUT_LIMIT, MAX_OUTPUT_LIMIT, explicit_output_ceiling, model_output_limit,
+    provider_stated_output_limit,
+};
 #[cfg(test)]
 mod gemini_tests;
 mod oauth_identity;

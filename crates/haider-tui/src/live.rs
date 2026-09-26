@@ -1849,6 +1849,8 @@ pub enum LiveReply {
         provider: String,
         model: String,
         worker_generation: u64,
+        /// Budget the selection committed; a clamp becomes a visible notice.
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     },
     /// `session.rename` committed (G2): the NORMALIZED title — never an
     /// echo of the request.
@@ -2056,6 +2058,8 @@ struct PendingCustom {
 
 /// `account.oauth_status` poll cadence while the browser owns the flow.
 const OAUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Minimum spacing between filesystem probes of a pending dated leaf.
+const WORKSPACE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const SESSION_SEEN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// The committed coordinates of one open menu (report R11 cut 4): a live
@@ -2170,6 +2174,26 @@ pub struct LiveDriver {
     origin_opens: HashMap<SessionId, OriginOpen>,
     origin_revisions: HashMap<SessionId, u64>,
     workspace_paths: HashMap<SessionId, String>,
+    /// Sessions whose workspace is a lazily-materialised dated leaf (created
+    /// here with an allocation, or carrying one in their metadata). Only
+    /// these may wear the "not created yet" cue: an absent legacy cwd is a
+    /// different fact the cue must not claim.
+    dated_sessions: std::collections::HashSet<SessionId>,
+    /// `session.create` commands that carried a dated allocation, keyed
+    /// until their reply names the daemon's session id.
+    creating_dated: std::collections::HashSet<CommandId>,
+    /// Dated leaves already observed on disk; materialisation is one-way,
+    /// so these are never probed again.
+    materialized_sessions: std::collections::HashSet<SessionId>,
+    /// The session the presence probe last judged, so a surface switch
+    /// re-probes even without an inbound reply.
+    workspace_probe_session: Option<SessionId>,
+    /// A reply arrived since the last probe of a pending leaf.
+    workspace_probe_due: bool,
+    /// When the pending leaf was last probed (throttle anchor).
+    workspace_probe_last: Option<std::time::Instant>,
+    /// Filesystem probes performed so far.
+    workspace_probe_count: u64,
     /// The ONE durable command of the open login card, so a failure can be
     /// correlated to it instead of merely coinciding with it (P2-2) and a
     /// retry re-stages UNDER IT rather than minting a second (P1-4).
@@ -2409,22 +2433,9 @@ fn ssh_profile_command(
     }
 }
 
-/// Ceiling on the OUTPUT-token budget `session.create` requests (W5f-2).
-///
-/// `session.create`'s `max_tokens` reaches the providers as the per-request
-/// OUTPUT cap (`max_output_tokens` / `max_tokens`) — it was being fed the
-/// identity's CONTEXT window (200k), which Anthropic rejects outright and
-/// OpenAI clamps unpredictably. 30k sits inside every current subscription
-/// model's output limit while leaving real headroom; a context window
-/// smaller than the ceiling still wins.
-pub const SESSION_OUTPUT_CAP: u64 = 30_000;
-
-/// The output budget a new session may request: the ceiling, bounded by the
-/// (smaller) context window when one is declared.
-#[must_use]
-pub fn session_output_cap(context_window: u64) -> u64 {
-    SESSION_OUTPUT_CAP.min(context_window.max(1))
-}
+/// Shared output-budget default retained for callers inspecting TUI policy.
+/// New sessions send zero so the daemon derives the limit for the exact model.
+pub use haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT as SESSION_OUTPUT_CAP;
 
 impl LiveDriver {
     /// A driver for one client instance. `instance` must be unique per
@@ -2445,6 +2456,13 @@ impl LiveDriver {
             origin_opens: HashMap::new(),
             origin_revisions: HashMap::new(),
             workspace_paths: HashMap::new(),
+            dated_sessions: std::collections::HashSet::new(),
+            creating_dated: std::collections::HashSet::new(),
+            materialized_sessions: std::collections::HashSet::new(),
+            workspace_probe_session: None,
+            workspace_probe_due: false,
+            workspace_probe_last: None,
+            workspace_probe_count: 0,
             login_command: None,
             login_attempt: None,
             retired_logins: std::collections::HashSet::new(),
@@ -2916,6 +2934,82 @@ impl LiveDriver {
         }
     }
 
+    /// Keep the active session's "not created yet" cue truthful (ratified
+    /// 972 contract: the TUI must not imply a dated leaf exists before its
+    /// first write). Bounded filesystem work: only an attached DATED session
+    /// whose leaf has not been seen is ever probed. Surface switches and
+    /// inbound replies both merely mark a probe due; a due probe runs at once
+    /// when the window allows, otherwise at its boundary (folded into
+    /// [`Self::next_deadline`]), so probes never exceed one per
+    /// [`WORKSPACE_PROBE_INTERVAL`] however fast replies or switches arrive.
+    /// Until a probe has seen the leaf, the cue stays on.
+    /// Once the leaf exists it is never probed again. The stat runs in the
+    /// live pass, never the render path. Non-local surfaces (no captured
+    /// launch path) cannot see the daemon's disk and never claim either
+    /// state.
+    pub fn sync_workspace_presence(&mut self, model: &mut AppModel, reply_arrived: bool) {
+        let active = model.active_session.clone();
+        let candidate = match (active.as_ref(), model.session_workspace_cwd.as_deref()) {
+            (Some(session), Some(cwd))
+                if self.launch_origin_path.is_some()
+                    && self.dated_sessions.contains(session)
+                    && !self.materialized_sessions.contains(session) =>
+            {
+                Some((session.clone(), cwd.to_owned()))
+            }
+            _ => None,
+        };
+        let switched = self.workspace_probe_session != active;
+        if switched {
+            // A switch marks the new surface due; it does NOT reset the
+            // throttle anchor, so rapid switching cannot exceed the bound.
+            self.workspace_probe_session.clone_from(&active);
+            self.workspace_probe_due = candidate.is_some();
+        } else if reply_arrived && candidate.is_some() {
+            self.workspace_probe_due = true;
+        }
+        let throttled = self
+            .workspace_probe_last
+            .is_some_and(|last| self.now < last + WORKSPACE_PROBE_INTERVAL);
+        let uncreated = match candidate {
+            Some((session, cwd)) if self.workspace_probe_due && !throttled => {
+                self.workspace_probe_due = false;
+                self.workspace_probe_last = Some(self.now);
+                self.workspace_probe_count = self.workspace_probe_count.saturating_add(1);
+                let exists = std::path::Path::new(&cwd).is_dir();
+                if exists {
+                    self.materialized_sessions.insert(session);
+                }
+                !exists
+            }
+            // Not probed this pass (throttled or not due): a candidate has
+            // never been SEEN on disk, so it keeps the cue — the safe side
+            // of the contract — until a probe observes the leaf.
+            Some(_) => true,
+            None => {
+                self.workspace_probe_due = false;
+                false
+            }
+        };
+        if model.session_workspace_uncreated != uncreated {
+            model.session_workspace_uncreated = uncreated;
+            model.dirty = true;
+        }
+    }
+
+    /// Whether a throttled presence probe is still waiting to run.
+    #[must_use]
+    pub fn workspace_probe_due(&self) -> bool {
+        self.workspace_probe_due
+    }
+
+    /// How many presence probes have stat-ed the filesystem (the bound's
+    /// observable, for tests and diagnostics).
+    #[must_use]
+    pub fn workspace_probe_count(&self) -> u64 {
+        self.workspace_probe_count
+    }
+
     // ------------------------------------------------------------ replies --
 
     /// Reduce one inbound fact, mutating the model, and return the RPCs the
@@ -3275,6 +3369,9 @@ impl LiveDriver {
                     if let Some(metadata) = summary.metadata.as_ref() {
                         self.workspace_paths
                             .insert(summary.session_id.clone(), metadata.cwd.clone());
+                        if metadata.workspace_allocation.is_some() {
+                            self.dated_sessions.insert(summary.session_id.clone());
+                        }
                         if let Some(origin) = metadata.launch_origin.as_ref() {
                             self.origin_revisions
                                 .insert(summary.session_id.clone(), origin.revision);
@@ -3460,6 +3557,9 @@ impl LiveDriver {
                 self.retire(&command_id);
                 self.generations.insert(session.clone(), worker_generation);
                 self.workspace_paths.insert(session.clone(), cwd.clone());
+                if self.creating_dated.remove(&command_id) {
+                    self.dated_sessions.insert(session.clone());
+                }
                 // THE LAUNCHER ORDER (R11 cut 4). Only now — with the
                 // daemon's own id in hand — does a row exist. Nothing was
                 // fabricated locally, so nothing has to be reconciled.
@@ -4523,6 +4623,7 @@ impl LiveDriver {
                 provider,
                 model: model_name,
                 worker_generation,
+                output_budget,
             } => {
                 self.retire(&command_id);
                 if self
@@ -4534,6 +4635,9 @@ impl LiveDriver {
                 }
                 self.generations.insert(session, worker_generation);
                 model.apply_model_selected(&provider, &model_name);
+                if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
+                    model.apply_output_budget_clamp(&clamp);
+                }
                 Vec::new()
             }
             LiveReply::Renamed {
@@ -5898,7 +6002,16 @@ impl LiveDriver {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        match (existing, busy) {
+        let existing = match (existing, busy) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        // A throttled presence probe wakes the loop when it may run.
+        let probe = self
+            .workspace_probe_last
+            .filter(|_| self.workspace_probe_due)
+            .map(|last| last + WORKSPACE_PROBE_INTERVAL);
+        match (existing, probe) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -6585,15 +6698,23 @@ impl LiveDriver {
                 let command_id = self.mint();
                 self.creating.insert(command_id.clone(), text.clone());
                 let workspace_allocation = model.pending_workspace_allocation.clone();
+                if workspace_allocation.is_some() {
+                    self.creating_dated.insert(command_id.clone());
+                }
                 if let Some(current) = workspace_allocation.as_ref() {
                     match haider_client::workspace::renew_workspace_allocation(current)
                         .and_then(haider_client::workspace::available_workspace_allocation)
                     {
                         Ok(next) => {
                             model.cwd = next.leaf.clone();
+                            model.pending_workspace_display =
+                                Some(workspace_display_path(&next.leaf));
                             model.pending_workspace_allocation = Some(next);
                         }
-                        Err(_) => model.pending_workspace_allocation = None,
+                        Err(_) => {
+                            model.pending_workspace_allocation = None;
+                            model.pending_workspace_display = None;
+                        }
                     }
                 }
                 vec![self.enqueue(
@@ -6606,7 +6727,7 @@ impl LiveDriver {
                         workspace_allocation,
                         provider: model.identity.provider.clone(),
                         model: model.identity.model_short.clone(),
-                        max_tokens: session_output_cap(model.identity.context_window),
+                        max_tokens: 0,
                         first_text: text,
                     },
                 )]
@@ -7783,7 +7904,11 @@ impl LiveDriver {
 /// canonical value remains in `workspace_cwd` for every filesystem/RPC use;
 /// this path is only painted, so it follows the same home abbreviation,
 /// other-user masking, and control escaping as launch-origin context.
-fn workspace_display_path(path: &str) -> String {
+/// The ONE display producer for workspace paths (sanitised, home-relative,
+/// `/`-normalised); the exe uses it for the first dated preview too, so the
+/// initial and renewed previews — and their fallback — are identical.
+#[must_use]
+pub fn workspace_display_path(path: &str) -> String {
     let environment = haider_client::workspace::WorkspaceEnvironment::capture();
     haider_client::launch_origin::sanitize_origin_path(
         Some(std::path::Path::new(path)),

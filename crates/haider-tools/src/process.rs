@@ -1007,6 +1007,7 @@ impl EffectBroker {
                         mutation_digest,
                         workspace_revision: None,
                         subject_digest: None,
+                        redacted_content: false,
                     });
             let outcome = match (&process_result.result, process_result.cancelled) {
                 (_, true) => match &process_result.escalation_note {

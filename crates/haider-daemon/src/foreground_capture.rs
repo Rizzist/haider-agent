@@ -7,6 +7,17 @@ use haider_protocol::ids::SessionId;
 use haider_protocol::item::OutputStream;
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_tools::{ProcessOutputChunk, ProcessResult, ToolError, ToolResult};
+use sha2::{Digest as _, Sha256};
+
+fn safe_capture_chunks(text: &str) -> Vec<ProcessOutputChunk> {
+    text.as_bytes()
+        .chunks(haider_tools::PROCESS_OUTPUT_CHUNK_BYTES)
+        .map(|bytes| ProcessOutputChunk {
+            stream: OutputStream::Stdout,
+            chunk_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+        .collect()
+}
 
 impl TaskFacade {
     /// Retains already-produced text in the same CAS chunk format and alias
@@ -18,17 +29,16 @@ impl TaskFacade {
         call_id: &str,
         text: &str,
     ) -> ToolResult<(haider_protocol::ids::ArtifactRef, usize)> {
-        let chunks = text
-            .as_bytes()
-            .chunks(haider_tools::PROCESS_OUTPUT_CHUNK_BYTES)
-            .map(|bytes| ProcessOutputChunk {
-                stream: OutputStream::Stdout,
-                chunk_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-            })
-            .collect::<Vec<_>>();
-        let safe_bytes = haider_tools::redact_process_output(&chunks)?.len();
+        let chunks = safe_capture_chunks(text);
+        let (safe, masked) = haider_tools::redact_process_output_with_redaction(&chunks)?;
+        let safe_bytes = safe.len();
+        let stored = if masked {
+            safe_capture_chunks(&safe)
+        } else {
+            chunks
+        };
         let bytes =
-            serde_json::to_vec(&chunks).map_err(|error| ToolError::cas(error.to_string()))?;
+            serde_json::to_vec(&stored).map_err(|error| ToolError::cas(error.to_string()))?;
         let artifact = self
             .hub
             .put_internal_artifact(bytes)
@@ -47,7 +57,7 @@ impl TaskFacade {
         session: &SessionId,
         result: &mut ProcessResult,
     ) -> ToolResult<String> {
-        let (artifact, safe) = if let Some(artifact) = &result.artifact {
+        let (artifact, chunks) = if let Some(artifact) = &result.artifact {
             let bytes = self
                 .hub
                 .get_internal_artifact(artifact)
@@ -55,22 +65,44 @@ impl TaskFacade {
                 .map_err(|error| ToolError::cas(error.message))?;
             let chunks: Vec<ProcessOutputChunk> = serde_json::from_slice(&bytes)
                 .map_err(|error| ToolError::cas(format!("invalid process capture: {error}")))?;
-            (
-                artifact.clone(),
-                haider_tools::redact_process_output(&chunks)?,
-            )
+            (artifact.clone(), chunks)
         } else {
-            let bytes = serde_json::to_vec(&result.inline_output)
+            let chunks = result.inline_output.clone();
+            let bytes =
+                serde_json::to_vec(&chunks).map_err(|error| ToolError::cas(error.to_string()))?;
+            let artifact = self
+                .hub
+                .put_internal_artifact(bytes)
+                .await
+                .map_err(|error| ToolError::cas(error.message))?;
+            (artifact, chunks)
+        };
+        let (safe, redaction_applied) =
+            haider_tools::redact_process_output_with_redaction(&chunks)?;
+        let artifact = if redaction_applied {
+            // All outward provenance now describes the complete redacted
+            // rendering. The original capture may remain owner-only in CAS,
+            // but its content address cannot cross the result boundary.
+            let safe_chunks = safe_capture_chunks(&safe);
+            let bytes = serde_json::to_vec(&safe_chunks)
                 .map_err(|error| ToolError::cas(error.to_string()))?;
             let artifact = self
                 .hub
                 .put_internal_artifact(bytes)
                 .await
                 .map_err(|error| ToolError::cas(error.message))?;
-            (
-                artifact,
-                haider_tools::redact_process_output(&result.inline_output)?,
-            )
+            result.inline_output = safe_chunks;
+            result.output_bytes = safe.len();
+            // Preserve incompleteness without publishing a raw drain count.
+            result.output_elided_bytes_at_least =
+                usize::from(result.output_elided_bytes_at_least > 0);
+            result.source_output_elided_bytes_at_least =
+                usize::from(result.source_output_elided_bytes_at_least > 0);
+            result.output_sha256 = format!("{:x}", Sha256::digest(safe.as_bytes()));
+            result.transcript_digest = format!("blake3:{}", blake3::hash(safe.as_bytes()).to_hex());
+            artifact
+        } else {
+            artifact
         };
         let registry = self.hub.task_registry();
         registry.retain_capture(

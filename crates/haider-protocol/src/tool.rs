@@ -106,7 +106,9 @@ pub struct ToolInventorySnapshot {
 pub struct BoundedResult {
     pub preview: String,
     pub truncated: bool,
-    /// Exact byte provenance for an output projection that discarded bytes.
+    /// Byte provenance for the complete safe rendering before projection.
+    /// With no redaction this is the original output; with redaction it is
+    /// the redacted rendering so the footer cannot test secret guesses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<ToolTruncation>,
     /// Applied file mutations, in workspace-receipt order.
@@ -145,8 +147,11 @@ pub struct BoundedResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolTruncation {
     pub truncated: bool,
+    /// Complete source bytes for unredacted output, or complete safe-rendering
+    /// bytes when a producer masked content. The field name is retained on wire.
     pub original_bytes: u64,
     pub payload_bytes: u64,
+    /// Digest of the same byte stream counted by `original_bytes`.
     pub sha256: String,
 }
 
@@ -288,6 +293,18 @@ pub enum ToolResultData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repaired: Option<bool>,
     },
+    /// The provider stopped because the response-token limit was reached
+    /// while this tool call's arguments were still open. The actor records
+    /// the raw partial bytes for diagnosis but never executes the call.
+    OutputLimitTruncation {
+        tool: String,
+        message: String,
+        /// Whether the actor sent the ordinary split-write continuation.
+        /// A repeated truncation reports false and remains a tool error,
+        /// never a malformed-call strike or a run terminal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repaired: Option<bool>,
+    },
     FsSearch {
         matches: Vec<FsSearchMatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -295,6 +312,8 @@ pub enum ToolResultData {
         binary_files_skipped: usize,
         skipped_sensitive: usize,
         files_scanned: usize,
+        /// Safe-rendering bytes for a search that masked any content; otherwise
+        /// the historical scanned source-byte count.
         bytes_scanned: usize,
     },
     FsGlob {
@@ -315,7 +334,10 @@ pub enum ToolResultData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsSearchMatch {
     pub path: String,
+    /// One-based physical line. Zero withholds the coordinate after a masked
+    /// secret spanning lines, whose hidden line count it would reveal.
     pub line: usize,
+    /// One-based column in the redacted line, never in the source line.
     pub column: usize,
     pub text: String,
     pub context_before: Vec<String>,
