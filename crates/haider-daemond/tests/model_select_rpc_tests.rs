@@ -796,11 +796,10 @@ async fn explicit_budget_above_unverified_fallback_is_admitted() {
 }
 
 /// 973-output-cap-fixes B1: Kimi Code (`kimi-oauth/kimi-for-coding`) and
-/// Haider Code (`haider-code/deepseek-v4-flash`, the daemon's static Haider
-/// Code row: 128,000 window, no declared output maximum) publish a context
-/// window but no output maximum, so their 30,000 derived default is not an
-/// explicit ceiling. (A catalog `glm-5.3` row without `max_output_tokens` is
-/// pinned in `provider_registry_tests` and the real-binary probe.) Over the real socket: session.create with 60,000,
+/// Haider Code (`haider-code/glm-5.3`, seeded as a fetched catalog row with
+/// no output maximum) publish a context window but no output maximum, so
+/// their 30,000 derived default is not an explicit ceiling. Over the real
+/// socket: session.create with 60,000,
 /// a session-config update to 60,000, and a model switch that inherits a
 /// user-set 60,000 are all admitted unclamped, and each next turn requests
 /// exactly 60,000. The context bound still refuses above half the window.
@@ -818,6 +817,30 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
         root.path().join("store"),
         root.path().join("runtime"),
     );
+    // Seed the persisted public catalog before daemon startup, as the
+    // account RPC tests do. The real inventory authority must select GLM.
+    let glm = haider_provider::DiscoveredModel {
+        slug: "glm-5.3".into(),
+        display_name: "GLM 5.3".into(),
+        context_window: Some(200_000),
+        max_output_tokens: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let store = haider_store::Store::open(&config.store_dir).expect("open catalog store");
+    let models_json = serde_json::to_string(&vec![glm]).expect("serialize catalog row");
+    let fetched_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as u64;
+    store
+        .put_provider_models("haider-code", &models_json, None, fetched_at_ms)
+        .expect("seed public Haider Code inventory");
     let kimi = Arc::new(FakeProvider::new(
         [text_turn("kimi one"), text_turn("kimi two")].concat(),
     ));
@@ -871,7 +894,7 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
             "b1-a-switch",
             &session_a,
             generation_a,
-            "deepseek-v4-flash",
+            "glm-5.3",
             Some("haider-code"),
         ),
     )
@@ -892,7 +915,7 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
         &config,
         &workspace,
         "haider-code",
-        "deepseek-v4-flash",
+        "glm-5.3",
         0,
     )
     .await;
@@ -913,7 +936,7 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
         "b1-b-config",
         &session_b,
         generation_b,
-        "deepseek-v4-flash",
+        "glm-5.3",
         None,
     );
     if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut update {
@@ -932,16 +955,16 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
     )
     .await;
     assert_eq!(haider_code.requests()[2].max_tokens, 60_000);
-    // The known window still bounds explicit budgets (half of 128,000).
+    // The known window still bounds explicit budgets (half of 200,000).
     let mut over = select_body(
         "b1-b-over",
         &session_b,
         generation_b,
-        "deepseek-v4-flash",
+        "glm-5.3",
         None,
     );
     if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut over {
-        *max_tokens = Some(64_001);
+        *max_tokens = Some(100_001);
     }
     let response = select_budget(&mut client, &config, "b1-b-over", over).await;
     let ResponseBody::Error { data, .. } = response else {
@@ -950,8 +973,8 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
     assert!(matches!(
         data,
         Some(ErrorData::ModelOutputLimit {
-            requested: 64_001,
-            max_output_tokens: 64_000,
+            requested: 100_001,
+            max_output_tokens: 100_000,
             ..
         })
     ));
