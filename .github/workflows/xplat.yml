@@ -117,6 +117,11 @@ jobs:
       - name: thin executable dependency and binary boundary
         if: matrix.phase == 'test' && (runner.os != 'Windows' || matrix.shard == 1)
         run: python scripts/qa-gate/thinexe_abba.py boundary --candidate target/debug --target ${{ matrix.target }} --output target/ci-test-logs/thinexe-boundary.json
+      - name: Windows executables must not need the VC++ redistributable
+        if: matrix.phase == 'test' && runner.os == 'Windows' && matrix.shard == 1
+        # Registry #176: hosted runners preinstall the redistributable, so a
+        # dynamic-CRT regression passes every runtime test here; check imports.
+        run: python scripts/release_packaging.py verify-windows-imports target/debug/haider.exe target/debug/haider-tui.exe target/debug/haiderd.exe
       - name: native Windows clipboard write and paste gate (no terminal)
         if: matrix.phase == 'test' && runner.os == 'Windows' && matrix.shard == 1
         env:

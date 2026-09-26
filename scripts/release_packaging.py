@@ -627,6 +627,197 @@ def _verify_release_bundle(artifact: Path, target: str, *, legacy: bool) -> None
         raise PackagingError(f"{sidecar}: archive checksum mismatch")
 
 
+# Redistributable Microsoft C/C++ runtime DLLs. They are absent from clean
+# Windows installs without the VC++ redistributable, so a shipped PE that
+# imports one dies with 0xC0000135 (STATUS_DLL_NOT_FOUND) before main
+# (registry #176: haider 0.0.972 on Chocolatey's clean Server 2019 verifier).
+# The api-ms-win-crt-* API sets forward to the Universal CRT; importing them
+# means the binary was linked against the dynamic CRT (/MD) at all.
+FORBIDDEN_WINDOWS_IMPORT = re.compile(
+    r"(?:vcruntime\d+(?:_\d+)?d?|msvcp\d+(?:_[a-z0-9_]+)?d?|msvcr\d+d?|ucrtbased?"
+    r"|api-ms-win-crt-[a-z0-9-]+|concrt\d+d?|vcomp\d+d?|vccorlib\d+d?|mfc\d+[a-z]*)\.dll",
+    re.IGNORECASE,
+)
+_PE_IMPORT_DIRECTORY = 1
+_PE_DELAY_IMPORT_DIRECTORY = 13
+
+
+class _PeImage:
+    """Just enough of the PE/COFF format to read import and delay-import names."""
+
+    def __init__(self, data: bytes, source: str) -> None:
+        self.data = data
+        self.source = source
+        if len(data) < 0x40 or data[:2] != b"MZ":
+            raise PackagingError(f"{source}: not a PE image (missing MZ header)")
+        pe = self._u32(0x3C)
+        if data[pe : pe + 4] != b"PE\0\0":
+            raise PackagingError(f"{source}: not a PE image (missing PE signature)")
+        coff = pe + 4
+        sections = self._u16(coff + 2)
+        optional_size = self._u16(coff + 16)
+        optional = coff + 20
+        magic = self._u16(optional)
+        if magic == 0x10B:
+            self.image_base = self._u32(optional + 28)
+            directories = optional + 96
+        elif magic == 0x20B:
+            self.image_base = self._u64(optional + 24)
+            directories = optional + 112
+        else:
+            raise PackagingError(f"{source}: unknown PE optional-header magic {magic:#x}")
+        self.directory_count = self._u32(directories - 4)
+        self.directories = directories
+        table = optional + optional_size
+        self.sections = []
+        for index in range(sections):
+            entry = table + index * 40
+            virtual_size, virtual_address, raw_size, raw_pointer = (
+                self._u32(entry + 8),
+                self._u32(entry + 12),
+                self._u32(entry + 16),
+                self._u32(entry + 20),
+            )
+            self.sections.append(
+                (virtual_address, max(virtual_size, raw_size), raw_pointer, raw_size)
+            )
+
+    def _read(self, offset: int, size: int) -> bytes:
+        if offset < 0 or offset + size > len(self.data):
+            raise PackagingError(f"{self.source}: truncated PE structure at {offset:#x}")
+        return self.data[offset : offset + size]
+
+    def _u16(self, offset: int) -> int:
+        return int.from_bytes(self._read(offset, 2), "little")
+
+    def _u32(self, offset: int) -> int:
+        return int.from_bytes(self._read(offset, 4), "little")
+
+    def _u64(self, offset: int) -> int:
+        return int.from_bytes(self._read(offset, 8), "little")
+
+    def directory(self, index: int) -> tuple[int, int]:
+        if index >= self.directory_count:
+            return 0, 0
+        entry = self.directories + index * 8
+        return self._u32(entry), self._u32(entry + 4)
+
+    def offset(self, rva: int) -> int:
+        for virtual_address, size, raw_pointer, raw_size in self.sections:
+            if virtual_address <= rva < virtual_address + size:
+                delta = rva - virtual_address
+                if delta >= raw_size:
+                    break
+                return raw_pointer + delta
+        raise PackagingError(f"{self.source}: RVA {rva:#x} is outside every PE section")
+
+    def string(self, rva: int) -> str:
+        start = self.offset(rva)
+        end = self.data.find(b"\0", start, start + 512)
+        if end < 0:
+            raise PackagingError(f"{self.source}: unterminated PE import name at {rva:#x}")
+        return self.data[start:end].decode("ascii", errors="replace")
+
+    def imports(self) -> tuple[list[str], list[str]]:
+        """Return (imported DLLs, delay-loaded DLLs) in table order."""
+        normal: list[str] = []
+        rva, size = self.directory(_PE_IMPORT_DIRECTORY)
+        if rva and size:
+            cursor = self.offset(rva)
+            while True:
+                descriptor = self._read(cursor, 20)
+                if descriptor == bytes(20):
+                    break
+                normal.append(self.string(int.from_bytes(descriptor[12:16], "little")))
+                cursor += 20
+        delayed: list[str] = []
+        rva, size = self.directory(_PE_DELAY_IMPORT_DIRECTORY)
+        if rva and size:
+            cursor = self.offset(rva)
+            while True:
+                descriptor = self._read(cursor, 32)
+                if descriptor == bytes(32):
+                    break
+                attributes = int.from_bytes(descriptor[0:4], "little")
+                name = int.from_bytes(descriptor[4:8], "little")
+                if not attributes & 1:
+                    # Pre-VC7 delay descriptors hold virtual addresses.
+                    name -= self.image_base
+                delayed.append(self.string(name))
+                cursor += 32
+        return normal, delayed
+
+
+def windows_pe_imports(data: bytes, source: str) -> dict[str, list[str]]:
+    normal, delayed = _PeImage(data, source).imports()
+    return {"imports": normal, "delay_imports": delayed}
+
+
+def forbidden_windows_imports(imports: dict[str, list[str]]) -> list[str]:
+    return sorted(
+        {
+            name
+            for names in imports.values()
+            for name in names
+            if FORBIDDEN_WINDOWS_IMPORT.fullmatch(name)
+        },
+        key=str.lower,
+    )
+
+
+def _windows_pe_inputs(path: Path) -> list[tuple[str, bytes]]:
+    suffixes = (".exe", ".dll")
+    if path.is_dir():
+        return [
+            (str(item), item.read_bytes())
+            for item in sorted(path.rglob("*"))
+            if item.is_file() and item.suffix.lower() in suffixes
+        ]
+    if path.suffix.lower() == ".zip":
+        try:
+            with zipfile.ZipFile(path) as archive:
+                return [
+                    (f"{path}!{item.filename}", archive.read(item))
+                    for item in archive.infolist()
+                    if not item.is_dir() and item.filename.lower().endswith(suffixes)
+                ]
+        except zipfile.BadZipFile as error:
+            raise PackagingError(f"{path}: invalid ZIP: {error}") from error
+    if not path.is_file():
+        raise PackagingError(f"{path}: Windows PE input does not exist")
+    return [(str(path), path.read_bytes())]
+
+
+def verify_windows_imports(paths: list[Path]) -> list[str]:
+    """Fail unless every shipped PE avoids the redistributable CRT DLLs.
+
+    Accepts PE files, directories (every nested .exe/.dll) and ZIP bundles
+    (every .exe/.dll member). Returns one report line per inspected PE.
+    """
+    report: list[str] = []
+    failures: list[str] = []
+    for path in paths:
+        inputs = _windows_pe_inputs(path)
+        if not inputs:
+            raise PackagingError(f"{path}: contains no .exe or .dll to inspect")
+        for source, data in inputs:
+            imports = windows_pe_imports(data, source)
+            forbidden = forbidden_windows_imports(imports)
+            report.append(
+                f"{source}: imports={','.join(imports['imports']) or '-'} "
+                f"delay={','.join(imports['delay_imports']) or '-'}"
+            )
+            if forbidden:
+                failures.append(f"{source}: imports {', '.join(forbidden)}")
+    if failures:
+        raise PackagingError(
+            "Windows PE imports the dynamic MSVC C runtime (link with "
+            "-C target-feature=+crt-static; clean Windows lacks the VC++ "
+            "redistributable):\n  " + "\n  ".join(failures)
+        )
+    return report
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -656,6 +847,14 @@ def _parser() -> argparse.ArgumentParser:
     repin.add_argument("--sha-linux-x64", required=True)
     repin.add_argument("--sha-windows-x64", required=True)
 
+    imports = commands.add_parser(
+        "verify-windows-imports",
+        help="fail if a Windows PE imports VCRUNTIME/MSVCP/api-ms-win-crt DLLs",
+    )
+    imports.add_argument(
+        "paths", type=Path, nargs="+", help="PE files, directories or ZIP bundles"
+    )
+
     npm = commands.add_parser("verify-npm")
     npm.add_argument("--package", type=Path, required=True)
     npm.add_argument("--version", required=True)
@@ -681,6 +880,9 @@ def main(argv: list[str] | None = None) -> int:
             repin_homebrew_scoop(
                 args.packaging_root, args.version, _release_shas(args)
             )
+        elif args.command == "verify-windows-imports":
+            for line in verify_windows_imports(args.paths):
+                print(line)
         elif args.command == "verify-npm":
             verify_npm_archive(args.package, args.version)
         else:  # pragma: no cover - argparse makes this unreachable.

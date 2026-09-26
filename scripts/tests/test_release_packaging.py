@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import hashlib
 import io
 import json
+import os
+import re
 import shutil
+import struct
 import tarfile
 import tempfile
 import unittest
@@ -77,6 +81,65 @@ def _nupkg(tree: Path, destination: Path) -> None:
         for path in tree.rglob("*"):
             if path.is_file():
                 archive.write(path, path.relative_to(tree).as_posix())
+
+
+def _pe(imports=(), delay_imports=(), *, pe32=False, legacy_delay=False) -> bytes:
+    """A minimal x64/x86 PE image whose .idata holds the given import names."""
+    image_base = 0x400000 if pe32 else 0x140000000
+    section_rva, section_offset = 0x1000, 0x200
+    import_size = 20 * (len(imports) + 1)
+    delay_size = 32 * (len(delay_imports) + 1)
+    names = b""
+    name_rvas = []
+    for name in (*imports, *delay_imports):
+        name_rvas.append(section_rva + import_size + delay_size + len(names))
+        names += name.encode("ascii") + b"\0"
+    body = b"".join(
+        struct.pack("<5I", 1, 0, 0, rva, 1) for rva in name_rvas[: len(imports)]
+    ) + bytes(20)
+    for rva in name_rvas[len(imports):]:
+        body += struct.pack(
+            "<8I", 0 if legacy_delay else 1,
+            (image_base + rva) if legacy_delay else rva, 0, 0, 0, 0, 0, 0,
+        )
+    body += bytes(32) + names
+    raw_size = (len(body) + 0x1FF) & ~0x1FF
+    optional_size = 224 if pe32 else 240
+    directories = [(0, 0)] * 16
+    if imports:
+        directories[1] = (section_rva, import_size)
+    if delay_imports:
+        directories[13] = (section_rva + import_size, delay_size)
+    optional = bytearray(optional_size)
+    if pe32:
+        struct.pack_into("<HI", optional, 0, 0x10B, 0)
+        struct.pack_into("<I", optional, 28, image_base)
+        struct.pack_into("<I", optional, 92, 16)
+        base = 96
+    else:
+        struct.pack_into("<H", optional, 0, 0x20B)
+        struct.pack_into("<Q", optional, 24, image_base)
+        struct.pack_into("<I", optional, 108, 16)
+        base = 112
+    for index, (rva, size) in enumerate(directories):
+        struct.pack_into("<II", optional, base + index * 8, rva, size)
+    header = bytearray(section_offset)
+    header[0:2] = b"MZ"
+    struct.pack_into("<I", header, 0x3C, 0x40)
+    header[0x40:0x44] = b"PE\0\0"
+    struct.pack_into(
+        "<HHIIIHH", header, 0x44, 0x14C if pe32 else 0x8664, 1, 0, 0, 0,
+        optional_size, 0x22,
+    )
+    header[0x58 : 0x58 + optional_size] = optional
+    struct.pack_into(
+        "<8sIIII", header, 0x58 + optional_size, b".idata", len(body),
+        section_rva, raw_size, section_offset,
+    )
+    return bytes(header) + body + bytes(raw_size - len(body))
+
+
+SYSTEM_IMPORTS = ("KERNEL32.dll", "ntdll.dll", "bcryptprimitives.dll", "ws2_32.dll")
 
 
 class ChocolateyReleaseTests(unittest.TestCase):
@@ -280,6 +343,136 @@ class SplitArchiveTests(unittest.TestCase):
         choco = (ROOT / "packaging/chocolatey/tools/chocolateyinstall.ps1").read_text()
         self.assertIn("haider-tui.exe", choco)
         self.assertIn("$binary.ignore", choco)
+        # Upgrade/uninstall must not fail on a still-running sibling image.
+        before = (ROOT / "packaging/chocolatey/tools/chocolateybeforemodify.ps1").read_text()
+        for name in ("'haider'", "'haider-tui'", "'haiderd'", "StartsWith($prefix", "Stop-Process"):
+            self.assertIn(name, before)
+
+
+class WindowsCrtImportTests(unittest.TestCase):
+    """Registry #176: a shipped PE must not need the VC++ redistributable."""
+
+    def write(self, root: Path, name: str, data: bytes) -> Path:
+        path = root / name
+        path.write_bytes(data)
+        return path
+
+    def test_parser_reads_import_and_delay_tables_for_pe32_and_pe32_plus(self):
+        # Pre-VC7 (VA-based) delay descriptors only exist in 32-bit images.
+        for pe32, legacy_delay in ((False, False), (True, False), (True, True)):
+            with self.subTest(pe32=pe32, legacy_delay=legacy_delay):
+                image = _pe(SYSTEM_IMPORTS, ("user32.dll",), pe32=pe32, legacy_delay=legacy_delay)
+                self.assertEqual(
+                    release_packaging.windows_pe_imports(image, "fixture"),
+                    {"imports": list(SYSTEM_IMPORTS), "delay_imports": ["user32.dll"]},
+                )
+
+    def test_static_crt_image_passes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.write(Path(temporary), "haider.exe", _pe(SYSTEM_IMPORTS))
+            report = release_packaging.verify_windows_imports([path])
+            self.assertEqual(len(report), 1)
+            self.assertIn("KERNEL32.dll", report[0])
+
+    def test_every_redistributable_crt_import_fails(self):
+        for forbidden in (
+            "VCRUNTIME140.dll", "vcruntime140_1.dll", "VCRUNTIME140D.dll",
+            "MSVCP140.dll", "msvcp140_atomic_wait.dll", "MSVCR120.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-heap-l1-1-0.dll",
+            "ucrtbase.dll", "ucrtbased.dll", "CONCRT140.dll", "VCOMP140.dll",
+        ):
+            for delayed in (False, True):
+                with self.subTest(forbidden=forbidden, delayed=delayed), tempfile.TemporaryDirectory() as temporary:
+                    image = (
+                        _pe(SYSTEM_IMPORTS, (forbidden,)) if delayed
+                        else _pe((*SYSTEM_IMPORTS, forbidden))
+                    )
+                    path = self.write(Path(temporary), "haiderd.exe", image)
+                    with self.assertRaisesRegex(release_packaging.PackagingError, re.escape(forbidden)):
+                        release_packaging.verify_windows_imports([path])
+
+    def test_system_dlls_that_merely_resemble_crt_names_pass(self):
+        # msvcrt.dll is the OS-private CRT shipped with every Windows release.
+        for name in ("msvcrt.dll", "api-ms-win-core-synch-l1-2-0.dll", "KERNEL32.dll"):
+            self.assertIsNone(release_packaging.FORBIDDEN_WINDOWS_IMPORT.fullmatch(name), name)
+
+    def test_zip_and_directory_inputs_check_every_pe_member(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "haider-v9.8.7-x86_64-pc-windows-msvc-split.zip"
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr("top/", b"")
+                archive.writestr("top/haider.exe", _pe(SYSTEM_IMPORTS))
+                archive.writestr("top/haider-tui.exe", _pe(SYSTEM_IMPORTS))
+                archive.writestr("top/haiderd.EXE", _pe((*SYSTEM_IMPORTS, "VCRUNTIME140.dll")))
+                archive.writestr("top/README.txt", b"readme")
+            with self.assertRaisesRegex(release_packaging.PackagingError, r"haiderd\.EXE: imports VCRUNTIME140\.dll"):
+                release_packaging.verify_windows_imports([bundle])
+            directory = root / "bin"
+            (directory / "nested").mkdir(parents=True)
+            self.write(directory, "haider.exe", _pe(SYSTEM_IMPORTS))
+            self.write(directory / "nested", "helper.dll", _pe(("MSVCP140.dll",)))
+            with self.assertRaisesRegex(release_packaging.PackagingError, r"helper\.dll: imports MSVCP140\.dll"):
+                release_packaging.verify_windows_imports([directory])
+
+    def test_inputs_without_a_real_pe_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            empty = root / "empty.zip"
+            with zipfile.ZipFile(empty, "w") as archive:
+                archive.writestr("top/README.txt", b"readme")
+            with self.assertRaisesRegex(release_packaging.PackagingError, "no .exe or .dll"):
+                release_packaging.verify_windows_imports([empty])
+            with self.assertRaisesRegex(release_packaging.PackagingError, "not a PE image"):
+                release_packaging.verify_windows_imports([self.write(root, "fake.exe", b"binary")])
+            with self.assertRaisesRegex(release_packaging.PackagingError, "does not exist"):
+                release_packaging.verify_windows_imports([root / "missing.exe"])
+            truncated = _pe(SYSTEM_IMPORTS)[:0x210]
+            with self.assertRaisesRegex(release_packaging.PackagingError, "truncated|outside"):
+                release_packaging.verify_windows_imports([self.write(root, "cut.exe", truncated)])
+
+    def test_cli_exit_codes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            good = self.write(root, "good.exe", _pe(SYSTEM_IMPORTS))
+            bad = self.write(root, "bad.exe", _pe(("VCRUNTIME140.dll",)))
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(release_packaging.main(["verify-windows-imports", str(good)]), 0)
+                self.assertEqual(release_packaging.main(["verify-windows-imports", str(good), str(bad)]), 1)
+
+    @unittest.skipUnless(os.environ.get("HAIDER_DYNAMIC_CRT_WINDOWS_ZIP"), "set HAIDER_DYNAMIC_CRT_WINDOWS_ZIP to a known-bad (e.g. 0.0.972) Windows zip")
+    def test_published_dynamic_crt_bundle_fails(self):
+        with self.assertRaisesRegex(release_packaging.PackagingError, "VCRUNTIME140.dll"):
+            release_packaging.verify_windows_imports([Path(os.environ["HAIDER_DYNAMIC_CRT_WINDOWS_ZIP"])])
+
+    def test_windows_msvc_targets_link_the_crt_statically(self):
+        # Plain-text parse: tomllib is 3.11+, and these tests also run on 3.9.
+        config = (ROOT / ".cargo/config.toml").read_text()
+        for target in ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+            table = re.search(rf"(?ms)^\[target\.{re.escape(target)}\]\n(.*?)(?=^\[|\Z)", config)
+            self.assertIsNotNone(table, target)
+            self.assertRegex(
+                table.group(1),
+                r'(?m)^rustflags = \["-C", "target-feature=\+crt-static"\]$',
+                target,
+            )
+
+    def test_workflows_gate_windows_imports_before_publication(self):
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        for job, before in (
+            ("\n  build:", "upload distribution archives"),
+            ("\n  installers:", "Build sign and inspect Windows installer"),
+            ("\n  publish:", "create or update release"),
+            ("\n  chocolatey:", "choco pack"),
+        ):
+            section = release[release.index(job):]
+            self.assertLess(section.index("verify-windows-imports"), section.index(before), job)
+        installer_check = (ROOT / ".github/workflows/windows-installer-check.yml").read_text()
+        self.assertLess(installer_check.index("verify-windows-imports"), installer_check.index("upload distribution archives"))
+        xplat = (ROOT / ".github/workflows/xplat.yml").read_text()
+        self.assertIn("verify-windows-imports target/debug/haider.exe target/debug/haider-tui.exe target/debug/haiderd.exe", xplat)
+        for text in (release, installer_check, xplat):
+            self.assertNotRegex(text, r"(?m)^\s*(?:RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_\w*WINDOWS\w*_RUSTFLAGS)\s*:")
 
 
 if __name__ == "__main__":
