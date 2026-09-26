@@ -23,6 +23,7 @@ fn request() -> TurnRequest {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 

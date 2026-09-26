@@ -121,11 +121,11 @@ use haider_provider::{
     Message, PROVIDER_DEADLINE_SAFETY_MARGIN, PromptCacheMetadata, Provider, ProviderError,
     ProviderErrorKind, ProviderRequestOrdinal, ProviderStream, ProviderStreamItem,
     ProviderTimeoutReason, ROUTE_STATE_POLL_INTERVAL, ResolvedAttachment, ToolDefinition,
-    TurnRequest, TurnTraceContext, apply_tool_result_image_budget,
+    ToolResultImageProjection, TurnRequest, TurnTraceContext, apply_tool_result_image_budget,
     before_provider_request_deadline, canonical_tool_definitions,
     canonical_tool_definitions_digest, deadline_exhausted_error,
     degrade_tool_result_images_to_placeholders, effective_request_budget,
-    validate_provider_view_prefix,
+    has_stale_computer_screenshots, validate_provider_view_prefix,
 };
 
 #[path = "actor_wake.rs"]
@@ -2272,6 +2272,11 @@ pub struct HarnessConfig {
     shared_provider_local_web_tool_names: Arc<[String]>,
     /// CAS-backed attachments resolved before crossing the provider boundary.
     pub attachments: Vec<ResolvedAttachment>,
+    /// Typed record of the image elision the daemon's prompt compile already
+    /// applied to the submitted history. Every provider request merges it
+    /// with its own projection, so a rewrite made before the actor saw the
+    /// history still reaches adapters as a typed fact.
+    pub prompt_image_projection: ToolResultImageProjection,
     /// Whether the resolved provider/model accepts vision inputs. Unsupported
     /// providers receive artifact-naming placeholders for tool images.
     pub tool_result_images_supported: bool,
@@ -2467,6 +2472,7 @@ impl HarnessConfig {
             provider_local_web_tools: Vec::new(),
             shared_provider_local_web_tool_names: Arc::default(),
             attachments: Vec::new(),
+            prompt_image_projection: ToolResultImageProjection::default(),
             tool_result_images_supported: false,
             usage_account: None,
             account_incarnation: None,
@@ -3299,6 +3305,9 @@ pub struct ContextCompactionRequest<'a> {
     pub covered_messages: Vec<Message>,
     pub retained_messages: Vec<Message>,
     pub attachments: Vec<haider_provider::ResolvedAttachment>,
+    /// Typed image-elision record of `covered_messages` (the actor's exact
+    /// provider projection), carried onto the summary request.
+    pub image_projection: ToolResultImageProjection,
     pub latest_compaction_summary_end: Option<usize>,
     pub economy_before: &'a ContextEconomy,
 }
@@ -4293,7 +4302,7 @@ impl HarnessActor {
     async fn resolve_tool_result_images(
         &mut self,
         messages: &mut [Message],
-    ) -> Result<Vec<ResolvedAttachment>, HaiderError> {
+    ) -> Result<(Vec<ResolvedAttachment>, ToolResultImageProjection), HaiderError> {
         let mut attachments = self.config.attachments.clone();
         let images_supported = self.config.tool_result_images_supported;
 
@@ -4368,10 +4377,11 @@ impl HarnessActor {
             ));
         }
 
-        apply_tool_result_image_budget(messages);
+        let mut projection = apply_tool_result_image_budget(messages);
+        projection.merge(&self.config.prompt_image_projection);
         if !images_supported {
             degrade_tool_result_images_to_placeholders(messages);
-            return Ok(attachments);
+            return Ok((attachments, projection));
         }
 
         let mut requested = Vec::<ImageBlockRef>::new();
@@ -4393,7 +4403,7 @@ impl HarnessActor {
         }
         if requested.is_empty() {
             self.resolved_tool_images.clear();
-            return Ok(attachments);
+            return Ok((attachments, projection));
         }
         let Some(reader) = reader else {
             return Err(tool_image_corrupt(
@@ -4439,7 +4449,7 @@ impl HarnessActor {
                 attachments.push(resolved.clone());
             }
         }
-        Ok(attachments)
+        Ok((attachments, projection))
     }
 
     /// Validates every tool-produced image before its ref can enter the
@@ -5660,7 +5670,8 @@ impl HarnessActor {
                 });
             let request_images_will_mutate = !self.config.tool_result_images_supported
                 || request_image_count > TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
-                || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN;
+                || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN
+                || has_stale_computer_screenshots(&request_messages);
             let mut request_only_tool_results =
                 if request_images_will_mutate {
                     request_messages
@@ -5685,6 +5696,14 @@ impl HarnessActor {
                 } else {
                     Vec::new()
                 };
+            // Image budgeting is request-local: durable history and its CAS
+            // refs are restored as soon as the stream opens. Computer-history
+            // elision, count/byte budgeting, and unsupported-image fallback
+            // can each rewrite previously sent provider bytes. Declare every
+            // such projection as a provider-view epoch rather than treating
+            // the rewritten prefix as append-only cache history.
+            let request_image_projection_epoch =
+                request_images_will_mutate.then(|| digest_json(&request_only_tool_results));
             let snapshot_insert_at = current_turn_start.min(request_messages.len());
             let mut request_stable_history_end = stable_history_end.min(request_messages.len());
             let mut request_cacheable_history_end =
@@ -5711,9 +5730,9 @@ impl HarnessActor {
             // the compatibility fallback instead of serializing P twice.
             let mut prefix_digests = usage_prefix_digests(&self.config, &[]);
             prefix_digests.immutable_history.clear();
-            let request_attachments =
+            let (request_attachments, request_image_projection) =
                 match self.resolve_tool_result_images(&mut request_messages).await {
-                    Ok(attachments) => attachments,
+                    Ok(resolved) => resolved,
                     Err(error) => {
                         if let Err(state_error) = self
                             .commit_pending_thinking(&run_id, &mut thinking_pending)
@@ -5732,6 +5751,10 @@ impl HarnessActor {
                             .await;
                     }
                 };
+            let request_view_snapshot = combine_provider_view_epochs(
+                volatile_context_epoch.as_deref(),
+                request_image_projection_epoch.as_deref(),
+            );
             // Cache metadata must exist before provider preparation, so this
             // is the last provider-neutral request-send boundary available to
             // the TTL selector. Sample every request at this same boundary;
@@ -5756,7 +5779,7 @@ impl HarnessActor {
                 },
                 prefix_digests.clone(),
                 usage_account.as_ref(),
-                volatile_context_epoch.as_deref(),
+                request_view_snapshot.as_deref(),
             );
             // Built-in adapters render directly from the daemon's Arc-backed
             // definitions. Standalone/injected providers retain the owned Vec
@@ -5775,6 +5798,7 @@ impl HarnessActor {
                 tools: request_tools,
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
+                tool_result_image_projection: request_image_projection,
             };
             let projected_input_tokens =
                 estimate_if_budget_guarded(self.config.provider_budget_guard.as_deref(), || {
@@ -5905,7 +5929,7 @@ impl HarnessActor {
                 },
                 prefix_digests.clone(),
                 usage_account.as_ref(),
-                volatile_context_epoch.as_deref(),
+                request_view_snapshot.as_deref(),
             );
             provider_request.cache_metadata = Some(cache_metadata.clone());
             if let Some(provider_view) = prepared
@@ -9642,7 +9666,7 @@ impl HarnessActor {
         // Round 5: resolve tool-result images exactly as the live lane does
         // — the compactor's replay must be the bytes the provider actually
         // saw, attachments included.
-        let attachments = self
+        let (attachments, image_projection) = self
             .resolve_tool_result_images(&mut covered)
             .await
             .map_err(DriveError::Store)?;
@@ -9653,6 +9677,7 @@ impl HarnessActor {
                 covered_messages: covered,
                 retained_messages: suffix.clone(),
                 attachments,
+                image_projection,
                 latest_compaction_summary_end,
                 economy_before: &self.config.context_economy,
             })
@@ -15370,11 +15395,14 @@ fn provider_error_allows_retry(
     {
         return false;
     }
-    // A locally bounded response-open wait is still retryable by the caller,
-    // but an automatic replay would start the same parked request again.
-    // Preserve the typed Retry action while terminalizing this attempt under
-    // Haider's own control, independent of the configured timeout value.
-    if error.timeout_reason == Some(ProviderTimeoutReason::ResponseOpen) {
+    // A locally bounded request upload or response-open wait is still
+    // retryable by the caller, but an automatic replay would start the same
+    // parked request again. Preserve the typed Retry action while ending
+    // this attempt under Haider's own control.
+    if matches!(
+        error.timeout_reason,
+        Some(ProviderTimeoutReason::RequestUpload | ProviderTimeoutReason::ResponseOpen)
+    ) {
         return false;
     }
     let Some(deadline) = deadline else {
@@ -17063,6 +17091,18 @@ fn tool_image_corrupt(message: impl Into<String>) -> HaiderError {
     HaiderError::new(ErrorCode::StoreCorrupt, message, false)
 }
 
+/// A request-only image projection and a volatile-context snapshot are both
+/// provider-view epochs; the request declares one digest covering whichever
+/// are present.
+fn combine_provider_view_epochs(volatile: Option<&str>, images: Option<&str>) -> Option<String> {
+    match (volatile, images) {
+        (None, None) => None,
+        (Some(volatile), None) => Some(volatile.to_owned()),
+        (None, Some(images)) => Some(images.to_owned()),
+        (Some(volatile), Some(images)) => Some(digest_json(&(volatile, images))),
+    }
+}
+
 /// E2 normalization point: every tool result passes through the actor before
 /// it is journaled, so legacy dispatchers cannot accidentally omit the typed
 /// presentation on a non-success result.
@@ -17206,6 +17246,44 @@ mod cu1_actor_tests {
         );
         config.tool_result_images_supported = images_supported;
         config
+    }
+
+    fn computer_screenshot(call_id: &str) -> [Message; 2] {
+        [
+            Message::assistant(vec![Block::ToolCall {
+                call_id: call_id.into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            }]),
+            Message::tool_result_with_images(
+                call_id,
+                "screenshot",
+                false,
+                vec![ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{call_id}")),
+                    media_type: "image/png".into(),
+                    width: 1_429,
+                    height: 804,
+                    byte_len: 1_000_000,
+                }],
+            ),
+        ]
+    }
+
+    #[test]
+    fn second_computer_screenshot_declares_request_only_history_rewrite() {
+        let first = computer_screenshot("screenshot-1");
+        assert!(!has_stale_computer_screenshots(&first));
+
+        let mut repeated = first.to_vec();
+        repeated.extend(computer_screenshot("screenshot-2"));
+        assert!(has_stale_computer_screenshots(&repeated));
+
+        repeated.push(Message::tool_result("ordinary-tool", "done", false));
+        assert!(
+            has_stale_computer_screenshots(&repeated),
+            "an unrelated result must not hide the request-local rewrite"
+        );
     }
 
     #[test]
@@ -17426,7 +17504,7 @@ mod cu1_actor_tests {
                 .collect(),
         )];
 
-        let attachments = actor
+        let (attachments, _) = actor
             .resolve_tool_result_images(&mut messages)
             .await
             .expect("unsupported provider projection");
@@ -17445,6 +17523,47 @@ mod cu1_actor_tests {
             preview.matches("unavailable to this provider").count(),
             TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
         );
+    }
+
+    /// The daemon's prompt compile elides stale screenshots BEFORE the actor
+    /// sees the history, so the actor's own projection of that history finds
+    /// nothing left to elide. The typed compile record must still reach every
+    /// provider request (it is what enables the Anthropic drop policy and the
+    /// OpenAI native-screenshot placeholder), merged with the actor's own.
+    #[tokio::test]
+    async fn prompt_compile_image_projection_reaches_every_actor_request() {
+        let mut durable = computer_screenshot("screenshot-1").to_vec();
+        durable.extend(computer_screenshot("screenshot-2"));
+        let mut compiled = durable.clone();
+        let compile_projection = apply_tool_result_image_budget(&mut compiled);
+        assert!(compile_projection.elided_all_images("screenshot-1"));
+        let mut again = compiled.clone();
+        assert!(
+            apply_tool_result_image_budget(&mut again).is_empty(),
+            "re-projecting compiled history finds nothing new"
+        );
+
+        let mut config = actor_config(false);
+        config.prompt_image_projection = compile_projection;
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new(Vec::new()));
+        let store: Arc<dyn StoreHandle> = Arc::new(MemoryStore::new());
+        let (mut actor, _handle) = HarnessActor::new(config, provider, store);
+        let mut request_messages = compiled;
+        request_messages.extend(computer_screenshot("screenshot-3"));
+        let (_, projection) = actor
+            .resolve_tool_result_images(&mut request_messages)
+            .await
+            .expect("request projection");
+        assert!(projection.rewrites_earlier_tool_results());
+        assert!(
+            projection.elided_all_images("screenshot-1"),
+            "compile record kept"
+        );
+        assert!(
+            projection.elided_all_images("screenshot-2"),
+            "actor record added"
+        );
+        assert!(!projection.elided_all_images("screenshot-3"), "latest kept");
     }
 
     #[tokio::test]
@@ -17492,7 +17611,7 @@ mod cu1_actor_tests {
             false,
             images.clone(),
         )];
-        let attachments = actor
+        let (attachments, _) = actor
             .resolve_tool_result_images(&mut messages)
             .await
             .expect("budgeted provider resolution");

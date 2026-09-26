@@ -427,6 +427,7 @@ fn responses_payload_uses_native_input_tools_and_reasoning_summary() {
         }],
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
 
     let payload = provider
@@ -525,6 +526,7 @@ fn responses_payload_carries_daemon_extracted_pdf_as_plain_input_text() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
 
     let payload = provider
@@ -550,6 +552,7 @@ fn compatible_payload_uses_chat_completions_lingua_franca() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
 
     let payload = provider.request_payload(&request).expect("Chat payload");
@@ -591,6 +594,7 @@ fn image_tool_request(artifact: ArtifactRef) -> TurnRequest {
             data_base64: "iVBORw0KGgo=".into(),
         }],
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -920,6 +924,7 @@ fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
 
     let payload = provider
@@ -1079,6 +1084,7 @@ fn openai_shape_request(with_cache_metadata: bool) -> TurnRequest {
             expected_later_reads: 2,
             reuse_gap_ms: Some(1_000),
         }),
+        tool_result_image_projection: Default::default(),
     }
 }
 

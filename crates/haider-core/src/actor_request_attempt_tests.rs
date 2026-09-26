@@ -334,30 +334,35 @@ fn provider_timeout_retry_requires_a_full_post_backoff_budget() {
     assert!(!short.retryable);
     assert_eq!(short.presentation.allowed_actions, vec![ErrorAction::None]);
 
-    let mut timeout = ProviderError::new(ProviderErrorKind::Transport, "provider timeout")
-        .with_presentation(ErrorPresentation::new(
-            "provider-timeout",
-            "Provider request timed out",
-            "The provider did not open in time.",
-            ErrorScope::Turn,
-            [ErrorAction::Retry],
-        ))
-        // The restored default can park for 60 seconds. With no outer
-        // deadline, only the typed reason prevents another identical wait.
-        .with_timeout_budget(60_000, 60_000)
-        .with_timeout_reason(ProviderTimeoutReason::ResponseOpen);
+    for reason in [
+        ProviderTimeoutReason::RequestUpload,
+        ProviderTimeoutReason::ResponseOpen,
+    ] {
+        let mut timeout = ProviderError::new(ProviderErrorKind::Transport, "provider timeout")
+            .with_presentation(ErrorPresentation::new(
+                "provider-timeout",
+                "Provider request timed out",
+                "The provider request did not finish in time.",
+                ErrorScope::Turn,
+                [ErrorAction::Retry],
+            ))
+            // Without an outer deadline, the typed reason prevents another
+            // identical long wait while preserving explicit user retry.
+            .with_timeout_budget(60_000, 60_000)
+            .with_timeout_reason(reason);
 
-    assert!(!provider_error_allows_retry(
-        &mut timeout,
-        None,
-        &RunId::new("response-open-timeout"),
-        1,
-    ));
-    assert!(timeout.retryable, "the caller may explicitly retry");
-    assert_eq!(
-        timeout.presentation.allowed_actions,
-        vec![ErrorAction::Retry]
-    );
+        assert!(!provider_error_allows_retry(
+            &mut timeout,
+            None,
+            &RunId::new("request-phase-timeout"),
+            1,
+        ));
+        assert!(timeout.retryable, "the caller may explicitly retry");
+        assert_eq!(
+            timeout.presentation.allowed_actions,
+            vec![ErrorAction::Retry]
+        );
+    }
 }
 
 #[test]

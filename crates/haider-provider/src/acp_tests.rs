@@ -153,6 +153,7 @@ fn turn_request(text: &str) -> TurnRequest {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 

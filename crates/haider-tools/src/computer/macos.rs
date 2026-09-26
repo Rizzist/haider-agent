@@ -1624,21 +1624,21 @@ mod tests {
             display_bounds: CGRect {
                 origin: CGPoint { x: 100.0, y: 50.0 },
                 size: CGSize {
-                    width: 1_440.0,
-                    height: 900.0,
+                    width: 1_920.0,
+                    height: 1_080.0,
                 },
             },
-            // A 3,000x1,875 Retina capture admitted by CU-1 at 2,048x1,280.
-            image_width: 2_048,
-            image_height: 1_280,
+            // A 1920x1080 capture admitted at the 1.15 MP compatibility cap.
+            image_width: 1_429,
+            image_height: 804,
         };
-        let point = match map_delivered_pixel(viewport, ScreenPoint { x: 1_024, y: 640 }) {
+        let point = match map_delivered_pixel(viewport, ScreenPoint { x: 714, y: 402 }) {
             Ok(point) => point,
             Err(error) => panic!("center must map: {error}"),
         };
-        assert_eq!(point.x, 820.0);
-        assert_eq!(point.y, 500.0);
-        assert!(map_delivered_pixel(viewport, ScreenPoint { x: 2_048, y: 0 }).is_err());
+        assert!((point.x - 1_059.328_201_539_538).abs() < 1e-9);
+        assert_eq!(point.y, 590.0);
+        assert!(map_delivered_pixel(viewport, ScreenPoint { x: 1_429, y: 0 }).is_err());
     }
 
     #[test]

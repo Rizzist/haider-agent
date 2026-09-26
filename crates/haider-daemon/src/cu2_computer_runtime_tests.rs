@@ -1267,8 +1267,7 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
             }
         })
         .expect("computer screenshot result");
-    assert_eq!(image.width, 2048);
-    assert!(image.height < 1_000);
+    assert_eq!((image.width, image.height), (1_567, 522));
     assert!(!journal_json.contains("data_base64"));
     let cas_bytes = store.get(&image.artifact).await.expect("screenshot CAS");
     assert!(!journal_json.contains(&base64::engine::general_purpose::STANDARD.encode(&cas_bytes)));
@@ -1306,6 +1305,33 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
             _ => None,
         })
         .expect("provider inspect image");
+    let (older_preview, older_images) = requests[2]
+        .messages
+        .iter()
+        .find_map(|message| match message.blocks.as_slice() {
+            [
+                Block::ToolResult {
+                    call_id,
+                    preview,
+                    images,
+                    ..
+                },
+            ] if call_id == "cu2-screenshot" => Some((preview, images)),
+            _ => None,
+        })
+        .expect("older screenshot result remains as retrievable history");
+    assert!(older_images.is_empty());
+    assert!(older_preview.contains("\"scope\":\"computer_screenshot_history\""));
+    assert!(older_preview.contains(image.artifact.as_str()));
+    assert_eq!(
+        requests[2]
+            .attachments
+            .iter()
+            .map(|attachment| &attachment.artifact)
+            .collect::<Vec<_>>(),
+        vec![&inspect_image.artifact],
+        "only the newest full computer screenshot reaches the provider"
+    );
     assert_ne!(inspect_image.artifact, image.artifact);
     assert_eq!((inspect_image.width, inspect_image.height), (1_500, 700));
     assert_eq!(

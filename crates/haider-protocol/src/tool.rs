@@ -22,6 +22,16 @@ pub const TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC: u64 = 192 * 1024 * 1024;
 /// Maximum width or height retained for a tool-produced image. Larger source
 /// screenshots are downscaled before they enter the CAS.
 pub const TOOL_RESULT_IMAGE_MAX_DIMENSION: u32 = 2_048;
+/// Compatibility envelope for screenshots returned by the computer tool,
+/// narrower than the generic tool-image ceiling above. Both limits come from
+/// Anthropic's computer-use tool guidance (long edge <= 1568 px, total area
+/// about 1.15 megapixels); captures are downscaled to satisfy both, and the
+/// stricter pixel limit is what bounds a 16:9 desktop capture.
+/// <https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool>
+pub const COMPUTER_SCREENSHOT_MAX_DIMENSION: u32 = 1_568;
+/// Pixel-area half of the computer-screenshot envelope; see
+/// [`COMPUTER_SCREENSHOT_MAX_DIMENSION`].
+pub const COMPUTER_SCREENSHOT_MAX_PIXELS: u64 = 1_150_000;
 /// Maximum tool-result images admitted to one provider request.
 pub const TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN: usize = 5;
 /// Maximum encoded tool-result image bytes admitted to one provider request.

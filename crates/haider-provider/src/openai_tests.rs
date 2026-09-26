@@ -20,6 +20,147 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TryRecvError;
 
 #[test]
+fn openai_computer_screenshot_history_still_elides_older_images() {
+    let screenshot = |id: &str| {
+        [
+            Message::assistant(vec![Block::ToolCall {
+                call_id: id.into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            }]),
+            Message::tool_result_with_images(
+                id,
+                "screenshot",
+                false,
+                vec![ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{id}")),
+                    media_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 8,
+                }],
+            ),
+        ]
+    };
+    let mut messages = screenshot("a")
+        .into_iter()
+        .chain(screenshot("b"))
+        .collect::<Vec<_>>();
+    crate::apply_tool_result_image_budget(&mut messages);
+    assert!(
+        matches!(&messages[1].blocks[0], Block::ToolResult { images, .. } if images.is_empty())
+    );
+    assert!(
+        matches!(&messages[3].blocks[0], Block::ToolResult { images, .. } if images.len() == 1)
+    );
+}
+
+/// Regression (12-final-opus BLOCKER 1): shared stale-screenshot elision
+/// strips the image of every earlier native OpenAI computer call, and the
+/// Responses render replays the full history, so from the second call on it
+/// failed with "completed without its required updated screenshot". Elided
+/// outputs now replay a placeholder screenshot keyed by the TYPED projection
+/// record, the latest output keeps its real capture, and a screenshot that
+/// is missing without that record is still rejected.
+#[test]
+fn native_openai_computer_history_renders_after_stale_screenshot_elision() {
+    let ga = |call_id: &str, x: u32| {
+        serde_json::json!({
+            "type": "computer_call", "call_id": call_id, "status": "completed",
+            "actions": [{"type": "click", "button": "left", "x": x, "y": 20}],
+        })
+    };
+    let preview = |call_id: &str, x: u32| {
+        serde_json::json!({
+            "type": "computer_call", "call_id": call_id, "status": "completed",
+            "action": {"type": "click", "button": "left", "x": x, "y": 20},
+        })
+    };
+    let cases = [
+        ("gpt-5.4", [ga("ga_1", 10), ga("ga_2", 30), ga("ga_3", 50)]),
+        (
+            "computer-use-preview",
+            [
+                preview("pv_1", 10),
+                preview("pv_2", 30),
+                preview("pv_3", 50),
+            ],
+        ),
+    ];
+    for (model, calls) in cases {
+        let mut request = native_computer_followup(model, calls[0].clone());
+        for call in &calls[1..] {
+            let next = native_computer_followup(model, call.clone());
+            request.messages.extend(next.messages);
+            request.attachments.extend(next.attachments);
+        }
+        responses_request_json(&request, false, None, false)
+            .expect("unprojected native history renders");
+
+        request.tool_result_image_projection =
+            crate::apply_tool_result_image_budget(&mut request.messages);
+        assert!(
+            request
+                .tool_result_image_projection
+                .rewrites_earlier_tool_results()
+        );
+        let body = responses_request_json(&request, false, None, false)
+            .unwrap_or_else(|error| panic!("{model}: projected history renders: {error:?}"));
+        let outputs = body["input"]
+            .as_array()
+            .expect("input items")
+            .iter()
+            .filter(|item| item["type"] == "computer_call_output")
+            .collect::<Vec<_>>();
+        let expected_ids = calls
+            .iter()
+            .map(|call| call["call_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output["call_id"].clone())
+                .collect::<Vec<_>>(),
+            expected_ids,
+            "{model}: every native call keeps exactly one output"
+        );
+        for output in &outputs[..2] {
+            assert_eq!(
+                output["output"]["image_url"], OPENAI_ELIDED_COMPUTER_SCREENSHOT_URL,
+                "{model}: superseded screenshot replays the placeholder"
+            );
+            assert_eq!(output["output"]["type"], "computer_screenshot");
+        }
+        assert_eq!(
+            outputs[2]["output"]["image_url"], "data:image/png;base64,iVBORw0=",
+            "{model}: the latest screenshot keeps full fidelity"
+        );
+
+        request.tool_result_image_projection = crate::ToolResultImageProjection::default();
+        let error = responses_request_json(&request, false, None, false)
+            .expect_err("a screenshot missing without the typed record is still rejected");
+        assert!(
+            error
+                .message
+                .contains("completed without its required updated screenshot"),
+            "{}",
+            error.message
+        );
+    }
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        OPENAI_ELIDED_COMPUTER_SCREENSHOT_URL
+            .strip_prefix("data:image/png;base64,")
+            .expect("PNG data URL"),
+    )
+    .expect("placeholder base64");
+    assert!(
+        decoded.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "valid PNG signature"
+    );
+}
+
+#[test]
 fn shared_provider_builder_pins_idle_h2_and_tcp_keep_alive() {
     assert_eq!(
         crate::PROVIDER_KEEP_ALIVE,
@@ -1786,6 +1927,7 @@ fn probe_request(model: &str) -> TurnRequest {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -2124,6 +2266,7 @@ fn native_computer_followup(model: &str, call: serde_json::Value) -> TurnRequest
             data_base64: "iVBORw0=".into(),
         }],
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -3321,6 +3464,7 @@ fn openai_rendered_prefix_bytes_are_stable_across_turns() {
                 },
                 2,
             )),
+            tool_result_image_projection: Default::default(),
         };
         let (mut first_payload, first_wire_end, _) =
             responses_request_json_with_boundary(&first_turn, codex_responses_lite, None, false, 2)
@@ -3426,6 +3570,7 @@ fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 3)),
+        tool_result_image_projection: Default::default(),
     };
     request
         .cache_metadata
@@ -3654,6 +3799,7 @@ fn cm2g_openai_cache_keys_do_not_change_model_visible_content() {
         }],
         attachments: Vec::new(),
         cache_metadata: Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 2)),
+        tool_result_image_projection: Default::default(),
     };
     let mut annotated =
         responses_request_json(&request, false, None, false).expect("annotated wire");
@@ -3688,6 +3834,7 @@ fn cm2g_kimi_cache_key_preserves_thinking_tools_and_arguments() {
         }],
         attachments: Vec::new(),
         cache_metadata: Some(cm2_cache_metadata(KIMI_OAUTH_PROVIDER_NAME, 2)),
+        tool_result_image_projection: Default::default(),
     };
     let thinking = KimiThinkingConfig {
         thinking_type: KimiThinkingType::Enabled,
@@ -3949,6 +4096,7 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: Some(cm2_cache_metadata(KIMI_OAUTH_PROVIDER_NAME, 1)),
+        tool_result_image_projection: Default::default(),
     };
     let mut expected: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/openai/kimi_request.json"))
@@ -4084,6 +4232,7 @@ async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: Some(cm2_cache_metadata(DEEPSEEK_PROVIDER_NAME, 1)),
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider
         .request_payload(&request)
@@ -4149,6 +4298,7 @@ async fn haider_code_request_uses_fixed_chat_completions_bearer_and_model() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider
         .request_payload(&request)
@@ -4205,6 +4355,7 @@ async fn grok_oauth_proxy_request_pins_complete_header_contract() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider.request_payload(&request).expect("Grok payload");
     let outbound = provider
@@ -4896,6 +5047,7 @@ fn kimi_reasoning_effort_is_top_level_and_kimi_only() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider.request_payload(&request).expect("Kimi payload");
     assert_eq!(payload["reasoning_effort"], "max");
@@ -5037,6 +5189,7 @@ fn assistant_history_replays_as_output_text() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     for lite in [true, false] {
         let payload = responses_request_json(&request, lite, None, false).expect("payload");
@@ -5113,6 +5266,7 @@ async fn lz1_azure_request_rides_api_key_header_and_deployment_model() {
             tools: Vec::new(),
             attachments: Vec::new(),
             cache_metadata: None,
+            tool_result_image_projection: Default::default(),
         })
         .expect("azure chat payload");
     assert_eq!(

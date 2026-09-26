@@ -109,6 +109,7 @@ fn constructor_transport_config_disables_retries_and_bounds_connects_and_chunk_i
 
     assert_eq!(config.retry_policy, AnthropicRetryPolicy::Never);
     assert_eq!(config.connect_timeout, Duration::from_secs(10));
+    assert_eq!(config.response_open_timeout, Duration::from_secs(60));
     assert_eq!(config.chunk_idle_timeout, Duration::from_secs(90));
 }
 
@@ -216,6 +217,7 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
                 }],
             },
         ],
+        tool_result_image_projection: Default::default(),
     };
 
     let payload = provider
@@ -283,6 +285,7 @@ fn image_bearing_tool_result_uses_native_nested_content_or_named_placeholder() {
             data_base64: "iVBORw0KGgo=".into(),
         }],
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
 
     let payload = provider
@@ -418,6 +421,7 @@ fn native_pdf_enforces_anthropics_complete_request_size_limit() {
                 delivery: PdfDeliveryMode::NativeDocument,
             })],
         }],
+        tool_result_image_projection: Default::default(),
     };
 
     let error = provider
@@ -450,6 +454,7 @@ fn missing_image_data_is_a_typed_invalid_request() {
                 height: None,
             })],
         }],
+        tool_result_image_projection: Default::default(),
     };
 
     let error = provider
@@ -898,6 +903,7 @@ fn thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_reject
             },
             Message::tool_result("toolu_capture", "file contents", false),
         ],
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider("claude-fable-5")
         .request_payload(&request)
@@ -949,6 +955,7 @@ fn web_tools_declaration_is_exact_and_absent_without_the_flag() {
         attachments: Vec::new(),
         cache_metadata: None,
         messages: vec![Message::user_text("search the web")],
+        tool_result_image_projection: Default::default(),
     };
 
     let with_tools = provider("claude-fable-5")
@@ -1207,6 +1214,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
             },
             Message::user_text("thanks — continue"),
         ],
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider("claude-fable-5")
         .with_web_tools(true)
@@ -1243,6 +1251,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
             Message::assistant(vec![opaque(&signed_text)]),
             Message::user_text("next question"),
         ],
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider("claude-fable-5")
         .request_payload(&rehydrated)
@@ -1273,6 +1282,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
                 opaque(&signed_text),
             ]),
         ],
+        tool_result_image_projection: Default::default(),
     };
     let error = provider("claude-fable-5")
         .request_payload(&disagreeing)

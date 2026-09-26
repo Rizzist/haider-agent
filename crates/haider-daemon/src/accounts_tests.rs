@@ -14126,6 +14126,7 @@ fn the_api_key_gemini_request_shape_is_unchanged_by_the_supervised_agent() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider
         .request_payload(&request)

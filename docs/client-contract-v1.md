@@ -3212,7 +3212,15 @@ the same batch as the terminal and survives replay. Its data contains
 the original preceding provider error, including its retryability and typed
 timeout reason when present. A request that was silent from its first attempt
 has no preceding error. Genuine per-request response-open timeouts keep
-`provider_timeout` and their existing CLI exit 65. No RPC method is added.
+`provider_timeout` and their existing CLI exit 65. So does a request body that
+does not finish uploading within its size-based budget (64 KiB/s, clamped to
+30-300 s); its durable error `details.reason` is `request_upload`, and like
+`response_open` it is terminal for automatic replay while keeping an explicit
+Retry. No RPC method is added.
+`elapsed_ms` is active logical-request time from the first attempt and excludes
+time spent uploading request bodies. It is not wall-clock request duration;
+`idle_elapsed_ms` is time since the last received provider progress, also
+excluding upload intervals.
 
 ### 15.7 Custom OpenAI-compatible providers (local or web)
 

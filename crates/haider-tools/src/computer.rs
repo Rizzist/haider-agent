@@ -25,9 +25,19 @@ mod wayland;
 #[path = "computer/windows.rs"]
 mod windows;
 
+// Pure geometry for the Windows backend; compiled everywhere so its tests run
+// in macOS/Linux CI (only the Windows backend uses it at runtime).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[path = "computer/windows_geometry.rs"]
+mod windows_geometry;
+
 #[path = "computer/region.rs"]
 mod region;
 pub use region::{ComputerScreenshotCrop, ComputerScreenshotRegion, crop_screenshot_png};
+
+#[path = "computer/screenshot_bounds.rs"]
+mod screenshot_bounds;
+pub use screenshot_bounds::bound_computer_screenshot_png;
 
 use crate::broker::EffectOperation;
 use crate::{ToolError, ToolResult};
@@ -851,6 +861,44 @@ mod tests {
             .redact_png(png)
             .expect("passthrough");
         assert!(matches!(output, Cow::Borrowed(bytes) if bytes == png));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn computer_screenshot_enforces_long_edge_and_pixel_envelope() {
+        use haider_protocol::tool::{
+            COMPUTER_SCREENSHOT_MAX_DIMENSION, COMPUTER_SCREENSHOT_MAX_PIXELS,
+        };
+        use image::{DynamicImage, ImageFormat, ImageReader, RgbaImage};
+        use std::io::Cursor;
+
+        let pixels = RgbaImage::from_pixel(1_920, 1_080, image::Rgba([9, 40, 90, 255]));
+        let mut source = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut source, ImageFormat::Png)
+            .expect("encode full-HD screenshot");
+
+        let bounded = bound_computer_screenshot_png(source.get_ref()).expect("bound screenshot");
+        let dimensions = ImageReader::with_format(Cursor::new(&bounded), ImageFormat::Png)
+            .into_dimensions()
+            .expect("bounded dimensions");
+
+        assert_eq!(dimensions, (1_429, 804));
+        assert!(dimensions.0 <= COMPUTER_SCREENSHOT_MAX_DIMENSION);
+        assert!(dimensions.1 <= COMPUTER_SCREENSHOT_MAX_DIMENSION);
+        assert!(
+            u64::from(dimensions.0) * u64::from(dimensions.1) <= COMPUTER_SCREENSHOT_MAX_PIXELS
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn already_bounded_computer_screenshot_keeps_exact_png_bytes() {
+        let source = png_fixture();
+        assert_eq!(
+            bound_computer_screenshot_png(&source).expect("bounded screenshot"),
+            source
+        );
     }
 
     #[test]
