@@ -8,6 +8,9 @@ import importlib.util
 import hashlib
 import io
 import json
+import os
+import subprocess
+import textwrap
 import shutil
 import tarfile
 import tempfile
@@ -78,6 +81,53 @@ def _nupkg(tree: Path, destination: Path) -> None:
         for path in tree.rglob("*"):
             if path.is_file():
                 archive.write(path, path.relative_to(tree).as_posix())
+
+
+def _parse_workflow_structure(source: str) -> dict:
+    result: dict = {"jobs": {}, "permissions": {}, "env": {}, "on": {}}
+    section = ""
+    job: dict | None = None
+    step: dict | None = None
+    step_section = ""
+    for raw in source.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        if indent == 0 and line.endswith(":"):
+            section = line[:-1]
+            continue
+        if section == "on" and indent == 2 and line.endswith(":"):
+            result["on"][line[:-1]] = {}
+        elif section in ("permissions", "env") and indent == 2 and ":" in line:
+            key, value = line.split(":", 1)
+            result[section][key] = value.strip()
+        elif section == "jobs":
+            if indent == 2 and line.endswith(":"):
+                job = {"steps": []}
+                result["jobs"][line[:-1]] = job
+                step = None
+            elif indent == 4 and job is not None and ":" in line:
+                key, value = line.split(":", 1)
+                value = value.strip()
+                if key != "steps":
+                    job[key] = [part.strip() for part in value[1:-1].split(",")] if value.startswith("[") else value
+            elif indent == 6 and line.startswith("- ") and job is not None:
+                step = {}
+                job["steps"].append(step)
+                step_section = ""
+                key, value = line[2:].split(":", 1)
+                step[key] = value.strip()
+            elif indent == 8 and step is not None and ":" in line:
+                key, value = line.split(":", 1)
+                step_section = key if not value.strip() or (key == "run" and value.strip() == "|") else ""
+                step[key] = {} if step_section in ("env", "with") else value.strip()
+            elif indent >= 10 and step is not None and step_section == "run":
+                step["run"] += "\n" + line
+            elif indent == 10 and step is not None and step_section in ("env", "with") and ":" in line:
+                key, value = line.split(":", 1)
+                step[step_section][key] = False if value.strip() == "false" else value.strip()
+    return result
 
 
 class ChocolateyReleaseTests(unittest.TestCase):
@@ -340,29 +390,111 @@ class ChocolateyPackageFixTests(unittest.TestCase):
                     1,
                 )
 
-    def test_package_fix_workflow_is_dispatch_only_and_pins_the_original_release(self) -> None:
-        workflow = (ROOT / ".github/workflows/chocolatey-package-fix.yml").read_text()
-        self.assertIn("workflow_dispatch:", workflow)
-        self.assertNotIn("\n  push:", workflow)
-        self.assertNotIn("\n  pull_request:", workflow)
-        for fragment in (
-            "release_tag:",
-            "package_version:",
-            "--package-version",
-            "--dependency",
-            "--checksum",
-            "verify-chocolatey",
-            "choco pack",
-            "choco push",
-            "secrets.CHOCO_API_KEY",
-            "vcredist140=",
-            "403|Forbidden",
-            "401|Unauthorized",
-        ):
-            self.assertIn(fragment, workflow)
-        self.assertNotIn("gh release upload", workflow)
-        self.assertNotIn("gh release edit", workflow)
-        self.assertNotIn("git push", workflow)
+    def test_package_fix_workflow_scopes_secret_and_gates_publish(self) -> None:
+        workflow_text = (ROOT / ".github/workflows/chocolatey-package-fix.yml").read_text()
+        try:
+            import yaml
+        except ImportError:
+            # CI's stock Python has no YAML package. Parse the relevant mappings
+            # with strict indentation instead of silently skipping this gate.
+            workflow = _parse_workflow_structure(workflow_text)
+        else:
+            workflow = yaml.safe_load(workflow_text)
+        self.assertEqual(workflow_text.count("secrets.CHOCO_API_KEY"), 1)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertIn("pull_request", triggers)
+        self.assertIn("workflow_dispatch", triggers)
+        jobs = workflow["jobs"]
+        self.assertEqual(jobs["accept"]["needs"], "pack")
+        self.assertEqual(jobs["publish"]["needs"], ["pack", "accept"])
+        self.assertEqual(jobs["publish"]["if"], "github.event_name == 'workflow_dispatch'")
+        self.assertNotIn("CHOCO_API_KEY", workflow["env"])
+        push_steps = [step for step in jobs["publish"]["steps"]
+                      if "-Mode Push" in step.get("run", "")]
+        self.assertEqual(len(push_steps), 1)
+        self.assertEqual(push_steps[0]["env"]["CHOCO_API_KEY"], "${{ secrets.CHOCO_API_KEY }}")
+        for job in jobs.values():
+            self.assertNotIn("CHOCO_API_KEY", job.get("env", {}))
+            for step in job["steps"]:
+                if step is not push_steps[0]:
+                    self.assertNotIn("CHOCO_API_KEY", step.get("env", {}))
+                if step.get("uses", "").startswith("actions/checkout@"):
+                    self.assertIs(step["with"]["persist-credentials"], False)
+        self.assertIn("choco push", (ROOT / "scripts/chocolatey_publish.ps1").read_text())
+        self.assertNotIn("gh release upload", workflow_text)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell is required for publish behavior")
+    def test_chocolatey_publish_behavior(self) -> None:
+        script = ROOT / "scripts/chocolatey_publish.ps1"
+        harness = r"""
+function Invoke-WebRequest {
+  $index = $global:queryIndex
+  $global:queryIndex++
+  $statuses = $env:MOCK_STATUSES.Split(',')
+  $status = [int]$statuses[[Math]::Min($index, $statuses.Length - 1)]
+  if ($status -eq 200) {
+    $version = $env:PACKAGE_VERSION
+    $uri = "https://community.chocolatey.org/api/v2/Packages(Id='haider',Version='$version')"
+    $content = "<entry xmlns='http://www.w3.org/2005/Atom' xmlns:d='http://schemas.microsoft.com/ado/2007/08/dataservices' xmlns:m='http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'><id>$uri</id><title>haider</title><m:properties><d:Version>$version</d:Version></m:properties></entry>"
+    return [pscustomobject]@{ StatusCode = 200; Content = $content }
+  }
+  return [pscustomobject]@{ StatusCode = $status; Content = '' }
+}
+function choco {
+  Add-Content $env:MOCK_TRACE 'push'
+  $global:LASTEXITCODE = [int]$env:MOCK_PUSH_EXIT
+  Write-Output $env:MOCK_PUSH_OUTPUT
+}
+$global:queryIndex = 0
+try {
+  if ($env:MOCK_CHECK -eq '1') {
+    & $env:PUBLISH_SCRIPT -Mode Check
+    $env:PACKAGE_PRESENT = (Get-Content $env:GITHUB_OUTPUT | Select-Object -Last 1).Split('=')[1]
+  }
+  if ($env:MOCK_DO_PUSH -eq '1') { & $env:PUBLISH_SCRIPT -Mode Push }
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} catch {
+  Write-Output "EXPECTED_ERROR: $_"
+  exit 1
+}
+"""
+        cases = [
+            # name, query statuses, key, check, push exit, output, expected exit, push calls
+            ("missing key", "404", "", False, 0, "", 1, 0),
+            ("present before push", "200", "fake", True, 0, "", 0, 0),
+            ("push success", "404", "fake", True, 0, "ok", 0, 1),
+            ("push 401", "404,404", "fake", True, 19, "401 Unauthorized", 19, 1),
+            ("push 403", "404,404", "fake", True, 19, "403 Forbidden", 19, 1),
+            ("409 now present", "404,200", "fake", True, 19, "409 Conflict", 0, 1),
+            ("409 still absent", "404,404", "fake", True, 19, "409 Conflict", 19, 1),
+            ("push 500", "404,404", "fake", True, 19, "500 Server Error", 19, 1),
+            ("feed query error", "503", "fake", True, 0, "", 1, 0),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness_path = root / "publish-harness.ps1"
+            harness_path.write_text(textwrap.dedent(harness))
+            for name, statuses, key, check, push_exit, push_output, expected, pushes in cases:
+                with self.subTest(name=name):
+                    trace = root / "trace.txt"
+                    summary = root / "summary.txt"
+                    output = root / "output.txt"
+                    for path in (trace, summary, output):
+                        path.write_text("")
+                    env = {**os.environ, "PUBLISH_SCRIPT": str(script),
+                           "PACKAGE_VERSION": FIX_VERSION, "CHOCO_API_KEY": key,
+                           "PACKAGE_PRESENT": "false", "MOCK_STATUSES": statuses,
+                           "MOCK_CHECK": "1" if check else "0", "MOCK_DO_PUSH": "0" if name == "feed query error" else "1",
+                           "MOCK_PUSH_EXIT": str(push_exit), "MOCK_PUSH_OUTPUT": push_output,
+                           "MOCK_TRACE": str(trace), "GITHUB_OUTPUT": str(output),
+                           "GITHUB_STEP_SUMMARY": str(summary)}
+                    result = subprocess.run(["pwsh", "-NoProfile", "-File", str(harness_path)],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertEqual(trace.read_text().count("push"), pushes)
+                    if name in ("missing key", "push 401", "push 403", "409 still absent", "push 500"):
+                        self.assertIn("NOT pushed", summary.read_text())
 
 
 class SiblingPackagerTests(unittest.TestCase):
