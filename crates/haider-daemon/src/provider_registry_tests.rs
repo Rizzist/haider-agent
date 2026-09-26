@@ -2272,7 +2272,7 @@ fn declared_and_fallback_rows_with_equal_maxima_keep_distinct_provenance() {
         ModelDetailWire {
             name: undeclared.name.clone(),
             display_name: undeclared.display_name.clone(),
-            max_output_tokens_source: declared.max_output_tokens_source,
+            max_output_tokens_source: undeclared.max_output_tokens_source,
             ..declared.clone()
         },
         undeclared.clone(),
