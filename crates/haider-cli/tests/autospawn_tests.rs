@@ -548,10 +548,24 @@ fn sigint_twice_with_nonterminal_run_honors_absolute_linger_for_both_endpoints()
         wait_for_daemon_exit(&profile, daemon_pid, case);
         let log = std::fs::read_to_string(profile.store_dir.join(haider_client::DAEMON_LOG_FILE))
             .expect("read daemon recovery log");
-        assert!(
-            log.contains("durable_quiescent=false decision=shutdown"),
-            "{case} deadline did not prove the stalled run was still nonterminal: {log}"
-        );
+        if remove_endpoint {
+            // A degraded endpoint keeps its immediate reap at the deadline.
+            assert!(
+                log.contains("durable_quiescent=false decision=shutdown"),
+                "{case} deadline did not prove the stalled run was still nonterminal: {log}"
+            );
+        } else {
+            // Orchestrator ruling O-1 (2026-09-25): the still-cancelling run
+            // EXTENDS the linger; the daemon retires only once it is terminal.
+            assert!(
+                log.contains("durable_quiescent=false decision=extend_linger"),
+                "{case} deadline did not extend the linger for the nonterminal run: {log}"
+            );
+            assert!(
+                log.contains("durable_quiescent=true decision=shutdown"),
+                "{case} did not retire only after the run settled: {log}"
+            );
+        }
         if remove_endpoint {
             assert!(
                 log.contains("endpoint-health event=coordinate_lost"),
@@ -821,20 +835,23 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     );
 }
 
-/// Abrupt launcher death leaves no cancellation receipt, so a hanging fake
-/// provider pins a genuinely nonterminal run through the launcher linger. The
-/// deadline must still start graceful drain, whose worker-aware cancellation
-/// becomes durable before the store and profile lock close.
+/// Orchestrator ruling O-1 (2026-09-25, no default caps; subagents keep
+/// running): abrupt launcher death leaves a genuinely nonterminal run. The
+/// launcher linger no longer retires the daemon underneath it — each expired
+/// deadline is EXTENDED while the run is live. (This test previously required
+/// the opposite: drain-cancel at the absolute deadline.) An explicit graceful
+/// `daemon stop` (O-2) is still a user stop of everything: it cancels the run
+/// durably before the store and profile lock close.
 ///
-/// MUTATION CHECK: restoring the durable-quiescence guard around the expired
-/// linger timer leaves the daemon and profile lock alive past the exit budget.
+/// MUTATION CHECK: restore the unconditional shutdown at the expired linger.
+/// Expected runtime failure: the daemon exits while the run is still live.
 #[test]
-fn absolute_idle_linger_durably_settles_a_nonterminal_run() {
+fn launcher_linger_is_extended_while_a_run_is_live_until_explicit_stop() {
     const IDLE_TTL_MS: u64 = 250;
     const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;
     const PROCESS_EXIT_GRACE_MS: u64 = 2_000;
     const EXIT_DEADLINE: Duration =
-        Duration::from_millis(IDLE_TTL_MS + DAEMON_DRAIN_BUDGET_MS + PROCESS_EXIT_GRACE_MS);
+        Duration::from_millis(DAEMON_DRAIN_BUDGET_MS + PROCESS_EXIT_GRACE_MS);
 
     ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
@@ -869,6 +886,36 @@ fn absolute_idle_linger_durably_settles_a_nonterminal_run() {
         "killed launcher must not exit successfully"
     );
 
+    // Many linger periods pass with no client while the run is live.
+    std::thread::sleep(Duration::from_millis(IDLE_TTL_MS * 12));
+    let daemon_log = || {
+        std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
+            .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"))
+    };
+    assert!(
+        process_exists(daemon_pid),
+        "daemon {daemon_pid} retired under a live run\n{}",
+        daemon_log()
+    );
+    let (state, terminal) = durable_run_head(store.path(), &observed);
+    assert!(!terminal, "the live run was settled by the linger: {state}");
+    assert!(
+        daemon_log().contains("reason=launcher_linger_deadline")
+            && daemon_log().contains("durable_quiescent=false decision=extend_linger"),
+        "the expired linger did not extend for the live run: {}",
+        daemon_log()
+    );
+
+    // Explicit graceful stop: a user stop of everything.
+    let stopped = haider_command(store.path())
+        .args(["daemon", "stop", "--json"])
+        .output()
+        .expect("explicit daemon stop");
+    assert!(
+        stopped.status.success(),
+        "daemon stop failed: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
     let deadline = Instant::now() + EXIT_DEADLINE;
     while (process_exists(daemon_pid) || profile.endpoint_path.exists())
         && Instant::now() < deadline
@@ -877,32 +924,23 @@ fn absolute_idle_linger_durably_settles_a_nonterminal_run() {
     }
     assert!(
         !process_exists(daemon_pid),
-        "daemon {daemon_pid} did not retire after the absolute launcher linger\n{}",
-        std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
-            .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"))
+        "daemon did not exit on explicit stop"
     );
     assert!(
         !profile.endpoint_path.exists(),
-        "absolute linger exit must remove the profile endpoint"
+        "explicit stop must remove the profile endpoint"
     );
     assert_eq!(
         haider_client::profile_lock::profile_lock_owner_pid(&profile.store_dir)
-            .expect("query profile lock after absolute linger"),
+            .expect("query profile lock after explicit stop"),
         None,
-        "absolute linger exit must release the kernel profile lock"
+        "explicit stop must release the kernel profile lock"
     );
     let (state, terminal) = durable_run_head(store.path(), &observed);
-    assert!(terminal, "graceful linger drain left the run nonterminal");
+    assert!(terminal, "graceful stop drain left the run nonterminal");
     assert_eq!(
         state, "cancelled",
         "graceful drain preserves a replayable terminal"
-    );
-    let daemon_log = std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
-        .expect("read absolute linger daemon log");
-    assert!(
-        daemon_log.contains("reason=launcher_linger_deadline")
-            && daemon_log.contains("durable_quiescent=false decision=shutdown"),
-        "absolute linger did not observe and drain the nonterminal run: {daemon_log}"
     );
 }
 

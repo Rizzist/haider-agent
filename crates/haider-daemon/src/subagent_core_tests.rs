@@ -4060,7 +4060,7 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                 .await
                 .expect("recover delegation mirror"),
             RecoveredWork::DetachedChildren(recovered) => DelegationHandle::new(hub.clone())
-                .rearm_detached_deliveries(&recovered.session_id, &recovered.run_id)
+                .rearm_detached_deliveries(&recovered.agents)
                 .await
                 .expect("re-arm detached deliveries"),
         }
@@ -5944,7 +5944,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 .await
                 .expect("recover delegation mirror"),
             RecoveredWork::DetachedChildren(recovered) => DelegationHandle::new(hub.clone())
-                .rearm_detached_deliveries(&recovered.session_id, &recovered.run_id)
+                .rearm_detached_deliveries(&recovered.agents)
                 .await
                 .expect("re-arm detached deliveries"),
             RecoveredWork::RouteWait(recovered) => manager_handle

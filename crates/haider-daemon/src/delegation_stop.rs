@@ -25,6 +25,11 @@ use haider_protocol::subagent_stop::{
 use std::sync::LazyLock;
 
 const DETACHED_DELIVERY_POLL: Duration = Duration::from_millis(250);
+/// A stop waits at most this long for its cancelled runs to settle before
+/// reporting (the report stays truthful either way).
+const STOP_CONVERGENCE_BOUND: Duration = Duration::from_secs(10);
+const STOP_CONVERGENCE_RESUBMIT_AFTER: Duration = Duration::from_millis(750);
+const STOP_CONVERGENCE_POLL: Duration = Duration::from_millis(50);
 
 /// In-process guard so one detached child has at most one delivery watcher.
 /// Durable dedupe is the deterministic delivery event id.
@@ -168,6 +173,10 @@ impl DelegationHandle {
     ) -> Result<SubagentStopSummary, HaiderError> {
         let mut summary = SubagentStopSummary::default();
         let mut monitors_cleared = HashSet::<SessionId>::new();
+        // Every run this request moved to cancelling, plus any run found
+        // already cancelling in the tree: the stop converges all of them.
+        let mut moved = Vec::<(SessionId, RunId)>::new();
+        let mut targets = Vec::<(SessionId, RunId)>::new();
         loop {
             let visited = self.walk_tree(&root).await?;
             summary.sessions = summary
@@ -189,6 +198,17 @@ impl DelegationHandle {
                             .await,
                     );
                 }
+                let snapshot = self
+                    .child_session_snapshot(&record.child_session_id)
+                    .await?;
+                for (run_id, state) in &snapshot.states {
+                    if *state == RunState::Cancelling {
+                        let key = (record.child_session_id.clone(), run_id.clone());
+                        if !targets.contains(&key) {
+                            targets.push(key);
+                        }
+                    }
+                }
                 for run_id in self.live_session_runs(&record.child_session_id).await? {
                     let command = stop_cancel_command(
                         &self.hub,
@@ -203,6 +223,11 @@ impl DelegationHandle {
                                 == haider_core::TurnCancellationStatus::Accepted =>
                         {
                             cancelled_this_pass = cancelled_this_pass.saturating_add(1);
+                            let key = (record.child_session_id.clone(), run_id.clone());
+                            moved.push(key.clone());
+                            if !targets.contains(&key) {
+                                targets.push(key);
+                            }
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -216,13 +241,196 @@ impl DelegationHandle {
                     }
                 }
             }
-            summary.cancelled_runs = summary.cancelled_runs.saturating_add(cancelled_this_pass);
             if cancelled_this_pass == 0 {
                 break;
             }
         }
-        summary.still_running = 0;
+        self.converge_cancelled_runs(&targets).await?;
+        // Report truthfully: count only runs this request moved that are
+        // now durably Cancelled, and every subagent whose session still has
+        // a non-terminal run (cancelling included).
+        let mut confirmed = 0_u64;
+        for (session_id, run_id) in &moved {
+            if self.run_state_of(session_id, run_id).await? == Some(RunState::Cancelled) {
+                confirmed = confirmed.saturating_add(1);
+            }
+        }
+        summary.cancelled_runs = confirmed;
+        summary.still_running = self.nonterminal_subagent_count(&root).await?;
         Ok(summary)
+    }
+
+    /// Durable state of one run (journal authority).
+    async fn run_state_of(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<Option<RunState>, HaiderError> {
+        Ok(self
+            .child_session_snapshot(session_id)
+            .await?
+            .states
+            .get(run_id)
+            .cloned())
+    }
+
+    /// Subagents in the tree with ANY non-terminal run, cancelling included.
+    async fn nonterminal_subagent_count(
+        &self,
+        root: &SubagentTreeRoot,
+    ) -> Result<u64, HaiderError> {
+        let mut count = 0_u64;
+        for record in self.walk_tree(root).await? {
+            if self
+                .child_session_snapshot(&record.child_session_id)
+                .await?
+                .states
+                .values()
+                .any(|state| !state.is_terminal())
+            {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Drives cancelled runs to a terminal state. A run whose owning
+    /// supervisor never started (an accepted-but-never-launched child) or
+    /// exited without terminalizing is re-submitted to the worker manager,
+    /// whose admission finalizes a durably cancelling run as Cancelled
+    /// without provider work; a run already owned is a no-op there.
+    async fn converge_cancelled_runs(
+        &self,
+        targets: &[(SessionId, RunId)],
+    ) -> Result<(), HaiderError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let started = tokio::time::Instant::now();
+        let mut resubmitted = HashSet::<RunId>::new();
+        loop {
+            let mut pending = Vec::new();
+            for (session_id, run_id) in targets {
+                if !self
+                    .run_state_of(session_id, run_id)
+                    .await?
+                    .is_some_and(|state| state.is_terminal())
+                {
+                    pending.push((session_id, run_id));
+                }
+            }
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= STOP_CONVERGENCE_RESUBMIT_AFTER {
+                for (session_id, run_id) in &pending {
+                    if resubmitted.insert((*run_id).clone())
+                        && let Err(error) = self.resubmit_for_finalization(session_id, run_id).await
+                    {
+                        tracing::warn!(%run_id, ?error, "cancelled subagent run could not be re-submitted for finalization");
+                    }
+                }
+            }
+            if elapsed >= STOP_CONVERGENCE_BOUND {
+                tracing::warn!(
+                    pending = pending.len(),
+                    "subagent stop did not observe every cancelled run terminal within its bound"
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(STOP_CONVERGENCE_POLL).await;
+        }
+    }
+
+    /// Re-submits a durable run to the worker manager so its supervisor
+    /// admission can finalize it (dedup-safe for an owned or queued run).
+    async fn resubmit_for_finalization(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<(), HaiderError> {
+        let mut cursor = 0;
+        let mut accepted_at = None;
+        loop {
+            let page = self
+                .hub
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                if envelope.run_id.as_ref() == Some(run_id)
+                    && matches!(
+                        envelope.payload.decode_event(),
+                        Ok(haider_protocol::EventPayload::UserMessage { .. })
+                    )
+                {
+                    accepted_at = Some((envelope.seq, envelope.branch_id.clone()));
+                    break;
+                }
+            }
+            if accepted_at.is_some() {
+                break;
+            }
+        }
+        let Some((accepted_seq, branch_id)) = accepted_at else {
+            return Ok(());
+        };
+        let turn_ordinal = self
+            .hub
+            .turn_ordinal(session_id, run_id)
+            .await?
+            .unwrap_or(0);
+        self.hub
+            .submit_internal_turn(AcceptedTurn {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn_ordinal,
+                accepted_seq,
+                worker_generation: self.hub.worker_generation(),
+                branch_id,
+                disposition: haider_core::TurnAdmissionDisposition::Queued,
+                first_user_turn: false,
+                pdf_attachments: Vec::new(),
+            })
+            .await
+    }
+
+    /// True when the delegating run of `agent` is already cancelling or
+    /// cancelled.
+    pub(crate) async fn parent_run_stopping(&self, agent: &AgentId) -> Result<bool, HaiderError> {
+        let Some(record) = self.hub.delegation(agent.clone()).await? else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.run_state_of(&record.parent_session_id, &record.parent_run_id)
+                .await?,
+            Some(RunState::Cancelling | RunState::Cancelled)
+        ))
+    }
+
+    /// Moves a never-launched child's accepted turn to cancelling; the
+    /// following submission finalizes it as Cancelled.
+    pub(crate) async fn cancel_unlaunched_child(&self, agent: &AgentId) -> Result<(), HaiderError> {
+        let Some(record) = self.hub.delegation(agent.clone()).await? else {
+            return Ok(());
+        };
+        let command = stop_cancel_command(
+            &self.hub,
+            &record,
+            &record.child_run_id,
+            &format!("parent-stopped-{}", record.agent_id),
+            "parent_stopped",
+        )?;
+        self.hub.cancel_internal_turn(command).await.map(|_| ())
     }
 
     /// Stops ONE named subagent: its original run (the receipt-bearing
@@ -260,6 +468,24 @@ impl DelegationHandle {
             monitors_removed,
             "named subagent cancelled without its children"
         );
+        // Acceptance is the response; convergence (finalizing a run whose
+        // supervisor never started) continues in the background.
+        let targets = self
+            .child_session_snapshot(&record.child_session_id)
+            .await?
+            .states
+            .into_iter()
+            .filter(|(_, state)| *state == RunState::Cancelling)
+            .map(|(run_id, _)| (record.child_session_id.clone(), run_id))
+            .collect::<Vec<_>>();
+        if !targets.is_empty() {
+            let coordinator = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = coordinator.converge_cancelled_runs(&targets).await {
+                    tracing::warn!(?error, "named subagent cancellation did not converge");
+                }
+            });
+        }
         Ok(primary_result)
     }
 
@@ -346,27 +572,29 @@ impl DelegationHandle {
         Ok(still_running)
     }
 
-    /// Startup recovery: re-arms result delivery for every child a main-only
-    /// stop detached from this run and that has not been delivered yet.
+    /// Startup recovery: re-arms result delivery for every child the
+    /// durable marker still owes a result, WHATEVER its state. A child that
+    /// was cancelled or failed while its delivery was owed (for example by a
+    /// graceful daemon stop) still delivers that cancelled/errored result, so
+    /// a foreground `agent wait` on it resolves (9-verify3 B-2).
     pub(crate) async fn rearm_detached_deliveries(
         &self,
-        parent_session_id: &SessionId,
-        parent_run_id: &RunId,
+        agents: &[AgentId],
     ) -> Result<(), HaiderError> {
-        for record in self
-            .hub
-            .delegations_for_parent_run(parent_session_id.clone(), parent_run_id.clone())
-            .await?
-        {
-            if record.report.is_some() || is_background_record(&record) {
-                continue;
-            }
-            let original = self.session_progress(&record).await?.state;
-            if !matches!(original, Some(RunState::Cancelling | RunState::Cancelled)) {
+        for agent in agents {
+            if let Some(record) = self.hub.delegation(agent.clone()).await? {
                 self.arm_detached_delivery(record);
             }
         }
         Ok(())
+    }
+
+    /// True while any in-process delivery watcher still owes a result.
+    pub(crate) fn detached_deliveries_pending() -> bool {
+        !DETACHED_WATCHERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     fn arm_detached_delivery(&self, record: DelegationRecord) {

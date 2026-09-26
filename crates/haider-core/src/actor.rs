@@ -9164,10 +9164,23 @@ impl HarnessActor {
                     cancel,
                 ),
             );
-            let result = tokio::select! {
-                biased;
-                () = cancel.cancelled() => None,
-                result = execution => Some(result),
+            // Delegation establishment (spawn/message) is short, bounded store
+            // work that accepts a child turn and then launches it. Dropping it
+            // mid-flight left accepted children never launched (stuck
+            // queued -> cancelling) and a Dispatched effect without an outcome
+            // that fences the parent's terminal commit (9-verify3 B-1). It is
+            // therefore run to completion; the cancellation is observed right
+            // after, and the coordinator finalizes a child whose parent run
+            // is already cancelling instead of launching it.
+            let non_abortable = matches!(tool.name.as_str(), "spawn_subagent" | "message_subagent");
+            let result = if non_abortable {
+                Some(execution.await)
+            } else {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    result = execution => Some(result),
+                }
             };
             let Some(result) = result else {
                 // Drop the losing execution future first. Process-backed

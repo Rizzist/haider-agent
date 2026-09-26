@@ -73,6 +73,11 @@ changes are additive; `schema_version` remains 1.
 - `agent.cancel` now stops only the named subagent (its original run, any
   later live run, and its own monitors). Its children keep running; this
   replaces the former recursive descendant sweep.
+- Welcome feature `run_stop_scope_v1` advertises scoped stops and
+  `agent.cancel_all`. Stops converge to terminal (never-launched children are
+  finalized as cancelled) and the `subagents` summary counts confirmed
+  cancellations; an auto-spawned daemon's idle linger is extended while any
+  run or owed delivery is live.
 
 ### v0.0.973 — autonomy limits become explicit opt-ins
 

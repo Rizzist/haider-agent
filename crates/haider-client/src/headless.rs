@@ -2339,6 +2339,23 @@ pub async fn headless_run_status(
     }
 }
 
+/// A non-default stop scope requires a daemon that advertises
+/// `run_stop_scope_v1`: an older daemon ignores the field and would silently
+/// perform a full stop. The ensure step then fails with `MissingFeatures`
+/// before any request is sent, so nothing is stopped.
+#[must_use]
+pub fn stop_scope_ensure_options(
+    mut ensure: EnsureOptions,
+    scope: haider_rpc::RunStopScopeWire,
+) -> EnsureOptions {
+    if !scope.is_all() {
+        ensure
+            .required_features
+            .insert(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned());
+    }
+    ensure
+}
+
 /// Idempotently requests durable cancellation by run id. `scope` `All`
 /// (`haider run --stop`) stops the run and every subagent in its tree;
 /// `Main` stops only the run; `Subagents` stops only its subagents.
@@ -2348,6 +2365,7 @@ pub async fn stop_headless_run(
     run_id: RunId,
     scope: haider_rpc::RunStopScopeWire,
 ) -> Result<HeadlessRunStopResult, HeadlessRunError> {
+    let ensure = stop_scope_ensure_options(ensure, scope);
     match lifecycle_request(
         profile,
         ensure,

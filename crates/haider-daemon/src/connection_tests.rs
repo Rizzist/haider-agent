@@ -362,14 +362,15 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        121,
-        "session launch-origin registration adds one feature to the \
-         existing 120-feature set"
+        122,
+        "run_stop_scope_v1 (2026-09-25 subagent stop semantics) adds one feature \
+         to the existing 121-feature set"
     );
     assert_eq!(
         welcome_features(),
         BTreeSet::from([
             haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned(),
+            haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned(),
             haider_rpc::FEATURE_AGENT_MESSAGE_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned(),
             FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),

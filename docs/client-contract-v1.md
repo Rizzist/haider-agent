@@ -2934,7 +2934,27 @@ Subagent stop semantics (owner decision 2026-09-25):
 - `agent.cancel` stops the named subagent only: its original run, any later
   live run and its own monitors. Its children keep running.
   `agent.cancel_all` (`haider agent cancel <session> --all`) is the explicit
-  whole-tree stop for a session.
+  whole-tree stop for a session. It deliberately leaves the session's own
+  (main) runs alone; a main run that is still going may spawn new subagents
+  afterwards. Use `headless.run.stop` (default scope) to stop a run together
+  with its subagents.
+- A stop converges: every subagent run it cancels reaches a terminal state,
+  including a child that was accepted but never launched. A spawn whose parent
+  run is already cancelling is never launched; its child is finalized as
+  cancelled. `subagents.cancelled_runs` counts runs confirmed `cancelled`;
+  `still_running` counts subagent runs still non-terminal when the response
+  was built.
+- A non-default `scope` requires the `run_stop_scope_v1` feature. The CLI
+  refuses `--stop-main`/`--stop-subagents` against a daemon without it (an
+  older daemon would ignore the field and stop everything).
+- Daemon lifetime: an auto-spawned daemon with a finite idle TTL never retires
+  while work is live. Any non-terminal run — a main run, a detached subagent —
+  or an owed detached-result delivery extends the linger; the daemon exits
+  only after everything is terminal and a full TTL has elapsed with no client.
+- An explicit graceful `haider daemon stop` is still a user stop of
+  everything: it cancels live runs, including subagents. A detached result
+  that was owed is delivered as `cancelled` when the daemon next starts, so a
+  foreground `agent wait` still resolves.
 
 Token and cost accounting is last-snapshot-wins per physical request ordinal.
 All request kinds, including compaction/cache-lifecycle traffic, participate.

@@ -747,7 +747,12 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                         ExitCode::from(EX_IOERR)
                     }
                 },
-                Err(error) => report_lifecycle_error(options.output, "haider.run.stop.v1", &error),
+                Err(error) => {
+                    if let Some(message) = stop_scope_unsupported_message(scope, &error) {
+                        eprintln!("haider: {message}");
+                    }
+                    report_lifecycle_error(options.output, "haider.run.stop.v1", &error)
+                }
             };
         }
         RunAction::Execute | RunAction::Start | RunAction::Replay(_) => {}
@@ -1668,6 +1673,37 @@ impl ClassifiedRunError {
             retryable: false,
         }
     }
+}
+
+/// S-1: an older daemon lacks `run_stop_scope_v1` and would treat a scoped
+/// stop as a full stop. The ensure step refuses first; say so plainly.
+fn stop_scope_unsupported_message(
+    scope: haider_rpc::RunStopScopeWire,
+    error: &HeadlessRunError,
+) -> Option<String> {
+    let flag = match scope {
+        haider_rpc::RunStopScopeWire::Main => "--stop-main",
+        haider_rpc::RunStopScopeWire::Subagents => "--stop-subagents",
+        _ => return None,
+    };
+    let HeadlessRunError::Ensure(EnsureError::MissingFeatures {
+        missing,
+        daemon_version,
+    }) = error
+    else {
+        return None;
+    };
+    missing
+        .contains(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1)
+        .then(|| {
+            format!(
+                "the running daemon (version {daemon_version}) does not support {flag} \
+                 (missing {}); nothing was stopped. Restart it with this haider version \
+                 (`haider daemon stop`) and retry, or use --stop to stop the run and all \
+                 of its subagents.",
+                haider_rpc::FEATURE_RUN_STOP_SCOPE_V1
+            )
+        })
 }
 
 fn classify_headless_error(error: &HeadlessRunError) -> ClassifiedRunError {
@@ -3174,5 +3210,49 @@ mod tests {
             })
         );
         assert!(stderr.is_empty());
+    }
+
+    /// S-1 (9-verify3): a scoped stop against a daemon without
+    /// `run_stop_scope_v1` is refused with a clear, flag-specific message;
+    /// the client also requires the feature before sending the request.
+    ///
+    /// MUTATION CHECK: drop the requirement in `stop_scope_ensure_options`
+    /// or the message mapping. Expected runtime failure: the feature is not
+    /// required, or no message names the flag.
+    #[test]
+    fn scoped_stop_requires_the_stop_scope_feature_and_explains_refusal() {
+        use haider_rpc::RunStopScopeWire as Scope;
+        let base = haider_client::EnsureOptions::default();
+        for (scope, required) in [
+            (Scope::All, false),
+            (Scope::Main, true),
+            (Scope::Subagents, true),
+        ] {
+            let options = haider_client::stop_scope_ensure_options(base.clone(), scope);
+            assert_eq!(
+                options
+                    .required_features
+                    .contains(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1),
+                required,
+                "{scope:?}"
+            );
+        }
+        let missing = HeadlessRunError::Ensure(EnsureError::MissingFeatures {
+            missing: std::collections::BTreeSet::from([
+                haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned()
+            ]),
+            daemon_version: "0.0.972".into(),
+        });
+        let main = super::stop_scope_unsupported_message(Scope::Main, &missing)
+            .expect("--stop-main refusal is explained");
+        assert!(
+            main.contains("--stop-main") && main.contains("nothing was stopped"),
+            "{main}"
+        );
+        assert!(
+            super::stop_scope_unsupported_message(Scope::Subagents, &missing)
+                .is_some_and(|message| message.contains("--stop-subagents"))
+        );
+        assert!(super::stop_scope_unsupported_message(Scope::All, &missing).is_none());
     }
 }

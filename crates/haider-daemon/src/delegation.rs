@@ -1215,6 +1215,21 @@ impl DelegationHandle {
         self.hub
             .mark_delegation_running(established.ticket.manifest.agent.clone())
             .await?;
+        // Never launch a spawn whose parent run is already stopping: the
+        // accepted child turn is moved to cancelling first, and the
+        // submission below lets its supervisor finalize it as Cancelled
+        // without starting provider work (9-verify3 B-1).
+        if self
+            .parent_run_stopping(&established.ticket.manifest.agent)
+            .await?
+        {
+            self.cancel_unlaunched_child(&established.ticket.manifest.agent)
+                .await?;
+            self.hub
+                .submit_internal_turn(established.accepted.clone())
+                .await?;
+            return Ok(());
+        }
         self.hub
             .submit_internal_turn(established.accepted.clone())
             .await?;

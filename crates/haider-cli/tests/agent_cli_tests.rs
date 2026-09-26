@@ -22,6 +22,7 @@ struct Profile {
     workspace: PathBuf,
     script: String,
     tool_exposure: Option<&'static str>,
+    extra_env: Vec<(&'static str, String)>,
 }
 
 impl Profile {
@@ -59,6 +60,7 @@ impl Profile {
             workspace,
             script: script.to_string(),
             tool_exposure: Some("spawn_subagent"),
+            extra_env: Vec::new(),
         }
     }
 
@@ -86,6 +88,9 @@ impl Profile {
             .stdin(Stdio::null());
         if let Some(exposure) = self.tool_exposure {
             command.env("HAIDER_TOOL_EXPOSURE", exposure);
+        }
+        for (name, value) in &self.extra_env {
+            command.env(name, value);
         }
         command
     }
@@ -2040,5 +2045,297 @@ fn run_stop_subagents_leaves_main_running() {
     wait_for("main cancelled", STOP_OBSERVATION, || {
         profile.run_state(&session, &run_id).as_deref() == Some("cancelled")
     });
+    profile.stop();
+}
+
+fn tree_script(width: usize, fan: usize) -> (Vec<String>, Value) {
+    let kids = (0..width).map(|i| format!("fake-k{i}")).collect::<Vec<_>>();
+    let mut root = kids
+        .iter()
+        .enumerate()
+        .map(|(i, kid)| spawn_step(&format!("s{i}"), &format!("kid {i}"), kid, true))
+        .collect::<Vec<_>>();
+    root.push(json!({"step":"finish","reason":"tool_use"}));
+    root.extend((0..width).map(|i| json!({"step":"expect_tool_result","call_id":format!("s{i}")})));
+    root.push(json!({"step":"hang"}));
+    let mut by_model = serde_json::Map::new();
+    by_model.insert("fake-model".into(), Value::Array(root));
+    by_model.insert("fake-leaf".into(), json!([{"step":"hang"}]));
+    for (i, kid) in kids.iter().enumerate() {
+        let mut steps = (0..fan)
+            .map(|j| {
+                spawn_step(
+                    &format!("g{j}"),
+                    &format!("leaf {i}.{j}"),
+                    "fake-leaf",
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        steps.push(json!({"step":"finish","reason":"tool_use"}));
+        steps.extend(
+            (0..fan).map(|j| json!({"step":"expect_tool_result","call_id":format!("g{j}")})),
+        );
+        steps.push(json!({"step":"hang"}));
+        by_model.insert(kid.clone(), Value::Array(steps));
+    }
+    let mut models = vec!["fake-model".to_owned(), "fake-leaf".to_owned()];
+    models.extend(kids);
+    (models, json!({"by_model": Value::Object(by_model)}))
+}
+
+impl Profile {
+    /// Non-terminal runs in any delegated child session (cancelling included).
+    fn nonterminal_child_runs(&self) -> Vec<(String, String)> {
+        let connection = self.db();
+        let mut statement = connection
+            .prepare(
+                "SELECT h.session_id, h.state_json FROM run_heads h
+                 JOIN delegations d ON d.child_session_id = h.session_id WHERE h.terminal = 0",
+            )
+            .expect("nonterminal child query");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("nonterminal rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode nonterminal rows")
+    }
+}
+
+/// 9-verify3 B-1: `run --stop` landing while a 6x4 tree is still spawning
+/// must converge — no child run may stay queued/cancelling — the tree must
+/// not keep growing afterwards, and the response must not overclaim.
+/// Random stop delays across fresh profiles (the verifier's race harness
+/// shape); fails on e66bc195 in most iterations.
+///
+/// MUTATION CHECK: make spawn dispatch abortable again, or skip the launch
+/// finalization under a stopping parent. Expected runtime failure: a child
+/// run remains `cancelling`/`queued` after the stop.
+#[test]
+fn run_stop_while_tree_is_spawning_converges_with_no_stuck_runs() {
+    let iterations = std::env::var("HAIDER_STOP_RACE_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(6);
+    for iteration in 0..iterations {
+        let (models, script) = tree_script(6, 4);
+        let profile = Profile::new(script);
+        profile.seed_models(&models.iter().map(String::as_str).collect::<Vec<_>>());
+        let (run_id, session) = profile.start_run("fake-model", "spawn a 6x4 tree");
+        let holder = profile
+            .command(&["session", &session, "--watch"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("attached watcher");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .subsec_nanos();
+        let delay_ms = 50 + u64::from(nanos % 550);
+        thread::sleep(Duration::from_millis(delay_ms));
+        let stopped = profile.stop_run("--stop", &run_id);
+        let summary = &stopped["result"]["subagents"];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut stuck = profile.nonterminal_child_runs();
+        while !stuck.is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(250));
+            stuck = profile.nonterminal_child_runs();
+        }
+        let settled = profile.delegations().len();
+        thread::sleep(Duration::from_secs(3));
+        assert!(
+            stuck.is_empty(),
+            "iteration {iteration} (stop after {delay_ms} ms): stuck child runs {stuck:?}; response {stopped}"
+        );
+        assert!(profile.nonterminal_child_runs().is_empty());
+        assert_eq!(
+            profile.delegations().len(),
+            settled,
+            "iteration {iteration}: the tree kept growing after the stop"
+        );
+        assert_eq!(
+            summary["still_running"], 0,
+            "iteration {iteration}: {stopped}"
+        );
+        let cancelled = summary["cancelled_runs"].as_u64().unwrap_or(u64::MAX);
+        assert!(
+            cancelled <= u64::try_from(settled).unwrap_or(u64::MAX),
+            "iteration {iteration}: overclaimed {stopped}"
+        );
+        eprintln!(
+            "stop race iteration {iteration}: delay {delay_ms} ms, {settled} delegations, cancelled_runs {cancelled}"
+        );
+        let mut holder = holder;
+        let _ = holder.kill();
+        let _ = holder.wait();
+        profile.stop();
+    }
+}
+
+/// 9-verify3 B-2: a waited-on result owed by a main-only stop survives a
+/// graceful daemon stop (which cancels the child): after restart the
+/// cancelled result is delivered and `agent wait` on the child resolves.
+///
+/// MUTATION CHECK: filter re-armed children by state again. Expected
+/// runtime failure: no delivery after restart and `agent wait` times out.
+#[test]
+fn owed_detached_result_is_delivered_after_daemon_restart() {
+    let root = json!([
+        spawn_step("spawn-c", "waited c", "fake-c", false),
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"spawn-c"},
+        {"step":"emit_text","text":"root done"},
+        {"step":"finish","reason":"end_turn"}
+    ]);
+    let profile = Profile::new(json!({"by_model": {
+        "fake-model": root,
+        "fake-c": [{"step":"delay","ms":60000},{"step":"emit_text","text":"never"},{"step":"finish","reason":"end_turn"}],
+    }}));
+    profile.seed_models(&["fake-model", "fake-c"]);
+    let (run_id, session) = profile.start_run("fake-model", "wait on c");
+    wait_for("child c", STOP_OBSERVATION, || {
+        profile.delegations().len() == 1
+    });
+    let c = profile.row(1);
+    wait_for("c live", STOP_OBSERVATION, || {
+        !profile.live_runs(&c.child_session).is_empty()
+    });
+    let stopped = profile.stop_run("--stop-main", &run_id);
+    assert_eq!(
+        stopped["result"]["subagents"]["still_running"], 1,
+        "{stopped}"
+    );
+    wait_for("marker", STOP_OBSERVATION, || {
+        profile
+            .journal_kinds(&session)
+            .iter()
+            .any(|item| item["kind"] == "subagents_still_running_v1")
+    });
+    // Explicit graceful daemon stop: cancels everything (O-2).
+    profile.stop();
+    assert_eq!(profile.row(1).state.as_deref(), Some("cancelled"));
+    // Restart through the wait itself; recovery must deliver the cancelled
+    // result so the foreground wait resolves.
+    let waited = profile.json(
+        &[
+            "agent",
+            "wait",
+            &session,
+            &c.agent,
+            "--json",
+            "--timeout",
+            "60s",
+        ],
+        "haider.agent.wait.v1",
+        130,
+    );
+    assert_eq!(waited["result"]["state"], "cancelled", "{waited}");
+    let delivered = profile
+        .journal_kinds(&session)
+        .into_iter()
+        .filter(|item| item["kind"] == "detached_child_result_v1")
+        .collect::<Vec<_>>();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert_eq!(delivered[0]["data"]["state"], "cancelled");
+    profile.stop();
+}
+
+/// Orchestrator ruling O-1: an auto-spawned daemon with a finite idle TTL
+/// does NOT retire while runs are live. After `run --stop-main` with no
+/// attached client, the detached children run to completion (the waited-on
+/// result is delivered), and only then does the daemon exit on its own.
+///
+/// MUTATION CHECK: let the linger deadline shut down with live runs again.
+/// Expected runtime failure: the children end `cancelled`, not `done`.
+#[test]
+fn ephemeral_daemon_outlives_linger_while_detached_children_run() {
+    let root = json!([
+        spawn_step("spawn-b", "background b", "fake-b", true),
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"spawn-b"},
+        spawn_step("spawn-c", "waited c", "fake-c", false),
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"spawn-c"},
+        {"step":"emit_text","text":"root done"},
+        {"step":"finish","reason":"end_turn"}
+    ]);
+    let child = |text: &str| json!([{"step":"delay","ms":9000},{"step":"emit_text","text":text},{"step":"finish","reason":"end_turn"}]);
+    let mut profile = Profile::new(json!({"by_model": {
+        "fake-model": root, "fake-b": child("B_DONE"), "fake-c": child("C_DONE"),
+    }}));
+    profile
+        .extra_env
+        .push(("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "1500".into()));
+    profile.seed_models(&["fake-model", "fake-b", "fake-c"]);
+    let (run_id, session) = profile.start_run("fake-model", "spawn b, wait on c");
+    wait_for("both children", STOP_OBSERVATION, || {
+        profile.delegations().len() == 2
+    });
+    let stopped = profile.stop_run("--stop-main", &run_id);
+    assert_eq!(
+        stopped["result"]["subagents"]["still_running"], 2,
+        "{stopped}"
+    );
+    // No client is attached from here on; the 1.5 s linger passes many
+    // times while the children still run.
+    wait_for("both children done", Duration::from_secs(60), || {
+        profile
+            .delegations()
+            .iter()
+            .all(|row| row.terminal == Some(1))
+    });
+    for row in profile.delegations() {
+        assert_eq!(row.state.as_deref(), Some("done"), "{row:?}");
+    }
+    // Everything terminal: the daemon now retires on its own, with no
+    // client attached. Each status probe is itself a client (it restarts the
+    // 1.5 s linger), so probe less often than the linger.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        thread::sleep(Duration::from_secs(4));
+        let status = profile.run(&["status", "--json", "--no-spawn"]);
+        if status.status.code() == Some(69) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not retire after work ended"
+        );
+    }
+    // The waited-on result was delivered before retirement: a fresh daemon
+    // serves it from the parent's durable child_result.
+    let c_agent: String = profile
+        .db()
+        .query_row(
+            "SELECT agent_id FROM delegations WHERE task = 'waited c'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("waited child c");
+    let waited = profile.json(
+        &[
+            "agent",
+            "wait",
+            &session,
+            &c_agent,
+            "--json",
+            "--timeout",
+            "20s",
+        ],
+        "haider.agent.wait.v1",
+        0,
+    );
+    assert_eq!(waited["result"]["report"]["summary"], "C_DONE", "{waited}");
+    assert_eq!(
+        waited["result"]["report_source"], "child_result",
+        "{waited}"
+    );
+    let delivered = profile
+        .journal_kinds(&session)
+        .into_iter()
+        .find(|item| item["kind"] == "detached_child_result_v1")
+        .expect("waited-on result delivered");
+    assert_eq!(delivered["data"]["summary"], "C_DONE");
     profile.stop();
 }

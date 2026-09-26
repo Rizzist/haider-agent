@@ -5390,6 +5390,7 @@ async fn run_supervisor(
                         }
                         let durable_before_close =
                             durable_run_state(&lease, &finished.run_id).await;
+
                         let cancellation_requested = matches!(
                             outcome_state.as_ref(),
                             Some(RunState::Cancelled)
@@ -5531,7 +5532,7 @@ async fn run_supervisor(
                             // effect-history scan on the ordinary no-effect path.
                             durable_run_state(&lease, &finished.run_id).await
                         } else {
-                            durable_before_close
+                            durable_before_close.clone()
                         };
                         if durable == Some(RunState::EffectOutcomeUnknown) {
                             let _ = lease.unregister_worker().await;
@@ -5597,8 +5598,33 @@ async fn run_supervisor(
                             }
                             continue;
                         }
+                        // A user cancellation that raced the harness (its
+                        // next lifecycle commit was refused because the run
+                        // was already durably Cancelling, so core reported
+                        // Errored) must still cross the Cancelled terminal;
+                        // otherwise the run stays Cancelling forever
+                        // (9-verify3 B-1 flake).
                         let cancelled =
-                            idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
+                            idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref())
+                                || durable_before_close == Some(RunState::Cancelling);
+                        if cancelled {
+                            // Owner decision 2026-09-25: a cancelled main run
+                            // detaches (never cancels) its subagents. Core does
+                            // this on its orderly cancellation path; a harness
+                            // that ended through the raced-error path above
+                            // skipped it, so the supervisor repeats the
+                            // idempotent detach (marker + owed deliveries).
+                            if let Err(error) =
+                                crate::delegation::DelegationHandle::new(lease.hub().clone())
+                                    .detach_parent_run_children(
+                                        lease.session_id(),
+                                        &finished.run_id,
+                                    )
+                                    .await
+                            {
+                                tracing::warn!(run_id = %finished.run_id, ?error, "supervisor detach of a cancelled run's subagents failed");
+                            }
+                        }
                         if cancelled {
                             delay_fake_provider_cancellation_settlement().await;
                             // Reduce durable lifecycle truth again after the

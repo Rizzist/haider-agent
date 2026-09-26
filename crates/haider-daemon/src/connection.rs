@@ -2292,6 +2292,7 @@ fn cached_standard_welcome(
 fn welcome_features() -> BTreeSet<String> {
     BTreeSet::from([
         haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned(),
+        haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned(),
         haider_rpc::FEATURE_AGENT_MESSAGE_V1.to_owned(),
         FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned(),

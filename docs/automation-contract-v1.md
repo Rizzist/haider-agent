@@ -828,7 +828,13 @@ touched. Stopping a main run is separate: `haider run --stop <run>` stops the
 run and its whole subagent tree, `--stop-main` stops only the run (subagents
 keep running; a waited-on subagent's result is delivered to the session when
 it finishes), and `--stop-subagents` stops only the tree. The TUI's Esc is a
-main-only stop.
+main-only stop. `agent cancel --all` never stops the parent session's own main
+run (by design; stop a run with `run --stop`). Scoped stops require a daemon
+advertising `run_stop_scope_v1`; otherwise the CLI refuses them and stops
+nothing. An auto-spawned daemon stays up while any run or owed result
+delivery is live and retires only after all work is terminal plus its idle
+TTL. `haider daemon stop` remains an explicit stop of everything, including
+subagents.
 
 Spawn/run accept `--provider`, `--model`, `--agent-type`, `--task`, and
 `--cwd`; `--prompt`/`-p` can replace the positional prompt. Omitted provider

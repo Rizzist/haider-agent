@@ -135,8 +135,8 @@ pub(crate) enum RecoveredWork {
 }
 
 pub(crate) struct RecoveredDetachedChildren {
-    pub(crate) session_id: SessionId,
-    pub(crate) run_id: RunId,
+    /// The marker's owed (`result_pending`) agents not yet delivered.
+    pub(crate) agents: Vec<haider_protocol::ids::AgentId>,
 }
 
 pub(crate) struct RecoveredQueued {
@@ -559,8 +559,11 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             }
             if !reduction.detached_pending.is_empty() {
                 recovered.push(RecoveredWork::DetachedChildren(RecoveredDetachedChildren {
-                    session_id: session_id.clone(),
-                    run_id: run_id.clone(),
+                    agents: reduction
+                        .detached_pending
+                        .iter()
+                        .map(haider_protocol::ids::AgentId::new)
+                        .collect(),
                 }));
             }
             if state.is_terminal() {

@@ -16202,6 +16202,7 @@ impl HubConnection {
             subagents.monitors_removed = subagents
                 .monitors_removed
                 .saturating_add(again.monitors_removed);
+            subagents.still_running = again.still_running;
         } else {
             subagents.still_running = delegation
                 .live_subagent_count(&tree)

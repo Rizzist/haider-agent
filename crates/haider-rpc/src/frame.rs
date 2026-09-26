@@ -417,6 +417,11 @@ pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// Daemon implements receipt-backed cancellation of an owned direct child.
 /// The child remains visible and reaches a durable terminal run state.
 pub const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
+/// Daemon honours `headless.run.stop` `scope` (`all`/`main`/`subagents`) and
+/// serves `agent.cancel_all` (owner decision 2026-09-25). An older daemon
+/// ignores the scope field, so clients must require this feature before
+/// sending a non-default scope.
+pub const FEATURE_RUN_STOP_SCOPE_V1: &str = "run_stop_scope_v1";
 /// Daemon implements receipt-backed per-session provider/account/endpoint
 /// routing changes (`session.provider.rebind`) at the next request boundary.
 pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";
