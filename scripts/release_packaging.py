@@ -25,6 +25,8 @@ HOMEBREW_TARGETS = (
 )
 VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
 SHA256_PATTERN = re.compile(r"[a-fA-F0-9]{64}")
+PACKAGE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+DEPENDENCY_VERSION_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+){1,3}")
 
 
 class PackagingError(RuntimeError):
@@ -41,6 +43,53 @@ def _sha256(value: str, label: str) -> str:
     if not SHA256_PATTERN.fullmatch(value):
         raise PackagingError(f"{label}: expected a 64-digit SHA-256, got {value!r}")
     return value.lower()
+
+
+def _package_version(release: str, package: str | None) -> str:
+    """Return the Chocolatey package version for an unchanged release payload.
+
+    A package-fix version appends one numeric segment (Chocolatey convention:
+    the fix date, e.g. 0.0.972.20260927) to a plain x.y.z release version. The
+    payload, URL and checksum stay pinned to the original release.
+    """
+
+    release = _version(release)
+    if package is None or package == release:
+        return release
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", release) or not re.fullmatch(
+        rf"{re.escape(release)}\.[0-9]+", package
+    ):
+        raise PackagingError(
+            f"invalid package-fix version {package!r}: expected "
+            f"{release}.<number> for release {release}"
+        )
+    return package
+
+
+Dependency = tuple[str, str]
+
+
+def _dependencies(values: list[str] | tuple[Dependency, ...] | None) -> tuple[Dependency, ...]:
+    """Normalize ID=VERSION strings or (id, version) pairs into validated pairs."""
+
+    result: list[Dependency] = []
+    for value in values or ():
+        if isinstance(value, str):
+            package_id, separator, version = value.partition("=")
+            if not separator:
+                raise PackagingError(f"invalid dependency {value!r}: expected ID=VERSION")
+        else:
+            package_id, version = value
+        if not PACKAGE_ID_PATTERN.fullmatch(package_id):
+            raise PackagingError(f"invalid dependency id: {package_id!r}")
+        if not DEPENDENCY_VERSION_PATTERN.fullmatch(version):
+            raise PackagingError(
+                f"invalid dependency version for {package_id}: {version!r}"
+            )
+        if any(existing.lower() == package_id.lower() for existing, _ in result):
+            raise PackagingError(f"duplicate dependency id: {package_id!r}")
+        result.append((package_id, version))
+    return tuple(result)
 
 
 def _windows_artifact(version: str) -> str:
@@ -89,19 +138,63 @@ def _replace_token(path: Path, token: str, replacement: str, field: str) -> None
     path.write_bytes(data.replace(needle, replacement.encode("ascii")))
 
 
-def render_chocolatey_tree(
-    source: Path, output: Path, version: str, sha256: str
+def _insert_nuspec_dependencies(
+    path: Path, dependencies: tuple[Dependency, ...]
 ) -> None:
-    """Copy and render the Chocolatey template without interpreting line endings."""
+    """Add a <dependencies> block before </metadata>, keeping the line endings."""
+
+    data = path.read_bytes()
+    if b"<dependencies" in data:
+        raise PackagingError(f"{path}: template already declares dependencies")
+    closing = b"</metadata>"
+    if data.count(closing) != 1:
+        raise PackagingError(
+            f"{path}: </metadata> matched {data.count(closing)} times; expected exactly 1"
+        )
+    newline = b"\r\n" if b"\r\n" in data else b"\n"
+    position = data.index(closing)
+    line_start = data.rfind(b"\n", 0, position) + 1
+    lines = [b"    <dependencies>"]
+    lines.extend(
+        f'      <dependency id="{package_id}" version="{version}" />'.encode("ascii")
+        for package_id, version in dependencies
+    )
+    lines.append(b"    </dependencies>")
+    block = newline.join(lines) + newline
+    path.write_bytes(data[:line_start] + block + data[line_start:])
+
+
+def render_chocolatey_tree(
+    source: Path,
+    output: Path,
+    version: str,
+    sha256: str,
+    *,
+    package_version: str | None = None,
+    dependencies: list[str] | tuple[Dependency, ...] | None = None,
+) -> None:
+    """Copy and render the Chocolatey template without interpreting line endings.
+
+    ``version`` is the GitHub release whose Windows zip is installed.
+    ``package_version`` (default: ``version``) is the nuspec version, which may
+    be a Chocolatey package-fix version of the same release.
+    """
 
     version = _version(version)
+    package_version = _package_version(version, package_version)
+    dependencies = _dependencies(dependencies)
     sha256 = _sha256(sha256, "Chocolatey artifact")
     if output.exists():
         raise PackagingError(f"{output}: output directory already exists")
     shutil.copytree(source, output)
 
     substitutions = (
-        (output / "haider.nuspec", "__HAIDER_VERSION__", version, "nuspec version"),
+        (
+            output / "haider.nuspec",
+            "__HAIDER_VERSION__",
+            package_version,
+            "nuspec version",
+        ),
         (
             output / "tools" / "chocolateyinstall.ps1",
             "__HAIDER_VERSION__",
@@ -135,6 +228,8 @@ def render_chocolatey_tree(
     )
     for path, token, replacement, field in substitutions:
         _replace_token(path, token, replacement, field)
+    if dependencies:
+        _insert_nuspec_dependencies(output / "haider.nuspec", dependencies)
 
     for relative in (
         Path("haider.nuspec"),
@@ -148,11 +243,45 @@ def render_chocolatey_tree(
             raise PackagingError(f"{path}: unresolved release placeholders: {rendered}")
 
 
+def published_windows_sha256(artifact: Path, version: str, checksum: Path) -> str:
+    """Return the release's published zip checksum after matching it to the zip."""
+
+    actual = windows_artifact_sha256(artifact, version)
+    fields = checksum.read_text(encoding="utf-8").strip().split()
+    if len(fields) != 2 or Path(fields[1].lstrip("*")).name != artifact.name:
+        raise PackagingError(f"{checksum}: expected exact archive checksum record")
+    published = _sha256(fields[0], str(checksum))
+    if published != actual:
+        raise PackagingError(
+            f"{checksum}: published checksum {published} does not match "
+            f"{artifact.name} ({actual})"
+        )
+    return published
+
+
+def _artifact_sha256(artifact: Path, version: str, checksum: Path | None) -> str:
+    if checksum is None:
+        return windows_artifact_sha256(artifact, version)
+    return published_windows_sha256(artifact, version, checksum)
+
+
 def render_chocolatey_from_artifact(
-    source: Path, output: Path, version: str, artifact: Path
+    source: Path,
+    output: Path,
+    version: str,
+    artifact: Path,
+    *,
+    package_version: str | None = None,
+    dependencies: list[str] | tuple[Dependency, ...] | None = None,
+    checksum: Path | None = None,
 ) -> None:
     render_chocolatey_tree(
-        source, output, version, windows_artifact_sha256(artifact, version)
+        source,
+        output,
+        version,
+        _artifact_sha256(artifact, version, checksum),
+        package_version=package_version,
+        dependencies=dependencies,
     )
 
 
@@ -198,10 +327,15 @@ def verify_chocolatey_contents(
     version: str,
     sha256: str,
     source: str,
+    *,
+    package_version: str | None = None,
+    dependencies: list[str] | tuple[Dependency, ...] | None = None,
 ) -> None:
     """Verify every release pin in the material that will be published."""
 
     version = _version(version)
+    package_version = _package_version(version, package_version)
+    dependencies = _dependencies(dependencies)
     sha256 = _sha256(sha256, "Chocolatey artifact")
     try:
         nuspec_root = ET.fromstring(nuspec)
@@ -210,9 +344,19 @@ def verify_chocolatey_contents(
 
     _assert_equal(
         _single_xml_text(nuspec_root, "version", source),
-        version,
+        package_version,
         source,
         "nuspec version",
+    )
+    declared = [
+        (element.get("id", ""), element.get("version", ""))
+        for element in nuspec_root.findall(".//{*}dependency")
+    ]
+    _assert_equal(
+        repr(sorted(declared)),
+        repr(sorted(dependencies)),
+        source,
+        "nuspec dependencies",
     )
     _assert_equal(
         _single_xml_text(nuspec_root, "iconUrl", source),
@@ -289,7 +433,14 @@ def _zip_member(archive: zipfile.ZipFile, suffix: str, label: str) -> bytes:
     return archive.read(matches[0])
 
 
-def verify_chocolatey_nupkg(nupkg: Path, version: str, sha256: str) -> None:
+def verify_chocolatey_nupkg(
+    nupkg: Path,
+    version: str,
+    sha256: str,
+    *,
+    package_version: str | None = None,
+    dependencies: list[str] | tuple[Dependency, ...] | None = None,
+) -> None:
     if not nupkg.is_file():
         raise PackagingError(f"{nupkg}: Chocolatey package does not exist")
     try:
@@ -307,22 +458,35 @@ def verify_chocolatey_nupkg(nupkg: Path, version: str, sha256: str) -> None:
                 version,
                 sha256,
                 str(nupkg),
+                package_version=package_version,
+                dependencies=dependencies,
             )
     except zipfile.BadZipFile as error:
         raise PackagingError(f"{nupkg}: invalid nupkg ZIP: {error}") from error
 
 
 def verify_chocolatey_against_artifact(
-    nupkg: Path, version: str, artifact: Path
+    nupkg: Path,
+    version: str,
+    artifact: Path,
+    *,
+    package_version: str | None = None,
+    dependencies: list[str] | tuple[Dependency, ...] | None = None,
+    checksum: Path | None = None,
 ) -> None:
     version = _version(version)
-    expected_package = f"haider.{version}.nupkg"
+    package_version = _package_version(version, package_version)
+    expected_package = f"haider.{package_version}.nupkg"
     if nupkg.name != expected_package:
         raise PackagingError(
             f"{nupkg}: nupkg filename mismatch: expected {expected_package!r}"
         )
     verify_chocolatey_nupkg(
-        nupkg, version, windows_artifact_sha256(artifact, version)
+        nupkg,
+        version,
+        _artifact_sha256(artifact, version, checksum),
+        package_version=package_version,
+        dependencies=dependencies,
     )
 
 
@@ -646,6 +810,23 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--nupkg", type=Path, required=True)
     verify.add_argument("--version", required=True)
     verify.add_argument("--artifact", type=Path, required=True)
+    for command in (render, verify):
+        command.add_argument(
+            "--package-version",
+            help="Chocolatey package-fix version (default: --version)",
+        )
+        command.add_argument(
+            "--dependency",
+            action="append",
+            default=[],
+            metavar="ID=VERSION",
+            help="nuspec dependency with a minimum version; repeatable",
+        )
+        command.add_argument(
+            "--checksum",
+            type=Path,
+            help="the release's published .sha256 record for --artifact",
+        )
 
     repin = commands.add_parser("repin-manifests")
     repin.add_argument("--packaging-root", type=Path, required=True)
@@ -671,11 +852,22 @@ def main(argv: list[str] | None = None) -> int:
             verify_legacy_bundle(args.artifact, args.target)
         elif args.command == "render-chocolatey":
             render_chocolatey_from_artifact(
-                args.source, args.output, args.version, args.artifact
+                args.source,
+                args.output,
+                args.version,
+                args.artifact,
+                package_version=args.package_version,
+                dependencies=args.dependency,
+                checksum=args.checksum,
             )
         elif args.command == "verify-chocolatey":
             verify_chocolatey_against_artifact(
-                args.nupkg, args.version, args.artifact
+                args.nupkg,
+                args.version,
+                args.artifact,
+                package_version=args.package_version,
+                dependencies=args.dependency,
+                checksum=args.checksum,
             )
         elif args.command == "repin-manifests":
             repin_homebrew_scoop(
