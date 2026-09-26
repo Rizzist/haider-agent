@@ -1189,6 +1189,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
                 display_name: Some("Fixture frontier-a".to_owned()),
                 context_window: Some(100_000),
                 max_output_tokens: Some(haider_provider::UNKNOWN_OUTPUT_LIMIT),
+                max_output_tokens_source: Some(haider_rpc::ModelOutputLimitSourceWire::Fallback),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -1201,6 +1202,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
                 display_name: Some("Fixture frontier-b".to_owned()),
                 context_window: Some(200_000),
                 max_output_tokens: Some(haider_provider::UNKNOWN_OUTPUT_LIMIT),
+                max_output_tokens_source: Some(haider_rpc::ModelOutputLimitSourceWire::Fallback),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -2196,4 +2198,146 @@ fn upgrade_removes_persisted_public_seed_without_creating_aliases() {
             .inventory,
         haider_rpc::ModelInventoryWire::Static
     );
+}
+
+fn selection_over_projected_rows(
+    provider: &str,
+    rows: Vec<DiscoveredModel>,
+) -> (
+    crate::model_select::ModelSelectionAuthority,
+    Vec<ModelDetailWire>,
+) {
+    let model_details = rows
+        .into_iter()
+        .map(|row| model_detail_wire(provider, row, haider_rpc::ModelDetailSourceWire::Remote))
+        .collect::<Vec<_>>();
+    let summary = haider_rpc::ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        endpoint: None,
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        models: model_details
+            .iter()
+            .map(|detail| detail.name.clone())
+            .collect(),
+        model_details: model_details.clone(),
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 },
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
+        auth_methods: Vec::new(),
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: None,
+        enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
+    };
+    (
+        crate::model_select::ModelSelectionAuthority::new(
+            Some(std::iter::once(provider.to_owned()).collect()),
+            vec![summary],
+        ),
+        model_details,
+    )
+}
+
+/// 973-output-cap-fixes B2: provenance travels from catalog projection to
+/// daemon selection; it is never reconstructed from the value. Two otherwise
+/// identical unlisted Gemini rows project the same 8,192 maximum: the row
+/// whose catalog DECLARES 8,192 bounds an explicit 20,000 request, while the
+/// row without a declaration (the local fallback) admits it.
+/// MUTATION CHECK: drop `max_output_tokens_source` from the projection, or
+/// make selection compare the projected value with the fallback. Expected
+/// runtime failure: the declared row's explicit ceiling becomes 384,000, or
+/// the undeclared row's becomes 8,192.
+#[test]
+fn declared_and_fallback_rows_with_equal_maxima_keep_distinct_provenance() {
+    let row = |slug: &str, declared: Option<u64>| DiscoveredModel {
+        max_output_tokens: declared,
+        ..discovered_with_context(slug, true, None, Some(1_048_576))
+    };
+    let provider = haider_provider::GEMINI_PROVIDER_NAME;
+    let (authority, details) = selection_over_projected_rows(
+        provider,
+        vec![
+            row("gemini-9-declared", Some(8_192)),
+            row("gemini-9-undeclared", None),
+        ],
+    );
+    let (declared, undeclared) = (&details[0], &details[1]);
+    assert_eq!(declared.max_output_tokens, Some(8_192));
+    assert_eq!(undeclared.max_output_tokens, Some(8_192));
+    assert_eq!(
+        ModelDetailWire {
+            name: undeclared.name.clone(),
+            display_name: undeclared.display_name.clone(),
+            max_output_tokens_source: declared.max_output_tokens_source,
+            ..declared.clone()
+        },
+        undeclared.clone(),
+        "the rows differ only by name and output provenance"
+    );
+    assert_eq!(
+        declared.max_output_tokens_source,
+        Some(haider_rpc::ModelOutputLimitSourceWire::Declared)
+    );
+    assert_eq!(
+        undeclared.max_output_tokens_source,
+        Some(haider_rpc::ModelOutputLimitSourceWire::Fallback)
+    );
+
+    let declared = authority
+        .validate_selection_with_status(provider, None, "gemini-9-declared")
+        .expect("declared row selects");
+    assert_eq!(declared.max_output_tokens, 8_192);
+    assert_eq!(
+        declared.explicit_max_output_tokens, 8_192,
+        "a declared 8,192 bounds an explicit 20,000"
+    );
+    let undeclared = authority
+        .validate_selection_with_status(provider, None, "gemini-9-undeclared")
+        .expect("undeclared row selects");
+    assert_eq!(undeclared.max_output_tokens, 8_192);
+    assert_eq!(
+        undeclared.explicit_max_output_tokens,
+        haider_provider::MAX_OUTPUT_LIMIT,
+        "the fallback 8,192 admits an explicit 20,000"
+    );
+}
+
+/// 973-output-cap-fixes B1, catalog path: a fetched Kimi Code or Haider Code
+/// row with a window and no `max_output_tokens` projects the conservative
+/// 30,000 default as an UNPUBLISHED (fallback) maximum, so selection admits
+/// an explicit 60,000 within the window.
+/// MUTATION CHECK: let a known context window make the output maximum
+/// sourced. Expected runtime failure: the explicit ceiling is 30,000.
+#[test]
+fn window_only_catalog_rows_project_an_unpublished_output_maximum() {
+    for (provider, slug, window, ceiling) in [
+        (
+            haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+            "kimi-for-coding",
+            1_048_576,
+            384_000,
+        ),
+        ("haider-code", "glm-5.3", 200_000, 100_000),
+    ] {
+        let (authority, details) = selection_over_projected_rows(
+            provider,
+            vec![discovered_with_context(slug, true, None, Some(window))],
+        );
+        assert_eq!(details[0].max_output_tokens, Some(30_000), "{provider}");
+        assert_eq!(
+            details[0].max_output_tokens_source,
+            Some(haider_rpc::ModelOutputLimitSourceWire::Fallback),
+            "{provider}"
+        );
+        let selection = authority
+            .validate_selection_with_status(provider, None, slug)
+            .expect("row selects");
+        assert_eq!(selection.max_output_tokens, 30_000, "{provider}");
+        assert_eq!(selection.explicit_max_output_tokens, ceiling, "{provider}");
+        assert!(selection.explicit_max_output_tokens >= 60_000);
+    }
 }

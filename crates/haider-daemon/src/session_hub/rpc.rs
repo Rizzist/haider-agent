@@ -3652,10 +3652,11 @@ fn ssh_timeout(timeout_s: Option<u32>) -> Result<Option<Duration>, crate::ssh::S
 /// value is an exact user-set override, and an override above the row's
 /// explicit ceiling is a typed refusal rather than a silent clamp — the user
 /// asked for that exact value in this request. The explicit ceiling equals the
-/// row maximum when that maximum is sourced; when it is only the unverified
-/// fallback guess, explicit values up to `MAX_OUTPUT_LIMIT` (strictly below a
-/// known context window) are admitted and the provider-stated one-shot retry
-/// is the backstop.
+/// row maximum when that maximum is declared by the catalog or published by
+/// the provider; when it is an unpublished local value (the unverified
+/// fallback, or a conservative default beside a published window), explicit
+/// values up to `MAX_OUTPUT_LIMIT` (strictly below a known context window) are
+/// admitted and the provider-stated one-shot retry is the backstop.
 pub(super) fn resolve_session_output_limit(
     requested: u64,
     selection: &crate::model_select::ValidatedModelSelection,

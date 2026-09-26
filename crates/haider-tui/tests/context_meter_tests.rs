@@ -62,6 +62,7 @@ fn summary(
                 display_name: None,
                 context_window: *window,
                 max_output_tokens: None,
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),

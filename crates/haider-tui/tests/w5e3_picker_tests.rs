@@ -45,6 +45,7 @@ fn picker_keeps_403_subscription_static_row_selectable() {
         display_name: None,
         context_window: Some(1_000_000),
         max_output_tokens: None,
+        max_output_tokens_source: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),
