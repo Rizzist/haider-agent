@@ -73,6 +73,105 @@ fn canonical_path_beneath_symlinked_own_home_stays_home_relative() {
     assert_eq!(sanitized.display.as_deref(), Some("~/projects/haider"));
 }
 
+/// A dated leaf is previewed before its first write creates it. When HOME and
+/// the leaf are spelled differently (macOS `/var` vs `/private/var`, Windows
+/// `C:\` vs `\\?\C:\`, or a Windows 8.3 `RUNNER~1` short name), the
+/// canonical comparison must still recognise the own home via the nearest
+/// existing ancestor instead of masking the owner as another user.
+#[test]
+fn missing_leaf_beneath_differently_spelled_own_home_stays_home_relative() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let leaf = temp
+        .path()
+        .join("Haider")
+        .join("1448-04-07")
+        .join("s-0123456789abcdef");
+    assert!(!leaf.exists());
+
+    let sanitized = sanitize_origin_path(Some(&leaf), Some(&home)).unwrap();
+    assert_eq!(sanitized.kind, OriginPathKind::HomeRelative);
+    assert_eq!(
+        sanitized.display.as_deref(),
+        Some("~/Haider/1448-04-07/s-0123456789abcdef")
+    );
+    assert!(!leaf.exists(), "sanitising must never create the leaf");
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_leaf_beneath_symlinked_own_home_stays_home_relative() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let real_home = temp.path().join("real-home");
+    std::fs::create_dir_all(real_home.join("Documents")).unwrap();
+    let linked_home = temp.path().join("linked-home");
+    symlink(&real_home, &linked_home).unwrap();
+    let leaf = real_home
+        .canonicalize()
+        .unwrap()
+        .join("Documents")
+        .join("Haider")
+        .join("s-1");
+
+    let sanitized = sanitize_origin_path(Some(&leaf), Some(&linked_home)).unwrap();
+    assert_eq!(sanitized.kind, OriginPathKind::HomeRelative);
+    assert_eq!(sanitized.display.as_deref(), Some("~/Documents/Haider/s-1"));
+}
+
+/// A `..` in the not-yet-existing tail cannot be resolved lexically, so the
+/// canonical fallback declines and the path is shown as given.
+#[cfg(unix)]
+#[test]
+fn missing_tail_with_parent_component_is_not_resolved() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let real_home = temp.path().join("real-home");
+    std::fs::create_dir_all(&real_home).unwrap();
+    let linked_home = temp.path().join("linked-home");
+    symlink(&real_home, &linked_home).unwrap();
+    let path = real_home.canonicalize().unwrap().join("missing").join("..");
+
+    let sanitized = sanitize_origin_path(Some(&path), Some(&linked_home)).unwrap();
+    assert_ne!(sanitized.kind, OriginPathKind::HomeRelative);
+}
+
+/// The Windows other-user mask is string-level on the `/`-normalised display,
+/// so its forward-slash form is exercised on every host.
+#[test]
+fn windows_drive_user_homes_are_masked_on_every_host() {
+    for (input, expected) in [
+        (
+            "C:/Users/RUNNER~1/AppData/Local/Temp/x",
+            "C:/Users/<user>/AppData/Local/Temp/x",
+        ),
+        ("D:/Users/bob", "D:/Users/<user>"),
+    ] {
+        let sanitized = sanitize_origin_path(Some(Path::new(input)), Some(own_home())).unwrap();
+        assert_eq!(sanitized.kind, OriginPathKind::Redacted, "for {input}");
+        assert_eq!(sanitized.display.as_deref(), Some(expected), "for {input}");
+    }
+}
+
+/// Native Windows spelling: backslash separators are normalised to `/` and
+/// the user component (long or 8.3 short name) is masked.
+#[cfg(windows)]
+#[test]
+fn windows_backslash_user_homes_are_masked_and_normalised() {
+    let sanitized = sanitize_origin_path(
+        Some(Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\x")),
+        Some(Path::new(r"C:\Users\nobody-here")),
+    )
+    .unwrap();
+    assert_eq!(sanitized.kind, OriginPathKind::Redacted);
+    assert_eq!(
+        sanitized.display.as_deref(),
+        Some("C:/Users/<user>/AppData/Local/Temp/x")
+    );
+}
+
 #[test]
 fn other_user_homes_are_masked() {
     for (input, expected) in [

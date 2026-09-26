@@ -128,17 +128,43 @@ pub fn sanitize_origin_path(
 
 /// Returns the component-relative own-home suffix using the caller's lexical
 /// spelling first, then canonical identities. The latter covers a symlinked
-/// HOME whose captured cwd has already been canonicalized by the OS/client.
+/// HOME whose captured cwd has already been canonicalized by the OS/client,
+/// and a Windows path spelled through an 8.3 short name
+/// (`C:\Users\RUNNER~1\...` for `C:\Users\runneradmin`), which the OS
+/// expands to the long name when canonicalizing.
+///
+/// The path may not exist yet: a dated workspace leaf is previewed before its
+/// first write materialises it. The canonical comparison therefore resolves
+/// the nearest existing ancestor and re-appends the not-yet-created tail, so
+/// a lazy leaf under the own home is `~/...` exactly like its created form
+/// rather than falling through to the other-user mask.
 fn relative_to_own_home(path: &Path, home: &Path) -> Option<std::path::PathBuf> {
     if let Ok(relative) = path.strip_prefix(home) {
         return Some(relative.to_path_buf());
     }
     let canonical_home = home.canonicalize().ok()?;
-    let canonical_path = path.canonicalize().ok()?;
+    let canonical_path = canonicalize_existing_prefix(path)?;
     canonical_path
         .strip_prefix(canonical_home)
         .ok()
         .map(Path::to_path_buf)
+}
+
+/// Canonicalizes the longest existing ancestor of `path` and re-appends the
+/// remaining (not yet existing) components lexically. Gives up (`None`) on a
+/// `..` in the missing tail, whose meaning depends on directories that do not
+/// exist, and on relative paths with no existing ancestor.
+fn canonicalize_existing_prefix(path: &Path) -> Option<std::path::PathBuf> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = existing.canonicalize() {
+            canonical.extend(missing.iter().rev());
+            return Some(canonical);
+        }
+        missing.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
 }
 
 fn bounded(
