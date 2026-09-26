@@ -272,7 +272,7 @@ fn session_create_before_model_details_requests_daemon_derivation() {
     assert!(
         haider_tui::render::status_left_segments(&model, 120)
             .iter()
-            .any(|segment| segment.text.contains("context unknown"))
+            .any(|segment| segment.text.contains("window unknown"))
     );
 }
 

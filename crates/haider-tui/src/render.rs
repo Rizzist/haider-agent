@@ -7418,11 +7418,11 @@ fn highlight_transcript_lines(
         .collect()
 }
 
-/// ⌃G / `/tokens` — context by model (sim tui.js:2946-2977), floated
-/// above the input band. Live rows carry the W7b footprint truth: an
-/// EXACT snapshot prints plain splits, an ESTIMATED one keeps the sim's
-/// `~` prefixes; with no snapshot yet the sim's fabricated 62/28/10
-/// split stands in (demo parity).
+/// ⌃G / `/tokens` — context by model (sim tui.js:2946-2977),
+/// floated above the input band. Live rows carry the W7b footprint truth:
+/// an EXACT snapshot prints plain splits, an ESTIMATED one keeps the sim's
+/// `~` prefixes. Only the DEMO (which fabricates locally) keeps the sim's
+/// 62/28/10 split with no snapshot; a live session says it has none yet.
 fn render_token_panel(
     model: &AppModel,
     theme: &Theme,
@@ -7430,111 +7430,77 @@ fn render_token_panel(
     area: Rect,
     input_top: u16,
 ) {
-    struct PanelRow {
-        label: String,
-        tokens: u64,
-        window: u64,
-        detail: String,
-    }
     let identity = &model.identity;
-    let main_label = format!("● {} · {}", identity.model_short, identity.provider);
-    let main = model.projection.latest_footprint().map_or_else(
-        || {
-            // Sim math (tui.js:2951-2953): fabricated splits + burn-rate
-            // turns estimate from the transcript's user rows.
-            let tokens = model.projection.context_tokens();
-            let window = identity.context_window;
-            let turns = u64::from(model.projection.user_row_count().max(1));
-            let burn = (tokens / turns).max(6000);
-            let to_threshold = (window.saturating_mul(85) / 100).saturating_sub(tokens);
-            let mut detail = format!(
-                "in ~{} · out ~{} · cached ~{}",
-                fmt_tok(tokens.saturating_mul(62) / 100),
-                fmt_tok(tokens.saturating_mul(28) / 100),
-                fmt_tok(tokens.saturating_mul(10) / 100),
-            );
-            if window > 0 {
-                detail.push_str(&format!(
-                    " · ≈{} turns to auto-compaction",
-                    to_threshold.div_ceil(burn).max(1)
-                ));
-            }
-            PanelRow {
-                label: main_label.clone(),
-                tokens,
-                window,
-                detail,
-            }
-        },
-        |footprint| {
-            let approx = match footprint.truth {
-                haider_protocol::context::ContextFootprintTruth::Exact => "",
-                haider_protocol::context::ContextFootprintTruth::Estimated => "~",
-            };
-            let mut detail = format!(
-                "in {approx}{} · out {approx}{} · cached {approx}{}",
-                fmt_tok(footprint.input_tokens),
-                fmt_tok(footprint.output_tokens),
-                fmt_tok(footprint.cached_input_tokens),
-            );
-            if let Some(turns) = footprint.estimated_turns_to_threshold {
-                detail.push_str(&format!(" · ≈{turns} turns to auto-compaction"));
-            }
-            PanelRow {
-                label: main_label.clone(),
-                tokens: footprint.used_tokens,
-                window: footprint.context_window.unwrap_or(identity.context_window),
-                detail,
-            }
-        },
-    );
-    let mut rows = vec![main];
+    // 973-context-meter: every row resolves through the ONE meter, so the
+    // panel, the status line and the mirror can never disagree; the main
+    // row's detail defines each number (prompt incl. cached, reply,
+    // auto-compaction trigger).
+    let main_meter = model.context_meter();
+    let main_detail = if model.mode.fabricates_locally() && !main_meter.from_snapshot {
+        // Sim math (tui.js:2951-2953): fabricated splits + burn-rate turns
+        // estimate from the transcript's user rows — demo parity only.
+        let tokens = main_meter.used_tokens;
+        let turns = u64::from(model.projection.user_row_count().max(1));
+        let burn = (tokens / turns).max(6000);
+        let to_threshold = main_meter
+            .auto_compact_at
+            .unwrap_or_default()
+            .saturating_sub(tokens);
+        vec![format!(
+            "in ~{} · out ~{} · cached ~{} · ≈{} turns to auto-compaction",
+            fmt_tok(tokens.saturating_mul(62) / 100),
+            fmt_tok(tokens.saturating_mul(28) / 100),
+            fmt_tok(tokens.saturating_mul(10) / 100),
+            to_threshold.div_ceil(burn).max(1),
+        )]
+    } else {
+        main_meter.detail_lines()
+    };
+    let mut rows = vec![(
+        format!("● {} · {}", identity.model_short, identity.provider),
+        main_meter,
+        main_detail,
+    )];
     for (_, chip) in crate::app::flatten_chips(&model.chips) {
-        let (tokens, window, detail) = chip.transcript.latest_footprint().map_or_else(
-            || (chip.tokens, identity.context_window, String::new()),
-            |footprint| {
-                (
-                    footprint.used_tokens,
-                    footprint.context_window.unwrap_or(identity.context_window),
-                    String::new(),
+        // A child's window is ITS model's: its own snapshot, else the
+        // catalog row for its model — never the parent's figure.
+        let declared = model
+            .providers
+            .declared_window(&identity.provider, &chip.model)
+            .unwrap_or(0);
+        let meter = crate::context_meter::ContextMeter::resolve(
+            chip.transcript.latest_footprint(),
+            chip.tokens,
+            declared,
+            true,
+            |window| {
+                crate::context_meter::derived_reserved_output(
+                    model
+                        .providers
+                        .declared_output_limit(&identity.provider, &chip.model),
+                    window,
                 )
             },
         );
-        rows.push(PanelRow {
-            label: format!("└ {} · {}", chip.name, chip.model),
-            tokens,
-            window,
-            detail,
-        });
+        rows.push((
+            format!("└ {} · {}", chip.name, chip.model),
+            meter,
+            Vec::new(),
+        ));
     }
     let mut lines = vec![Line::styled(
         "context by model — ⌃G · /tokens · esc closes",
         theme.dim_style(),
     )];
-    for row in &rows {
-        #[allow(clippy::cast_precision_loss)]
-        let pct = if row.window == 0 {
-            0.0
-        } else {
-            row.tokens as f64 / row.window as f64
-        };
-        let mut text = if row.window == 0 {
-            format!("{}  {}/unknown", row.label, fmt_tok(row.tokens))
-        } else {
-            format!(
-                "{}  {} {}%  {}/{}",
-                row.label,
-                meter_cells(pct, 12),
-                (pct.clamp(0.0, 1.0) * 100.0).round(),
-                fmt_tok(row.tokens),
-                fmt_tok(row.window),
-            )
-        };
-        if !row.detail.is_empty() {
-            text.push_str(" · ");
-            text.push_str(&row.detail);
+    for (label, meter, detail) in &rows {
+        lines.push(Line::styled(
+            format!("{label}  {}", panel_meter_text(meter)),
+            theme.text_style(),
+        ));
+        // One fact per line so a narrow terminal clips none of them.
+        for fact in detail {
+            lines.push(Line::styled(format!("    {fact}"), theme.dim_style()));
         }
-        lines.push(Line::styled(text, theme.text_style()));
     }
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let width = area.width.saturating_sub(2).max(24);
@@ -7554,6 +7520,25 @@ fn render_token_panel(
         ),
         rect,
     );
+}
+
+/// One `/tokens` panel row's meter: `▰▰▱… 17%  34k/200k`, or the honest
+/// `34k tok · window unknown`.
+fn panel_meter_text(meter: &crate::context_meter::ContextMeter) -> String {
+    match (meter.window, meter.fraction(), meter.percent()) {
+        (Some(window), Some(fraction), Some(percent)) => format!(
+            "{} {percent}%  {}{}/{}",
+            meter_cells(fraction, 12),
+            meter.approx(),
+            fmt_tok(meter.used_tokens),
+            fmt_tok(window),
+        ),
+        _ => format!(
+            "{}{} tok · window unknown",
+            meter.approx(),
+            fmt_tok(meter.used_tokens)
+        ),
+    }
 }
 
 /// `/tree` — the session tree (B2b-m3; sim tui.js:3366-3430). ONE branch
@@ -14868,46 +14853,11 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
     // The derived WAITING-on-subagents badge overlays plain IDLE (§2.6).
     let (badge, _) = model.status_badge();
     let (state, detail) = model.status_badge_state_detail();
-    let identity = &model.identity;
-    // W7b meter truth: the durable occupancy snapshot beats the
-    // cumulative usage sum, and an ESTIMATED snapshot wears `~` so the
-    // meter never claims a precision it does not have.
-    let (tokens, window, approx) = model.projection.latest_footprint().map_or_else(
-        || {
-            (
-                model.projection.context_tokens(),
-                identity.context_window,
-                "",
-            )
-        },
-        |footprint| {
-            (
-                footprint.used_tokens,
-                footprint.context_window.unwrap_or(identity.context_window),
-                match footprint.truth {
-                    haider_protocol::context::ContextFootprintTruth::Exact => "",
-                    haider_protocol::context::ContextFootprintTruth::Estimated => "~",
-                },
-            )
-        },
-    );
-    #[allow(clippy::cast_precision_loss)]
-    let pct = if window == 0 {
-        0.0
-    } else {
-        tokens as f64 / window as f64
-    };
-    let meter = if window == 0 {
-        format!("{approx}{} tok · context unknown", fmt_tok(tokens))
-    } else {
-        format!(
-            "{approx}{} tok · {} {}% of {}",
-            fmt_tok(tokens),
-            meter_cells(pct, METER_CELLS_DEFAULT),
-            (pct.clamp(0.0, 1.0) * 100.0).round(),
-            fmt_tok(window)
-        )
-    };
+    // W7b meter truth through the ONE resolution (973-context-meter): the
+    // durable occupancy snapshot beats the usage fallback, an ESTIMATED
+    // snapshot wears `~`, and an unknown window reads unknown — never a
+    // percentage of a guessed (or output-budget) window.
+    let meter = model.context_meter().status_text(METER_CELLS_DEFAULT);
 
     // F2c: token usage sits DIRECTLY right of the state — the identity
     // block (model / auth / reasoning) moved to the composer's top rule.

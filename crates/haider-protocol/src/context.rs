@@ -590,6 +590,32 @@ fn utf8_suffix_start(input: &str, max_bytes: usize) -> usize {
     start
 }
 
+/// Model-summary (automatic compaction) boundary as a percentage of the
+/// model context window.
+pub const CONTEXT_SUMMARY_TIER_PERCENT: u64 = 85;
+
+/// The one threshold law shared by the daemon (which acts on it) and clients
+/// (which display it before the first snapshot of a newly selected model):
+/// `percent` of the window, never past the hard fit that still leaves the
+/// reserved output budget. `None` when the output reservation does not fit.
+#[must_use]
+pub fn context_tier_threshold_tokens(
+    window: u64,
+    reserved_output_tokens: u64,
+    percent: u64,
+) -> Option<u64> {
+    let hard_fit = window.checked_sub(reserved_output_tokens)?;
+    let percentage = u64::try_from(u128::from(window).saturating_mul(u128::from(percent)) / 100)
+        .unwrap_or(u64::MAX);
+    Some(percentage.min(hard_fit))
+}
+
+/// Automatic model-summary compaction trigger for one model window.
+#[must_use]
+pub fn context_soft_threshold_tokens(window: u64, reserved_output_tokens: u64) -> Option<u64> {
+    context_tier_threshold_tokens(window, reserved_output_tokens, CONTEXT_SUMMARY_TIER_PERCENT)
+}
+
 /// Complete programmatic context-accounting snapshot for one request boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextAccounting {

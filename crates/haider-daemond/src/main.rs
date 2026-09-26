@@ -53,6 +53,12 @@ mod telemetry;
 /// exits 64 rather than degrading), and it announces itself loudly on
 /// stderr AND in its log so the profile's daemon.log names the condition.
 const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
+/// TEST-ONLY companion of [`FAKE_PROVIDER_ENV`], read only while that seam
+/// is armed: a JSON object `{"<model>": <context window>}` giving the fake
+/// turns per-model windows, so a real-binary PTY probe can exercise the
+/// context meter and compaction thresholds per model (973-context-meter).
+/// Models it does not name keep the honest unknown window.
+const FAKE_CONTEXT_WINDOWS_ENV: &str = "HAIDER_TEST_FAKE_CONTEXT_WINDOWS";
 const READY_DELAY_ENV: &str = "HAIDER_TEST_READY_DELAY_MS";
 const DISABLE_ENDPOINT_RECOVERY_ENV: &str = "HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY";
 const DISABLE_DEGRADED_IDLE_REAP_ENV: &str = "HAIDER_TEST_DISABLE_DEGRADED_IDLE_REAP";
@@ -278,6 +284,16 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
     let fake = FakeProvider::from_json(&script)
         .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not a fake-provider script: {error}"))?
         .without_request_recording();
+    let context_windows = match std::env::var(FAKE_CONTEXT_WINDOWS_ENV) {
+        Ok(json) => serde_json::from_str::<std::collections::BTreeMap<String, u64>>(&json)
+            .map_err(|error| {
+                format!("{FAKE_CONTEXT_WINDOWS_ENV} is not a model→window map: {error}")
+            })?,
+        Err(std::env::VarError::NotPresent) => std::collections::BTreeMap::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{FAKE_CONTEXT_WINDOWS_ENV} is not valid UTF-8"));
+        }
+    };
     eprintln!("haiderd: TEST MODE — every turn resolves to the injected fake provider");
     // Every turn resolves to the fake regardless of what the session was
     // created with, so the creatable set includes the release default too:
@@ -292,6 +308,7 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
         provider_factory: ProviderFactoryConfig::Injected {
             factory: Arc::new(FakeFactory {
                 fake: Arc::new(fake),
+                context_windows,
             }),
             providers,
         },
@@ -302,6 +319,7 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
 /// The injected factory: one deterministic provider for every turn.
 struct FakeFactory {
     fake: Arc<FakeProvider>,
+    context_windows: std::collections::BTreeMap<String, u64>,
 }
 
 #[async_trait::async_trait]
@@ -318,7 +336,7 @@ impl ProviderFactory for FakeFactory {
             // the IMPLEMENTATION, not to rewrite the session.
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
-            context_window: None,
+            context_window: self.context_windows.get(&metadata.model).copied(),
             account_alias: None,
             account_incarnation: None,
             active_no_auth: false,
