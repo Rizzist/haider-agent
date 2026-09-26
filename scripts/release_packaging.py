@@ -632,10 +632,12 @@ def _verify_release_bundle(artifact: Path, target: str, *, legacy: bool) -> None
 # imports one dies with 0xC0000135 (STATUS_DLL_NOT_FOUND) before main
 # (registry #176: haider 0.0.972 on Chocolatey's clean Server 2019 verifier).
 # The api-ms-win-crt-* API sets forward to the Universal CRT; importing them
-# means the binary was linked against the dynamic CRT (/MD) at all.
+# means the binary was linked against the dynamic CRT (/MD) at all. Unversioned
+# atl.dll and msvcrt.dll ship with Windows itself and stay allowed.
 FORBIDDEN_WINDOWS_IMPORT = re.compile(
-    r"(?:vcruntime\d+(?:_\d+)?d?|msvcp\d+(?:_[a-z0-9_]+)?d?|msvcr\d+d?|ucrtbased?"
-    r"|api-ms-win-crt-[a-z0-9-]+|concrt\d+d?|vcomp\d+d?|vccorlib\d+d?|mfc\d+[a-z]*)\.dll",
+    r"(?:vcruntime\d+d?(?:_[a-z0-9_]+)?|msvcp\d+d?(?:_[a-z0-9_]+)?|msvcr\d+d?"
+    r"|ucrtbased?|api-ms-win-crt-[a-z0-9-]+|concrt\d+d?|vcomp\d+d?|vccorlib\d+d?"
+    r"|mfcm?\d+[a-z]*|atl\d+d?|vcamp\d+d?|libomp[a-z0-9_.-]*)\.dll",
     re.IGNORECASE,
 )
 _PE_IMPORT_DIRECTORY = 1
@@ -700,7 +702,14 @@ class _PeImage:
         if index >= self.directory_count:
             return 0, 0
         entry = self.directories + index * 8
-        return self._u32(entry), self._u32(entry + 4)
+        rva, size = self._u32(entry), self._u32(entry + 4)
+        if rva and not size:
+            # The loader walks descriptors from the address until a null entry
+            # regardless of size; never treat a sized-zero table as absent.
+            raise PackagingError(
+                f"{self.source}: data directory {index} has address {rva:#x} but size 0"
+            )
+        return rva, size
 
     def offset(self, rva: int) -> int:
         for virtual_address, size, raw_pointer, raw_size in self.sections:
@@ -722,7 +731,7 @@ class _PeImage:
         """Return (imported DLLs, delay-loaded DLLs) in table order."""
         normal: list[str] = []
         rva, size = self.directory(_PE_IMPORT_DIRECTORY)
-        if rva and size:
+        if rva:
             cursor = self.offset(rva)
             while True:
                 descriptor = self._read(cursor, 20)
@@ -732,7 +741,7 @@ class _PeImage:
                 cursor += 20
         delayed: list[str] = []
         rva, size = self.directory(_PE_DELAY_IMPORT_DIRECTORY)
-        if rva and size:
+        if rva:
             cursor = self.offset(rva)
             while True:
                 descriptor = self._read(cursor, 32)

@@ -122,6 +122,32 @@ jobs:
         # Registry #176: hosted runners preinstall the redistributable, so a
         # dynamic-CRT regression passes every runtime test here; check imports.
         run: python scripts/release_packaging.py verify-windows-imports target/debug/haider.exe target/debug/haider-tui.exe target/debug/haiderd.exe
+      - name: run the executables in a clean Server Core container (no VC++ redist)
+        if: matrix.phase == 'test' && runner.os == 'Windows' && matrix.shard == 1
+        # Registry #176 behavioral proof. Hosted runners preinstall the VC++
+        # redistributable; Server Core images do not, like Chocolatey's
+        # verifier. Reuses the target/debug siblings built above. Process
+        # isolation needs the image to match the host build.
+        shell: pwsh
+        run: |
+          $Build = [Environment]::OSVersion.Version.Build
+          $Tag = switch ($Build) { 26100 { 'ltsc2025' } 20348 { 'ltsc2022' } default { throw "no Server Core tag for host build $Build" } }
+          $Image = "mcr.microsoft.com/windows/servercore:$Tag"
+          $Dir = Join-Path $env:RUNNER_TEMP 'clean-windows-exes'
+          New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+          foreach ($exe in 'haider.exe', 'haider-tui.exe', 'haiderd.exe') {
+            Copy-Item "target/debug/$exe" $Dir -Force
+          }
+          docker pull --quiet $Image
+          if ($LASTEXITCODE -ne 0) { throw "docker pull $Image failed, rc=$LASTEXITCODE" }
+          docker run --rm --isolation process $Image cmd /c "if exist C:\Windows\System32\vcruntime140.dll (echo REDIST PRESENT& exit 3)"
+          if ($LASTEXITCODE -ne 0) { throw "container is not clean (vcruntime140.dll present), rc=$LASTEXITCODE" }
+          foreach ($exe in 'haider.exe', 'haider-tui.exe', 'haiderd.exe') {
+            docker run --rm --isolation process -v "${Dir}:C:\h:ro" $Image "C:\h\$exe" --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "$exe --version failed on clean Server Core, rc=$LASTEXITCODE (-1073741515 = 0xC0000135 STATUS_DLL_NOT_FOUND)"
+            }
+          }
       - name: native Windows clipboard write and paste gate (no terminal)
         if: matrix.phase == 'test' && runner.os == 'Windows' && matrix.shard == 1
         env:

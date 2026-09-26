@@ -83,7 +83,7 @@ def _nupkg(tree: Path, destination: Path) -> None:
                 archive.write(path, path.relative_to(tree).as_posix())
 
 
-def _pe(imports=(), delay_imports=(), *, pe32=False, legacy_delay=False) -> bytes:
+def _pe(imports=(), delay_imports=(), *, pe32=False, legacy_delay=False, zero_size=()) -> bytes:
     """A minimal x64/x86 PE image whose .idata holds the given import names."""
     image_base = 0x400000 if pe32 else 0x140000000
     section_rva, section_offset = 0x1000, 0x200
@@ -110,6 +110,8 @@ def _pe(imports=(), delay_imports=(), *, pe32=False, legacy_delay=False) -> byte
         directories[1] = (section_rva, import_size)
     if delay_imports:
         directories[13] = (section_rva + import_size, delay_size)
+    for index in zero_size:
+        directories[index] = (directories[index][0] or section_rva, 0)
     optional = bytearray(optional_size)
     if pe32:
         struct.pack_into("<HI", optional, 0, 0x10B, 0)
@@ -380,6 +382,11 @@ class WindowsCrtImportTests(unittest.TestCase):
             "MSVCP140.dll", "msvcp140_atomic_wait.dll", "MSVCR120.dll",
             "api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-heap-l1-1-0.dll",
             "ucrtbase.dll", "ucrtbased.dll", "CONCRT140.dll", "VCOMP140.dll",
+            "vcruntime140_threads.dll", "vcruntime140_threadsd.dll", "vcruntime140_1d.dll",
+            "MSVCP140D.dll", "msvcp140d_atomic_wait.dll", "msvcp140_codecvt_ids.dll",
+            "mfc140u.dll", "mfcm140.dll", "mfcm140ud.dll", "atl140.dll", "ATL110.dll",
+            "vcamp140.dll", "vcamp140d.dll", "libomp140.x86_64.dll", "libomp.dll",
+            "vccorlib140d.dll", "concrt140d.dll",
         ):
             for delayed in (False, True):
                 with self.subTest(forbidden=forbidden, delayed=delayed), tempfile.TemporaryDirectory() as temporary:
@@ -392,8 +399,8 @@ class WindowsCrtImportTests(unittest.TestCase):
                         release_packaging.verify_windows_imports([path])
 
     def test_system_dlls_that_merely_resemble_crt_names_pass(self):
-        # msvcrt.dll is the OS-private CRT shipped with every Windows release.
-        for name in ("msvcrt.dll", "api-ms-win-core-synch-l1-2-0.dll", "KERNEL32.dll"):
+        # msvcrt.dll (OS-private CRT) and atl.dll (ATL 3.0) ship with Windows itself.
+        for name in ("msvcrt.dll", "atl.dll", "api-ms-win-core-synch-l1-2-0.dll", "KERNEL32.dll", "mf.dll", "mfplat.dll"):
             self.assertIsNone(release_packaging.FORBIDDEN_WINDOWS_IMPORT.fullmatch(name), name)
 
     def test_zip_and_directory_inputs_check_every_pe_member(self):
@@ -430,6 +437,18 @@ class WindowsCrtImportTests(unittest.TestCase):
             truncated = _pe(SYSTEM_IMPORTS)[:0x210]
             with self.assertRaisesRegex(release_packaging.PackagingError, "truncated|outside"):
                 release_packaging.verify_windows_imports([self.write(root, "cut.exe", truncated)])
+
+    def test_directory_with_address_but_zero_size_fails_closed(self):
+        # The loader walks a table from its address regardless of the size field.
+        for index, image in (
+            (1, _pe(("VCRUNTIME140.dll",), zero_size=(1,))),
+            (1, _pe(SYSTEM_IMPORTS, zero_size=(1,))),
+            (13, _pe(SYSTEM_IMPORTS, ("VCRUNTIME140.dll",), zero_size=(13,))),
+        ):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temporary:
+                path = self.write(Path(temporary), "haider.exe", image)
+                with self.assertRaisesRegex(release_packaging.PackagingError, f"data directory {index} has address"):
+                    release_packaging.verify_windows_imports([path])
 
     def test_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -471,6 +490,15 @@ class WindowsCrtImportTests(unittest.TestCase):
         self.assertLess(installer_check.index("verify-windows-imports"), installer_check.index("upload distribution archives"))
         xplat = (ROOT / ".github/workflows/xplat.yml").read_text()
         self.assertIn("verify-windows-imports target/debug/haider.exe target/debug/haider-tui.exe target/debug/haiderd.exe", xplat)
+        # Behavioral proof on every candidate: the siblings run on Server Core without the redist.
+        clean = xplat[xplat.index("run the executables in a clean Server Core container"):]
+        clean = clean[: clean.index("\n      - name:")]
+        self.assertIn("matrix.phase == 'test' && runner.os == 'Windows' && matrix.shard == 1", clean)
+        for fragment in ("mcr.microsoft.com/windows/servercore:", "vcruntime140.dll", "--isolation process",
+                         "'haider.exe', 'haider-tui.exe', 'haiderd.exe'", "--version", "0xC0000135"):
+            self.assertIn(fragment, clean)
+        self.assertNotIn("continue-on-error", clean)
+        self.assertLess(xplat.index("verify-windows-imports target/debug"), xplat.index("run the executables in a clean Server Core container"))
         for text in (release, installer_check, xplat):
             self.assertNotRegex(text, r"(?m)^\s*(?:RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_\w*WINDOWS\w*_RUSTFLAGS)\s*:")
 
