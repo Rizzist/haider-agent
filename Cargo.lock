@@ -1957,8 +1957,10 @@ dependencies = [
  "haider-accounts",
  "haider-platform",
  "haider-protocol",
+ "haider-tools",
  "haider-webextract",
  "httpdate",
+ "regex",
  "reqwest",
  "rustls",
  "serde",
@@ -1967,6 +1969,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-width",
+ "url",
 ]
 
 [[package]]

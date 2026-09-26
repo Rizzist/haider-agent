@@ -25,6 +25,7 @@ mod effort;
 #[cfg(test)]
 mod effort_tests;
 mod error_detail;
+mod error_templates;
 mod gemini;
 mod idle;
 mod model_limits;
@@ -2999,8 +3000,10 @@ pub enum ProviderErrorKind {
     ConnectionConfiguration,
 }
 
-/// Typed failure yielded by a provider stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Typed failure yielded by a provider stream. Equality compares the
+/// serialized (wire/journal) fields only; the owner-local raw detail and the
+/// untrusted-message marker are process-local metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
@@ -3021,11 +3024,156 @@ pub struct ProviderError {
     pub timeout_reason: Option<ProviderTimeoutReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<ProviderIdleTimeout>,
+    /// OWNER-LOCAL ONLY: credential-redacted provider text that matched no
+    /// known template. Never serialized with the error (serialized provider
+    /// errors reach journal extensions and child/peer projections); core
+    /// moves it into the RunFailed presentation's `provider_raw_detail`,
+    /// which shareable surfaces strip.
+    #[serde(skip)]
+    pub provider_raw_detail: Option<String>,
+    /// `message` interpolates provider- or child-controlled values (frame
+    /// fields, decoder errors, agent-offered ids). Such a message is
+    /// published only when it matches a known template. Not serialized: a
+    /// serialized error already carries its public message.
+    #[serde(skip)]
+    message_untrusted: bool,
+    /// Process-local: the provider prose behind `presentation.detail` and the
+    /// evidence gathered so far, so a later corroboration step (captured
+    /// request id, requested model, request tool-call ids) can re-decide
+    /// between a template rendering and "details withheld". Never serialized.
+    #[serde(skip)]
+    prose_state: Option<Box<ProseState>>,
 }
+
+/// What Haider itself sent for a failed provider request; see
+/// [`ProviderError::corroborate_slots`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderSlotEvidence {
+    pub requested_model: Option<String>,
+    pub tool_call_ids: Vec<String>,
+}
+
+impl ProviderSlotEvidence {
+    /// Model id and every tool-call id the request carries.
+    #[must_use]
+    pub fn from_request(request: &TurnRequest) -> Self {
+        let tool_call_ids = request
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                Block::ToolCall { call_id, .. } | Block::ToolResult { call_id, .. } => {
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        Self {
+            requested_model: Some(request.model.clone()),
+            tool_call_ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProseState {
+    prose: String,
+    default_detail: String,
+    raw_from_prose: bool,
+    evidence: ProviderSlotEvidence,
+    captured_request_id: Option<String>,
+}
+
+impl PartialEq for ProviderError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.message == other.message
+            && self.retryable == other.retryable
+            && self.retry_after_ms == other.retry_after_ms
+            && self.opened_within_ms == other.opened_within_ms
+            && self.budget_ms == other.budget_ms
+            && self.presentation == other.presentation
+            && self.timeout_reason == other.timeout_reason
+            && self.idle_timeout == other.idle_timeout
+    }
+}
+
+impl Eq for ProviderError {}
 
 impl ProviderError {
     pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
         Self::new_with_presentation(kind, message, provider_error_presentation(kind))
+    }
+
+    /// The only message form core may persist in `RunFailed` (and the form
+    /// every shareable projection of a provider error uses). Haider-authored
+    /// adapter messages (fixed HTTP/stream templates, local timeout
+    /// telemetry) are published as written. A message marked untrusted
+    /// ([`Self::with_untrusted_message`]) is published only when it matches a
+    /// known provider template; otherwise the provider-class default
+    /// explanation replaces it and [`Self::local_message_detail`] keeps the
+    /// raw text for owner-local surfaces.
+    #[must_use]
+    pub fn public_message(&self) -> String {
+        if !self.message_untrusted || self.timeout_reason.is_some() {
+            return self.to_string();
+        }
+        format!(
+            "{:?}: {}",
+            self.kind,
+            public_provider_message(self.kind, &self.message)
+        )
+    }
+
+    /// Marks `message` as carrying provider- or child-controlled text. An
+    /// untrusted message that matches no template is recorded once, here, as
+    /// the owner-local raw detail; clearing `provider_raw_detail` (lockdown)
+    /// therefore removes it for good — nothing re-derives it later.
+    #[must_use]
+    pub fn with_untrusted_message(mut self) -> Self {
+        self.message_untrusted = true;
+        if self.provider_raw_detail.is_none()
+            && self.timeout_reason.is_none()
+            && crate::error_templates::render_known_provider_message(&self.message).is_none()
+        {
+            self.provider_raw_detail = Some(crate::error_detail::local_raw_detail(&self.message));
+        }
+        self
+    }
+
+    /// The provider's own error prose, kept in process memory only (never
+    /// serialized, never published) for local decisions such as parsing a
+    /// stated output-token maximum.
+    #[must_use]
+    pub(crate) fn provider_prose(&self) -> Option<&str> {
+        self.prose_state.as_ref().map(|state| state.prose.as_str())
+    }
+
+    /// Owner-local raw text for this error (unknown provider prose, or an
+    /// untrusted message that matched no template; credential-redacted).
+    /// `None` once a lockdown gate cleared it.
+    #[must_use]
+    pub fn local_message_detail(&self) -> Option<String> {
+        self.provider_raw_detail.clone()
+    }
+
+    /// A copy safe for serialization into journal extensions and other
+    /// shareable projections: the message is [`Self::public_message`]'s text
+    /// and no owner-local field survives.
+    #[must_use]
+    pub fn shareable(&self) -> Self {
+        let mut shareable = self.clone();
+        if self.message_untrusted && self.timeout_reason.is_none() {
+            shareable.message = public_provider_message(self.kind, &self.message);
+        }
+        shareable.message_untrusted = false;
+        shareable.provider_raw_detail = None;
+        shareable.presentation.strip_local_only();
+        shareable.idle_timeout = self
+            .idle_timeout
+            .as_ref()
+            .map(ProviderIdleTimeout::shareable);
+        shareable
     }
 
     fn new_with_presentation(
@@ -3043,6 +3191,9 @@ impl ProviderError {
             presentation,
             timeout_reason: None,
             idle_timeout: None,
+            provider_raw_detail: None,
+            message_untrusted: false,
+            prose_state: None,
         }
     }
 
@@ -3057,10 +3208,99 @@ impl ProviderError {
 
     #[must_use]
     pub fn with_http_metadata(mut self, status: u16, request_id: Option<&str>) -> Self {
+        let captured = request_id.map(str::to_owned);
+        let request_id = request_id.and_then(crate::error_detail::safe_request_id);
         self.presentation = self
             .presentation
             .with_http_status(status)
             .with_request_id(request_id);
+        if let Some(state) = self.prose_state.as_mut() {
+            state.captured_request_id = captured;
+            self.redecide_prose();
+        }
+        self
+    }
+
+    /// Re-decides a template rendering with what Haider sent for the failed
+    /// request: `{model}` and `{tool_call_id}` slots publish only values
+    /// equal to the requested model or a tool-call id in the request.
+    /// Without this call such templates stay withheld (fail closed).
+    pub fn corroborate_slots(&mut self, evidence: &ProviderSlotEvidence) {
+        if let Some(state) = self.prose_state.as_mut() {
+            state.evidence = evidence.clone();
+            self.redecide_prose();
+        }
+    }
+
+    fn redecide_prose(&mut self) {
+        use crate::error_detail::ProviderProse;
+        let Some(state) = self.prose_state.as_ref() else {
+            return;
+        };
+        let evidence = crate::error_templates::SlotEvidence {
+            requested_model: state.evidence.requested_model.as_deref(),
+            tool_call_ids: &state.evidence.tool_call_ids,
+            captured_request_id: state.captured_request_id.as_deref(),
+        };
+        let Some(prose) =
+            crate::error_detail::classify_provider_prose_with(&state.prose, &evidence)
+        else {
+            return;
+        };
+        let withheld = format!(
+            "{} · {}",
+            state.default_detail,
+            haider_protocol::error::PROVIDER_DETAIL_WITHHELD
+        );
+        let raw_from_prose = state.raw_from_prose;
+        let (detail, local_raw) = match prose {
+            ProviderProse::Known(rendered) => (rendered, None),
+            ProviderProse::Unknown { local_raw } => (withheld, Some(local_raw)),
+            ProviderProse::Withheld => (withheld, None),
+        };
+        if raw_from_prose {
+            self.provider_raw_detail = local_raw;
+        }
+        self.replace_detail(&detail);
+    }
+
+    /// Owner-local raw text that is not the published prose itself (for
+    /// example an ACP stderr tail next to a known RPC message); later
+    /// corroboration never discards it.
+    pub(crate) fn with_local_raw_detail(mut self, raw: String) -> Self {
+        self.provider_raw_detail = Some(raw);
+        if let Some(state) = self.prose_state.as_mut() {
+            state.raw_from_prose = false;
+        }
+        self
+    }
+
+    fn replace_detail(&mut self, detail: &str) {
+        let mut presentation = ErrorPresentation::new(
+            self.presentation.subcode.as_str(),
+            &self.presentation.title,
+            detail,
+            self.presentation.scope,
+            self.presentation.allowed_actions.clone(),
+        );
+        presentation.provider_http_status = self.presentation.provider_http_status;
+        presentation
+            .provider_request_id
+            .clone_from(&self.presentation.provider_request_id);
+        presentation
+            .provider_error_type
+            .clone_from(&self.presentation.provider_error_type);
+        presentation.retry_after_ms = self.presentation.retry_after_ms;
+        presentation.reset_at_ms = self.presentation.reset_at_ms;
+        presentation.opened_within_ms = self.presentation.opened_within_ms;
+        presentation.budget_ms = self.presentation.budget_ms;
+        self.presentation = presentation;
+    }
+
+    #[must_use]
+    pub(crate) fn with_provider_error_type(mut self, error_type: Option<&str>) -> Self {
+        let error_type = error_type.and_then(crate::error_detail::safe_error_type);
+        self.presentation = self.presentation.with_provider_error_type(error_type);
         self
     }
 
@@ -3089,27 +3329,27 @@ impl ProviderError {
     }
 
     /// Replaces only the operator-facing explanation while retaining the
-    /// typed recovery contract and provider metadata. The presentation
-    /// constructor supplies the durable public-text bound and control-byte
-    /// sanitization; adapters must redact credentials before calling this.
+    /// typed recovery contract and provider metadata. This is the single
+    /// provider-prose boundary: adapters (including ACP stderr tails) pass
+    /// raw, untrusted prose here. Prose matching a known template renders
+    /// from it; anything else keeps the provider-class default explanation
+    /// plus the fixed withheld notice, and its credential-redacted raw text
+    /// is kept only in the owner-local `provider_raw_detail`. Blank prose
+    /// leaves the existing presentation untouched.
     #[must_use]
     pub(crate) fn with_provider_detail(mut self, detail: &str) -> Self {
-        let mut presentation = ErrorPresentation::new(
-            self.presentation.subcode.as_str(),
-            &self.presentation.title,
-            detail,
-            self.presentation.scope,
-            self.presentation.allowed_actions.clone(),
-        );
-        presentation.provider_http_status = self.presentation.provider_http_status;
-        presentation
-            .provider_request_id
-            .clone_from(&self.presentation.provider_request_id);
-        presentation.retry_after_ms = self.presentation.retry_after_ms;
-        presentation.reset_at_ms = self.presentation.reset_at_ms;
-        presentation.opened_within_ms = self.presentation.opened_within_ms;
-        presentation.budget_ms = self.presentation.budget_ms;
-        self.presentation = presentation;
+        let prose = detail.trim();
+        if prose.is_empty() {
+            return self;
+        }
+        self.prose_state = Some(Box::new(ProseState {
+            prose: prose.to_owned(),
+            default_detail: self.presentation.detail.clone(),
+            raw_from_prose: true,
+            evidence: ProviderSlotEvidence::default(),
+            captured_request_id: None,
+        }));
+        self.redecide_prose();
         self
     }
 }
@@ -3389,7 +3629,7 @@ pub(crate) fn reqwest_transport_error_with_route_gating(
     } else {
         ProviderError::new(
             ProviderErrorKind::Transport,
-            format!("{provider} HTTP transport failed: {error}"),
+            format!("{provider} HTTP transport failed"),
         )
     }
 }
@@ -3401,6 +3641,19 @@ impl fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+/// Publishes a `ProviderError.message` candidate that carries provider- or
+/// child-controlled text: its known-template rendering, or else the
+/// provider-class default explanation, so raw text never survives.
+pub(crate) fn public_provider_message(kind: ProviderErrorKind, raw: &str) -> String {
+    crate::error_templates::render_known_provider_message(raw)
+        .unwrap_or_else(|| provider_default_detail(kind))
+}
+
+/// The provider-class default explanation shown when prose is withheld.
+pub(crate) fn provider_default_detail(kind: ProviderErrorKind) -> String {
+    provider_error_presentation(kind).detail
+}
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -3784,6 +4037,20 @@ pub enum FakeStep {
     ExpectToolResult {
         call_id: String,
     },
+    /// Fails the request with a provider error whose message carries
+    /// provider-controlled text (as adapters' malformed-frame errors do).
+    ErrorUntrustedMessage {
+        kind: ProviderErrorKind,
+        message: String,
+    },
+    /// Fails the request with the error the real adapter classifies from a
+    /// captured HTTP error body (`family`: `anthropic`, `openai` — also
+    /// DeepSeek and other OpenAI-compatible APIs — or `gemini`).
+    ReplayHttpError {
+        family: String,
+        status: u16,
+        body: String,
+    },
     EmitText {
         text: String,
     },
@@ -4051,6 +4318,8 @@ impl FakeProvider {
                 self.script[end - 1],
                 FakeStep::Finish { .. }
                     | FakeStep::Error { .. }
+                    | FakeStep::ErrorUntrustedMessage { .. }
+                    | FakeStep::ReplayHttpError { .. }
                     | FakeStep::ErrorPresented { .. }
                     | FakeStep::Hang
                     | FakeStep::PrematureEof
@@ -4245,6 +4514,27 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 let _ = sender
                     .send(Err(
                         ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+                    ))
+                    .await;
+                return;
+            }
+            FakeStep::ReplayHttpError {
+                family,
+                status,
+                body,
+            } => {
+                let error = match family.as_str() {
+                    "anthropic" => replay_anthropic_http_error(status, None, body.as_bytes()),
+                    "gemini" => replay_gemini_http_error(status, None, body.as_bytes()),
+                    _ => replay_openai_http_error(status, None, body.as_bytes()),
+                };
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            FakeStep::ErrorUntrustedMessage { kind, message } => {
+                let _ = sender
+                    .send(Err(
+                        ProviderError::new(kind, message).with_untrusted_message()
                     ))
                     .await;
                 return;
@@ -4836,7 +5126,8 @@ mod e2_contract_tests {
 
     #[test]
     fn e2a_provider_429_presentation_carries_retry_metadata_and_safe_explanation() {
-        const DETAIL: &str = "Rate limit reached for this account.";
+        // A known template (ruling 2): unknown prose would be withheld.
+        const DETAIL: &str = "Resource has been exhausted (e.g. check quota).";
         const SECRET: &str = "RAW_SECRET_MUST_NEVER_RENDER_98c4";
         let body = format!(
             r#"{{"error":{{"type":"rate_limit_error","message":"{DETAIL}"}},"api_key":"{SECRET}"}}"#

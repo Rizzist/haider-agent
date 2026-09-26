@@ -72,8 +72,9 @@ class TranscriptCache(private val directory: File) {
         val hash = MessageDigest.getInstance("SHA-256").digest(session.toByteArray()).joinToString("") { "%02x".format(it) }
         // Projection changes replay from zero: v1 lost unknown items, v2
         // classified ordinary lifecycle/metric records as missing chat content,
-        // and v3 threw away the canonical run_failed cause.
-        return File(directory, "$hash.replay-v4.jsonl")
+        // v3 threw away the canonical run_failed cause; v4 dropped its
+        // provider type, status and request ID.
+        return File(directory, "$hash.replay-v5.jsonl")
     }
     private fun atomic(file: File, contents: String) {
         val temp = File.createTempFile("cache-", ".tmp", directory)
@@ -109,6 +110,9 @@ class TranscriptCache(private val directory: File) {
                     obj("type" to "run_failed", "run_id" to envelope.optionalString("run_id"), "code" to payload.optionalString("code"),
                         "title" to presentation?.optionalString("title"),
                         "detail" to presentation?.optionalString("detail"),
+                        "provider_error_type" to presentation?.optionalString("provider_error_type"),
+                        "provider_request_id" to presentation?.optionalString("provider_request_id"),
+                        "provider_http_status" to presentation?.optionalNumber("provider_http_status"),
                         "retryable" to (payload["retryable"] == JsonPrimitive(true)))
                 }
                 "node_committed" -> {

@@ -4013,15 +4013,23 @@ pub fn replay_openai_http_error(
     body: &[u8],
 ) -> ProviderError {
     let parsed = serde_json::from_slice::<OpenAiErrorEnvelope>(body).ok();
-    let provider_detail = crate::error_detail::http_error_detail(body);
+    // Raw, untrusted prose: classified here, published only through
+    // `with_provider_detail`'s shape policy.
+    let raw_detail = crate::error_detail::http_error_prose(body);
     let error_type = parsed
         .as_ref()
         .and_then(|envelope| envelope.error.kind.as_deref());
     let error_code = parsed
         .as_ref()
         .and_then(|envelope| envelope.error.code.as_deref());
+    let safe_type = error_type.and_then(crate::error_detail::safe_error_type);
+    let safe_code = error_code.and_then(crate::error_detail::safe_error_type);
+    // An allowlisted code is the most specific classifier. Unknown codes are
+    // ignored, then an allowlisted type can classify the response. The public
+    // identity below instead prefers type, matching the provider's type field.
+    let error_tag = safe_code.or(safe_type);
     let context_exceeded = matches!(
-        error_code.or(error_type),
+        error_tag,
         Some(
             "context_length_exceeded"
                 | "context_window_exceeded"
@@ -4031,7 +4039,7 @@ pub fn replay_openai_http_error(
         )
     );
     let quota_exhausted = matches!(
-        error_code.or(error_type),
+        error_tag,
         Some("insufficient_quota" | "billing_hard_limit_reached" | "credit_balance_too_low")
     );
     let kind = match status {
@@ -4042,18 +4050,18 @@ pub fn replay_openai_http_error(
         503 => ProviderErrorKind::Overloaded,
         408 | 500..=599 => ProviderErrorKind::Transport,
         _ if context_exceeded => ProviderErrorKind::ContextExceeded,
-        _ => match error_code.or(error_type) {
+        _ => match error_tag {
             Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
             Some("permission_denied") => ProviderErrorKind::PermissionDenied,
             Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
             Some("server_error" | "timeout") => ProviderErrorKind::Transport,
-            _ if provider_detail
+            _ if raw_detail
                 .as_deref()
                 .is_some_and(openai_error_message_is_authentication) =>
             {
                 ProviderErrorKind::Authentication
             }
-            _ if provider_detail
+            _ if raw_detail
                 .as_deref()
                 .is_some_and(openai_error_message_is_overload) =>
             {
@@ -4076,7 +4084,7 @@ pub fn replay_openai_http_error(
     } else {
         format!("OpenAI HTTP {status} returned {}", provider_kind_name(kind))
     };
-    let error = match error_code.or(error_type) {
+    let error = match error_tag {
         Some("account_deleted" | "account_not_found") => ProviderError::new_with_presentation(
             kind,
             message,
@@ -4091,11 +4099,12 @@ pub fn replay_openai_http_error(
         }
         _ => ProviderError::new(kind, message),
     };
-    let error = match provider_detail.as_deref() {
+    let error = match raw_detail.as_deref() {
         Some(detail) => error.with_provider_detail(detail),
         None => error,
     };
     error
+        .with_provider_error_type(safe_type.or(safe_code))
         .with_retry_after_ms(retry_after_ms)
         .with_http_metadata(status, None)
 }
@@ -4135,12 +4144,14 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
                 .and_then(|response| response.get("error"))
         })
         .unwrap_or(value);
-    let kind = error
-        .get("code")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| error.get("type").and_then(serde_json::Value::as_str));
-    let provider_detail = crate::error_detail::provider_error_message(error)
-        .and_then(crate::error_detail::sanitize_provider_error_detail);
+    let code = error.get("code").and_then(serde_json::Value::as_str);
+    let error_type = error.get("type").and_then(serde_json::Value::as_str);
+    let safe_code = code.and_then(crate::error_detail::safe_error_type);
+    let safe_type = error_type.and_then(crate::error_detail::safe_error_type);
+    // Match HTTP precedence: safe code, then safe type. Raw values never
+    // classify or enter the public presentation.
+    let kind = safe_code.or(safe_type);
+    let raw_detail = crate::error_detail::provider_error_message(error);
     let provider_kind = match kind {
         Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
         Some("permission_denied") => ProviderErrorKind::PermissionDenied,
@@ -4157,20 +4168,14 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
             | "input_too_large",
         ) => ProviderErrorKind::ContextExceeded,
         Some("server_error" | "timeout") => ProviderErrorKind::Transport,
-        _ if provider_detail
-            .as_deref()
-            .is_some_and(openai_error_message_is_authentication) =>
-        {
+        _ if raw_detail.is_some_and(openai_error_message_is_authentication) => {
             ProviderErrorKind::Authentication
         }
         // The codex backend returns overload under codes the arms above
         // don't know — the prose is the only stable marker. Misclassifying
         // it as InvalidRequest made a RETRYABLE condition error whole runs
         // (nine journaled failures before daemon.log named the cause).
-        _ if provider_detail
-            .as_deref()
-            .is_some_and(openai_error_message_is_overload) =>
-        {
+        _ if raw_detail.is_some_and(openai_error_message_is_overload) => {
             ProviderErrorKind::Overloaded
         }
         _ => ProviderErrorKind::InvalidRequest,
@@ -4181,24 +4186,18 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
             "OpenAI stream returned {}",
             provider_kind_name(provider_kind)
         ),
-    );
-    match provider_detail.as_deref() {
+    )
+    .with_provider_error_type(kind);
+    match raw_detail {
         Some(detail) => provider_error.with_provider_detail(detail),
         None => provider_error,
     }
 }
 
 fn openai_stream_error_prose(detail: &str) -> ProviderError {
-    let provider_detail = crate::error_detail::sanitize_provider_error_detail(detail);
-    let provider_kind = if provider_detail
-        .as_deref()
-        .is_some_and(openai_error_message_is_authentication)
-    {
+    let provider_kind = if openai_error_message_is_authentication(detail) {
         ProviderErrorKind::Authentication
-    } else if provider_detail
-        .as_deref()
-        .is_some_and(openai_error_message_is_overload)
-    {
+    } else if openai_error_message_is_overload(detail) {
         ProviderErrorKind::Overloaded
     } else {
         ProviderErrorKind::InvalidRequest
@@ -4210,10 +4209,7 @@ fn openai_stream_error_prose(detail: &str) -> ProviderError {
             provider_kind_name(provider_kind)
         ),
     );
-    match provider_detail.as_deref() {
-        Some(detail) => provider_error.with_provider_detail(detail),
-        None => provider_error,
-    }
+    provider_error.with_provider_detail(detail)
 }
 
 /// Stand-in for a native computer screenshot that request-time elision
@@ -6747,8 +6743,10 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
+/// Malformed-frame messages interpolate provider-controlled values (event
+/// names, ids, decoder text), so they are published only via templates.
 fn malformed(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+    ProviderError::new(ProviderErrorKind::MalformedFrame, message).with_untrusted_message()
 }
 
 fn stream_interrupted(message: impl Into<String>) -> ProviderError {

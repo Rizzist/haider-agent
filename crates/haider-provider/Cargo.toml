@@ -18,8 +18,10 @@ futures-util.workspace = true
 haider-accounts = { path = "../haider-accounts" }
 haider-platform = { path = "../haider-platform" }
 haider-protocol = { path = "../haider-protocol" }
+haider-tools = { path = "../haider-tools" }
 haider-webextract = { path = "../haider-webextract" }
 httpdate.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
@@ -28,6 +30,7 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 unicode-width.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -233,6 +233,11 @@ fn render_plain_impl_with_status(
                 out.push_str(line);
                 out.push('\n');
             }
+            for line in crate::projection::error_identity_lines(presentation) {
+                out.push_str("  ");
+                out.push_str(&line);
+                out.push('\n');
+            }
             let facts = crate::projection::error_fact_segments(presentation, None);
             out.push_str("  ");
             out.push_str(&crate::projection::join_error_fact_segments(&facts));

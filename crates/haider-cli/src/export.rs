@@ -288,13 +288,18 @@ impl SessionExport {
                     seq,
                 }),
                 EventPayload::RunFailed {
-                    presentation: Some(presentation),
+                    presentation: Some(mut presentation),
                     ..
-                } => turns.push(Turn::Error {
-                    presentation,
-                    at_ms,
-                    seq,
-                }),
+                } => {
+                    // Exports (masked or not) are shareable artifacts: the
+                    // owner-local raw provider text never enters them.
+                    presentation.strip_local_only();
+                    turns.push(Turn::Error {
+                        presentation,
+                        at_ms,
+                        seq,
+                    });
+                }
                 EventPayload::ToolResult { call_id, result } => {
                     let key = (
                         envelope

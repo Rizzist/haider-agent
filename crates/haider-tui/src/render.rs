@@ -11975,6 +11975,12 @@ fn wrapped_menu_body(
             .flat_map(|logical| wrap_body(logical, budget))
             .map(|row| (row, DiffTone::Body))
             .collect();
+        rows.extend(
+            crate::projection::error_identity_lines(presentation)
+                .iter()
+                .flat_map(|line| wrap_body(line, budget))
+                .map(|row| (row, DiffTone::Body)),
+        );
         let facts = crate::projection::error_fact_segments(presentation, Some(now_ms));
         rows.push((shed_fact_line(&facts, budget), DiffTone::Body));
         return rows;
@@ -15384,7 +15390,7 @@ fn peer_entry_lines<'a>(
 ///  ✗ Provider rate limit reached            ← err ink, BOLD (title)
 ///  ▏ Wait for the provider limit to reset,  ← err rail · dim detail,
 ///  ▏ then retry.                              wrapped by display cells
-///  ▏ rate-limited · HTTP 429 · req 8f3a2c1… ← dim fact line, whole-
+///  ▏ rate-limited · HTTP 429 · Request id: …  ← dim fact line, whole-
 ///                                             segment shed to width
 /// ```
 ///
@@ -15422,7 +15428,12 @@ fn error_entry_lines<'a>(
     if budget == 0 {
         return;
     }
-    for logical in presentation.detail.split('\n') {
+    let identity = crate::projection::error_identity_lines(presentation);
+    for logical in presentation
+        .detail
+        .split('\n')
+        .chain(identity.iter().map(String::as_str))
+    {
         for row in wrap_body(logical, budget) {
             lines.push(Line::from(vec![
                 Span::raw(" "),

@@ -826,12 +826,12 @@ impl DaemonContextCompactor {
                 Ok(None) => {}
             }
         }
-        let code = if error.presentation.subcode.as_str() == "provider-timeout" {
-            ErrorCode::ProviderTimeout
-        } else {
-            ErrorCode::ProviderError
-        };
-        HaiderError::new(code, format!("{message}: {error}"), error.retryable)
+        // Same publication boundary as a turn's provider failure: public
+        // message, typed presentation (status, type, request id), and raw
+        // provider text only in the owner-local field.
+        let mut mapped = haider_core::provider_error_to_haider(error);
+        mapped.message = format!("{message}: {}", mapped.message);
+        mapped
     }
 
     async fn provider_open_error(&self, run_id: &RunId, error: ProviderError) -> HaiderError {
@@ -7450,6 +7450,8 @@ async fn perform_manual_compaction(
         lease.worker_generation(),
     );
     post_compaction_config.tools = post_compaction_tool_pack.current.as_ref().to_vec();
+    post_compaction_config.provider_lockdown = lockdown.is_some();
+    let lockdown_active = lockdown.is_some();
     if let Some(configured) = initial_tool_exposure_for_turn(
         dependencies.tool_factory.as_ref(),
         grant,
@@ -7726,6 +7728,9 @@ async fn perform_manual_compaction(
                 false,
             ),
         };
+        // Same lockdown gate as a turn's terminal failure: the journaled
+        // RunFailed and the RPC reply carry templates only.
+        let error = lockdown_gated_failure(error, lockdown_active);
         append_failure(
             lease,
             device_id,
@@ -9471,6 +9476,7 @@ async fn start_turn(
     config.context_window = resolved.context_window;
     config.agent_id = agent_id;
     config.enforce_advertised_tool_ceiling = loom_provider_fenced || lockdown.is_some();
+    config.provider_lockdown = lockdown.is_some();
     config.branch_id = accepted.branch_id.clone();
     config.max_tokens = metadata.max_tokens;
     config.interaction_policy =
@@ -12654,6 +12660,15 @@ impl Drop for AbortOnDropTask {
             task.abort();
         }
     }
+}
+
+/// Lockdown shows provider templates only: the owner-local raw provider text
+/// is removed from a failure before it is journaled or returned.
+fn lockdown_gated_failure(mut error: HaiderError, lockdown: bool) -> HaiderError {
+    if lockdown && let Some(presentation) = error.presentation.as_mut() {
+        presentation.strip_local_only();
+    }
+    error
 }
 
 async fn append_failure(
@@ -26985,3 +27000,50 @@ mod provider_rebind;
 #[cfg(all(test, feature = "android-standalone"))]
 #[path = "android_inventory_tests.rs"]
 mod android_inventory_tests;
+
+#[cfg(test)]
+mod manual_compaction_lockdown_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// A failed manual `/compact` on a lockdown session journals RunFailed via
+    /// `append_failure` -> `presentation_for_haider_error`. The summarization
+    /// provider error keeps unknown prose only as owner-local raw text, and
+    /// the lockdown gate removes it before journaling or replying.
+    #[test]
+    fn failed_manual_compaction_under_lockdown_journals_templates_only() {
+        let body = serde_json::json!({"error": {
+            "type": "permission_error",
+            "message": "Your organization quillcompact has no access to this model."
+        }})
+        .to_string();
+        let provider_error =
+            haider_provider::replay_anthropic_http_error(403, None, body.as_bytes());
+        let summarization = || {
+            let mut mapped = haider_core::provider_error_to_haider(provider_error.clone());
+            mapped.message = format!("context summarization failed: {}", mapped.message);
+            mapped
+        };
+        let journal = |error: &HaiderError| {
+            serde_json::to_string(&EventPayload::RunFailed {
+                code: error.code,
+                message: sanitized_failure_message(&error.message),
+                retryable: error.retryable,
+                presentation: Some(presentation_for_haider_error(error)),
+            })
+            .expect("serialize run failure")
+        };
+        let locked = lockdown_gated_failure(summarization(), true);
+        let locked_journal = journal(&locked);
+        assert!(!locked_journal.contains("quillcompact"), "{locked_journal}");
+        assert!(locked_journal.contains("details withheld"));
+        let open = lockdown_gated_failure(summarization(), false);
+        assert!(
+            open.presentation
+                .as_ref()
+                .and_then(|presentation| presentation.provider_raw_detail.as_deref())
+                .is_some_and(|raw| raw.contains("quillcompact"))
+        );
+    }
+}
