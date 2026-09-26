@@ -134,7 +134,7 @@ jobs:
           "Clean Server Core ($Image) acceptance exit: $Result" >> $env:GITHUB_STEP_SUMMARY
           $PassLines | ForEach-Object { "- $_" >> $env:GITHUB_STEP_SUMMARY }
           if ($Result -ne 0) { throw "Clean Server Core package acceptance failed, rc=$Result" }
-          if ($PassLines.Count -ne 4) { throw "Expected four acceptance PASS lines, got $($PassLines.Count)" }
+          if ($PassLines.Count -ne 5) { throw "Expected five acceptance PASS lines, got $($PassLines.Count)" }
 
   publish:
     needs: [pack, accept]
