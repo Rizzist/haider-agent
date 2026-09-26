@@ -7385,6 +7385,13 @@ async fn handle_device_import(
         );
         return;
     };
+    // Adoption ingests a credential Haider did not mint. While the debug
+    // fake-OAuth hook fakes this provider it is refused first, with its own
+    // typed reason, before any other eligibility check.
+    if let Err(error) = crate::oauth::require_live_oauth_provider(&candidate.wire.provider) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
     let Some(source) = candidate.import_source else {
         respond_management_error(
             &job.route,
@@ -7399,12 +7406,6 @@ async fn handle_device_import(
         );
         return;
     };
-    // Adoption ingests a credential Haider did not mint: never while the debug
-    // fake-OAuth hook fakes that provider.
-    if let Err(error) = crate::oauth::require_live_oauth_provider(&candidate.wire.provider) {
-        respond_management_error(&job.route, &error);
-        return;
-    }
     let expected_source_fingerprint = candidate.content_fingerprint;
     // G4b (LV2): the gcloud candidate imports through the SHELL-OUT source,
     // not an OAuth bundle file — its own arm, before the bundle machinery.
