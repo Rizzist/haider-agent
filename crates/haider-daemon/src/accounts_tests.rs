@@ -11322,6 +11322,111 @@ async fn reimport_over_a_retired_secret_restores_the_account() {
     store.close().await.expect("close");
 }
 
+/// Provider removal runs the catalog sweep: rows no reader uses (an orphan
+/// `account-v2:` key left by a removed custom-provider account, the
+/// unreleased `account:<len>:` form, a legacy bare key for an account-scoped
+/// catalog) are deleted, while the public Haider Code catalog under its bare
+/// key survives.
+/// MUTATION CHECK: drop `prune_catalog_cache` from `handle_provider_remove`
+/// (the orphan rows survive), or classify by the profile's inference auth
+/// (the public `haider-code` row is deleted).
+#[tokio::test]
+async fn provider_removal_prunes_unread_catalog_rows_and_keeps_public_catalogs() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let unread = [
+        "account-v2:1111111111111111111111111111111111111111111111111111111111111111",
+        "account:12:openai-oauth:legacy",
+        OPENAI_OAUTH_PROVIDER_NAME,
+    ];
+    for key in unread
+        .into_iter()
+        .chain([haider_provider::HAIDER_CODE_PROVIDER_NAME, "custom-lab"])
+    {
+        store
+            .put_provider_models(key.to_owned(), "[]".to_owned(), None, 1)
+            .await
+            .expect("seed catalog row");
+    }
+    let mut profiles = initial_provider_profiles(
+        &std::collections::BTreeSet::from([
+            OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            haider_provider::HAIDER_CODE_PROVIDER_NAME.to_owned(),
+        ]),
+        "unused",
+    );
+    profiles.push(removable_provider_profile("custom-lab"));
+    let provider_store: Box<dyn ProviderRegistryStoreLike> =
+        Box::new(JsonProviderRegistryStore::new(dir.path()));
+    let providers = ProviderRegistry::new(
+        provider_store,
+        profiles,
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("provider registry");
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
+        profile_id: "provider-remove-prune".into(),
+        default_model: "unused".into(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
+    });
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RemoveProvider(Box::new(
+            ProviderRemoveJob {
+                command_id: "remove-custom-prune".to_owned(),
+                provider: "custom-lab".to_owned(),
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("remove-custom-prune"),
+                    sink,
+                },
+            },
+        )))
+        .await
+        .expect("send remove");
+    assert!(matches!(
+        frames.recv().await.expect("remove response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderRemove { .. },
+            ..
+        }
+    ));
+    for key in unread.into_iter().chain(["custom-lab"]) {
+        assert!(
+            store
+                .provider_models(key.to_owned())
+                .await
+                .expect("cache read")
+                .is_none(),
+            "provider removal prunes unread row {key}"
+        );
+    }
+    assert!(
+        store
+            .provider_models(haider_provider::HAIDER_CODE_PROVIDER_NAME.to_owned())
+            .await
+            .expect("cache read")
+            .is_some(),
+        "the public Haider Code catalog is never pruned"
+    );
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 fn removable_provider_profile(provider: &str) -> ProviderProfileV1 {
     ProviderProfileV1 {
         provider_id: provider.to_owned(),

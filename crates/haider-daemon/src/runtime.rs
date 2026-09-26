@@ -1002,23 +1002,31 @@ async fn run_inner(
                 .with_resilience(account_resilience.clone()),
             ),
         },
+        // Test seam: identical wiring to `Accounts` except for the adapter
+        // builder, so the management snapshot (catalog windows, provider
+        // profiles) and the model source reach the worker exactly as in
+        // production.
         crate::worker::ProviderFactoryConfig::AccountsWith(builder) => {
             match accounts_runtime.broker.clone() {
                 Some(broker) => std::sync::Arc::new(
-                    crate::accounts::AccountsProviderFactory::with_broker(
+                    crate::accounts::AccountsProviderFactory::with_broker_and_management(
                         std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                        accounts_runtime.facade.management.clone(),
                         accounts_runtime.vault.clone(),
                         std::sync::Arc::clone(builder),
                         broker,
                     )
+                    .with_model_source(std::sync::Arc::clone(&accounts_runtime.model_source))
                     .with_resilience(account_resilience.clone()),
                 ),
                 None => std::sync::Arc::new(
-                    crate::accounts::AccountsProviderFactory::new(
+                    crate::accounts::AccountsProviderFactory::new_with_management(
                         std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                        accounts_runtime.facade.management.clone(),
                         accounts_runtime.vault.clone(),
                         std::sync::Arc::clone(builder),
                     )
+                    .with_model_source(std::sync::Arc::clone(&accounts_runtime.model_source))
                     .with_resilience(account_resilience.clone()),
                 ),
             }

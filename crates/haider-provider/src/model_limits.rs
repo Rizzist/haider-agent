@@ -152,6 +152,9 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         // https://developers.openai.com/api/docs/models/gpt-6-luna
         //   (checked 2026-09-25: 1,050,000 context, 128,000 max output)
         // https://developers.openai.com/api/docs/models/gpt-5.6-sol
+        //   (the bare `gpt-5.6` id has no page of its own: its URL
+        //   301-redirects here, so it is the gpt-5.6-sol alias; checked
+        //   2026-09-26)
         // https://developers.openai.com/api/docs/models/gpt-5.6-terra
         // https://developers.openai.com/api/docs/models/gpt-5.6-luna
         // https://developers.openai.com/api/docs/models/gpt-5.5

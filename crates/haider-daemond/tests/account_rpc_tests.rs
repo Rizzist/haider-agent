@@ -1180,6 +1180,126 @@ impl haider_daemon::ProviderModelDiscoverer for AccountScopedCatalog {
     }
 }
 
+/// Catalog cache sweep through the real daemon: the startup sweep drops
+/// rows no reader uses (a legacy bare key for an account-scoped catalog, the
+/// unreleased `account:<len>:` form, an orphan `account-v2:` key), keeps every
+/// live account's row and the PUBLIC Haider Code catalog under its bare key
+/// (Haider Code runs turns with an API key but reads a Public catalog), and
+/// account removal then drops exactly the removed account's row.
+/// MUTATION CHECK: classify providers by the profile's inference auth
+/// instead of the catalog's auth (the F1 bug); the public `haider-code` row
+/// disappears on the first restart.
+#[tokio::test]
+async fn catalog_sweep_keeps_public_and_live_rows_across_startup_and_account_removal() {
+    let root = test_root("hac-sweep-");
+    let config = DaemonConfig::new(
+        "profile-catalog-sweep",
+        root.path().join("store"),
+        root.path(),
+    );
+    let fixture = AccountFixture::for_provider("haider-code", Vec::new());
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+    let stage_a = stage_secret(&mut client, "sweep-a", "synthetic-haider-code-a").await;
+    let a = expect_descriptor(
+        request(
+            &mut client,
+            "login-sweep-a",
+            login_body_for_provider("command-sweep-a", "haider-code", &stage_a, Some("a"), None),
+        )
+        .await,
+    );
+    let stage_b = stage_secret(&mut client, "sweep-b", "synthetic-haider-code-b").await;
+    let b = expect_descriptor(
+        request(
+            &mut client,
+            "login-sweep-b",
+            login_body_for_provider("command-sweep-b", "haider-code", &stage_b, Some("b"), None),
+        )
+        .await,
+    );
+    drop(client);
+    task.shutdown_handle().request("seed catalog rows");
+    let _ = task.join().await;
+
+    let key_a = haider_store::ProviderModelCacheKey::for_account("haider-code", &a);
+    let key_b = haider_store::ProviderModelCacheKey::for_account("haider-code", &b);
+    let public = "haider-code";
+    let unread = [
+        "openai-oauth",
+        "account:12:openai-oauth:legacy",
+        "account-v2:0000000000000000000000000000000000000000000000000000000000000000",
+    ];
+    {
+        let store = haider_store::Store::open(&config.store_dir)
+            .unwrap_or_else(|error| panic!("open store: {error:?}"));
+        for key in [public, key_a.as_str(), key_b.as_str()]
+            .into_iter()
+            .chain(unread)
+        {
+            store
+                .put_provider_models(key, "[]", Some("etag"), 1)
+                .unwrap_or_else(|error| panic!("seed {key}: {error:?}"));
+        }
+    }
+    let present = |key: &str| {
+        haider_store::Store::open(&config.store_dir)
+            .unwrap_or_else(|error| panic!("reopen store: {error:?}"))
+            .provider_models(key)
+            .unwrap_or_else(|error| panic!("read {key}: {error:?}"))
+            .is_some()
+    };
+
+    // Startup sweep.
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    task.shutdown_handle().request("after startup sweep");
+    let _ = task.join().await;
+    assert!(
+        present(public),
+        "the public Haider Code catalog survives startup"
+    );
+    assert!(
+        present(key_a.as_str()) && present(key_b.as_str()),
+        "live accounts keep rows"
+    );
+    for key in unread {
+        assert!(!present(key), "startup sweep removes unread row {key}");
+    }
+
+    // Account change: removing B drops only B's row.
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+    let removed = request(
+        &mut client,
+        "remove-sweep-b",
+        RequestBody::AccountRemove {
+            command_id: CommandId::new("command-remove-sweep-b"),
+            alias: b.alias.as_str().to_owned(),
+            expected_revision: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(removed, ResponseBody::AccountRemove { .. }),
+        "remove B: {removed:?}"
+    );
+    drop(client);
+    task.shutdown_handle().request("after account removal");
+    let _ = task.join().await;
+    assert!(
+        present(public),
+        "the public catalog survives an account change"
+    );
+    assert!(
+        present(key_a.as_str()),
+        "the remaining account keeps its row"
+    );
+    assert!(
+        !present(key_b.as_str()),
+        "the removed account's row is pruned"
+    );
+}
+
 #[tokio::test]
 async fn newly_active_alias_never_projects_previous_account_after_failed_refresh() {
     let root = test_root("hac-active-catalog-");
@@ -1277,6 +1397,415 @@ async fn newly_active_alias_never_projects_previous_account_after_failed_refresh
     task.join()
         .await
         .unwrap_or_else(|error| panic!("daemon joins: {error:?}"));
+}
+
+/// End to end on the production accounts factory (catalog windows from the
+/// management snapshot): a static-window subscription row (haider-code /
+/// deepseek-v4-flash, 128K from the pinned limits table, no catalog window)
+/// accumulates history over several turns until the pre-request estimate
+/// crosses the 85% soft threshold; that turn commits
+/// `context_compaction_intent_v1` and still completes. The per-turn
+/// footprint history and any terminal error text are printed for evidence.
+/// MUTATION CHECK: drop the management snapshot from the `AccountsWith` seam
+/// (the worker gets no window: footprints carry no threshold and no intent
+/// is ever committed), or drop the limits-table window fallback.
+#[tokio::test]
+async fn static_window_row_auto_compacts_at_the_soft_threshold_and_completes() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::history::COMPACTION_INTENT_EXTENSION_KIND;
+    use haider_protocol::item::TurnItem;
+    use haider_provider::{FakeProvider, FakeStep};
+
+    let root = test_root("hacC");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
+    let config = DaemonConfig::new("profile-compact", root.path().join("store"), root.path());
+    let segment = |text: &str| {
+        vec![
+            FakeStep::EmitText { text: text.into() },
+            FakeStep::Finish {
+                reason: haider_protocol::provider::FinishReason::EndTurn,
+            },
+        ]
+    };
+    let script = (0..24)
+        .flat_map(|index| segment(&format!("fake reply {index}")))
+        .collect::<Vec<_>>();
+    let fake = Arc::new(FakeProvider::new(script));
+    let builder = Arc::new(FakeAccountBuilder {
+        provider_id: "haider-code",
+        fake: fake.clone(),
+        built: StdMutex::new(Vec::new()),
+    });
+    let dependencies = DaemonDependencies {
+        provider_factory: haider_daemon::ProviderFactoryConfig::AccountsWith(builder.clone()),
+        accounts: AccountsDependencies {
+            vault: VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+            validator: ScriptedValidator::for_provider("haider-code", Vec::new()),
+            descriptor_store: None,
+            model_discoverer: Some(Arc::new(ForbiddenCatalog::default())),
+            ..AccountsDependencies::default()
+        },
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = control_client(&config).await;
+    let reference = stage_secret(&mut client, "stage-compact", "sk-compact-fake-key").await;
+    expect_descriptor(
+        request(
+            &mut client,
+            "req-compact-login",
+            login_body_for_provider(
+                "command-compact-login",
+                "haider-code",
+                &reference,
+                Some("compact"),
+                None,
+            ),
+        )
+        .await,
+    );
+    let created = request(
+        &mut client,
+        "req-compact-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("command-compact-create"),
+            cwd: workspace.display().to_string(),
+            provider: "haider-code".into(),
+            model: "deepseek-v4-flash".into(),
+            max_tokens: 4_096,
+        },
+    )
+    .await;
+    let (session_id, generation) = match created {
+        ResponseBody::SessionCreate {
+            session_id,
+            worker_generation,
+            ..
+        } => (session_id, worker_generation),
+        other => panic!("expected session.create response, got {other:?}"),
+    };
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("req-compact-attach"),
+                body: RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
+                },
+            },
+            LIMIT,
+        )
+        .await;
+    loop {
+        if let WireFrame::Response { request_id, body } = client.next().await {
+            assert_eq!(request_id.as_str(), "req-compact-attach");
+            assert!(matches!(body, ResponseBody::SessionAttach { .. }));
+            break;
+        }
+    }
+
+    // ~24K estimated tokens per prompt (bytes / 4): the 128K window's 85%
+    // line (108,800) is crossed only after several turns of history.
+    let chunk = "context filler for the compaction threshold ".repeat(2_200);
+    let mut history = Vec::new();
+    let mut compacted_turn = None;
+    for turn in 0..8_usize {
+        client
+            .send(
+                &WireFrame::Request {
+                    request_id: RequestId::new(format!("req-compact-submit-{turn}")),
+                    body: RequestBody::TurnSubmit {
+                        command_id: CommandId::new(format!("command-compact-submit-{turn}")),
+                        session_id: session_id.clone(),
+                        worker_generation: generation,
+                        text: format!("turn {turn}: {chunk}"),
+                        attachments: Vec::new(),
+                        mode: haider_protocol::DeliveryMode::Queue,
+                    },
+                },
+                LIMIT,
+            )
+            .await;
+        let mut footprints = Vec::new();
+        let mut intent = false;
+        let mut recent = std::collections::VecDeque::new();
+        let terminal = loop {
+            let WireFrame::Event { envelope, .. } = client.next().await else {
+                continue;
+            };
+            let raw: serde_json::Value = envelope.payload.into();
+            if recent.len() == 6 {
+                recent.pop_front();
+            }
+            recent.push_back(raw.to_string().chars().take(600).collect::<String>());
+            match serde_json::from_value::<EventPayload>(raw) {
+                Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data, .. },
+                    ..
+                })) => {
+                    if kind == COMPACTION_INTENT_EXTENSION_KIND {
+                        intent = true;
+                    } else if kind == "context_footprint_v1" {
+                        footprints.push((
+                            data["used_tokens"].as_u64(),
+                            data["context_window"].as_u64(),
+                            data["soft_threshold_tokens"].as_u64(),
+                        ));
+                    }
+                }
+                Ok(EventPayload::RunState(state)) if state.is_terminal() => break state,
+                _ => {}
+            }
+        };
+        eprintln!(
+            "compaction-e2e turn={turn} terminal={terminal:?} intent={intent} footprints={footprints:?}"
+        );
+        assert_eq!(
+            terminal,
+            haider_protocol::state::RunState::Done,
+            "turn {turn} must complete; footprints {footprints:?}; last events {recent:?}"
+        );
+        assert!(
+            footprints
+                .iter()
+                .all(|(_, window, threshold)| *window == Some(128_000)
+                    && *threshold == Some(108_800)),
+            "the catalog window reaches the worker: {footprints:?}"
+        );
+        history.push((turn, intent, footprints));
+        if intent {
+            compacted_turn = Some(turn);
+            break;
+        }
+    }
+    let compacted_turn = compacted_turn
+        .unwrap_or_else(|| panic!("no turn crossed 85% into compaction: {history:?}"));
+    assert!(
+        compacted_turn >= 2,
+        "compaction follows several prior turns"
+    );
+    let (_, _, footprints) = &history[compacted_turn];
+    assert!(
+        footprints
+            .iter()
+            .any(|(used, _, threshold)| used.zip(*threshold).is_some_and(|(u, t)| u >= t)),
+        "the compacting turn crossed the soft threshold: {footprints:?}"
+    );
+    for (turn, intent, footprints) in &history[..compacted_turn] {
+        assert!(!intent, "turn {turn} stayed under the threshold");
+        assert!(
+            footprints
+                .iter()
+                .all(|(used, _, threshold)| used.zip(*threshold).is_some_and(|(u, t)| u < t)),
+            "turn {turn} was below 85%: {footprints:?}"
+        );
+    }
+
+    drop(client);
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
+}
+
+/// Verifier F2 reproduction (repair 2): one prior turn, then a prompt whose
+/// own estimate (~142K) exceeds the whole 128K window. The window reaches the
+/// worker (threshold 108,800) and the soft line is crossed, but the planner in
+/// `prompt_history::plan_compaction` refuses before committing an intent:
+/// `invalid_argument` "there is not enough older clean-turn history to
+/// compact" (it keeps `COMPACTION_MIN_RECENT_PRIOR_TURNS` recent turns and
+/// needs one more older turn). No provider request is made. This pins the
+/// current compaction-internals behaviour, which belongs to the in-turn
+/// compaction lane; it is not a catalog/window defect.
+#[tokio::test]
+async fn oversized_turn_after_one_prior_turn_is_refused_by_the_compaction_planner() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::history::COMPACTION_INTENT_EXTENSION_KIND;
+    use haider_protocol::item::TurnItem;
+    use haider_provider::{FakeProvider, FakeStep};
+
+    let root = test_root("hacV");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
+    let config = DaemonConfig::new(
+        "profile-compact-probe",
+        root.path().join("store"),
+        root.path(),
+    );
+    let segment = |text: &str| {
+        vec![
+            FakeStep::EmitText { text: text.into() },
+            FakeStep::Finish {
+                reason: haider_protocol::provider::FinishReason::EndTurn,
+            },
+        ]
+    };
+    let script = (0..24)
+        .flat_map(|index| segment(&format!("fake reply {index}")))
+        .collect::<Vec<_>>();
+    let fake = Arc::new(FakeProvider::new(script));
+    let builder = Arc::new(FakeAccountBuilder {
+        provider_id: "haider-code",
+        fake: fake.clone(),
+        built: StdMutex::new(Vec::new()),
+    });
+    let dependencies = DaemonDependencies {
+        provider_factory: haider_daemon::ProviderFactoryConfig::AccountsWith(builder.clone()),
+        accounts: AccountsDependencies {
+            vault: VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+            validator: ScriptedValidator::for_provider("haider-code", Vec::new()),
+            descriptor_store: None,
+            model_discoverer: Some(Arc::new(ForbiddenCatalog::default())),
+            ..AccountsDependencies::default()
+        },
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = control_client(&config).await;
+    let reference = stage_secret(&mut client, "stage-compact", "sk-compact-fake-key").await;
+    expect_descriptor(
+        request(
+            &mut client,
+            "req-compact-login",
+            login_body_for_provider(
+                "command-compact-login",
+                "haider-code",
+                &reference,
+                Some("compact"),
+                None,
+            ),
+        )
+        .await,
+    );
+    let created = request(
+        &mut client,
+        "req-compact-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("command-compact-create"),
+            cwd: workspace.display().to_string(),
+            provider: "haider-code".into(),
+            model: "deepseek-v4-flash".into(),
+            max_tokens: 4_096,
+        },
+    )
+    .await;
+    let (session_id, generation) = match created {
+        ResponseBody::SessionCreate {
+            session_id,
+            worker_generation,
+            ..
+        } => (session_id, worker_generation),
+        other => panic!("expected session.create response, got {other:?}"),
+    };
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("req-compact-attach"),
+                body: RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
+                },
+            },
+            LIMIT,
+        )
+        .await;
+    loop {
+        if let WireFrame::Response { request_id, body } = client.next().await {
+            assert_eq!(request_id.as_str(), "req-compact-attach");
+            assert!(matches!(body, ResponseBody::SessionAttach { .. }));
+            break;
+        }
+    }
+
+    // The verifier's scratch shape: one small prior turn, then a single
+    // prompt whose own estimate (~140K) exceeds the whole 128K window.
+    let mut outcomes = Vec::new();
+    for (turn, text) in [
+        (0_usize, "small prior turn".to_owned()),
+        (1, "oversized ".repeat(56_000)),
+    ] {
+        client
+            .send(
+                &WireFrame::Request {
+                    request_id: RequestId::new(format!("req-probe-submit-{turn}")),
+                    body: RequestBody::TurnSubmit {
+                        command_id: CommandId::new(format!("command-probe-submit-{turn}")),
+                        session_id: session_id.clone(),
+                        worker_generation: generation,
+                        text,
+                        attachments: Vec::new(),
+                        mode: haider_protocol::DeliveryMode::Queue,
+                    },
+                },
+                LIMIT,
+            )
+            .await;
+        let mut footprints = Vec::new();
+        let mut intent = false;
+        let mut errors = Vec::new();
+        let terminal = loop {
+            let WireFrame::Event { envelope, .. } = client.next().await else {
+                continue;
+            };
+            let raw: serde_json::Value = envelope.payload.into();
+            let text = raw.to_string();
+            if text.contains("\"message\"") || text.contains("error") {
+                errors.push(text.chars().take(800).collect::<String>());
+            }
+            match serde_json::from_value::<EventPayload>(raw) {
+                Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data, .. },
+                    ..
+                })) => {
+                    if kind == COMPACTION_INTENT_EXTENSION_KIND {
+                        intent = true;
+                    } else if kind == "context_footprint_v1" {
+                        footprints.push((
+                            data["used_tokens"].as_u64(),
+                            data["soft_threshold_tokens"].as_u64(),
+                        ));
+                    }
+                }
+                Ok(EventPayload::RunState(state)) if state.is_terminal() => break state,
+                _ => {}
+            }
+        };
+        eprintln!(
+            "oversized-probe turn={turn} terminal={terminal:?} intent={intent} footprints={footprints:?} requests={} errors={errors:#?}",
+            fake.requests().len()
+        );
+        outcomes.push((terminal, intent, footprints, errors));
+    }
+    assert_eq!(outcomes[0].0, haider_protocol::state::RunState::Done);
+    let (terminal, intent, footprints, errors) = &outcomes[1];
+    assert_eq!(*terminal, haider_protocol::state::RunState::Errored);
+    assert!(
+        !intent,
+        "the planner refuses before any intent is committed"
+    );
+    assert!(
+        footprints
+            .iter()
+            .any(|(used, threshold)| used.zip(*threshold).is_some_and(|(u, t)| u > t)),
+        "the catalog window reached the worker and the soft line was crossed: {footprints:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("not enough older clean-turn history to compact")),
+        "typed planner refusal: {errors:?}"
+    );
+    assert_eq!(
+        fake.requests().len(),
+        1,
+        "the oversized turn never reached the provider"
+    );
+    drop(client);
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
 }
 
 // MUTATION CHECK (R6/R10 next-turn pickup): make the accounts-backed factory

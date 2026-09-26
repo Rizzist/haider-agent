@@ -3520,6 +3520,21 @@ fn catalog_cache_key(
     }
 }
 
+/// Whether `provider`'s catalog rows are keyed by account (never by the
+/// bare provider id). Offline catalogs and Public catalogs are not.
+fn catalog_is_account_scoped(
+    provider: &str,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> bool {
+    matches!(
+        catalog_source(provider, providers),
+        Some((
+            _,
+            ProviderAuthRequirementWire::OAuth | ProviderAuthRequirementWire::ApiKey
+        ))
+    )
+}
+
 fn active_catalog_cache_key(
     provider: &str,
     accounts: &AccountStore<Box<dyn StoreLike>>,
@@ -3563,15 +3578,16 @@ async fn prune_catalog_cache(
             ProviderModelCacheKey::for_account(&descriptor.provider, descriptor).into()
         })
         .collect();
+    // A bare provider key is unread exactly when the provider's CATALOG is
+    // account-scoped: the same auth `catalog_cache_key` maps to
+    // `for_account`. The profile's inference auth is not that fact: Haider
+    // Code runs turns with an API key but reads a Public catalog under its
+    // bare key, which must survive every sweep.
     let authenticated = providers
         .summaries(&|_| false)
         .into_iter()
-        .filter_map(|summary| {
-            providers.get(&summary.provider).and_then(|profile| {
-                (profile.auth_requirement != ProviderAuthRequirementWire::None)
-                    .then_some(summary.provider)
-            })
-        })
+        .map(|summary| summary.provider)
+        .filter(|provider| catalog_is_account_scoped(provider, providers))
         .collect();
     if let Err(error) = store.prune_provider_model_caches(keep, authenticated).await {
         tracing::warn!(
@@ -9933,6 +9949,9 @@ impl StoreLike for ReadOnlySnapshotStore {
 }
 
 impl AccountsProviderFactory {
+    /// Unit-test constructor without a management snapshot (no catalog
+    /// windows). Every daemon wiring uses `new_with_management`.
+    #[cfg(test)]
     pub(crate) fn new(
         snapshot: AccountsSnapshot,
         vault: VaultProvision,
@@ -9950,6 +9969,7 @@ impl AccountsProviderFactory {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_broker(
         snapshot: AccountsSnapshot,
         vault: VaultProvision,
