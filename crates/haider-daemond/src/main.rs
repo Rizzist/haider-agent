@@ -171,6 +171,13 @@ fn prepare_dispatch() -> Result<Option<ParsedArgs>, ExitCode> {
         println!("haiderd {}", env!("CARGO_PKG_VERSION"));
         return Ok(None);
     }
+    // The daemon re-executes itself as its computer-use presence overlay (a
+    // UI process that needs the real main thread); it never starts a daemon.
+    if matches!(args.as_slice(), [argument] if argument == haider_tools::presence::PRESENCE_HELPER_ARG)
+    {
+        let status = haider_tools::presence::run_presence_overlay_helper();
+        return Err(ExitCode::from(u8::try_from(status).unwrap_or(EX_SOFTWARE)));
+    }
     if matches!(args.as_slice(), [argument] if argument == "--client-self-test")
         || matches!(args.as_slice(), [argument, flag, _] if argument == "--client-self-test" && flag == "--payload")
     {

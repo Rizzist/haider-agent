@@ -340,7 +340,9 @@ impl WindowsComputerBackend {
                     mouseData: data,
                     dwFlags: flags,
                     time: 0,
-                    dwExtraInfo: 0,
+                    // Lets the presence overlay reject a Stop click that
+                    // Haider itself synthesised (`GetMessageExtraInfo`).
+                    dwExtraInfo: crate::presence::SYNTHETIC_INPUT_TAG as usize,
                 },
             },
         };
@@ -758,6 +760,23 @@ impl ComputerBackend for WindowsComputerBackend {
 
     fn set_viewport(&self, width: u32, height: u32) -> ComputerResult<()> {
         self.set_viewport_region(width, height, None)
+    }
+
+    fn presence_point(&self, action: &ComputerAction) -> Option<crate::presence::PresencePoint> {
+        let point = match action {
+            ComputerAction::LeftClick { x, y }
+            | ComputerAction::MouseMove { x, y }
+            | ComputerAction::Inspect { x, y }
+            | ComputerAction::Scroll { x, y, .. } => ScreenPoint { x: *x, y: *y },
+            ComputerAction::LeftClickDrag { to, .. } => *to,
+            _ => return None,
+        };
+        self.map_point(point)
+            .ok()
+            .map(|native| crate::presence::PresencePoint {
+                x: f64::from(native.x),
+                y: f64::from(native.y),
+            })
     }
 
     fn set_viewport_region(

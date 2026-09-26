@@ -76,6 +76,7 @@ mod config;
 mod connection;
 #[cfg(test)]
 mod context_core_tests;
+mod cu_presence;
 mod delegation;
 #[cfg(all(test, unix))]
 mod delegation_rollup_tests;

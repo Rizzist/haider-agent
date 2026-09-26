@@ -3,6 +3,7 @@ package ai.diffforge.haider.service
 import android.content.Context
 import android.content.Intent
 import android.util.Base64
+import ai.diffforge.haider.service.presence.CuPresence
 import ai.diffforge.haider.transport.CapabilityHandler
 import ai.diffforge.haider.transport.ControlGate
 import ai.diffforge.haider.transport.Frames
@@ -26,8 +27,19 @@ class AndroidCapabilityHandler(context: Context) : CapabilityHandler {
     override suspend fun handle(body: JSONObject): JSONObject {
         refreshSmsCapabilities(appContext)
         val type = body.optString("type")
-        if (type in MUTATING_REQUESTS && !controlAllowed(body)) {
+        if (type == CuPresence.REQUEST_END) {
+            CuPresence.controller.onPresenceEnd()
+            return Frames.ack(ok = true)
+        }
+        val mutating = type in MUTATING_REQUESTS
+        if (mutating && !controlAllowed(body)) {
             return Frames.rejected("observe_only")
+        }
+        // "Haider is controlling your phone": raise/animate the overlay for every screen request,
+        // and refuse further control once the human pressed Stop.
+        val (x, y) = presenceTarget(type, body)
+        if (!CuPresence.controller.onRequest(type, x, y, mutating)) {
+            return Frames.rejected("stopped_by_user")
         }
 
         return when (type) {
@@ -61,6 +73,12 @@ class AndroidCapabilityHandler(context: Context) : CapabilityHandler {
         }
     }
 
+    private fun presenceTarget(type: String, body: JSONObject): Pair<Int?, Int?> = when (type) {
+        "a11y.tap" -> body.optInt("x", -1).takeIf { it >= 0 } to body.optInt("y", -1).takeIf { it >= 0 }
+        "a11y.swipe" -> body.optInt("x2", -1).takeIf { it >= 0 } to body.optInt("y2", -1).takeIf { it >= 0 }
+        else -> null to null
+    }
+
     private fun controlAllowed(body: JSONObject): Boolean =
         body.opt("control") == true && ControlGate.enabled
 
@@ -84,7 +102,9 @@ class AndroidCapabilityHandler(context: Context) : CapabilityHandler {
             ScreenCaptureService.requestConsent(appContext)
             return Frames.ack(ok = false)
         }
-        val png = service.captureOnce() ?: return Frames.ack(ok = false)
+        // The model-facing capture never includes the presence overlay.
+        val png = CuPresence.withOverlayHidden { service.captureOnce() }
+            ?: return Frames.ack(ok = false)
         return JSONObject()
             .put("type", "png")
             .put("base64", Base64.encodeToString(png, Base64.NO_WRAP))

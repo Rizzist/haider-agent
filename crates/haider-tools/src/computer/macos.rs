@@ -59,6 +59,8 @@ const CG_EVENT_OTHER_DOWN: u32 = 25;
 const CG_EVENT_OTHER_UP: u32 = 26;
 const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 const CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
+/// `kCGEventSourceUserData`.
+const CG_EVENT_SOURCE_USER_DATA: u32 = 42;
 const CG_FLAG_SHIFT: u64 = 0x0002_0000;
 const CG_FLAG_CONTROL: u64 = 0x0004_0000;
 const CG_FLAG_OPTION: u64 = 0x0008_0000;
@@ -619,9 +621,16 @@ impl MacOsComputerBackend {
             // setter borrows it without retaining any caller pointer.
             unsafe { CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, click_state) };
         }
-        // SAFETY: `event` remains live through the synchronous post and is
-        // released exactly once immediately afterward.
+        // SAFETY: `event` remains live through the tag write and the
+        // synchronous post, and is released exactly once immediately
+        // afterward. The tag lets the presence overlay reject a Stop click
+        // that Haider itself synthesised.
         unsafe {
+            CGEventSetIntegerValueField(
+                event,
+                CG_EVENT_SOURCE_USER_DATA,
+                crate::presence::SYNTHETIC_INPUT_TAG,
+            );
             CGEventPost(CG_EVENT_TAP_HID, event);
             CFRelease(event.cast_const());
         }
@@ -1379,6 +1388,23 @@ impl ComputerBackend for MacOsComputerBackend {
 
     fn set_viewport(&self, width: u32, height: u32) -> ComputerResult<()> {
         self.set_viewport_region(width, height, None)
+    }
+
+    fn presence_point(&self, action: &ComputerAction) -> Option<crate::presence::PresencePoint> {
+        let point = match action {
+            ComputerAction::LeftClick { x, y }
+            | ComputerAction::MouseMove { x, y }
+            | ComputerAction::Inspect { x, y }
+            | ComputerAction::Scroll { x, y, .. } => ScreenPoint { x: *x, y: *y },
+            ComputerAction::LeftClickDrag { to, .. } => *to,
+            _ => return None,
+        };
+        self.map_point(point)
+            .ok()
+            .map(|quartz| crate::presence::PresencePoint {
+                x: quartz.x,
+                y: quartz.y,
+            })
     }
 
     fn set_viewport_region(

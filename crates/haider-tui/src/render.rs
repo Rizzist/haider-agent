@@ -1360,11 +1360,25 @@ fn voice_header_chip<'a>(model: &AppModel, theme: &Theme) -> Option<Vec<Span<'a>
     ))
 }
 
-/// Paint the voice chip at the RIGHT end of the header's top row — over a
-/// rect exactly the chip's width, so the left-aligned product line on the
-/// same row is never cleared. `left_used` is the display width the product
-/// line already occupies; the chip is dropped (narrow terminal) when it would
-/// overlap that content, and hidden entirely when voice is off.
+/// The computer-use presence chip (owner 2026-09-24, "show it like
+/// ChatGPT/Codex"): `[ ◉ controlling screen · esc stop ]` while the current
+/// run has driven the desktop (or `phone`) within the shared idle window.
+/// Esc is the existing turn cancel, which the daemon routes to the same
+/// cancellation as the overlay's own Stop button.
+fn cu_presence_header_chip<'a>(model: &AppModel, theme: &Theme) -> Option<Vec<Span<'a>>> {
+    let surface = model.projection.cu_presence()?;
+    Some(chip_two_tone(
+        format!("◉ controlling {} · esc stop", surface.noun()),
+        theme.warn_style(),
+        theme.warn_style().add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Paint the header's TOP-RIGHT chips — the computer-use presence chip, then
+/// the voice chip to its left — each over a rect exactly its width, so the
+/// left-aligned product line on the same row is never cleared. `left_used`
+/// is the display width the product line already occupies; a chip that
+/// would overlap it (narrow terminal) is dropped, presence last.
 fn render_header_voice_chip(
     model: &AppModel,
     theme: &Theme,
@@ -1375,19 +1389,30 @@ fn render_header_voice_chip(
     if header_area.height == 0 {
         return;
     }
-    if let Some(spans) = voice_header_chip(model, theme) {
+    let mut right = header_area.x + header_area.width;
+    let limit = header_area.x.saturating_add(left_used).saturating_add(2);
+    for spans in [
+        cu_presence_header_chip(model, theme),
+        voice_header_chip(model, theme),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let chip_w = u16::try_from(Line::from(spans.clone()).width()).unwrap_or(0);
-        if chip_w > 0 && left_used.saturating_add(2).saturating_add(chip_w) <= header_area.width {
-            frame.render_widget(
-                Paragraph::new(Line::from(spans)),
-                Rect {
-                    x: header_area.x + header_area.width - chip_w,
-                    y: header_area.y,
-                    width: chip_w,
-                    height: 1,
-                },
-            );
+        if chip_w == 0 || right.saturating_sub(chip_w) < limit {
+            continue;
         }
+        right -= chip_w;
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: right,
+                y: header_area.y,
+                width: chip_w,
+                height: 1,
+            },
+        );
+        right = right.saturating_sub(1);
     }
 }
 

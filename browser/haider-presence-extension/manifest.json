@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Haider",
+  "description": "Shows when Haider controls this browser: agent tabs live in an orange \"Haider\" tab group and Chrome's own \"Haider started debugging this browser \u00b7 Cancel\" bar stops the run.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "storage",
+    "nativeMessaging"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Haider"
+  }
+}

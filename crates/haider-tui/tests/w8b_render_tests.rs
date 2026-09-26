@@ -97,6 +97,114 @@ fn computer_control_raises_the_sacred_banner_and_screenshot_does_not() {
     );
 }
 
+/// Computer-use presence (owner 2026-09-24): from the run's FIRST `computer`
+/// action — observation included — the session header carries a persistent
+/// `◉ controlling screen · esc stop` chip until the run ends; a `mobile` tap
+/// reads `phone`; SMS reads raise nothing. The idle window mirrors the daemon.
+/// MUTATION CHECK: drop the chip, or clear it only on control actions.
+/// Expected runtime failure: the header assertions below.
+#[test]
+fn computer_use_presence_chip_is_session_scoped_in_the_header() {
+    use haider_protocol::state::RunState;
+    use haider_tui::projection::CuPresenceSurface;
+    let header_has =
+        |rows: &[String], needle: &str| rows.iter().take(3).any(|r| r.contains(needle));
+
+    let mut model = session_model();
+    model
+        .projection
+        .apply(&EventPayload::RunState(RunState::Streaming));
+    let (rows, _) = draw(&model, 118, 40);
+    assert!(
+        !header_has(&rows, "controlling"),
+        "no CU action yet: no chip"
+    );
+
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("cu-p1"),
+            item: TurnItem::ToolCall {
+                call_id: "p1".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+                status: ToolStatus::InProgress,
+            },
+        }));
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("cu-p1"),
+            item: TurnItem::ToolCall {
+                call_id: "p1".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+                status: ToolStatus::Completed,
+            },
+        }));
+    let (rows, _) = draw(&model, 118, 40);
+    assert!(
+        header_has(&rows, "controlling screen · esc stop"),
+        "the chip persists after the action completes:\n{}",
+        rows[..3].join("\n")
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("controlling your screen")),
+        "the transient banner stays reserved for in-flight control"
+    );
+    let later = std::time::Instant::now()
+        + std::time::Duration::from_secs(haider_protocol::computer::CU_PRESENCE_IDLE_SECS);
+    assert_eq!(
+        model.projection.cu_presence_at(later),
+        None,
+        "idle retires the chip"
+    );
+
+    model
+        .projection
+        .apply(&EventPayload::RunState(RunState::Done));
+    let (rows, _) = draw(&model, 118, 40);
+    assert!(
+        !header_has(&rows, "controlling"),
+        "run end retires the chip"
+    );
+
+    let mut phone = session_model();
+    phone
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("m-sms"),
+            item: TurnItem::ToolCall {
+                call_id: "m0".into(),
+                name: "mobile".into(),
+                args: serde_json::json!({"action": "sms_read"}),
+                status: ToolStatus::InProgress,
+            },
+        }));
+    assert_eq!(
+        phone.projection.cu_presence(),
+        None,
+        "SMS reads are not phone control"
+    );
+    phone
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("m-tap"),
+            item: TurnItem::ToolCall {
+                call_id: "m1".into(),
+                name: "mobile".into(),
+                args: serde_json::json!({"action": "tap", "x": 1, "y": 2}),
+                status: ToolStatus::InProgress,
+            },
+        }));
+    assert_eq!(
+        phone.projection.cu_presence(),
+        Some(CuPresenceSurface::Phone)
+    );
+    let (rows, _) = draw(&phone, 118, 40);
+    assert!(header_has(&rows, "controlling phone · esc stop"));
+}
+
 /// MUTATION CHECK (research risk 10): drop the ToolCall output block from
 /// the renderer. Expected runtime failure: the tail line assertion below —
 /// durably retained process output goes invisible again.

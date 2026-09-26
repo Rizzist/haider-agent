@@ -550,4 +550,10 @@
     <string name="authoring_execution_digest">execution digest %1$s</string>
     <string name="authoring_install_job">Install job %1$s</string>
     <string name="authoring_digest_preview">canonical digest preview %1$s</string>
+    <string name="cu_presence_chip">Haider is controlling your phone</string>
+    <string name="cu_presence_stop">Stop</string>
+    <string name="cu_presence_stopping">Stopping…</string>
+    <string name="cu_presence_stop_description">Stop Haider controlling your phone</string>
+    <string name="cu_presence_channel">Phone control</string>
+    <string name="cu_presence_notification_text">Tap Stop to cancel the current run.</string>
 </resources>

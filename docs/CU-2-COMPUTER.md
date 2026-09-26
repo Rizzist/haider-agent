@@ -63,3 +63,5 @@ HAIDER_CU_WAYLAND_E2E=1 \
 ```
 
 On Windows, the named-pipe transport authenticates the connecting process before protocol framing: `GetNamedPipeClientProcessId`/`GetNamedPipeServerProcessId` identifies the peer, `OpenProcess` + `OpenProcessToken` retrieves `TokenUser`, and `EqualSid` compares it with the daemon token. Every lookup failure is fail-closed. Same-process and SID-comparison pins run on Windows; rejecting a genuinely different logged-in user remains a manual multi-user Windows validation.
+
+While any `computer`/`mobile` action runs, the human sees a presence indicator ("Haider is controlling this screen · Stop", an agent pointer, a phone chip, or Chrome's debugging bar) whose Stop cancels the in-flight action and the run through the same receipt-backed turn cancellation as ESC. See `docs/cu-presence.md`.

@@ -14091,6 +14091,26 @@ pub(crate) struct BrokerToolFactory;
 pub(crate) struct InjectedComputerBrokerToolFactory {
     backend: Arc<dyn ComputerBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
+    /// Per-test presence controller, so a test's Stop can never reach runs
+    /// of other tests executing in the same process.
+    presence: Arc<crate::cu_presence::CuPresence>,
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+impl InjectedComputerBrokerToolFactory {
+    /// Uses `presence` (e.g. with fake renderers) instead of a fresh one.
+    pub(crate) fn with_presence(mut self, presence: Arc<crate::cu_presence::CuPresence>) -> Self {
+        self.presence = presence;
+        self
+    }
+}
+
+#[cfg(test)]
+fn isolated_test_presence() -> Arc<crate::cu_presence::CuPresence> {
+    crate::cu_presence::CuPresence::new(
+        haider_tools::presence::PRESENCE_IDLE_TIMEOUT,
+        std::time::Duration::from_secs(1),
+    )
 }
 
 #[cfg(test)]
@@ -14109,6 +14129,7 @@ impl BrokerToolFactory {
         InjectedComputerBrokerToolFactory {
             backend,
             screenshot_redaction: Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            presence: isolated_test_presence(),
         }
     }
 
@@ -14123,6 +14144,7 @@ impl BrokerToolFactory {
         InjectedComputerBrokerToolFactory {
             backend,
             screenshot_redaction,
+            presence: isolated_test_presence(),
         }
     }
 
@@ -16625,6 +16647,7 @@ impl TurnToolFactory for AndroidToolFactory {
             )),
             crate::mobile_transport::platform_mobile_backend(),
             Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            Arc::clone(crate::cu_presence::global()),
         )
         .await
     }
@@ -16694,6 +16717,7 @@ impl TurnToolFactory for BrokerToolFactory {
             haider_tools::platform_computer_backend(),
             crate::mobile_transport::platform_mobile_backend(),
             redaction,
+            Arc::clone(crate::cu_presence::global()),
         )
         .await
     }
@@ -16750,6 +16774,7 @@ impl TurnToolFactory for InjectedComputerBrokerToolFactory {
             Arc::clone(&self.backend),
             haider_tools::platform_mobile_backend(),
             Arc::clone(&self.screenshot_redaction),
+            Arc::clone(&self.presence),
         )
         .await
     }
@@ -16806,6 +16831,7 @@ impl TurnToolFactory for InjectedMobileBrokerToolFactory {
             Arc::new(haider_tools::UnavailableComputerBackend::new("mobile-test")),
             Arc::clone(&self.backend),
             Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            isolated_test_presence(),
         )
         .await
     }
@@ -16821,6 +16847,7 @@ async fn create_broker_tool_dispatcher(
     computer: Arc<dyn ComputerBackend>,
     mobile: Arc<dyn MobileBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
+    presence: Arc<crate::cu_presence::CuPresence>,
 ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
     let session_id = context.store.session_id().clone();
     let durable_terminal_failure = durable_read_only_terminal_failure(
@@ -16927,6 +16954,12 @@ async fn create_broker_tool_dispatcher(
         device_id: context.device_id.clone(),
         event_ids: Arc::clone(&context.event_ids),
     };
+    let cu_presence = crate::cu_presence::PresenceLease::for_run(
+        presence,
+        context.store.hub().clone(),
+        session_id.clone(),
+        context.run_id.clone(),
+    );
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
         pending_workspace: Mutex::new(pending_workspace),
@@ -16938,6 +16971,7 @@ async fn create_broker_tool_dispatcher(
         mobile,
         screenshot_redaction,
         active_computer_turn_cancel: StdMutex::new(None),
+        cu_presence,
         pending_terminal_failure_after_tool_results: Mutex::new(durable_terminal_failure),
         terminal_failure_after_tool_results: Mutex::new(None),
         os_permission_menus: Mutex::new(HashMap::new()),
@@ -17165,6 +17199,9 @@ struct BrokerToolDispatcher {
     /// execute future, allowing `close` to distinguish ESC from a panic or
     /// transport failure and preserve honest Cancelled vs Unknown outcomes.
     active_computer_turn_cancel: StdMutex<Option<CancelToken>>,
+    /// This run's membership in the human-visible computer-use presence
+    /// indicator; its Stop control cancels the run (see `cu_presence`).
+    cu_presence: crate::cu_presence::PresenceLease,
     pending_terminal_failure_after_tool_results: Mutex<Option<HaiderError>>,
     terminal_failure_after_tool_results: Mutex<Option<HaiderError>>,
     os_permission_menus: Mutex<HashMap<MenuId, Menu>>,
@@ -19017,6 +19054,7 @@ impl BrokerToolDispatcher {
     }
 
     async fn close_effects(&self, cancelled: bool) -> Result<(), HaiderError> {
+        self.cu_presence.end(cancelled);
         self.parsed_tool_operations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -22601,14 +22639,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         timeout_s: None,
                     };
                     let (result, retain_for_approval) = self
-                        .dispatch_ssh_shell(
-                            broker,
-                            &policy,
-                            &remote,
-                            run_id,
-                            item_id,
-                            call_id,
-                        )
+                        .dispatch_ssh_shell(broker, &policy, &remote, run_id, item_id, call_id)
                         .await?;
                     if retain_for_approval {
                         operation_lease.retain_for_approval();
@@ -22635,7 +22666,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
-                    orchestration: None,
+                        orchestration: None,
                     }));
                 }
                 if *background {
@@ -22660,8 +22691,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         )
                         .await
                 } else {
-                    let effective_cwd =
-                        command_cwd(&self.metadata.cwd, requested_cwd.as_deref());
+                    let effective_cwd = command_cwd(&self.metadata.cwd, requested_cwd.as_deref());
                     let cas = self.cas.lock().await.clone();
                     let output = self.output.sink(
                         run_id.clone(),
@@ -22740,7 +22770,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             };
                             match waited {
                                 Ok(mut result) => {
-                                    let safe_output = self.tasks.retain_foreground_capture(&self.session_id, &mut result).await.map_err(tool_error)?;
+                                    let safe_output = self
+                                        .tasks
+                                        .retain_foreground_capture(&self.session_id, &mut result)
+                                        .await
+                                        .map_err(tool_error)?;
                                     let _ = shell.add_output(result.output_bytes);
                                     let _ = shell.exited(result.exit_code);
                                     match self.output.record_process_signal(run_id, &result).await {
@@ -22809,9 +22843,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     })
                     .and_then(|value| {
                         u32::try_from(value).map_err(|_| {
-                            ToolError::invalid_argument(
-                                "loom_register `expected_rev` exceeds u32",
-                            )
+                            ToolError::invalid_argument("loom_register `expected_rev` exceeds u32")
                         })
                     }) {
                     Ok(expected_rev) => expected_rev,
@@ -22837,11 +22869,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     status: ToolResultStatus::Completed,
                     reason: None,
                     presentation: None,
-                orchestration: None,
+                    orchestration: None,
                 };
-                let refusal = |error: String| {
-                    completed(serde_json::json!({ "ok": false, "error": error }))
-                };
+                let refusal =
+                    |error: String| completed(serde_json::json!({ "ok": false, "error": error }));
                 let conflict = |conflict: haider_protocol::loom::LoomRevisionConflict| {
                     completed(serde_json::json!({
                         "ok": false,
@@ -22880,17 +22911,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 .loom_register_workflow_cas(source, expected)
                                 .await
                             {
-                                Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => {
-                                    Ok(receipt("workflow", value, None))
-                                }
+                                Ok(haider_core::LoomRegistryMutation::Applied {
+                                    value, ..
+                                }) => Ok(receipt("workflow", value, None)),
                                 Ok(haider_core::LoomRegistryMutation::Conflict(value)) => {
                                     Ok(conflict(value))
                                 }
                                 Err(error) if error.code == ErrorCode::InvalidArgument => {
-                                    Ok(refusal(format!(
-                                        "registration rejected: {}",
-                                        error.message
-                                    )))
+                                    Ok(refusal(format!("registration rejected: {}", error.message)))
                                 }
                                 Err(error) => Err(ToolError::Runtime {
                                     message: error.message,
@@ -22936,7 +22964,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 .loom_register_agent_type_cas(record, expected)
                                 .await
                             {
-                                Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => Ok(receipt(
+                                Ok(haider_core::LoomRegistryMutation::Applied {
+                                    value, ..
+                                }) => Ok(receipt(
                                     "agent_type",
                                     value.registration,
                                     value.install_job_id,
@@ -22945,10 +22975,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     Ok(conflict(value))
                                 }
                                 Err(error) if error.code == ErrorCode::InvalidArgument => {
-                                    Ok(refusal(format!(
-                                        "registration rejected: {}",
-                                        error.message
-                                    )))
+                                    Ok(refusal(format!("registration rejected: {}", error.message)))
                                 }
                                 Err(error) => Err(ToolError::Runtime {
                                     message: error.message,
@@ -23032,7 +23059,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
-                    orchestration: None,
+                        orchestration: None,
                     }));
                 }
                 match broker.begin_web_fetch(operation, &policy).await {
@@ -23097,7 +23124,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         "transient web_fetch failure — retry 2/2 succeeded".into()
                                     }),
                                     presentation: None,
-                                orchestration: None,
+                                    orchestration: None,
                                 };
                                 if let Some(truncation) = outcome.truncation {
                                     result.declare_truncation(truncation);
@@ -23244,7 +23271,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         .await
                 {
                     self.clear_cached_operation(&operation_key);
-                    return Err(tool_error(error.with_applied_effects(result.as_ref().map_or_else(|_| Vec::new(), |result| result.effects.clone()))));
+                    return Err(tool_error(
+                        error.with_applied_effects(
+                            result
+                                .as_ref()
+                                .map_or_else(|_| Vec::new(), |result| result.effects.clone()),
+                        ),
+                    ));
                 }
                 result
             }
@@ -23385,6 +23418,16 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     let intent = broker
                         .authorize_computer(operation, &policy)
                         .await?;
+                    // Stop pressed: refuse before prepare/dispatch (nothing
+                    // reaches the OS) and let the turn cancellation that Stop
+                    // submitted settle the turn, exactly like ESC.
+                    if self.cu_presence.is_stopped() {
+                        return Ok(presence_stopped_result(
+                            cancel,
+                            computer_failure_result(&ComputerError::Cancelled),
+                        )
+                        .await);
+                    }
                     match self
                         .computer
                         .prepare(operation.action(), &action_cancel)
@@ -23456,6 +23499,37 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 return Err(error);
                             }
                         }
+                    } else {
+                        None
+                    };
+                    // Human-visible presence: show/animate the indicator,
+                    // and refuse the action outright once Stop was pressed.
+                    let presence_point = self.computer.presence_point(operation.action());
+                    let _presence = match self
+                        .cu_presence
+                        .begin_computer(operation.action(), presence_point, &action_cancel)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(haider_tools::presence::PresenceRefusal::Stopped) => {
+                            broker
+                                .journal_computer_outcome(&intent, EffectOutcome::Cancelled)
+                                .await?;
+                            return Ok(presence_stopped_result(
+                                cancel,
+                                computer_failure_result(&ComputerError::Cancelled),
+                            )
+                            .await);
+                        }
+                    };
+                    // A capturable indicator (Linux notification popup) is
+                    // taken off screen for the model-facing capture.
+                    let _revealed_after_capture = if matches!(
+                        operation.action(),
+                        haider_protocol::computer::ComputerAction::Screenshot
+                            | haider_protocol::computer::ComputerAction::Inspect { .. }
+                    ) {
+                        self.cu_presence.conceal_for_capture().await
                     } else {
                         None
                     };
@@ -23683,8 +23757,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::Mobile => {
                 async {
-                    let operation = self
-                        .cached_mobile_operation(&operation_key, args.as_ref())?;
+                    let operation = self.cached_mobile_operation(&operation_key, args.as_ref())?;
                     let ParsedToolOperation::Mobile(operation) = operation.as_ref() else {
                         return Err(ToolError::Runtime {
                             message: cached_operation_route_mismatch(route).message,
@@ -23697,6 +23770,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     }
                     let action_cancel = MobileCancelToken::new();
                     let intent = broker.authorize_mobile(operation, &policy).await?;
+                    if self.cu_presence.is_stopped() {
+                        return Ok(presence_stopped_result(
+                            cancel,
+                            mobile_failure_result(&MobileError::Cancelled),
+                        )
+                        .await);
+                    }
                     self.mobile
                         .prepare(operation.action(), &action_cancel)
                         .await
@@ -23704,7 +23784,28 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     broker
                         .dispatch_mobile(&intent, action_cancel.clone())
                         .await?;
-                    match self.mobile.execute(operation.action(), &action_cancel).await {
+                    let _presence = match self
+                        .cu_presence
+                        .begin_mobile(operation.action(), &action_cancel)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(haider_tools::presence::PresenceRefusal::Stopped) => {
+                            broker
+                                .journal_mobile_outcome(&intent, EffectOutcome::Cancelled)
+                                .await?;
+                            return Ok(presence_stopped_result(
+                                cancel,
+                                mobile_failure_result(&MobileError::Cancelled),
+                            )
+                            .await);
+                        }
+                    };
+                    match self
+                        .mobile
+                        .execute(operation.action(), &action_cancel)
+                        .await
+                    {
                         Ok(MobileOutput::Screenshot(png)) => {
                             let stored = self.admit_mobile_screenshot(png, &action_cancel).await;
                             match stored {
@@ -23727,7 +23828,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         status: ToolResultStatus::Completed,
                                         reason: None,
                                         presentation: None,
-                                    orchestration: None,
+                                        orchestration: None,
                                     })
                                 }
                                 Err(ToolError::Mobile(MobileError::Cancelled)) => {
@@ -23749,10 +23850,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 }
                             }
                         }
-                        Ok(output @ (MobileOutput::A11yTree(_)
-                        | MobileOutput::AppList(_)
-                        | MobileOutput::Ack
-                        | MobileOutput::SmsList(_))) => {
+                        Ok(
+                            output @ (MobileOutput::A11yTree(_)
+                            | MobileOutput::AppList(_)
+                            | MobileOutput::Ack
+                            | MobileOutput::SmsList(_)),
+                        ) => {
                             let preview = match serde_json::to_string(&output) {
                                 Ok(preview) => preview,
                                 Err(error) => {
@@ -23787,7 +23890,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 status: ToolResultStatus::Completed,
                                 reason: None,
                                 presentation: None,
-                            orchestration: None,
+                                orchestration: None,
                             })
                         }
                         Err(MobileError::Cancelled) => {
@@ -24557,6 +24660,26 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         error,
         serde_json::Value::Null,
     ))
+}
+
+/// How long a Stop-refused CU action waits for the run's own turn
+/// cancellation (which Stop submitted) before settling as a tool result.
+const PRESENCE_STOP_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Settles a CU action refused because the human pressed Stop.
+///
+/// Stop refuses the action before the turn cancellation it submitted has
+/// committed. Returning the refusal straight away (as `Err(Cancelled)`,
+/// which the route maps to a `Cancelled` tool result) would hand that result
+/// to the provider and start ANOTHER model round — an extra request, and the
+/// model may issue further actions — until the cancellation lands. Instead
+/// wait for that cancellation: the core drops this future and settles the
+/// turn exactly like ESC. Only if it never arrives within the grace, report
+/// the `Cancelled` tool result. (The 3-repair "stuck in `cancelling`" hang
+/// was the journal/actor race fixed in haider-core, not this path.)
+async fn presence_stopped_result(cancel: &CancelToken, cancelled: BoundedResult) -> BoundedResult {
+    let _ = tokio::time::timeout(PRESENCE_STOP_CANCEL_GRACE, cancel.cancelled()).await;
+    cancelled
 }
 
 fn computer_failure_result(error: &ComputerError) -> BoundedResult {
