@@ -746,7 +746,7 @@ impl AcpTurnDecoder {
         {
             let mut changed = false;
             if let Some(title) = update.title.as_deref().filter(|title| !title.is_empty())
-                && name != title
+                && name.as_str() != title
             {
                 *name = title.to_owned();
                 changed = true;

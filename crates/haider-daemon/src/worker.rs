@@ -20992,6 +20992,16 @@ impl ToolDispatcher for BrokerToolDispatcher {
         &self,
         name: &str,
     ) -> Option<haider_protocol::activity::ActivityKind> {
+        if self
+            .lockdown
+            .as_ref()
+            .is_some_and(|lockdown| !lockdown.tools_allowed.iter().any(|allowed| allowed == name))
+        {
+            return None;
+        }
+        if name == "web_search" && self.web_search.is_none() {
+            return None;
+        }
         match registered_tool_route(name)? {
             RegisteredToolRoute::WebSearch => Some(haider_protocol::activity::ActivityKind::Web),
             RegisteredToolRoute::SessionTranscript
