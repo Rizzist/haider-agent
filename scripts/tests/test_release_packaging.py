@@ -814,7 +814,6 @@ class WindowsCrtImportTests(unittest.TestCase):
                 'KERNEL32.dll',
                 'api-ms-win-core-synch-l1-2-0.dll',
                 'ext-ms-win-ntuser-window-l1-1-0.dll',
-                'kernel32.dll::$DATA',
             ]}),
             [],
         )
@@ -853,8 +852,38 @@ class WindowsCrtImportTests(unittest.TestCase):
                             release_packaging.verify_windows_imports([path])
                         self.assertIn(repr(name), str(raised.exception))
         for name in ('kernel32.dll', 'KERNEL32', 'kernel32.dll ',
-                     'kernel32.dll::$DATA', 'api-ms-win-core-synch-l1-2-0.dll'):
+                     'api-ms-win-core-synch-l1-2-0.dll'):
             self.assertEqual(release_packaging.forbidden_windows_imports({'imports': [name]}), [])
+
+    def test_any_colon_in_import_name_fails_in_all_five_modes(self):
+        # Import names are bare modules. Even the canonical default-stream
+        # spelling describes a stream-qualified filename, not a PE module.
+        names = (
+            'kernel32.dll:', 'kernel32.dll::', 'kernel32.dll::$DATA',
+            'KERNEL32.DLL::$dAtA', 'kernel32.dll:$DATA', 'kernel32:$DATA',
+            'crypt32.dll:$DATA', 'kernel32.dll:$DATA:$DATA',
+            'kernel32.dll:$data:$DaTa', 'kernel32.dll:$DATA:',
+            'kernel32.dll:ntdll.dll', 'kernel32:ntdll',
+            'kernel32.dll:kernel32.dll',
+            'kernel32.dll:api-ms-win-core-file-l1-1-0.dll',
+            'api-ms-win-core-file-l1-1-0.dll:kernel32.dll',
+            'kernel32.dll::ntdll.dll', 'kernel32.dll:ntdll.dll:advapi32.dll',
+            'kernel32.dll:ntdll.dll.', 'kernel32.dll:::$DATA',
+            ':kernel32.dll', '1:kernel32.dll', 'C:kernel32.dll',
+        )
+        modes = ((False, False, False), (True, False, False),
+                 (False, True, False), (True, True, False), (True, True, True))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'stream.exe'
+            for name in names:
+                for pe32, delayed, legacy in modes:
+                    with self.subTest(name=name, pe32=pe32, delayed=delayed, legacy=legacy):
+                        path.write_bytes(_pe(SYSTEM_IMPORTS if delayed else (name,),
+                                             (name,) if delayed else (), pe32=pe32,
+                                             legacy_delay=legacy))
+                        with self.assertRaises(release_packaging.PackagingError) as raised:
+                            release_packaging.verify_windows_imports([path])
+                        self.assertIn('stream/drive separator', str(raised.exception))
 
     def test_reviewed_os_imports_pass(self):
         # Independent release-policy mirror: a removed allowlist row breaks
@@ -1012,6 +1041,21 @@ class WindowsCrtImportTests(unittest.TestCase):
             self.assertLess(section.index("verify-windows-imports"), section.index(before), job)
         installer_check = (ROOT / ".github/workflows/windows-installer-check.yml").read_text()
         self.assertLess(installer_check.index("verify-windows-imports"), installer_check.index("upload distribution archives"))
+        for workflow in (release, installer_check):
+            build = workflow[workflow.index("\n  build:"):workflow.index("upload distribution archives")]
+            self.assertLess(build.index("verify complete split archive and checksum"),
+                            build.index("clean launch of the exact Windows release ZIP"))
+            self.assertLess(build.index("verify-windows-imports"),
+                            build.index("clean launch of the exact Windows release ZIP"))
+            self.assertIn("check-windows-clean-launch.ps1", build)
+            clean = build[build.index("clean launch of the exact Windows release ZIP"):]
+            self.assertNotIn("continue-on-error", clean)
+        clean_script = (ROOT / "scripts/release/check-windows-clean-launch.ps1").read_text()
+        for fragment in ("Get-FileHash", "Expand-Archive", "[guid]::NewGuid()",
+                         "mcr.microsoft.com/windows/servercore:", "vcruntime140.dll",
+                         "'haider.exe', 'haider-tui.exe', 'haiderd.exe'", "--version",
+                         "-EncodedCommand", "-cne $Expected"):
+            self.assertIn(fragment, clean_script)
         xplat = (ROOT / ".github/workflows/xplat.yml").read_text()
         self.assertIn("verify-windows-imports target/debug/haider.exe target/debug/haider-tui.exe target/debug/haiderd.exe", xplat)
         # Behavioral proof on every candidate: the siblings run on Server Core without the redist.

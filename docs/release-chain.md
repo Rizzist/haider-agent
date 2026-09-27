@@ -11,19 +11,25 @@ dynamic-CRT indicators, even on Windows versions that provide them. The
 runtime-family patterns in the script supply rejection labels only. Any other
 import, including a previously unseen third-party runtime, fails by default.
 Path-qualified imports (drive-relative, drive-absolute, UNC, or containing a
-slash) also fail: PE import names must be bare module names.
+slash) and every colon-qualified stream name also fail: PE import names must
+be bare module names, including where a filename spells the default stream
+as `name.dll::$DATA`.
 
 The current three 973 release executables have 31 import entries, covering
 `advapi32`, `api-ms-win-core-synch-l1-2-0`, `bcrypt`, `bcryptprimitives`,
 `combase`, `crypt32`, `gdi32`, `kernel32`, `ntdll`, `ole32`, `oleaut32`,
 `shell32`, `user32`, `userenv`, and `ws2_32`. The remaining names below are a
 reviewed Windows module reserve for plausible desktop, networking, security,
-device, and compatibility imports. A name on this list says only that
-the DLL belongs to Windows; a clean native-Windows launch still proves the
-target OS image provides it and the required exports.
-API sets may be missing on some devices, which is why only the families the
-release actually needs are expected to appear. A clean native-Windows launch
-remains the availability check.
+device, and compatibility imports. A name on this list establishes OS
+provenance, not availability on every Windows image. Reserve entries absent
+from the current release imports remain unverified on Server Core. The
+required release and installer-rehearsal jobs verify the final Windows ZIP's
+checksum, extract it into a fresh directory, and launch all three shipped
+executables with exact version checks in a matching Server Core container
+without the VC++ redistributable. That catches a future ordinary startup
+import missing from that image. Delay-loaded imports need execution of their
+relevant paths. The allowlist permits both named API-set families; any given
+contract or export may still be unavailable on a particular image.
 
 | Allowlisted module or family | Microsoft documentation used for OS provenance |
 | --- | --- |

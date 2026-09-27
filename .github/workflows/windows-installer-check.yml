@@ -408,6 +408,12 @@ jobs:
         run: |
           NAME=haider-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}-split
           python scripts/release_packaging.py verify-windows-imports "dist/$NAME.zip"
+      - name: clean launch of the exact Windows release ZIP on Server Core
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Name = "haider-${env:GITHUB_REF_NAME}-${{ matrix.target }}-split.zip"
+          ./scripts/release/check-windows-clean-launch.ps1 -Artifact "dist/$Name"
       - name: package compatibility assets for installed two-member macOS updaters
         if: runner.os == 'macOS'
         shell: bash

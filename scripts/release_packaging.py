@@ -845,30 +845,21 @@ def _is_windows_os_import(component: str) -> bool:
 
 
 def _windows_import_rejection(name: str) -> str | None:
-    # PE imports are bare names. Keep inspecting qualified names for a useful
-    # VC-runtime diagnostic, but never allow one through by its basename.
-    qualified = "/" in name or "\\" in name or re.match(r"^[a-zA-Z]:", name) is not None
-    # Other DLL-shaped path/ADS segments are checked as well, so an embedded
-    # dependency cannot hide behind a later OS basename. A non-default stream
-    # is not an OS DLL import.
+    # A PE import must name a bare module. Colons introduce a drive or stream
+    # separator, regardless of whether any component resembles an OS DLL.
+    if ":" in name:
+        return "rejected: import name contains a stream/drive separator"
+    qualified = "/" in name or "\\" in name
+    # Inspect path components for a useful VC-runtime diagnostic, but never
+    # grant permission based on an allowed basename inside a path.
     raw_segments = [
-        segment for segment in re.split(r"[/\\:]", name.rstrip(" "))
+        segment for segment in re.split(r"[/\\]", name.rstrip(" "))
         if segment and segment not in (".", "..")
     ]
     segments = [_windows_import_component(segment) for segment in raw_segments]
     basename = re.split(r"[/\\]", name.rstrip(" "))[-1]
-    if re.match(r"^[a-zA-Z]:", basename):
-        basename = basename[2:]
-    target = _windows_import_component(basename.split(":", 1)[0])
-    candidates = [target]
-    candidates.extend(
-        _windows_import_component(segment) for segment in raw_segments
-        if segment.rstrip(" .").casefold().endswith(".dll")
-    )
-    streams = basename.split(":")[1:]
-    if streams and any(stream.casefold() not in ("", "$data") for stream in streams):
-        candidates.extend(_windows_import_component(stream) for stream in streams if stream)
-    if not qualified and candidates and all(_is_windows_os_import(component) for component in candidates):
+    target = _windows_import_component(basename)
+    if not qualified and _is_windows_os_import(target):
         return None
     # This table describes the failure; it never grants an import permission.
     for component in segments:
