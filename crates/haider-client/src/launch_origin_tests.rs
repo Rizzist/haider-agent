@@ -3,11 +3,13 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
+use super::{MaskPath, sanitize_with_canonicalizers};
 use super::{
-    MaskPath, ORIGIN_DISPLAY_MAX_BYTES, OriginPathKind, OriginSanitizeError, SanitizedOriginPath,
+    ORIGIN_DISPLAY_MAX_BYTES, OriginPathKind, OriginSanitizeError, SanitizedOriginPath,
     canonicalize_existing_prefix_with, canonicalize_masking_prefix_with,
     display_homes_from_profile, sanitize_origin_path, sanitize_origin_path_with_homes,
-    sanitize_with, sanitize_with_canonicalizers, usable_home,
+    sanitize_with, usable_home,
 };
 
 fn projected(path: &str, homes: &[&str]) -> (OriginPathKind, String) {
