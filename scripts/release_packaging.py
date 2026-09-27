@@ -627,14 +627,13 @@ def _verify_release_bundle(artifact: Path, target: str, *, legacy: bool) -> None
         raise PackagingError(f"{sidecar}: archive checksum mismatch")
 
 
-# Redistributable Microsoft C/C++ runtime DLLs. They are absent from clean
-# Windows installs without the VC++ redistributable, so a shipped PE that
-# imports one dies with 0xC0000135 (STATUS_DLL_NOT_FOUND) before main
-# (registry #176: haider 0.0.972 on Chocolatey's clean Server 2019 verifier).
-# The api-ms-win-crt-* API sets and ucrtbase.dll are OS components on Windows
-# 10+, but this gate also uses them to detect /MD (registry #176). The entries
-# below describe runtime *families* across toolset versions. Unknown future
-# version numbers fail closed; only exact x64 Windows names below are exempt.
+# Diagnostic labels for known redistributable runtime families. The release
+# decision is made by the OS allowlist below, not by completeness of this table.
+# This avoids accepting a new third-party runtime whose name we have not seen.
+# Registry #176: haider 0.0.972 failed to start on clean Server 2019 because
+# it imported the dynamic MSVC CRT (STATUS_DLL_NOT_FOUND, 0xC0000135).
+# api-ms-win-crt-* and ucrtbase are intentionally rejected even where Windows
+# provides them: an import indicates the dynamic-CRT configuration in this gate.
 # Sources: https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute
 # and https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features
 FORBIDDEN_WINDOWS_IMPORT_FAMILIES = (
@@ -669,12 +668,28 @@ FORBIDDEN_WINDOWS_IMPORT = re.compile(
     "|".join(f"(?:{pattern})" for pattern, _, _ in FORBIDDEN_WINDOWS_IMPORT_FAMILIES),
     re.IGNORECASE,
 )
-# Only the two owner-ruled exact Windows names below are exempt. Framework-
-# servicing and 32-bit compatibility names fail closed.
-WINDOWS_SYSTEM_RUNTIME_IMPORTS = {
-    "mfc42u.dll",  # MS07-012 x64 file table: Mfc42u.dll 6.5.9146.0 on XP x64 / Server 2003 x64; https://learn.microsoft.com/en-us/security-updates/securitybulletins/2007/ms07-012
-    "msvcp110_win.dll",  # Microsoft staff: Windows component, not VC redist; https://learn.microsoft.com/en-us/answers/questions/950582/is-msvcp110-win-specific-to-a-visual-studio-versio
-}
+# Reviewed Windows modules. Each group and its Microsoft documentation are
+# recorded in docs/release-chain.md. Additions require review of the new
+# release import, an OS provenance citation, tests, and clean-Windows evidence.
+# Do not use a wildcard for ordinary DLL names.
+WINDOWS_OS_IMPORTS = frozenset({
+    # Actual 973 release imports (31 entries across three executables).
+    "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "combase.dll",
+    "crypt32.dll", "gdi32.dll", "kernel32.dll", "ntdll.dll", "ole32.dll",
+    "oleaut32.dll", "shell32.dll", "user32.dll", "userenv.dll", "ws2_32.dll",
+    # Reviewed Windows modules plausibly needed by the desktop/daemon code.
+    "kernelbase.dll", "secur32.dll", "ncrypt.dll", "iphlpapi.dll",
+    "dwmapi.dll", "uxtheme.dll", "shlwapi.dll", "winhttp.dll", "dnsapi.dll",
+    "powrprof.dll", "psapi.dll", "version.dll", "setupapi.dll",
+    "cfgmgr32.dll", "rpcrt4.dll", "shcore.dll", "profapi.dll",
+    "netapi32.dll", "wtsapi32.dll", "win32u.dll",
+    # Windows compatibility and media components with OS provenance.
+    "msvcrt.dll", "msvcp_win.dll", "mf.dll", "mfplat.dll",
+})
+WINDOWS_OS_API_SET = re.compile(
+    r"(?:api-ms-win-core-[a-z0-9-]+|ext-ms-win-[a-z0-9-]+)\.dll",
+    re.IGNORECASE,
+)
 _PE_IMPORT_DIRECTORY = 1
 _PE_DELAY_IMPORT_DIRECTORY = 13
 _PE_IMPORT_NAME_WINDOW = 512
@@ -822,36 +837,62 @@ def windows_pe_imports(data: bytes, source: str) -> dict[str, list[str]]:
     return {"imports": normal, "delay_imports": delayed}
 
 
-def forbidden_windows_imports(imports: dict[str, list[str]]) -> list[str]:
-    def is_forbidden(name: str) -> bool:
-        # Wine's build_import_name strips trailing spaces before appending .dll;
-        # Win32 path normalization (collapse_path / RtlDosPathNameToNtPathName)
-        # trims spaces and dots and collapses path segments. Check every segment
-        # conservatively so a path alias cannot hide a loadable CRT import.
-        for segment in re.split(r"[/\\:]", name.rstrip(" ")):
-            component = segment.rstrip(" .")
-            if not component or component in (".", ".."):
-                continue
-            component = component.casefold()
-            if "." not in component:
-                component += ".dll"
-            if component in WINDOWS_SYSTEM_RUNTIME_IMPORTS:
-                continue
-            # Wine's get_apiset_entry ignores the suffix after the last hyphen
-            # and stops at the first dot; only the CRT API-set family is banned.
-            if component.startswith("api-ms-win-crt-") or FORBIDDEN_WINDOWS_IMPORT.fullmatch(component):
-                return True
-        return False
+def _windows_import_component(segment: str) -> str:
+    component = segment.rstrip(" .").casefold()
+    return component + ".dll" if component and "." not in component else component
 
-    return sorted(
-        {
-            name
-            for names in imports.values()
-            for name in names
-            if is_forbidden(name)
-        },
-        key=str.lower,
+
+def _is_windows_os_import(component: str) -> bool:
+    return component in WINDOWS_OS_IMPORTS or WINDOWS_OS_API_SET.fullmatch(component) is not None
+
+
+def _windows_import_rejection(name: str) -> str | None:
+    # The import target is the basename before an alternate data stream. A
+    # drive-relative name (C:kernel32) has its drive prefix removed first.
+    # Other DLL-shaped path/ADS segments are checked as well, so an embedded
+    # dependency cannot hide behind a later OS basename. A non-default stream
+    # is not an OS DLL import.
+    raw_segments = [
+        segment for segment in re.split(r"[/\\:]", name.rstrip(" "))
+        if segment and segment not in (".", "..")
+    ]
+    segments = [_windows_import_component(segment) for segment in raw_segments]
+    basename = re.split(r"[/\\]", name.rstrip(" "))[-1]
+    if re.match(r"^[a-zA-Z]:", basename):
+        basename = basename[2:]
+    target = _windows_import_component(basename.split(":", 1)[0])
+    candidates = [target]
+    candidates.extend(
+        _windows_import_component(segment) for segment in raw_segments
+        if segment.rstrip(" .").casefold().endswith(".dll")
     )
+    streams = basename.split(":")[1:]
+    if streams and any(stream.casefold() not in ("", "$data") for stream in streams):
+        candidates.extend(_windows_import_component(stream) for stream in streams if stream)
+    if candidates and all(_is_windows_os_import(component) for component in candidates):
+        return None
+    # This table describes the failure; it never grants an import permission.
+    for component in segments:
+        if component.startswith("api-ms-win-crt-"):
+            return "rejected: VC runtime family UCRT API set"
+        for pattern, family, _ in FORBIDDEN_WINDOWS_IMPORT_FAMILIES:
+            if re.fullmatch(pattern, component, re.IGNORECASE):
+                return f"rejected: VC runtime family {family}"
+    return "rejected: not an allowlisted OS DLL"
+
+
+def rejected_windows_imports(imports: dict[str, list[str]]) -> list[tuple[str, str]]:
+    names = {name for values in imports.values() for name in values}
+    return [
+        (name, reason)
+        for name in sorted(names, key=str.lower)
+        if (reason := _windows_import_rejection(name)) is not None
+    ]
+
+
+def forbidden_windows_imports(imports: dict[str, list[str]]) -> list[str]:
+    """Compatibility helper: names rejected by the release import policy."""
+    return [name for name, _ in rejected_windows_imports(imports)]
 
 
 def _windows_pe_inputs(path: Path) -> list[tuple[str, bytes]]:
@@ -878,7 +919,7 @@ def _windows_pe_inputs(path: Path) -> list[tuple[str, bytes]]:
 
 
 def verify_windows_imports(paths: list[Path]) -> list[str]:
-    """Fail unless every shipped PE avoids the redistributable CRT DLLs.
+    """Fail unless every shipped PE imports only reviewed Windows OS DLLs.
 
     Accepts PE files, directories (every nested .exe/.dll) and ZIP bundles
     (every .exe/.dll member). Returns one report line per inspected PE.
@@ -891,18 +932,21 @@ def verify_windows_imports(paths: list[Path]) -> list[str]:
             raise PackagingError(f"{path}: contains no .exe or .dll to inspect")
         for source, data in inputs:
             imports = windows_pe_imports(data, source)
-            forbidden = forbidden_windows_imports(imports)
+            rejected = rejected_windows_imports(imports)
             report.append(
                 f"{source}: imports={','.join(imports['imports']) or '-'} "
                 f"delay={','.join(imports['delay_imports']) or '-'}"
             )
-            if forbidden:
-                failures.append(f"{source}: imports {', '.join(map(repr, forbidden))}")
+            if rejected:
+                failures.append(
+                    f"{source}: imports "
+                    + ", ".join(f"{name!r} ({reason})" for name, reason in rejected)
+                )
     if failures:
         raise PackagingError(
-            "Windows PE imports the dynamic MSVC C runtime (link with "
-            "-C target-feature=+crt-static; clean Windows lacks the VC++ "
-            "redistributable):\n  " + "\n  ".join(failures)
+            "Windows PE imports a DLL outside the reviewed OS allowlist "
+            "(dynamic CRT builds should use -C target-feature=+crt-static):\n  "
+            + "\n  ".join(failures)
         )
     return report
 

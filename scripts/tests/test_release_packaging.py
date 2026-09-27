@@ -503,26 +503,26 @@ class WindowsCrtImportTests(unittest.TestCase):
                 'concrt140_app.dll', 'vccorlib140_app.dll', 'vcomp140_app.dll', 'vcamp140_app.dll', 'concrt140d_app.dll',
                 'msvcr120_app.dll', 'msvcr110_app.dll', 'vccorlib120_app.dll', 'msvcm90.dll', 'msvcm80.dll', 'msvcm90d.dll',
                 'msvci70.dll')],
-            # 8.3 short names
-            ('VCRUNT~1.DLL', 0), ('VCRUNT~2.DLL', 0), ('MSVCP1~1.DLL', 0), ('API-MS~1.DLL', 0),
-            ('UCRTBA~1.DLL', 0), ('VCRUNT~1', 0),
-            # different files to the loader
-            ('VCRUNTIME140.ocx', 0), ('VCRUNTIME140.drv', 0), ('VCRUNTIME140.dll.dll', 0),
-            ('VCRUNTIME140.exe', 0), (' VCRUNTIME140.dll', 0), ('VCRUNTIME140 .dll', 0),
-            ('xVCRUNTIME140.dll', 0), ('foo.dll:VCRUNTIME140.dll', 1), ('NUL', 0),
-            ('CON.dll', 0), (B*2 + '.' + B + 'NUL', 0), ('libomp140.x86_64', 0),
-            ('api-ms-win-crt.dll', 0),
+            # No unknown filename or 8.3 guess receives an OS exemption.
+            ('VCRUNT~1.DLL', 1), ('VCRUNT~2.DLL', 1), ('MSVCP1~1.DLL', 1), ('API-MS~1.DLL', 1),
+            ('UCRTBA~1.DLL', 1), ('VCRUNT~1', 1),
+            ('VCRUNTIME140.ocx', 1), ('VCRUNTIME140.drv', 1), ('VCRUNTIME140.dll.dll', 1),
+            ('VCRUNTIME140.exe', 1), (' VCRUNTIME140.dll', 1), ('VCRUNTIME140 .dll', 1),
+            ('xVCRUNTIME140.dll', 1), ('foo.dll:VCRUNTIME140.dll', 1), ('NUL', 1),
+            ('CON.dll', 1), (B*2 + '.' + B + 'NUL', 1), ('libomp140.x86_64', 1),
+            ('api-ms-win-crt.dll', 1),
             # legitimate OS names
             *[(n, 0) for n in (
                 'KERNEL32.dll', 'api-ms-win-core-crt-l1-1-0.dll', 'api-ms-win-core-crt-l2-1-0.dll', 'API-MS-WIN-CORE-CRT-L1-1-0',
                 'ext-ms-win-ntuser-window-l1-1-0.dll', 'ext-ms-win-kernel32-package-current-l1-1-0.dll',
-                'msvcrt.dll', 'msvcirt.dll', 'msvcp_win.dll',
-                'atl.dll', 'atlthunk.dll', 'mfcsubs.dll', 'mfcans32.dll',
+                'msvcrt.dll', 'msvcp_win.dll',
                 'C:' + B + 'Windows' + B + 'System32' + B + 'bcrypt.dll',
                 B*2 + '?' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'ntdll.dll', 'C:KERNEL32.dll',
-                'vcruntime.dll', 'mfc.dll', 'msvcr.dll', 'concrt.dll', 'My_Odd Name~1+(x).dll')],
-            # Exact x64 System32 exemptions and fail-closed former exemptions.
-            *[(n, 0) for n in ('mfc42u.dll', 'msvcp110_win.dll')],
+            )],
+            *[(n, 1) for n in ('vcruntime.dll', 'mfc.dll', 'msvcr.dll', 'concrt.dll',
+                                'My_Odd Name~1+(x).dll', 'mfc42u.dll', 'msvcp110_win.dll',
+                                'msvcirt.dll', 'atl.dll', 'atlthunk.dll', 'mfcsubs.dll',
+                                'mfcans32.dll')],
             *[(n, 1) for n in ('msvcrt20.dll', 'msvcrt40.dll', 'msvcp60.dll',
                               'mfc40.dll', 'mfc40u.dll', 'mfc42.dll', 'mfc42loc.dll',
                               'msvcr120_clr0400.dll', 'vcruntime140_clr0400.dll',
@@ -563,8 +563,8 @@ class WindowsCrtImportTests(unittest.TestCase):
             ('C:vcruntime140_clr0400.dll', 1),
             (r'C:\Windows\System32\mfc40.dll', 1),
             ('C:mfc40.dll', 1),
-            (r'C:\Windows\System32\mfc42u.dll', 0),
-            ('C:mfc42u.dll', 0),
+            (r'C:\Windows\System32\mfc42u.dll', 1),
+            ('C:mfc42u.dll', 1),
             (r'C:\Windows\System32\msvcr120_clr0400.dll', 1),
             ('C:msvcr120_clr0400.dll', 1),
         ])
@@ -700,9 +700,9 @@ class WindowsCrtImportTests(unittest.TestCase):
                             self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), 1)
                         self.assertIn(repr(name), errors.getvalue())
 
-    def test_exact_os_inventory_and_siblings_in_each_import_mode(self):
-        exempt = ('mfc42u.dll', 'msvcp110_win.dll')
+    def test_removed_os_exemptions_and_siblings_in_each_import_mode(self):
         removed = (
+            'mfc42u.dll', 'msvcp110_win.dll',
             'msvcrt20.dll', 'msvcrt40.dll', 'msvcp60.dll',
             'mfc40.dll', 'mfc40u.dll', 'mfc42.dll', 'mfc42loc.dll',
             'msvcp110_clr0400.dll',
@@ -716,10 +716,7 @@ class WindowsCrtImportTests(unittest.TestCase):
             'msvcp110d.dll', 'msvcp120.dll', 'msvcp140.dll',
             'msvcr120d_clr0400.dll', 'vcruntime140d_clr0400.dll',
         )
-        names = [(name, 0) for base in exempt for name in (
-            base, base[:-4], base.upper(), 'C:' + base.upper(),
-            'C:\\Windows\\System32\\' + base + ' .', base + '::$DATA')]
-        names += [(name, 1) for base in removed for name in (
+        names = [(name, 1) for base in removed for name in (
             base, base[:-4], base.upper(), 'C:' + base.upper(),
             'C:\\Windows\\System32\\' + base + ' .', base + '::$DATA')]
         names += [(name, 1) for name in siblings]
@@ -737,7 +734,7 @@ class WindowsCrtImportTests(unittest.TestCase):
                             self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), expected)
                         if expected:
                             self.assertIn(repr(name), errors.getvalue())
-        self.assertEqual(set(exempt), release_packaging.WINDOWS_SYSTEM_RUNTIME_IMPORTS)
+        self.assertTrue(set(removed).isdisjoint(release_packaging.WINDOWS_OS_IMPORTS))
 
     def test_every_redistributable_crt_import_fails(self):
         for forbidden in (
@@ -761,10 +758,102 @@ class WindowsCrtImportTests(unittest.TestCase):
                     with self.assertRaisesRegex(release_packaging.PackagingError, re.escape(forbidden)):
                         release_packaging.verify_windows_imports([path])
 
-    def test_system_dlls_that_merely_resemble_crt_names_pass(self):
-        # msvcrt.dll (OS-private CRT) and atl.dll (ATL 3.0) ship with Windows itself.
-        for name in ("msvcrt.dll", "atl.dll", "api-ms-win-core-synch-l1-2-0.dll", "KERNEL32.dll", "mf.dll", "mfplat.dll"):
-            self.assertIsNone(release_packaging.FORBIDDEN_WINDOWS_IMPORT.fullmatch(name), name)
+    def test_any_non_os_import_fails_in_all_five_modes(self):
+        # The allowlist, not the diagnostic family vocabulary, makes the
+        # decision. Include the OpenMP and ASan gaps from the independent r7
+        # review, future variants, and arbitrary third-party names.
+        names = (
+            'libiomp5md.dll', 'libiompstubs5md.dll', 'libiompprof5md.dll',
+            'libguide40.dll', 'libguide40_stats.dll', 'libgomp-1.dll',
+            'cyggomp-1.dll', 'pgmp.dll', 'libiomp6md.dll',
+            'libiompstubs6md.dll', 'libiompprof6md.dll', 'libguide50.dll',
+            'libguide50_stats.dll', 'libgomp-2.dll', 'cyggomp-2.dll',
+            'libclang_rt.asan_dynamic-x86_64.dll',
+            'libclang_rt.asan_dynamic-i386.dll',
+            'clang_rt.asan_dynamic.dll', 'libclang_rt.asan_dynamic.dll',
+            'clang_rt.asan_dbg_dynamic.dll',
+            'libclang_rt.asan_dbg_dynamic.dll',
+            'libclang_rt.asan_dbg_dynamic-x86_64.dll',
+            'libclang_rt.asan_dynamic-aarch64.dll',
+            'sqlite3.dll', 'libssl-3-x64.dll', 'thirdparty.dll',
+            'mfc42u.dll', 'msvcp110_win.dll',
+        )
+        modes = ((False, False, False), (True, False, False),
+                 (False, True, False), (True, True, False), (True, True, True))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'runtime.exe'
+            for pe32, delayed, legacy in modes:
+                for base in names:
+                    for name in (
+                        base, base.upper(), 'C:' + base,
+                        'C:\\Windows\\System32\\' + base,
+                        '\\\\?\\C:\\runtime\\' + base,
+                        '//server/share/' + base,
+                        '.\\x\\..\\' + base,
+                        base + ' .', base + '::$DATA',
+                        *(() if base.count('.') > 1 else (base[:-4],)),
+                    ):
+                        with self.subTest(name=name, pe32=pe32, delayed=delayed, legacy=legacy):
+                            path.write_bytes(_pe(SYSTEM_IMPORTS if delayed else (name,),
+                                                 (name,) if delayed else (), pe32=pe32,
+                                                 legacy_delay=legacy))
+                            output, errors = io.StringIO(), io.StringIO()
+                            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                                self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), 1)
+                            self.assertIn(repr(name), errors.getvalue())
+
+    def test_allowlist_and_diagnostic_are_separate(self):
+        self.assertEqual(
+            release_packaging.rejected_windows_imports({'imports': ['vcruntime140.dll', 'thirdparty.dll']}),
+            [('thirdparty.dll', 'rejected: not an allowlisted OS DLL'),
+             ('vcruntime140.dll', 'rejected: VC runtime family VC runtime and satellites')],
+        )
+        self.assertEqual(
+            release_packaging.forbidden_windows_imports({'imports': [
+                'KERNEL32.dll', r'C:\Windows\System32\bcrypt.dll',
+                'api-ms-win-core-synch-l1-2-0.dll',
+                'ext-ms-win-ntuser-window-l1-1-0.dll',
+                'kernel32.dll::$DATA',
+            ]}),
+            [],
+        )
+        self.assertEqual(
+            release_packaging.forbidden_windows_imports({'imports': [
+                'api-ms-win-crt-runtime-l1-1-0.dll', 'api-ms-win-core-fake.dllx',
+                'ext-ms-win-other.ocx', 'api-ms-win-crt-math-l1-1-0.xyz',
+            ]}),
+            ['api-ms-win-core-fake.dllx', 'api-ms-win-crt-math-l1-1-0.xyz',
+             'api-ms-win-crt-runtime-l1-1-0.dll', 'ext-ms-win-other.ocx'],
+        )
+
+    def test_reviewed_os_imports_pass(self):
+        # Independent release-policy mirror: a removed allowlist row breaks
+        # this test, and an added row must be reviewed here and in the docs.
+        names = (
+            'advapi32.dll', 'bcrypt.dll', 'bcryptprimitives.dll', 'combase.dll',
+            'crypt32.dll', 'gdi32.dll', 'kernel32.dll', 'ntdll.dll', 'ole32.dll',
+            'oleaut32.dll', 'shell32.dll', 'user32.dll', 'userenv.dll', 'ws2_32.dll',
+            'kernelbase.dll', 'secur32.dll', 'ncrypt.dll', 'iphlpapi.dll',
+            'dwmapi.dll', 'uxtheme.dll', 'shlwapi.dll', 'winhttp.dll', 'dnsapi.dll',
+            'powrprof.dll', 'psapi.dll', 'version.dll', 'setupapi.dll',
+            'cfgmgr32.dll', 'rpcrt4.dll', 'shcore.dll', 'profapi.dll',
+            'netapi32.dll', 'wtsapi32.dll', 'win32u.dll', 'msvcrt.dll',
+            'msvcp_win.dll', 'mf.dll', 'mfplat.dll',
+            'api-ms-win-core-synch-l1-2-0.dll',
+            'ext-ms-win-ntuser-window-l1-1-0.dll',
+        )
+        self.assertEqual(set(names[:-2]), release_packaging.WINDOWS_OS_IMPORTS)
+        modes = ((False, False, False), (True, False, False),
+                 (False, True, False), (True, True, False), (True, True, True))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'system.exe'
+            for name in names:
+                for pe32, delayed, legacy in modes:
+                    with self.subTest(name=name, pe32=pe32, delayed=delayed, legacy=legacy):
+                        path.write_bytes(_pe(SYSTEM_IMPORTS if delayed else (name,),
+                                             (name,) if delayed else (), pe32=pe32,
+                                             legacy_delay=legacy))
+                        self.assertIn(name, release_packaging.verify_windows_imports([path])[0])
 
     def test_zip_and_directory_inputs_check_every_pe_member(self):
         with tempfile.TemporaryDirectory() as temporary:
