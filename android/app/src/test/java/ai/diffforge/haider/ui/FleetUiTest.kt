@@ -380,6 +380,63 @@ class FleetUiTest {
     }
 
     @Test
+    fun `973 the settings switch turns activity icons off and back on`() {
+        val service = app()
+        val context = rule.activity
+        ai.diffforge.haider.ui.fleet.ActivityIconPreference.resetCache()
+        assertTrue(ai.diffforge.haider.ui.fleet.ActivityIconPreference.enabled(context))
+        service.fleetOverride = { session ->
+            if (session == "s-fleet") {
+                FleetLoad.Snapshot(
+                    FleetSnapshot(
+                        sessionId = "s-fleet",
+                        generatedAtMs = FakeDaemonService.FIXED_NOW,
+                        nodeLimit = 64,
+                        depthLimit = 4,
+                        roots = listOf(
+                            FleetNode(
+                                agentId = "agent-editor",
+                                sessionId = "s-editor",
+                                callsign = "editor",
+                                task = "activity proof",
+                                depth = 1,
+                                parentSessionId = "s-fleet",
+                                state = FleetStateView.of("live"),
+                                activity = FleetActivity.Edit,
+                            ),
+                        ),
+                        rollup = FleetRollup(nodeCount = 1, maxDepth = 1, metricsComplete = true, complete = true),
+                        truncated = false,
+                    ),
+                )
+            } else {
+                null
+            }
+        }
+        try {
+            rule.runOnUiThread {
+                ai.diffforge.haider.ui.fleet.ActivityIconPreference.set(context, false)
+            }
+            viewModel.openFleet()
+            rule.waitForIdle()
+            rule.onNodeWithTag(fleetRowTag("agent-editor")).assertExists()
+            rule.onAllNodesWithTag(fleetActivityTag("agent-editor"), useUnmergedTree = true)
+                .assertCountEquals(0)
+            // Persisted locally: a fresh read of the file says off.
+            ai.diffforge.haider.ui.fleet.ActivityIconPreference.resetCache()
+            assertTrue(!ai.diffforge.haider.ui.fleet.ActivityIconPreference.enabled(context))
+            rule.runOnUiThread {
+                ai.diffforge.haider.ui.fleet.ActivityIconPreference.set(context, true)
+            }
+            rule.waitForIdle()
+            rule.onNodeWithTag(fleetActivityTag("agent-editor"), useUnmergedTree = true).assertExists()
+        } finally {
+            ai.diffforge.haider.ui.fleet.ActivityIconPreference.set(context, true)
+            ai.diffforge.haider.ui.fleet.ActivityIconPreference.resetCache()
+        }
+    }
+
+    @Test
     fun `the panel says what the daemon bounded and what it refused`() {
         app()
         viewModel.openFleet()

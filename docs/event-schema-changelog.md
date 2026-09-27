@@ -41,7 +41,27 @@ pre-field payload. Clients render emoji (`🖥️ 📱 🌐 🔌 ✏️ ⚙️ �
 the base defaults to text presentation, two columns each) or the text
 fallbacks `[screen] [phone] [web] [remote] [edit] [run] [read] [orch]`;
 `HAIDER_ACTIVITY_ICONS=emoji|text|off`, the TUI `/icons` setting, `NO_COLOR`
-and limited `TERM` values select the form.
+and limited `TERM` values select the form. `AgentMetricsSnapshot` (session
+summaries, observe digests and fleet node metrics) gains an additive
+`activity` object — the time-independent tracker state (`open`, `touched`,
+`latest`, `terminal`) clients evaluate on their own clock; it is likewise
+withheld from peers without `session_fleet_identity_v1`. Only work that
+really ran counts: live activity opens on a `Dispatched` effect (by its
+typed `EffectClass`) and closes at its outcome; a completed `ToolCall`
+counts only with status `completed`. A tool name the model merely
+requested (unadvertised, ungranted, malformed or refused) sets no icon and
+adds no history. The computer-use overlay names an acting subagent
+(`🖥️ <callsign> is using your screen`), re-labels when a different actor
+takes over a shown surface, and follows the daemon's `HAIDER_ACTIVITY_ICONS`
+then `NO_COLOR` (it is a shared daemon surface, so a single TUI's `/icons`
+choice does not apply to it).
+
+**Release note (CLI behaviour change):** `haider agent list` without
+`--json` now prints a human fleet tree (state glyph, activity glyph, name,
+task, metrics) instead of pretty-printed JSON. Scripts must use `--json`,
+whose document is the standard `{schema, ok, result, error}` envelope — the
+fleet is at `.result.roots` (previously the bare default output exposed
+`.roots`).
 
 ### v0.0.973 — provider-request budgets become opt-in
 

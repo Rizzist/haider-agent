@@ -593,9 +593,10 @@ async fn a_subagent_lease_names_itself_on_the_overlay_badge() {
     }
     lease.end(false);
     let commands = recorded.commands.lock().unwrap().clone();
-    let expected_label = if std::env::var("HAIDER_ACTIVITY_ICONS")
-        .is_ok_and(|value| matches!(value.as_str(), "text" | "off"))
-    {
+    let expected_label = if !crate::cu_presence::overlay_emoji(
+        std::env::var("HAIDER_ACTIVITY_ICONS").ok().as_deref(),
+        std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+    ) {
         "Ammar is using your screen".to_owned()
     } else {
         "\u{1F5A5}\u{FE0F} Ammar is using your screen".to_owned()
@@ -618,4 +619,21 @@ async fn a_subagent_lease_names_itself_on_the_overlay_badge() {
     let commands = recorded.commands.lock().unwrap().clone();
     assert!(commands.iter().any(|command| matches!(command,
         PresenceCommand::Show { label, .. } if label == "Haider is controlling this screen")));
+}
+
+#[test]
+fn overlay_emoji_rule_follows_override_then_no_color() {
+    use crate::cu_presence::overlay_emoji;
+    assert!(overlay_emoji(None, false));
+    assert!(
+        !overlay_emoji(None, true),
+        "NO_COLOR selects the plain badge"
+    );
+    assert!(overlay_emoji(Some("emoji"), true), "explicit override wins");
+    assert!(!overlay_emoji(Some("text"), false));
+    assert!(!overlay_emoji(Some("off"), false));
+    assert!(
+        overlay_emoji(Some("sparkles"), false),
+        "unparseable override ignored"
+    );
 }

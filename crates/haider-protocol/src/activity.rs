@@ -2,10 +2,23 @@
 //! as opposed to its run STATE (queued/live/waiting/done…), which already has
 //! its own glyphs.
 //!
-//! Activity is derived ONLY from typed journal facts — the tool identity on a
-//! `ToolCall` item (its registered route name), the typed
-//! `CommandExecution` / `FileChange` / `ChildSpawn` items, and `RunState` —
-//! never from free text (task names, assistant prose, arguments).
+//! Activity is derived ONLY from facts the daemon authored about work that
+//! really ran — never from free text (task names, prose, arguments) and never
+//! from a tool NAME the model merely requested:
+//!
+//! * live activity: an effect's typed [`EffectClass`], opened when the effect
+//!   is `Dispatched` (authorized, crossing the dispatch boundary) and closed
+//!   at its `Outcome`;
+//! * completed activity: a `ToolCall` / `CommandExecution` item whose status
+//!   is `completed` (a real route ran — this also covers provider-executed
+//!   server tools such as `web_search`), plus the daemon-authored
+//!   `FileChange` / `ChildSpawn` items;
+//! * `RunState` for terminal detection.
+//!
+//! A model that names an unadvertised, ungranted, malformed or refused tool
+//! (e.g. `computer` from a child without computer use) produces no effect
+//! dispatch and no successful completion, so it sets no icon and adds no
+//! history.
 //!
 //! ## Priority
 //!
@@ -25,9 +38,8 @@
 //!
 //! ## Timing (documented contract)
 //!
-//! * A tool call is ACTIVE from its `Started` item until its `Completed` item
-//!   (or the run's terminal state), however long it runs — a 20-minute test
-//!   run shows ⚙️ throughout.
+//! * A dispatched effect is ACTIVE until its outcome (or the run's terminal
+//!   state), however long it runs — a 20-minute test run shows ⚙️ throughout.
 //! * A finished call stays HOT for [`ACTIVITY_HOT_WINDOW_MS`] (8 s) after its
 //!   last touch. Every active or hot kind competes; the highest priority wins,
 //!   so an agent that read a file and edited it within the window shows ✏️.
@@ -43,8 +55,9 @@
 //! list`) and in clients over the live child stream, so both agree.
 
 use crate::EventPayload;
+use crate::effect::{AuthorizationVerdict, EffectClass, EffectPhase};
 use crate::envelope::RawEnvelope;
-use crate::item::{ItemEvent, TurnItem};
+use crate::item::{ItemEvent, ToolStatus, TurnItem};
 use serde::{Deserialize, Serialize};
 
 /// A finished call competes on priority for this long after its last touch.
@@ -223,6 +236,27 @@ impl ActivityKind {
         })
     }
 
+    /// The activity of one typed effect class — the daemon's own authority
+    /// vocabulary for what a dispatched tool is about to do.
+    #[must_use]
+    pub fn for_effect(class: &EffectClass) -> Option<Self> {
+        Some(match class {
+            EffectClass::GuiAct | EffectClass::ScreenObserve | EffectClass::ScreenControl => {
+                Self::Computer
+            }
+            EffectClass::MobileObserve | EffectClass::MobileControl | EffectClass::ReadSms => {
+                Self::Mobile
+            }
+            EffectClass::Network { .. } => Self::Web,
+            EffectClass::RemoteExecution => Self::Remote,
+            EffectClass::FsWrite | EffectClass::GitOp => Self::Edit,
+            EffectClass::ProcessExec => Self::Run,
+            EffectClass::FsRead => Self::Read,
+            EffectClass::AgentSpawn | EffectClass::PeerMessage => Self::Orchestrate,
+            EffectClass::CredentialAccess => return None,
+        })
+    }
+
     /// The activity a typed turn item evidences, if any.
     #[must_use]
     pub fn for_item(item: &TurnItem) -> Option<Self> {
@@ -356,8 +390,14 @@ pub struct ActivityStateV1 {
 /// envelope's `committed_at_ms`; ask [`Self::current`] at any instant.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActivityTracker {
-    /// Open calls: (item id, kind). Bounded by [`ACTIVITY_MAX_IN_FLIGHT`].
+    /// Dispatched, unfinished effects: (effect id, kind). Bounded by
+    /// [`ACTIVITY_MAX_IN_FLIGHT`].
     in_flight: Vec<(String, ActivityKind)>,
+    /// Delegated children spawned and not yet reported (agent ids).
+    children: Vec<String>,
+    /// Journaled but not yet dispatched effect intents: (effect id, kind).
+    /// Never shown; promoted to `in_flight` only on `Dispatched`.
+    pending: Vec<(String, ActivityKind)>,
     /// Per kind (indexed by rank): the last instant it was touched.
     last_touch: [Option<u64>; 8],
     /// The most recently STARTED/observed kind and when.
@@ -383,38 +423,101 @@ impl ActivityTracker {
         }
     }
 
-    /// Apply one item lifecycle event.
+    /// Apply one item lifecycle event. A `ToolCall` item carries the name
+    /// the MODEL requested — it may be unadvertised, ungranted, malformed or
+    /// refused — so it never opens or touches an activity on its own. Only a
+    /// SUCCESSFULLY completed call (which proves a real route ran; this also
+    /// covers provider-executed server tools, whose only fact is their
+    /// completed item) and the daemon-authored typed items count. Live
+    /// in-flight activity comes from dispatched effects (see
+    /// [`Self::observe_effect`]).
     pub fn observe_item(&mut self, event: &ItemEvent, at_ms: u64) {
-        match event {
-            ItemEvent::Started { item_id, item } => {
-                let Some(kind) = ActivityKind::for_item(item) else {
+        let ItemEvent::Completed { item, .. } = event else {
+            return;
+        };
+        // A delegated child is outstanding from the daemon-authored
+        // `ChildSpawn` fact until its `ChildResult`: the parent is
+        // orchestrating the whole time it waits.
+        match item {
+            TurnItem::ChildSpawn { agent }
+                if !self.children.iter().any(|open| open == agent.as_str()) =>
+            {
+                if self.children.len() >= ACTIVITY_MAX_IN_FLIGHT {
+                    self.children.remove(0);
+                }
+                self.children.push(agent.as_str().to_owned());
+            }
+            TurnItem::ChildResult { report } => {
+                self.children.retain(|open| open != report.agent.as_str());
+                self.touch(ActivityKind::Orchestrate, at_ms);
+                return;
+            }
+            _ => {}
+        }
+        let counts = match item {
+            TurnItem::ToolCall { status, .. } | TurnItem::CommandExecution { status, .. } => {
+                *status == ToolStatus::Completed
+            }
+            TurnItem::FileChange { .. } | TurnItem::ChildSpawn { .. } => true,
+            _ => false,
+        };
+        if counts && let Some(kind) = ActivityKind::for_item(item) {
+            self.terminal = false;
+            self.touch(kind, at_ms);
+        }
+    }
+
+    /// Apply one effect lifecycle fact. The daemon journals an effect's
+    /// typed class before authorization; the activity OPENS only when the
+    /// effect is `Dispatched` (authorized and actually crossing the dispatch
+    /// boundary) and closes at its `Outcome`. Refused, denied, never-asked or
+    /// never-dispatched effects set no icon and add no history.
+    pub fn observe_effect(&mut self, phase: &EffectPhase, at_ms: u64) {
+        match phase {
+            EffectPhase::Intent(intent) => {
+                if let Some(kind) = ActivityKind::for_effect(&intent.class) {
+                    let id = intent.effect.as_str().to_owned();
+                    self.pending.retain(|(held, _)| *held != id);
+                    if self.pending.len() >= ACTIVITY_MAX_IN_FLIGHT {
+                        self.pending.remove(0);
+                    }
+                    self.pending.push((id, kind));
+                }
+            }
+            EffectPhase::Authorized { effect, verdict } => {
+                if matches!(verdict, AuthorizationVerdict::Deny { .. }) {
+                    self.pending.retain(|(held, _)| held != effect.as_str());
+                }
+            }
+            EffectPhase::Dispatched { effect } => {
+                let Some(position) = self
+                    .pending
+                    .iter()
+                    .position(|(held, _)| held == effect.as_str())
+                else {
                     return;
                 };
+                let (id, kind) = self.pending.remove(position);
                 self.terminal = false;
                 self.touch(kind, at_ms);
-                // Only calls have a lifecycle worth holding open; the other
-                // typed items are instantaneous facts.
-                if matches!(
-                    item,
-                    TurnItem::ToolCall { .. } | TurnItem::CommandExecution { .. }
-                ) && !self
-                    .in_flight
-                    .iter()
-                    .any(|(open, _)| open == item_id.as_str())
-                {
+                if !self.in_flight.iter().any(|(open, _)| *open == id) {
                     if self.in_flight.len() >= ACTIVITY_MAX_IN_FLIGHT {
                         self.in_flight.remove(0);
                     }
-                    self.in_flight.push((item_id.as_str().to_owned(), kind));
+                    self.in_flight.push((id, kind));
                 }
             }
-            ItemEvent::Completed { item_id, item } => {
-                self.in_flight.retain(|(open, _)| open != item_id.as_str());
-                if let Some(kind) = ActivityKind::for_item(item) {
+            EffectPhase::Outcome { effect, .. } => {
+                self.pending.retain(|(held, _)| held != effect.as_str());
+                if let Some(position) = self
+                    .in_flight
+                    .iter()
+                    .position(|(open, _)| open == effect.as_str())
+                {
+                    let (_, kind) = self.in_flight.remove(position);
                     self.touch(kind, at_ms);
                 }
             }
-            ItemEvent::Delta { .. } => {}
         }
     }
 
@@ -422,10 +525,13 @@ impl ActivityTracker {
     pub fn observe(&mut self, payload: &EventPayload, at_ms: u64) {
         match payload {
             EventPayload::Item(event) => self.observe_item(event, at_ms),
+            EventPayload::Effect(phase) => self.observe_effect(phase, at_ms),
             EventPayload::RunState(state) => {
                 if state.is_terminal() {
                     self.terminal = true;
                     self.in_flight.clear();
+                    self.pending.clear();
+                    self.children.clear();
                 } else {
                     self.terminal = false;
                 }
@@ -441,7 +547,7 @@ impl ActivityTracker {
             .payload
             .get("type")
             .and_then(serde_json::Value::as_str);
-        if !matches!(kind, Some("item" | "run_state")) {
+        if !matches!(kind, Some("item" | "run_state" | "effect")) {
             return;
         }
         if kind == Some("item") {
@@ -452,7 +558,13 @@ impl ActivityTracker {
                 .and_then(serde_json::Value::as_str);
             if !matches!(
                 item_kind,
-                Some("tool_call" | "command_execution" | "file_change" | "child_spawn")
+                Some(
+                    "tool_call"
+                        | "command_execution"
+                        | "file_change"
+                        | "child_spawn"
+                        | "child_result"
+                )
             ) {
                 return;
             }
@@ -490,7 +602,8 @@ impl ActivityTracker {
                 .is_some_and(|at| now_ms.saturating_sub(at) <= ACTIVITY_HOT_WINDOW_MS)
         });
         let open = self.in_flight.iter().map(|(_, kind)| *kind);
-        let orchestrating = live_children.then_some(ActivityKind::Orchestrate);
+        let orchestrating =
+            (live_children || !self.children.is_empty()).then_some(ActivityKind::Orchestrate);
         if let Some(best) = highest(hot.chain(open).chain(orchestrating)) {
             return Some(best);
         }
@@ -503,6 +616,9 @@ impl ActivityTracker {
     #[must_use]
     pub fn state(&self) -> ActivityStateV1 {
         let mut open: Vec<ActivityKind> = self.in_flight.iter().map(|(_, kind)| *kind).collect();
+        if !self.children.is_empty() {
+            open.push(ActivityKind::Orchestrate);
+        }
         open.sort_by_key(|kind| kind.rank());
         open.dedup();
         ActivityStateV1 {

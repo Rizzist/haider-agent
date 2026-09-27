@@ -357,6 +357,9 @@ impl Lease {
 pub struct PresenceMachine<K: Ord + Clone> {
     leases: BTreeMap<K, Lease>,
     shown: BTreeSet<PresenceSurface>,
+    /// The badge label each shown surface currently displays, so a different
+    /// actor taking over a shown surface re-labels it (973-activity-icons).
+    labels: BTreeMap<PresenceSurface, String>,
     idle_timeout: Duration,
     next_seq: u64,
 }
@@ -373,6 +376,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         Self {
             leases: BTreeMap::new(),
             shown: BTreeSet::new(),
+            labels: BTreeMap::new(),
             idle_timeout,
             next_seq: 1,
         }
@@ -394,8 +398,9 @@ impl<K: Ord + Clone> PresenceMachine<K> {
 
     /// [`Self::begin_action`] naming the acting subagent: a `Show` this
     /// action raises carries [`PresenceSurface::actor_label`]
-    /// (973-activity-icons). A surface already shown keeps the label it was
-    /// raised with.
+    /// (973-activity-icons). When a different actor (or the main thread)
+    /// acts on an already-shown surface, `Show` is re-issued with its label,
+    /// so the badge always names whoever is acting now.
     pub fn begin_action_as(
         &mut self,
         key: K,
@@ -426,7 +431,11 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             || surface.badge_label().to_owned(),
             |actor| surface.actor_label(&actor.name, actor.emoji),
         );
-        if self.shown.insert(surface) {
+        // First show, or a DIFFERENT actor now drives an already-shown
+        // surface: (re)issue Show so the badge names who is acting now.
+        let relabel = self.labels.get(&surface) != Some(&label);
+        if self.shown.insert(surface) || relabel {
+            self.labels.insert(surface, label.clone());
             commands.push(PresenceCommand::Show { surface, label });
         }
         let seq = self.next_seq;
@@ -516,6 +525,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         }
         let mut commands = Vec::new();
         if self.shown.remove(&surface) {
+            self.labels.remove(&surface);
             commands.push(PresenceCommand::Stopping { surface });
             commands.push(PresenceCommand::Hide {
                 surface,
@@ -556,6 +566,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             .values()
             .any(|lease| !lease.stopped() && lease.surfaces.contains_key(&surface));
         if !still_used && self.shown.remove(&surface) {
+            self.labels.remove(&surface);
             vec![PresenceCommand::Hide { surface, reason }]
         } else {
             Vec::new()

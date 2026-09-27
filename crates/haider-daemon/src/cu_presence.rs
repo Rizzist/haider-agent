@@ -418,6 +418,13 @@ impl Drop for ActionGuard<'_> {
     }
 }
 
+/// Whether an overlay badge leads with the activity emoji (see
+/// [`PresenceLease::with_actor`]).
+pub(crate) fn overlay_emoji(override_value: Option<&str>, no_color: bool) -> bool {
+    haider_protocol::activity::ActivityDisplay::resolve(override_value, None, no_color, None)
+        == haider_protocol::activity::ActivityDisplay::Emoji
+}
+
 impl PresenceLease {
     pub(crate) fn new(presence: Arc<CuPresence>, key: String, stop: StopHook) -> Self {
         Self {
@@ -429,15 +436,20 @@ impl PresenceLease {
         }
     }
 
-    /// Name the subagent driving this run on any badge it raises. The
-    /// activity glyph leads unless `HAIDER_ACTIVITY_ICONS` asks for text or
-    /// no icons.
+    /// Name the subagent driving this run on any badge it raises.
+    ///
+    /// Emoji rule (973-activity-icons, F4 — documented choice): the overlay
+    /// is a DAEMON surface shared by every client, so it cannot follow one
+    /// TUI's `/icons` preference. It uses the daemon's own environment with
+    /// the client resolution order minus the terminal heuristics:
+    /// `HAIDER_ACTIVITY_ICONS` (`emoji`/`text`/`off`) wins, else `NO_COLOR`
+    /// selects the plain label, else emoji. An auto-spawned daemon inherits
+    /// both from the client that launched it.
     #[must_use]
     pub(crate) fn with_actor(mut self, name: Option<String>) -> Self {
-        let emoji = std::env::var("HAIDER_ACTIVITY_ICONS")
-            .ok()
-            .and_then(|value| haider_protocol::activity::ActivityDisplay::parse(&value))
-            .is_none_or(|display| display == haider_protocol::activity::ActivityDisplay::Emoji);
+        let override_value = std::env::var(haider_client::fleet::ACTIVITY_ICONS_ENV).ok();
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let emoji = overlay_emoji(override_value.as_deref(), no_color);
         self.actor = name
             .filter(|name| !name.trim().is_empty())
             .map(|name| haider_tools::presence::PresenceActor { name, emoji });

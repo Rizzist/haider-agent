@@ -7079,14 +7079,25 @@ impl AppModel {
         &self,
         chip: &ChipModel,
     ) -> Option<haider_protocol::activity::ActivityKind> {
+        self.chip_activity_with(chip, false)
+    }
+
+    /// [`Self::chip_activity`] with extra live-children knowledge (a fleet
+    /// snapshot can see grandchildren the chip tree does not hold).
+    fn chip_activity_with(
+        &self,
+        chip: &ChipModel,
+        known_live_children: bool,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
         use crate::script::ChipDisplayState as S;
         if chip.closed || matches!(chip.display_state(), S::Done | S::Error) {
             return None;
         }
-        let live_children = chip
-            .children
-            .iter()
-            .any(|child| !child.closed && !matches!(child.display_state(), S::Done | S::Error));
+        let live_children = known_live_children
+            || chip
+                .children
+                .iter()
+                .any(|child| !child.closed && !matches!(child.display_state(), S::Done | S::Error));
         if !chip.activity.is_empty() {
             return chip.activity.current(self.clock_ms, live_children);
         }
@@ -7114,13 +7125,13 @@ impl AppModel {
         if matches!(node.state, F::Done | F::Failed | F::Cancelled) {
             return None;
         }
-        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
-            return self.chip_activity(chip);
-        }
         let live_children = node
             .children
             .iter()
             .any(|child| !matches!(child.state, F::Done | F::Failed | F::Cancelled));
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            return self.chip_activity_with(chip, live_children);
+        }
         // A deeper member has no chip; its own session summary carries the
         // live activity state (fresher than the snapshot's instant).
         // Freshest of the two daemon projections (replace-by-head law):

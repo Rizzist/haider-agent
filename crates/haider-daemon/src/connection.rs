@@ -959,7 +959,38 @@ fn omit_fleet_identity(frame: &mut WireFrame) {
             event: haider_rpc::SessionDescendantStreamEventWire::Delta { child, .. },
             ..
         } => omit_descendant_node_identity(std::slice::from_mut(child)),
+        // 973-activity-icons: `AgentMetricsSnapshot.activity` postdates X1
+        // as well; every frame that carries agent metrics drops it.
+        WireFrame::Response {
+            body: ResponseBody::SessionList { sessions, .. },
+            ..
+        }
+        | WireFrame::SessionRosterDelta {
+            summaries: sessions,
+        } => {
+            for summary in sessions {
+                omit_metrics_activity(summary.agent_metrics.as_mut());
+            }
+        }
+        WireFrame::Response {
+            body: ResponseBody::SessionObserve { digest },
+            ..
+        } => omit_metrics_activity(digest.agent_metrics.as_mut()),
+        WireFrame::Response {
+            body: ResponseBody::SessionObserveBatch { digests },
+            ..
+        } => {
+            for digest in digests {
+                omit_metrics_activity(digest.agent_metrics.as_mut());
+            }
+        }
         _ => {}
+    }
+}
+
+fn omit_metrics_activity(metrics: Option<&mut haider_protocol::agent::AgentMetricsSnapshot>) {
+    if let Some(metrics) = metrics {
+        metrics.activity = None;
     }
 }
 
@@ -971,6 +1002,7 @@ fn omit_fleet_node_identity(nodes: &mut [haider_rpc::FleetNodeWire]) {
         // keeps its exact pre-X1 payload.
         node.activity = None;
         node.activities.clear();
+        omit_metrics_activity(node.metrics.as_mut());
         omit_fleet_node_identity(&mut node.children);
     }
 }

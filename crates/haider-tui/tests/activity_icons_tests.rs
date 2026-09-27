@@ -23,7 +23,11 @@ use haider_protocol::activity::{
     ACTIVITY_HOT_WINDOW_MS, ACTIVITY_LINGER_MS, ActivityDisplay, ActivityKind,
 };
 use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+use haider_protocol::effect::{
+    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
+};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
+use haider_protocol::ids::EffectId;
 use haider_protocol::ids::{AgentId, DeviceId, EventId, ItemId, LeaseId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_tui::app::{AppEvent, AppModel, Screen};
@@ -121,6 +125,8 @@ impl Fixture {
         );
     }
 
+    /// A REAL call: the model's item starts, and the daemon journals the
+    /// typed effect intent, the allow verdict and the dispatch.
     fn start(&mut self, agent: &str, id: &str, name: &str, at_ms: u64) {
         self.route(
             Some(agent),
@@ -130,9 +136,44 @@ impl Fixture {
                 item: call(id, name),
             }),
         );
+        let effect = EffectId::new(format!("effect-{id}"));
+        self.route(
+            Some(agent),
+            at_ms,
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect.clone(),
+                class: class_of(name),
+                summary: format!("{name} call"),
+                args_digest: "digest".into(),
+                workspace_revision: None,
+            })),
+        );
+        self.route(
+            Some(agent),
+            at_ms,
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect: effect.clone(),
+                verdict: AuthorizationVerdict::Allow,
+            }),
+        );
+        self.route(
+            Some(agent),
+            at_ms,
+            EventPayload::Effect(EffectPhase::Dispatched { effect }),
+        );
     }
 
     fn finish(&mut self, agent: &str, id: &str, name: &str, at_ms: u64) {
+        self.route(
+            Some(agent),
+            at_ms,
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: EffectId::new(format!("effect-{id}")),
+                outcome: EffectOutcome::Ok,
+                freshness: None,
+                workspace_mutation: None,
+            }),
+        );
         let mut item = call(id, name);
         if let TurnItem::ToolCall { status, .. } = &mut item {
             *status = ToolStatus::Completed;
@@ -145,6 +186,43 @@ impl Fixture {
                 item,
             }),
         );
+    }
+
+    /// A SPOOFED call: the model names a tool it was never granted; the item
+    /// starts and fails, and no effect is ever dispatched.
+    fn spoof(&mut self, agent: &str, id: &str, name: &str, at_ms: u64) {
+        self.route(
+            Some(agent),
+            at_ms,
+            EventPayload::Item(ItemEvent::Started {
+                item_id: ItemId::new(id),
+                item: call(id, name),
+            }),
+        );
+        let mut item = call(id, name);
+        if let TurnItem::ToolCall { status, .. } = &mut item {
+            *status = ToolStatus::Failed;
+        }
+        self.route(
+            Some(agent),
+            at_ms + 1,
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(id),
+                item,
+            }),
+        );
+    }
+}
+
+fn class_of(name: &str) -> EffectClass {
+    match name {
+        "computer" => EffectClass::ScreenControl,
+        "web_search" | "web_fetch" => EffectClass::Network {
+            host: "example.test".into(),
+        },
+        "fs_edit" => EffectClass::FsWrite,
+        "test_run" | "process_exec" => EffectClass::ProcessExec,
+        _ => EffectClass::FsRead,
     }
 }
 
@@ -582,5 +660,31 @@ fn live_mode_chips_read_the_childs_published_activity_state() {
     assert_eq!(
         fixture.model.chip_activity(chip(&fixture.model, AMINA)),
         None
+    );
+}
+
+#[test]
+fn a_spoofed_tool_name_never_shows_an_icon() {
+    // F1: Bilal (no computer use) names `computer`; the call starts, is
+    // refused, and never dispatches. No 🖥️, no history, no slot.
+    let mut fixture = Fixture {
+        model: session_model(),
+        seq: 0,
+    };
+    fixture.spawn(BILAL, "Bilal", "check the release notes", None);
+    fixture.model.chips[0].device = "test-box".into();
+    fixture.spoof(BILAL, "x1", "computer", T0 + 1_000);
+    fixture.spoof(BILAL, "x2", "mobile", T0 + 1_100);
+    fixture.model.clock_ms = T0 + 1_200;
+    assert_eq!(
+        fixture.model.chip_activity(chip(&fixture.model, BILAL)),
+        None
+    );
+    assert!(chip(&fixture.model, BILAL).activity.used().is_empty());
+    let frame = draw(&fixture.model, 118, 36);
+    let bilal = row(&frame, "Bilal");
+    assert!(
+        !bilal.contains('\u{1F5A5}') && !bilal.contains('\u{1F4F1}'),
+        "{bilal}"
     );
 }

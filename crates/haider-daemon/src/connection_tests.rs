@@ -808,6 +808,32 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     assert_unadvertised_fleet_identity_is_byte_identical();
 }
 
+fn identity_gate_metrics() -> haider_protocol::agent::AgentMetricsSnapshot {
+    use haider_protocol::activity::{ActivityKind, ActivityStateV1, ActivityTouchV1};
+    haider_protocol::agent::AgentMetricsSnapshot {
+        agent: Some(haider_protocol::ids::AgentId::new("identity-gate-agent")),
+        session_id: haider_protocol::ids::SessionId::new("identity-gate-child"),
+        head_seq: 9,
+        started_at_ms: 1,
+        terminal_at_ms: None,
+        live: true,
+        tool_attempts: 2,
+        usage: None,
+        activity: Some(ActivityStateV1 {
+            open: vec![ActivityKind::Edit],
+            touched: vec![ActivityTouchV1 {
+                kind: ActivityKind::Edit,
+                at_ms: 1,
+            }],
+            latest: Some(ActivityTouchV1 {
+                kind: ActivityKind::Edit,
+                at_ms: 1,
+            }),
+            terminal: false,
+        }),
+    }
+}
+
 fn assert_unadvertised_fleet_identity_is_byte_identical() {
     use haider_protocol::ids::{AgentId, RunId, SessionId};
 
@@ -833,7 +859,9 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                     parent_session_id: root_session_id.clone(),
                     parent_agent_id: None,
                     state: haider_rpc::FleetAgentStateWire::Live,
-                    metrics: None,
+                    // 973-activity-icons: populated metrics carry the
+                    // activity state the legacy sink must drop too.
+                    metrics: Some(identity_gate_metrics()),
                     // 973-activity-icons: the legacy sink omits these too.
                     activity: Some(haider_protocol::activity::ActivityKind::Edit),
                     activities: vec![
@@ -907,7 +935,19 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
         },
     };
 
-    let rich_frames = [fleet, baseline, delta];
+    let roster: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "identity-gate-child",
+        "head_seq": 9,
+        "worker_generation": 1,
+    }))
+    .expect("minimal summary");
+    let roster = WireFrame::SessionRosterDelta {
+        summaries: vec![haider_rpc::SessionSummary {
+            agent_metrics: Some(identity_gate_metrics()),
+            ..roster
+        }],
+    };
+    let rich_frames = [fleet, baseline, delta, roster];
     for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
         let sink = ConnectionFrameSink {
             lane: OutboundLane::new(1, 1_048_576, 1_048_576),
@@ -926,6 +966,14 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                     snapshot.roots[0].provider = None;
                     snapshot.roots[0].activity = None;
                     snapshot.roots[0].activities.clear();
+                    if let Some(metrics) = snapshot.roots[0].metrics.as_mut() {
+                        metrics.activity = None;
+                    }
+                }
+                WireFrame::SessionRosterDelta { summaries } => {
+                    if let Some(metrics) = summaries[0].agent_metrics.as_mut() {
+                        metrics.activity = None;
+                    }
                 }
                 WireFrame::Response {
                     body: ResponseBody::SessionDescendantsAttach { baseline, .. },
@@ -943,11 +991,19 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                 }
                 _ => unreachable!("identity gate fixture covers all delivery shapes"),
             }
+            if !matches!(legacy_frame, WireFrame::SessionRosterDelta { .. }) {
+                assert!(
+                    serde_json::to_string(&legacy_frame)
+                        .expect("legacy identity frame serializes")
+                        .contains("\"callsign\":\"jade-fox-a1b2c3\""),
+                    "the pre-existing callsign field survives the X1 feature gate"
+                );
+            }
             assert!(
-                serde_json::to_string(&legacy_frame)
-                    .expect("legacy identity frame serializes")
-                    .contains("\"callsign\":\"jade-fox-a1b2c3\""),
-                "the pre-existing callsign field survives the X1 feature gate"
+                !serde_json::to_string(&legacy_frame)
+                    .expect("legacy frame serializes")
+                    .contains("\"activit"),
+                "no 973 activity field reaches a legacy peer"
             );
             let expected = uds_codec::encode_with(&legacy_frame, 1_048_576, encoding)
                 .expect("legacy identity frame encodes");

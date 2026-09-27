@@ -6615,18 +6615,17 @@ async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capabil
         live_node.children[0].parent_agent_id.as_ref(),
         Some(&live.agent_id)
     );
-    // 973-activity-icons: each child's typed `fs_read` call is still open,
-    // so live/waiting nodes are reading; terminal nodes show no current
-    // activity but keep their history; a parent with children lists
-    // orchestrating in its history.
+    // 973-activity-icons: every child only STARTED a model-requested
+    // `fs_read` item — no effect was ever dispatched — so no node reads
+    // (F1: a requested tool name alone sets no icon and no history). The
+    // live parent still orchestrates its live child, and terminal nodes are
+    // quiet.
     {
         use haider_protocol::activity::ActivityKind;
-        assert_eq!(live_node.activity, Some(ActivityKind::Read));
-        assert_eq!(
-            live_node.activities,
-            vec![ActivityKind::Read, ActivityKind::Orchestrate]
-        );
-        assert_eq!(live_node.children[0].activity, Some(ActivityKind::Read));
+        assert_eq!(live_node.activity, Some(ActivityKind::Orchestrate));
+        assert_eq!(live_node.activities, vec![ActivityKind::Orchestrate]);
+        assert_eq!(live_node.children[0].activity, None);
+        assert!(live_node.children[0].activities.is_empty());
         for node in &snapshot.roots {
             if matches!(
                 node.state,
@@ -6635,7 +6634,7 @@ async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capabil
                     | FleetAgentStateWire::Cancelled
             ) {
                 assert_eq!(node.activity, None, "{}", node.agent_id);
-                assert_eq!(node.activities, vec![ActivityKind::Read]);
+                assert!(node.activities.is_empty(), "{}", node.agent_id);
             }
         }
         let json = serde_json::to_value(&snapshot).expect("fleet json");
@@ -6645,11 +6644,8 @@ async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capabil
             .iter()
             .find(|node| node["agent_id"] == "fleet-agent-live")
             .expect("live json node");
-        assert_eq!(live_json["activity"], "read");
-        assert_eq!(
-            live_json["activities"],
-            serde_json::json!(["read", "orchestrate"])
-        );
+        assert_eq!(live_json["activity"], "orchestrate");
+        assert_eq!(live_json["activities"], serde_json::json!(["orchestrate"]));
     }
 
     let denied_sink = Arc::new(CollectSink::default());

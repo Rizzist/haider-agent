@@ -410,4 +410,38 @@ class FleetWireShapeTest {
         assertEquals("[screen]", FleetActivity.Computer.label)
         assertEquals("\uD83D\uDDA5\uFE0F", FleetActivity.Computer.emoji)
     }
+
+    @Test
+    fun `the published activity state decays on the phone clock`() {
+        val node = FleetRpcAdapter.parseNode(
+            JSONObject(
+                """
+                {"agent_id":"a","session_id":"s","state":"live","activity":"edit",
+                 "metrics":{"session_id":"s","head_seq":3,"started_at_ms":0,"live":true,
+                   "tool_attempts":2,"activity":{
+                     "touched":[{"kind":"edit","at_ms":1000},{"kind":"read","at_ms":500},
+                                {"kind":"teleport","at_ms":900}],
+                     "latest":{"kind":"edit","at_ms":1000}}}}
+                """.trimIndent(),
+            ),
+        )
+        val state = node.metrics!!.activity!!
+        assertEquals(setOf(FleetActivity.Edit, FleetActivity.Read), state.touched.keys)
+        // Hot: edit outranks read.
+        assertEquals(FleetActivity.Edit, node.activityAt(1_500))
+        // Past the 8 s hot window: the most recent activity lingers …
+        assertEquals(FleetActivity.Edit, node.activityAt(1_000 + 8_001))
+        // … and after 60 s of quiet the icon is gone, with no new fetch.
+        assertNull(node.activityAt(1_000 + 60_001))
+        // The earliest boundary: read (touched at 500) leaves the hot window first.
+        assertEquals(500 + 8_001L, state.nextChangeAt(1_500))
+        // An open call stays current however long it runs.
+        val open = state.copy(open = listOf(FleetActivity.Run))
+        assertEquals(FleetActivity.Run, open.current(10_000_000, liveChildren = false))
+        // Live children orchestrate when quiet; terminal state shows nothing.
+        assertEquals(FleetActivity.Orchestrate, state.current(10_000_000, liveChildren = true))
+        assertNull(state.copy(terminal = true).current(1_500, liveChildren = true))
+        // Without a clock reference the snapshot figure is used.
+        assertEquals(FleetActivity.Edit, node.activityAt(null))
+    }
 }

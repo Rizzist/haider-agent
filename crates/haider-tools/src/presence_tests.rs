@@ -538,3 +538,71 @@ fn a_named_subagent_raises_the_activity_badge_for_each_surface() {
         "Ammar is using this browser"
     );
 }
+
+#[test]
+fn a_different_actor_on_a_shown_surface_relabels_the_badge() {
+    // F3: A raises the badge; B then acts on the same shown screen within
+    // the idle window — the badge must name B, and the main thread's action
+    // restores the generic badge. Repeat actions by the same actor re-show
+    // nothing.
+    let mut machine = PresenceMachine::<String>::default();
+    let now = Instant::now();
+    let actor = |name: &str| {
+        Some(PresenceActor {
+            name: name.into(),
+            emoji: false,
+        })
+    };
+    let show = |commands: &[PresenceCommand]| {
+        commands.iter().find_map(|command| match command {
+            PresenceCommand::Show { label, .. } => Some(label.clone()),
+            _ => None,
+        })
+    };
+    let (_, first) = machine
+        .begin_action_as(
+            key("a"),
+            PresenceSurface::Screen,
+            PresenceMark::Observe,
+            None,
+            now,
+            actor("Amina"),
+        )
+        .expect("not stopped");
+    assert_eq!(show(&first).as_deref(), Some("Amina is using your screen"));
+    let (_, again) = machine
+        .begin_action_as(
+            key("a"),
+            PresenceSurface::Screen,
+            PresenceMark::Click,
+            None,
+            now,
+            None,
+        )
+        .expect("not stopped");
+    assert_eq!(show(&again), None, "same actor: no re-show");
+    let (_, other) = machine
+        .begin_action_as(
+            key("b"),
+            PresenceSurface::Screen,
+            PresenceMark::Click,
+            None,
+            now,
+            actor("Bilal"),
+        )
+        .expect("not stopped");
+    assert_eq!(show(&other).as_deref(), Some("Bilal is using your screen"));
+    let (_, main) = machine
+        .begin_action(
+            key("main"),
+            PresenceSurface::Screen,
+            PresenceMark::Click,
+            None,
+            now,
+        )
+        .expect("not stopped");
+    assert_eq!(
+        show(&main).as_deref(),
+        Some("Haider is controlling this screen")
+    );
+}

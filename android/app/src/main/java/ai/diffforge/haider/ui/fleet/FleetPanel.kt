@@ -4,6 +4,13 @@ import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.components.ForgeIconButton
 import ai.diffforge.haider.ui.components.StateDot
 import ai.diffforge.haider.ui.daemon.FleetCompleteness
+import ai.diffforge.haider.ui.daemon.FleetActivity
+import android.os.SystemClock
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import ai.diffforge.haider.ui.daemon.FleetLoad
 import ai.diffforge.haider.ui.daemon.FleetModel
 import ai.diffforge.haider.ui.daemon.FleetNode
@@ -66,6 +73,8 @@ data class FleetEntry(
     val parentSessionId: String,
     val parentTitle: String?,
     val node: FleetNode,
+    /** The snapshot's daemon-clock instant (activity decay reference). */
+    val generatedAtMs: Long? = null,
 )
 
 /** Pure selection over the panel's reads, so the list itself can be pinned. */
@@ -89,7 +98,7 @@ object FleetPanelModel {
         .flatMap { (sessionId, snapshot) ->
             FleetModel.flatten(snapshot.roots)
                 .filter { it.state.active }
-                .map { FleetEntry(sessionId, titles[sessionId], it) }
+                .map { FleetEntry(sessionId, titles[sessionId], it, snapshot.generatedAtMs) }
         }
 
     fun finished(panel: Map<String, FleetLoad>): Int = panel.values
@@ -176,6 +185,30 @@ fun FleetPanelContent(
     val folded = remember(panel) { FleetPanelModel.folded(panel) }
     val bounded = remember(panel) { FleetPanelModel.bounded(panel) }
     val refused = remember(panel) { FleetPanelModel.unavailable(panel) }
+    // 973-activity-icons: map the phone's clock onto the daemon's via the
+    // snapshot instant, and recompose only at the next instant an icon can
+    // change (hot-window / linger boundary) — no polling loop.
+    val receivedAt = remember(panel) { SystemClock.elapsedRealtime() }
+    var tick by remember { mutableLongStateOf(0L) }
+    val daemonNow: (FleetEntry) -> Long? = { entry ->
+        entry.generatedAtMs?.let { it + (SystemClock.elapsedRealtime() - receivedAt) }
+    }
+    val nextChange = entries.mapNotNull { entry ->
+        val now = daemonNow(entry) ?: return@mapNotNull null
+        entry.node.metrics?.activity?.nextChangeAt(now)?.let { it - now }
+    }.minOrNull()
+    LaunchedEffect(panel, tick, nextChange) {
+        if (nextChange != null) {
+            delay(nextChange.coerceAtLeast(1L))
+            tick++
+        }
+    }
+    val iconsOn = ActivityIconPreference.current()
+    // Re-evaluated on every recomposition `tick` triggers.
+    val activities: Map<String, FleetActivity?> = entries.associate { entry ->
+        "${entry.parentSessionId}:${entry.node.agentId}" to
+            if (iconsOn && tick >= 0L) entry.node.activityAt(daemonNow(entry)) else null
+    }
 
     Column(
         modifier = modifier
@@ -220,6 +253,7 @@ fun FleetPanelContent(
                 items(entries, key = { "${it.parentSessionId}:${it.node.agentId}" }) { entry ->
                     FleetEntryRow(
                         entry = entry,
+                        activity = activities["${entry.parentSessionId}:${entry.node.agentId}"],
                         onJump = onJump,
                         onOpenChild = onOpenChild,
                     )
@@ -254,6 +288,7 @@ fun FleetPanelContent(
 @Composable
 private fun FleetEntryRow(
     entry: FleetEntry,
+    activity: FleetActivity?,
     onJump: (String) -> Unit,
     onOpenChild: (String, String, String) -> Unit,
 ) {
@@ -264,14 +299,18 @@ private fun FleetEntryRow(
     val stateWord = FleetTone.label(node.state)
     val parent = entry.parentTitle ?: entry.parentSessionId
     val jumpable = node.sessionId.isNotEmpty()
-    val activity = node.currentActivity
-    val spoken = stringResource(
+    val base = stringResource(
         R.string.cd_fleet_jump,
         label.text,
         node.task,
         stateWord,
         parent,
-    ).let { base -> if (activity == null) base else "$base, ${activity.description}" }
+    )
+    val spoken = if (activity == null) {
+        base
+    } else {
+        stringResource(R.string.cd_fleet_activity, base, stringResource(activity.description))
+    }
     Row(
         modifier = Modifier.fillMaxWidth().heightIn(min = ForgeSize.touch),
         verticalAlignment = Alignment.CenterVertically,
