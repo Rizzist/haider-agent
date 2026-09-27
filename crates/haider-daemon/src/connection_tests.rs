@@ -2673,6 +2673,35 @@ fn gate_f2_legacy_event_frame_strips_metrics_activity() {
                 }
             };
             assert_eq!(actual, bytes, "sink preserves pre-lane bytes");
+            if let WireFrame::Event {
+                attachment_id,
+                session_id,
+                envelope,
+            } = &frame
+            {
+                let prepared = sink
+                    .prepare_event(attachment_id, session_id, envelope)
+                    .expect("attachment Event encodes");
+                let encoded = prepared.encoded_bytes().expect("prepared bytes");
+                let actual = match encoded {
+                    OutboundBytes::Contiguous(bytes) => bytes.as_slice().to_vec(),
+                    OutboundBytes::Framed(frame) => {
+                        let mut bytes = Vec::new();
+                        bytes.extend_from_slice(frame.prefix());
+                        bytes.extend_from_slice(frame.body());
+                        bytes
+                    }
+                    OutboundBytes::Event(frame) => {
+                        let mut bytes = Vec::new();
+                        frame.write_to(&mut bytes).expect("writes event");
+                        bytes
+                    }
+                };
+                assert_eq!(
+                    actual, bytes,
+                    "prepared attach/replay Event is legacy identical"
+                );
+            }
         }
     }
 }

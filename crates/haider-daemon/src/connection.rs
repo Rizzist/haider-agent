@@ -1209,6 +1209,14 @@ impl FrameSink for ConnectionFrameSink {
         session_id: &haider_protocol::ids::SessionId,
         envelope: &haider_protocol::envelope::RawEnvelope,
     ) -> Result<PreparedFrame, FrameSendError> {
+        let mut legacy_envelope;
+        let envelope = if self.fleet_identity {
+            envelope
+        } else {
+            legacy_envelope = envelope.clone();
+            omit_event_activity(&mut legacy_envelope);
+            &legacy_envelope
+        };
         uds_codec::encode_event_zeroizing_parts_with(
             attachment_id,
             session_id,
