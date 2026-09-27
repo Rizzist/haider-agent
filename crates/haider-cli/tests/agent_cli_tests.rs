@@ -2339,3 +2339,379 @@ fn ephemeral_daemon_outlives_linger_while_detached_children_run() {
     assert_eq!(delivered["data"]["summary"], "C_DONE");
     profile.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Repair 5 (Astra 13-final B1-B3).
+
+impl Profile {
+    /// Every run head of a session, terminal or not.
+    fn all_runs(&self, session: &str) -> Vec<(String, String)> {
+        let connection = self.db();
+        let mut statement = connection
+            .prepare("SELECT run_id, state_json FROM run_heads WHERE session_id = ?1")
+            .expect("run head query");
+        statement
+            .query_map([session], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("run heads")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode run heads")
+    }
+}
+
+fn find_kind<'a>(value: &'a Value, kind: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            if map.get("kind").and_then(Value::as_str) == Some(kind) {
+                return Some(value);
+            }
+            map.values().find_map(|child| find_kind(child, kind))
+        }
+        Value::Array(items) => items.iter().find_map(|child| find_kind(child, kind)),
+        _ => None,
+    }
+}
+
+/// B2: a blocking spawn whose `wait_ms` observation ends returns
+/// `child_still_running` with an `agent wait` command. After BOTH the parent
+/// turn and the child finish, that exact command must collect the child's
+/// real report (repeatedly), from the parent's durable child result.
+///
+/// MUTATION CHECK: drop `detach_observed_child` from the worker's
+/// `detach_deferred`. Expected runtime failure: the returned command exits
+/// 124 because no parent child result is ever written.
+#[test]
+fn wait_ms_child_is_collected_by_the_returned_command_after_parent_and_child_finish() {
+    let mut spawn = spawn_step("spawn-c", "observed c", "fake-c", false);
+    spawn["args"]["wait_ms"] = json!(100);
+    let root = json!([
+        spawn,
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"spawn-c"},
+        {"step":"emit_text","text":"parent finished observing"},
+        {"step":"finish","reason":"end_turn"}
+    ]);
+    let profile = Profile::new(json!({"by_model": {
+        "fake-model": root,
+        "fake-c": [
+            {"step":"delay","ms":6000},
+            {"step":"emit_text","text":"WAIT_MS_CHILD_DONE"},
+            {"step":"finish","reason":"end_turn"}
+        ],
+    }}));
+    profile.seed_models(&["fake-model", "fake-c"]);
+    let (run_id, session) = profile.finish_run("fake-model", "observe c briefly");
+    assert_eq!(
+        profile.run_state(&session, &run_id).as_deref(),
+        Some("done"),
+        "the parent finished normally after the observation window"
+    );
+    let c = profile.row(1);
+    assert_eq!(c.terminal, Some(0), "the child outlives its parent turn");
+    let still_running = profile
+        .journal(&session)
+        .iter()
+        .find_map(|event| find_kind(event, "child_still_running").cloned())
+        .expect("child_still_running tool result");
+    let collect = still_running["collect"]
+        .as_str()
+        .expect("collection command")
+        .to_owned();
+    let words = collect.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(
+        &words[..3],
+        &["haider", "agent", "wait"],
+        "collection command: {collect}"
+    );
+    assert!(words.contains(&c.agent.as_str()), "{collect}");
+    wait_for("child done", STOP_OBSERVATION, || {
+        profile.row(1).state.as_deref() == Some("done")
+    });
+    for attempt in 0..2 {
+        let waited = profile.json(&words[1..], "haider.agent.wait.v1", 0);
+        assert_eq!(
+            waited["result"]["report"]["summary"], "WAIT_MS_CHILD_DONE",
+            "attempt {attempt}: {waited}"
+        );
+        assert_eq!(
+            waited["result"]["report_source"], "child_result",
+            "attempt {attempt}: {waited}"
+        );
+    }
+    let delivered = profile
+        .journal_kinds(&session)
+        .into_iter()
+        .filter(|item| item["kind"] == "detached_child_result_v1")
+        .collect::<Vec<_>>();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert_eq!(delivered[0]["data"]["reason"], "observation_ended");
+    assert_eq!(delivered[0]["data"]["summary"], "WAIT_MS_CHILD_DONE");
+    profile.stop();
+}
+
+/// B3: the durable delivery obligation is not the 16-entry display list.
+/// Sixteen background children fill the marker; the seventeenth, waited-on
+/// child is owed its result. After `--stop-main` and a graceful daemon
+/// stop (which cancels it), a restart must still deliver its cancelled
+/// result, so `agent wait` resolves 130 instead of timing out.
+///
+/// MUTATION CHECK: make recovery read owed agents from the marker again, or
+/// stop journalling `detached_delivery_v1`. Expected runtime failure: the
+/// waits exit 124.
+#[test]
+fn owed_result_beyond_the_display_list_is_delivered_after_restart() {
+    const BACKGROUND: usize = 16;
+    let mut root = Vec::new();
+    let mut models = vec!["fake-model".to_owned()];
+    let mut by_model = serde_json::Map::new();
+    for index in 0..BACKGROUND {
+        let model = format!("fake-b{index}");
+        let call = format!("spawn-b{index}");
+        root.push(spawn_step(
+            &call,
+            &format!("background {index}"),
+            &model,
+            true,
+        ));
+        root.push(json!({"step":"finish","reason":"tool_use"}));
+        root.push(json!({"step":"expect_tool_result","call_id":call}));
+        by_model.insert(model.clone(), json!([{"step":"hang"}]));
+        models.push(model);
+    }
+    root.push(spawn_step("spawn-c", "owed seventeenth", "fake-c", false));
+    root.extend(steps_after_call("spawn-c", "UNEXPECTED_PARENT_WORK"));
+    by_model.insert("fake-c".into(), json!([{"step":"hang"}]));
+    models.push("fake-c".into());
+    by_model.insert("fake-model".into(), Value::Array(root));
+    let profile = Profile::new(json!({ "by_model": by_model }));
+    profile.seed_models(&models.iter().map(String::as_str).collect::<Vec<_>>());
+    let (run_id, session) = profile.start_run("fake-model", "sixteen then foreground");
+    wait_for("seventeen children", Duration::from_secs(90), || {
+        profile.delegations().len() == BACKGROUND + 1
+    });
+    let c_agent: String = profile
+        .db()
+        .query_row(
+            "SELECT agent_id FROM delegations WHERE task = 'owed seventeenth'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("owed child");
+    let c = profile
+        .delegations()
+        .into_iter()
+        .find(|row| row.agent == c_agent)
+        .expect("owed child row");
+    wait_for("c live", STOP_OBSERVATION, || {
+        !profile.live_runs(&c.child_session).is_empty()
+    });
+    let stopped = profile.stop_run("--stop-main", &run_id);
+    assert_eq!(
+        stopped["result"]["subagents"]["still_running"],
+        json!(BACKGROUND + 1),
+        "{stopped}"
+    );
+    wait_for("owed fact", STOP_OBSERVATION, || {
+        profile.journal_kinds(&session).iter().any(|item| {
+            item["kind"] == "detached_delivery_v1"
+                && item["data"]["agent"] == c_agent.as_str()
+                && item["data"]["phase"] == "owed"
+        })
+    });
+    let marker = profile
+        .journal_kinds(&session)
+        .into_iter()
+        .find(|item| item["kind"] == "subagents_still_running_v1")
+        .expect("display marker");
+    assert_eq!(marker["data"]["agents_truncated"], true, "{marker}");
+    // Graceful stop cancels every live run, including the owed child.
+    profile.stop();
+    assert_eq!(
+        profile
+            .delegations()
+            .into_iter()
+            .find(|row| row.agent == c_agent)
+            .and_then(|row| row.state)
+            .as_deref(),
+        Some("cancelled")
+    );
+    for attempt in 0..2 {
+        let waited = profile.json(
+            &[
+                "agent",
+                "wait",
+                &session,
+                &c_agent,
+                "--json",
+                "--timeout",
+                "60s",
+            ],
+            "haider.agent.wait.v1",
+            130,
+        );
+        assert_eq!(
+            waited["result"]["state"], "cancelled",
+            "attempt {attempt}: {waited}"
+        );
+    }
+    let delivered = profile
+        .journal_kinds(&session)
+        .into_iter()
+        .filter(|item| {
+            item["kind"] == "detached_child_result_v1" && item["data"]["agent"] == c_agent.as_str()
+        })
+        .count();
+    assert_eq!(delivered, 1);
+    profile.stop();
+}
+
+/// B1: a subagent that registers a monitor WHILE it is being stopped must
+/// not keep it: the stop fences registration (and wakes) for the stopped
+/// session until its runs settled and a final drain ran. Covered for named
+/// cancel, `agent cancel --all`, `run --stop` and `run --stop-subagents`.
+///
+/// MUTATION CHECK: remove the `registration_fenced` check from the monitor
+/// tool. Expected runtime failure: a late timer survives the stop and wakes
+/// the stopped child into `monitor-run-*` runs.
+#[test]
+fn stop_refuses_monitors_registered_during_the_stop_for_every_scope() {
+    for scope in ["named", "all", "run", "subagents"] {
+        monitor_registration_race(scope);
+    }
+}
+
+fn monitor_registration_race(scope: &str) {
+    const MONITORS: usize = 25;
+    let timer = |call_id: &str, interval_ms: u64| {
+        json!({"step":"emit_tool_call","call_id":call_id,"name":"monitor","args":{
+            "operation":"register","source":{"kind":"timer","interval_ms":interval_ms},
+            "action":{"report":true},"occurrence":"every"}})
+    };
+    let discover = |tool: &str| json!({"step":"emit_tool_call","call_id":format!("discover-{tool}"),"name":"list_tools","args":{"filter":tool}});
+    // The child's gate paths live in the fixture workspace, so the script
+    // is installed before the first command starts the daemon.
+    let mut profile = Profile::new(json!({}));
+    let ready = profile.workspace.join("ready");
+    let release = profile.workspace.join("release");
+    let mut child = vec![
+        discover("monitor"),
+        json!({"step":"finish","reason":"tool_use"}),
+        json!({"step":"expect_tool_result","call_id":"discover-monitor"}),
+        discover("process_exec"),
+        json!({"step":"finish","reason":"tool_use"}),
+        json!({"step":"expect_tool_result","call_id":"discover-process_exec"}),
+    ];
+    for index in 0..MONITORS {
+        let call = format!("timer-{index}");
+        child.push(timer(&call, 3_600_000));
+        child.push(json!({"step":"finish","reason":"tool_use"}));
+        child.push(json!({"step":"expect_tool_result","call_id":call}));
+    }
+    let gate = format!(
+        "touch '{}'; while [ ! -e '{}' ]; do sleep 0.001; done",
+        ready.display(),
+        release.display()
+    );
+    child.extend([
+        json!({"step":"emit_tool_call","call_id":"gate","name":"process_exec","args":{"command":gate}}),
+        json!({"step":"finish","reason":"tool_use"}),
+        json!({"step":"expect_tool_result","call_id":"gate"}),
+        timer("late-timer", 2_000),
+        json!({"step":"finish","reason":"tool_use"}),
+        json!({"step":"expect_tool_result","call_id":"late-timer"}),
+        json!({"step":"hang"}),
+    ]);
+    profile.script = json!({"by_model": {
+        "fake-model": [
+            spawn_step("spawn-c", "monitor child", "fake-c", true),
+            {"step":"finish","reason":"tool_use"},
+            {"step":"expect_tool_result","call_id":"spawn-c"},
+            {"step":"emit_text","text":"root done"},
+            {"step":"finish","reason":"end_turn"}
+        ],
+        "fake-c": child,
+    }})
+    .to_string();
+    profile.seed_models(&["fake-model", "fake-c"]);
+    let output = profile.run(&[
+        "run",
+        "--auto-allow",
+        "--provider",
+        "fake",
+        "--model",
+        "fake-model",
+        "--json",
+        "-p",
+        "monitor stop race",
+    ]);
+    assert!(
+        output.status.success(),
+        "{scope}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("run JSON");
+    let (run_id, session) = (
+        field(&body, "run_id").to_owned(),
+        field(&body, "session_id").to_owned(),
+    );
+    wait_for("child at its gate", Duration::from_secs(90), || {
+        ready.exists()
+    });
+    let c = profile.row(1);
+    assert_eq!(profile.monitor_count(&c.child_session), MONITORS, "{scope}");
+    let args: Vec<&str> = match scope {
+        "named" => vec![
+            "agent",
+            "cancel",
+            &session,
+            &c.agent,
+            "--json",
+            "--no-spawn",
+        ],
+        "all" => vec!["agent", "cancel", &session, "--all", "--json", "--no-spawn"],
+        "run" => vec!["run", "--stop", &run_id, "--json"],
+        _ => vec!["run", "--stop-subagents", &run_id, "--json"],
+    };
+    let stop = profile
+        .command(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("stop command");
+    // Release the child right after the stop's first monitor removal, while
+    // its remaining removals and the cancel are still ahead.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && profile.monitor_count(&c.child_session) >= MONITORS {
+        thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::write(&release, b"go").expect("release the gate");
+    let stopped = stop.wait_with_output().expect("stop completes");
+    assert!(
+        stopped.status.success(),
+        "{scope}: {}\n{}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    wait_for("child cancelled", STOP_OBSERVATION, || {
+        profile.live_runs(&c.child_session).is_empty()
+    });
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        profile.monitor_count(&c.child_session),
+        0,
+        "{scope}: no monitor survives the stop"
+    );
+    // A surviving 2 s timer would wake the child into new runs by now.
+    thread::sleep(Duration::from_secs(5));
+    assert_eq!(profile.monitor_count(&c.child_session), 0, "{scope}");
+    let runs = profile.all_runs(&c.child_session);
+    assert_eq!(
+        runs.len(),
+        1,
+        "{scope}: no monitor woke the stopped child: {runs:?}"
+    );
+    assert!(
+        runs[0].1.contains("cancelled"),
+        "{scope}: the child was stopped: {runs:?}"
+    );
+    profile.stop();
+}

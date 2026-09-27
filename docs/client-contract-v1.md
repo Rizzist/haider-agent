@@ -2921,7 +2921,12 @@ Subagent stop semantics (owner decision 2026-09-25):
   `detached_child_result_v1` note that never starts provider work), with the
   ordinary `child_result` item so `agent wait` resolves. The stop journals a
   `subagents_still_running_v1` marker ("main thread stopped — N subagents
-  still running") whenever subagents live on.
+  still running") whenever subagents live on. That marker's agent list is
+  bounded for display; each owed result is also a durable
+  `detached_delivery_v1` obligation that startup recovery honours for every
+  owed child. A blocking spawn whose `wait_ms` observation ended is owed its
+  child's result the same way, so its returned `haider agent wait` command
+  collects the result after both parent and child finished.
 - `headless.run.stop` with the default scope `all` (`haider run --stop`)
   stops the run and every subagent in its tree, however deep. The tree is
   walked by session, so children started by a subagent's later runs (a
@@ -2933,6 +2938,12 @@ Subagent stop semantics (owner decision 2026-09-25):
   `monitors_removed` and `still_running`.
 - `agent.cancel` stops the named subagent only: its original run, any later
   live run and its own monitors. Its children keep running.
+- Every stop fences the stopped subagents' monitor registration and wakes
+  until their runs settled and a final monitor drain ran, so a monitor
+  registered during the stop cannot restart stopped work. `agent.cancel` and
+  `agent.cancel_all` validate `worker_generation` and the command identity
+  before any removal or cancel (a stale or conflicting request changes
+  nothing); committed commands replay their responses.
   `agent.cancel_all` (`haider agent cancel <session> --all`) is the explicit
   whole-tree stop for a session. It deliberately leaves the session's own
   (main) runs alone; a main run that is still going may spawn new subagents

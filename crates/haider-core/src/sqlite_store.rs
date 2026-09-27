@@ -38,8 +38,8 @@ use haider_store::{
     SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRecencyKey, SessionRecencyRow,
     SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
     SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome, TypedAgentInstallCas,
+    ShellExecAcceptOutcome, Store, SubagentStopClaim, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -2342,6 +2342,65 @@ impl SqliteStoreHandle {
                     &command_id,
                     &session_id,
                     accepted_seq,
+                    &response,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn subagent_stop_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<serde_json::Value>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.subagent_stop_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn claim_subagent_stop_receipt(
+        &self,
+        command_id: String,
+        worker_generation: u64,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<SubagentStopClaim, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.claim_subagent_stop_receipt(
+                    &command_id,
+                    worker_generation,
+                    &request_digest,
+                    &request_json,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_subagent_stop_receipt(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+        request_digest: String,
+        request_json: String,
+        response: serde_json::Value,
+    ) -> Result<serde_json::Value, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_subagent_stop_receipt(
+                    &command_id,
+                    &session_id,
+                    &request_digest,
+                    &request_json,
                     &response,
                 )
             })

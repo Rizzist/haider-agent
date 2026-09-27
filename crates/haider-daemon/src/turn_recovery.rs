@@ -117,7 +117,10 @@ const CHECKPOINT_SHAPE_VERSION: u32 = 1;
 // ordinal 1 before the first model request.
 // v9 retains direct operator delegation pins, which must never resume a
 // parent provider request after a restart.
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v9";
+// v10 reduces durable detached-delivery obligations (per-child facts and
+// `child_still_running` observation results), so an older checkpoint that
+// dropped such a terminal run is rescanned.
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v10";
 
 pub(crate) enum RecoveredWork {
     Queued(RecoveredQueued),
@@ -135,8 +138,12 @@ pub(crate) enum RecoveredWork {
 }
 
 pub(crate) struct RecoveredDetachedChildren {
-    /// The marker's owed (`result_pending`) agents not yet delivered.
-    pub(crate) agents: Vec<haider_protocol::ids::AgentId>,
+    /// Every owed agent not yet delivered or settled, with why its result
+    /// is delivered detached. Never bounded by the display marker.
+    pub(crate) agents: Vec<(
+        haider_protocol::ids::AgentId,
+        haider_protocol::subagent_stop::DetachedReasonV1,
+    )>,
 }
 
 pub(crate) struct RecoveredQueued {
@@ -246,6 +253,14 @@ struct RunReduction {
     /// until every delivery fact is journalled.
     #[serde(default)]
     detached_pending: std::collections::BTreeSet<String>,
+    /// The subset of `detached_pending` owed because a `wait_ms`
+    /// observation ended (not a main-thread stop).
+    #[serde(default)]
+    detached_observed: std::collections::BTreeSet<String>,
+    /// Agents whose detached delivery was journalled or settled; an owed
+    /// fact is pending only without one of these, in any order.
+    #[serde(default)]
+    detached_done: std::collections::BTreeSet<String>,
     route_replay_epoch: u64,
     #[serde(default)]
     route_replay_events: Vec<StreamEvent>,
@@ -502,6 +517,28 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                     false,
                 ));
             }
+            // Owed detached deliveries do not depend on the run's own state
+            // being in this scan: an obligation journalled after the run
+            // went terminal (and after a checkpoint dropped it) still
+            // re-arms (Astra 13-final B3).
+            if !reduction.detached_pending.is_empty() {
+                recovered.push(RecoveredWork::DetachedChildren(RecoveredDetachedChildren {
+                    agents: reduction
+                        .detached_pending
+                        .iter()
+                        .map(|agent| {
+                            (
+                                haider_protocol::ids::AgentId::new(agent),
+                                if reduction.detached_observed.contains(agent) {
+                                    haider_protocol::subagent_stop::DetachedReasonV1::ObservationEnded
+                                } else {
+                                    haider_protocol::subagent_stop::DetachedReasonV1::MainStopped
+                                },
+                            )
+                        })
+                        .collect(),
+                }));
+            }
             let Some((state, _)) = reduction.state.clone() else {
                 continue;
             };
@@ -556,15 +593,6 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                         handoff: handoff.clone(),
                     },
                 )));
-            }
-            if !reduction.detached_pending.is_empty() {
-                recovered.push(RecoveredWork::DetachedChildren(RecoveredDetachedChildren {
-                    agents: reduction
-                        .detached_pending
-                        .iter()
-                        .map(haider_protocol::ids::AgentId::new)
-                        .collect(),
-                }));
             }
             if state.is_terminal() {
                 continue;
@@ -1520,16 +1548,12 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 Ok(None) => {}
                 Err(_) => reduction.provider_request_attempt_corrupt = true,
             }
-            if let Some(marker) =
-                haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(&item)
+            // The still-running marker is a bounded DISPLAY list; delivery
+            // obligations are the per-child `detached_delivery_v1` facts
+            // (Astra 13-final B3).
+            if haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(&item)
+                .is_some()
             {
-                reduction.detached_pending.extend(
-                    marker
-                        .agents
-                        .iter()
-                        .filter(|agent| agent.result_pending)
-                        .map(|agent| agent.agent.as_str().to_owned()),
-                );
                 reduction.open_items.remove(&item_id);
                 return;
             }
@@ -1537,6 +1561,34 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 haider_protocol::subagent_stop::DetachedChildResultV1::from_extension_item(&item)
             {
                 reduction.detached_pending.remove(delivered.agent.as_str());
+                reduction.detached_observed.remove(delivered.agent.as_str());
+                reduction
+                    .detached_done
+                    .insert(delivered.agent.as_str().to_owned());
+                reduction.open_items.remove(&item_id);
+                return;
+            }
+            if let Some(delivery) =
+                haider_protocol::subagent_stop::DetachedDeliveryV1::from_extension_item(&item)
+            {
+                let agent = delivery.agent.as_str().to_owned();
+                match delivery.phase {
+                    haider_protocol::subagent_stop::DetachedDeliveryPhaseV1::Owed => {
+                        if !reduction.detached_done.contains(&agent) {
+                            if delivery.reason
+                                == haider_protocol::subagent_stop::DetachedReasonV1::ObservationEnded
+                            {
+                                reduction.detached_observed.insert(agent.clone());
+                            }
+                            reduction.detached_pending.insert(agent);
+                        }
+                    }
+                    haider_protocol::subagent_stop::DetachedDeliveryPhaseV1::Settled => {
+                        reduction.detached_pending.remove(&agent);
+                        reduction.detached_observed.remove(&agent);
+                        reduction.detached_done.insert(agent);
+                    }
+                }
                 reduction.open_items.remove(&item_id);
                 return;
             }
@@ -1637,6 +1689,18 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             reduction.menu = None;
         }
         EventPayload::ToolResult { call_id, result } => {
+            // A `wait_ms` observation that ended before the child did is
+            // itself the durable detach: the parent is owed the child's
+            // terminal result (Astra 13-final B2).
+            if let Some(haider_protocol::tool::ToolResultData::ChildStillRunning { agent, .. }) =
+                &result.data
+                && !reduction.detached_done.contains(agent.as_str())
+            {
+                reduction
+                    .detached_observed
+                    .insert(agent.as_str().to_owned());
+                reduction.detached_pending.insert(agent.as_str().to_owned());
+            }
             reduction.tool_results.insert(call_id.clone());
             reduction.tool_result_values.insert(call_id, result);
         }
@@ -2436,7 +2500,7 @@ mod composite_recovery_tests {
             serde_json::from_value(serde_json::to_value(reduction).expect("encode"))
                 .expect("decode");
         assert!(restored.direct_agent_spawn);
-        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v9");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v10");
     }
 
     #[test]
@@ -2652,7 +2716,7 @@ mod composite_recovery_tests {
         let encoded = rmp_serde::to_vec(&reduction).expect("encode composite checkpoint");
         let recovered: RunReduction =
             rmp_serde::from_slice(&encoded).expect("decode composite checkpoint");
-        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v9");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v10");
         assert_eq!(
             recovered
                 .workflow_deferral

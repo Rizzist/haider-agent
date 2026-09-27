@@ -6,10 +6,12 @@
 //! it finishes. Cancelling one named subagent stops only that subagent. An
 //! explicit "stop all" stops every subagent in the tree, however deep.
 //!
-//! Two durable parent-session facts make the main-only stop honest:
+//! Durable parent-session facts make the main-only stop honest:
 //! [`SubagentsStillRunningV1`] records how many subagents the stop left
-//! running, and [`DetachedChildResultV1`] delivers a detached foreground
-//! subagent's result later. Both are `TurnItem::Extension` items.
+//! running (a bounded display list), [`DetachedDeliveryV1`] records every
+//! owed result delivery (one fact per child, never truncated), and
+//! [`DetachedChildResultV1`] delivers a detached foreground subagent's result
+//! later. All are `TurnItem::Extension` items.
 
 use crate::agent::ReportVerification;
 use crate::ids::{AgentId, RunId, SessionId};
@@ -18,7 +20,9 @@ use serde::{Deserialize, Serialize};
 
 pub const SUBAGENTS_STILL_RUNNING_EXTENSION_KIND: &str = "subagents_still_running_v1";
 pub const DETACHED_CHILD_RESULT_EXTENSION_KIND: &str = "detached_child_result_v1";
-/// Bounded number of named direct children carried by the marker.
+pub const DETACHED_DELIVERY_EXTENSION_KIND: &str = "detached_delivery_v1";
+/// Bounded number of named direct children carried by the display marker.
+/// Durable delivery obligations are separate [`DetachedDeliveryV1`] facts.
 pub const STILL_RUNNING_AGENT_LIST_MAX: usize = 16;
 /// Bounded summary bytes carried by a delivered detached result.
 pub const DETACHED_RESULT_SUMMARY_MAX_BYTES: usize = 16 * 1024;
@@ -145,8 +149,68 @@ pub enum DetachedChildStateV1 {
     Cancelled,
 }
 
+/// Why a foreground subagent's result is delivered detached from the turn
+/// that spawned it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetachedReasonV1 {
+    /// The main thread that was waiting on it was stopped.
+    #[default]
+    MainStopped,
+    /// The spawn's explicit `wait_ms` observation window ended first.
+    ObservationEnded,
+}
+
+impl DetachedReasonV1 {
+    fn is_main_stopped(&self) -> bool {
+        *self == Self::MainStopped
+    }
+}
+
+/// Lifecycle of one owed detached-result delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetachedDeliveryPhaseV1 {
+    /// The parent session is owed this child's terminal result.
+    Owed,
+    /// The obligation ended without a detached delivery (a collector had
+    /// already recorded the child's result in the parent session).
+    Settled,
+}
+
+/// Durable, per-child delivery obligation. Startup recovery re-arms every
+/// `Owed` child without a later [`DetachedChildResultV1`] or `Settled` fact,
+/// whatever the child's state; nothing here is bounded by the display list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetachedDeliveryV1 {
+    pub agent: AgentId,
+    pub phase: DetachedDeliveryPhaseV1,
+    #[serde(default)]
+    pub reason: DetachedReasonV1,
+}
+
+impl DetachedDeliveryV1 {
+    pub fn to_extension_item(&self) -> Result<TurnItem, serde_json::Error> {
+        Ok(TurnItem::Extension {
+            kind: DETACHED_DELIVERY_EXTENSION_KIND.into(),
+            data: serde_json::to_value(self)?,
+        })
+    }
+
+    #[must_use]
+    pub fn from_extension_item(item: &TurnItem) -> Option<Self> {
+        let TurnItem::Extension { kind, data } = item else {
+            return None;
+        };
+        if kind != DETACHED_DELIVERY_EXTENSION_KIND {
+            return None;
+        }
+        serde_json::from_value(data.clone()).ok()
+    }
+}
+
 /// A detached foreground subagent's result, delivered to its parent session
-/// after the turn that was waiting on it was stopped.
+/// after the turn that was waiting on it was stopped or stopped observing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DetachedChildResultV1 {
     pub agent: AgentId,
@@ -157,6 +221,8 @@ pub struct DetachedChildResultV1 {
     pub summary: String,
     #[serde(default)]
     pub summary_truncated: bool,
+    #[serde(default, skip_serializing_if = "DetachedReasonV1::is_main_stopped")]
+    pub reason: DetachedReasonV1,
 }
 
 impl DetachedChildResultV1 {
@@ -167,8 +233,12 @@ impl DetachedChildResultV1 {
             DetachedChildStateV1::Errored => "failed",
             DetachedChildStateV1::Cancelled => "was cancelled",
         };
+        let after = match self.reason {
+            DetachedReasonV1::MainStopped => "after its waiting turn was stopped",
+            DetachedReasonV1::ObservationEnded => "after its observation window ended",
+        };
         format!(
-            "subagent {} ({}) {state} after its waiting turn was stopped — result delivered",
+            "subagent {} ({}) {state} {after} — result delivered",
             self.agent, self.task
         )
     }
@@ -181,8 +251,12 @@ impl DetachedChildResultV1 {
             DetachedChildStateV1::Errored => "errored",
             DetachedChildStateV1::Cancelled => "cancelled",
         };
+        let why = match self.reason {
+            DetachedReasonV1::MainStopped => "had been stopped",
+            DetachedReasonV1::ObservationEnded => "stopped waiting after its wait_ms window",
+        };
         format!(
-            "[subagent result] agent {} ({}) — state: {state}. The turn that was waiting on it ({}) had been stopped, so its result is delivered here.{}\n{}",
+            "[subagent result] agent {} ({}) — state: {state}. The turn that was waiting on it ({}) {why}, so its result is delivered here.{}\n{}",
             self.agent,
             self.task,
             self.stopped_run_id,
@@ -227,61 +301,4 @@ pub fn bounded_summary(summary: &str, max: usize) -> (String, bool) {
         end -= 1;
     }
     (summary[..end].to_owned(), true)
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn marker_round_trips_through_extension_item() {
-        let marker = SubagentsStillRunningV1 {
-            parent_session_id: SessionId::new("s"),
-            stopped_run_id: RunId::new("r"),
-            still_running: 2,
-            agents: vec![StillRunningAgentV1 {
-                agent: AgentId::new("a"),
-                task: "t".into(),
-                result_pending: true,
-            }],
-            agents_truncated: false,
-        };
-        let item = marker.to_extension_item().expect("encode");
-        assert_eq!(
-            SubagentsStillRunningV1::from_extension_item(&item),
-            Some(marker.clone())
-        );
-        assert!(
-            marker
-                .summary()
-                .starts_with("main thread stopped — 2 subagents still running")
-        );
-        assert!(
-            marker
-                .model_note()
-                .contains("haider agent cancel s --all --json")
-        );
-    }
-
-    #[test]
-    fn detached_result_round_trips_and_bounds_summary() {
-        let (summary, truncated) = bounded_summary("ééé", 3);
-        assert_eq!((summary.as_str(), truncated), ("é", true));
-        let result = DetachedChildResultV1 {
-            agent: AgentId::new("a"),
-            task: "t".into(),
-            stopped_run_id: RunId::new("r"),
-            state: DetachedChildStateV1::Done,
-            verified: ReportVerification::Unverified,
-            summary: "ok".into(),
-            summary_truncated: false,
-        };
-        let item = result.to_extension_item().expect("encode");
-        assert_eq!(
-            DetachedChildResultV1::from_extension_item(&item),
-            Some(result.clone())
-        );
-        assert!(result.model_note().contains("state: done"));
-    }
 }

@@ -56,7 +56,18 @@ changes are additive; `schema_version` remains 1.
     `summary_truncated`. It is accompanied by the ordinary `agent_report`,
     `agent_chip_state` and `child_result` item. It is steered into an active
     parent run when one exists (the extension then has prompt=omit); otherwise
-    it is a prompt-visible note. Delivery never starts provider work.
+    it is a prompt-visible note. Delivery never starts provider work. Optional
+    `reason` (`observation_ended`) marks a result delivered because a
+    `wait_ms` observation ended before the child; it is omitted for the
+    default `main_stopped`.
+  - `detached_delivery_v1` — the durable delivery obligation, one fact per
+    owed child and never truncated (`agent`, `phase` `owed`/`settled`,
+    optional `reason`); `render.ui` false, prompt=omit. A main-only stop
+    journals `owed` for every foreground child whose result the parent has
+    not recorded (whatever the child's state), as does an ended `wait_ms`
+    observation; startup recovery re-arms every `owed` child without a later
+    `detached_child_result_v1` or `settled` fact. `subagents_still_running_v1`
+    is a display list only.
 - RPC: `headless.run.stop` gains optional request `scope`
   (`all` default and omitted, `main`, `subagents`); the response gains
   optional `scope` (echo of a non-default scope) and `subagents`
@@ -69,7 +80,15 @@ changes are additive; `schema_version` remains 1.
 - RPC: new method `agent.cancel_all` (`command_id`, `session_id`,
   `worker_generation`) → `{session_id, stopped}`; `haider agent cancel
   <session> --all`. It stops every subagent in the session's tree and removes
-  their monitors; the session's own runs are untouched.
+  their monitors; the session's own runs are untouched. It is receipt-backed
+  (method `agent.cancel_all`): a committed command replays its response, a
+  stale `worker_generation` or a command id reused with other semantics is
+  refused before any monitor removal or cancel. `agent.cancel` likewise
+  validates generation and command identity before any side effect.
+- While a stop is in progress, monitor registration from the stopped
+  subagent's runs is refused (tool result status `subagent_stopping`) and its
+  monitor wakes are dismissed; a final monitor drain runs after the cancelled
+  runs settle.
 - `agent.cancel` now stops only the named subagent (its original run, any
   later live run, and its own monitors). Its children keep running; this
   replaces the former recursive descendant sweep.

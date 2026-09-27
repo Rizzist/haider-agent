@@ -213,14 +213,36 @@ pub(crate) async fn wake_monitor(
     }
     let journal = load(hub, &report.session_id).await.map_err(store_error)?;
     let id = format!("monitor:{}", report.report_id);
+    // An explicit stop of this subagent is removing its monitors: a report
+    // that fires meanwhile must not wake the stopped session into new work
+    // (Astra 13-final B1). It is dismissed, never retried later.
+    let stopping = service.stop_fences().session_fenced(&report.session_id);
     let Some(obligation) = journal.projection.pending.get(&id) else {
         // Direct transport seam callers predate the outbox. Settled reports
         // must never reach this fallback; their durable source proves ownership.
-        if journal.projection.is_settled(&id) {
+        if stopping || journal.projection.is_settled(&id) {
             return Ok(retained_receipt());
         }
         return hub.admit_monitor_report(report, None).await;
     };
+    if stopping {
+        if matches!(
+            obligation.status,
+            CompletionStatus::Pending | CompletionStatus::Admitting
+        ) {
+            append(
+                hub,
+                obligation,
+                CompletionEvent::CompletionDismissed {
+                    obligation_id: id,
+                    attempt: obligation.attempt,
+                },
+            )
+            .await
+            .map_err(store_error)?;
+        }
+        return Ok(retained_receipt());
+    }
     if !matches!(
         obligation.status,
         CompletionStatus::Pending | CompletionStatus::Admitting

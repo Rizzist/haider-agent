@@ -4653,6 +4653,60 @@ impl SessionHub {
             .await
     }
 
+    pub(crate) async fn subagent_stop_receipt(
+        &self,
+        command_id: &haider_rpc::CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<serde_json::Value>, HaiderError> {
+        self.inner
+            .store
+            .subagent_stop_receipt(
+                command_id.as_str().to_owned(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+    }
+
+    pub(crate) async fn claim_subagent_stop_receipt(
+        &self,
+        command_id: &haider_rpc::CommandId,
+        worker_generation: u64,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<haider_core::SubagentStopClaim, HaiderError> {
+        self.inner
+            .store
+            .claim_subagent_stop_receipt(
+                command_id.as_str().to_owned(),
+                worker_generation,
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+    }
+
+    pub(crate) async fn finalize_subagent_stop_receipt(
+        &self,
+        command_id: &haider_rpc::CommandId,
+        session_id: &SessionId,
+        request_digest: &str,
+        request_json: &str,
+        response: serde_json::Value,
+    ) -> Result<serde_json::Value, HaiderError> {
+        self.inner
+            .store
+            .finalize_subagent_stop_receipt(
+                command_id.as_str().to_owned(),
+                session_id.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+                response,
+            )
+            .await
+    }
+
     /// Opens one logical connection after handshake negotiation.
     ///
     /// W3c/W3d seam: every real client — CLI attach, TUI live-attach, web —

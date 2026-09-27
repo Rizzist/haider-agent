@@ -14899,6 +14899,35 @@ impl HubConnection {
             Ok(command) => command,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
+        // Astra 13-final B4: the request's generation and command identity
+        // are validated before ANY monitor removal or cancel side effect. A
+        // committed receipt replays unfenced (R2, like `turn.cancel`); a
+        // conflicting reuse of the command id is refused by the lookup; a
+        // fresh command must carry the current generation.
+        match self
+            .hub
+            .turn_cancel_receipt(
+                &command_id,
+                &target_command.request_digest,
+                &target_command.request_json,
+            )
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let current = self.hub.worker_generation();
+                if worker_generation != current {
+                    return self.respond_turn_error(
+                        request_id,
+                        stale_generation_error(worker_generation, current),
+                    );
+                }
+            }
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
         let prefix = format!(
             "agent-cancel-{}",
             &crate::delegation::stable_digest(&[command_id.as_str(), record.agent_id.as_str()])
@@ -14946,6 +14975,58 @@ impl HubConnection {
                 None,
             );
         }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!(
+                "cannot encode agent-cancel-all coordinates: {error}"
+            ))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        // Astra 13-final B4: replay, identity and generation are settled
+        // before any removal or cancel. The receipt lookup is unfenced (a
+        // committed stop replays its response across restarts); the claim is
+        // generation-fenced and atomic, so a stale or conflicting request
+        // has zero side effects.
+        match self
+            .hub
+            .subagent_stop_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(response)) => {
+                return self.respond_agent_cancel_all(request_id, session_id, response);
+            }
+            Ok(None) => {}
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }
+        let current = self.hub.worker_generation();
+        if worker_generation != current {
+            return self.respond_turn_error(
+                request_id,
+                stale_generation_error(worker_generation, current),
+            );
+        }
+        match self
+            .hub
+            .claim_subagent_stop_receipt(
+                &command_id,
+                worker_generation,
+                &request_digest,
+                &request_json,
+            )
+            .await
+        {
+            Ok(haider_core::SubagentStopClaim::Committed(response)) => {
+                return self.respond_agent_cancel_all(request_id, session_id, response);
+            }
+            Ok(
+                haider_core::SubagentStopClaim::Fresh
+                | haider_core::SubagentStopClaim::ResumePending,
+            ) => {}
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }
         let prefix = format!(
             "agent-cancel-all-{}",
             &crate::delegation::stable_digest(&[
@@ -14964,11 +15045,51 @@ impl HubConnection {
             Ok(stopped) => stopped,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
+        let response = serde_json::to_value(stopped.wire()).map_err(|error| {
+            SessionHubError::Task(format!("cannot encode agent-cancel-all response: {error}"))
+        })?;
+        let response = match self
+            .hub
+            .finalize_subagent_stop_receipt(
+                &command_id,
+                &session_id,
+                &request_digest,
+                &request_json,
+                response,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        self.respond_agent_cancel_all(request_id, session_id, response)
+    }
+
+    fn respond_agent_cancel_all(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        response: serde_json::Value,
+    ) -> Result<(), SessionHubError> {
+        let stopped = match serde_json::from_value::<haider_rpc::SubagentStopSummaryWire>(response)
+        {
+            Ok(stopped) => stopped,
+            Err(error) => {
+                return self.respond_turn_error(
+                    request_id,
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("agent-cancel-all receipt response is invalid: {error}"),
+                        false,
+                    ),
+                );
+            }
+        };
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::AgentCancelAll {
                 session_id,
-                stopped: stopped.wire(),
+                stopped,
             },
         })
     }
@@ -16115,6 +16236,28 @@ impl HubConnection {
             &crate::delegation::stable_digest(&[command_id.as_str(), run_id.as_str()])[..24]
         );
         let echo_scope = (!scope.is_all()).then_some(scope);
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &found.session_id,
+            "worker_generation": self.hub.worker_generation(),
+            "run_id": &run_id,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode headless stop coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        // A command id already used with different semantics is refused
+        // before the subagent tree is touched (Astra 13-final B4).
+        let replayed = match self
+            .hub
+            .turn_cancel_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(replayed) => replayed,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
         let mut subagents = crate::delegation::SubagentStopSummary::default();
         if matches!(scope, Scope::All | Scope::Subagents) {
             // Subagents first, so the main run's own stop cleanup finds no
@@ -16148,22 +16291,9 @@ impl HubConnection {
                 },
             });
         }
-        let request_json = serde_json::to_string(&serde_json::json!({
-            "session_id": &found.session_id,
-            "worker_generation": self.hub.worker_generation(),
-            "run_id": &run_id,
-        }))
-        .map_err(|error| {
-            SessionHubError::Task(format!("cannot encode headless stop coordinates: {error}"))
-        })?;
-        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
-        let cancelled = match self
-            .hub
-            .turn_cancel_receipt(&command_id, &request_digest, &request_json)
-            .await
-        {
-            Ok(Some(cancelled)) => cancelled,
-            Ok(None) => {
+        let cancelled = match replayed {
+            Some(cancelled) => cancelled,
+            None => {
                 let command = TurnCancelCommand {
                     command_id: command_id.0,
                     request_digest,
@@ -16183,10 +16313,6 @@ impl HubConnection {
                     Err(error) => return Err(error),
                 }
             }
-            Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
-            }
-            Err(error) => return Err(error),
         };
         if matches!(scope, Scope::All) {
             // A second walk closes the window in which the run spawned a
@@ -20550,6 +20676,15 @@ fn authorize(capabilities: &CapabilitySet, operation: Operation) -> Result<(), &
         Operation::View => "this method requires the view capability",
         Operation::Control => "this method requires the control capability",
     })
+}
+
+/// The store's own stale-generation refusal, raised before any side effect.
+fn stale_generation_error(provided: u64, current: u64) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::SingleWriterViolation,
+        format!("stale worker generation {provided}; current generation is {current}"),
+        false,
+    )
 }
 
 fn agent_cancel_command(

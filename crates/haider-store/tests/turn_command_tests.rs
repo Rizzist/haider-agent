@@ -1380,3 +1380,87 @@ fn fork_rejects_hidden_prompt_boundary_and_remaps_retained_retraction_cursor() {
     ));
     assert_eq!(child_fact.prompt_node_id, source_fact.prompt_node_id);
 }
+
+/// Astra 13-final B4: `agent.cancel_all` receipts. The claim is
+/// generation-fenced, a reused command id with other semantics is refused
+/// before any effect, and a committed command replays its first response
+/// even when a concurrent execution tries to finalize a different one.
+#[test]
+fn subagent_stop_receipt_fences_generation_identity_and_replays() {
+    use haider_store::SubagentStopClaim;
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("session-stop");
+    create(&store, &session_id);
+    let generation = store.worker_generation();
+    let body = |generation: u64| {
+        format!(r#"{{"session_id":"session-stop","worker_generation":{generation}}}"#)
+    };
+    let current = body(generation);
+    let stale = store
+        .claim_subagent_stop_receipt(
+            "stop-a",
+            generation + 1,
+            "digest-stale",
+            &body(generation + 1),
+        )
+        .expect_err("stale generation is refused");
+    assert_eq!(
+        stale.code,
+        haider_protocol::error::ErrorCode::SingleWriterViolation
+    );
+    assert_eq!(
+        store
+            .subagent_stop_receipt("stop-a", "digest-a", &current)
+            .expect("nothing was claimed"),
+        None
+    );
+    assert_eq!(
+        store
+            .claim_subagent_stop_receipt("stop-a", generation, "digest-a", &current)
+            .expect("fresh claim"),
+        SubagentStopClaim::Fresh
+    );
+    assert_eq!(
+        store
+            .claim_subagent_stop_receipt("stop-a", generation, "digest-a", &current)
+            .expect("unfinished claim resumes"),
+        SubagentStopClaim::ResumePending
+    );
+    let first = serde_json::json!({"cancelled_runs": 1, "sessions": 1, "monitors_removed": 2, "still_running": 0});
+    assert_eq!(
+        store
+            .finalize_subagent_stop_receipt("stop-a", &session_id, "digest-a", &current, &first)
+            .expect("finalize"),
+        first
+    );
+    let late = serde_json::json!({"cancelled_runs": 0, "sessions": 1, "monitors_removed": 0, "still_running": 0});
+    assert_eq!(
+        store
+            .finalize_subagent_stop_receipt("stop-a", &session_id, "digest-a", &current, &late)
+            .expect("second finalize replays"),
+        first
+    );
+    assert_eq!(
+        store
+            .subagent_stop_receipt("stop-a", "digest-a", &current)
+            .expect("lookup"),
+        Some(first.clone())
+    );
+    assert_eq!(
+        store
+            .claim_subagent_stop_receipt("stop-a", generation, "digest-a", &current)
+            .expect("committed claim"),
+        SubagentStopClaim::Committed(first)
+    );
+    let conflict = store
+        .claim_subagent_stop_receipt("stop-a", generation, "digest-other", &body(generation + 7))
+        .expect_err("reused id with another body");
+    assert_eq!(
+        conflict.code,
+        haider_protocol::error::ErrorCode::InvalidArgument
+    );
+    store
+        .subagent_stop_receipt("stop-a", "digest-other", &body(generation + 7))
+        .expect_err("lookup refuses the conflicting body too");
+}

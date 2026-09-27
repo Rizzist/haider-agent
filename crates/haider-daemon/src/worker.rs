@@ -23935,6 +23935,20 @@ impl ToolDispatcher for BrokerToolDispatcher {
 
     async fn detach_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
         self.deferred.lock().await.remove(&ticket.manifest.agent);
+        // The `wait_ms` observation ended and its `child_still_running`
+        // result is committed: the collector has let go of the child. Owe
+        // the parent session its terminal result so the advertised
+        // `agent wait` collects it (Astra 13-final B2). Bookkeeping failure
+        // never fails the parent turn; the child keeps running either way,
+        // and startup recovery re-derives the obligation from the durable
+        // `child_still_running` tool result.
+        if let Err(error) = self
+            .delegation
+            .detach_observed_child(&ticket.manifest.agent)
+            .await
+        {
+            tracing::warn!(agent = %ticket.manifest.agent, ?error, "observation-detached child delivery was not armed");
+        }
         Ok(())
     }
 

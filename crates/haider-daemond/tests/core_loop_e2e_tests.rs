@@ -4667,3 +4667,365 @@ async fn attachment_written_by_the_first_daemon_is_projected_by_the_next_daemon(
     second_task.shutdown_handle().request("test complete");
     second_task.join().await.expect("second daemon joins");
 }
+
+async fn child_monitor_count(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    session_id: SessionId,
+    request_id: &str,
+) -> usize {
+    send_request(
+        client,
+        config,
+        request_id,
+        RequestBody::MonitorList { session_id },
+    )
+    .await;
+    loop {
+        if let WireFrame::Response {
+            body: ResponseBody::MonitorList { receipt },
+            ..
+        } = client.next().await
+        {
+            return match receipt.outcome {
+                haider_rpc::MonitorListOutcomeWire::Listed { monitors } => monitors.len(),
+                other => panic!("monitor.list rejected: {other:?}"),
+            };
+        }
+    }
+}
+
+async fn assert_child_untouched(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    session: &SessionId,
+    child_session: &SessionId,
+    what: &str,
+) {
+    let snapshot = fleet(
+        client,
+        config,
+        session.clone(),
+        &format!("untouched-{what}"),
+    )
+    .await;
+    assert_eq!(
+        snapshot.roots[0].state,
+        FleetAgentStateWire::Live,
+        "{what}: the child must keep streaming"
+    );
+    assert_eq!(
+        child_monitor_count(
+            client,
+            config,
+            child_session.clone(),
+            &format!("untouched-monitors-{what}")
+        )
+        .await,
+        1,
+        "{what}: the child's monitor must survive"
+    );
+}
+
+fn error_code(frame: &WireFrame) -> Option<&str> {
+    match frame {
+        WireFrame::Response {
+            body: ResponseBody::Error { code, .. },
+            ..
+        } => Some(code.as_str()),
+        _ => None,
+    }
+}
+
+/// Astra 13-final B4: `agent.cancel` and `agent.cancel_all` validate the
+/// request's worker generation and command identity before ANY monitor
+/// removal or cancel. A stale generation and a command id reused with other
+/// semantics are refused with the child still streaming and its monitor
+/// intact; a committed `agent.cancel_all` replays its exact response.
+///
+/// MUTATION CHECK: move the named-cancel monitor removal back before the
+/// generation check, or drop the `agent.cancel_all` receipt claim. Expected
+/// runtime failure: the child's monitor disappears or the child is
+/// cancelled by a refused request.
+#[tokio::test]
+async fn subagent_stops_refuse_stale_or_conflicting_requests_without_side_effects() {
+    let root = test_root("core-loop-stop-fence-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let parent = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "fenced-child-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({
+                "task": "fenced-child",
+                "prompt": "keep a monitor and stay active",
+                "model": "child-model",
+                "provider": "child-provider",
+                "background": true
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "fenced-child-spawn".into(),
+        },
+        FakeStep::EmitText {
+            text: "parent done".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let child = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "fenced-discover".into(),
+            name: "list_tools".into(),
+            args: serde_json::json!({"filter": "monitor"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "fenced-discover".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "fenced-keeper".into(),
+            name: "monitor".into(),
+            args: serde_json::json!({
+                "operation": "register",
+                "source": {"kind": "timer", "interval_ms": 3_600_000},
+                "action": {"report": true},
+                "occurrence": "every"
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "fenced-keeper".into(),
+        },
+        FakeStep::Hang,
+    ]));
+    let parent_provider: Arc<dyn Provider> = parent.clone();
+    let child_provider: Arc<dyn Provider> = child.clone();
+    let config = DaemonConfig::new(
+        "core-loop-stop-fence",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let task = ready_with_dependencies(
+        &config,
+        dependencies(
+            [
+                ("parent-provider".into(), parent_provider),
+                ("child-provider".into(), child_provider),
+            ],
+            [],
+        )
+        .with_tool_exposure(Some(vec!["spawn_subagent".into()])),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "core-loop-e2e",
+        "stop-fence-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session, generation) = create_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "parent-provider",
+        "parent-model",
+        None,
+        None,
+    )
+    .await;
+    let parent_run = submit_turn(
+        &mut client,
+        &config,
+        "fenced-parent-turn",
+        session.clone(),
+        generation,
+        "spawn a child that keeps a monitor",
+    )
+    .await;
+    let (child_agent, child_session) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut attempt = 0_u32;
+            loop {
+                attempt = attempt.saturating_add(1);
+                let snapshot = fleet(
+                    &mut client,
+                    &config,
+                    session.clone(),
+                    &format!("fenced-fleet-{attempt}"),
+                )
+                .await;
+                if let Some(node) = snapshot
+                    .roots
+                    .first()
+                    .filter(|node| node.state == FleetAgentStateWire::Live)
+                {
+                    let (agent, child_session) = (node.agent_id.clone(), node.session_id.clone());
+                    if child_monitor_count(
+                        &mut client,
+                        &config,
+                        child_session.clone(),
+                        &format!("fenced-monitors-{attempt}"),
+                    )
+                    .await
+                        == 1
+                    {
+                        break (agent, child_session);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("live child holds one monitor");
+
+    // Stale generation, named and all.
+    for (label, body) in [
+        (
+            "stale-named",
+            RequestBody::AgentCancel {
+                command_id: CommandId::new("stale-named-command"),
+                session_id: session.clone(),
+                worker_generation: generation + 100,
+                agent: child_agent.clone(),
+            },
+        ),
+        (
+            "stale-all",
+            RequestBody::AgentCancelAll {
+                command_id: CommandId::new("stale-all-command"),
+                session_id: session.clone(),
+                worker_generation: generation + 100,
+            },
+        ),
+    ] {
+        send_request(&mut client, &config, label, body).await;
+        let response = next_response(&mut client).await;
+        assert_eq!(
+            error_code(&response),
+            Some(haider_rpc::ERROR_CODE_STALE_GENERATION),
+            "{label}: {response:?}"
+        );
+        assert_child_untouched(&mut client, &config, &session, &child_session, label).await;
+    }
+
+    // Commit an unrelated receipt, then reuse its command id for both stops.
+    send_request(
+        &mut client,
+        &config,
+        "commit-reused-id",
+        RequestBody::TurnCancel {
+            command_id: CommandId::new("reused-command"),
+            session_id: session.clone(),
+            worker_generation: generation,
+            run_id: parent_run.clone(),
+        },
+    )
+    .await;
+    let committed = next_response(&mut client).await;
+    assert!(
+        matches!(
+            committed,
+            WireFrame::Response {
+                body: ResponseBody::TurnCancel { .. },
+                ..
+            }
+        ),
+        "{committed:?}"
+    );
+    for (label, body) in [
+        (
+            "reused-named",
+            RequestBody::AgentCancel {
+                command_id: CommandId::new("reused-command"),
+                session_id: session.clone(),
+                worker_generation: generation,
+                agent: child_agent.clone(),
+            },
+        ),
+        (
+            "reused-all",
+            RequestBody::AgentCancelAll {
+                command_id: CommandId::new("reused-command"),
+                session_id: session.clone(),
+                worker_generation: generation,
+            },
+        ),
+    ] {
+        send_request(&mut client, &config, label, body).await;
+        let response = next_response(&mut client).await;
+        assert_eq!(
+            error_code(&response),
+            Some(haider_rpc::ERROR_CODE_INVALID_ARGUMENT),
+            "{label}: {response:?}"
+        );
+        assert_child_untouched(&mut client, &config, &session, &child_session, label).await;
+    }
+
+    // A valid stop-all acts once; its exact retry replays the response, and
+    // a named cancel reusing its command id is refused.
+    let stop_all = || RequestBody::AgentCancelAll {
+        command_id: CommandId::new("final-all-command"),
+        session_id: session.clone(),
+        worker_generation: generation,
+    };
+    send_request(&mut client, &config, "final-all", stop_all()).await;
+    let first = next_response(&mut client).await;
+    let WireFrame::Response {
+        body: ResponseBody::AgentCancelAll { stopped, .. },
+        ..
+    } = &first
+    else {
+        panic!("expected agent.cancel_all response, got {first:?}");
+    };
+    assert_eq!(stopped.monitors_removed, 1, "{first:?}");
+    assert_eq!(stopped.still_running, 0, "{first:?}");
+    let first_stopped = *stopped;
+    assert_eq!(
+        child_monitor_count(&mut client, &config, child_session.clone(), "after-all").await,
+        0
+    );
+    send_request(&mut client, &config, "final-all-replay", stop_all()).await;
+    let replay = next_response(&mut client).await;
+    assert!(
+        matches!(
+            &replay,
+            WireFrame::Response {
+                body: ResponseBody::AgentCancelAll { stopped, .. },
+                ..
+            } if *stopped == first_stopped
+        ),
+        "replay must return the committed response: {replay:?}"
+    );
+    send_request(
+        &mut client,
+        &config,
+        "reuse-all-id-named",
+        RequestBody::AgentCancel {
+            command_id: CommandId::new("final-all-command"),
+            session_id: session.clone(),
+            worker_generation: generation,
+            agent: child_agent,
+        },
+    )
+    .await;
+    let reused = next_response(&mut client).await;
+    assert_eq!(
+        error_code(&reused),
+        Some(haider_rpc::ERROR_CODE_INVALID_ARGUMENT),
+        "{reused:?}"
+    );
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}

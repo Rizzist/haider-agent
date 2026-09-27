@@ -1726,6 +1726,21 @@ pub enum MonitorControlClaim {
     Committed(serde_json::Value),
 }
 
+/// Durable command method of an explicit whole-tree subagent stop.
+pub const AGENT_CANCEL_ALL_METHOD: &str = "agent.cancel_all";
+
+/// Outcome of claiming one `agent.cancel_all` command receipt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubagentStopClaim {
+    /// First execution of this command.
+    Fresh,
+    /// An earlier execution claimed the command and did not finish; the
+    /// idempotent stop runs again and finalizes it.
+    ResumePending,
+    /// The command already committed; replay this response.
+    Committed(serde_json::Value),
+}
+
 /// Secret-free coordinates for atomically accepting a direct user shell
 /// command. The command bytes themselves live in the ordinary started item
 /// and in the canonical receipt request JSON, never in this response.
@@ -8452,6 +8467,122 @@ impl Store {
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(())
+    }
+
+    /// Looks up a committed `agent.cancel_all` response before generation
+    /// validation (R2 response-loss replay: receipt lookups are unfenced).
+    /// Same command id with a different method or body is
+    /// `invalid_argument`.
+    pub fn subagent_stop_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<serde_json::Value>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            AGENT_CANCEL_ALL_METHOD,
+            request_digest,
+            request_json,
+            "agent-cancel-all",
+        )
+    }
+
+    /// Claims one `agent.cancel_all` command before any stop side effect:
+    /// identity conflicts and a stale generation are refused here, inside
+    /// one immediate transaction, so a refused request changes nothing.
+    pub fn claim_subagent_stop_receipt(
+        &self,
+        command_id: &str,
+        worker_generation: u64,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<SubagentStopClaim> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response::<serde_json::Value>(
+            &transaction,
+            command_id,
+            AGENT_CANCEL_ALL_METHOD,
+            request_digest,
+            request_json,
+            "agent-cancel-all",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SubagentStopClaim::Committed(response));
+        }
+        if worker_generation != self.worker_generation {
+            return Err(stale_generation(worker_generation, self.worker_generation));
+        }
+        let pending = transaction
+            .query_row(
+                "SELECT 1 FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        claim_pending_receipt(
+            &transaction,
+            command_id,
+            AGENT_CANCEL_ALL_METHOD,
+            request_digest,
+            request_json,
+            now_ms()?,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(if pending {
+            SubagentStopClaim::ResumePending
+        } else {
+            SubagentStopClaim::Fresh
+        })
+    }
+
+    /// Commits the response of a claimed `agent.cancel_all` command and
+    /// returns the authoritative response: a concurrent execution of the
+    /// same command that committed first wins, and this one replays it.
+    pub fn finalize_subagent_stop_receipt(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+        request_digest: &str,
+        request_json: &str,
+        response: &serde_json::Value,
+    ) -> StoreResult<serde_json::Value> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(committed) = lookup_command_response::<serde_json::Value>(
+            &transaction,
+            command_id,
+            AGENT_CANCEL_ALL_METHOD,
+            request_digest,
+            request_json,
+            "agent-cancel-all",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(committed);
+        }
+        finalize_command_receipt(
+            &transaction,
+            command_id,
+            session_id.as_str(),
+            None,
+            None,
+            response,
+            now_ms()?,
+            "agent-cancel-all",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(response.clone())
     }
 
     /// Looks up a committed `session.create` response before filesystem

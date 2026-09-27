@@ -403,7 +403,9 @@ async fn execute(options: &Options) -> Result<(Value, u8), Failure> {
             // Owner decision 2026-09-25: the explicit "stop all" — every
             // subagent in the session's tree, however deep, including
             // children started by messaged or monitor-woken child turns.
-            connection.require(haider_rpc::FEATURE_AGENT_CANCEL_V1)?;
+            // `agent.cancel_all` is advertised by `run_stop_scope_v1`; an
+            // older daemon refuses here, before any request is sent.
+            connection.require(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1)?;
             let session_id = SessionId::new(&options.positional[0]);
             let worker_generation = connection.control(&session_id, deadline).await?;
             match connection

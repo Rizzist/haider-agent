@@ -77,6 +77,7 @@ fn main_thread_stop_marker_and_delivered_result_render_in_both_surfaces() {
         verified: ReportVerification::Unverified,
         summary: "c finished".into(),
         summary_truncated: false,
+        reason: Default::default(),
     };
     model
         .projection

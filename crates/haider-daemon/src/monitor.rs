@@ -1220,6 +1220,8 @@ struct MonitorServiceInner {
     ready: watch::Sender<bool>,
     activated: AtomicBool,
     shutdown: watch::Sender<bool>,
+    /// Registration/wake admission fence for explicit subagent stops.
+    stop_fences: crate::monitor_stop_fence::MonitorStopFences,
 }
 
 /// Hub-owned monitor service. Clone is cheap and every clone shares the same
@@ -1262,6 +1264,7 @@ impl Default for MonitorService {
                 ready,
                 activated: AtomicBool::new(false),
                 shutdown,
+                stop_fences: crate::monitor_stop_fence::MonitorStopFences::default(),
             }),
         }
     }
@@ -1280,6 +1283,12 @@ impl MonitorService {
 
     pub(crate) async fn completion_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.completion_mutations.lock().await
+    }
+
+    /// Admission fence shared by explicit subagent stops, monitor
+    /// registration and monitor wakes.
+    pub(crate) fn stop_fences(&self) -> &crate::monitor_stop_fence::MonitorStopFences {
+        &self.inner.stop_fences
     }
 
     pub(crate) fn has_active_monitors(&self) -> bool {
@@ -4158,6 +4167,24 @@ impl MonitorService {
                     .await?
                 {
                     return Ok(result);
+                }
+                // Checked under the mutation lock every stop listing also
+                // takes: a registration either commits before a stop lists
+                // this session's monitors or observes the stop's fence.
+                if self
+                    .inner
+                    .stop_fences
+                    .registration_fenced(store.session_id(), &coordinates.run_id)
+                {
+                    return Ok(tool_result(
+                        json!({
+                            "status": "subagent_stopping",
+                            "source": source.kind(),
+                            "message": "this subagent is being stopped; the monitor was not registered",
+                        }),
+                        ToolResultStatus::Rejected,
+                        Some("monitor registration refused: this subagent is being stopped".into()),
+                    ));
                 }
                 let command_unapproved =
                     source.resolved_argv().is_some() && coordinates.approved_command.is_none();

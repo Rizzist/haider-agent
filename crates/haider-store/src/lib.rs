@@ -57,11 +57,11 @@ pub use event_store::{
     SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
     SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
     SessionWorkspaceSetCommand, SessionWorkspaceSetOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
-    TurnRetractCommand, TurnRetractOutcome, TypedAgentInstallCancelResult, TypedAgentInstallCas,
-    TypedAgentInstallItemCas, TypedAgentInstallRetryResult, TypedAgentInstallSnapshot,
-    TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
+    ShellExecAcceptOutcome, Store, SubagentStopClaim, SwitchedGraph, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus, TurnRetractCommand, TurnRetractOutcome, TypedAgentInstallCancelResult,
+    TypedAgentInstallCas, TypedAgentInstallItemCas, TypedAgentInstallRetryResult,
+    TypedAgentInstallSnapshot, TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
 };
 pub use event_store::{
     ForkCacheInheritanceCandidate, fork_provider_view_prefix_digest,

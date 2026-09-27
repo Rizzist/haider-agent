@@ -748,10 +748,15 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                     }
                 },
                 Err(error) => {
-                    if let Some(message) = stop_scope_unsupported_message(scope, &error) {
-                        eprintln!("haider: {message}");
-                    }
-                    report_lifecycle_error(options.output, "haider.run.stop.v1", &error)
+                    // S-1: the precise refusal is both the stderr line and
+                    // the JSON `error.message`.
+                    let message = stop_scope_unsupported_message(scope, &error);
+                    report_lifecycle_error_with(
+                        options.output,
+                        "haider.run.stop.v1",
+                        &error,
+                        message.as_deref(),
+                    )
                 }
             };
         }
@@ -1183,15 +1188,31 @@ fn write_lifecycle_value(
 }
 
 fn report_lifecycle_error(mode: RunOutput, schema: &str, error: &HeadlessRunError) -> ExitCode {
+    report_lifecycle_error_with(mode, schema, error, None)
+}
+
+/// One lifecycle error document. `message` replaces the error's own text
+/// when the caller has a more precise explanation (S-1 stop-scope refusal).
+fn lifecycle_error_line(schema: &str, error: &HeadlessRunError, message: Option<&str>) -> String {
+    let failure = classify_headless_error(error);
+    let schema = serde_json::to_string(schema).unwrap_or_else(|_| "null".into());
+    let code = serde_json::to_string(&failure.code).unwrap_or_else(|_| "null".into());
+    let message = serde_json::to_string(message.unwrap_or(&failure.message))
+        .unwrap_or_else(|_| "null".into());
+    format!(
+        "{{\"schema\":{schema},\"result\":null,\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{}}}}}\n",
+        failure.retryable
+    )
+}
+
+fn report_lifecycle_error_with(
+    mode: RunOutput,
+    schema: &str,
+    error: &HeadlessRunError,
+    message: Option<&str>,
+) -> ExitCode {
     if mode != RunOutput::Print {
-        let failure = classify_headless_error(error);
-        let schema = serde_json::to_string(schema).unwrap_or_else(|_| "null".into());
-        let code = serde_json::to_string(&failure.code).unwrap_or_else(|_| "null".into());
-        let message = serde_json::to_string(&failure.message).unwrap_or_else(|_| "null".into());
-        let line = format!(
-            "{{\"schema\":{schema},\"result\":null,\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{}}}}}\n",
-            failure.retryable
-        );
+        let line = lifecycle_error_line(schema, error, message);
         let mut stdout = io::stdout().lock();
         if let Err(io_error) = stdout
             .write_all(line.as_bytes())
@@ -1201,7 +1222,10 @@ fn report_lifecycle_error(mode: RunOutput, schema: &str, error: &HeadlessRunErro
             return ExitCode::from(EX_IOERR);
         }
     }
-    eprintln!("haider: {error}");
+    match message {
+        Some(message) => eprintln!("haider: {message}"),
+        None => eprintln!("haider: {error}"),
+    }
     ExitCode::from(exit_code_for_error(error))
 }
 
@@ -3254,5 +3278,13 @@ mod tests {
                 .is_some_and(|message| message.contains("--stop-subagents"))
         );
         assert!(super::stop_scope_unsupported_message(Scope::All, &missing).is_none());
+        // S-1 (12-final2): the JSON document carries the same precise text.
+        let line = super::lifecycle_error_line("haider.run.stop.v1", &missing, Some(main.as_str()));
+        let document: serde_json::Value = serde_json::from_str(&line).expect("one JSON line");
+        assert_eq!(document["error"]["message"], main.as_str(), "{document}");
+        assert_eq!(document["error"]["code"], "missing_feature", "{document}");
+        let plain = super::lifecycle_error_line("haider.run.stop.v1", &missing, None);
+        let plain: serde_json::Value = serde_json::from_str(&plain).expect("one JSON line");
+        assert_eq!(plain["error"]["message"], missing.to_string());
     }
 }
