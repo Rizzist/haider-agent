@@ -516,7 +516,8 @@ class WindowsCrtImportTests(unittest.TestCase):
             *[(n, 0) for n in (
                 'KERNEL32.dll', 'api-ms-win-core-crt-l1-1-0.dll', 'api-ms-win-core-crt-l2-1-0.dll', 'API-MS-WIN-CORE-CRT-L1-1-0',
                 'ext-ms-win-ntuser-window-l1-1-0.dll', 'ext-ms-win-kernel32-package-current-l1-1-0.dll',
-                'msvcrt.dll', 'msvcrt20.dll', 'msvcrt40.dll', 'msvcirt.dll', 'atl.dll', 'ucrtbase_clr0400.dll',
+                'msvcrt.dll', 'msvcrt20.dll', 'msvcrt40.dll', 'msvcirt.dll', 'msvcp_win.dll',
+                'atl.dll', 'atlthunk.dll', 'mfcsubs.dll', 'mfcans32.dll', 'ucrtbase_clr0400.dll',
                 'msvcr120_clr0400.dll', 'ucrtbase_enclave.dll', 'C:' + B + 'Windows' + B + 'System32' + B + 'bcrypt.dll',
                 B*2 + '?' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'ntdll.dll', 'C:KERNEL32.dll',
                 'vcruntime.dll', 'mfc.dll', 'msvcr.dll', 'concrt.dll', 'My_Odd Name~1+(x).dll')],
@@ -642,8 +643,55 @@ class WindowsCrtImportTests(unittest.TestCase):
                             self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), 1)
                         self.assertIn(repr(name), errors.getvalue())
 
+    def test_future_runtime_versions_in_each_import_mode(self):
+        # Literal representatives independent of the production family table.
+        # Cover each versioned family and suffix axis, including OS-name siblings.
+        forbidden = (
+            'vcruntime141.dll', 'vcruntime150.dll', 'vcruntime150_1.dll',
+            'vcruntime150d_app.dll', 'vcruntime150_threads.dll',
+            'msvcr140.dll', 'msvcr200d.dll', 'msvcr200_app.dll',
+            'msvcp150.dll', 'msvcp150_atomic_wait.dll',
+            'msvcp150d_codecvt_ids.dll', 'msvcp150_2.dll',
+            'concrt150.dll', 'concrt150d_app.dll',
+            'vccorlib150.dll', 'vccorlib150_app.dll',
+            'vcamp150.dll', 'vcamp150d.dll',
+            'vcomp150.dll', 'vcomp150d.dll', 'vcomp150ui.dll',
+            'vcomp150ui_app.dll',
+            'msvcm100.dll', 'msvcm100d_app.dll',
+            'msvci80.dll', 'msvci80d.dll',
+            'mfc150.dll', 'mfc150u.dll', 'mfc150ud.dll',
+            'mfc150enu.dll', 'mfc150d_app.dll', 'mfcm150u.dll',
+            'mfcm150ud_app.dll', 'mfcd50d.dll', 'mfcd50ud_app.dll',
+            'mfcn50ud.dll', 'mfco50d.dll',
+            'atl150.dll', 'atl150d.dll', 'atl150d_app.dll',
+            'msvcrt30.dll', 'msvcrt30d_app.dll',
+            'msvcrt20d.dll', 'msvcrt40d.dll',
+            'appcrt150.dll', 'desktopcrt150d.dll',
+            'clang_rt.asan_dynamic-arm64ec.dll',
+            'ucrtbased_enclave.dll',
+            'VCRUNTIME150', 'VCRUNTIME150.DLL',
+            'C:MSVCP150_ATOMIC_WAIT.DLL',
+            r'C:\Windows\System32\mfc150enu.dll .',
+            'msvcr200d.dll::$DATA',
+        )
+        self.assertEqual(len(forbidden), len(set(forbidden)))
+        modes = ((False, False, False), (True, False, False),
+                 (False, True, False), (True, True, False), (True, True, True))
+        with tempfile.TemporaryDirectory() as temporary:
+            for pe32, delayed, legacy in modes:
+                for name in forbidden:
+                    with self.subTest(name=name, pe32=pe32, delayed=delayed, legacy=legacy):
+                        image = _pe(SYSTEM_IMPORTS if delayed else (name,),
+                                    (name,) if delayed else (), pe32=pe32, legacy_delay=legacy)
+                        path = self.write(Path(temporary), 'future.exe', image)
+                        output, errors = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                            self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), 1)
+                        self.assertIn(repr(name), errors.getvalue())
+
     def test_exact_os_inventory_and_siblings_in_each_import_mode(self):
         exempt = (
+            'msvcrt20.dll', 'msvcrt40.dll',
             'msvcp60.dll', 'mfc40.dll', 'mfc40u.dll', 'mfc42.dll',
             'mfc42u.dll', 'mfc42loc.dll',
             'msvcp110_win.dll', 'msvcp110_clr0400.dll',
