@@ -1974,13 +1974,20 @@ mod continuation_progress_tests {
     /// whose visible text is `text` (stable id, resource id and bounds, as
     /// `mobile_transport` derives node ids from resource id + index).
     fn numeric_tree(text: &str) -> String {
-        let output: haider_protocol::mobile::MobileOutput =
-            serde_json::from_value(serde_json::json!({"A11yTree": [{
-                "id": "row1", "text": text, "content_desc": null,
-                "class": "android.widget.TextView", "resource_id": "example:id/row",
-                "bounds": {"left": 0, "top": 100, "right": 100, "bottom": 150}
-            }]}))
-            .unwrap();
+        use haider_protocol::mobile::{A11yNode, MobileOutput, Point4};
+        let output = MobileOutput::A11yTree(vec![A11yNode {
+            id: "row1".into(),
+            text: Some(text.into()),
+            content_desc: None,
+            class: "android.widget.TextView".into(),
+            resource_id: Some("example:id/row".into()),
+            bounds: Point4 {
+                left: 0,
+                top: 100,
+                right: 100,
+                bottom: 150,
+            },
+        }]);
         serde_json::to_string(&output).unwrap()
     }
 
@@ -2002,7 +2009,7 @@ mod continuation_progress_tests {
             let (stop, steers) = drive(600, |progress, request| {
                 let page = request.div_ceil(2);
                 if request % 2 == 1 {
-                    tool_call(progress, "mobile", swipe_args(), "\"Ack\"", None, request);
+                    tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
                 } else {
                     tool_call(
                         progress,
@@ -2043,7 +2050,7 @@ mod continuation_progress_tests {
         assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
         let (stop, _) = drive(600, |progress, request| {
             if request % 2 == 1 {
-                tool_call(progress, "mobile", swipe_args(), "\"Ack\"", None, request);
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
             } else {
                 tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
             }
@@ -2070,6 +2077,10 @@ mod continuation_progress_tests {
             (
                 "process_exec",
                 serde_json::json!({"command": "cat rows.json"}),
+            ),
+            (
+                "process_exec",
+                serde_json::json!({"action": "a11y_tree", "command": "cat rows.json"}),
             ),
             ("mobile_screenshot", a11y_tree_args()),
         ] {

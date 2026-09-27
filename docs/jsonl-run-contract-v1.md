@@ -441,9 +441,9 @@ omit both displays and the JSON field.
 
 ### Loop guards (`loop_limit`, v0.0.973)
 
-Three turn-local loop guards stop genuinely stuck loops. None counts
-productive work, and none is a request-count cap. They share one fingerprint
-set per turn.
+Three turn-local loop guards stop repeated work. None is a request-count cap;
+the action-level guard also bounds identical calls whose results keep changing.
+They share one fingerprint set per turn.
 
 Fresh call IDs, request ordinals, usage updates, transport attempts, opaque
 replay state, and the automatic `max_tokens` nudge are never progress.

@@ -283,6 +283,10 @@ mod tests {
             mask_digits("v\u{662}x abc_\u{661}"),
             "v\u{662}x abc_\u{661}"
         );
+        assert_eq!(
+            mask_digits("chunk_0001 mod٢ مد۱ نام_۱۲"),
+            "chunk_0001 mod٢ مد۱ نام_۱۲"
+        );
         // A run mixing scripts is one run.
         assert_eq!(mask_digits("n 1\u{662}\u{6f3}"), "n #");
         // Fullwidth digits fold to ASCII under NFKC before masking.
@@ -301,10 +305,21 @@ mod tests {
     #[test]
     fn screen_result_keeps_digits_and_order() {
         let page = |n: u32| {
-            format!(
-                "{{\"A11yTree\":[{{\"id\":\"row1\",\"text\":\"{}\",\"resource_id\":\"example:id/row\"}}]}}",
-                100_000 + n
-            )
+            use haider_protocol::mobile::{A11yNode, MobileOutput, Point4};
+            serde_json::to_string(&MobileOutput::A11yTree(vec![A11yNode {
+                id: "row1".into(),
+                text: Some((100_000 + n).to_string()),
+                content_desc: None,
+                class: "android.widget.TextView".into(),
+                resource_id: Some("example:id/row".into()),
+                bounds: Point4 {
+                    left: 0,
+                    top: 100,
+                    right: 100,
+                    bottom: 150,
+                },
+            }]))
+            .unwrap()
         };
         assert_ne!(screen_result(&page(0)), screen_result(&page(1)));
         assert_eq!(screen_result(&page(7)), screen_result(&page(7)));

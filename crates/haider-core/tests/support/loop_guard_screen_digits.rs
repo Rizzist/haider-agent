@@ -31,7 +31,7 @@ impl ToolDispatcher for NumericList {
             if !self.stuck {
                 self.page.fetch_add(1, Ordering::SeqCst);
             }
-            serde_json::json!("Ack")
+            haider_protocol::mobile::MobileOutput::Ack
         } else {
             assert_eq!(args["action"], "a11y_tree");
             let page = self.page.load(Ordering::SeqCst);
@@ -40,16 +40,24 @@ impl ToolDispatcher for NumericList {
             } else {
                 (100_000 + page).to_string()
             };
-            serde_json::json!({"A11yTree": [{
-                "id": "row1", "text": text, "content_desc": null,
-                "class": "android.widget.TextView", "resource_id": "example:id/row",
-                "bounds": {"left": 0, "top": 100, "right": 100, "bottom": 150}
-            }]})
+            haider_protocol::mobile::MobileOutput::A11yTree(vec![
+                haider_protocol::mobile::A11yNode {
+                    id: "row1".into(),
+                    text: Some(text),
+                    content_desc: None,
+                    class: "android.widget.TextView".into(),
+                    resource_id: Some("example:id/row".into()),
+                    bounds: haider_protocol::mobile::Point4 {
+                        left: 0,
+                        top: 100,
+                        right: 100,
+                        bottom: 150,
+                    },
+                },
+            ])
         };
         // The exact typed output envelope the daemon serializes as preview.
-        let typed: haider_protocol::mobile::MobileOutput =
-            serde_json::from_value(output).expect("typed mobile output");
-        let preview = serde_json::to_string(&typed).expect("preview");
+        let preview = serde_json::to_string(&output).expect("preview");
         if args["action"] == "a11y_tree" {
             self.trees.lock().expect("trees").push(preview.clone());
         }
