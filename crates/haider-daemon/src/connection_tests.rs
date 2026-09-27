@@ -947,7 +947,50 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
             ..roster
         }],
     };
-    let rich_frames = [fleet, baseline, delta, roster];
+    let summary: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "identity-gate-child",
+        "head_seq": 9,
+        "worker_generation": 1,
+    }))
+    .expect("minimal list summary");
+    let summary = haider_rpc::SessionSummary {
+        agent_metrics: Some(identity_gate_metrics()),
+        ..summary
+    };
+    let digest: haider_rpc::SessionObserveDigest = serde_json::from_value(serde_json::json!({
+        "session_id": "identity-gate-child",
+        "head_seq": 9,
+        "worker_generation": 1,
+        "title": "identity gate",
+        "run_state": "running",
+        "main_head_seq": 9,
+        "updated_at_ms": 1,
+    }))
+    .expect("minimal observe digest");
+    let digest = haider_rpc::SessionObserveDigest {
+        agent_metrics: Some(identity_gate_metrics()),
+        ..digest
+    };
+    let list = WireFrame::Response {
+        request_id: RequestId::new("identity-gate-list"),
+        body: ResponseBody::SessionList {
+            sessions: vec![summary],
+            next_cursor: None,
+        },
+    };
+    let observe = WireFrame::Response {
+        request_id: RequestId::new("identity-gate-observe"),
+        body: ResponseBody::SessionObserve {
+            digest: digest.clone(),
+        },
+    };
+    let observe_batch = WireFrame::Response {
+        request_id: RequestId::new("identity-gate-observe-batch"),
+        body: ResponseBody::SessionObserveBatch {
+            digests: vec![digest],
+        },
+    };
+    let rich_frames = [fleet, baseline, delta, roster, list, observe, observe_batch];
     for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
         let sink = ConnectionFrameSink {
             lane: OutboundLane::new(1, 1_048_576, 1_048_576),
@@ -976,6 +1019,30 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                     }
                 }
                 WireFrame::Response {
+                    body: ResponseBody::SessionList { sessions, .. },
+                    ..
+                } => {
+                    if let Some(metrics) = sessions[0].agent_metrics.as_mut() {
+                        metrics.activity = None;
+                    }
+                }
+                WireFrame::Response {
+                    body: ResponseBody::SessionObserve { digest },
+                    ..
+                } => {
+                    if let Some(metrics) = digest.agent_metrics.as_mut() {
+                        metrics.activity = None;
+                    }
+                }
+                WireFrame::Response {
+                    body: ResponseBody::SessionObserveBatch { digests },
+                    ..
+                } => {
+                    if let Some(metrics) = digests[0].agent_metrics.as_mut() {
+                        metrics.activity = None;
+                    }
+                }
+                WireFrame::Response {
                     body: ResponseBody::SessionDescendantsAttach { baseline, .. },
                     ..
                 } => {
@@ -991,7 +1058,17 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                 }
                 _ => unreachable!("identity gate fixture covers all delivery shapes"),
             }
-            if !matches!(legacy_frame, WireFrame::SessionRosterDelta { .. }) {
+            if matches!(
+                legacy_frame,
+                WireFrame::Response {
+                    body: ResponseBody::SessionFleet { .. }
+                        | ResponseBody::SessionDescendantsAttach { .. },
+                    ..
+                } | WireFrame::SessionDescendantStream {
+                    event: haider_rpc::SessionDescendantStreamEventWire::Delta { .. },
+                    ..
+                }
+            ) {
                 assert!(
                     serde_json::to_string(&legacy_frame)
                         .expect("legacy identity frame serializes")
@@ -1007,6 +1084,10 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
             );
             let expected = uds_codec::encode_with(&legacy_frame, 1_048_576, encoding)
                 .expect("legacy identity frame encodes");
+            assert!(
+                !expected.windows(7).any(|part| part == b"activit"),
+                "legacy {encoding:?} frame must not encode activity keys"
+            );
             let encoded = sink.encode(rich_frame).expect("legacy sink encodes");
             let actual = match encoded {
                 OutboundBytes::Contiguous(bytes) => bytes.as_slice().to_vec(),
