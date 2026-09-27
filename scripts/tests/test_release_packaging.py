@@ -464,38 +464,139 @@ class WindowsCrtImportTests(unittest.TestCase):
     def test_crt_aliases_and_os_names_in_each_import_mode(self):
         modes = ((False, False, False), (True, False, False),
                  (False, True, False), (True, True, False), (True, True, True))
-        forbidden = ("VCRUNTIME140", "VCRUNTIME140.", "VCRUNTIME140.dll.",
-                     "VCRUNTIME140..", r"C:\runtime\VCRUNTIME140",
-                     "vcruntime140.", "MSVCP140", "api-ms-win-crt-runtime-l1-1-0",
-                     r"x\..\VCRUNTIME140.dll", "C:/Windows/System32/vcruntime140.dll",
-                     "VCRUNTIME140 ", "VCRUNTIME140.dll ", "VCRUNTIME140.dll   ",
-                     "MSVCP140 ", "api-ms-win-crt-runtime-l1-1-0 ",
-                     "api-ms-win-crt-runtime-l1-1-0.dll ", "VCRUNTIME140.dll. ",
-                     "VCRUNTIME140.dll .", "VCRUNTIME140.dll\\.",
-                     "VCRUNTIME140.dll/.", "VCRUNTIME140.dll\\x\\..",
-                     "VCRUNTIME140.dll::$DATA",
-                     "api-ms-win-crt-runtime-l1-1-0.xyz",
-                     "api-ms-win-crt-runtime-l1-1-9.dll",
-                     "API-MS-WIN-CRT-HEAP-L1-1-0.foo")
-        allowed = ("KERNEL32", "KERNEL32.dll", "kernel32.DLL",
-                   "api-ms-win-core-synch-l1-2-0", "api-ms-win-core-synch-l1-2-0.dll",
-                   r"C:\Windows\System32\KERNEL32",
-                   "api-ms-win-core-winrt-string-l1-1-0.dll",
-                   "ext-ms-win-ntuser-window-l1-1-0.dll",
-                   "msvcrt", "msvcrt.dll", "atl.dll", "Microsoft.VisualStudio.Setup.dll",
-                   "vcruntime.dll", "mfc.dll", "msvcr.dll")
+        B = '\\'
+        cases = [
+            # drive-relative (Wine contains_path: name[1] == ':' is a path; RtlDosPathNameToNtPathName resolves
+            # it against the drive's current directory)
+            ('C:VCRUNTIME140.dll', 'must-reject'), ('c:vcruntime140', 'must-reject'), ('C:MSVCP140.dll', 'must-reject'),
+            ('C:api-ms-win-crt-runtime-l1-1-0.dll', 'must-reject'), ('C:VCRUNTIME140.dll ', 'must-reject'),
+            ('D:ucrtbase.dll', 'must-reject'), ('C:..' + B + 'VCRUNTIME140.dll', 'must-reject'),
+            # absolute / UNC / device namespace paths
+            (B*2 + 'server' + B + 'share' + B + 'VCRUNTIME140.dll', 'must-reject'),
+            (B*2 + '?' + B + 'C:' + B + 'x' + B + 'VCRUNTIME140.dll', 'must-reject'),
+            (B*2 + '.' + B + 'C:' + B + 'x' + B + 'VCRUNTIME140.dll', 'must-reject'),
+            (B + '??' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'vcruntime140.dll', 'must-reject'),
+            (B*2 + '?' + B + 'GLOBALROOT' + B + 'Device' + B + 'HarddiskVolume3' + B + 'Windows' + B + 'System32' + B + 'vcruntime140.dll', 'must-reject'),
+            (B*2 + '?' + B + 'UNC' + B + 'server' + B + 'share' + B + 'msvcp140.dll', 'must-reject'),
+            ('C:' + B + 'VCRUNTIME140.dll', 'must-reject'), (B + 'VCRUNTIME140.dll', 'must-reject'),
+            # case
+            ('VcRuNtImE140.DlL', 'must-reject'), ('VCRUNTIME140.DLL', 'must-reject'), ('UCRTBASE.DLL', 'must-reject'),
+            # streams
+            ('VCRUNTIME140.dll:stream', 'must-reject'), ('VCRUNTIME140:$DATA', 'must-reject'),
+            # extension spellings that stay the CRT via API-set resolution
+            ('api-ms-win-crt-runtime-l1-1-0.ocx', 'must-reject'), ('api-ms-win-crt-stdio-l1-1-0.drv', 'must-reject'),
+            ('API-MS-WIN-CRT-MATH-L1-1-0', 'must-reject'),
+            # known alias vocabulary
+            *[(n, 'must-reject') for n in (
+                'vcruntime140.dll', 'vcruntime140_1.dll', 'vcruntime140_threads.dll', 'vcruntime140d.dll', 'vcruntime140_1d.dll',
+                'vcruntime140_threadsd.dll', 'vcruntime140_app.dll', 'vcruntime140_1_app.dll', 'vcruntime140d_app.dll',
+                'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll',
+                'msvcp140d.dll', 'msvcp140d_atomic_wait.dll', 'msvcp140_app.dll', 'msvcp120_app.dll', 'msvcp120.dll', 'msvcp100.dll',
+                'msvcr120.dll', 'msvcr110.dll', 'msvcr100.dll', 'msvcr90.dll', 'msvcr80.dll', 'msvcr71.dll', 'msvcr120d.dll',
+                'ucrtbase.dll', 'ucrtbased.dll', 'concrt140.dll', 'concrt140d.dll', 'vcomp140.dll', 'vcomp140d.dll', 'vcomp120.dll',
+                'vcomp90.dll', 'vccorlib140.dll', 'vccorlib140d.dll', 'vccorlib120.dll', 'mfc140.dll', 'mfc140u.dll', 'mfc140d.dll',
+                'mfcm140u.dll', 'mfc140chs.dll', 'mfc140enu.dll', 'mfc120u.dll', 'atl110.dll', 'atl100.dll', 'atl90.dll', 'vcamp140.dll',
+                'vcamp140d.dll', 'libomp140.x86_64.dll', 'libomp140d.x86_64.dll', 'libomp140.aarch64.dll',
+                'api-ms-win-crt-runtime-l1-1-0.dll', 'api-ms-win-crt-private-l1-1-0.dll', 'api-ms-win-crt-conio-l1-1-0.dll')],
+            # candidate vocabulary gaps (source-derived: Microsoft.VCLibs appx framework DLLs, C++/CLI msvcm)
+            *[(n, 'regex-gap') for n in (
+                'concrt140_app.dll', 'vccorlib140_app.dll', 'vcomp140_app.dll', 'vcamp140_app.dll', 'concrt140d_app.dll',
+                'msvcr120_app.dll', 'msvcr110_app.dll', 'vccorlib120_app.dll', 'msvcm90.dll', 'msvcm80.dll', 'msvcm90d.dll',
+                'msvci70.dll')],
+            # 8.3 short names
+            ('VCRUNT~1.DLL', '8.3-short'), ('VCRUNT~2.DLL', '8.3-short'), ('MSVCP1~1.DLL', '8.3-short'), ('API-MS~1.DLL', '8.3-short'),
+            ('UCRTBA~1.DLL', '8.3-short'), ('VCRUNT~1', '8.3-short'),
+            # different files to the loader
+            ('VCRUNTIME140.ocx', 'not-alias'), ('VCRUNTIME140.drv', 'not-alias'), ('VCRUNTIME140.dll.dll', 'not-alias'),
+            ('VCRUNTIME140.exe', 'not-alias'), (' VCRUNTIME140.dll', 'not-alias'), ('VCRUNTIME140 .dll', 'not-alias'),
+            ('xVCRUNTIME140.dll', 'not-alias'), ('foo.dll:VCRUNTIME140.dll', 'not-alias'), ('NUL', 'not-alias'),
+            ('CON.dll', 'not-alias'), (B*2 + '.' + B + 'NUL', 'not-alias'), ('libomp140.x86_64', 'not-alias'),
+            ('api-ms-win-crt.dll', 'not-alias'),
+            # legitimate OS names
+            *[(n, 'os') for n in (
+                'KERNEL32.dll', 'api-ms-win-core-crt-l1-1-0.dll', 'api-ms-win-core-crt-l2-1-0.dll', 'API-MS-WIN-CORE-CRT-L1-1-0',
+                'ext-ms-win-ntuser-window-l1-1-0.dll', 'ext-ms-win-kernel32-package-current-l1-1-0.dll',
+                'msvcrt.dll', 'msvcrt20.dll', 'msvcrt40.dll', 'msvcirt.dll', 'atl.dll', 'ucrtbase_clr0400.dll',
+                'msvcr120_clr0400.dll', 'ucrtbase_enclave.dll', 'C:' + B + 'Windows' + B + 'System32' + B + 'bcrypt.dll',
+                B*2 + '?' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'ntdll.dll', 'C:KERNEL32.dll',
+                'vcruntime.dll', 'mfc.dll', 'msvcr.dll', 'concrt.dll', 'vcomp.dll', 'My_Odd Name~1+(x).dll')],
+            # OS-shipped but flagged by the pre-existing vocabulary
+            *[(n, 'os-overcorrect') for n in ('msvcp60.dll', 'mfc42.dll', 'mfc42u.dll', 'vcruntime140_clr0400.dll', 'mfc40.dll')],
+        ]
+        malformed = [('tab', 'VCRUNTIME140.dll', b'\t'), ('trailing CR', 'VCRUNTIME140.dll', b'\r'),
+                     ('U+0130 dotted I', 'VCRUNTXXME140.dll', '\u0130'.encode()), ('U+212A Kelvin in KERNEL32', 'XXXERNEL32.dll', '\u212a'.encode()),
+                     ('NBSP trailing', 'VCRUNTIME140.dllXX', '\u00a0'.encode()), ('DEL', 'VCRUNTIME140.dll', b'\x7f')]
+
+        cases.extend([
+            # Additional drive/stream separators and suffix forms for this repair.
+            ('C:VCRUNTIME140', 'must-reject'),
+            ('c:vcruntime140.dll', 'must-reject'),
+            (r'C:x/..\VCRUNTIME140.dll', 'must-reject'),
+            ('C:x:y:MSVCP140.dll', 'must-reject'),
+            ('x:y:vcruntime140', 'must-reject'),
+            (r'\\?\C:VCRUNTIME140.dll', 'must-reject'),
+            ('C. :VCRUNTIME140.dll', 'must-reject'),
+            ('C:VCRUNTIME140.dll:stream:$DATA', 'must-reject'),
+            ('vcomp140d_app.dll', 'regex-gap'),
+            ('vccorlib140d_app.dll', 'regex-gap'),
+            ('vcamp140d_app.dll', 'regex-gap'),
+            ('msvcr120d_app.dll', 'regex-gap'),
+            ('msvcm80d.dll', 'regex-gap'),
+            ('msvci70d.dll', 'regex-gap'),
+            ('VCRUNTIME140..', 'must-reject'),
+            (r'C:\runtime\VCRUNTIME140', 'must-reject'),
+            ('api-ms-win-crt-runtime-l1-1-0.xyz', 'must-reject'),
+            ('api-ms-win-crt-runtime-l1-1-9.dll', 'must-reject'),
+            ('API-MS-WIN-CRT-HEAP-L1-1-0.foo', 'must-reject'),
+            ('msvcp60.dll', 'os'),
+            ('mfc40.dll', 'os'),
+            ('mfc42.dll', 'os'),
+            ('mfc42u.dll', 'os'),
+            ('msvcr120_clr0400.dll', 'os'),
+            ('vcruntime140_clr0400.dll', 'os'),
+            (r'C:\Windows\System32\mfc42.dll', 'os'),
+            ('C:mfc42.dll', 'os'),
+            (r'C:\Windows\System32\msvcp60.dll', 'os'),
+            ('C:msvcp60.dll', 'os'),
+            (r'C:\Windows\System32\vcruntime140_clr0400.dll', 'os'),
+            ('C:vcruntime140_clr0400.dll', 'os'),
+            (r'C:\Windows\System32\mfc40.dll', 'os'),
+            ('C:mfc40.dll', 'os'),
+            (r'C:\Windows\System32\mfc42u.dll', 'os'),
+            ('C:mfc42u.dll', 'os'),
+            (r'C:\Windows\System32\msvcr120_clr0400.dll', 'os'),
+            ('C:msvcr120_clr0400.dll', 'os'),
+            ('C:KERNEL32.dll', 'os'),
+            ('msvcirt.dll', 'os'),
+            ('ucrtbase_clr0400.dll', 'os'),
+            ('ucrtbase_enclave.dll', 'os'),
+        ])
         for pe32, delayed, legacy in modes:
-            for name in (*forbidden, *allowed):
-                expected = int(name in forbidden)
-                with self.subTest(pe32=pe32, delayed=delayed, legacy=legacy, name=name), tempfile.TemporaryDirectory() as temporary:
+            for name, kind in cases:
+                expected = int(kind in ('must-reject', 'regex-gap') or name == 'foo.dll:VCRUNTIME140.dll')
+                with self.subTest(pe32=pe32, delayed=delayed, legacy=legacy, name=name, kind=kind), tempfile.TemporaryDirectory() as temporary:
                     image = _pe(SYSTEM_IMPORTS if delayed else (name,),
                                 (name,) if delayed else (), pe32=pe32, legacy_delay=legacy)
-                    path = self.write(Path(temporary), "alias.exe", image)
+                    path = self.write(Path(temporary), 'alias.exe', image)
                     output, errors = io.StringIO(), io.StringIO()
                     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-                        self.assertEqual(release_packaging.main(["verify-windows-imports", str(path)]), expected)
+                        self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), expected)
                     if expected:
                         self.assertIn(repr(name), errors.getvalue())
+        for label, placeholder, raw in malformed:
+            for pe32, delayed, legacy in modes:
+                with self.subTest(pe32=pe32, delayed=delayed, legacy=legacy, malformed=label), tempfile.TemporaryDirectory() as temporary:
+                    base_name = placeholder if 'XX' in placeholder else placeholder + 'Q'
+                    image = _pe(SYSTEM_IMPORTS if delayed else (base_name,),
+                                (base_name,) if delayed else (), pe32=pe32, legacy_delay=legacy)
+                    encoded = base_name.encode('ascii')
+                    replacement = encoded.replace(b'X' * len(raw), raw, 1) if 'XX' in placeholder else encoded[:-1] + raw
+                    self.assertEqual(len(replacement), len(encoded))
+                    self.assertEqual(image.count(encoded + b'\0'), 1)
+                    image = image.replace(encoded + b'\0', replacement + b'\0')
+                    path = self.write(Path(temporary), 'malformed.exe', image)
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), 1)
 
     def test_every_redistributable_crt_import_fails(self):
         for forbidden in (

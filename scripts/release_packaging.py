@@ -635,11 +635,23 @@ def _verify_release_bundle(artifact: Path, target: str, *, legacy: bool) -> None
 # means the binary was linked against the dynamic CRT (/MD) at all. Unversioned
 # atl.dll and msvcrt.dll ship with Windows itself and stay allowed.
 FORBIDDEN_WINDOWS_IMPORT = re.compile(
-    r"(?:vcruntime\d+d?(?:_[a-z0-9_]+)?|msvcp\d+d?(?:_[a-z0-9_]+)?|msvcr\d+d?"
-    r"|ucrtbased?|api-ms-win-crt-[a-z0-9-]+|concrt\d+d?|vcomp\d+d?|vccorlib\d+d?"
-    r"|mfcm?\d+[a-z]*|atl\d+d?|vcamp\d+d?|libomp[a-z0-9_.-]*)\.dll",
+    r"(?:vcruntime\d+d?(?:_[a-z0-9_]+)?|msvcp\d+d?(?:_[a-z0-9_]+)?"
+    r"|msvcr\d+d?(?:_[a-z0-9_]+)?|msvcm\d+d?|msvci\d+d?"
+    r"|ucrtbased?|api-ms-win-crt-[a-z0-9-]+|concrt\d+d?(?:_[a-z0-9_]+)?"
+    r"|vcomp\d+d?(?:_[a-z0-9_]+)?|vccorlib\d+d?(?:_[a-z0-9_]+)?"
+    r"|mfcm?\d+[a-z]*|atl\d+d?|vcamp\d+d?(?:_[a-z0-9_]+)?"
+    r"|libomp[a-z0-9_.-]*)\.dll",
     re.IGNORECASE,
 )
+# Exact OS-provided DLLs that resemble redistributable VC++ runtime names.
+WINDOWS_SYSTEM_RUNTIME_IMPORTS = {
+    "msvcp60.dll",  # Windows System32 VC6 C++ compatibility runtime, not a VC++ redist dependency.
+    "mfc40.dll",  # Windows System32 MFC 4.0 compatibility DLL, not a VC++ redist dependency.
+    "mfc42.dll",  # Windows System32 MFC 4.2 compatibility DLL, not a VC++ redist dependency.
+    "mfc42u.dll",  # Windows System32 Unicode MFC 4.2 DLL, not a VC++ redist dependency.
+    "msvcr120_clr0400.dll",  # Windows .NET Framework CLR VC12 runtime, not a VC++ redist dependency.
+    "vcruntime140_clr0400.dll",  # Windows .NET Framework 4.8 CLR VC14 runtime, not a VC++ redist dependency.
+}
 _PE_IMPORT_DIRECTORY = 1
 _PE_DELAY_IMPORT_DIRECTORY = 13
 _PE_IMPORT_NAME_WINDOW = 512
@@ -793,13 +805,15 @@ def forbidden_windows_imports(imports: dict[str, list[str]]) -> list[str]:
         # Win32 path normalization (collapse_path / RtlDosPathNameToNtPathName)
         # trims spaces and dots and collapses path segments. Check every segment
         # conservatively so a path alias cannot hide a loadable CRT import.
-        for segment in re.split(r"[/\\]", name.rstrip(" ")):
-            component = segment.split(":", 1)[0].rstrip(" .")
+        for segment in re.split(r"[/\\:]", name.rstrip(" ")):
+            component = segment.rstrip(" .")
             if not component or component in (".", ".."):
                 continue
             component = component.casefold()
             if "." not in component:
                 component += ".dll"
+            if component in WINDOWS_SYSTEM_RUNTIME_IMPORTS:
+                continue
             # Wine's get_apiset_entry ignores the suffix after the last hyphen
             # and stops at the first dot; only the CRT API-set family is banned.
             if component.startswith("api-ms-win-crt-") or FORBIDDEN_WINDOWS_IMPORT.fullmatch(component):
