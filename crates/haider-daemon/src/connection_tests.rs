@@ -2729,3 +2729,66 @@ fn legacy_event_strips_typed_tool_activity_but_modern_keeps_it() {
         assert!(!bytes.windows(7).any(|part| part == b"activit"));
     }
 }
+
+#[test]
+fn legacy_recovery_event_keeps_the_previous_network_shape() {
+    use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EffectId, EventId, SessionId};
+    let intent = EffectIntent {
+        effect: EffectId::new("provider-admission-r-1"),
+        class: EffectClass::ProviderTransport,
+        summary: "provider request attempt 1 admitted before daemon restart".into(),
+        args_digest: "sha256:0".into(),
+        workspace_revision: None,
+    };
+    let event = |class| WireFrame::Event {
+        attachment_id: AttachmentId::new("a"),
+        session_id: SessionId::new("s"),
+        envelope: EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("e"),
+            seq: 1,
+            session_id: SessionId::new("s"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("d"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(haider_protocol::EventPayload::Effect(
+                EffectPhase::Intent(EffectIntent {
+                    class,
+                    ..intent.clone()
+                }),
+            ))
+            .unwrap()
+            .into(),
+        },
+    };
+    let modern = event(EffectClass::ProviderTransport);
+    let historical = event(EffectClass::Network {
+        host: "provider-request".into(),
+    });
+    let mut legacy = modern.clone();
+    omit_fleet_identity(&mut legacy);
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        assert_eq!(
+            uds_codec::encode_with(&legacy, 1_048_576, encoding).unwrap(),
+            uds_codec::encode_with(&historical, 1_048_576, encoding).unwrap(),
+        );
+    }
+    assert!(
+        serde_json::to_string(&modern)
+            .unwrap()
+            .contains("provider_transport")
+    );
+}

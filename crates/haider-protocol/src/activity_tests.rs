@@ -433,6 +433,30 @@ fn gate_v1_completed_untyped_server_names_never_set_activity() {
 }
 
 #[test]
+fn failed_typed_rows_do_not_enter_history() {
+    for status in [
+        ToolStatus::Failed,
+        ToolStatus::Rejected,
+        ToolStatus::Cancelled,
+        ToolStatus::Unknown,
+        ToolStatus::Conflict,
+    ] {
+        let mut event = tool_item("typed", "Run tests", status, true);
+        if let EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::ToolCall { activity, .. },
+            ..
+        }) = &mut event
+        {
+            *activity = Some(ActivityKind::Run);
+        }
+        let mut tracker = ActivityTracker::new();
+        tracker.observe(&event, 50);
+        assert_eq!(tracker.current(50, false), None, "{status:?}");
+        assert!(tracker.used().is_empty(), "{status:?}");
+    }
+}
+
+#[test]
 fn gate_v4_provider_transport_recovery_has_no_agent_activity() {
     let effect = EffectId::new("provider-admission-run-1");
     let mut tracker = ActivityTracker::new();
