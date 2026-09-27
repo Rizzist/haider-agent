@@ -220,7 +220,9 @@ fn store_unwritable_banner_state_is_persistent_until_healthy_edge() {
 
 #[test]
 fn post_start_microphone_failure_uses_typed_voice_status_and_preserves_ghost() {
-    let mut model = AppModel::new();
+    let mut model = common::launcher_model();
+    let session = common::session_named(&model, "billing-service");
+    model.open_session(&session);
     model.talk.phase = haider_tui::talk::TalkPhase::Listening;
     model.talk.ghost = "unsent words".into();
     model.handle_talk(haider_tui::talk::TalkEvent::Health {

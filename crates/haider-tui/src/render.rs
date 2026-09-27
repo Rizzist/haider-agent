@@ -1389,28 +1389,37 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Sessions => render_sessions(model, theme, frame, body, &mut hits),
         }
     }
-    if model.tool_detail.is_some() {
-        render_tool_detail(model, theme, frame, body, &mut hits);
-    } else if model.inbox_open {
-        render_inbox(model, theme, frame, body);
-        hits.clear();
-    } else if model.help_open {
-        render_help(model, theme, frame, body);
-        hits.clear();
-    } else if model.shells_open {
-        render_shells_overlay(model, theme, frame, body, &mut hits);
-    } else if model.ssh_open {
-        render_ssh_overlay(model, theme, frame, body, &mut hits);
-    } else if model.monitors_open {
-        render_monitors_overlay(model, theme, frame, body, &mut hits);
-    }
-    if model.lockdown_overlay {
-        render_lockdown_overlay(model, theme, frame, body);
-        hits.clear();
+    match model.input_owner() {
+        crate::app::InputOwner::Lockdown => {
+            render_lockdown_overlay(model, theme, frame, body);
+            hits.clear();
+        }
+        crate::app::InputOwner::ToolDetail => {
+            render_tool_detail(model, theme, frame, body, &mut hits)
+        }
+        crate::app::InputOwner::Inbox => {
+            render_inbox(model, theme, frame, body);
+            hits.clear();
+        }
+        crate::app::InputOwner::Help => {
+            render_help(model, theme, frame, body);
+            hits.clear();
+        }
+        crate::app::InputOwner::Shells => {
+            render_shells_overlay(model, theme, frame, body, &mut hits)
+        }
+        crate::app::InputOwner::SshList | crate::app::InputOwner::SshForm => {
+            render_ssh_overlay(model, theme, frame, body, &mut hits)
+        }
+        crate::app::InputOwner::Monitors => {
+            render_monitors_overlay(model, theme, frame, body, &mut hits)
+        }
+        _ => {}
     }
     if status_height > 0 {
         render_status_bar(model, theme, frame, status, &mut hits);
     }
+    hits.retain(|(_, hit)| model.hit_owned(hit));
     // The in-app selection highlight (owner item 9) paints LAST, over
     // every widget on every screen — a screen-space overlay, ground only
     // (the hover-band law: selBg shifts the ground, never the ink).
@@ -6145,7 +6154,10 @@ fn render_session(
     // turns menu answers into typed secret bytes (a `1` meant for an
     // option landed in the mask; Enter staged a garbage credential). The
     // menu waits, unrendered and unclickable, until the card closes.
-    let menu = if model.login.is_some() {
+    let menu = if matches!(
+        model.input_owner(),
+        crate::app::InputOwner::Login | crate::app::InputOwner::TalkSetup
+    ) {
         None
     } else {
         // A zero-option ask never REPLACES the composer — the composer is
@@ -6156,7 +6168,10 @@ fn render_session(
             .open_menu()
             .filter(|menu| !menu.options.is_empty())
     };
-    let ask_menu = if model.login.is_some() {
+    let ask_menu = if matches!(
+        model.input_owner(),
+        crate::app::InputOwner::Login | crate::app::InputOwner::TalkSetup
+    ) {
         None
     } else {
         model
@@ -6838,12 +6853,14 @@ fn render_session(
     // D4: an open `plan` proposal owns the transcript area — the full
     // markdown document renders here (scrolled), while the decision menu
     // keeps the composer band through the ordinary blocking-menu path.
-    let plan_menu = model
-        .projection
-        .open_menu()
-        .filter(|open| open.origin == "plan" && !open.options.is_empty() && model.login.is_none());
+    let plan_menu = model.projection.open_menu().filter(|open| {
+        open.origin == "plan"
+            && !open.options.is_empty()
+            && model.login.is_none()
+            && model.talk_setup.is_none()
+    });
     let file_review_menu = model.projection.open_menu().and_then(|open| {
-        if open.options.is_empty() || model.login.is_some() {
+        if open.options.is_empty() || model.login.is_some() || model.talk_setup.is_some() {
             return None;
         }
         let review = crate::app::menu_file_review(open)?;
@@ -6929,7 +6946,6 @@ fn render_session(
             transcript_area,
             hits,
         );
-        render_transcript_search(model, theme, frame, transcript_area);
     }
     // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
     // while scrolled into history, pin the user prompt that produced the
@@ -7049,6 +7065,16 @@ fn render_session(
         // First-match dispatch: the chip paints over the transcript row
         // beneath it, so its hit must lead (the sticky-band precedent).
         hits.insert(0, (band_rect, Hit::JumpToBottom));
+    }
+
+    // Search owns the transcript's top row, including when a sticky prompt
+    // would otherwise be painted there. Retire every covered target after
+    // all transcript chrome has populated the map.
+    if model.input_owner() == crate::app::InputOwner::Search && transcript_area.height > 0 {
+        hits.retain(|(rect, _)| {
+            rect.y > transcript_area.y || rect.y + rect.height <= transcript_area.y
+        });
+        render_transcript_search(model, theme, frame, transcript_area);
     }
 
     if let Some(todos) = model.projection.todos().filter(|t| t.pinned) {
@@ -7378,6 +7404,7 @@ fn render_session(
     }
 
     if model.login.is_none()
+        && model.talk_setup.is_none()
         && let Some(card) = model.projection.permission_card()
     {
         // The computer OS-permission grant card takes the blocking-menu slot,
@@ -11095,7 +11122,10 @@ fn render_subagent(
     };
     // The login card outranks the chip's question card on the band too
     // (TUI6.2c finding 3, same law as the session menu).
-    let menu = if model.login.is_some() {
+    let menu = if matches!(
+        model.input_owner(),
+        crate::app::InputOwner::Login | crate::app::InputOwner::TalkSetup
+    ) {
         None
     } else {
         chip.question_menu()
@@ -12691,17 +12721,7 @@ const THEME_PICKER_ROWS: u16 = 8;
 /// that hosts it, with no daemon card holding the input slot (the menu /
 /// ask branches outrank it — local chrome never sits on a live ask).
 fn theme_picker_showing(model: &AppModel) -> bool {
-    model.theme_picker.is_some()
-        && matches!(
-            model.screen,
-            Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
-        )
-        && model.projection.open_menu().is_none()
-        && model.login.is_none()
-        && !(model.screen == Screen::Subagent
-            && model
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
+    model.input_owner() == crate::app::InputOwner::ThemePicker
 }
 
 /// The `/theme` picker (owner spec §3): a numbered arrow-highlight card in
@@ -12793,14 +12813,7 @@ fn render_theme_picker(
 /// session surface, with no daemon card holding the input slot — the same
 /// outranking law as `/theme`.
 fn effort_picker_showing(model: &AppModel) -> bool {
-    model.effort_picker.is_some()
-        && matches!(model.screen, Screen::Session | Screen::Subagent)
-        && model.projection.open_menu().is_none()
-        && model.login.is_none()
-        && !(model.screen == Screen::Subagent
-            && model
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
+    model.input_owner() == crate::app::InputOwner::EffortPicker
 }
 
 /// Rows the `/effort` picker card needs: title + body + the option rows +

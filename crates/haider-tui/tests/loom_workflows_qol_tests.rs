@@ -1084,11 +1084,19 @@ fn pending_authoring_locks_edits_and_navigation() {
 
     model.handle(key(KeyCode::Char('x')));
     model.handle(AppEvent::Paste("replacement".to_owned().into()));
-    model.handle(ctrl(KeyCode::Char('c')));
+    // Escape is owner-scoped; Ctrl+C is deliberately global across owners.
+    model.handle(key(KeyCode::Esc));
     model.handle_hit(Hit::GraphStrip);
     assert_eq!(model.composer.text(), "submitted bytes");
     assert_eq!(model.screen, Screen::Loom);
     assert!(model.loom_authoring.as_ref().expect("authoring").pending);
+
+    model.handle(ctrl(KeyCode::Char('c')));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert_eq!(
+        model.drafts.get(&DraftKey::Loom).map(Composer::text),
+        Some("submitted bytes")
+    );
 }
 
 #[test]
@@ -1171,11 +1179,10 @@ fn correlated_authoring_replies_update_the_parked_editor_offscreen() {
     assert!(!model.loom_authoring.as_ref().expect("authoring").pending);
 }
 
-/// MUTATION CHECK: remove the parked session text or bypass the Loom-to-graph
-/// surface swap. Expected runtime failure: either the restored live composer
-/// or the parked Loom draft assertion changes.
+/// A stale Session graph-strip hit cannot navigate from Loom. Global
+/// navigation still parks its editor and the bound session can be restored.
 #[test]
-fn graph_strip_parks_nonpending_loom_text_and_restores_the_session_draft() {
+fn stale_graph_strip_cannot_navigate_loom_and_global_exit_preserves_drafts() {
     let mut model = live_bound_model();
     model.graph = Some(active_graph());
     let session_key = DraftKey::Session(model.ui_generation());
@@ -1188,7 +1195,12 @@ fn graph_strip_parks_nonpending_loom_text_and_restores_the_session_draft() {
     model.composer.set_text("loom typed text");
 
     model.handle_hit(Hit::GraphStrip);
-    assert_eq!(model.screen, Screen::Graph);
+    assert_eq!(model.screen, Screen::Loom);
+    assert_eq!(model.composer.text(), "loom typed text");
+    model.handle(ctrl(KeyCode::Char('c')));
+    assert_eq!(model.screen, Screen::Launcher);
+    model.open_session(&sid());
+    assert_eq!(model.screen, Screen::Session);
     assert_eq!(model.composer.text(), "unfinished session prompt");
     assert_eq!(
         model.drafts.get(&DraftKey::Loom).map(Composer::text),

@@ -980,6 +980,19 @@ impl LiveDriver {
             }];
         }
 
+        // A covered composer must never re-publish its parked bytes. A
+        // retained foreign edit is applied by the mutable-model seam before
+        // this comparison, so OLD cannot overwrite NEW on the first frame.
+        if !model.accepts_injected_input()
+            || self
+                .input_mirror
+                .sessions
+                .get(&session)
+                .is_some_and(|state| state.pending.is_some())
+        {
+            return Vec::new();
+        }
+
         let text = model.composer.text();
         let attachments = if model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1) {
             model
@@ -1107,19 +1120,59 @@ impl LiveDriver {
         if floor.is_some_and(|floor| input.revision <= floor) {
             return;
         }
-        state.foreign_floors.insert(input.owner, input.revision);
-        // The mirror now equals the surface: block an immediate republish.
+        if !model.accepts_injected_input() {
+            if state.pending.as_ref().is_none_or(|pending| {
+                pending.input.owner != input.owner || input.revision > pending.input.revision
+            }) {
+                state.pending = Some(PendingForeignInput {
+                    input,
+                    epoch: self.connection_epoch,
+                });
+            }
+            model.mirror_waiting_for_owner = true;
+            return;
+        }
+        if state.pending.as_ref().is_some_and(|pending| {
+            pending.input.owner == input.owner && input.revision < pending.input.revision
+        }) {
+            return;
+        }
+        state.pending = None;
+        state
+            .foreign_floors
+            .insert(input.owner.clone(), input.revision);
         state.published = Some(PublishedSurfaceInput {
             text: input.text.clone(),
             attachments: attachments.clone(),
         });
-        // rev934 P3-5: the same predicate that gates injected ops gates a
-        // remote replace — an in-progress modal answer is never overwritten.
+        model.mirror_waiting_for_owner = false;
+        model.set_mirrored_input_attachments(session, attachments);
+        model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
+    }
+
+    /// Deliver a refused replacement only once its Session composer is the
+    /// visible owner again. Reconnects and closed sessions drop the slot.
+    pub fn apply_pending_input(&mut self, model: &mut AppModel) {
         if !model.accepts_injected_input() {
             return;
         }
-        model.set_mirrored_input_attachments(session, attachments);
-        model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
+        let Some(session) = model.active_session.clone() else {
+            model.mirror_waiting_for_owner = false;
+            return;
+        };
+        let pending = self
+            .input_mirror
+            .sessions
+            .get_mut(&session)
+            .and_then(|state| state.pending.take());
+        if let Some(pending) = pending
+            && pending.epoch == self.connection_epoch
+            && self.input_mirror.epoch == pending.epoch
+        {
+            self.apply_surface_input(model, session, pending.input);
+        }
+        model.mirror_waiting_for_owner = false;
+        model.deliver_pending_dictation();
     }
 }
 
@@ -2107,6 +2160,14 @@ struct InputMirrorSession {
     /// compare only within one owner — never against our own publish counter
     /// (rev934 P1-1).
     foreign_floors: HashMap<String, u64>,
+    /// Latest refused foreign edit. It has not advanced any applied floor.
+    pending: Option<PendingForeignInput>,
+}
+
+#[derive(Debug)]
+struct PendingForeignInput {
+    input: haider_rpc::SurfaceInputWire,
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

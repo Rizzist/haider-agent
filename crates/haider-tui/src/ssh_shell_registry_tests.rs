@@ -195,6 +195,7 @@ fn ssh_form_masks_and_redacts_password_before_staging() {
     form.user = "deploy".into();
     form.auth = SshFormAuthKind::Password;
     form.focus = 6;
+    model.ssh_open = true;
     model.ssh_form = Some(form);
     model.ssh_form_paste(sentinel);
 
@@ -228,6 +229,7 @@ fn ssh_form_allows_plain_s_in_cwd_without_submitting() {
     form.user = "deploy".into();
     form.credential = "/keys/prod".into();
     form.focus = 7;
+    model.ssh_open = true;
     model.ssh_form = Some(form);
 
     model.handle_key(key(KeyCode::Char('s')), std::time::Instant::now());

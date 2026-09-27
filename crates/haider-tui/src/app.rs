@@ -252,6 +252,46 @@ pub enum Screen {
     Loom,
 }
 
+/// The topmost surface that may consume input in the current frame.
+/// Render and every input path derive their precedence from this value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputOwner {
+    Lockdown,
+    ToolDetail,
+    Inbox,
+    Help,
+    Shells,
+    SshList,
+    Monitors,
+    SshTerminal,
+    SshForm,
+    ModelPicker,
+    Login,
+    TalkSetup,
+    CustomProviderForm,
+    AccountsReplace,
+    SessionMenu,
+    SubagentQuestion,
+    PlanDoc,
+    FileReviewDoc,
+    Search,
+    EffortPicker,
+    ThemePicker,
+    HistoryChooser,
+    FleetMemberDetail,
+    Screen(Screen),
+    Composer(Screen),
+}
+
+#[derive(Debug)]
+struct PendingDictation {
+    session: SessionId,
+    ui_generation: UiGeneration,
+    talk_generation: u64,
+    text: zeroize::Zeroizing<String>,
+    downgraded_submit: bool,
+}
+
 /// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
 #[must_use]
 pub fn auth_label(method: haider_protocol::credential::AuthMethod) -> &'static str {
@@ -5361,6 +5401,11 @@ pub struct AppModel {
     /// T2 — the LIVE talk state machine (phase, generation, ghost
     /// assembly, wave ring). Demo mode never engages it.
     pub talk: crate::talk::TalkState,
+    talk_origin: Option<(SessionId, UiGeneration, u64)>,
+    pending_dictation: Option<PendingDictation>,
+    /// A refused mirror edit must apply before any retained dictation, so a
+    /// foreign replacement cannot erase words just delivered to the draft.
+    pub(crate) mirror_waiting_for_owner: bool,
     /// The `/talk` setup card, while open. Owns the input band and the
     /// keyboard (the login-card modality) — the Deepgram key never
     /// reaches the composer.
@@ -6021,6 +6066,9 @@ impl Default for AppModel {
             voice: VoiceState::default(),
             listening: false,
             talk: crate::talk::TalkState::default(),
+            talk_origin: None,
+            pending_dictation: None,
+            mirror_waiting_for_owner: false,
             talk_setup: None,
             talk_config: haider_stt::config::TranscriptionConfig::default(),
             talk_config_error: None,
@@ -6426,12 +6474,17 @@ impl AppModel {
     /// The terminal consumes its own paste gesture OR forwards input to us;
     /// when forwarded, text must be inserted here as well as images.
     pub fn request_clipboard_paste(&mut self) {
-        let text_field = self.login.is_some()
-            || self.talk_setup.is_some()
-            || self.custom_add.is_some()
-            || self.ssh_form.is_some()
-            || self.ssh_terminal.is_some();
-        if !text_field && !self.clipboard_composer_visible() {
+        if !matches!(
+            self.input_owner(),
+            InputOwner::Composer(_)
+                | InputOwner::Search
+                | InputOwner::ModelPicker
+                | InputOwner::Login
+                | InputOwner::TalkSetup
+                | InputOwner::CustomProviderForm
+                | InputOwner::SshForm
+                | InputOwner::SshTerminal
+        ) {
             return;
         }
         self.requests.push(AppRequest::ClipboardRead);
@@ -6574,14 +6627,9 @@ impl AppModel {
             self.close_login_card();
             self.flash = Some("· /login cancelled — the surface changed".to_owned());
         }
-        // T2: talk is surface-local exactly like the login card — a live
-        // session (or the setup card) dies with the surface it borrowed
-        // the band from. Cancel is DISCARD by contract (Esc law), and the
-        // generation bump makes every late runtime event stale.
-        if self.talk.engaged() {
-            self.talk_cancel();
-            self.flash = Some("· ◉ talk cancelled — the surface changed".to_owned());
-        }
+        // A login card borrows this same Session draft through this seam.
+        // Moving it into a card must not cancel dictation; identity-changing
+        // callers retire talk explicitly before they stash.
         if self.talk_setup.is_some() {
             self.talk_setup = None;
             self.flash = Some("· /talk setup closed — the surface changed".to_owned());
@@ -6637,19 +6685,26 @@ impl AppModel {
     /// sites outside this function are enumerated on the `screen` field's
     /// doc (the founding donation and the two identity-flip split seams).
     pub(crate) fn switch_surface(&mut self, to: Screen) {
+        self.composer_drag = false;
         self.close_backtrack();
         self.retire_surface_overlays();
         let from = self.screen;
         let from_key = self.surface_key();
         self.screen = to;
         if self.surface_key() == from_key {
+            self.deliver_pending_dictation();
             return;
         }
         // Keys differ: rewind, then swap with the REAL key on each side.
         self.screen = from;
+        if self.talk.engaged() {
+            self.talk_cancel();
+            self.flash = Some("· ◉ talk cancelled — the surface changed".to_owned());
+        }
         self.stash_draft();
         self.screen = to;
         self.restore_draft();
+        self.deliver_pending_dictation();
     }
 
     /// The session's display name — the slug (sim `session.name`), never
@@ -7364,6 +7419,7 @@ impl AppModel {
     }
 
     fn open_transcript_search(&mut self) {
+        self.composer_drag = false;
         self.transcript_search = Some(TranscriptSearch::default());
         self.dirty = true;
     }
@@ -7549,6 +7605,18 @@ impl AppModel {
 
     /// Deterministic clock seam for rapid Esc backtracking laws.
     pub fn handle_at(&mut self, event: AppEvent, now: std::time::Instant) {
+        let previous_owner = self.input_owner();
+        self.handle_at_inner(event, now);
+        if self.input_owner() != previous_owner {
+            self.composer_drag = false;
+        }
+        self.deliver_pending_dictation();
+    }
+
+    fn handle_at_inner(&mut self, event: AppEvent, now: std::time::Instant) {
+        if !self.composer_owns_input() {
+            self.composer_drag = false;
+        }
         match event {
             AppEvent::Key(key) => {
                 self.dirty = true;
@@ -7558,6 +7626,32 @@ impl AppModel {
                 // moving on. Cleared BEFORE dispatch so the very key that
                 // raises a new one (⌃V) still shows it.
                 self.composer_notice = None;
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('t' | 'T') => {
+                            self.cycle_theme();
+                            return;
+                        }
+                        KeyCode::Char('c' | 'C')
+                            if !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            if self.composer_owns_input() && self.selection_key(&key) {
+                                return;
+                            }
+                            self.selection = None;
+                            match self.screen {
+                                Screen::Launcher | Screen::Boot => {
+                                    self.retire_surface_overlays();
+                                    self.close_login_card();
+                                    self.should_quit = true;
+                                }
+                                _ => self.back_to_launcher(),
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 // If the terminal forwards its paste chord, fetch the OS
                 // clipboard before a modal can ignore it or type a literal
                 // 'v'. Text re-enters the existing zeroizing Paste route,
@@ -7572,6 +7666,16 @@ impl AppModel {
                     self.request_clipboard_paste();
                     return;
                 }
+                // Chords without an owner-specific text action never fall
+                // through to the parked composer or to a covered chooser.
+                if key.modifiers == KeyModifiers::CONTROL
+                    && !self.composer_owns_input()
+                    && self.input_owner() != InputOwner::SshTerminal
+                    && !(self.input_owner() == InputOwner::ToolDetail
+                        && key.code == KeyCode::Char('o'))
+                {
+                    return;
+                }
                 // 971 F1(a), verify round 1 (Astra: PageDown and the wheel
                 // died inside the DeepSeek key card at both sizes): the
                 // roster's PAGING gestures are screen navigation, not form
@@ -7579,7 +7683,16 @@ impl AppModel {
                 // the paging pair is taken — Home/End are caret keys inside
                 // the custom card's fields, and every printable key stays
                 // private to the form that is holding it.
-                if self.accounts_scroll_gesture(key.code) {
+                if self.screen == Screen::Accounts
+                    && matches!(
+                        self.input_owner(),
+                        InputOwner::Screen(Screen::Accounts)
+                            | InputOwner::AccountsReplace
+                            | InputOwner::Login
+                            | InputOwner::CustomProviderForm
+                    )
+                    && self.accounts_scroll_gesture(key.code)
+                {
                     return;
                 }
                 // 971 F1(b): the one-line "replace the pending form?"
@@ -7587,7 +7700,7 @@ impl AppModel {
                 // it answers a gesture the user just made on that card's
                 // own surface, so the card must not read ⏎ as a commit of
                 // the secret it is still holding.
-                if self.screen == Screen::Accounts && self.accounts.pending_replace.is_some() {
+                if self.input_owner() == InputOwner::AccountsReplace {
                     self.accounts_replace_key(key.code);
                     return;
                 }
@@ -7595,14 +7708,14 @@ impl AppModel {
                 // (W3c3 M3): a key must never reach the composer, the
                 // palette, the input ring or a selection gate, because
                 // every one of those would keep a copy of it.
-                if self.login.is_some() {
+                if self.input_owner() == InputOwner::Login {
                     self.login_key(&key);
                     return;
                 }
                 // The `/talk` setup card owns the keyboard while open
                 // (same modality: the Deepgram key must never reach the
                 // composer, the palette or the input ring).
-                if self.talk_setup.is_some() {
+                if self.input_owner() == InputOwner::TalkSetup {
                     self.talk_setup_key(&key);
                     return;
                 }
@@ -7614,7 +7727,7 @@ impl AppModel {
                 // tool detail view outranks it: Esc/⏎ close the view and a
                 // typed key must not commit the transcript into the hidden
                 // draft (973-tui-toolview-fixes).
-                if self.tool_detail.is_none() && self.talk.engaged() && self.talk_key(&key) {
+                if self.composer_owns_input() && self.talk.engaged() && self.talk_key(&key) {
                     return;
                 }
                 // Windows/Linux copy chord. Handle both case spellings
@@ -7623,9 +7736,18 @@ impl AppModel {
                 if matches!(key.code, KeyCode::Char('c' | 'C'))
                     && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
                 {
-                    if self.selection.is_some() {
+                    // A screen-space selection from a covered frame is not
+                    // an invitation to copy what the modal painted over it.
+                    if self.selection.is_some()
+                        && matches!(
+                            self.input_owner(),
+                            InputOwner::Composer(_)
+                                | InputOwner::Screen(_)
+                                | InputOwner::ToolDetail
+                        )
+                    {
                         self.requests.push(AppRequest::CopySelection);
-                    } else if self.clipboard_composer_visible() {
+                    } else if self.composer_owns_input() {
                         self.selection_key(&key);
                     }
                     return;
@@ -7650,66 +7772,78 @@ impl AppModel {
                 // draft content by intent, retained exactly as long as
                 // the draft itself.
                 let text = text.as_str();
-                if self.ssh_terminal.is_some() {
-                    if let Some(id) = self
-                        .ssh_terminal
-                        .as_ref()
-                        .and_then(|terminal| terminal.shell_id.clone())
-                    {
-                        self.queue_ssh_terminal_input(&id, text.as_bytes());
-                    }
-                    return;
-                }
-                if self.ssh_form.is_some() {
-                    self.ssh_form_paste(text);
-                    return;
-                }
-                // Keys are pasted more often than typed; the paste lands in
-                // the masked buffer and NOWHERE else (no pill token, no
-                // draft, no ring).
-                if let Some(card) = self.login.as_mut() {
-                    card.push_str(text);
-                    return;
-                }
-                // The custom-provider card owns paste exactly as it owns
-                // typing. Insert at its character-indexed caret; demo cards
-                // remain the sim's non-editable fabrication menu.
-                if let Some(card) = self.custom_add.as_mut() {
-                    if !self.mode.fabricates_locally() {
-                        for character in text.chars() {
-                            insert_custom_card_character(card, character);
+                match self.input_owner() {
+                    InputOwner::SshTerminal => {
+                        if let Some(id) = self
+                            .ssh_terminal
+                            .as_ref()
+                            .and_then(|terminal| terminal.shell_id.clone())
+                        {
+                            self.queue_ssh_terminal_input(&id, text.as_bytes());
                         }
+                        return;
                     }
-                    return;
-                }
-                // The `/talk` setup card: paste lands in the FOCUSED field
-                // (the key buffer or the language field) and nowhere else.
-                if let Some(card) = self.talk_setup.as_mut() {
-                    match card.stage {
-                        crate::talk::SetupStage::DeepgramKey => card.key_push_str(text),
-                        crate::talk::SetupStage::Language => {
-                            for c in text.trim().chars() {
-                                if c.is_ascii_alphanumeric() || c == '-' {
-                                    card.language.push(c);
-                                }
+                    InputOwner::SshForm => {
+                        self.ssh_form_paste(text);
+                        return;
+                    }
+                    InputOwner::Login => {
+                        if let Some(card) = self.login.as_mut() {
+                            card.push_str(text);
+                        }
+                        return;
+                    }
+                    InputOwner::CustomProviderForm => {
+                        if !self.mode.fabricates_locally()
+                            && let Some(card) = self.custom_add.as_mut()
+                        {
+                            for character in text.chars() {
+                                insert_custom_card_character(card, character);
                             }
                         }
-                        _ => {}
+                        return;
                     }
-                    return;
-                }
-                // The ⌃O tool detail view is read-only and covers the
-                // composer: a paste has no visible target, so it is
-                // DISCARDED (zeroized with `text`) and said so, never
-                // inserted into the parked draft nor held for later
-                // (973-tui-toolview-fixes; UX rationale in the lane record:
-                // a deferred insert would land text the user can no longer
-                // see being chosen, possibly a secret, after the view closes).
-                if self.tool_detail.is_some() {
-                    self.flash = Some(
-                        "· paste ignored — the detail view is read-only (esc to return)".to_owned(),
-                    );
-                    return;
+                    InputOwner::TalkSetup => {
+                        if let Some(card) = self.talk_setup.as_mut() {
+                            match card.stage {
+                                crate::talk::SetupStage::DeepgramKey => card.key_push_str(text),
+                                crate::talk::SetupStage::Language => {
+                                    for c in text.trim().chars() {
+                                        if c.is_ascii_alphanumeric() || c == '-' {
+                                            card.language.push(c);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        return;
+                    }
+                    InputOwner::Search => {
+                        if let Some(search) = self.transcript_search.as_mut() {
+                            search.query.push_str(text);
+                            search.selected = 0;
+                        }
+                        self.refresh_transcript_search();
+                        return;
+                    }
+                    InputOwner::ModelPicker => {
+                        if let Some(picker) = self.model_picker.as_mut() {
+                            picker.query.push_str(text);
+                            picker.selection = 0;
+                        }
+                        return;
+                    }
+                    InputOwner::Composer(_) => {}
+                    owner => {
+                        self.flash = Some(if owner == InputOwner::ToolDetail {
+                            "· paste ignored — the detail view is read-only (esc to return)"
+                                .to_owned()
+                        } else {
+                            "· paste ignored — this view has no text field".to_owned()
+                        });
+                        return;
+                    }
                 }
                 // T2: pasting while a talk session is engaged COMMITS the
                 // partial transcript first (the typing-commits law), then
@@ -7718,16 +7852,6 @@ impl AppModel {
                     self.talk_commit_to_composer();
                 }
                 self.close_backtrack();
-                // While a blocking menu replaces the composer, paste has no
-                // target (r2 P2).
-                if self.screen == Screen::Session
-                    && self
-                        .projection
-                        .open_menu()
-                        .is_some_and(|menu| !menu.options.is_empty())
-                {
-                    return;
-                }
                 if self.screen == Screen::Loom {
                     if self
                         .loom_authoring
@@ -7766,7 +7890,7 @@ impl AppModel {
             AppEvent::SurfaceInputReplace { text } => {
                 // The Loom editor is a dedicated local surface. A volatile
                 // session-input mirror must never replace its bytes.
-                if self.screen == Screen::Loom {
+                if !self.accepts_injected_input() {
                     return;
                 }
                 self.composer.set_text(text);
@@ -7870,7 +7994,7 @@ impl AppModel {
     ) {
         // The detail view covers the composer; a one-frame-stale composer
         // hit must not move the parked draft's caret or selection.
-        if self.tool_detail.is_some() {
+        if !self.composer_owns_input() {
             return;
         }
         // TUI6.1 fix 1: the epoch gate joins the surface/revision gates —
@@ -7896,7 +8020,7 @@ impl AppModel {
     /// Drag with the button held after a composer press: the caret (the
     /// selection's active end) follows the pointer.
     pub fn composer_drag_to(&mut self, byte: usize) {
-        if !self.composer_drag || self.tool_detail.is_some() {
+        if !self.composer_drag || !self.composer_owns_input() {
             return;
         }
         self.composer.drag_to(byte);
@@ -7911,6 +8035,9 @@ impl AppModel {
             return;
         }
         self.composer_drag = false;
+        if !self.composer_owns_input() {
+            return;
+        }
         if let Some(text) = self.composer.selected_text() {
             self.requests.push(AppRequest::CopyText(text.to_owned()));
         }
@@ -8164,8 +8291,10 @@ impl AppModel {
                     self.dirty = true;
                 } else if self.fleet.stack.pop().is_none() {
                     self.switch_surface(Screen::Session);
+                    self.fleet.sel = 0;
+                } else {
+                    self.fleet.sel = 0;
                 }
-                self.fleet.sel = 0;
             }
             KeyCode::Enter => {
                 // From a member's detail frame, ⏎ opens the FULL transcript
@@ -8186,14 +8315,18 @@ impl AppModel {
             }
             // The destroy step — detail-frame only, always two presses.
             KeyCode::Char('d') => self.fleet_kill_step(),
-            KeyCode::Up | KeyCode::Char('k') => self.fleet_move(-stride),
-            KeyCode::Down | KeyCode::Char('j') => self.fleet_move(stride),
-            KeyCode::Left if grid => self.fleet_move(-1),
-            KeyCode::Right if grid => self.fleet_move(1),
-            KeyCode::PageUp => self.fleet_move(-(page * stride)),
-            KeyCode::PageDown => self.fleet_move(page * stride),
-            KeyCode::Home => self.fleet.sel = 0,
-            KeyCode::End => {
+            KeyCode::Up | KeyCode::Char('k') if self.fleet.detail.is_none() => {
+                self.fleet_move(-stride)
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.fleet.detail.is_none() => {
+                self.fleet_move(stride)
+            }
+            KeyCode::Left if grid && self.fleet.detail.is_none() => self.fleet_move(-1),
+            KeyCode::Right if grid && self.fleet.detail.is_none() => self.fleet_move(1),
+            KeyCode::PageUp if self.fleet.detail.is_none() => self.fleet_move(-(page * stride)),
+            KeyCode::PageDown if self.fleet.detail.is_none() => self.fleet_move(page * stride),
+            KeyCode::Home if self.fleet.detail.is_none() => self.fleet.sel = 0,
+            KeyCode::End if self.fleet.detail.is_none() => {
                 if let Some((count, _)) = self.fleet_nav() {
                     self.fleet.sel = count.saturating_sub(1);
                 }
@@ -8540,23 +8673,23 @@ impl AppModel {
     }
 
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
-        if self.ssh_terminal.is_some() {
+        if self.input_owner() == InputOwner::SshTerminal {
             self.handle_ssh_terminal_key(key);
             return;
         }
-        if self.ssh_form.is_some() {
+        if self.input_owner() == InputOwner::SshForm {
             self.handle_ssh_form_key(key);
             return;
         }
-        if self.lockdown_overlay {
+        if self.input_owner() == InputOwner::Lockdown {
             self.lockdown_overlay = false;
             self.dirty = true;
             return;
         }
-        if self.tool_detail_key(key) {
+        if self.input_owner() == InputOwner::ToolDetail && self.tool_detail_key(key) {
             return;
         }
-        if self.screen == Screen::Loom
+        if self.input_owner() == InputOwner::Composer(Screen::Loom)
             && self
                 .loom_authoring
                 .as_ref()
@@ -8566,18 +8699,18 @@ impl AppModel {
             self.dirty = true;
             return;
         }
-        if self.screen == Screen::Tools {
+        if self.input_owner() == InputOwner::Screen(Screen::Tools) {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                 self.switch_surface(Screen::Session);
                 self.dirty = true;
             }
             return;
         }
-        if self.screen == Screen::Hooks {
+        if self.input_owner() == InputOwner::Screen(Screen::Hooks) {
             self.handle_hooks_key(key.code);
             return;
         }
-        if self.screen == Screen::Tree {
+        if self.input_owner() == InputOwner::Screen(Screen::Tree) {
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.tree_sel = self.tree_sel.saturating_sub(1);
@@ -8708,11 +8841,11 @@ impl AppModel {
             }
             return;
         }
-        if self.screen == Screen::Sessions {
+        if self.input_owner() == InputOwner::Screen(Screen::Sessions) {
             self.handle_sessions_key(key);
             return;
         }
-        if self.inbox_open {
+        if self.input_owner() == InputOwner::Inbox {
             let last = self.inbox_rows().len().saturating_sub(1);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.inbox_open = false,
@@ -8730,7 +8863,7 @@ impl AppModel {
             self.dirty = true;
             return;
         }
-        if self.transcript_search.is_some() {
+        if self.input_owner() == InputOwner::Search {
             match key.code {
                 KeyCode::Esc => self.close_transcript_search(),
                 KeyCode::Enter | KeyCode::Down => self.search_move(true),
@@ -8743,7 +8876,7 @@ impl AppModel {
                     self.refresh_transcript_search();
                     self.dirty = true;
                 }
-                KeyCode::Char(character) if !character.is_control() => {
+                KeyCode::Char(character) if !character.is_control() && key.modifiers.is_empty() => {
                     if let Some(search) = self.transcript_search.as_mut() {
                         search.query.push(character);
                         search.selected = 0;
@@ -8757,17 +8890,17 @@ impl AppModel {
         }
         // Boot renders no composer — hidden input must not accumulate or
         // start turns (review r1 P2).
-        if self.screen == Screen::Boot {
+        if self.input_owner() == InputOwner::Screen(Screen::Boot) {
             return;
         }
-        if self.help_open {
+        if self.input_owner() == InputOwner::Help {
             // esc/enter/q close help; everything else is swallowed.
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                 self.help_open = false;
             }
             return;
         }
-        if self.shells_open {
+        if self.input_owner() == InputOwner::Shells {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.shells_open = false,
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -8792,7 +8925,7 @@ impl AppModel {
             self.dirty = true;
             return;
         }
-        if self.ssh_open {
+        if self.input_owner() == InputOwner::SshList {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.ssh_open = false;
@@ -8860,7 +8993,7 @@ impl AppModel {
         // resumes by the row's own state, t triggers, e hands the edit to
         // the agent, y copies the id. The overlay owns every key while it
         // is showing, exactly as `/ssh` and `/shells` do.
-        if self.monitors_open {
+        if self.input_owner() == InputOwner::Monitors {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.monitors_open = false;
@@ -8920,64 +9053,20 @@ impl AppModel {
         }
         // The `/model` picker owns EVERY key while it is showing (F2a —
         // heeded history: ⏎ selects the HIGHLIGHTED row, never an
-        // exact-match jump; esc closes without selecting). A daemon menu
-        // outranks it: local chrome never shadows a live ask.
-        if self.model_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if menu_owns {
-                self.model_picker = None;
-                self.dirty = true;
-            } else {
-                self.handle_model_picker_key(key.code);
-                return;
-            }
+        // exact-match jump; esc closes without selecting).
+        if self.input_owner() == InputOwner::ModelPicker {
+            self.handle_model_picker_key(key.code);
+            return;
         }
         // The `/effort` picker owns the keys while it is showing (G3) —
-        // the same input-replacement law as `/theme`; a daemon card
-        // outranks it and closes it.
-        if self.effort_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if !menu_owns && matches!(self.screen, Screen::Session | Screen::Subagent) {
-                self.handle_effort_picker_key(key.code);
-                return;
-            }
-            self.effort_picker = None;
-            self.dirty = true;
+        // the same input-replacement law as `/theme`.
+        if self.input_owner() == InputOwner::EffortPicker {
+            self.handle_effort_picker_key(key.code);
+            return;
         }
-        // The `/theme` picker owns the keys while it is showing. A daemon
-        // card or a navigation away from its surfaces outranks it: the
-        // picker then closes (reverting any preview) and the key proceeds
-        // to its normal owner — local chrome never shadows a live ask.
-        if self.theme_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if !menu_owns
-                && matches!(
-                    self.screen,
-                    Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
-                )
-            {
-                self.handle_theme_picker_key(key.code);
-                return;
-            }
-            if let Some(picker) = self.theme_picker.take() {
-                self.theme = picker.prior.resolve(self.detected_system);
-                self.dirty = true;
-            }
+        if self.input_owner() == InputOwner::ThemePicker {
+            self.handle_theme_picker_key(key.code);
+            return;
         }
         // Subagent view (§2.10): esc ALWAYS walks back to the session (the
         // parent is not blocked); the chip's question menu replaces the
@@ -9257,7 +9346,17 @@ impl AppModel {
                     self.retry_permission();
                     return;
                 }
-                _ => {}
+                _ => {
+                    // The standalone card never feeds the parked composer.
+                    // A paired menu may handle its ordinary choice keys.
+                    if !self.projection.permission_card().is_some_and(|card| {
+                        self.projection
+                            .open_menu()
+                            .is_some_and(|menu| menu.id == card.menu_id)
+                    }) {
+                        return;
+                    }
+                }
             }
         }
         // Edit/Write review keeps the ordinary permission-menu answer path.
@@ -9811,70 +9910,133 @@ impl AppModel {
         }
     }
 
-    /// rev933d finding 4: injection from an embedding client applies only
-    /// when the PLAIN session composer is the live Enter target — no card
-    /// (login, `/talk` setup, an engaged talk session), no menu, no help,
-    /// and never the subagent view (whose composer messages the child).
-    /// This mirrors the key-dispatch precedence exactly, so a synthesized
-    /// Submit can never activate a card row or answer a question.
+    /// The visible input target. This order is also used by the renderer for
+    /// its covering layers; stale hits and delayed input are checked again
+    /// against the current value before they can change state.
     #[must_use]
-    pub fn accepts_injected_input(&self) -> bool {
-        self.screen == Screen::Session
-            && self.login.is_none()
-            && self.talk_setup.is_none()
-            && !self.talk.engaged()
-            && self.composer_owns_input()
+    pub fn input_owner(&self) -> InputOwner {
+        if self.lockdown_overlay {
+            return InputOwner::Lockdown;
+        }
+        if self.tool_detail.is_some() {
+            return InputOwner::ToolDetail;
+        }
+        if self.inbox_open {
+            return InputOwner::Inbox;
+        }
+        if self.help_open {
+            return InputOwner::Help;
+        }
+        if self.shells_open {
+            return InputOwner::Shells;
+        }
+        if self.ssh_open {
+            return if self.ssh_form.is_some() {
+                InputOwner::SshForm
+            } else {
+                InputOwner::SshList
+            };
+        }
+        if self.monitors_open {
+            return InputOwner::Monitors;
+        }
+        if self.ssh_terminal.is_some() {
+            return InputOwner::SshTerminal;
+        }
+        if self.model_picker.is_some() {
+            return InputOwner::ModelPicker;
+        }
+        if self.screen == Screen::Accounts && self.accounts.pending_replace.is_some() {
+            return InputOwner::AccountsReplace;
+        }
+        if self.login.is_some() {
+            return InputOwner::Login;
+        }
+        if self.talk_setup.is_some() {
+            return InputOwner::TalkSetup;
+        }
+        // The native permission grant card paints over the answer band even
+        // when its paired menu has not arrived yet.
+        if self.screen == Screen::Session && self.projection.permission_card().is_some() {
+            return InputOwner::SessionMenu;
+        }
+        match self.screen {
+            Screen::Accounts | Screen::Providers if self.custom_add.is_some() => {
+                InputOwner::CustomProviderForm
+            }
+            Screen::Session => {
+                if let Some(menu) = self.projection.open_menu() {
+                    if menu.options.is_empty() {
+                        // A free-text ask paints an answer line, even if a
+                        // local picker or search was open when it arrived.
+                        return InputOwner::Composer(Screen::Session);
+                    }
+                    if menu.origin == "plan" {
+                        return InputOwner::PlanDoc;
+                    }
+                    if crate::app::menu_file_review(menu).is_some() {
+                        return InputOwner::FileReviewDoc;
+                    }
+                    return InputOwner::SessionMenu;
+                }
+                if self.transcript_search.is_some() {
+                    return InputOwner::Search;
+                }
+                if self.effort_picker.is_some() {
+                    return InputOwner::EffortPicker;
+                }
+                if self.theme_picker.is_some() {
+                    return InputOwner::ThemePicker;
+                }
+                if self.backtrack.is_some() {
+                    return InputOwner::HistoryChooser;
+                }
+                InputOwner::Composer(Screen::Session)
+            }
+            Screen::Subagent => {
+                if self
+                    .viewed_chip()
+                    .is_some_and(|chip| chip.question_menu().is_some())
+                {
+                    InputOwner::SubagentQuestion
+                } else if self.effort_picker.is_some() {
+                    InputOwner::EffortPicker
+                } else if self.theme_picker.is_some() {
+                    InputOwner::ThemePicker
+                } else {
+                    InputOwner::Composer(Screen::Subagent)
+                }
+            }
+            Screen::Fleet if self.fleet.detail.is_some() => InputOwner::FleetMemberDetail,
+            Screen::Launcher | Screen::Aura | Screen::Loom => {
+                if self.theme_picker.is_some() {
+                    InputOwner::ThemePicker
+                } else {
+                    InputOwner::Composer(self.screen)
+                }
+            }
+            screen => InputOwner::Screen(screen),
+        }
     }
 
-    /// Clipboard gestures can arrive before screen-specific key handlers.
-    /// Do not let them read/copy the parked draft behind a read-only view
-    /// or a modal; modal text paste has its own AppEvent::Paste targets.
+    /// Embedding input is accepted only by the plain Session answer line.
+    #[must_use]
+    pub fn accepts_injected_input(&self) -> bool {
+        self.input_owner() == InputOwner::Composer(Screen::Session) && !self.talk.engaged()
+    }
+
+    /// Whether the current owner can accept a composer image or selection.
     fn clipboard_composer_visible(&self) -> bool {
-        matches!(
-            self.screen,
-            Screen::Launcher | Screen::Session | Screen::Subagent | Screen::Aura | Screen::Loom
-        ) && self.composer_owns_input()
-            && !self.lockdown_overlay
-            && self.login.is_none()
-            && self.talk_setup.is_none()
-            && self.custom_add.is_none()
-            && self.ssh_form.is_none()
-            && self.ssh_terminal.is_none()
+        matches!(self.input_owner(), InputOwner::Composer(_))
             && !self
                 .loom_authoring
                 .as_ref()
                 .is_some_and(|authoring| self.screen == Screen::Loom && authoring.pending)
     }
 
-    /// The composer is the live input target: no boot screen, no help
-    /// overlay, no tool detail view, no blocking menu owning the keys
-    /// (session card or the viewed chip's question). Gates the TUI5 editing
-    /// keys, the composer selection gate (Esc / ⌃C), ↑/↓ recall and — via
-    /// [`Self::clipboard_composer_visible`] — clipboard paste, image paste
-    /// and ⌃⇧C, so no key can edit, copy or deselect a hidden draft.
-    ///
-    /// 973-tui-toolview-fixes: the ⌃O detail view covers the composer
-    /// while the draft stays parked underneath; ⌃U/⌃W/⌃K used to edit it
-    /// invisibly and a draft selection swallowed the view's closing Esc.
+    /// The only authority for editing and selecting the visible composer.
     fn composer_owns_input(&self) -> bool {
-        if self.screen == Screen::Boot || self.help_open || self.tool_detail.is_some() {
-            return false;
-        }
-        if self.screen == Screen::Session
-            && self
-                .projection
-                .open_menu()
-                .is_some_and(|menu| !menu.options.is_empty())
-        {
-            // A SELECT menu replaces the composer; a zero-option free-text
-            // ask KEEPS it — the composer is the answer line (owner
-            // report: the resistor question rendered unanswerable).
-            return false;
-        }
-        !(self.screen == Screen::Subagent
-            && self
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
+        matches!(self.input_owner(), InputOwner::Composer(_))
     }
 
     /// The composer-edit epilogue every text-changing key shares (the sim
@@ -10721,6 +10883,12 @@ impl AppModel {
                 self.requests.push(AppRequest::TranscriptionSecretRead);
             }
         }
+        if self.talk.engaged() {
+            self.talk_origin = self
+                .active_session
+                .clone()
+                .map(|session| (session, self.ui_generation(), self.talk.generation));
+        }
     }
 
     /// Esc law: DISCARD. Settles the machine (the generation bump makes
@@ -10850,6 +11018,69 @@ impl AppModel {
         }
     }
 
+    fn insert_or_retain_dictation(&mut self, text: &str, generation: u64, submit: bool) {
+        let Some(session) = self.active_session.clone() else {
+            return;
+        };
+        let ui_generation = self.ui_generation();
+        if self.talk_origin.as_ref().is_some_and(|(origin, ui, talk)| {
+            origin != &session || *ui != ui_generation || *talk != generation
+        }) {
+            return;
+        }
+        let text = crate::talk::clamp_realized(text.trim());
+        if text.is_empty() {
+            return;
+        }
+        let mut realized = zeroize::Zeroizing::new(text.to_owned());
+        realized.push(' ');
+        if self.input_owner() == InputOwner::Composer(Screen::Session)
+            && !self.mirror_waiting_for_owner
+        {
+            self.composer.insert_str(&realized);
+            if submit {
+                self.submit_composer();
+            }
+        } else {
+            self.pending_dictation = Some(PendingDictation {
+                session,
+                ui_generation,
+                talk_generation: generation,
+                text: realized,
+                downgraded_submit: submit,
+            });
+        }
+    }
+
+    pub(crate) fn deliver_pending_dictation(&mut self) {
+        if self.mirror_waiting_for_owner {
+            return;
+        }
+        let Some(pending) = self.pending_dictation.take() else {
+            return;
+        };
+        if self.input_owner() != InputOwner::Composer(Screen::Session) {
+            self.pending_dictation = Some(pending);
+            return;
+        }
+        if self.active_session.as_ref() != Some(&pending.session)
+            || self.ui_generation() != pending.ui_generation
+            || self
+                .talk_origin
+                .as_ref()
+                .is_some_and(|(_, _, generation)| *generation != pending.talk_generation)
+        {
+            return;
+        }
+        self.composer.insert_str(&pending.text);
+        self.flash = Some(if pending.downgraded_submit {
+            "· dictation added to your draft — auto-send paused while away".to_owned()
+        } else {
+            "· dictation added to your draft".to_owned()
+        });
+        self.dirty = true;
+    }
+
     /// Route a typed engine/setup error: model/runtime gaps open the
     /// setup card (the reinstall surface); everything else is an honest
     /// flash.
@@ -10883,8 +11114,7 @@ impl AppModel {
             TalkEvent::SupervisorFailed { reason } => {
                 let ghost = self.talk.ghost.trim().to_owned();
                 if !ghost.is_empty() {
-                    self.composer
-                        .insert_str(crate::talk::clamp_realized(&ghost));
+                    self.insert_or_retain_dictation(&ghost, self.talk.generation, false);
                 }
                 self.talk.settle();
                 self.listening = false;
@@ -10931,8 +11161,7 @@ impl AppModel {
                         haider_stt::capture::CaptureHealth::Failed { error } => {
                             let ghost = self.talk.ghost.trim().to_owned();
                             if !ghost.is_empty() {
-                                self.composer
-                                    .insert_str(crate::talk::clamp_realized(&ghost));
+                                self.insert_or_retain_dictation(&ghost, generation, false);
                             }
                             self.talk.settle();
                             self.listening = false;
@@ -10984,11 +11213,13 @@ impl AppModel {
                             // ordinary flow and the two transcripts must not
                             // fuse into one word. `submit_composer` trims, so
                             // the space costs the auto-send path nothing.
-                            let mut realized = crate::talk::clamp_realized(&text).to_owned();
-                            realized.push(' ');
-                            self.composer.insert_str(&realized);
+                            self.insert_or_retain_dictation(
+                                &text,
+                                generation,
+                                intent == CommitIntent::Submit,
+                            );
                             match intent {
-                                CommitIntent::Submit => self.submit_composer(),
+                                CommitIntent::Submit => {}
                                 CommitIntent::Insert => {
                                     self.flash = Some("· ◉ transcribed — ⏎ to send".to_owned());
                                 }
@@ -10999,9 +11230,7 @@ impl AppModel {
                         // Best-effort honesty: the words the ghost showed
                         // were watched landing — keep them; say what broke.
                         if !ghost.is_empty() {
-                            let mut text = crate::talk::clamp_realized(&ghost).to_owned();
-                            text.push(' ');
-                            self.composer.insert_str(&text);
+                            self.insert_or_retain_dictation(&ghost, generation, false);
                         }
                         self.talk_error(error);
                     }
@@ -11279,9 +11508,9 @@ impl AppModel {
         });
     }
 
-    /// Open the `/talk` setup card (engine picker first). Cancels any
-    /// engaged session; loads the world snapshot and the vaulted-key
-    /// presence.
+    /// Open the `/talk` setup card (engine picker first). An engaged capture
+    /// continues, with its result retained until the composer is visible.
+    /// Load the world snapshot and the vaulted-key presence.
     pub fn open_talk_setup(&mut self) {
         if self.mode.fabricates_locally() {
             self.flash = Some("· /talk setup — live only".to_owned());
@@ -11291,9 +11520,7 @@ impl AppModel {
             self.flash = Some("· /talk — session only".to_owned());
             return;
         }
-        if self.talk.engaged() {
-            self.talk_cancel();
-        }
+        self.composer_drag = false;
         let vault_supported = self
             .daemon_features
             .contains(haider_rpc::FEATURE_TRANSCRIPTION_V1);
@@ -13888,7 +14115,7 @@ impl AppModel {
         field: CustomField,
         character: usize,
     ) {
-        if !matches!(self.screen, Screen::Accounts | Screen::Providers) {
+        if self.input_owner() != InputOwner::CustomProviderForm {
             return;
         }
         if let Some(card) = self.custom_add.as_mut()
@@ -14234,6 +14461,7 @@ impl AppModel {
     }
 
     fn open_inbox(&mut self) {
+        self.composer_drag = false;
         self.inbox_open = true;
         self.inbox_cursor = 0;
         self.dirty = true;
@@ -16387,16 +16615,10 @@ impl AppModel {
 
     /// Only advertise Enter when this surface will hand it to the pager.
     pub(crate) fn task_pager_enter_available(&self) -> bool {
-        matches!(self.screen, Screen::Session | Screen::Subagent)
-            && self.clipboard_composer_visible()
-            && !self.shells_open
-            && !self.ssh_open
-            && !self.monitors_open
-            && self.model_picker.is_none()
-            && self.effort_picker.is_none()
-            && self.theme_picker.is_none()
-            && self.backtrack.is_none()
-            && self.projection.permission_card().is_none()
+        matches!(
+            self.input_owner(),
+            InputOwner::Composer(Screen::Session | Screen::Subagent)
+        ) && self.projection.permission_card().is_none()
             && self.composer.is_empty()
             && self.composer.attachments().is_empty()
             && self.focused_tool_row().is_none()
@@ -16745,6 +16967,7 @@ impl AppModel {
             return_to,
             ..ToolDetailView::default()
         });
+        self.composer_drag = false;
         self.dirty = true;
         true
     }
@@ -16763,6 +16986,7 @@ impl AppModel {
             });
             self.dirty = true;
         }
+        self.deliver_pending_dictation();
     }
 
     /// Scroll the open full-detail view by `delta` display rows, clamped to
@@ -18701,6 +18925,9 @@ impl AppModel {
         // TUI5 item 9: park the departing surface's draft BEFORE identity
         // flips (checkin() itself is draft-free — exactly one stash and
         // one restore per transition).
+        if self.talk.engaged() {
+            self.talk_cancel();
+        }
         self.stash_draft();
         self.checkin();
         let Some(index) = self.sessions.iter().position(|entry| &entry.id == id) else {
@@ -18974,6 +19201,9 @@ impl AppModel {
         // TUI5 item 9: park the departing surface's draft (session, aura,
         // or the scratch surface — which shares the launcher key, so its
         // stash/restore is an exact round-trip).
+        if self.talk.engaged() {
+            self.talk_cancel();
+        }
         self.stash_draft();
         // TUI4c: leaving DETACHES (sim `setActiveId(null)`, tui.js:1956) —
         // the session's state checks into its slot, its scripts keep
@@ -19516,28 +19746,47 @@ impl AppModel {
     /// one frame stale (review r2 P2-2): hits carry values and every
     /// context-sensitive hit re-checks its context — activate exactly what
     /// was clicked, or drop the click.
-    pub fn handle_hit(&mut self, hit: Hit) {
-        self.dirty = true;
-        self.flash = None;
-        // A visible overlay owns the screen; hits from the covered frame
-        // must not act through it.
-        if self.help_open {
-            return;
-        }
-        if self.tool_detail.is_some() {
-            if hit == Hit::ToolDetailClose {
-                self.close_tool_detail();
-            }
-            return;
-        }
-        if self.shells_open && !matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus) {
-            return;
-        }
-        if self.ssh_open {
-            return;
-        }
-        if self.monitors_open
-            && !matches!(
+    pub(crate) fn hit_owned(&self, hit: &Hit) -> bool {
+        let chrome = matches!(hit, Hit::BackChip | Hit::HelpHint | Hit::LockdownStatus);
+        let session = matches!(
+            hit,
+            Hit::InboxBand
+                | Hit::GraphStrip
+                | Hit::SessionHome
+                | Hit::RevealPath(_)
+                | Hit::RetryRun
+                | Hit::TalkChip
+                | Hit::ShellStatus
+                | Hit::MonitorStatus
+                | Hit::ChipRow(_)
+                | Hit::SubTreeToggle
+                | Hit::TodosToggle
+                | Hit::ToolRowToggle(_)
+                | Hit::ToolFoldToggle(_)
+                | Hit::ToolShowAll(_)
+                | Hit::ToolDetail(_)
+                | Hit::TaskLineToggle
+                | Hit::TaskLineMore
+                | Hit::TodoRow(_)
+                | Hit::FleetSummary
+                | Hit::StickyJump(_)
+                | Hit::JumpToBottom
+                | Hit::QueueRowSteer(_)
+                | Hit::QueueRowToggle(_)
+        );
+        match self.input_owner() {
+            InputOwner::Lockdown
+            | InputOwner::Help
+            | InputOwner::SshList
+            | InputOwner::SshForm
+            | InputOwner::SshTerminal
+            | InputOwner::TalkSetup
+            | InputOwner::HistoryChooser => false,
+            InputOwner::AccountsReplace => matches!(hit, Hit::AccountAdd(_)),
+            InputOwner::ToolDetail => matches!(hit, Hit::ToolDetailClose),
+            InputOwner::Inbox => false,
+            InputOwner::Shells => matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus),
+            InputOwner::Monitors => matches!(
                 hit,
                 Hit::MonitorStatus
                     | Hit::MonitorRow(_)
@@ -19546,30 +19795,103 @@ impl AppModel {
                     | Hit::MonitorTrigger(_)
                     | Hit::MonitorEdit(_)
                     | Hit::MonitorCopyId(_)
-            )
-        {
+            ),
+            InputOwner::ModelPicker => matches!(hit, Hit::ModelPickerRow { .. }),
+            InputOwner::Login => {
+                self.screen == Screen::Accounts && matches!(hit, Hit::AccountAdd(_))
+            }
+            InputOwner::CustomProviderForm => {
+                matches!(hit, Hit::CustomProviderField { .. } | Hit::AccountAdd(_))
+            }
+            InputOwner::SessionMenu | InputOwner::PlanDoc | InputOwner::FileReviewDoc => matches!(
+                hit,
+                Hit::BackChip
+                    | Hit::MenuOption { .. }
+                    | Hit::PermissionOpenSettings
+                    | Hit::PermissionRetry
+                    | Hit::InboxBand
+            ),
+            InputOwner::SubagentQuestion => matches!(
+                hit,
+                Hit::BackChip
+                    | Hit::SessionHome
+                    | Hit::ChipCloseBtn(_)
+                    | Hit::ChipCrumb(_)
+                    | Hit::MenuOption { .. }
+            ),
+            InputOwner::EffortPicker => matches!(hit, Hit::EffortOption(_)),
+            InputOwner::ThemePicker => matches!(hit, Hit::ThemeOption(_)),
+            InputOwner::FleetMemberDetail => {
+                matches!(hit, Hit::FleetTranscript(_) | Hit::FleetKill(_))
+            }
+            InputOwner::Search => chrome || session,
+            InputOwner::Screen(screen) => {
+                // A screen switch can race one mouse frame. Its previous
+                // screen's hits are never controls on the new full-screen
+                // owner, even when both screens share the Session draft.
+                (screen != Screen::Boot
+                    && matches!(hit, Hit::BackChip | Hit::HelpHint | Hit::LockdownStatus))
+                    || match screen {
+                        Screen::Boot | Screen::Graph | Screen::Tools => false,
+                        Screen::Sessions => matches!(hit, Hit::AttachSession(_)),
+                        Screen::Accounts => matches!(hit, Hit::AccountRow(_) | Hit::AccountAdd(_)),
+                        Screen::Providers => matches!(
+                            hit,
+                            Hit::ProviderModel { .. } | Hit::ProviderAccounts | Hit::AccountAdd(_)
+                        ),
+                        Screen::Usage => {
+                            matches!(hit, Hit::UsageScope(_) | Hit::UsageAccountTab { .. })
+                        }
+                        Screen::Fleet => matches!(hit, Hit::FleetNode(_)),
+                        Screen::Tree => matches!(hit, Hit::TreeRow(_)),
+                        Screen::Hooks => matches!(hit, Hit::HookRow(_) | Hit::HookFiring(_)),
+                        Screen::Launcher
+                        | Screen::Session
+                        | Screen::Subagent
+                        | Screen::Aura
+                        | Screen::Loom => false,
+                    }
+            }
+            InputOwner::Composer(screen) => {
+                chrome
+                    || matches!(hit, Hit::ComposerText { .. } | Hit::PaletteRow(_))
+                    || match screen {
+                        Screen::Session => session,
+                        Screen::Subagent => {
+                            session
+                                || matches!(
+                                    hit,
+                                    Hit::SessionHome | Hit::ChipCloseBtn(_) | Hit::ChipCrumb(_)
+                                )
+                        }
+                        Screen::Launcher => {
+                            matches!(
+                                hit,
+                                Hit::AttachSession(_) | Hit::ExtraRow(_) | Hit::TalkChip
+                            )
+                        }
+                        Screen::Aura => matches!(
+                            hit,
+                            Hit::AuraEngine | Hit::AuraMute | Hit::AuraExit | Hit::AuraTalkBtn
+                        ),
+                        Screen::Loom => matches!(hit, Hit::LoomNew),
+                        _ => false,
+                    }
+            }
+        }
+    }
+
+    pub fn handle_hit(&mut self, hit: Hit) {
+        if !self.hit_owned(&hit) {
             return;
         }
-        if self.lockdown_overlay {
-            self.lockdown_overlay = false;
-            return;
-        }
-        // TUI6.2b: the login card is MODAL against hits exactly as it is
-        // against keys (login_key owns the keyboard) — the frame beneath
-        // it still lists clickable rows, and a click that fell through
-        // ran open_session mid-login: its stash overwrote the
-        // login-parked draft (ring destroyed), the screen flipped under
-        // the open card, and the card's Esc-restore later clobbered the
-        // session draft. The card has no hit targets of its own, so the
-        // gate is total — with ONE exception since 971 F1(b): the `[+ …]`
-        // provider grid on `/accounts`, whose entire effect is "replace this
-        // card". That is precisely the gesture the owner is refused today (a
-        // pending key card silently swallows the click on another provider),
-        // and it runs the card's OWN close path — the parked draft is
-        // restored, the attempt retired, and the screen never flips.
-        if self.login.is_some()
-            && !(self.screen == Screen::Accounts && matches!(hit, Hit::AccountAdd(_)))
-        {
+        self.dirty = true;
+        self.flash = None;
+        // The owner check above is also the stale-frame guard. Detail has
+        // one close target; all other overlays fall through only to their
+        // own hit variants below.
+        if self.input_owner() == InputOwner::ToolDetail {
+            self.close_tool_detail();
             return;
         }
         if self.screen == Screen::Loom
@@ -20084,12 +20406,46 @@ impl AppModel {
     /// the view. The frame's own reconcile stays as the backstop (sim
     /// reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
-        // 971 F1(a), verify round 1: the `/accounts` roster scrolls under
-        // the wheel even while an add-form is open — the wheel is never form
-        // input, and the card stays pinned in view above the offset it moves
-        // (Astra: the DeepSeek card swallowed the wheel at both sizes). It
-        // therefore runs BEFORE the modal gate below.
-        if self.screen == Screen::Accounts && !self.help_open {
+        match self.input_owner() {
+            InputOwner::ToolDetail => {
+                self.scroll_tool_detail(if up { -3 } else { 3 });
+                return;
+            }
+            InputOwner::PlanDoc => {
+                let current = self.plan_scroll.get().min(self.plan_scroll_max.get());
+                self.plan_scroll.set(if up {
+                    current.saturating_sub(3)
+                } else {
+                    current.saturating_add(3).min(self.plan_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
+            InputOwner::FileReviewDoc => {
+                let current = self
+                    .file_review_scroll
+                    .get()
+                    .min(self.file_review_scroll_max.get());
+                self.file_review_scroll.set(if up {
+                    current.saturating_sub(3)
+                } else {
+                    current
+                        .saturating_add(3)
+                        .min(self.file_review_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
+            InputOwner::Screen(_) | InputOwner::Composer(_) => {}
+            // Accounts cards are pinned above a still-visible roster. The
+            // wheel belongs to that screen's scroll state, as before.
+            InputOwner::Login if self.screen == Screen::Accounts => {}
+            InputOwner::CustomProviderForm
+                if matches!(self.screen, Screen::Accounts | Screen::Providers) => {}
+            _ => return,
+        }
+        // The accounts roster remains visible beneath its pinned form.
+        if self.screen == Screen::Accounts {
             let max = self.accounts.scroll_max.get();
             let current = self.accounts.scroll.get().min(max);
             let next = if up {
@@ -20099,16 +20455,6 @@ impl AppModel {
             };
             self.accounts.scroll.set(next);
             self.dirty = true;
-            return;
-        }
-        // The login gate joins the help gate (TUI6.2c finding 7 —
-        // consistency: nothing scrolls beneath a modal).
-        if self.help_open || self.login.is_some() {
-            return;
-        }
-        // The full-detail view scrolls itself, never the transcript under it.
-        if self.tool_detail.is_some() {
-            self.scroll_tool_detail(if up { -3 } else { 3 });
             return;
         }
         // The all-sessions browser scrolls under the wheel: it is a long
@@ -20184,6 +20530,39 @@ impl AppModel {
     /// while the content slides beneath it and the copy-on-release reads
     /// the final frame.
     pub fn drag_autoscroll(&mut self, up: bool) {
+        match self.input_owner() {
+            InputOwner::ToolDetail => {
+                self.scroll_tool_detail(if up { -1 } else { 1 });
+                return;
+            }
+            InputOwner::PlanDoc => {
+                let current = self.plan_scroll.get().min(self.plan_scroll_max.get());
+                self.plan_scroll.set(if up {
+                    current.saturating_sub(1)
+                } else {
+                    current.saturating_add(1).min(self.plan_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
+            InputOwner::FileReviewDoc => {
+                let current = self
+                    .file_review_scroll
+                    .get()
+                    .min(self.file_review_scroll_max.get());
+                self.file_review_scroll.set(if up {
+                    current.saturating_sub(1)
+                } else {
+                    current
+                        .saturating_add(1)
+                        .min(self.file_review_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
+            InputOwner::Composer(_) => {}
+            _ => return,
+        }
         if !matches!(self.screen, Screen::Session | Screen::Subagent) {
             return;
         }
@@ -20253,10 +20632,7 @@ impl AppModel {
     /// on hover (sim onMouseEnter, tui.js:2992/3073); everything else is
     /// hover chrome the renderer paints from [`Self::hovered`].
     pub fn handle_hover(&mut self, hit: Option<Hit>) {
-        // TUI6.2c (verifier finding 4): modals own hover exactly as they
-        // own hits and keys — with the help overlay or the login card up,
-        // hover must not move palette/menu selections beneath the modal.
-        if self.help_open || self.login.is_some() {
+        if hit.as_ref().is_some_and(|hit| !self.hit_owned(hit)) {
             return;
         }
         if self.hovered == hit {
@@ -20361,6 +20737,7 @@ impl AppModel {
     /// Pushes a registry refresh so the roster is as fresh as the daemon
     /// serves; rows render from the snapshot in hand meanwhile.
     pub fn open_model_picker(&mut self, query: String) {
+        self.composer_drag = false;
         self.model_picker = Some(ModelPicker {
             query,
             ..ModelPicker::default()

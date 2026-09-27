@@ -4188,6 +4188,7 @@ pub async fn run_live(
         pending.extend(driver.sync_resident_binding(&model));
         // W-INP: watch and publish the active per-surface composer through
         // the driver's shared revision fence. Nothing is journaled.
+        driver.apply_pending_input(&mut model);
         pending.extend(driver.sync_input_mirror(&model));
         // The status half (status_segment_v1): the bar's bottom-left strip
         // mirrors under the same dedup discipline, through the one
