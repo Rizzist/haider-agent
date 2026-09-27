@@ -642,6 +642,7 @@ FORBIDDEN_WINDOWS_IMPORT = re.compile(
 )
 _PE_IMPORT_DIRECTORY = 1
 _PE_DELAY_IMPORT_DIRECTORY = 13
+_PE_IMPORT_NAME_WINDOW = 512
 
 
 class _PeImage:
@@ -669,6 +670,11 @@ class _PeImage:
         else:
             raise PackagingError(f"{source}: unknown PE optional-header magic {magic:#x}")
         self.directory_count = self._u32(directories - 4)
+        if self.directory_count <= _PE_DELAY_IMPORT_DIRECTORY:
+            raise PackagingError(
+                f"{source}: PE optional header has only {self.directory_count} data directories; "
+                "cannot inspect both import tables"
+            )
         self.directories = directories
         table = optional + optional_size
         self.sections = []
@@ -722,10 +728,24 @@ class _PeImage:
 
     def string(self, rva: int) -> str:
         start = self.offset(rva)
-        end = self.data.find(b"\0", start, start + 512)
+        for virtual_address, size, raw_pointer, raw_size in self.sections:
+            delta = rva - virtual_address
+            if 0 <= delta < size and delta < raw_size:
+                limit = min(
+                    start + _PE_IMPORT_NAME_WINDOW,
+                    raw_pointer + raw_size,
+                    len(self.data),
+                )
+                break
+        end = self.data.find(b"\0", start, limit)
         if end < 0:
-            raise PackagingError(f"{self.source}: unterminated PE import name at {rva:#x}")
-        return self.data[start:end].decode("ascii", errors="replace")
+            raise PackagingError(f"{self.source}: unterminated PE import name at RVA {rva:#x}")
+        name = self.data[start:end]
+        if not name:
+            raise PackagingError(f"{self.source}: empty PE import name at RVA {rva:#x}")
+        if any(byte < 0x20 or byte > 0x7E for byte in name):
+            raise PackagingError(f"{self.source}: non-printable ASCII PE import name at RVA {rva:#x}")
+        return name.decode("ascii")
 
     def imports(self) -> tuple[list[str], list[str]]:
         """Return (imported DLLs, delay-loaded DLLs) in table order."""

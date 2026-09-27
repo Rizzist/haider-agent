@@ -376,6 +376,47 @@ class WindowsCrtImportTests(unittest.TestCase):
             self.assertEqual(len(report), 1)
             self.assertIn("KERNEL32.dll", report[0])
 
+    def test_malformed_import_names_fail_closed(self):
+        name = b"VCRUNTIME140.dll\0"
+        for delayed in (False, True):
+            base = _pe(SYSTEM_IMPORTS, ("VCRUNTIME140.dll",)) if delayed else _pe(("VCRUNTIME140.dll",))
+            start = base.index(name)
+            cases = {}
+            for label, replacement in (
+                ("high-bit", b"\xffCRUNTIME140.dll\0"),
+                ("empty", b"\0"),
+                ("control", b"\x01CRUNTIME140.dll\0"),
+            ):
+                image = bytearray(base)
+                image[start:start + len(name)] = replacement.ljust(len(name), b"\0")
+                cases[label] = bytes(image)
+            cases["overlong"] = (
+                _pe(SYSTEM_IMPORTS, ("A" * 512,)) if delayed else _pe(("A" * 512,))
+            )
+            unterminated = bytearray(base)
+            unterminated[start:] = b"A" * (len(base) - start)
+            cases["unterminated at end of data"] = bytes(unterminated)
+            cases["terminator outside section"] = bytes(unterminated) + b"\0"
+            for label, image in cases.items():
+                with self.subTest(delayed=delayed, name=label):
+                    with self.assertRaisesRegex(
+                        release_packaging.PackagingError,
+                        r"malformed-fixture: .* at RVA 0x[0-9a-f]+",
+                    ):
+                        release_packaging.windows_pe_imports(image, "malformed-fixture")
+
+    def test_missing_import_directory_slots_fail_closed(self):
+        for count in (0, 8, 13):
+            with self.subTest(count=count):
+                image = bytearray(_pe(SYSTEM_IMPORTS, ("VCRUNTIME140.dll",)))
+                pe = struct.unpack_from("<I", image, 0x3C)[0]
+                struct.pack_into("<I", image, pe + 24 + 108, count)
+                with self.assertRaisesRegex(
+                    release_packaging.PackagingError,
+                    f"directory-count: PE optional header has only {count} data directories",
+                ):
+                    release_packaging.windows_pe_imports(bytes(image), "directory-count")
+
     def test_every_redistributable_crt_import_fails(self):
         for forbidden in (
             "VCRUNTIME140.dll", "vcruntime140_1.dll", "VCRUNTIME140D.dll",
@@ -458,6 +499,19 @@ class WindowsCrtImportTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(release_packaging.main(["verify-windows-imports", str(good)]), 0)
                 self.assertEqual(release_packaging.main(["verify-windows-imports", str(good), str(bad)]), 1)
+
+    def test_cli_rejects_malformed_import_name(self):
+        image = bytearray(_pe(("VCRUNTIME140.dll",)))
+        image[image.index(b"VCRUNTIME140.dll\0")] = 0xFF
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.write(Path(temporary), "malformed.exe", bytes(image))
+            output, errors = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                exit_code = release_packaging.main(["verify-windows-imports", str(path)])
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn(str(path), errors.getvalue())
+            self.assertIn("RVA", errors.getvalue())
 
     @unittest.skipUnless(os.environ.get("HAIDER_DYNAMIC_CRT_WINDOWS_ZIP"), "set HAIDER_DYNAMIC_CRT_WINDOWS_ZIP to a known-bad (e.g. 0.0.972) Windows zip")
     def test_published_dynamic_crt_bundle_fails(self):
