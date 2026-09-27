@@ -87,8 +87,9 @@ class DownloadBudgetTests(unittest.TestCase):
     def test_npm_stalled_body_and_redirects_share_each_attempt_deadline(self):
         attempt_ms = 400
         attempts = 2
-        # Only a deadlock watchdog uses wall time, with 10x the total budget.
-        watchdog_ms = attempt_ms * attempts * 10
+        # Virtual timers prove the attempt deadlines; this wall clock only
+        # catches a fixture deadlock, including under slow hosted startup.
+        watchdog_ms = 60_000
         code = r'''
 const assert = require('assert');
 const http = require('http');
@@ -217,7 +218,8 @@ assert sys.argv[sys.argv.index('--max-time') + 1] == ('31' if name.endswith('.sh
 marker = root / (name + '.started')
 marker.touch()
 other = name[:-7] if name.endswith('.sha256') else name + '.sha256'
-for _ in range(200):
+deadline = time.monotonic() + 60
+while time.monotonic() < deadline:
     if (root / (other + '.started')).exists(): break
     time.sleep(.01)
 else: sys.exit(91)
@@ -228,7 +230,7 @@ if not retry.exists():
     sys.exit(56)
 sys.stdout.buffer.write((root / name).read_bytes())
 ''')
-            result = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(call.exists())
 
@@ -287,7 +289,7 @@ const run = (binary, args) => {
 };
 installer.installArchive(fs.readFileSync(process.argv[2]), path.basename(process.argv[2]), process.argv[3], run);
 '''
-        result = subprocess.run(["node", "-e", code, str(ROOT / "packaging/npm/install.js"), str(artifact), str(prefix), "fail" if fail else "ok"], capture_output=True, text=True, timeout=30)
+        result = subprocess.run(["node", "-e", code, str(ROOT / "packaging/npm/install.js"), str(artifact), str(prefix), "fail" if fail else "ok"], capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode == 0, succeeds, result.stderr)
         return result
 
@@ -330,7 +332,7 @@ class ShellBundleTests(unittest.TestCase):
                     env.pop("HAIDER_INSTALL_DIR", None)
                     result = subprocess.run(["sh", "-c", functions + '\nBUNDLE_SUFFIX="$3"\nchoose_install_dir "$1" "$2"',
                                              "prefix-probe", str(shared), str(fallback), suffix], env=env,
-                                            capture_output=True, text=True, timeout=30)
+                                            capture_output=True, text=True, timeout=90)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.strip(), str(expected))
                     self.assertEqual(shared.stat().st_mode & 0o777, mode)
@@ -351,7 +353,7 @@ class ShellBundleTests(unittest.TestCase):
             call = root / "helper-call.json"
             env = fake_download_environment(root, prefix, VERSION)
             env.update(INSTALL_CALL=str(call), INSTALL_EXIT="74" if mode == "helper" else "0")
-            result = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode == 0, mode == "success", result.stderr)
             if mode == "unsafe_prefix":
                 self.assertIn("choose an owned prefix", result.stderr)
@@ -408,7 +410,7 @@ class HistoricalBundleTests(unittest.TestCase):
         if os.name != "nt":
             return subprocess.run(["sh", str(ROOT / "scripts/install.sh")],
                                   env=fake_download_environment(root, prefix, version),
-                                  capture_output=True, text=True, timeout=30)
+                                  capture_output=True, text=True, timeout=90)
         wrapper = root / "fixture.ps1"
         wrapper.write_text(r'''
 $ErrorActionPreference = 'Stop'
@@ -427,7 +429,7 @@ try {
         env = dict(os.environ, INSTALL_FIXTURE=str(root), INSTALL_SCRIPT=str(ROOT / "scripts/install.ps1"),
                    HAIDER_INSTALL_DIR=str(prefix), HAIDER_VERSION=version, PROCESSOR_ARCHITECTURE="AMD64")
         return subprocess.run(["pwsh", "-NoProfile", "-File", str(wrapper)], env=env,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=90)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,171 @@
+name: chocolatey-package-fix
+
+# Install the unchanged v0.0.972 release zip with a corrected Chocolatey dependency.
+# PRs pack and install on clean Windows; only an explicit post-merge dispatch publishes.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/chocolatey-package-fix.yml
+      - scripts/release_packaging.py
+      - scripts/chocolatey_publish.ps1
+      - scripts/chocolatey_accept.ps1
+      - scripts/tests/test_release_packaging.py
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing published release tag whose Windows zip is installed (e.g. v0.0.972)
+        required: true
+        type: string
+      package_version:
+        description: Chocolatey package-fix version (<release version>.<YYYYMMDD>)
+        required: true
+        type: string
+      confirm_timeout_seconds:
+        description: Maximum time to confirm the exact version on the feed after push (1-900 seconds)
+        required: false
+        default: '600'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chocolatey-package-fix-${{ github.event.pull_request.number || inputs.package_version || github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || 'v0.0.972' }}
+  PACKAGE_VERSION: ${{ inputs.package_version || '0.0.972.20260927' }}
+  VCREDIST_DEPENDENCY: vcredist140=14.51.36231
+
+jobs:
+  pack:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Validate inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "release_tag must look like v0.0.972, got '$($env:RELEASE_TAG)'"
+          }
+          $Version = $env:RELEASE_TAG.Substring(1)
+          if ($env:PACKAGE_VERSION -notmatch ('^' + [regex]::Escape($Version) + '\.[0-9]+$')) {
+            throw "package_version must be $Version.<number>, got '$($env:PACKAGE_VERSION)'"
+          }
+          "RELEASE_VERSION=$Version" >> $env:GITHUB_ENV
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || 'v0.0.972' }}
+          path: release-src
+          persist-credentials: false
+
+      - name: Download the unchanged release zip and its published checksum
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Zip = "haider-v$($env:RELEASE_VERSION)-x86_64-pc-windows-msvc-split.zip"
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+            --pattern $Zip --pattern "$Zip.sha256" --dir artifacts
+          if ($LASTEXITCODE -ne 0) { throw "Could not download $Zip from release $($env:RELEASE_TAG)" }
+          Get-Content "artifacts\$Zip.sha256" | Write-Output
+
+      - name: Render, pack and verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Zip = "haider-v$($env:RELEASE_VERSION)-x86_64-pc-windows-msvc-split.zip"
+          $Common = @(
+            '--version', $env:RELEASE_VERSION,
+            '--artifact', "artifacts\$Zip",
+            '--checksum', "artifacts\$Zip.sha256",
+            '--package-version', $env:PACKAGE_VERSION,
+            '--dependency', $env:VCREDIST_DEPENDENCY
+          )
+          python scripts\release_packaging.py render-chocolatey `
+            --source release-src\packaging\chocolatey --output dist-choco @Common
+          if ($LASTEXITCODE -ne 0) { throw "Chocolatey template rendering failed with exit code $LASTEXITCODE" }
+          Get-Content dist-choco\haider.nuspec | Write-Output
+          choco pack dist-choco\haider.nuspec --outputdirectory dist-choco
+          if ($LASTEXITCODE -ne 0) { throw "choco pack failed with exit code $LASTEXITCODE" }
+          python scripts\release_packaging.py verify-chocolatey `
+            --nupkg "dist-choco\haider.$($env:PACKAGE_VERSION).nupkg" @Common
+          if ($LASTEXITCODE -ne 0) { throw "Chocolatey post-pack verification failed with exit code $LASTEXITCODE" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chocolatey-haider
+          path: dist-choco/*.nupkg
+          if-no-files-found: error
+
+  accept:
+    needs: pack
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: chocolatey-haider
+          path: dist-choco
+      - name: Install package on clean Server Core
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Build = [Environment]::OSVersion.Version.Build
+          $Tag = switch ($Build) { 26100 { 'ltsc2025' } 20348 { 'ltsc2022' } default { throw "no Server Core tag for host build $Build" } }
+          $Image = "mcr.microsoft.com/windows/servercore:$Tag"
+          docker pull --quiet $Image
+          if ($LASTEXITCODE -ne 0) { throw "docker pull $Image failed, rc=$LASTEXITCODE" }
+          $PackageDir = (Resolve-Path dist-choco).Path
+          $ScriptsDir = (Resolve-Path scripts).Path
+          $Output = docker run --rm --isolation process `
+            -v "${PackageDir}:C:\pkg:ro" -v "${ScriptsDir}:C:\accept:ro" `
+            $Image powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File C:\accept\chocolatey_accept.ps1 -PackageVersion $env:PACKAGE_VERSION 2>&1
+          $Result = $LASTEXITCODE
+          $Output | Write-Output
+          $PassLines = @($Output | Where-Object { $_ -match '^PASS:' })
+          "Clean Server Core ($Image) acceptance exit: $Result" >> $env:GITHUB_STEP_SUMMARY
+          $PassLines | ForEach-Object { "- $_" >> $env:GITHUB_STEP_SUMMARY }
+          if ($Result -ne 0) { throw "Clean Server Core package acceptance failed, rc=$Result" }
+          if ($PassLines.Count -ne 5) { throw "Expected five acceptance PASS lines, got $($PassLines.Count)" }
+
+  publish:
+    needs: [pack, accept]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: chocolatey-haider
+          path: dist-choco
+      - name: Check exact Chocolatey version in OData
+        id: package
+        shell: pwsh
+        run: |
+          & scripts\chocolatey_publish.ps1 -Mode Check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Push
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+          PACKAGE_PRESENT: ${{ steps.package.outputs.present }}
+          CHOCO_CONFIRM_TIMEOUT_SECONDS: ${{ inputs.confirm_timeout_seconds || '600' }}
+        run: |
+          & scripts\chocolatey_publish.ps1 -Mode Push
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
