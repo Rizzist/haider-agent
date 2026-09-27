@@ -103,6 +103,7 @@ fn call(id: &str, name: &str) -> TurnItem {
         name: name.to_owned(),
         args: serde_json::json!({}),
         status: ToolStatus::InProgress,
+        activity: None,
     }
 }
 

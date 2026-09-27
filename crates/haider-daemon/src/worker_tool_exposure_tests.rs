@@ -19,6 +19,7 @@ fn discovery_start(call_id: &str) -> EventPayload {
             name: "list_tools".into(),
             args: serde_json::json!({"filter": "monitor"}),
             status: ToolStatus::InProgress,
+            activity: None,
         },
     })
 }
@@ -312,6 +313,7 @@ async fn sqlite_discovery_survives_turn_setup_suffix_and_restart() {
                     name: "list_tools".into(),
                     args: serde_json::json!({"filter": "monitor"}),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
         ),

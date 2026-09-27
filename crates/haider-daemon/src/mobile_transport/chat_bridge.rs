@@ -1118,6 +1118,7 @@ impl TurnProjection {
                 name,
                 args,
                 status,
+                ..
             } => {
                 let status = if completed {
                     tool_status(status)

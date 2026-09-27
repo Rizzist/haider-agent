@@ -29,15 +29,23 @@ additive, absence-preserving fields: `activity` (one of `computer`, `mobile`,
 DOING at `generated_at_ms`, distinct from its `state` — and `activities`, every
 activity used so far in priority order. Both are derived by
 `haider_protocol::activity::ActivityTracker` from typed journal facts only
-(`ToolCall` tool identity, `CommandExecution`, `FileChange`, `ChildSpawn`,
+(`ToolCall.activity`, `CommandExecution`, `FileChange`, `ChildSpawn`,
 `RunState`), never from free text. Priority (highest first) is the order
 above. Timing: an open call is active until it completes; a finished call
 stays hot for 8 s (hot kinds compete on priority); a quiet agent then shows
 its most recent activity until 60 s of quiet, then none; a node with live
 children is orchestrating; terminal nodes carry no current activity. The
-enum is `#[serde(other)]`-tolerant (`unknown`), no event shape changes, and a
+enum is `#[serde(other)]`-tolerant (`unknown`). Completed `ToolCall` items
+gain an optional `activity` discriminator; old journals without it do not
+infer activity from the display name. An ACP agent's typed `ToolKind` maps
+read/search to read, edit/delete/move to edit, execute to run, fetch to web,
+and think/switch_mode/other to none. Anthropic web_search/web_fetch and the
+hard-coded OpenAI/Gemini web_search carry web; unknown provider names and
+orphan results carry none. Local calls use only a daemon-registered route.
+Provider admission recovery uses `provider_transport`, which never counts as
+agent activity. This is an additive event shape change, and a
 peer that did not negotiate `session_fleet_identity_v1` receives the exact
-pre-field payload. Clients render emoji (`🖥️ 📱 🌐 🔌 ✏️ ⚙️ 🔍 🧭`, VS16 where
+pre-field payload on fleet, metrics and Event frames. Clients render emoji (`🖥️ 📱 🌐 🔌 ✏️ ⚙️ 🔍 🧭`, VS16 where
 the base defaults to text presentation, two columns each) or the text
 fallbacks `[screen] [phone] [web] [remote] [edit] [run] [read] [orch]`;
 `HAIDER_ACTIVITY_ICONS=emoji|text|off`, the TUI `/icons` setting, `NO_COLOR`
@@ -48,11 +56,12 @@ summaries, observe digests and fleet node metrics) gains an additive
 withheld from peers without `session_fleet_identity_v1`. Only work that
 really ran counts: live activity opens on a `Dispatched` effect (by its
 typed `EffectClass`) and closes at its outcome; a completed `ToolCall`
-counts only with status `completed`. A tool name the model merely
+counts only with status `completed` and a typed activity. A tool name the model merely
 requested (unadvertised, ungranted, malformed or refused) sets no icon and
 adds no history. The computer-use overlay names an acting subagent
 (`🖥️ <callsign> is using your screen`), re-labels when a different actor
-takes over a shown surface, and follows the daemon's `HAIDER_ACTIVITY_ICONS`
+takes over a shown surface (relabels debounce for 150 ms to coalesce rapid
+alternation), and follows the daemon's `HAIDER_ACTIVITY_ICONS`
 then `NO_COLOR` (it is a shared daemon surface, so a single TUI's `/icons`
 choice does not apply to it).
 

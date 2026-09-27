@@ -591,7 +591,11 @@ fn a_different_actor_on_a_shown_surface_relabels_the_badge() {
             actor("Bilal"),
         )
         .expect("not stopped");
-    assert_eq!(show(&other).as_deref(), Some("Bilal is using your screen"));
+    assert_eq!(show(&other), None, "relabel is debounced");
+    assert_eq!(
+        show(&machine.tick(now + Duration::from_millis(150))).as_deref(),
+        Some("Bilal is using your screen")
+    );
     let (_, main) = machine
         .begin_action(
             key("main"),
@@ -601,8 +605,48 @@ fn a_different_actor_on_a_shown_surface_relabels_the_badge() {
             now,
         )
         .expect("not stopped");
+    assert_eq!(show(&main), None);
     assert_eq!(
-        show(&main).as_deref(),
+        show(&machine.tick(now + Duration::from_millis(150))).as_deref(),
         Some("Haider is controlling this screen")
+    );
+}
+
+#[test]
+fn alternating_actors_coalesce_show_and_keep_final_label() {
+    let mut machine = PresenceMachine::<String>::default();
+    let now = Instant::now();
+    let mut shows = 0;
+    for index in 0..100 {
+        let actor = if index % 2 == 0 { "Amina" } else { "Bilal" };
+        let (_, commands) = machine
+            .begin_action_as(
+                key(actor),
+                PresenceSurface::Screen,
+                PresenceMark::Click,
+                None,
+                now + Duration::from_millis(index),
+                Some(PresenceActor {
+                    name: actor.into(),
+                    emoji: false,
+                }),
+            )
+            .expect("not stopped");
+        shows += commands
+            .iter()
+            .filter(|command| matches!(command, PresenceCommand::Show { .. }))
+            .count();
+    }
+    assert_eq!(shows, 1, "100 rapid alternations cost one initial Show");
+    let commands = machine.tick(now + Duration::from_millis(249));
+    assert_eq!(
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                PresenceCommand::Show { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["Bilal is using your screen"],
     );
 }

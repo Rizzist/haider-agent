@@ -10,8 +10,8 @@
 //!   is `Dispatched` (authorized, crossing the dispatch boundary) and closed
 //!   at its `Outcome`;
 //! * completed activity: a `ToolCall` / `CommandExecution` item whose status
-//!   is `completed` (a real route ran — this also covers provider-executed
-//!   server tools such as `web_search`), plus the daemon-authored
+//!   is `completed` and whose activity came from a registered route or
+//!   closed provider adapter, plus the daemon-authored
 //!   `FileChange` / `ChildSpawn` items;
 //! * `RunState` for terminal detection.
 //!
@@ -205,48 +205,22 @@ impl ActivityKind {
         }
     }
 
-    /// The activity of one tool by its TYPED identity: the registered route
-    /// name the daemon journals on the `ToolCall` item (plus the provider-
-    /// executed server tool names and the flat model-facing aliases the
-    /// daemon decodes into the same routes). Tools that do no observable
-    /// work (plans, todos, input requests, outcome reports) and unknown or
-    /// third-party tool names map to `None`.
-    #[must_use]
-    pub fn for_tool(name: &str) -> Option<Self> {
-        Some(match name {
-            "computer" => Self::Computer,
-            "mobile" => Self::Mobile,
-            // Local fetch/search plus provider-executed server tools
-            // (journaled under their provider name; `web_tool` is the
-            // daemon's fallback name for an unnamed server call).
-            "web_fetch" | "web_search" | "web_tool" | "webextract" | "browser"
-            | "google_search" | "url_context" => Self::Web,
-            _ if name.starts_with("browser_") => Self::Web,
-            "ssh_shell" | "remote_exec" => Self::Remote,
-            "fs_write" | "fs_edit" | "fs_patch" | "fs_path" | "edit" | "write" | "apply_patch" => {
-                Self::Edit
-            }
-            "process_exec" | "test_run" | "tool_script" | "task_output" | "task_kill" | "shell"
-            | "bash" | "code_execution" => Self::Run,
-            "fs_read" | "fs_search" | "fs_glob" | "read" | "list_tools" | "list_models"
-            | "session_transcript" | "ssh_list" | "peer_list" => Self::Read,
-            "spawn_subagent" | "message_subagent" | "workflow_author" | "loom_register"
-            | "peer_send" => Self::Orchestrate,
-            _ => return None,
-        })
-    }
-
     /// The activity of one typed effect class — the daemon's own authority
     /// vocabulary for what a dispatched tool is about to do.
     #[must_use]
     pub fn for_effect(class: &EffectClass) -> Option<Self> {
         Some(match class {
+            EffectClass::ProviderTransport => return None,
             EffectClass::GuiAct | EffectClass::ScreenObserve | EffectClass::ScreenControl => {
                 Self::Computer
             }
             EffectClass::MobileObserve | EffectClass::MobileControl | EffectClass::ReadSms => {
                 Self::Mobile
             }
+            // Historical recovery journals used this sentinel before the
+            // dedicated ProviderTransport class existed. New recovery facts
+            // use the typed class; this narrow guard makes old replay safe.
+            EffectClass::Network { host } if host == "provider-request" => return None,
             EffectClass::Network { .. } => Self::Web,
             EffectClass::RemoteExecution => Self::Remote,
             EffectClass::FsWrite | EffectClass::GitOp => Self::Edit,
@@ -261,7 +235,7 @@ impl ActivityKind {
     #[must_use]
     pub fn for_item(item: &TurnItem) -> Option<Self> {
         match item {
-            TurnItem::ToolCall { name, .. } => Self::for_tool(name),
+            TurnItem::ToolCall { activity, .. } => *activity,
             TurnItem::CommandExecution { .. } => Some(Self::Run),
             TurnItem::FileChange { .. } => Some(Self::Edit),
             TurnItem::ChildSpawn { .. } => Some(Self::Orchestrate),

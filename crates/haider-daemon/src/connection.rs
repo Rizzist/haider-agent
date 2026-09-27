@@ -947,6 +947,19 @@ impl ConnectionFrameSink {
 /// the two newly gated fields are omitted.
 fn omit_fleet_identity(frame: &mut WireFrame) {
     match frame {
+        WireFrame::Event { envelope, .. }
+        | WireFrame::SessionDescendantStream {
+            event: haider_rpc::SessionDescendantStreamEventWire::Envelope { envelope, .. },
+            ..
+        } => omit_event_activity(envelope),
+        WireFrame::Response {
+            body: ResponseBody::SessionRead { result },
+            ..
+        } => {
+            for envelope in &mut result.envelopes {
+                omit_event_activity(envelope);
+            }
+        }
         WireFrame::Response {
             body: ResponseBody::SessionFleet { snapshot },
             ..
@@ -982,6 +995,49 @@ fn omit_fleet_identity(frame: &mut WireFrame) {
         } => {
             for digest in digests {
                 omit_metrics_activity(digest.agent_metrics.as_mut());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn omit_event_activity(envelope: &mut haider_protocol::envelope::RawEnvelope) {
+    let payload = &mut envelope.payload;
+    match payload.get("type").and_then(serde_json::Value::as_str) {
+        Some("agent_metrics") => {
+            if let Some(fields) = payload.as_object_mut() {
+                fields.remove("activity");
+            }
+        }
+        Some("item") => {
+            if let Some(fields) = payload
+                .get_mut("item")
+                .filter(|item| {
+                    item.get("item").and_then(serde_json::Value::as_str) == Some("tool_call")
+                })
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                fields.remove("activity");
+            }
+        }
+        Some("effect")
+            if payload.get("phase").and_then(serde_json::Value::as_str) == Some("intent") =>
+        {
+            // Recovery used a Network effect before this lane. Keep the
+            // historical bytes for a peer without the fleet capability.
+            if let Some(class) = payload
+                .get_mut("class")
+                .and_then(serde_json::Value::as_object_mut)
+                && class.get("class").and_then(serde_json::Value::as_str)
+                    == Some("provider_transport")
+            {
+                *class = serde_json::json!({
+                    "class": "network",
+                    "host": "provider-request",
+                })
+                .as_object()
+                .expect("object")
+                .clone();
             }
         }
         _ => {}

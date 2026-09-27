@@ -1070,6 +1070,7 @@ fn server_tool_blocks_and_cited_text_are_captured_verbatim_for_replay() {
                 call_id: "srvtoolu_1".into(),
                 name: "web_search".into(),
                 args: serde_json::json!({"query": "rust sse"}),
+                activity: Some(haider_protocol::activity::ActivityKind::Web),
             }),
             Ok(StreamEvent::ProviderOpaque {
                 provider: "anthropic".into(),

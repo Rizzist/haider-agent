@@ -63,7 +63,15 @@ fn finish(tracker: &mut ActivityTracker, id: &str, name: &str, at_ms: u64) {
         }),
         at_ms,
     );
-    tracker.observe(&tool_item(id, name, ToolStatus::Completed, true), at_ms);
+    let mut completed = tool_item(id, name, ToolStatus::Completed, true);
+    if let EventPayload::Item(ItemEvent::Completed {
+        item: TurnItem::ToolCall { activity, .. },
+        ..
+    }) = &mut completed
+    {
+        *activity = ActivityKind::for_effect(&class_of(name));
+    }
+    tracker.observe(&completed, at_ms);
 }
 
 fn tool_item(id: &str, name: &str, status: ToolStatus, completed: bool) -> EventPayload {
@@ -72,6 +80,7 @@ fn tool_item(id: &str, name: &str, status: ToolStatus, completed: bool) -> Event
         name: name.to_owned(),
         args: serde_json::json!({}),
         status,
+        activity: None,
     };
     let item_id = ItemId::new(id);
     EventPayload::Item(if completed {
@@ -82,45 +91,25 @@ fn tool_item(id: &str, name: &str, status: ToolStatus, completed: bool) -> Event
 }
 
 #[test]
-fn tool_identity_maps_every_route_to_its_documented_kind() {
+fn only_typed_tool_activity_counts() {
     use ActivityKind as A;
-    for (name, kind) in [
-        ("computer", A::Computer),
-        ("mobile", A::Mobile),
-        ("web_fetch", A::Web),
-        ("web_search", A::Web),
-        ("webextract", A::Web),
-        ("browser_navigate", A::Web),
-        ("ssh_shell", A::Remote),
-        ("fs_write", A::Edit),
-        ("fs_edit", A::Edit),
-        ("fs_patch", A::Edit),
-        ("fs_path", A::Edit),
-        ("edit", A::Edit),
-        ("process_exec", A::Run),
-        ("test_run", A::Run),
-        ("tool_script", A::Run),
-        ("fs_read", A::Read),
-        ("fs_search", A::Read),
-        ("fs_glob", A::Read),
-        ("session_transcript", A::Read),
-        ("spawn_subagent", A::Orchestrate),
-        ("message_subagent", A::Orchestrate),
-        ("loom_register", A::Orchestrate),
-        ("workflow_author", A::Orchestrate),
+    for (name, typed) in [
+        ("computer", A::Read),
+        (" mobile ", A::Edit),
+        ("BROWSER_open", A::Run),
+        ("ssh_shell", A::Web),
+        ("ＣＯＭＰＵＴＥＲ", A::Read),
+        ("", A::Run),
+        ("mcp__server__computer", A::Read),
     ] {
-        assert_eq!(A::for_tool(name), Some(kind), "{name}");
-    }
-    for silent in [
-        "todo_write",
-        "plan",
-        "request_input",
-        "task_outcome",
-        "monitor",
-        "mcp__x__y",
-        "",
-    ] {
-        assert_eq!(A::for_tool(silent), None, "{silent}");
+        let item = TurnItem::ToolCall {
+            call_id: "typed".into(),
+            name: name.into(),
+            args: serde_json::Value::Null,
+            status: ToolStatus::Completed,
+            activity: Some(typed),
+        };
+        assert_eq!(A::for_item(&item), Some(typed), "{name}");
     }
 }
 
@@ -132,8 +121,9 @@ fn derivation_never_reads_free_text() {
         name: "fs_read".into(),
         args: serde_json::json!({"path": "computer_edit_ssh_web.md"}),
         status: ToolStatus::Completed,
+        activity: None,
     };
-    assert_eq!(ActivityKind::for_item(&item), Some(ActivityKind::Read));
+    assert_eq!(ActivityKind::for_item(&item), None);
     // Prose items carry no activity at all.
     let prose = TurnItem::AgentMessage {
         text: "I will now use the computer and ssh".to_owned().into(),
@@ -408,14 +398,70 @@ fn successful_server_tool_completion_counts_without_an_effect() {
     // Provider-executed tools (web_search) have no local effect; their only
     // fact is the completed item, which counts only when it succeeded.
     let mut tracker = ActivityTracker::new();
-    tracker.observe(
-        &tool_item("s", "web_search", ToolStatus::Completed, true),
-        5,
-    );
+    let mut completed = tool_item("s", "web_search", ToolStatus::Completed, true);
+    if let EventPayload::Item(ItemEvent::Completed {
+        item: TurnItem::ToolCall { activity, .. },
+        ..
+    }) = &mut completed
+    {
+        *activity = Some(ActivityKind::Web);
+    }
+    tracker.observe(&completed, 5);
     assert_eq!(tracker.current(5, false), Some(ActivityKind::Web));
     let mut failed = ActivityTracker::new();
     failed.observe(&tool_item("s", "web_search", ToolStatus::Failed, true), 5);
     assert!(failed.is_empty());
+}
+
+#[test]
+fn gate_v1_completed_untyped_server_names_never_set_activity() {
+    for name in [
+        "computer",
+        "mobile",
+        "browser_open the release page",
+        "ssh_shell",
+        " COMPUTER ",
+        "ｃｏｍｐｕｔｅｒ",
+        "",
+        "mcp__server__computer",
+    ] {
+        let mut tracker = ActivityTracker::new();
+        tracker.observe(&tool_item("srv", name, ToolStatus::Completed, true), 1_000);
+        assert_eq!(tracker.current(1_000, false), None, "{name}");
+        assert!(tracker.used().is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn gate_v4_provider_transport_recovery_has_no_agent_activity() {
+    let effect = EffectId::new("provider-admission-run-1");
+    let mut tracker = ActivityTracker::new();
+    for phase in [
+        EffectPhase::Intent(EffectIntent {
+            effect: effect.clone(),
+            class: EffectClass::ProviderTransport,
+            summary: "provider request admitted before restart".into(),
+            args_digest: "sha256:0".into(),
+            workspace_revision: None,
+        }),
+        EffectPhase::Authorized {
+            effect: effect.clone(),
+            verdict: AuthorizationVerdict::Allow,
+        },
+        EffectPhase::Dispatched {
+            effect: effect.clone(),
+        },
+        EffectPhase::Outcome {
+            effect,
+            outcome: EffectOutcome::Unknown,
+            freshness: None,
+            workspace_mutation: None,
+        },
+    ] {
+        tracker.observe(&EventPayload::Effect(phase), 5_000);
+    }
+    assert_eq!(tracker.current(5_000, false), None);
+    assert!(tracker.used().is_empty());
 }
 
 #[test]
@@ -437,6 +483,7 @@ fn effect_classes_map_to_the_documented_kinds() {
         (EffectClass::AgentSpawn, Some(A::Orchestrate)),
         (EffectClass::PeerMessage, Some(A::Orchestrate)),
         (EffectClass::CredentialAccess, None),
+        (EffectClass::ProviderTransport, None),
     ] {
         assert_eq!(A::for_effect(&class), kind, "{class:?}");
     }

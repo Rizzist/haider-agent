@@ -1734,6 +1734,7 @@ impl ChipModel {
                                 name: name.clone(),
                                 args: serde_json::json!({ "desc": desc, "meta": meta }),
                                 status: haider_protocol::item::ToolStatus::Completed,
+                                activity: None,
                             },
                         },
                     ));

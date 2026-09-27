@@ -14193,6 +14193,43 @@ pub(crate) enum RegisteredToolRoute {
     SshShell,
 }
 
+impl RegisteredToolRoute {
+    pub(crate) fn activity(self) -> Option<haider_protocol::activity::ActivityKind> {
+        use haider_protocol::activity::ActivityKind;
+        Some(match self {
+            Self::Computer => ActivityKind::Computer,
+            Self::Mobile => ActivityKind::Mobile,
+            Self::WebFetch | Self::WebSearch => ActivityKind::Web,
+            Self::SshShell => ActivityKind::Remote,
+            Self::FsWrite | Self::FsEdit | Self::FsPath => ActivityKind::Edit,
+            Self::ProcessExec
+            | Self::TestRun
+            | Self::ToolScript
+            | Self::TaskOutput
+            | Self::TaskKill => ActivityKind::Run,
+            Self::FsRead
+            | Self::FsGlob
+            | Self::FsSearch
+            | Self::SshList
+            | Self::ListModels
+            | Self::SessionTranscript
+            | Self::PeerList
+            | Self::ListTools => ActivityKind::Read,
+            Self::SpawnSubagent
+            | Self::MessageSubagent
+            | Self::WorkflowAuthor
+            | Self::LoomRegister
+            | Self::PeerSend => ActivityKind::Orchestrate,
+            Self::RequestInput
+            | Self::Plan
+            | Self::TodoWrite
+            | Self::TaskOutcome
+            | Self::GraphEvidence
+            | Self::Monitor => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RegisteredTool {
     pub(crate) manifest: ToolManifest,
@@ -19435,6 +19472,7 @@ impl BrokerToolDispatcher {
                 name: tool.to_owned(),
                 args: args.clone(),
                 status: haider_protocol::item::ToolStatus::InProgress,
+                activity: None,
             },
         });
         let mut events = vec![start];
@@ -20612,6 +20650,7 @@ impl BrokerToolDispatcher {
             name: pending.tool.clone(),
             args: pending.args.0.clone(),
             status: result.status.item_status(),
+            activity: None,
         };
         let mut prefix = vec![
             EventPayload::ToolResult {
@@ -20946,6 +20985,9 @@ async fn recover_orchestration_child(
 
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
+    fn activity_for_route(&self, name: &str) -> Option<haider_protocol::activity::ActivityKind> {
+        registered_tool_route(name).and_then(RegisteredToolRoute::activity)
+    }
     fn platform_tool_supported(&self, name: &str) -> bool {
         !crate::android_policy::enabled() || registered_tool_route(name).is_some()
     }

@@ -3383,6 +3383,11 @@ pub struct ContextCompactionOutcome {
 
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
+    /// Returns activity only for a route owned and registered by this
+    /// dispatcher. The actor never classifies the model's requested name.
+    fn activity_for_route(&self, _name: &str) -> Option<haider_protocol::activity::ActivityKind> {
+        None
+    }
     /// Hard platform availability precedes actor grant/exposure handling. A false
     /// result routes to the dispatcher's normal unsupported-tool outcome.
     fn platform_tool_supported(&self, _name: &str) -> bool {
@@ -5203,7 +5208,14 @@ impl HarnessActor {
         // TURN-scoped — a pause_turn boundary can split a server call from
         // its result across requests, and the bounded sources list journals
         // exactly once, under the finished message.
-        let mut server_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut server_calls: HashMap<
+            String,
+            (
+                String,
+                serde_json::Value,
+                Option<haider_protocol::activity::ActivityKind>,
+            ),
+        > = HashMap::new();
         let mut web_sources: Vec<WebSource> = Vec::new();
         // These are one logical provider response, not one physical transport
         // attempt. A reconnect keeps them alive while replay filtering skips
@@ -5274,8 +5286,10 @@ impl HarnessActor {
                         call_id,
                         name,
                         args,
+                        activity,
                     } => {
-                        server_calls.insert(call_id.clone(), (name.clone(), args.clone()));
+                        server_calls
+                            .insert(call_id.clone(), (name.clone(), args.clone(), *activity));
                     }
                     StreamEvent::ServerToolResult { call_id, .. } => {
                         server_calls.remove(call_id);
@@ -7775,6 +7789,7 @@ impl HarnessActor {
                         call_id,
                         name,
                         args,
+                        activity,
                     } => {
                         if let Err(error) = self.flush_pending_item_delta().await {
                             return self
@@ -7787,7 +7802,7 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
-                        server_calls.insert(call_id, (name, args));
+                        server_calls.insert(call_id, (name, args, activity));
                         Ok(None)
                     }
                     StreamEvent::ServerToolResult {
@@ -7795,9 +7810,9 @@ impl HarnessActor {
                         preview,
                         is_error,
                     } => {
-                        let (name, args) = server_calls
+                        let (name, args, activity) = server_calls
                             .remove(&call_id)
-                            .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null));
+                            .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null, None));
                         let result_preview = preview.clone();
                         let result_name = name.clone();
                         let result_args = args.clone();
@@ -7834,7 +7849,7 @@ impl HarnessActor {
                                 orchestration: None,
                             };
                             self.commit_server_tool_row(
-                                &run_id, &call_id, name, args, status, &result,
+                                &run_id, &call_id, name, args, activity, status, &result,
                             )
                             .await?;
                             continuation_progress.observe_server_tool(
@@ -10335,6 +10350,7 @@ impl HarnessActor {
                     name: name.clone(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             },
         )
@@ -12322,6 +12338,7 @@ impl HarnessActor {
                         name: tool.name.clone(),
                         args: tool_args_or_raw(tool),
                         status: ToolStatus::Pending,
+                        activity: None,
                     },
                 },
             )
@@ -12363,6 +12380,10 @@ impl HarnessActor {
         } else {
             parse_tool_args(tool)?.as_ref().clone()
         };
+        let activity = (status == ToolStatus::Completed
+            && tool_call_within_advertised_ceiling(&self.config, &tool.name))
+        .then(|| self.dispatcher.as_ref()?.activity_for_route(&tool.name))
+        .flatten();
         self.commit_item(
             run_id,
             ItemEvent::Completed {
@@ -12372,6 +12393,7 @@ impl HarnessActor {
                     name: tool.name.clone(),
                     args,
                     status,
+                    activity,
                 },
             },
         )
@@ -12462,6 +12484,10 @@ impl HarnessActor {
         } else {
             parse_tool_args(tool)?.as_ref().clone()
         };
+        let activity = (status == ToolStatus::Completed
+            && tool_call_within_advertised_ceiling(&self.config, &tool.name))
+        .then(|| self.dispatcher.as_ref()?.activity_for_route(&tool.name))
+        .flatten();
 
         self.flush_pending_item_delta()
             .await
@@ -12533,6 +12559,7 @@ impl HarnessActor {
                         name: tool.name.clone(),
                         args,
                         status,
+                        activity,
                     },
                 }),
                 prompt_verbatim_render(),
@@ -13076,6 +13103,7 @@ impl HarnessActor {
         call_id: &str,
         name: String,
         args: serde_json::Value,
+        activity: Option<haider_protocol::activity::ActivityKind>,
         status: ToolStatus,
         result: &BoundedResult,
     ) -> Result<(), DriveError> {
@@ -13085,12 +13113,14 @@ impl HarnessActor {
             name: name.clone(),
             args: args.clone(),
             status: ToolStatus::InProgress,
+            activity: None,
         };
         let completed = TurnItem::ToolCall {
             call_id: call_id.to_owned(),
             name,
             args,
             status,
+            activity,
         };
         let render = prompt_omit_render();
         let started = self

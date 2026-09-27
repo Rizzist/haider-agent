@@ -2557,3 +2557,175 @@ async fn welcome_barrier_holds_every_other_lane_until_the_welcome_writes() {
         "the held lane flows only after the welcome popped"
     );
 }
+
+#[test]
+fn gate_f2_legacy_event_frame_strips_metrics_activity() {
+    use haider_protocol::activity::{ActivityKind, ActivityStateV1, ActivityTouchV1};
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{AgentId, DeviceId, EventId, RunId, SessionId};
+    let snapshot = haider_protocol::agent::AgentMetricsSnapshot {
+        agent: Some(AgentId::new("repro-agent")),
+        session_id: SessionId::new("repro-child"),
+        head_seq: 9,
+        started_at_ms: 1,
+        terminal_at_ms: None,
+        live: true,
+        tool_attempts: 2,
+        usage: None,
+        activity: Some(ActivityStateV1 {
+            open: vec![ActivityKind::Edit],
+            touched: vec![ActivityTouchV1 {
+                kind: ActivityKind::Edit,
+                at_ms: 1,
+            }],
+            latest: Some(ActivityTouchV1 {
+                kind: ActivityKind::Edit,
+                at_ms: 1,
+            }),
+            terminal: false,
+        }),
+    };
+    let envelope: haider_protocol::envelope::RawEnvelope = EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("delegation-metrics-repro-agent-9"),
+        seq: 12,
+        session_id: SessionId::new("repro-parent"),
+        branch_id: None,
+        run_id: Some(RunId::new("repro-parent-run")),
+        agent_id: None,
+        device_id: DeviceId::new("repro-device"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 1,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: snapshot.to_payload_value().expect("payload").into(),
+    };
+    let frame = WireFrame::Event {
+        attachment_id: AttachmentId::new("repro-attachment"),
+        session_id: SessionId::new("repro-parent"),
+        envelope: envelope.clone(),
+    };
+    let descendant = WireFrame::SessionDescendantStream {
+        attachment_id: AttachmentId::new("repro-attachment"),
+        event: haider_rpc::SessionDescendantStreamEventWire::Envelope {
+            session_id: SessionId::new("repro-child"),
+            agent_id: AgentId::new("repro-agent"),
+            envelope: envelope.clone(),
+        },
+    };
+    let read = WireFrame::Response {
+        request_id: RequestId::new("read"),
+        body: ResponseBody::SessionRead {
+            result: haider_rpc::SessionReadResult {
+                session_id: SessionId::new("repro-child"),
+                range: haider_rpc::SeqRange {
+                    start_seq: 12,
+                    end_seq: 12,
+                },
+                head_seq: 12,
+                metadata: None,
+                latest_context_footprint: None,
+                envelopes: vec![envelope],
+            },
+        },
+    };
+    for frame in [frame, descendant, read] {
+        for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+            let mut legacy = frame.clone();
+            omit_fleet_identity(&mut legacy);
+            let json = serde_json::to_string(&legacy).expect("serializes");
+            assert!(
+                !json.contains("\"activit"),
+                "legacy event frame leaked metrics activity ({encoding:?}): {json}"
+            );
+            assert!(
+                serde_json::to_string(&frame)
+                    .unwrap()
+                    .contains("\"activity\"")
+            );
+            let bytes = uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("encodes");
+            assert!(!bytes.windows(7).any(|part| part == b"activit"));
+            let sink = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity: false,
+            };
+            let sent = sink.encode(&frame).expect("legacy sink encodes");
+            let actual = match sent {
+                OutboundBytes::Contiguous(bytes) => bytes.as_slice().to_vec(),
+                OutboundBytes::Framed(frame) => {
+                    let mut bytes = Vec::new();
+                    bytes.extend_from_slice(frame.prefix());
+                    bytes.extend_from_slice(frame.body());
+                    bytes
+                }
+                OutboundBytes::Event(frame) => {
+                    let mut bytes = Vec::new();
+                    frame.write_to(&mut bytes).expect("writes event");
+                    bytes
+                }
+            };
+            assert_eq!(actual, bytes, "sink preserves pre-lane bytes");
+        }
+    }
+}
+
+#[test]
+fn legacy_event_strips_typed_tool_activity_but_modern_keeps_it() {
+    use haider_protocol::activity::ActivityKind;
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EventId, ItemId, SessionId};
+    use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+    let payload = haider_protocol::EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("tool"),
+        item: TurnItem::ToolCall {
+            call_id: "tool".into(),
+            name: "computer".into(),
+            args: serde_json::Value::Null,
+            status: ToolStatus::Completed,
+            activity: Some(ActivityKind::Read),
+        },
+    });
+    let frame = WireFrame::Event {
+        attachment_id: AttachmentId::new("a"),
+        session_id: SessionId::new("s"),
+        envelope: EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("e"),
+            seq: 1,
+            session_id: SessionId::new("s"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("d"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).unwrap().into(),
+        },
+    };
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        let mut legacy = frame.clone();
+        omit_fleet_identity(&mut legacy);
+        let modern = serde_json::to_string(&frame).unwrap();
+        let old = serde_json::to_string(&legacy).unwrap();
+        assert!(modern.contains("\"activity\":\"read\""));
+        assert!(!old.contains("\"activit"));
+        let bytes = uds_codec::encode_with(&legacy, 1_048_576, encoding).unwrap();
+        assert!(!bytes.windows(7).any(|part| part == b"activit"));
+    }
+}

@@ -1094,6 +1094,7 @@ fn golden_item_lifecycle() {
                 name: "fs_edit".into(),
                 args: serde_json::json!({"path": "src/lib.rs"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         },
     );
@@ -1106,6 +1107,7 @@ fn golden_item_lifecycle() {
                 name: "fs_read".into(),
                 args: serde_json::json!({}),
                 status: ToolStatus::Cancelled,
+                activity: None,
             },
         },
     );
@@ -1202,6 +1204,7 @@ fn golden_item_lifecycle() {
                     ]
                 }),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         },
     );

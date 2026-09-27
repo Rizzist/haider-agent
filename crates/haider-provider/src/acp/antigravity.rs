@@ -21,7 +21,7 @@ use crate::acp::client::{
 use crate::acp::wire::{
     ACP_ERROR_AUTH_REQUIRED, AcpModelCatalog, AuthMethod, AuthMethodType, ClientInfo, ContentBlock,
     SessionConfigOption, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdate,
+    ToolCallUpdate, ToolKind,
 };
 use crate::{
     Block, MessageRole, Provider, ProviderError, ProviderErrorKind, ProviderStream,
@@ -682,6 +682,7 @@ impl AcpTurnDecoder {
             call_id: call.tool_call_id.clone(),
             name: display_name(&call.title, call.kind.as_str()),
             args: call.raw_input.clone().unwrap_or(serde_json::Value::Null),
+            activity: acp_activity(call.kind),
         }];
         if call.status.is_terminal() {
             events.extend(self.finish_tool_call(
@@ -709,6 +710,7 @@ impl AcpTurnDecoder {
                     update.kind.unwrap_or_default().as_str(),
                 ),
                 args: update.raw_input.clone().unwrap_or(serde_json::Value::Null),
+                activity: acp_activity(update.kind.unwrap_or_default()),
             });
         }
         if update.status.is_some_and(ToolCallStatus::is_terminal) {
@@ -768,6 +770,17 @@ fn display_name(title: &str, kind: &str) -> String {
     } else {
         title.to_owned()
     }
+}
+
+fn acp_activity(kind: ToolKind) -> Option<haider_protocol::activity::ActivityKind> {
+    use haider_protocol::activity::ActivityKind;
+    Some(match kind {
+        ToolKind::Read | ToolKind::Search => ActivityKind::Read,
+        ToolKind::Edit | ToolKind::Delete | ToolKind::Move => ActivityKind::Edit,
+        ToolKind::Execute => ActivityKind::Run,
+        ToolKind::Fetch => ActivityKind::Web,
+        ToolKind::Think | ToolKind::SwitchMode | ToolKind::Other => return None,
+    })
 }
 
 /// Builds the bounded, display-only result preview.

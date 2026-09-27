@@ -360,6 +360,8 @@ pub struct PresenceMachine<K: Ord + Clone> {
     /// The badge label each shown surface currently displays, so a different
     /// actor taking over a shown surface re-labels it (973-activity-icons).
     labels: BTreeMap<PresenceSurface, String>,
+    /// A relabel waits briefly so rapid actor alternation yields one Show.
+    pending_labels: BTreeMap<PresenceSurface, (String, Instant)>,
     idle_timeout: Duration,
     next_seq: u64,
 }
@@ -377,6 +379,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             leases: BTreeMap::new(),
             shown: BTreeSet::new(),
             labels: BTreeMap::new(),
+            pending_labels: BTreeMap::new(),
             idle_timeout,
             next_seq: 1,
         }
@@ -433,10 +436,14 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         );
         // First show, or a DIFFERENT actor now drives an already-shown
         // surface: (re)issue Show so the badge names who is acting now.
-        let relabel = self.labels.get(&surface) != Some(&label);
-        if self.shown.insert(surface) || relabel {
+        if self.shown.insert(surface) {
+            self.pending_labels.remove(&surface);
             self.labels.insert(surface, label.clone());
             commands.push(PresenceCommand::Show { surface, label });
+        } else if self.labels.get(&surface) == Some(&label) {
+            self.pending_labels.remove(&surface);
+        } else {
+            self.pending_labels.insert(surface, (label, now));
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1).max(1);
@@ -494,10 +501,27 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             });
             !lease.surfaces.is_empty() || lease.in_flight > 0
         });
-        expired
+        let mut commands: Vec<_> = expired
             .into_iter()
             .flat_map(|surface| self.hide_if_unused(surface, PresenceEndReason::Idle))
-            .collect()
+            .collect();
+        let ready: Vec<_> = self
+            .pending_labels
+            .iter()
+            .filter(|(surface, (_, changed))| {
+                self.shown.contains(*surface)
+                    && now.saturating_duration_since(*changed) >= Duration::from_millis(150)
+            })
+            .map(|(surface, (label, _))| (*surface, label.clone()))
+            .collect();
+        for (surface, label) in ready {
+            self.pending_labels.remove(&surface);
+            if self.labels.get(&surface) != Some(&label) {
+                self.labels.insert(surface, label.clone());
+                commands.push(PresenceCommand::Show { surface, label });
+            }
+        }
+        commands
     }
 
     /// The human pressed Stop on `surface`. Every active run that uses it is
@@ -526,6 +550,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         let mut commands = Vec::new();
         if self.shown.remove(&surface) {
             self.labels.remove(&surface);
+            self.pending_labels.remove(&surface);
             commands.push(PresenceCommand::Stopping { surface });
             commands.push(PresenceCommand::Hide {
                 surface,
@@ -567,6 +592,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             .any(|lease| !lease.stopped() && lease.surfaces.contains_key(&surface));
         if !still_used && self.shown.remove(&surface) {
             self.labels.remove(&surface);
+            self.pending_labels.remove(&surface);
             vec![PresenceCommand::Hide { surface, reason }]
         } else {
             Vec::new()

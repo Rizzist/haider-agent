@@ -3677,6 +3677,7 @@ async fn effect_probe_observation(
         // peer delivery and local/remote execution. Keep this exhaustive so a
         // new authority class cannot inherit probe semantics accidentally.
         EffectClass::ProcessExec
+        | EffectClass::ProviderTransport
         | EffectClass::RemoteExecution
         | EffectClass::GitOp
         | EffectClass::PeerMessage

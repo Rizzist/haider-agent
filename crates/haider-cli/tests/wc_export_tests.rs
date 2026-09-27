@@ -125,6 +125,7 @@ fn masked_export_withholds_mutation_checkpoint_and_file_review_integrity() {
                 args: serde_json::json!({"operation": "copy"}),
                 status: haider_protocol::item::ToolStatus::Completed,
                 call_id: "call-copy".into(),
+                activity: None,
             },
         }),
     ));

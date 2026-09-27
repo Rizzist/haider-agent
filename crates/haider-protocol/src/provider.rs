@@ -272,6 +272,9 @@ pub enum StreamEvent {
         call_id: String,
         name: String,
         args: serde_json::Value,
+        /// Closed adapter classification; never inferred from the display name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<crate::activity::ActivityKind>,
     },
     /// The bounded, display-only outcome of one provider-executed tool call.
     ServerToolResult {

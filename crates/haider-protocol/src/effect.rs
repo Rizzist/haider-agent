@@ -40,6 +40,8 @@ pub struct WorkspaceMutation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
 pub enum EffectClass {
+    /// Daemon/provider transport bookkeeping; never agent activity.
+    ProviderTransport,
     FsRead,
     FsWrite,
     ProcessExec,

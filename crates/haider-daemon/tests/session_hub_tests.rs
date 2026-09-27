@@ -2719,6 +2719,7 @@ async fn append_fleet_metrics(
                 name: "fs_read".into(),
                 args: serde_json::json!({}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }))
         .expect("tool event"),
@@ -2922,6 +2923,7 @@ async fn a_stale_v5_file_rebuilds_with_rejected_tool_status() {
                 name: "fs_write".into(),
                 args: serde_json::json!({"path": "guarded"}),
                 status: ToolStatus::Rejected,
+                activity: None,
             },
         }),
     );
@@ -5014,6 +5016,7 @@ async fn session_list_publishes_compact_agent_metrics_at_committed_head() {
         name: "fs_read".into(),
         args: serde_json::json!({}),
         status,
+        activity: None,
     };
     let mut started = envelope(&session_id, "metrics-started", generation);
     started.run_id = Some(run_id.clone());
@@ -9968,6 +9971,7 @@ async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() 
                 name: "shell".into(),
                 args: serde_json::json!({"cmd": "printf hot"}),
                 status: haider_protocol::item::ToolStatus::Completed,
+                activity: None,
             },
         }),
     );
