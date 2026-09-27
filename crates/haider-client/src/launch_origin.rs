@@ -79,6 +79,12 @@ fn usable_home_on(home: &Path, windows: bool) -> bool {
         && !parsed.parts.is_empty()
         && !parsed.unresolved_parent
         && !parsed.is_multiuser_ancestor()
+        && !(cfg!(unix)
+            && parsed.root == "/"
+            && home
+                .canonicalize()
+                .ok()
+                .is_some_and(|canonical| DisplayPath::parse(&canonical).is_multiuser_ancestor()))
 }
 
 /// The single path projection. HOME precedes USERPROFILE on equal or nested
@@ -87,7 +93,12 @@ pub fn sanitize_origin_path_with_homes(
     path: Option<&Path>,
     homes: &[&Path],
 ) -> Result<SanitizedOriginPath, OriginSanitizeError> {
-    sanitize_with(path, homes, &|path| canonicalize_existing_prefix(path))
+    sanitize_with_canonicalizers(
+        path,
+        homes,
+        &canonicalize_existing_prefix,
+        &canonicalize_masking_prefix,
+    )
 }
 
 /// Display-only path label for CLI and TUI chrome. The real `Path` stays
@@ -178,6 +189,15 @@ pub(crate) fn sanitize_with(
     homes: &[&Path],
     canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<SanitizedOriginPath, OriginSanitizeError> {
+    sanitize_with_canonicalizers(path, homes, canonicalize, canonicalize)
+}
+
+fn sanitize_with_canonicalizers(
+    path: Option<&Path>,
+    homes: &[&Path],
+    canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
+    canonicalize_for_mask: &impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<SanitizedOriginPath, OriginSanitizeError> {
     let Some(path) = path else {
         return Ok(SanitizedOriginPath {
             kind: OriginPathKind::Unavailable,
@@ -186,6 +206,10 @@ pub(crate) fn sanitize_with(
     };
     if path.as_os_str().is_empty() {
         return bounded(OriginPathKind::Absolute, String::new());
+    }
+    let spelling = path.to_string_lossy();
+    if spelling.starts_with(r"\\.\pipe\") {
+        return bounded(OriginPathKind::Absolute, spelling.into_owned());
     }
     let parsed = DisplayPath::parse(path);
     // A terminal '..' has no reliable meaning when the preceding component
@@ -205,6 +229,9 @@ pub(crate) fn sanitize_with(
         .enumerate()
         .filter(|(index, home)| {
             usable_home(home)
+                && canonicalize(home)
+                    .map(|resolved| !DisplayPath::parse(&resolved).is_multiuser_ancestor())
+                    .unwrap_or(true)
                 || (*index == 0
                     && homes
                         .get(1)
@@ -257,11 +284,17 @@ pub(crate) fn sanitize_with(
     if let Some((_, display)) = best {
         return bounded(OriginPathKind::HomeRelative, escape_display(&display));
     }
-    if let Some(masked) = parsed.mask_other_user().or_else(|| {
-        canonical_path
-            .as_ref()
-            .and_then(DisplayPath::mask_other_user)
-    }) {
+    let masking_path = canonical_path.or_else(|| {
+        if parsed.absolute && !parsed.had_parent {
+            canonicalize_for_mask(path).map(|resolved| DisplayPath::parse(&resolved))
+        } else {
+            None
+        }
+    });
+    if let Some(masked) = parsed
+        .mask_other_user()
+        .or_else(|| masking_path.as_ref().and_then(DisplayPath::mask_other_user))
+    {
         return bounded(OriginPathKind::Redacted, escape_display(&masked));
     }
     bounded(OriginPathKind::Absolute, escape_display(&parsed.render()))
@@ -272,6 +305,41 @@ pub(crate) fn sanitize_with(
 /// masking still applies.
 fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
     canonicalize_existing_prefix_with(path, &Path::canonicalize)
+}
+
+/// A denied descendant may still have an accessible symlink/firmlink
+/// ancestor. Use that ancestor only to find a maskable account root.
+fn canonicalize_masking_prefix(path: &Path) -> Option<PathBuf> {
+    canonicalize_masking_prefix_with(path, &Path::canonicalize)
+}
+
+fn canonicalize_masking_prefix_with(
+    path: &Path,
+    canonicalize: &impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut existing = path;
+    let mut unseen = Vec::new();
+    loop {
+        match canonicalize(existing) {
+            Ok(mut canonical) => {
+                canonical.extend(unseen.iter().rev());
+                return Some(canonical);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied
+                ) =>
+            {
+                unseen.push(existing.file_name()?);
+                existing = existing.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 fn canonicalize_existing_prefix_with(
@@ -322,6 +390,15 @@ struct DisplayPath {
 }
 
 impl DisplayPath {
+    fn is_wsl_share(&self) -> bool {
+        self.root
+            .strip_prefix("//")
+            .and_then(|root| root.split('/').next())
+            .is_some_and(|server| {
+                server.eq_ignore_ascii_case("wsl$") || server.eq_ignore_ascii_case("wsl.localhost")
+            })
+    }
+
     fn is_multiuser_ancestor(&self) -> bool {
         let roots: &[&[&str]] = if self.root == "/" {
             &[
@@ -330,18 +407,47 @@ impl DisplayPath {
                 &["var", "home"],
                 &["private", "var", "home"],
                 &["System", "Volumes", "Data", "Users"],
+                &["usr", "home"],
+                &["export", "home"],
             ]
         } else {
-            &[&["Users"]]
+            &[&["Users"], &["Documents and Settings"]]
         };
-        roots.iter().any(|root| {
+        let known = roots.iter().any(|root| {
             self.parts.len() <= root.len()
+                && self.parts.iter().zip(*root).all(|(part, known)| {
+                    (if self.windows {
+                        part.trim_end_matches(['.', ' '])
+                    } else {
+                        part
+                    })
+                    .eq_ignore_ascii_case(known)
+                })
+        });
+        known
+            || (self.root == "/"
                 && self
                     .parts
-                    .iter()
-                    .zip(*root)
-                    .all(|(part, known)| part.eq_ignore_ascii_case(known))
-        })
+                    .first()
+                    .is_some_and(|part| part.eq_ignore_ascii_case("mnt"))
+                && self.parts.len() <= 3
+                && (self.parts.len() == 1
+                    || self.parts[1].len() == 1
+                        && self.parts[1].as_bytes()[0].is_ascii_alphabetic()
+                        && (self.parts.len() == 2 || self.parts[2].eq_ignore_ascii_case("Users"))))
+            || (self.root == "/"
+                && self
+                    .parts
+                    .first()
+                    .is_some_and(|part| part.eq_ignore_ascii_case("Volumes"))
+                && self.parts.len() <= 3
+                && (self.parts.len() < 3 || self.parts[2].eq_ignore_ascii_case("Users")))
+            || self.is_wsl_share()
+                && self.parts.len() <= 1
+                && self
+                    .parts
+                    .first()
+                    .is_none_or(|part| part.eq_ignore_ascii_case("home"))
     }
 
     fn parse(path: &Path) -> Self {
@@ -357,10 +463,18 @@ impl DisplayPath {
         } else {
             original.to_string()
         };
-        let slash = slash
-            .strip_prefix("//?/")
-            .or_else(|| slash.strip_prefix("//./"))
-            .or_else(|| slash.strip_prefix("/??/"))
+        let verbatim = (cfg!(windows)
+            || original.starts_with(r"\\?\")
+            || original.starts_with(r"\\.\")
+            || original.starts_with(r"\??\"))
+        .then(|| {
+            slash
+                .strip_prefix("//?/")
+                .or_else(|| slash.strip_prefix("//./"))
+                .or_else(|| slash.strip_prefix("/??/"))
+        })
+        .flatten();
+        let slash = verbatim
             .map(|tail| {
                 if tail
                     .get(..4)
@@ -381,15 +495,18 @@ impl DisplayPath {
             .unwrap_or(slash);
         let drive_root =
             slash.as_bytes().get(1) == Some(&b':') && slash.as_bytes().get(2) == Some(&b'/');
-        let doubled_unix_root = !cfg!(windows)
-            && !original.starts_with(r"\\")
-            && slash.starts_with("//")
-            && slash[2..].split('/').next().is_some_and(|head| {
-                ["Users", "home", "var", "private", "System"]
-                    .iter()
-                    .any(|root| head.eq_ignore_ascii_case(root))
-            });
-        let windows = windows && !doubled_unix_root;
+        let doubled_unix_root = (!cfg!(windows) && original.starts_with("///"))
+            || !cfg!(windows)
+                && !original.starts_with(r"\\")
+                && slash.starts_with("//")
+                && slash[2..].split('/').next().is_some_and(|head| {
+                    ["Users", "home", "var", "private", "System"]
+                        .iter()
+                        .any(|root| head.eq_ignore_ascii_case(root))
+                });
+        let windows = windows
+            && !doubled_unix_root
+            && (cfg!(windows) || !(original.starts_with("//?/") || original.starts_with("//./")));
         let leading = if slash.starts_with("//") && !doubled_unix_root {
             "//"
         } else if slash.starts_with('/') {
@@ -519,7 +636,17 @@ impl DisplayPath {
         if !self.absolute {
             return None;
         }
-        let lower = |part: &str, value: &str| part.eq_ignore_ascii_case(value);
+        if !self.windows && (self.root.starts_with("//?/") || self.root.starts_with("//./")) {
+            return None;
+        }
+        let lower = |part: &str, value: &str| {
+            if self.windows {
+                part.trim_end_matches(['.', ' '])
+                    .eq_ignore_ascii_case(value)
+            } else {
+                part.eq_ignore_ascii_case(value)
+            }
+        };
         let index = if self.root == "/" {
             if self
                 .parts
@@ -545,6 +672,23 @@ impl DisplayPath {
                 && lower(&self.parts[3], "Users")
             {
                 Some(4)
+            } else if self.parts.len() >= 4
+                && lower(&self.parts[0], "Volumes")
+                && lower(&self.parts[2], "Users")
+            {
+                Some(3)
+            } else if self.parts.len() >= 4
+                && lower(&self.parts[0], "mnt")
+                && self.parts[1].len() == 1
+                && self.parts[1].as_bytes()[0].is_ascii_alphabetic()
+                && lower(&self.parts[2], "Users")
+            {
+                Some(3)
+            } else if self.parts.len() >= 3
+                && (lower(&self.parts[0], "usr") || lower(&self.parts[0], "export"))
+                && lower(&self.parts[1], "home")
+            {
+                Some(2)
             } else {
                 None
             }
@@ -556,6 +700,32 @@ impl DisplayPath {
         } else if self.root.ends_with(':') || self.root.starts_with("//") {
             if self.parts.first().is_some_and(|p| lower(p, "Users")) {
                 Some(1)
+            } else if self.root.ends_with(':')
+                && self
+                    .parts
+                    .first()
+                    .is_some_and(|p| lower(p, "Documents and Settings"))
+            {
+                Some(1)
+            } else if self.root.starts_with("//")
+                && self
+                    .root
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|share| lower(share, "Users"))
+            {
+                Some(0)
+            } else if self.is_wsl_share() {
+                self.parts
+                    .first()
+                    .is_some_and(|part| lower(part, "home"))
+                    .then_some(1)
+            } else if self.root.ends_with(':')
+                && self.parts.len() >= 3
+                && lower(&self.parts[0], "msys64")
+                && lower(&self.parts[1], "home")
+            {
+                Some(2)
             } else {
                 None
             }

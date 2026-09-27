@@ -5,17 +5,14 @@ use std::path::Path;
 
 use super::{
     ORIGIN_DISPLAY_MAX_BYTES, OriginPathKind, OriginSanitizeError, SanitizedOriginPath,
-    canonicalize_existing_prefix_with, display_homes_from_profile, sanitize_origin_path,
-    sanitize_origin_path_with_homes, sanitize_with, usable_home,
+    canonicalize_existing_prefix_with, canonicalize_masking_prefix_with,
+    display_homes_from_profile, sanitize_origin_path, sanitize_origin_path_with_homes,
+    sanitize_with, sanitize_with_canonicalizers, usable_home,
 };
 
 fn projected(path: &str, homes: &[&str]) -> (OriginPathKind, String) {
     let homes = homes.iter().map(Path::new).collect::<Vec<_>>();
-    let value = if path.starts_with(r"\\srv\")
-        || path.starts_with(r"\\Users\")
-        || path.starts_with(r"\\?\UNC\srv\")
-        || path.starts_with(r"\\?\unc\SRV\")
-    {
+    let value = if path.starts_with(r"\\") || path.starts_with("//") {
         sanitize_with(Some(Path::new(path)), &homes, &|_| None).unwrap()
     } else {
         sanitize_origin_path_with_homes(Some(Path::new(path)), &homes).unwrap()
@@ -220,6 +217,7 @@ fn every_known_other_user_root_and_case_are_masked() {
             "/System/Volumes/Data/Users/bob/x",
             "/System/Volumes/Data/Users/<user>/x",
         ),
+        ("/Volumes/Work/Users/bob/x", "/Volumes/Work/Users/<user>/x"),
         (
             "/system/volumes/data/users/bob/x",
             "/system/volumes/data/users/<user>/x",
@@ -244,6 +242,24 @@ fn every_known_other_user_root_and_case_are_masked() {
             "//device/GLOBALROOT/Device/HarddiskVolume1/Users/<user>/x",
         ),
         (r"\\srv\share\Users\bob\x", "//srv/share/Users/<user>/x"),
+        (r"\\srv\Users\bob\x", "//srv/Users/<user>/x"),
+        (r"\\?\UNC\srv\Users\bob\x", "//srv/Users/<user>/x"),
+        (r"\\wsl$\Ubuntu\home\bob\x", "//wsl$/Ubuntu/home/<user>/x"),
+        (
+            r"\\wsl.localhost\Ubuntu\home\bob\x",
+            "//wsl.localhost/Ubuntu/home/<user>/x",
+        ),
+        (r"\\WSL$\Ubuntu\HOME\bob\x", "//WSL$/Ubuntu/HOME/<user>/x"),
+        ("/mnt/c/Users/bob/proj", "/mnt/c/Users/<user>/proj"),
+        ("/usr/home/bob/x", "/usr/home/<user>/x"),
+        ("/export/home/bob/x", "/export/home/<user>/x"),
+        (r"C:\Users.\bob\x", "C:/Users./<user>/x"),
+        (r"C:\Users \bob\x", "C:/Users /<user>/x"),
+        (
+            r"C:\Documents and Settings\bob\x",
+            "C:/Documents and Settings/<user>/x",
+        ),
+        (r"C:\msys64\home\bob\x", "C:/msys64/home/<user>/x"),
         ("//srv/share/Users/bob/x", "//srv/share/Users/<user>/x"),
         (r"\\srv\\share\\Users\\bob\\x", "//srv/share/Users/<user>/x"),
         ("/Users/张伟/x", "/Users/<user>/x"),
@@ -269,6 +285,13 @@ fn every_known_other_user_root_and_case_are_masked() {
         projected("//Users//bob//x", &[]),
         (OriginPathKind::Redacted, "/Users/<user>/x".into())
     );
+    #[cfg(unix)]
+    for spelling in ["///Users/bob/x", "////Users/bob/x"] {
+        assert_eq!(
+            projected(spelling, &[]),
+            (OriginPathKind::Redacted, "/Users/<user>/x".into())
+        );
+    }
     #[cfg(windows)]
     assert_eq!(
         projected(r"\\Users\bob\x", &[]),
@@ -407,10 +430,76 @@ fn ancestor_walk_continues_only_for_not_found() {
             "{kind:?} must fall back to lexical masking"
         );
     }
+    let denied_child = |candidate: &Path| {
+        if candidate == existing {
+            Ok(resolved.parent().unwrap().parent().unwrap().to_path_buf())
+        } else {
+            Err(Error::from(ErrorKind::PermissionDenied))
+        }
+    };
+    assert_eq!(canonicalize_existing_prefix_with(path, &denied_child), None);
+    assert_eq!(
+        canonicalize_masking_prefix_with(path, &denied_child),
+        Some(resolved.to_path_buf())
+    );
     assert_eq!(
         canonicalize_existing_prefix_with(Path::new("relative/path"), &|_| panic!("relative walk")),
         None
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_alias_uses_only_its_resolved_ancestor_for_masking() {
+    use std::io::{Error, ErrorKind};
+    let path = Path::new("/Volumes/alias/Users/bob/private/x");
+    let resolved = sanitize_with_canonicalizers(Some(path), &[], &|_| None, &|candidate| {
+        canonicalize_masking_prefix_with(candidate, &|probe| {
+            if probe == Path::new("/Volumes/alias/Users") {
+                Ok(Path::new("/Users").to_path_buf())
+            } else {
+                Err(Error::from(ErrorKind::PermissionDenied))
+            }
+        })
+    })
+    .unwrap();
+    assert_eq!(resolved.kind, OriginPathKind::Redacted);
+    assert_eq!(resolved.display.as_deref(), Some("/Users/<user>/private/x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn aliased_multiuser_home_cannot_collapse_another_account() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let alias = temp.path().join("usersalias");
+    symlink("/Users", &alias).unwrap();
+    assert!(!usable_home(&alias));
+    let input = alias.join("bob/x");
+    let projected = sanitize_with_canonicalizers(
+        Some(&input),
+        &[&alias],
+        &|candidate| {
+            if candidate == alias {
+                Some(Path::new("/Users").to_path_buf())
+            } else {
+                None
+            }
+        },
+        &|_| Some(Path::new("/Users/bob/x").to_path_buf()),
+    )
+    .unwrap();
+    assert_eq!(projected.display.as_deref(), Some("/Users/<user>/x"));
+}
+
+#[test]
+fn named_pipes_and_literal_unix_question_mark_dirs_keep_their_spelling() {
+    let pipe = r"\\.\pipe\haider-0123";
+    assert_eq!(projected(pipe, &[]).1, pipe);
+    #[cfg(unix)]
+    for literal in ["/??/x", "//?/x", "/??/Users/bob", "//?/Users/bob"] {
+        assert_eq!(projected(literal, &[]).1, literal);
+    }
 }
 
 #[cfg(unix)]

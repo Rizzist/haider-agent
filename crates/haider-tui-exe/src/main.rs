@@ -801,6 +801,7 @@ fn apply_cwd_for_path(model: &mut AppModel, cwd: &std::path::Path, homes: &[Path
 }
 
 fn seed_display_dirs(model: &mut AppModel, cwd: &std::path::Path, homes: &[PathBuf]) {
+    model.display_homes = homes.to_vec();
     let display =
         haider_tui::live::workspace_display_path_with_homes(&cwd.to_string_lossy(), homes);
     model.launcher_dir = display.clone();

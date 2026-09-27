@@ -322,10 +322,15 @@ impl std::fmt::Display for WorkspaceError {
             Self::EmptySelector(name) => write!(f, "{name} is set but empty"),
             Self::EnvWorkspaceInvalid(path) => write!(
                 f,
-                "HAIDER_WORKSPACE must be an existing absolute directory: {path}"
+                "HAIDER_WORKSPACE must be an existing absolute directory: {}",
+                crate::launch_origin::display_path(Path::new(path))
             ),
             Self::ExplicitWorkspaceMissing(path) => {
-                write!(f, "workspace path does not exist: {path}")
+                write!(
+                    f,
+                    "workspace path does not exist: {}",
+                    crate::launch_origin::display_path(Path::new(path))
+                )
             }
             Self::LaunchCwdUnavailable => f.write_str(
                 "launch directory is unavailable; pass --workspace or use --workspace-mode dated",
@@ -333,7 +338,11 @@ impl std::fmt::Display for WorkspaceError {
             Self::Calendar(error) => write!(f, "calendar error: {error}"),
             Self::InvalidBase(reason) => write!(f, "invalid workspace base: {reason}"),
             Self::NonUtf8Path(path) => {
-                write!(f, "workspace path is not valid UTF-8: {}", path.display())
+                write!(
+                    f,
+                    "workspace path is not valid UTF-8: {}",
+                    crate::launch_origin::display_path(path)
+                )
             }
         }
     }
@@ -636,13 +645,13 @@ fn validate_selected_base(path: &Path, source: &str) -> Result<(), WorkspaceErro
     if path.as_os_str().is_empty() || !path.is_absolute() {
         return Err(WorkspaceError::InvalidBase(format!(
             "{source} must be a nonempty absolute path: {}",
-            path.display()
+            crate::launch_origin::display_path(path)
         )));
     }
     if has_parent_component(path) {
         return Err(WorkspaceError::InvalidBase(format!(
             "{source} must not contain `..`: {}",
-            path.display()
+            crate::launch_origin::display_path(path)
         )));
     }
     Ok(())
@@ -806,27 +815,35 @@ impl std::fmt::Display for MaterializeError {
                 write!(
                     f,
                     "workspace base unavailable at {}: {error}",
-                    path.display()
+                    crate::launch_origin::display_path(path)
                 )
             }
             Self::InvalidPlan(reason) => write!(f, "invalid workspace plan: {reason}"),
             Self::UnsafeComponent(path) => write!(
                 f,
                 "workspace path component is not a real directory: {}",
-                path.display()
+                crate::launch_origin::display_path(path)
             ),
-            Self::Io(path, error) => write!(f, "cannot create {}: {error}", path.display()),
+            Self::Io(path, error) => write!(
+                f,
+                "cannot create {}: {error}",
+                crate::launch_origin::display_path(path)
+            ),
             Self::CollisionRetriesExhausted => {
                 f.write_str("workspace leaf collision retries exhausted")
             }
             Self::LeafValidationFailed(path) => {
-                write!(f, "created leaf failed validation: {}", path.display())
+                write!(
+                    f,
+                    "created leaf failed validation: {}",
+                    crate::launch_origin::display_path(path)
+                )
             }
             Self::LeafAlreadyExists(path) => {
                 write!(
                     f,
                     "workspace allocation leaf already exists: {}",
-                    path.display()
+                    crate::launch_origin::display_path(path)
                 )
             }
         }

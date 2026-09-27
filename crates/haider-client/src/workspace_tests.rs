@@ -28,6 +28,33 @@ fn reference_sample() -> CivilDateSample {
     }
 }
 
+#[test]
+fn workspace_startup_errors_project_paths_before_display() {
+    let path = PathBuf::from("/Users/bob/private");
+    let messages = [
+        WorkspaceError::EnvWorkspaceInvalid(path.to_string_lossy().into_owned()).to_string(),
+        WorkspaceError::ExplicitWorkspaceMissing(path.to_string_lossy().into_owned()).to_string(),
+        WorkspaceError::NonUtf8Path(path.clone()).to_string(),
+        MaterializeError::BaseUnavailable(
+            path.clone(),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .to_string(),
+        MaterializeError::UnsafeComponent(path.clone()).to_string(),
+        MaterializeError::Io(
+            path.clone(),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .to_string(),
+        MaterializeError::LeafValidationFailed(path.clone()).to_string(),
+        MaterializeError::LeafAlreadyExists(path).to_string(),
+    ];
+    for message in messages {
+        assert!(message.contains("/Users/<user>/private"), "{message}");
+        assert!(!message.contains("/Users/bob/"), "{message}");
+    }
+}
+
 fn environment_with_base(base: &Path) -> WorkspaceEnvironment {
     WorkspaceEnvironment {
         base: Some(base.display().to_string()),

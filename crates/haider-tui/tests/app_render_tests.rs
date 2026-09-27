@@ -147,9 +147,15 @@ fn session_screen_shows_transcript_and_meter() {
     assert_eq!(model.screen, Screen::Session);
     let (text, _) = draw(&model, 100, 30);
     assert!(text.contains("❯ fix the failing boundary test"));
-    assert!(text.contains("✓ fs_read"), "tool row: status glyph + name");
-    // File changes render as the sim's fs_edit tool-row shape (G30).
-    assert!(text.contains("✓ fs_edit crates/haider-store/src/event_store.rs +4 −1"));
+    // 973-tui-toolview: a tool row is `● Verb(argument)`.
+    assert!(
+        text.contains("● Read(crates/haider-store/src/event_store.rs)"),
+        "tool row: status bullet + verb + argument"
+    );
+    // File changes read like the edit row they report: the header, then
+    // the `⎿` line counts (G30's +4 −1, in words).
+    assert!(text.contains("● Edit(crates/haider-store/src/event_store.rs)"));
+    assert!(text.contains("⎿ Added 4 lines, removed 1 line"));
     assert!(text.contains("IDLE"));
     assert!(text.contains("17% of 200k"));
     // F2c: the identity lives on the composer's TOP RULE (right end),
@@ -324,9 +330,11 @@ fn command_decode_error_is_visible_in_the_session_view() {
         },
     ))));
     let (text, _) = draw(&model, 90, 30);
+    // 973-tui-toolview: a MODEL command reads as a Bash call (the Claude
+    // Code idiom); only the reader's own `!` command wears the `!` sigil.
     assert!(
-        text.contains("$ cat log.bin") && !text.contains("! cat log.bin"),
-        "an unmarked/model command keeps the $ sigil"
+        text.contains("Bash(cat log.bin)") && !text.contains("! cat log.bin"),
+        "an unmarked/model command reads as Bash(…), never as a user ! row"
     );
     assert!(text.contains("⚠ some output could not be decoded"));
 
