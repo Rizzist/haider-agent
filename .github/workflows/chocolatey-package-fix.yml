@@ -20,6 +20,11 @@ on:
         description: Chocolatey package-fix version (<release version>.<YYYYMMDD>)
         required: true
         type: string
+      confirm_timeout_seconds:
+        description: Maximum time to confirm the exact version on the feed after push (1-900 seconds)
+        required: false
+        default: '600'
+        type: string
 
 permissions:
   contents: read
@@ -140,7 +145,7 @@ jobs:
     needs: [pack, accept]
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -160,6 +165,7 @@ jobs:
         env:
           CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
           PACKAGE_PRESENT: ${{ steps.package.outputs.present }}
+          CHOCO_CONFIRM_TIMEOUT_SECONDS: ${{ inputs.confirm_timeout_seconds || '600' }}
         run: |
           & scripts\chocolatey_publish.ps1 -Mode Push
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

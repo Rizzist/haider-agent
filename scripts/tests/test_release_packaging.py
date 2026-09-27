@@ -432,14 +432,19 @@ function Invoke-WebRequest {
   $index = $global:queryIndex
   $global:queryIndex++
   $statuses = $env:MOCK_STATUSES.Split(',')
-  $status = [int]$statuses[[Math]::Min($index, $statuses.Length - 1)]
-  if ($status -eq 200) {
+  $status = $statuses[[Math]::Min($index, $statuses.Length - 1)]
+  Add-Content $env:MOCK_TRACE "query:$status"
+  if ($status -eq 'network') { throw 'Synthetic network failure' }
+  if ($status -in @('exact', 'wrong', 'prefix', 'malformed')) {
     $version = $env:PACKAGE_VERSION
+    if ($status -eq 'wrong') { $version = '0.0.972' }
+    if ($status -eq 'prefix') { $version += '0' }
     $uri = "https://community.chocolatey.org/api/v2/Packages(Id='haider',Version='$version')"
     $content = "<entry xmlns='http://www.w3.org/2005/Atom' xmlns:d='http://schemas.microsoft.com/ado/2007/08/dataservices' xmlns:m='http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'><id>$uri</id><title>haider</title><m:properties><d:Version>$version</d:Version></m:properties></entry>"
+    if ($status -eq 'malformed') { $content = '<entry><' }
     return [pscustomobject]@{ StatusCode = 200; Content = $content }
   }
-  return [pscustomobject]@{ StatusCode = $status; Content = '' }
+  return [pscustomobject]@{ StatusCode = [int]$status; Content = '' }
 }
 function choco {
   Add-Content $env:MOCK_TRACE 'push'
@@ -459,24 +464,39 @@ try {
   exit 1
 }
 """
+        # name, responses, key, check, push exit, expected exit, push calls,
+        # minimum post-push queries, summary fragment, setting override
         cases = [
-            # name, query statuses, key, check, push exit, output, expected exit, push calls
-            ("missing key", "404", "", False, 0, "", 1, 0),
-            ("present before push", "200", "fake", True, 0, "", 0, 0),
-            ("push success", "404", "fake", True, 0, "ok", 0, 1),
-            ("push 401", "404,404", "fake", True, 19, "401 Unauthorized", 19, 1),
-            ("push 403", "404,404", "fake", True, 19, "403 Forbidden", 19, 1),
-            ("409 now present", "404,200", "fake", True, 19, "409 Conflict", 0, 1),
-            ("409 still absent", "404,404", "fake", True, 19, "409 Conflict", 19, 1),
-            ("push 500", "404,404", "fake", True, 19, "500 Server Error", 19, 1),
-            ("post-push feed error", "404,503", "fake", True, 19, "409 Conflict", 19, 1),
-            ("feed query error", "503", "fake", True, 0, "", 1, 0),
+            ("missing key", "404", "", False, 0, 1, 0, 0, "NOT pushed", None),
+            ("check incomplete", "404", "fake", False, 0, 1, 0, 0, "", None),
+            ("present before push", "exact", "fake", True, 0, 0, 0, 0, "push skipped", None),
+            ("push confirmed", "404,exact", "fake", True, 0, 0, 1, 1, "pushed and confirmed", None),
+            ("push absent", "404", "fake", True, 0, 1, 1, 2, "NOT confirmed", None),
+            ("push 503", "404,503", "fake", True, 0, 1, 1, 2, "NOT confirmed", None),
+            ("push 501", "404,501", "fake", True, 0, 1, 1, 2, "NOT confirmed", None),
+            ("push network", "404,network", "fake", True, 0, 1, 1, 2, "NOT confirmed", None),
+            ("push wrong version", "404,wrong", "fake", True, 0, 1, 1, 1, "NOT confirmed", None),
+            ("push prefix version", "404,prefix", "fake", True, 0, 1, 1, 1, "NOT confirmed", None),
+            ("push malformed XML", "404,malformed", "fake", True, 0, 1, 1, 1, "NOT confirmed", None),
+            ("push nontransient 403", "404,403", "fake", True, 0, 1, 1, 1, "NOT confirmed", None),
+            ("delayed indexing", "404,404,404,exact", "fake", True, 0, 0, 1, 3, "pushed and confirmed", None),
+            ("push 401", "404", "fake", True, 19, 19, 1, 2, "NOT pushed", None),
+            ("push 403", "404", "fake", True, 23, 23, 1, 2, "NOT pushed", None),
+            ("409 now present", "404,exact", "fake", True, 19, 0, 1, 1, "idempotent success", None),
+            ("409 delayed present", "404,404,exact", "fake", True, 19, 0, 1, 2, "idempotent success", None),
+            ("409 still absent", "404", "fake", True, 19, 19, 1, 2, "NOT pushed", None),
+            ("push 500", "404", "fake", True, 42, 42, 1, 2, "NOT pushed", None),
+            ("post-push feed error", "404,503", "fake", True, 19, 19, 1, 2, "NOT pushed", None),
+            ("feed query error", "503", "fake", True, 0, 1, 0, 0, "", None),
+            ("invalid timeout", "404", "fake", True, 0, 1, 0, 0, "", "0"),
+            ("nonnumeric timeout", "404", "fake", True, 0, 1, 0, 0, "", "ten"),
+            ("too large timeout", "404", "fake", True, 0, 1, 0, 0, "", "901"),
         ]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             harness_path = root / "publish-harness.ps1"
             harness_path.write_text(textwrap.dedent(harness))
-            for name, statuses, key, check, push_exit, push_output, expected, pushes in cases:
+            for name, statuses, key, check, push_exit, expected, pushes, post_queries, summary_fragment, setting in cases:
                 with self.subTest(name=name):
                     trace = root / "trace.txt"
                     summary = root / "summary.txt"
@@ -485,17 +505,22 @@ try {
                         path.write_text("")
                     env = {**os.environ, "PUBLISH_SCRIPT": str(script),
                            "PACKAGE_VERSION": FIX_VERSION, "CHOCO_API_KEY": key,
-                           "PACKAGE_PRESENT": "false", "MOCK_STATUSES": statuses,
+                           "PACKAGE_PRESENT": "unknown" if name == "check incomplete" else "false", "MOCK_STATUSES": statuses,
                            "MOCK_CHECK": "1" if check else "0", "MOCK_DO_PUSH": "0" if name == "feed query error" else "1",
-                           "MOCK_PUSH_EXIT": str(push_exit), "MOCK_PUSH_OUTPUT": push_output,
+                           "MOCK_PUSH_EXIT": str(push_exit), "MOCK_PUSH_OUTPUT": "synthetic push",
                            "MOCK_TRACE": str(trace), "GITHUB_OUTPUT": str(output),
-                           "GITHUB_STEP_SUMMARY": str(summary)}
+                           "GITHUB_STEP_SUMMARY": str(summary),
+                           "CHOCO_CONFIRM_TIMEOUT_SECONDS": setting or "1",
+                           "CHOCO_CONFIRM_POLL_INTERVAL_MS": "100"}
                     result = subprocess.run(["pwsh", "-NoProfile", "-File", str(harness_path)],
                                             env=env, capture_output=True, text=True)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                    self.assertEqual(trace.read_text().count("push"), pushes)
-                    if name in ("missing key", "push 401", "push 403", "409 still absent", "push 500", "post-push feed error"):
-                        self.assertIn("NOT pushed", summary.read_text())
+                    events = trace.read_text().splitlines()
+                    self.assertEqual(events.count("push"), pushes)
+                    if pushes:
+                        self.assertGreaterEqual(len(events[events.index("push") + 1:]), post_queries)
+                    if summary_fragment:
+                        self.assertIn(summary_fragment, summary.read_text())
 
 
 class SiblingPackagerTests(unittest.TestCase):

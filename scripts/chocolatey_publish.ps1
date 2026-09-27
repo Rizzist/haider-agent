@@ -6,34 +6,70 @@ $Version = $env:PACKAGE_VERSION
 if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Invalid PACKAGE_VERSION '$Version'" }
 $Uri = "https://community.chocolatey.org/api/v2/Packages(Id='haider',Version='$Version')"
 
+function Get-ExactPackageStatus([int]$TimeoutSeconds = 30) {
+  try {
+    $Response = Invoke-WebRequest -Uri $Uri -TimeoutSec $TimeoutSeconds -SkipHttpErrorCheck
+  } catch {
+    # Connection failures are transient. Identity and HTTP errors below are not.
+    return 'transient'
+  }
+  if ($Response.StatusCode -eq 404) { return 'absent' }
+  if ($Response.StatusCode -eq 200) {
+    try { [xml]$Entry = $Response.Content }
+    catch { throw "OData 200 response was malformed XML for haider $Version" }
+    $Root = $Entry.SelectSingleNode("/*[local-name()='entry']")
+    $Id = $Entry.SelectSingleNode("/*[local-name()='entry']/*[local-name()='id']")
+    $Title = $Entry.SelectSingleNode("/*[local-name()='entry']/*[local-name()='title']")
+    $FoundVersion = $Entry.SelectSingleNode("/*[local-name()='entry']/*[local-name()='properties']/*[local-name()='Version']")
+    if ($null -eq $Root -or $null -eq $Id -or $null -eq $Title -or $null -eq $FoundVersion -or
+        $Id.InnerText -ne $Uri -or $Title.InnerText -ne 'haider' -or $FoundVersion.InnerText -ne $Version) {
+      throw "OData 200 response did not identify haider $Version"
+    }
+    return 'present'
+  }
+  if ($Response.StatusCode -in @(408, 429) -or
+      ($Response.StatusCode -ge 500 -and $Response.StatusCode -le 599)) { return 'transient' }
+  throw "OData query returned HTTP $($Response.StatusCode)"
+}
+
 function Get-ExactPackagePresence {
   for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
-    try {
-      $Response = Invoke-WebRequest -Uri $Uri -TimeoutSec 30 -SkipHttpErrorCheck
-      if ($Response.StatusCode -eq 404) { return $false }
-      if ($Response.StatusCode -eq 200) {
-        [xml]$Entry = $Response.Content
-        $Root = $Entry.SelectSingleNode("/*[local-name()='entry']")
-        $Id = $Entry.SelectSingleNode("/*[local-name()='entry']/*[local-name()='id']")
-        $Title = $Entry.SelectSingleNode("/*[local-name()='entry']/*[local-name()='title']")
-        $FoundVersion = $Entry.SelectSingleNode("/*[local-name()='entry']/*[local-name()='properties']/*[local-name()='Version']")
-        if ($null -eq $Root -or $null -eq $Id -or $null -eq $Title -or $null -eq $FoundVersion -or
-            $Id.InnerText -ne $Uri -or $Title.InnerText -ne 'haider' -or $FoundVersion.InnerText -ne $Version) {
-          throw "OData 200 response did not identify haider $Version"
-        }
-        return $true
-      }
-      if ($Response.StatusCode -notin @(408, 429, 500, 502, 503, 504)) {
-        throw "OData query returned HTTP $($Response.StatusCode)"
-      }
-      $Problem = "OData query returned HTTP $($Response.StatusCode)"
-    } catch {
-      if ($_.Exception.Message -like 'OData 200 response*' -or $_.Exception.Message -like 'OData query returned HTTP 4*') { throw }
-      $Problem = $_.Exception.Message
-    }
-    if ($Attempt -eq 3) { throw "Could not establish whether haider $Version exists: $Problem" }
+    $Status = Get-ExactPackageStatus
+    if ($Status -eq 'present') { return $true }
+    if ($Status -eq 'absent') { return $false }
+    if ($Attempt -eq 3) { throw "Could not establish whether haider $Version exists after 3 preflight queries" }
     Start-Sleep -Seconds $Attempt
   }
+}
+
+function Read-PositiveSetting([string]$Name, [int]$Default, [int]$Maximum) {
+  $Raw = [Environment]::GetEnvironmentVariable($Name)
+  if ([string]::IsNullOrEmpty($Raw)) { return $Default }
+  if ($Raw -notmatch '^[1-9][0-9]*$' -or $Raw.Length -gt 9) {
+    throw "$Name must be a positive integer no greater than $Maximum"
+  }
+  $Value = [int]$Raw
+  if ($Value -gt $Maximum) { throw "$Name must be a positive integer no greater than $Maximum" }
+  return $Value
+}
+
+function Confirm-ExactPackage([int]$TimeoutSeconds, [int]$InitialIntervalMs) {
+  # Only absence and transient transport/server failures are retried until the deadline.
+  # A malformed or mismatched 200 and any non-transient HTTP error fail closed.
+  $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+  $IntervalMs = $InitialIntervalMs
+  do {
+    $RemainingMs = $TimeoutSeconds * 1000 - $Clock.ElapsedMilliseconds
+    if ($RemainingMs -le 0) { break }
+    $RequestSeconds = [Math]::Min(30, [Math]::Max(1, [Math]::Ceiling($RemainingMs / 1000)))
+    $Status = Get-ExactPackageStatus -TimeoutSeconds $RequestSeconds
+    if ($Status -eq 'present') { return $true }
+    $RemainingMs = $TimeoutSeconds * 1000 - $Clock.ElapsedMilliseconds
+    if ($RemainingMs -le 0) { break }
+    Start-Sleep -Milliseconds ([int][Math]::Min($IntervalMs, $RemainingMs))
+    $IntervalMs = [Math]::Min(60000, $IntervalMs * 2)
+  } while ($true)
+  return $false
 }
 
 if ($Mode -eq 'Check') {
@@ -58,28 +94,39 @@ if ($env:PACKAGE_PRESENT -eq 'true') {
 }
 if ($env:PACKAGE_PRESENT -ne 'false') { throw 'The keyless exact-version check did not complete; refusing to push blind.' }
 
+$ConfirmTimeout = Read-PositiveSetting 'CHOCO_CONFIRM_TIMEOUT_SECONDS' 600 900
+$ConfirmIntervalMs = Read-PositiveSetting 'CHOCO_CONFIRM_POLL_INTERVAL_MS' 10000 60000
 $NupkgPath = Join-Path 'dist-choco' "haider.$Version.nupkg"
 $PushOutput = & choco push $NupkgPath --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY 2>&1
 $PushExit = $LASTEXITCODE
 $PushOutput | Write-Output
-if ($PushExit -eq 0) {
-  "Pushed haider $Version to Chocolatey moderation." >> $env:GITHUB_STEP_SUMMARY
-  Write-Output "PASS: pushed haider $Version"
-  exit 0
-}
-
 try {
-  $PresentAfterFailure = Get-ExactPackagePresence
+  $Confirmed = Confirm-ExactPackage -TimeoutSeconds $ConfirmTimeout -InitialIntervalMs $ConfirmIntervalMs
 } catch {
-  "haider $Version was NOT pushed (choco exit $PushExit); post-push feed status unknown." >> $env:GITHUB_STEP_SUMMARY
-  Write-Output "::error::choco push failed (exit $PushExit); post-push feed query failed: $_"
+  if ($PushExit -eq 0) {
+    "choco push exited 0, but haider $Version was NOT confirmed on the feed: $_" >> $env:GITHUB_STEP_SUMMARY
+    Write-Output "::error::Push exited 0 but exact feed confirmation failed: $_"
+    exit 1
+  }
+  "haider $Version was NOT pushed successfully (choco exit $PushExit); exact feed confirmation failed: $_" >> $env:GITHUB_STEP_SUMMARY
+  Write-Output "::error::choco push failed (exit $PushExit); exact feed confirmation failed: $_"
   exit $PushExit
 }
-if ($PresentAfterFailure) {
-  "haider $Version now exists on Chocolatey after choco exit $PushExit; idempotent no-op." >> $env:GITHUB_STEP_SUMMARY
-  Write-Output "PASS: haider $Version exists after failed push; idempotent no-op."
+if ($Confirmed) {
+  if ($PushExit -eq 0) {
+    "haider $Version was pushed and confirmed on the Chocolatey feed (including moderation)." >> $env:GITHUB_STEP_SUMMARY
+    Write-Output "PASS: pushed and confirmed haider $Version"
+  } else {
+    "haider $Version was confirmed on Chocolatey after choco exit $PushExit; idempotent success." >> $env:GITHUB_STEP_SUMMARY
+    Write-Output "PASS: haider $Version exists after failed push; idempotent success."
+  }
   exit 0
 }
-"haider $Version was NOT pushed (choco exit $PushExit)." >> $env:GITHUB_STEP_SUMMARY
-Write-Output "::error::Chocolatey push failed (exit $PushExit). Regenerate the key at https://community.chocolatey.org/account and update the repository secret CHOCO_API_KEY if rejected. haider $Version was NOT pushed."
+if ($PushExit -eq 0) {
+  "choco push exited 0, but haider $Version was NOT confirmed on the feed within $ConfirmTimeout s." >> $env:GITHUB_STEP_SUMMARY
+  Write-Output "::error::Push exited 0 but exact feed entity was not confirmed within $ConfirmTimeout s."
+  exit 1
+}
+"haider $Version was NOT pushed successfully (choco exit $PushExit); exact feed entity was NOT confirmed within $ConfirmTimeout s." >> $env:GITHUB_STEP_SUMMARY
+Write-Output "::error::Chocolatey push failed (exit $PushExit); exact feed entity was not confirmed within $ConfirmTimeout s."
 exit $PushExit
