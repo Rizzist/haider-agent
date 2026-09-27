@@ -228,6 +228,11 @@ fn sanitize_with_canonicalizers(
     if parsed.unresolved_parent {
         return bounded(OriginPathKind::Redacted, "<path unavailable>".to_owned());
     }
+    // A relative display label has no authoritative filesystem root.
+    // Neither the path nor any configured home may consult process cwd.
+    if !parsed.absolute {
+        return bounded(OriginPathKind::Absolute, escape_display(&parsed.render()));
+    }
     let canonical_path = if parsed.absolute && !parsed.had_parent {
         canonicalize(path).map(|p| DisplayPath::parse(&p))
     } else {
