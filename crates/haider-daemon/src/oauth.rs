@@ -1059,7 +1059,12 @@ fn ensure_live_issuer_for_remote(
             ),
             false,
         )),
-        _ => Ok(()),
+        Some(_) => Ok(()),
+        None => Err(HaiderError::new(
+            ErrorCode::Unauthorized,
+            "OAuth live issuer is unavailable; sign in again",
+            false,
+        )),
     }
 }
 
@@ -2837,7 +2842,7 @@ fn invalid_import(path: &Path, source: &str) -> HaiderError {
     )
 }
 
-fn is_numeric_loopback_http(url: &Url) -> bool {
+pub(crate) fn is_numeric_loopback_http(url: &Url) -> bool {
     url.scheme() == "http" && matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
 }
 
@@ -5066,9 +5071,13 @@ async fn account_identity_from_endpoint(
 /// row's own still-valid access token; no other account's credential is used.
 pub(crate) async fn legacy_anthropic_profile_identity(
     access_token: &[u8],
+    expected_issuer: &str,
 ) -> Option<AccountIdentity> {
     let registration = OAuthProviderCatalog::default()
         .registration(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)?;
+    if registration.issuer != expected_issuer {
+        return None;
+    }
     legacy_anthropic_profile_identity_with_registration(access_token, &registration).await
 }
 
@@ -5076,7 +5085,7 @@ async fn legacy_anthropic_profile_identity_with_registration(
     access_token: &[u8],
     registration: &OAuthProviderRegistration,
 ) -> Option<AccountIdentity> {
-    let client = reqwest::Client::builder()
+    let client = haider_platform::native_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()
@@ -5585,6 +5594,53 @@ enum SnapshotOAuthState {
     Replaced,
 }
 
+/// The destination approved before resolving an OAuth access token. This
+/// value travels with the resolution through every vault re-read and flight.
+#[derive(Clone)]
+enum CredentialDestination {
+    Remote,
+    Loopback(Url),
+    InProcess,
+}
+
+impl CredentialDestination {
+    fn check(
+        &self,
+        descriptor: &CredentialDescriptor,
+        bundle: &OAuthTokenBundleV1,
+    ) -> Result<(), HaiderError> {
+        match self {
+            Self::Remote => ensure_live_issuer_for_remote(descriptor, bundle),
+            Self::Loopback(url) if !is_numeric_loopback_http(url) => Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "a loopback credential resolution requires a numeric-loopback http destination",
+                false,
+            )),
+            Self::Loopback(_)
+                if live_issuer(&descriptor.provider) == Some(bundle.issuer.as_str()) =>
+            {
+                Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "a live-issued OAuth credential is never sent to a loopback endpoint",
+                    false,
+                ))
+            }
+            Self::Loopback(url)
+                if !Url::parse(&bundle.issuer).is_ok_and(|issuer| {
+                    is_numeric_loopback_http(&issuer) && issuer.origin() == url.origin()
+                }) =>
+            {
+                Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "OAuth credential issuer does not match the loopback destination",
+                    false,
+                ))
+            }
+            Self::Loopback(_) | Self::InProcess => Ok(()),
+        }
+    }
+}
+
 /// Completes the public single-flight even if the worker unwinds before its
 /// normal `finish` call. `JoinSet` still records the panic for shutdown
 /// honesty; this guard is the immediate fail-closed wakeup for waiters.
@@ -5823,14 +5879,14 @@ impl CredentialBroker {
     /// Resolves a credential for a request to the provider's REAL (network)
     /// endpoint: inference, usage, catalog. An OAuth token not minted by the
     /// live issuer is refused (typed) before it can leave the process; see
-    /// [`ensure_live_issuer_for_remote`]. Every data-plane send point uses
-    /// this or [`Self::resolve_to_loopback`], never bare [`Self::resolve`].
+    /// [`ensure_live_issuer_for_remote`]. Every network send point uses
+    /// this or [`Self::resolve_to_loopback`].
     pub(crate) async fn resolve_remote(
         &self,
         descriptor: &CredentialDescriptor,
     ) -> Result<SecretHandle, HaiderError> {
-        self.ensure_remote_issuer(descriptor).await?;
-        self.resolve(descriptor).await
+        self.resolve_for_destination(descriptor, CredentialDestination::Remote)
+            .await
     }
 
     /// Resolves a credential for a request to a numeric-loopback `destination`
@@ -5847,33 +5903,35 @@ impl CredentialBroker {
                 false,
             ));
         }
-        self.resolve(descriptor).await
+        self.resolve_for_destination(
+            descriptor,
+            CredentialDestination::Loopback(destination.clone()),
+        )
+        .await
     }
 
-    async fn ensure_remote_issuer(
+    /// A credential for a consumer that cannot make an HTTP request.
+    pub(crate) async fn resolve_in_process(
         &self,
         descriptor: &CredentialDescriptor,
-    ) -> Result<(), HaiderError> {
-        if descriptor.auth_method != AuthMethod::OAuth
-            || live_issuer(&descriptor.provider).is_none()
-        {
-            return Ok(());
-        }
-        // An unreadable bundle is left to the ordinary path's own error.
-        let Ok(stored) = self.resolve_vault(&descriptor.alias).await else {
-            return Ok(());
-        };
-        let Ok(bundle) = OAuthTokenBundleV1::decode(stored.expose_secret()) else {
-            return Ok(());
-        };
-        ensure_live_issuer_for_remote(descriptor, &bundle)
+    ) -> Result<SecretHandle, HaiderError> {
+        self.resolve_for_destination(descriptor, CredentialDestination::InProcess)
+            .await
     }
 
-    /// Destination-agnostic resolution for in-process consumers (tests and
-    /// fakes that never send the token anywhere).
+    /// Legacy test seam. Production callers must name a destination.
+    #[cfg(test)]
     pub(crate) async fn resolve(
         &self,
         descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, HaiderError> {
+        self.resolve_in_process(descriptor).await
+    }
+
+    async fn resolve_for_destination(
+        &self,
+        descriptor: &CredentialDescriptor,
+        destination: CredentialDestination,
     ) -> Result<SecretHandle, HaiderError> {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(broker_stopped());
@@ -5882,7 +5940,8 @@ impl CredentialBroker {
             AuthMethod::ApiKey => self.resolve_vault(&descriptor.alias).await,
             AuthMethod::OAuth => match Self::snapshot_oauth_state(&self.inner, descriptor) {
                 SnapshotOAuthState::Current | SnapshotOAuthState::Expired => {
-                    self.resolve_oauth(descriptor, false, None).await
+                    self.resolve_oauth(descriptor, false, None, &destination)
+                        .await
                 }
                 SnapshotOAuthState::Replaced => {
                     let Some(flight) = self.active_flight(descriptor) else {
@@ -5890,13 +5949,15 @@ impl CredentialBroker {
                     };
                     match flight.wait().await? {
                         RefreshFlightOutcome::Imported(expected) => {
-                            self.resolve_imported_bundle(descriptor, &expected).await
+                            self.resolve_imported_bundle(descriptor, &expected, &destination)
+                                .await
                         }
                         RefreshFlightOutcome::Refreshed
                             if Self::snapshot_oauth_state(&self.inner, descriptor)
                                 != SnapshotOAuthState::Replaced =>
                         {
-                            self.resolve_oauth(descriptor, false, None).await
+                            self.resolve_oauth(descriptor, false, None, &destination)
+                                .await
                         }
                         RefreshFlightOutcome::Refreshed => Err(expired_or_replaced(descriptor)),
                     }
@@ -5912,19 +5973,37 @@ impl CredentialBroker {
         descriptor: &CredentialDescriptor,
         failed_access_fingerprint: Option<[u8; 32]>,
     ) -> Result<SecretHandle, HaiderError> {
-        self.ensure_remote_issuer(descriptor).await?;
-        self.refresh_after_auth_failure(descriptor, failed_access_fingerprint)
-            .await
+        self.refresh_after_auth_failure_for_destination(
+            descriptor,
+            failed_access_fingerprint,
+            &CredentialDestination::Remote,
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn refresh_after_auth_failure(
         &self,
         descriptor: &CredentialDescriptor,
         failed_access_fingerprint: Option<[u8; 32]>,
     ) -> Result<SecretHandle, HaiderError> {
+        self.refresh_after_auth_failure_for_destination(
+            descriptor,
+            failed_access_fingerprint,
+            &CredentialDestination::InProcess,
+        )
+        .await
+    }
+
+    async fn refresh_after_auth_failure_for_destination(
+        &self,
+        descriptor: &CredentialDescriptor,
+        failed_access_fingerprint: Option<[u8; 32]>,
+        destination: &CredentialDestination,
+    ) -> Result<SecretHandle, HaiderError> {
         match descriptor.auth_method {
             AuthMethod::OAuth => {
-                self.resolve_oauth(descriptor, true, failed_access_fingerprint)
+                self.resolve_oauth(descriptor, true, failed_access_fingerprint, destination)
                     .await
             }
             // G4b (LV2): the vertex gcloud-refresh credential re-mints
@@ -6001,6 +6080,7 @@ impl CredentialBroker {
         descriptor: &CredentialDescriptor,
         force_refresh: bool,
         failed_access_fingerprint: Option<[u8; 32]>,
+        destination: &CredentialDestination,
     ) -> Result<SecretHandle, HaiderError> {
         let fence = self.fence_for(&descriptor.alias);
         let expected_fence = fence.load(Ordering::Acquire);
@@ -6016,6 +6096,7 @@ impl CredentialBroker {
                         .await?;
                 return Err(error);
             }
+            destination.check(descriptor, &bundle)?;
             let now = now_ms().ok_or_else(|| {
                 HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
             })?;
@@ -6062,7 +6143,9 @@ impl CredentialBroker {
             {
                 match flight.wait().await? {
                     RefreshFlightOutcome::Imported(expected) => {
-                        return self.resolve_imported_bundle(descriptor, &expected).await;
+                        return self
+                            .resolve_imported_bundle(descriptor, &expected, destination)
+                            .await;
                     }
                     RefreshFlightOutcome::Refreshed
                         if Self::snapshot_oauth_state(&self.inner, descriptor)
@@ -6213,7 +6296,9 @@ impl CredentialBroker {
         }
         let outcome = flight.wait().await?;
         if let RefreshFlightOutcome::Imported(expected) = outcome {
-            return self.resolve_imported_bundle(descriptor, &expected).await;
+            return self
+                .resolve_imported_bundle(descriptor, &expected, destination)
+                .await;
         }
         if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
             return Err(rotation_error(
@@ -6237,6 +6322,7 @@ impl CredentialBroker {
                     .await?;
             return Err(error);
         }
+        destination.check(descriptor, &refreshed)?;
         if now_ms().is_none_or(|current| refreshed.expires_at_unix_ms <= current) {
             return Err(HaiderError::new(
                 ErrorCode::ProviderError,
@@ -6320,6 +6406,7 @@ impl CredentialBroker {
         &self,
         descriptor: &CredentialDescriptor,
         expected: &crate::accounts::OAuthRefreshFence,
+        destination: &CredentialDestination,
     ) -> Result<SecretHandle, HaiderError> {
         if self.fence_for(&descriptor.alias).load(Ordering::Acquire) != expected.fence_epoch {
             return Err(stale_refresh());
@@ -6337,6 +6424,7 @@ impl CredentialBroker {
             return Err(stale_refresh());
         }
         self.validate_bundle(&current, &bundle)?;
+        destination.check(&current, &bundle)?;
         if now_ms().is_none_or(|now| bundle.expires_at_unix_ms <= now) {
             return Err(imported_credential_expired_for_provider(
                 descriptor,
@@ -7439,3 +7527,6 @@ mod openai_tests;
 #[cfg(test)]
 #[path = "oauth_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::non_live_issued_broker_for_sendpoint;

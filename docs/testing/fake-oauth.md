@@ -20,9 +20,11 @@ real provider.
 
 Every real-binary run with `HAIDER_TEST_FAKE_OAUTH_ORIGIN` set MUST run under
 `sandbox-exec -f scripts/test-support/loopback-only.sb …`. Proxy egress
-traps are NOT evidence: provider and control clients are built with
-`.no_proxy()` and never consult `HTTPS_PROXY`/`ALL_PROXY`, so a proxy trap
-cannot see catalog, inference or OAuth traffic. A run script should prove it
+traps are NOT complete evidence: credential-bearing clients use
+`haider_platform::native_http_client_builder()`. On desktop it ignores
+environment and system proxies for live and fake traffic alike. On Android
+it uses only the explicit system proxy published over JNI for non-loopback
+destinations; numeric loopback remains direct. A run script should prove it
 is sandboxed before it starts. A connect to the never-routed TEST-NET address
 `192.0.2.1` must fail locally with EPERM ("Operation not permitted"), not time out.
 

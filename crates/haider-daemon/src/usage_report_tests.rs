@@ -104,6 +104,16 @@ impl MeterTokenSource for StubTokens {
 
 struct FailingTokens;
 
+#[tokio::test]
+async fn meter_bearer_refuses_non_live_issued_bundle() {
+    let (broker, descriptor) =
+        crate::oauth::non_live_issued_broker_for_sendpoint("anthropic-oauth").await;
+    let error = MeterTokenSource::bearer(&broker, &descriptor)
+        .await
+        .expect_err("remote meter bearer refused");
+    assert_eq!(error.reason, "credential_unavailable");
+}
+
 #[async_trait::async_trait]
 impl MeterTokenSource for FailingTokens {
     async fn bearer(

@@ -16,8 +16,10 @@ pub fn http_client_builder() -> reqwest::ClientBuilder {
     builder
 }
 
-/// Control/provider traffic uses the explicit Android system proxy, if any.
-/// Desktop retains its existing no-proxy behavior. Pinned web-fetch clients
+/// Control/provider traffic uses the explicit Android system proxy, if any,
+/// for non-loopback destinations.
+/// Desktop ignores environment and system proxies for live and loopback
+/// credential traffic alike. Pinned web-fetch clients
 /// use `http_client_builder().no_proxy()` to preserve their DNS boundary.
 pub fn native_http_client_builder() -> reqwest::ClientBuilder {
     let builder = http_client_builder().no_proxy();
@@ -100,6 +102,19 @@ impl SystemProxy {
     }
 
     fn selected_for(&self, request: &reqwest::Url) -> Option<reqwest::Url> {
+        // A fake issuer or local service is the origin itself. Never route
+        // its credential through the Android system proxy either.
+        if request
+            .host_str()
+            .and_then(|host| {
+                host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|ip| ip.is_loopback())
+        {
+            return None;
+        }
         let host = request.host_str()?.to_ascii_lowercase();
         (!self
             .exclusions

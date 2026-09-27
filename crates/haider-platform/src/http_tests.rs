@@ -139,6 +139,24 @@ fn android_proxy_exclusions_are_whole_host_patterns() {
     assert_eq!(ipv6.url.as_str(), "http://[::1]:8080/");
 }
 
+#[test]
+fn android_system_proxy_never_intercepts_numeric_loopback_credentials() {
+    let proxy = SystemProxy::new("127.0.0.1", 8080, vec![]).expect("proxy");
+    for url in [
+        "http://127.0.0.1:4321/profile",
+        "http://127.2.3.4:4321/v1/models",
+        "http://[::1]:4321/profile",
+    ] {
+        let request = reqwest::Url::parse(url).expect("loopback URL");
+        assert!(proxy.selected_for(&request).is_none(), "{url}");
+    }
+    let live = reqwest::Url::parse("https://claude.ai/api/oauth/profile").expect("live URL");
+    assert!(
+        proxy.selected_for(&live).is_some(),
+        "live traffic still uses the Android system proxy"
+    );
+}
+
 #[tokio::test]
 async fn android_proxy_reconfiguration_does_not_reuse_an_idle_connection() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

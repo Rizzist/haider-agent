@@ -20,6 +20,223 @@ use crate::oauth::{
     oauth_import_read_count, reset_oauth_import_read_count,
 };
 
+struct RefuseRemoteDiscovery(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl ProviderModelDiscoverer for RefuseRemoteDiscovery {
+    fn destination(&self, _: &CatalogSource) -> CatalogDestination {
+        CatalogDestination::Remote
+    }
+
+    async fn discover(
+        &self,
+        _: CatalogSource,
+        _: CatalogDestination,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<DiscoveredCatalog, CatalogError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(CatalogError::Unauthorized)
+    }
+}
+
+#[tokio::test]
+async fn remote_catalog_sendpoint_refuses_non_live_issued_bundle_before_discovery() {
+    let (broker, descriptor) =
+        crate::oauth::non_live_issued_broker_for_sendpoint(ANTHROPIC_OAUTH_PROVIDER_NAME).await;
+    let discoverer = RefuseRemoteDiscovery(std::sync::atomic::AtomicUsize::new(0));
+    let result = discover_models_with_account(
+        &broker,
+        &descriptor,
+        &discoverer,
+        CatalogSource::AnthropicSubscription,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, ProviderModelsRefreshResult::Credential(error) if error.code == ErrorCode::Unauthorized)
+    );
+    assert_eq!(discoverer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn production_catalog_uses_the_destination_chosen_before_discovery() {
+    const CHILD: &str = "HAIDER_CATALOG_DESTINATION_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let destination =
+            url::Url::parse(&std::env::var("HAIDER_CATALOG_SELECTED_URL").expect("selected URL"))
+                .expect("URL");
+        let _ = ProductionProviderModelDiscoverer
+            .discover(
+                CatalogSource::AnthropicSubscription,
+                CatalogDestination::Loopback(destination),
+                Some("fake-at-catalog-test"),
+                None,
+            )
+            .await;
+        return;
+    }
+    async fn serve_once(listener: TcpListener) -> usize {
+        let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(Duration::from_secs(4), listener.accept()).await
+        else {
+            return 0;
+        };
+        let mut request = [0_u8; 2048];
+        let _ = stream.read(&mut request).await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await;
+        1
+    }
+    let first = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("first catalog");
+    let second = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("selected catalog");
+    let first_origin = format!("http://{}", first.local_addr().expect("first address"));
+    let selected_url = format!(
+        "http://{}/v1/models",
+        second.local_addr().expect("second address")
+    );
+    let first_task = tokio::spawn(serve_once(first));
+    let second_task = tokio::spawn(serve_once(second));
+    let output = tokio::process::Command::new(std::env::current_exe().expect("test executable"))
+        .arg("production_catalog_uses_the_destination_chosen_before_discovery")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env("HAIDER_TEST_FAKE_OAUTH_ORIGIN", first_origin)
+        .env("HAIDER_CATALOG_SELECTED_URL", selected_url)
+        .output()
+        .await
+        .expect("catalog child");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        first_task.await.expect("first task"),
+        0,
+        "re-deciding the destination sent a bearer to the wrong origin"
+    );
+    assert_eq!(
+        second_task.await.expect("second task"),
+        1,
+        "selected destination received the catalog request"
+    );
+}
+
+#[tokio::test]
+async fn turn_factory_refuses_non_live_issued_bundle() {
+    let (broker, descriptor) =
+        crate::oauth::non_live_issued_broker_for_sendpoint(OPENAI_OAUTH_PROVIDER_NAME).await;
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+    let factory = AccountsProviderFactory::with_broker(
+        snapshot,
+        VaultProvision::Unsupported,
+        Arc::new(ProductionAccountBuilder::default()),
+        broker,
+    );
+    let error = factory
+        .resolve_secret(&descriptor)
+        .await
+        .expect_err("turn credential refused");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+}
+
+#[tokio::test]
+async fn auth_retry_refuses_non_live_issued_bundle() {
+    let (broker, descriptor) =
+        crate::oauth::non_live_issued_broker_for_sendpoint(OPENAI_OAUTH_PROVIDER_NAME).await;
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+    let factory = AccountsProviderFactory::with_broker(
+        snapshot,
+        VaultProvision::Unsupported,
+        Arc::new(ProductionAccountBuilder::default()),
+        broker,
+    );
+    let metadata = haider_protocol::session::SessionMetadataV1 {
+        launch_origin: None,
+        workspace_allocation: None,
+        provider_base_url: None,
+        provider_rebind_id: None,
+        cwd: "/tmp/non-live-issuer".into(),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+        account_alias: Some(descriptor.alias.as_str().into()),
+        model: "gpt-5.6-sol".into(),
+        max_tokens: 64,
+        permission_overrides: None,
+        interaction_mode: Default::default(),
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        context_economy: Default::default(),
+        created_at_ms: 1,
+        agent_type: None,
+    };
+    let resolver = AccountsAttemptResolver::new(
+        factory,
+        metadata,
+        ProviderTuning::default(),
+        Some([0; 32]),
+        false,
+    );
+    let decision = resolver
+        .resolve(
+            &descriptor.alias,
+            &ProviderError::new(ProviderErrorKind::Authentication, "synthetic 401"),
+        )
+        .await
+        .expect("typed refusal yields stop");
+    assert!(matches!(
+        decision,
+        haider_core::ProviderAttemptDecision::Stop
+    ));
+}
+
+#[test]
+fn startup_refresh_and_login_legacy_probes_share_the_hardened_source() {
+    let source = include_str!("accounts.rs");
+    let implementation = source
+        .split("impl LegacyAnthropicProfileSource for ProductionLegacyAnthropicProfile")
+        .nth(1)
+        .expect("production profile source");
+    assert!(
+        implementation
+            .split("/// When a legacy identity upgrade runs.")
+            .next()
+            .expect("impl body")
+            .contains(
+                "crate::oauth::legacy_anthropic_profile_identity(access_token, issuer).await"
+            )
+    );
+    for (path, needle) in [
+        (
+            "startup",
+            "&ProductionLegacyAnthropicProfile,\n        IdentityUpgradeScope::Startup",
+        ),
+        (
+            "account refresh",
+            "&ProductionLegacyAnthropicProfile,\n                    &snapshot",
+        ),
+        (
+            "login legacy match",
+            "&ProductionLegacyAnthropicProfile,\n            &requested_alias",
+        ),
+    ] {
+        assert!(
+            source.contains(needle),
+            "{path} bypassed the hardened legacy profile source"
+        );
+    }
+}
+
 pub(super) fn test_store_dir() -> tempfile::TempDir {
     #[cfg(unix)]
     {
@@ -786,7 +1003,7 @@ async fn legacy_anthropic_profiles_upgrade_each_own_vault_bundle() {
     struct FakeProfile;
     #[async_trait::async_trait]
     impl LegacyAnthropicProfileSource for FakeProfile {
-        async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+        async fn identity(&self, access_token: &[u8], _issuer: &str) -> Option<AccountIdentity> {
             access_token.starts_with(b"synthetic-legacy-").then(|| {
                 stable_test_identity(
                     "owner@example.test",
@@ -938,7 +1155,7 @@ async fn legacy_profile_probes_run_concurrently_within_one_budget() {
     struct HangingProfile;
     #[async_trait::async_trait]
     impl LegacyAnthropicProfileSource for HangingProfile {
-        async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+        async fn identity(&self, access_token: &[u8], _issuer: &str) -> Option<AccountIdentity> {
             if access_token == b"synthetic-legacy-hang" {
                 std::future::pending::<()>().await;
             }
@@ -1142,7 +1359,7 @@ async fn explicit_anthropic_identity_refresh_persists_upgrade_across_repeats() {
     struct FakeProfile;
     #[async_trait::async_trait]
     impl LegacyAnthropicProfileSource for FakeProfile {
-        async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+        async fn identity(&self, access_token: &[u8], _issuer: &str) -> Option<AccountIdentity> {
             (access_token == b"synthetic-refresh-access").then(|| {
                 stable_test_identity(
                     "owner@example.test",
@@ -3689,6 +3906,7 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
         async fn discover(
             &self,
             source: CatalogSource,
+            _destination: CatalogDestination,
             access_token: Option<&str>,
             etag: Option<&str>,
         ) -> Result<DiscoveredCatalog, CatalogError> {
@@ -3812,6 +4030,7 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
         async fn discover(
             &self,
             _source: CatalogSource,
+            _destination: CatalogDestination,
             _access_token: Option<&str>,
             _etag: Option<&str>,
         ) -> Result<DiscoveredCatalog, CatalogError> {
@@ -8396,7 +8615,12 @@ async fn wh3_deepseek_catalog_source_populates_models_and_flips_available() {
         let source = source.clone();
         tokio::spawn(async move {
             discoverer
-                .discover(source, Some("DEEPSEEK_DISCOVERY_KEY_SENTINEL_43af"), None)
+                .discover(
+                    source,
+                    CatalogDestination::InProcess,
+                    Some("DEEPSEEK_DISCOVERY_KEY_SENTINEL_43af"),
+                    None,
+                )
                 .await
         })
     };
@@ -8440,6 +8664,7 @@ impl ProviderModelDiscoverer for BlockingModelDiscoverer {
     async fn discover(
         &self,
         source: CatalogSource,
+        _destination: CatalogDestination,
         access_token: Option<&str>,
         etag: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError> {
@@ -15520,6 +15745,7 @@ impl ProviderModelDiscoverer for CustomprovFixtureDiscovery {
     async fn discover(
         &self,
         source: CatalogSource,
+        _destination: CatalogDestination,
         access_token: Option<&str>,
         etag: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError> {
@@ -15701,6 +15927,7 @@ impl ProviderModelDiscoverer for CustomprovNoSecondDiscovery {
     async fn discover(
         &self,
         _: CatalogSource,
+        _: CatalogDestination,
         _: Option<&str>,
         _: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError> {
@@ -16738,7 +16965,7 @@ async fn fresh_claude_login_reaches_a_skipped_legacy_row_only_by_its_own_probe()
     struct FakeProfile;
     #[async_trait::async_trait]
     impl LegacyAnthropicProfileSource for FakeProfile {
-        async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+        async fn identity(&self, access_token: &[u8], _issuer: &str) -> Option<AccountIdentity> {
             let account = match access_token {
                 b"legacy-owner" | b"legacy-owner-again" => "account=owner;organization=o",
                 b"legacy-other" => "account=other;organization=o",
@@ -16838,7 +17065,7 @@ async fn legacy_profile_probe_never_sends_a_token_across_issuers() {
     struct CountingProfile(std::sync::atomic::AtomicUsize);
     #[async_trait::async_trait]
     impl LegacyAnthropicProfileSource for CountingProfile {
-        async fn identity(&self, _access_token: &[u8]) -> Option<AccountIdentity> {
+        async fn identity(&self, _access_token: &[u8], _issuer: &str) -> Option<AccountIdentity> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(stable_test_identity(
                 "x@example.test",

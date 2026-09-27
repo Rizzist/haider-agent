@@ -166,10 +166,11 @@ pub(super) async fn discover_models_with_account(
     // The discoverer names where the credential goes: a real endpoint only
     // ever receives a live-issued token; the debug fake data plane is
     // numeric loopback.
-    let resolved = match model_discoverer.destination(&source) {
-        CatalogDestination::InProcess => broker.resolve(descriptor).await,
+    let destination = model_discoverer.destination(&source);
+    let resolved = match &destination {
+        CatalogDestination::InProcess => broker.resolve_in_process(descriptor).await,
         CatalogDestination::Remote => broker.resolve_remote(descriptor).await,
-        CatalogDestination::Loopback(url) => broker.resolve_to_loopback(descriptor, &url).await,
+        CatalogDestination::Loopback(url) => broker.resolve_to_loopback(descriptor, url).await,
     };
     match resolved {
         Ok(access_token) => {
@@ -186,6 +187,7 @@ pub(super) async fn discover_models_with_account(
                     discover_provider_models_bounded(
                         model_discoverer,
                         source,
+                        destination,
                         Some(access_token),
                         etag,
                     )

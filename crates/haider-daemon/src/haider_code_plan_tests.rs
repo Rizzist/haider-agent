@@ -35,6 +35,57 @@ fn descriptor(alias: &str) -> CredentialDescriptor {
     }
 }
 
+#[tokio::test]
+async fn plan_credential_source_refuses_non_live_oauth_before_http() {
+    let (broker, descriptor) =
+        crate::oauth::non_live_issued_broker_for_sendpoint("openai-oauth").await;
+    let result = PlanCredentialSource::resolve(&broker, &descriptor).await;
+    assert!(matches!(
+        result,
+        Err(PlanTransientFailure::CredentialUnavailable)
+    ));
+
+    let guarded = Arc::new(CountingGuardedCredentials {
+        broker,
+        calls: AtomicUsize::new(0),
+    });
+    let accounts = Arc::new(FakeAccounts::new(1, descriptor));
+    let interest = Arc::new(FakeInterest::new(vec!["connection".into()]));
+    let http = Arc::new(FakeHttp::new([]));
+    let (stop, receiver) = watch::channel(false);
+    let task = tokio::spawn(run_plan_poller(
+        accounts,
+        guarded.clone(),
+        interest,
+        http.clone(),
+        receiver,
+    ));
+    wait_for(|| guarded.calls.load(Ordering::SeqCst) > 0).await;
+    assert_eq!(
+        http.call_count(),
+        0,
+        "poller never posted the refused bearer"
+    );
+    stop.send_replace(true);
+    task.await.expect("poller stopped");
+}
+
+struct CountingGuardedCredentials {
+    broker: crate::oauth::CredentialBroker,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl PlanCredentialSource for CountingGuardedCredentials {
+    async fn resolve(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, PlanTransientFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        PlanCredentialSource::resolve(&self.broker, descriptor).await
+    }
+}
+
 struct FakeAccounts {
     active: Mutex<Option<ActivePlanAccount>>,
     changes: watch::Sender<u64>,

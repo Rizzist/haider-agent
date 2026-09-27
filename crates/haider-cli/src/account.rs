@@ -963,7 +963,10 @@ async fn execute_import(
         .into_iter()
         .find(|candidate| candidate.source == source)
         .ok_or_else(|| AccountError::MissingAlias(format!("{source} local login")))?;
-    if !candidate.import_supported {
+    // The daemon owns the Claude Code policy gate. Forward this candidate so
+    // fake mode reports its typed refusal before the ordinary unsupported
+    // source reason; the daemon still refuses the import in live mode.
+    if !candidate.import_supported && source != "claude-code" {
         return Err(AccountError::Protocol(
             "the discovered local login cannot be imported safely",
         ));

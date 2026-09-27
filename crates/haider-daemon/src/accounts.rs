@@ -1593,6 +1593,7 @@ trait ProviderModelDiscoverer: Send + Sync {
     async fn discover(
         &self,
         source: CatalogSource,
+        destination: CatalogDestination,
         access_token: Option<&str>,
         etag: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError>;
@@ -1614,12 +1615,18 @@ impl ProviderModelDiscoverer for ProductionProviderModelDiscoverer {
     async fn discover(
         &self,
         source: CatalogSource,
+        destination: CatalogDestination,
         access_token: Option<&str>,
         etag: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError> {
         #[cfg(debug_assertions)]
-        if let Some(url) = fake_catalog_url(&source) {
-            return discover_fake_catalog(&url, source, access_token).await;
+        if let CatalogDestination::Loopback(url) = &destination {
+            return discover_fake_catalog(url, source, access_token).await;
+        }
+        if destination != CatalogDestination::Remote {
+            return Err(CatalogError::Unavailable {
+                reason: "catalog destination is invalid".to_owned(),
+            });
         }
         discover_models(source, access_token, etag).await
     }
@@ -1651,8 +1658,7 @@ async fn discover_fake_catalog(
             "fake catalog must be numeric loopback".to_owned(),
         ));
     }
-    let client = reqwest::Client::builder()
-        .no_proxy()
+    let client = haider_platform::native_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()
@@ -2791,15 +2797,15 @@ async fn backfill_oauth_identities(
 /// rows and vault slots; duplicate hints provide the explicit merge path.
 #[async_trait::async_trait]
 trait LegacyAnthropicProfileSource: Send + Sync {
-    async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity>;
+    async fn identity(&self, access_token: &[u8], issuer: &str) -> Option<AccountIdentity>;
 }
 
 struct ProductionLegacyAnthropicProfile;
 
 #[async_trait::async_trait]
 impl LegacyAnthropicProfileSource for ProductionLegacyAnthropicProfile {
-    async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
-        crate::oauth::legacy_anthropic_profile_identity(access_token).await
+    async fn identity(&self, access_token: &[u8], issuer: &str) -> Option<AccountIdentity> {
+        crate::oauth::legacy_anthropic_profile_identity(access_token, issuer).await
     }
 }
 
@@ -2852,11 +2858,13 @@ async fn upgrade_legacy_anthropic_identities(
     // keeps every probe that finished in time.
     let identities =
         futures_util::future::join_all(probes.iter().map(|(alias, token)| async move {
-            let identity =
-                tokio::time::timeout(LEGACY_PROFILE_PROBE_BUDGET, profile.identity(token))
-                    .await
-                    .ok()
-                    .flatten();
+            let identity = tokio::time::timeout(
+                LEGACY_PROFILE_PROBE_BUDGET,
+                profile.identity(&token.0, &token.1),
+            )
+            .await
+            .ok()
+            .flatten();
             (alias.clone(), identity)
         }))
         .await;
@@ -2890,7 +2898,7 @@ fn is_legacy_anthropic_row(row: &CredentialDescriptor, scope: IdentityUpgradeSco
 fn legacy_anthropic_access_token(
     vault: &dyn Vault,
     alias: &CredentialAlias,
-) -> Option<Zeroizing<Vec<u8>>> {
+) -> Option<(Zeroizing<Vec<u8>>, String)> {
     let secret = vault.resolve(alias).ok()?;
     let bundle = haider_accounts::OAuthTokenBundleV1::decode(secret.expose_secret()).ok()?;
     // The probe goes to the catalog's profile endpoint: only a token that
@@ -2899,7 +2907,12 @@ fn legacy_anthropic_access_token(
     (bundle.expires_at_unix_ms > unix_ms_after(Duration::ZERO)
         && crate::oauth::catalog_issuer(ANTHROPIC_OAUTH_PROVIDER_NAME).as_deref()
             == Some(bundle.issuer.as_str()))
-    .then(|| Zeroizing::new(bundle.access_token().to_vec()))
+    .then(|| {
+        (
+            Zeroizing::new(bundle.access_token().to_vec()),
+            bundle.issuer,
+        )
+    })
 }
 
 async fn upgrade_legacy_anthropic_alias(
@@ -2919,8 +2932,11 @@ async fn upgrade_legacy_anthropic_alias(
     let Some(token) = legacy_anthropic_access_token(vault, alias) else {
         return false;
     };
-    let Ok(Some(identity)) =
-        tokio::time::timeout(LEGACY_PROFILE_PROBE_BUDGET, profile.identity(&token)).await
+    let Ok(Some(identity)) = tokio::time::timeout(
+        LEGACY_PROFILE_PROBE_BUDGET,
+        profile.identity(&token.0, &token.1),
+    )
+    .await
     else {
         return false;
     };
@@ -3205,7 +3221,8 @@ fn begin_provider_models_probe(
                 return;
             }
         };
-        match discoverer.discover(source, secret, None).await {
+        let destination = discoverer.destination(&source);
+        match discoverer.discover(source, destination, secret, None).await {
             Ok(catalog) => {
                 let models = catalog
                     .models
@@ -3439,12 +3456,14 @@ async fn begin_provider_models_refresh(
             }
             (final_alias, final_result)
         } else if descriptors.is_empty() {
+            let destination = model_discoverer.destination(&source);
             (
                 None,
                 ProviderModelsRefreshResult::Discovery(
                     discover_provider_models_bounded(
                         model_discoverer.as_ref(),
                         source,
+                        destination,
                         None,
                         etag.as_deref(),
                     )
@@ -3837,12 +3856,13 @@ fn enqueue_catalog_discovery(
 async fn discover_provider_models_bounded(
     discoverer: &dyn ProviderModelDiscoverer,
     source: CatalogSource,
+    destination: CatalogDestination,
     access_token: Option<&str>,
     etag: Option<&str>,
 ) -> Result<DiscoveredCatalog, CatalogError> {
     tokio::time::timeout(
         PROVIDER_MODEL_DISCOVERY_TIMEOUT,
-        discoverer.discover(source, access_token, etag),
+        discoverer.discover(source, destination, access_token, etag),
     )
     .await
     .unwrap_or_else(|_| {
@@ -5697,7 +5717,14 @@ async fn handle_provider_configure(
                     if let Some(secret) = job.probe_secret.as_ref() {
                         match std::str::from_utf8(secret) {
                             Ok(secret) => {
-                                model_discoverer.discover(source, Some(secret), None).await
+                                model_discoverer
+                                    .discover(
+                                        source.clone(),
+                                        model_discoverer.destination(&source),
+                                        Some(secret),
+                                        None,
+                                    )
+                                    .await
                             }
                             Err(_) => {
                                 respond_error(
@@ -5744,7 +5771,14 @@ async fn handle_provider_configure(
                                 return;
                             }
                         };
-                        model_discoverer.discover(source, Some(secret), None).await
+                        model_discoverer
+                            .discover(
+                                source.clone(),
+                                model_discoverer.destination(&source),
+                                Some(secret),
+                                None,
+                            )
+                            .await
                     }
                 }
                 Some(ProviderAuthRequirementWire::None) => {
@@ -5757,7 +5791,14 @@ async fn handle_provider_configure(
                         );
                         return;
                     }
-                    model_discoverer.discover(source, None, None).await
+                    model_discoverer
+                        .discover(
+                            source.clone(),
+                            model_discoverer.destination(&source),
+                            None,
+                            None,
+                        )
+                        .await
                 }
                 _ => {
                     respond_error(
@@ -8615,11 +8656,13 @@ async fn match_unprobed_legacy_anthropic_row(
         .collect::<Vec<_>>();
     let identities =
         futures_util::future::join_all(probes.iter().map(|(alias, token)| async move {
-            let identity =
-                tokio::time::timeout(LEGACY_PROFILE_PROBE_BUDGET, profile.identity(token))
-                    .await
-                    .ok()
-                    .flatten();
+            let identity = tokio::time::timeout(
+                LEGACY_PROFILE_PROBE_BUDGET,
+                profile.identity(&token.0, &token.1),
+            )
+            .await
+            .ok()
+            .flatten();
             (alias.clone(), identity)
         }))
         .await;

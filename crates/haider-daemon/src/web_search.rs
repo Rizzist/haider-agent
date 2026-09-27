@@ -29,7 +29,7 @@ use std::time::Duration;
 use haider_accounts::SecretHandle;
 use haider_protocol::cache::ProviderRequestAttemptV1;
 use haider_provider::{
-    OPENAI_OAUTH_PROVIDER_NAME, apply_provider_request_headers_for,
+    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_SUBSCRIPTION_BASE_URL, apply_provider_request_headers_for,
     codex_alpha_search_request_body, codex_alpha_search_response_text, codex_alpha_search_url,
 };
 
@@ -84,13 +84,37 @@ impl WebSearchCredentials for CredentialBroker {
             .resolve_account(OPENAI_OAUTH_PROVIDER_NAME, None)
             .await
             .map_err(|error| error.message)?;
-        let base_url = account.descriptor.base_url.clone();
-        let bearer = self
-            .resolve(&account.descriptor)
-            .await
-            .map_err(|error| error.message)?;
-        Ok((base_url, bearer))
+        subscription_bearer_for_descriptor(self, &account.descriptor).await
     }
+}
+
+async fn subscription_bearer_for_descriptor(
+    broker: &CredentialBroker,
+    descriptor: &haider_protocol::credential::CredentialDescriptor,
+) -> Result<(Option<String>, SecretHandle), String> {
+    // A descriptor supplied by an import is not authority to send an
+    // OAuth bearer to an arbitrary search host.
+    let base_url = descriptor.base_url.clone();
+    let destination = match base_url.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(base) if base.trim_end_matches('/') == OPENAI_SUBSCRIPTION_BASE_URL => None,
+        #[cfg(debug_assertions)]
+        Some(base) if crate::oauth::debug_fake_oauth::active_for(OPENAI_OAUTH_PROVIDER_NAME) => {
+            let url = url::Url::parse(base)
+                .map_err(|_| "subscription search destination is invalid".to_owned())?;
+            if !crate::oauth::is_numeric_loopback_http(&url) {
+                return Err("subscription search destination is not issuer-bound".into());
+            }
+            Some(url)
+        }
+        Some(_) => return Err("subscription search destination is not issuer-bound".into()),
+    };
+    let bearer = match destination {
+        Some(url) => broker.resolve_to_loopback(descriptor, &url).await,
+        None => broker.resolve_remote(descriptor).await,
+    }
+    .map_err(|error| error.message)?;
+    Ok((base_url, bearer))
 }
 
 /// Injected HTTP seam: ONE authenticated POST, no retries (the tool result
@@ -340,10 +364,38 @@ mod web_search_tests {
         SubscriptionWebSearch::new(credentials, http)
     }
 
+    #[tokio::test]
+    async fn web_search_refuses_non_live_issuer_and_unbound_override_before_post() {
+        let (broker, mut descriptor) =
+            crate::oauth::non_live_issued_broker_for_sendpoint(OPENAI_OAUTH_PROVIDER_NAME).await;
+        let http = StubHttp::replying(200, "{}");
+        let search = executor(
+            Arc::new(broker.clone()),
+            Arc::clone(&http) as Arc<dyn WebSearchHttp>,
+        );
+        let error = search
+            .search("m", "s", "q", &side_attempt())
+            .await
+            .expect_err("fake-issued bearer refused");
+        assert!(
+            error
+                .message
+                .contains("never sent to a non-loopback endpoint")
+        );
+        assert!(http.posts().is_empty());
+
+        descriptor.base_url = Some("https://other.example.invalid/backend-api/codex".into());
+        let error = subscription_bearer_for_descriptor(&broker, &descriptor)
+            .await
+            .expect_err("unbound host refused");
+        assert!(error.contains("not issuer-bound"));
+        assert!(http.posts().is_empty());
+    }
+
     /// LAW (LW4 client half, request): one search is exactly ONE POST to
     /// `{subscription_base}/alpha/search`, under the SAME Bearer as turns,
-    /// carrying the golden SearchRequest body; a credential's own base_url
-    /// wins over the sanctioned default.
+    /// carrying the golden SearchRequest body. This stub exercises URL
+    /// joining; the broker test above enforces the destination policy.
     #[tokio::test]
     async fn one_search_is_one_authenticated_post_of_the_golden_body() {
         let http = StubHttp::replying(200, r#"{"output_text":"the answer"}"#);
@@ -376,7 +428,7 @@ mod web_search_tests {
         );
         assert_eq!(posts[0].3, side_attempt());
 
-        // A credential that pins its own origin is honored.
+        // The injected seam's URL is joined as supplied.
         let proxied = StubHttp::replying(200, "{}");
         let search = executor(
             Arc::new(StubCredentials {
