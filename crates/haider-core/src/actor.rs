@@ -2338,6 +2338,9 @@ pub struct HarnessConfig {
     /// Daemon-owned durable pair-selection seam. Automatic fallback and
     /// promotion refuse to switch unless this is installed.
     pub provider_pair_switch_committer: Option<Arc<dyn ProviderPairSwitchCommitter>>,
+    /// Commits an account-route epoch before an in-turn credential rotation.
+    /// This turn keeps its begin epoch, so its eventual footprint projects.
+    pub provider_route_committer: Option<Arc<dyn ProviderRouteCommitter>>,
     /// Optional already-resolved larger-context lane used by the compaction
     /// runaway guard. Daemons prove its credential and window ordering.
     pub compaction_promotion: Option<ProviderPairSwitchTarget>,
@@ -2500,6 +2503,7 @@ impl HarnessConfig {
             provider_rebind_resolver: None,
             provider_route_epoch: None,
             provider_pair_switch_committer: None,
+            provider_route_committer: None,
             compaction_promotion: None,
             retry_sleeper: Arc::new(RealRetrySleeper),
             context_compactor: None,
@@ -3175,6 +3179,16 @@ pub struct ProviderPairSwitch {
 pub trait ProviderPairSwitchCommitter: Send + Sync + std::fmt::Debug {
     /// Returns the durable selection epoch for requests made after the switch.
     async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError>;
+}
+
+#[async_trait]
+pub trait ProviderRouteCommitter: Send + Sync + std::fmt::Debug {
+    async fn commit(
+        &self,
+        provider: &str,
+        model: &str,
+        to: &CredentialAlias,
+    ) -> Result<u64, HaiderError>;
 }
 
 /// Result of consulting the daemon at an eligible pre-first-event failure.
@@ -9316,6 +9330,16 @@ impl HarnessActor {
                         return Err(DriveError::Provider(provider_protocol_error(
                             "attempt resolver returned inconsistent rotation coordinates",
                         )));
+                    }
+                    if let Some(committer) = self.config.provider_route_committer.as_ref() {
+                        committer
+                            .commit(
+                                &self.config.usage_scope.provider,
+                                &self.config.model,
+                                &resolved.account,
+                            )
+                            .await
+                            .map_err(DriveError::Store)?;
                     }
                     self.commit_payload(
                         context.run_id,

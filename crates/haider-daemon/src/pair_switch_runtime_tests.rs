@@ -14,15 +14,17 @@ use crate::worker::{
 };
 use haider_core::{
     ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitchCause,
-    ProviderPairSwitchTarget, QueueConsumeCommand, QueuePromoteCommand, SessionCreateCommand,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    SqliteStoreHandle, StoreHandle, TurnAcceptCommand, TurnAdmissionDisposition,
+    ProviderPairSwitchTarget, QueueConsumeCommand, QueuePromoteCommand, ResolvedProviderAttempt,
+    SessionCreateCommand, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
+    TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
 use haider_protocol::context::ContextFootprint;
+use haider_protocol::credential::{RotationCause, RotationEvent};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{CredentialAlias, DeviceId, EventId, RunId, SessionId};
@@ -73,6 +75,34 @@ struct RoutingProviderFactory {
     providers: HashMap<String, Arc<FakeProvider>>,
     cache_reconciliations: Arc<Mutex<Vec<(SessionId, String)>>>,
     fallback_enabled: bool,
+    rotation_enabled: bool,
+}
+
+#[derive(Debug)]
+struct RuntimeRotationResolver {
+    target: Arc<FakeProvider>,
+}
+
+#[async_trait::async_trait]
+impl ProviderAttemptResolver for RuntimeRotationResolver {
+    async fn resolve(
+        &self,
+        current_account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        let to = CredentialAlias::new("fake-a-account-b");
+        Ok(ProviderAttemptDecision::Rotate(ResolvedProviderAttempt {
+            provider: Arc::clone(&self.target) as Arc<dyn haider_provider::Provider>,
+            account: to.clone(),
+            account_incarnation: Some(2),
+            rotation: RotationEvent {
+                provider: "fake-a".into(),
+                from: current_account.clone(),
+                to,
+                cause: RotationCause::Error,
+            },
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -126,7 +156,11 @@ impl ProviderFactory for RoutingProviderFactory {
                 false,
             )
         })?;
-        let attempt_resolver =
+        let attempt_resolver = if self.rotation_enabled && metadata.provider == "fake-a" {
+            Some(Arc::new(RuntimeRotationResolver {
+                target: Arc::clone(self.providers.get("fake-b").expect("rotation target")),
+            }) as Arc<dyn ProviderAttemptResolver>)
+        } else {
             (self.fallback_enabled && metadata.provider == "fake-a").then(|| {
                 Arc::new(RuntimeFallbackResolver {
                     target: Arc::clone(
@@ -135,7 +169,8 @@ impl ProviderFactory for RoutingProviderFactory {
                             .expect("fallback target is registered"),
                     ),
                 }) as Arc<dyn ProviderAttemptResolver>
-            });
+            })
+        };
         Ok(ResolvedTurnProvider {
             provider: Arc::clone(provider) as Arc<dyn haider_provider::Provider>,
             provider_name: metadata.provider.clone(),
@@ -207,6 +242,24 @@ impl PairSwitchWorld {
         fake_b: Arc<FakeProvider>,
         fallback_enabled: bool,
     ) -> Self {
+        Self::boot_with_attempt_mode(prefix, fake_a, fake_b, fallback_enabled, false).await
+    }
+
+    async fn boot_with_rotation(
+        prefix: &str,
+        fake_a: Arc<FakeProvider>,
+        fake_b: Arc<FakeProvider>,
+    ) -> Self {
+        Self::boot_with_attempt_mode(prefix, fake_a, fake_b, false, true).await
+    }
+
+    async fn boot_with_attempt_mode(
+        prefix: &str,
+        fake_a: Arc<FakeProvider>,
+        fake_b: Arc<FakeProvider>,
+        fallback_enabled: bool,
+        rotation_enabled: bool,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temp profile");
         let store = SqliteStoreHandle::open(root.path()).await.expect("store");
         // Leak the tempdir handle so the profile outlives this constructor;
@@ -227,6 +280,7 @@ impl PairSwitchWorld {
                     ]),
                     cache_reconciliations: Arc::clone(&cache_reconciliations),
                     fallback_enabled,
+                    rotation_enabled,
                 }),
                 // Pair-switch scripts explicitly include delegation; retain
                 // its declaration across provider changes.
@@ -688,6 +742,160 @@ async fn pinned_loom_workflow_runs_its_next_turn_after_registry_edit() {
     world.shutdown().await;
 }
 
+/// An ordinary RPC create stays unpinned; an in-turn account rotation then
+/// advances only that session's route epoch and finishes on the alternate.
+#[tokio::test]
+async fn rpc_created_unpinned_session_can_rotate_and_commit_its_route_epoch() {
+    let first = Arc::new(FakeProvider::new(vec![FakeStep::Error {
+        kind: haider_provider::ProviderErrorKind::Authentication,
+        message: "first account failed authentication".into(),
+        retry_after_ms: None,
+    }]));
+    let alternate = Arc::new(FakeProvider::new(text_turn("alternate account answered")));
+    let mut world = PairSwitchWorld::boot_with_rotation(
+        "rpc-rotation-runtime",
+        Arc::clone(&first),
+        Arc::clone(&alternate),
+    )
+    .await;
+    let archived = world.session_id.clone();
+    let sink = Arc::new(GraphSelectionSink::default());
+    let connection = world
+        .hub
+        .open_connection(
+            BTreeSet::from([Capability::Control, Capability::View]),
+            Arc::clone(&sink) as Arc<dyn FrameSink>,
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("local RPC connection");
+    connection
+        .request(
+            RequestId::new("rpc-rotation-create"),
+            RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: CommandId::new("rpc-rotation-create-command"),
+                cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                    .expect("canonical cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                provider: "fake-a".into(),
+                model: "model-a".into(),
+                max_tokens: 4_096,
+                permission_overrides: None,
+                workspace_allocation: None,
+                cache_policy: None,
+                interaction_mode: Default::default(),
+                ssh_scope: None,
+                account_alias: None,
+                resolve_provider: false,
+                resolve_model: false,
+                effort: None,
+                fast: None,
+            },
+        )
+        .await
+        .expect("RPC create");
+    let ResponseBody::SessionCreate {
+        session_id,
+        metadata: created,
+        ..
+    } = graph_response(&sink, "rpc-rotation-create").expect("create response")
+    else {
+        panic!("unexpected create response")
+    };
+    assert_eq!(created.account_alias, None);
+    assert_eq!(created.selection_epoch, Some(0));
+    world.session_id = session_id;
+    let (run_id, disposition) = world
+        .submit_turn(
+            "rpc-rotation-turn",
+            "rotate and answer",
+            DeliveryMode::Steer,
+        )
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    let terminal = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some((_, state)) = world
+                .latest_run_states()
+                .await
+                .into_iter()
+                .find(|(candidate, _)| candidate == &run_id)
+                && matches!(
+                    state,
+                    RunState::Done | RunState::Errored | RunState::Cancelled
+                )
+            {
+                break state;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let journal = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("journal");
+    assert!(
+        matches!(terminal, Ok(RunState::Done)),
+        "rotation did not finish ({terminal:?}): {:?}",
+        journal
+            .iter()
+            .map(|event| event.payload.decode_event())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(first.requests().len(), 1);
+    assert_eq!(alternate.requests().len(), 1);
+    let committed = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("session");
+    assert_eq!(committed.account_alias, None, "rotation must not pin");
+    assert_eq!(
+        committed.resolved_route_alias.as_deref(),
+        Some("fake-a-account-b")
+    );
+    assert!(committed.selection_epoch.unwrap_or(0) > 0);
+    let events = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("journal");
+    assert!(events.iter().any(|event| {
+        ModelSelected::from_payload_value(&event.payload).is_some_and(|fact| {
+            fact.provider == "fake-a"
+                && fact.model == "model-a"
+                && fact.selection_epoch == committed.selection_epoch
+        })
+    }));
+    assert!(events.iter().any(|event| {
+        event.payload.decode_event().is_ok_and(|payload| {
+            matches!(
+                payload,
+                EventPayload::Rotation(RotationEvent {
+                    cause: RotationCause::Error,
+                    ..
+                })
+            )
+        })
+    }));
+    assert_eq!(
+        world
+            .store
+            .session_metadata(&archived)
+            .await
+            .expect("archived metadata")
+            .expect("archived row")
+            .selection_epoch,
+        Some(0),
+        "an unrelated session is untouched"
+    );
+    connection.close().await.expect("connection closes");
+    world.shutdown().await;
+}
+
 /// LAW: an authentication wall with no within-provider alternate commits the
 /// exact receipted pair-selection transaction, surfaces both the cold epoch
 /// and human-readable hop reason, and finishes the SAME run on provider B.
@@ -728,6 +936,8 @@ async fn fallback_chain_switch_is_durable_visible_and_finishes_the_same_turn() {
         (metadata.provider.as_str(), metadata.model.as_str()),
         ("fake-b", "model-b")
     );
+    assert_eq!(metadata.account_alias, None, "fallback must stay unpinned");
+    assert!(metadata.selection_epoch.unwrap_or(0) > 0);
 
     let request_json = serde_json::json!({
         "automatic": true,
@@ -1882,6 +2092,7 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
                 ]),
                 cache_reconciliations: Arc::new(Mutex::new(Vec::new())),
                 fallback_enabled: false,
+                rotation_enabled: false,
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,

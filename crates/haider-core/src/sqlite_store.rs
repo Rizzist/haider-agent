@@ -355,6 +355,36 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.session_metadata(&session_id))).await
     }
 
+    pub async fn commit_resolved_route(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &haider_protocol::ids::DeviceId,
+    ) -> Result<u64, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        let expected_provider = expected_provider.to_owned();
+        let expected_model = expected_model.to_owned();
+        let resolved_alias = resolved_alias.map(str::to_owned);
+        let device_id = device_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.commit_resolved_route(
+                    &session_id,
+                    &expected_provider,
+                    &expected_model,
+                    expected_epoch,
+                    resolved_alias.as_deref(),
+                    &device_id,
+                )
+            })
+        })
+        .await
+    }
+
     pub async fn persist_context_economy(
         &self,
         session_id: SessionId,

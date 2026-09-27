@@ -2387,16 +2387,25 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         active: true,
         ..descriptor.clone()
     };
+    let active_fake = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("active-fake"),
+        active: true,
+        ..descriptor.clone()
+    };
     let mut other_provider = provider_summary("other");
     other_provider.models = vec!["other-v1".into()];
     other_provider.default_model = Some("other-v1".into());
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
         oauth: None,
-        snapshot: Arc::new(Mutex::new(vec![descriptor.clone(), active_other.clone()])),
+        snapshot: Arc::new(Mutex::new(vec![
+            descriptor.clone(),
+            active_fake.clone(),
+            active_other.clone(),
+        ])),
         management: crate::accounts::ManagementSnapshot::new(
             0,
-            vec![descriptor, active_other],
+            vec![descriptor, active_fake, active_other],
             vec![provider, other_provider],
         ),
         vault_supported: false,
@@ -2470,9 +2479,148 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         haider_protocol::session::SessionInteractionModeV1::Autonomous
     );
 
+    // An ordinary create follows the provider's active account on each
+    // turn. The RPC must not turn that mutable default into an explicit pin.
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("ordinary-create"),
+            RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: haider_rpc::CommandId::new("ordinary-create-command"),
+                cwd: std::env::current_dir()
+                    .expect("cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                provider: "fake".into(),
+                model: "fake-v1".into(),
+                max_tokens: 4_096,
+                permission_overrides: None,
+                workspace_allocation: None,
+                cache_policy: None,
+                interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
+                ssh_scope: None,
+                account_alias: None,
+                resolve_provider: false,
+                resolve_model: false,
+                effort: None,
+                fast: None,
+            },
+        )
+        .await
+        .expect("ordinary create request");
+    let ordinary = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { metadata, .. },
+            } if request_id.as_str() == "ordinary-create" => Some(metadata.clone()),
+            _ => None,
+        })
+        .expect("ordinary create response");
+    assert_eq!(ordinary.account_alias, None);
+
     drop(connection);
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn account_switch_preflight_does_not_pin_archived_or_child_sessions() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let archived = SessionId::new("archived-account-route");
+    store
+        .create_session(create_command(&archived, "archived-account-route"))
+        .await
+        .expect("archive fixture");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let child = SessionId::new("child-account-route");
+    hub.create_internal_session(create_command(&child, "child-account-route"))
+        .await
+        .expect("child fixture");
+    let before_archived = store
+        .session_metadata(&archived)
+        .await
+        .expect("archived metadata");
+    let before_child = store
+        .session_metadata(&child)
+        .await
+        .expect("child metadata");
+    let old = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("old-fake"),
+        provider: "fake".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "old fake account".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let new = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("new-fake"),
+        active: false,
+        ..old.clone()
+    };
+    let (login, mut queued) = tokio::sync::mpsc::channel(1);
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: Some(login),
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+        management: crate::accounts::ManagementSnapshot::new(
+            0,
+            vec![old, new],
+            vec![provider_summary("fake")],
+        ),
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(Mutex::new(Vec::new())),
+        vault: None,
+    })
+    .expect("accounts");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+            sink,
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("switch-preflight"),
+            RequestBody::AccountSetActive {
+                command_id: haider_rpc::CommandId::new("switch-preflight-command"),
+                alias: "new-fake".into(),
+                confirm_new_epoch: true,
+            },
+        )
+        .await
+        .expect("switch request");
+    assert!(matches!(
+        queued.try_recv(),
+        Ok(crate::accounts::AccountCommand::SetActive(_))
+    ));
+    assert_eq!(
+        store
+            .session_metadata(&archived)
+            .await
+            .expect("archived after"),
+        before_archived
+    );
+    assert_eq!(
+        store.session_metadata(&child).await.expect("child after"),
+        before_child
+    );
+    drop(connection);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
 }
 
 /// R2-03: absent storage is the canonical default `All` scope. A later

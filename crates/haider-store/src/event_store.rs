@@ -5021,10 +5021,119 @@ impl Store {
             )
             .optional()
             .map_err(map_sqlite_error)?;
-        match metadata {
-            Some(json) => decode_session_metadata(session_id, &json),
-            None => Ok(None),
+        let Some(json) = metadata else {
+            return Ok(None);
+        };
+        let Some(metadata) = decode_session_metadata(session_id, &json)? else {
+            return Ok(None);
+        };
+        if metadata.selection_epoch.is_some() {
+            return Ok(Some(metadata));
         }
+        drop(connection);
+        // The rare pre-epoch migration takes a write transaction and
+        // re-reads under its lock so a concurrent selection cannot be lost.
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut metadata = typed_session_metadata(&transaction, session_id)?;
+        if metadata.selection_epoch.is_none() {
+            metadata.selection_epoch = Some(latest_seq_in_connection(&transaction, session_id)?);
+            transaction
+                .execute(
+                    "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                    params![
+                        session_id.as_str(),
+                        serde_json::to_string(&metadata).map_err(|error| {
+                            store_error(ErrorCode::StoreCorrupt, error.to_string(), false)
+                        })?
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(Some(metadata))
+    }
+
+    /// Advance only this session's meter epoch when an unpinned route starts
+    /// using a different resolved account. The route remains mutable for
+    /// rotation, fallback, and active-account switches.
+    pub fn commit_resolved_route(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &DeviceId,
+    ) -> StoreResult<u64> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut metadata = typed_session_metadata(&transaction, session_id)?;
+        if metadata.provider != expected_provider
+            || metadata.model != expected_model
+            || metadata.selection_epoch.unwrap_or(0) != expected_epoch
+        {
+            // A selection committed after this request captured metadata.
+            // Its request keeps the old epoch and cannot acquire the new one.
+            return Ok(expected_epoch);
+        }
+        let current = metadata
+            .selection_epoch
+            .unwrap_or(latest_seq_in_connection(&transaction, session_id)?);
+        let changed = metadata.resolved_route_seen
+            && metadata.resolved_route_alias.as_deref() != resolved_alias;
+        let epoch = if changed {
+            current
+                .max(latest_seq_in_connection(&transaction, session_id)?)
+                .checked_add(1)
+                .ok_or_else(|| corrupt("session selection epoch space is exhausted"))?
+        } else {
+            current
+        };
+        if !metadata.resolved_route_seen
+            || metadata.selection_epoch != Some(epoch)
+            || metadata.resolved_route_alias.as_deref() != resolved_alias
+        {
+            metadata.selection_epoch = Some(epoch);
+            metadata.resolved_route_alias = resolved_alias.map(str::to_owned);
+            metadata.resolved_route_seen = true;
+            transaction
+                .execute(
+                    "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                    params![
+                        session_id.as_str(),
+                        serde_json::to_string(&metadata).map_err(|error| {
+                            store_error(ErrorCode::StoreCorrupt, error.to_string(), false)
+                        })?
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+        if changed {
+            let mut envelopes = vec![unstamped_raw_command_envelope(
+                EventId::new(format!("route-selection-{}-{epoch}", session_id.as_str())),
+                session_id,
+                None,
+                None,
+                device_id.clone(),
+                self.worker_generation,
+                ModelSelected {
+                    selection_epoch: Some(epoch),
+                    provider: metadata.provider.clone(),
+                    model: metadata.model.clone(),
+                }
+                .to_payload_value()
+                .map_err(|error| store_error(ErrorCode::StoreCorrupt, error.to_string(), false))?,
+                PromptRender::Omit,
+            )?];
+            append_transaction_envelopes(&transaction, session_id, now_ms()?, &mut envelopes)?;
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(epoch)
     }
 
     /// Monotonically persists conversation-level savings after the matching
@@ -8626,6 +8735,8 @@ impl Store {
 
         let metadata = SessionMetadataV1 {
             selection_epoch: Some(0),
+            resolved_route_alias: None,
+            resolved_route_seen: false,
             provider_base_url: None,
             provider_rebind_id: None,
             cwd: command.cwd.clone(),
@@ -9854,6 +9965,7 @@ impl Store {
             metadata.selection_epoch.unwrap_or(0)
         } else {
             latest_seq_in_connection(&transaction, &command.session_id)?
+                .max(metadata.selection_epoch.unwrap_or(0))
                 .checked_add(1)
                 .ok_or_else(|| corrupt("event sequence space is exhausted"))?
         };
@@ -11039,6 +11151,7 @@ impl Store {
         mutate(&mut metadata);
         if selection.method == "session.provider.rebind" {
             let epoch = latest_seq_in_connection(&transaction, selection.session_id)?
+                .max(metadata.selection_epoch.unwrap_or(0))
                 .checked_add(1)
                 .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
             metadata.selection_epoch = Some(epoch);

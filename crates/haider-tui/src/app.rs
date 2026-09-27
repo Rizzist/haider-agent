@@ -20,6 +20,17 @@ use haider_protocol::{DeliveryMode, EventPayload};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+fn loom_selection_slash(draft: &str) -> bool {
+    let Some(name) = draft
+        .trim_start()
+        .strip_prefix('/')
+        .and_then(|tail| tail.split_whitespace().next())
+    else {
+        return false;
+    };
+    matches!(name.to_ascii_lowercase().as_str(), "model" | "provider")
+}
+
 /// Sim `autoBlurb` (tui.js:401-406): strip a leading slash-command token,
 /// keep the first seven words, cap at 46 chars, capitalize the first letter.
 #[must_use]
@@ -9080,7 +9091,7 @@ impl AppModel {
                     self.composer.insert_str("\n");
                     self.note_loom_author_edit();
                 }
-                KeyCode::Enter if self.composer.text().trim_start().starts_with('/') => {
+                KeyCode::Enter if loom_selection_slash(self.composer.text()) => {
                     self.submit_composer();
                 }
                 KeyCode::Enter if self.loom_authoring.is_some() => {
@@ -11852,9 +11863,18 @@ impl AppModel {
             .iter()
             .find(|row| row.id.as_str() == session)?;
         let (provider, model) = row.meter_epoch.pair.as_ref()?;
-        let footprint = row.latest_context_footprint();
+        // The viewed child may already have a streamed transcript while its
+        // list summary has no usage yet. Both sources belong to this child;
+        // never fall back to the parent's projection.
+        let footprint = row
+            .latest_context_footprint()
+            .or_else(|| chip.transcript.latest_footprint());
         let fallback = row
             .known_tokens()
+            .or_else(|| {
+                let tokens = chip.transcript.context_tokens();
+                (tokens > 0).then_some(tokens)
+            })
             .or_else(|| footprint.map(|item| item.used_tokens))?;
         let window = self.providers.declared_window(provider, model).unwrap_or(0);
         let output_limit = self.providers.declared_output_limit(provider, model);
@@ -21058,11 +21078,9 @@ impl AppModel {
     pub fn apply_model_selected(&mut self, provider: &str, model: &str) {
         self.identity.provider = provider.to_owned();
         self.identity.model_short = model.to_owned();
-        if self.active_session.is_none() {
-            self.launcher_identity_pinned = true;
-            self.launcher_identity = self.identity.clone();
-        }
         self.refresh_context_window();
+        self.launcher_identity_pinned = true;
+        self.launcher_identity = self.identity.clone();
         self.model_picker = None;
         self.pending_cache_change = None;
         // Count this committed pick for the current surface.
@@ -21131,6 +21149,12 @@ impl AppModel {
             return;
         }
         if viewed_child {
+            self.launcher_identity.provider = provider.to_owned();
+            self.launcher_identity.model_short = model.to_owned();
+            self.launcher_identity.context_window =
+                self.providers.declared_window(provider, model).unwrap_or(0);
+            self.launcher_identity_pinned = true;
+            self.model_commits += 1;
             self.model_picker = None;
             self.pending_cache_change = None;
             self.flash = Some(format!("· model → {model} · {provider}"));

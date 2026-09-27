@@ -7072,26 +7072,21 @@ impl LiveDriver {
                         }
                     }
                 }
-                vec![
-                    self.enqueue(LiveCommand::Create {
+                vec![self.enqueue(
+                    LiveCommand::Create {
                         command_id,
                         cwd: workspace_allocation.as_ref().map_or_else(
                             || model.cwd.clone(),
                             |allocation| allocation.leaf.clone(),
                         ),
                         workspace_allocation,
-                        account_alias: model
-                            .accounts
-                            .rows
-                            .iter()
-                            .find(|row| row.selected && row.provider == model.identity.provider)
-                            .map(|row| haider_protocol::ids::CredentialAlias::new(&row.alias)),
+                        account_alias: None,
                         provider: model.identity.provider.clone(),
                         model: model.identity.model_short.clone(),
                         max_tokens: 0,
                         first_text: text,
-                    }),
-                ]
+                    },
+                )]
             }
             AppRequest::SubmitText {
                 text,

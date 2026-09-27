@@ -292,3 +292,34 @@ fn meter_epoch_transitions() {
         SnapshotEpoch::CurrentReserveMismatch
     );
 }
+
+#[test]
+fn epochless_legacy_metadata_confirms_budget_without_claiming_snapshot_truth() {
+    let pair = ("local".to_owned(), "model".to_owned());
+    let mut epoch = MeterEpoch::default();
+    assert!(epoch.admit(pair.clone(), Some(2), Some(50_000), Some(true)));
+    assert!(epoch.admit(pair.clone(), Some(3), None, None));
+    assert!(epoch.reserve_assumed);
+    assert!(epoch.admit(pair.clone(), None, Some(30_000), Some(true)));
+    assert_eq!(epoch.selection_epoch, Some(3));
+    assert_eq!(epoch.output_budget, Some(30_000));
+    assert!(!epoch.reserve_assumed);
+    let mut old = footprint(10_000, 0, 0, Some(100_000), 30_000);
+    old.selection_epoch = None;
+    assert_eq!(epoch.snapshot_epoch(Some(&old)), SnapshotEpoch::Previous);
+    let mut meter = ContextMeter::resolve(
+        Some(&old),
+        0,
+        100_000,
+        epoch.snapshot_epoch(Some(&old)),
+        |window| epoch_reserved_output(epoch.output_budget, None, window),
+    );
+    meter.reserve_assumed = epoch.reserve_assumed;
+    assert!(
+        meter
+            .detail_lines()
+            .iter()
+            .all(|line| !line.contains("pending confirmation"))
+    );
+    assert!(!epoch.admit(("other".into(), "model".into()), None, None, None));
+}

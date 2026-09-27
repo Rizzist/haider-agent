@@ -401,6 +401,8 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert_eq!(encoded["fast"], true);
     let versioned = SessionMetadataV1 {
         selection_epoch: Some(42),
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         ..tuned.clone()
     };
     let versioned_json = serde_json::to_value(&versioned).expect("versioned metadata encode");

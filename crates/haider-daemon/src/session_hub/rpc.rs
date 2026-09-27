@@ -9887,16 +9887,6 @@ impl HubConnection {
                     .find(|descriptor| descriptor.alias.as_str() == alias)
             });
         if let Some(descriptor) = descriptor {
-            let old_active_alias = self
-                .hub
-                .accounts()?
-                .and_then(|facade| facade.management.read())
-                .and_then(|view| {
-                    view.descriptors
-                        .into_iter()
-                        .find(|account| account.provider == descriptor.provider && account.active)
-                        .map(|account| account.alias.as_str().to_owned())
-                });
             let target_auth_scope = match descriptor.auth_method {
                 haider_protocol::credential::AuthMethod::ApiKey => "api_key",
                 haider_protocol::credential::AuthMethod::OAuth => "oauth_subscription",
@@ -9943,47 +9933,6 @@ impl HubConnection {
                 && crate::cache_policy::blocks_change(&warning, confirm_new_epoch)
             {
                 return self.respond_cache_confirmation_required(request_id, &warning);
-            }
-            // Older sessions predate account pinning and still have no alias
-            // in their durable metadata. Pin the account they currently use
-            // before changing the global default. Each pin is a committed
-            // per-session selection, so an in-flight old-route footprint
-            // cannot masquerade as truth after this boundary.
-            if let Some(old_alias) = old_active_alias {
-                for session_id in self.hub.inner.store.session_ids().await? {
-                    let Some(metadata) = self.hub.inner.store.session_metadata(&session_id).await?
-                    else {
-                        continue;
-                    };
-                    if metadata.provider != descriptor.provider || metadata.account_alias.is_some()
-                    {
-                        continue;
-                    }
-                    let request_json = serde_json::json!({
-                        "legacy_account_pin": true,
-                        "session_id": &session_id,
-                        "account_alias": &old_alias,
-                    })
-                    .to_string();
-                    self.hub
-                        .select_session_model(SessionSelectModelCommand {
-                            command_id: random_id("legacy-account-pin")?,
-                            request_digest: blake3::hash(request_json.as_bytes())
-                                .to_hex()
-                                .to_string(),
-                            request_json,
-                            session_id,
-                            worker_generation: self.hub.inner.store.worker_generation(),
-                            provider: metadata.provider.clone(),
-                            model: metadata.model.clone(),
-                            expected_pair: Some((metadata.provider, metadata.model)),
-                            account_alias: Some(old_alias.clone()),
-                            output_budget: None,
-                            event_id: EventId::new(random_id("legacy-account-pinned")?),
-                            device_id: self.hub.inner.device_id.clone(),
-                        })
-                        .await?;
-                }
             }
         }
         self.send_management_command(
@@ -16558,7 +16507,7 @@ impl HubConnection {
         cache_policy: haider_protocol::cache::CachePolicySettingsV1,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         ssh_scope: Option<haider_rpc::SshScopeWire>,
-        mut account_alias: Option<CredentialAlias>,
+        account_alias: Option<CredentialAlias>,
         resolve_provider: bool,
         resolve_model: bool,
         effort: Option<String>,
@@ -16808,30 +16757,6 @@ impl HubConnection {
                 let message = format!("provider `{provider}` publishes no default model");
                 return self.respond_error(request_id, "no_default_model", &message, false, None);
             }
-        }
-
-        // Freeze the current provider account into the new session. Global
-        // account selection then affects future sessions without changing
-        // the route of a session that is already attached. Explicit aliases
-        // stay explicit; keyless/injected providers legitimately stay None.
-        if account_alias.is_none()
-            && let Some(facade) = self.hub.accounts()?
-        {
-            let Some(active_alias) = facade.management.inspect(|view| {
-                view.descriptors
-                    .iter()
-                    .find(|descriptor| descriptor.provider == provider && descriptor.active)
-                    .map(|descriptor| descriptor.alias.clone())
-            }) else {
-                return self.respond_error(
-                    request_id,
-                    ERROR_CODE_DRAINING,
-                    "management snapshot is unavailable",
-                    true,
-                    None,
-                );
-            };
-            account_alias = active_alias;
         }
 
         // D3-5: the dependency configuration is the ONE authority on

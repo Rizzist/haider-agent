@@ -1349,6 +1349,8 @@ fn listed_summary(
 ) -> haider_rpc::SessionSummary {
     let metadata = haider_protocol::session::SessionMetadataV1 {
         selection_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,

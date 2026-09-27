@@ -54,6 +54,8 @@ fn overrides() -> Option<SessionPermissionOverridesV1> {
 fn task_metadata(cwd: &str) -> SessionMetadataV1 {
     SessionMetadataV1 {
         selection_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,

@@ -109,6 +109,14 @@ impl MeterEpoch {
         output_budget: Option<u64>,
         user_budget: Option<bool>,
     ) -> bool {
+        // Older daemons omit the epoch from metadata. It can confirm the
+        // budget for an already known pair, but cannot claim a new selection
+        // or make an epochless footprint current.
+        let selection_epoch = selection_epoch.or_else(|| {
+            (self.pair.as_ref() == Some(&pair))
+                .then_some(self.selection_epoch)
+                .flatten()
+        });
         match (self.selection_epoch, selection_epoch) {
             (Some(current), Some(incoming)) if incoming < current => return false,
             (Some(current), Some(incoming)) if incoming == current => {

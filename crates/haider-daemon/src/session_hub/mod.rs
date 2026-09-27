@@ -8433,6 +8433,25 @@ impl HubStoreHandle {
             .await
     }
 
+    pub(crate) async fn commit_resolved_route(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        alias: Option<&str>,
+    ) -> Result<u64, HaiderError> {
+        self.hub
+            .inner
+            .store
+            .commit_resolved_route(
+                &self.session_id,
+                &metadata.provider,
+                &metadata.model,
+                metadata.selection_epoch.unwrap_or(0),
+                alias,
+                &self.hub.inner.device_id,
+            )
+            .await
+    }
+
     /// Installs this lease's harness. The receiver cannot name another
     /// session or lease, so registration carries the same structural R1 seal
     /// as reads and appends.

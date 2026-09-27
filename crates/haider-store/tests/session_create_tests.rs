@@ -5,7 +5,10 @@ use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHE
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_protocol::state::SessionState;
-use haider_store::{EventStore, SessionCreateCommand, SessionCreateOutcome, Store};
+use haider_store::{
+    EventStore, SessionCreateCommand, SessionCreateOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, Store,
+};
 use serde_json::json;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -254,6 +257,150 @@ fn session_create_commits_metadata_created_and_receipt_atomically_and_replays_af
     assert_eq!(
         reopened.session_ids().expect("session ids"),
         [first.session_id]
+    );
+}
+
+#[test]
+fn resolved_account_route_advances_only_the_served_sessions_epoch() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open");
+    let served = SessionId::new("served");
+    let parked = SessionId::new("parked");
+    let device = DeviceId::new("daemon-test");
+    store
+        .create_session(&command("create-served", "served", "created-served"))
+        .expect("served");
+    store
+        .create_session(&command("create-parked", "parked", "created-parked"))
+        .expect("parked");
+    assert_eq!(
+        store
+            .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-a"), &device)
+            .expect("first route"),
+        0
+    );
+    assert_eq!(
+        store
+            .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-a"), &device)
+            .expect("same route"),
+        0
+    );
+    let changed = store
+        .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-b"), &device)
+        .expect("switched route");
+    assert!(changed > 0);
+    assert_eq!(
+        store
+            .commit_resolved_route(
+                &served,
+                "fake",
+                "fake-v1",
+                changed,
+                Some("account-b"),
+                &device
+            )
+            .expect("same switched route"),
+        changed
+    );
+    assert_eq!(
+        store
+            .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-a"), &device)
+            .expect("stale request"),
+        0
+    );
+    let served_metadata = store
+        .session_metadata(&served)
+        .expect("served metadata")
+        .expect("served row");
+    assert_eq!(served_metadata.selection_epoch, Some(changed));
+    assert_eq!(
+        served_metadata.resolved_route_alias.as_deref(),
+        Some("account-b")
+    );
+    assert_eq!(
+        served_metadata.account_alias, None,
+        "route tracking must not pin rotation"
+    );
+    let selection = SessionSelectModelCommand {
+        command_id: "select-after-route".into(),
+        request_digest: "select-after-route-digest".into(),
+        request_json: "{}".into(),
+        session_id: served.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "fake".into(),
+        model: "fake-v2".into(),
+        expected_pair: None,
+        account_alias: None,
+        output_budget: None,
+        event_id: EventId::new("selected-after-route"),
+        device_id: DeviceId::new("daemon-test"),
+    };
+    let SessionSelectModelOutcome::Committed { selected, .. } = store
+        .select_session_model(&selection)
+        .expect("model after route")
+    else {
+        panic!("selection was not committed")
+    };
+    assert!(selected.selected_seq > changed);
+    let parked_metadata = store
+        .session_metadata(&parked)
+        .expect("parked metadata")
+        .expect("parked row");
+    assert_eq!(parked_metadata.selection_epoch, Some(0));
+    assert_eq!(parked_metadata.resolved_route_alias, None);
+
+    let keyless = SessionId::new("keyless");
+    store
+        .create_session(&command("create-keyless", "keyless", "created-keyless"))
+        .expect("keyless");
+    assert_eq!(
+        store
+            .commit_resolved_route(&keyless, "fake", "fake-v1", 0, None, &device)
+            .expect("observe keyless route"),
+        0
+    );
+    assert!(
+        store
+            .session_metadata(&keyless)
+            .expect("keyless metadata")
+            .expect("keyless row")
+            .resolved_route_seen
+    );
+    let keyed = store
+        .commit_resolved_route(&keyless, "fake", "fake-v1", 0, Some("account-a"), &device)
+        .expect("keyed route after keyless");
+    assert!(keyed > 0);
+    let keyless_again = store
+        .commit_resolved_route(&keyless, "fake", "fake-v1", keyed, None, &device)
+        .expect("keyless route after keyed");
+    assert!(keyless_again > keyed);
+}
+
+#[test]
+fn legacy_session_mints_an_epoch_on_first_metadata_load() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open");
+    let session = SessionId::new("legacy-epoch");
+    store
+        .create_session(&command("create-legacy", "legacy-epoch", "created-legacy"))
+        .expect("create");
+    let connection = rusqlite::Connection::open(store.database_path()).expect("sqlite");
+    connection.execute(
+        "UPDATE sessions SET meta_json = json_remove(meta_json, '$.selection_epoch') WHERE id = ?1",
+        [session.as_str()],
+    ).expect("simulate pre-epoch metadata");
+    let metadata = store
+        .session_metadata(&session)
+        .expect("load")
+        .expect("metadata");
+    assert_eq!(metadata.selection_epoch, Some(1));
+    assert_eq!(
+        store
+            .session_metadata(&session)
+            .expect("reload")
+            .expect("metadata")
+            .selection_epoch,
+        Some(1)
     );
 }
 

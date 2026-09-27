@@ -85,12 +85,13 @@ use haider_core::{
     ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
     ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit, ProviderDeadlineGuard,
     ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
-    ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint, RouteWaitCheckpoint,
-    SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    TurnTraceContext, UserCommandOutput, build_cache_request_diagnostic, build_context_accounting,
-    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
+    ProviderRouteCommitter, ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint,
+    RouteWaitCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult,
+    ToolDispatcher, TurnHandle, TurnTraceContext, UserCommandOutput,
+    build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
+    context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
     presentation_for_haider_error, register_turn_trace, registered_turn_trace,
     sanitized_failure_message,
@@ -373,6 +374,47 @@ struct DaemonProviderPairSwitchCommitter {
     event_ids: Arc<EventIdGenerator>,
 }
 
+struct DaemonProviderRouteCommitter {
+    store: HubStoreHandle,
+}
+
+impl std::fmt::Debug for DaemonProviderRouteCommitter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonProviderRouteCommitter")
+            .field("session_id", self.store.session_id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
+    async fn commit(
+        &self,
+        provider: &str,
+        model: &str,
+        to: &haider_protocol::ids::CredentialAlias,
+    ) -> Result<u64, HaiderError> {
+        let metadata = self.store.session_metadata().await?.ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::SessionNotFound,
+                "session disappeared during account rotation",
+                false,
+            )
+        })?;
+        if metadata.provider != provider || metadata.model != model {
+            return Err(HaiderError::new(
+                ErrorCode::RevisionConflict,
+                "session selection changed during account rotation",
+                true,
+            ));
+        }
+        self.store
+            .commit_resolved_route(&metadata, Some(to.as_str()))
+            .await
+    }
+}
+
 impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -501,19 +543,6 @@ fn lockdown_pair_switch_allowed(
     target_lockdown: bool,
 ) -> bool {
     switch.from_provider == switch.to_provider || (!source_lockdown && !target_lockdown)
-}
-
-/// A request can claim the committed selection only when its resolved
-/// account is the account durably bound to the session. Legacy unpinned
-/// sessions and health-driven account rotation have no per-session route
-/// commit yet, so their snapshots remain projected. Keyless routes match
-/// `None == None` and keep normal current truth.
-fn frozen_selection_epoch(
-    metadata: &SessionMetadataV1,
-    resolved_account_alias: Option<&str>,
-) -> Option<u64> {
-    (metadata.account_alias.as_deref() == resolved_account_alias)
-        .then_some(metadata.selection_epoch.unwrap_or(0))
 }
 
 #[derive(Clone)]
@@ -7690,7 +7719,11 @@ async fn perform_manual_compaction(
     .await?
     .cache_cohort();
     let compactor = DaemonContextCompactor {
-        selection_epoch: frozen_selection_epoch(metadata, resolved.account_alias.as_deref()),
+        selection_epoch: Some(
+            lease
+                .commit_resolved_route(metadata, resolved.account_alias.as_deref())
+                .await?,
+        ),
         store: lease.clone(),
         provider: resolved.provider,
         model: resolved.model,
@@ -9473,7 +9506,13 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
-    config.selection_epoch = frozen_selection_epoch(metadata, resolved.account_alias.as_deref());
+    let route_epoch = lease
+        .commit_resolved_route(metadata, resolved.account_alias.as_deref())
+        .await?;
+    config.selection_epoch = Some(route_epoch);
+    config.provider_route_committer = Some(Arc::new(DaemonProviderRouteCommitter {
+        store: lease.clone(),
+    }));
     config.turn_trace = turn_trace.clone();
     config.agent_spawn = headless
         .as_ref()

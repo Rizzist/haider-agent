@@ -99,6 +99,8 @@ pub fn transcript() -> Vec<WireFrame> {
     };
     let fork_metadata = SessionMetadataV1 {
         selection_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -425,6 +427,8 @@ pub fn transcript() -> Vec<WireFrame> {
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
                     selection_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,

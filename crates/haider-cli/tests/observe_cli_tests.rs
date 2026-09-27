@@ -89,6 +89,8 @@ fn digest(
         worker_generation: 7,
         metadata: Some(SessionMetadataV1 {
             selection_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,

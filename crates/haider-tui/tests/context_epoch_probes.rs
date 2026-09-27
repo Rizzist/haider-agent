@@ -862,6 +862,29 @@ fn a_reopened_session_meters_against_its_own_model_a_b_a() {
     assert!(status_left_string(&model, 118).contains("of 200k"));
 }
 
+#[test]
+fn committed_session_model_becomes_the_next_launcher_default() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let session = session_id("s-meter-a");
+    let before = model.model_commits;
+    driver.apply(
+        &mut model,
+        model_selected_reply(
+            &session,
+            "anthropic-oauth",
+            "claude-sonnet-4-6",
+            Some(budget(16_384, 16_384, false)),
+        ),
+    );
+    assert!(
+        model.model_commits > before,
+        "the persistence sync must see the commit"
+    );
+    assert_eq!(model.launcher_identity.model_short, "claude-sonnet-4-6");
+    model.checkin();
+    assert_eq!(model.identity.model_short, "claude-sonnet-4-6");
+}
+
 /// B1: a BACKGROUND model change (another client switches parked session B)
 /// binds B's own epoch: the viewed A is untouched, and reopening B (which
 /// replays nothing — it stays attached) meters B's pre-switch snapshot
@@ -1333,6 +1356,8 @@ fn listed_summary(
 ) -> haider_rpc::SessionSummary {
     let metadata = haider_protocol::session::SessionMetadataV1 {
         selection_epoch: Some(3),
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -1795,16 +1820,9 @@ fn astra_live_child_meter_reads_its_own_durable_summary_footprint() {
     row.head_seq = 10;
     row.footprint_tokens = Some(64_000);
     row.footprint_truth = Some(ContextFootprintTruth::Exact);
-    let mut child_fp = snapshot(
-        63_000,
-        0,
-        1_000,
-        Some(128_000),
-        ContextFootprintTruth::Exact,
-    );
-    child_fp.selection_epoch = Some(3);
-    child_fp.reserved_output_tokens = 16_384;
-    row.latest_context_footprint = Some(child_fp);
+    // Legacy summaries have only the exact aggregate; no rich footprint may
+    // supply the expected value in this probe.
+    assert!(row.latest_context_footprint.is_none());
     driver.apply(
         &mut model,
         LiveReply::Listed {
@@ -1918,6 +1936,7 @@ fn astra_a_fact_during_an_inflight_list_gets_a_fresh_budget_read() {
             sessions: vec![{
                 let mut row = listed_summary(&s, "eq-oauth", "eq-small", 8192);
                 row.head_seq = next;
+                row.metadata.as_mut().expect("metadata").selection_epoch = Some(next);
                 row
             }],
             next_cursor: None,
@@ -2293,6 +2312,7 @@ fn selection_slash(model: &mut AppModel, line: &str) {
 #[test]
 fn astra_model_pick_from_subagent_surface_cannot_locally_rebind_parent_meter() {
     let (mut model, _driver) = astra_child_setup();
+    let parent_meter = model.context_meter();
     model
         .daemon_features
         .insert(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned());
@@ -2314,6 +2334,7 @@ fn astra_model_pick_from_subagent_surface_cannot_locally_rebind_parent_meter() {
         haider_tui::app::AppRequest::SelectModel { session, provider, model, .. }
         if session.as_str()=="astra-child-session" && provider=="q-oauth" && model=="big-model")));
     assert_eq!(model.identity.model_short, "claude-opus-5-5");
+    assert_eq!(model.context_meter(), parent_meter);
 }
 
 #[test]
@@ -2402,6 +2423,7 @@ fn child_selection_reattaches_before_replay_after_disconnect() {
 #[test]
 fn astra_provider_pick_from_aura_cannot_locally_rebind_parent_meter() {
     let (mut model, _driver) = two_attached_sessions();
+    let parent_meter = model.context_meter();
     model
         .daemon_features
         .insert(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned());
@@ -2416,6 +2438,7 @@ fn astra_provider_pick_from_aura_cannot_locally_rebind_parent_meter() {
         haider_tui::app::AppRequest::SelectModel { session, provider, .. }
         if session.as_str()=="s-meter-a" && provider=="openai-oauth")));
     assert_eq!(model.identity.provider, "anthropic-oauth");
+    assert_eq!(model.context_meter(), parent_meter);
 }
 
 #[test]
@@ -2632,12 +2655,8 @@ fn astra_child_view_status_and_mirror_use_the_viewed_childs_meter() {
         16_384,
     );
     row.head_seq = 10;
-    row.footprint_tokens = Some(64_000);
-    row.footprint_truth = Some(ContextFootprintTruth::Exact);
-    let mut own = child.clone();
-    own.selection_epoch = Some(3);
-    own.reserved_output_tokens = 16_384;
-    row.latest_context_footprint = Some(own);
+    // The child view must read its transcript when no summary usage exists.
+    assert!(row.latest_context_footprint.is_none());
     driver.apply(
         &mut model,
         LiveReply::Listed {
@@ -3472,7 +3491,7 @@ fn account_refresh_while_attached_updates_only_future_launcher_default() {
 }
 
 #[test]
-fn launcher_create_freezes_its_selected_account_alias_on_the_wire() {
+fn launcher_create_keeps_the_account_route_unpinned_on_the_wire() {
     let (mut model, mut driver) = live_session(true);
     model.active_session = None;
     let commands = driver.handle_request(
@@ -3488,19 +3507,13 @@ fn launcher_create_freezes_its_selected_account_alias_on_the_wire() {
     let LiveCommand::Create { account_alias, .. } = &create else {
         unreachable!()
     };
-    assert_eq!(
-        account_alias.as_ref().map(|alias| alias.as_str()),
-        Some("anthropic-oauth")
-    );
+    assert_eq!(account_alias, &None);
     let body = haider_tui::link::request_body_for_features(create, &Default::default());
     let haider_rpc::RequestBody::SessionCreateWithPermissionOverrides { account_alias, .. } = body
     else {
         panic!("create body")
     };
-    assert_eq!(
-        account_alias.as_ref().map(|alias| alias.as_str()),
-        Some("anthropic-oauth")
-    );
+    assert_eq!(account_alias, None);
 }
 
 #[test]

@@ -228,6 +228,13 @@ pub struct SessionMetadataV1 {
     /// Zero is the initial binding before a selection fact is committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_epoch: Option<u64>,
+    /// Last account route actually resolved for a turn. This is not an
+    /// account pin: unpinned sessions continue to follow the active account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_route_alias: Option<String>,
+    /// Distinguishes an observed keyless route from a route not yet resolved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resolved_route_seen: bool,
     /// Canonical absolute UTF-8 workspace path.
     pub cwd: String,
     /// Provider adapter name (`anthropic`, `openai`, `openai-compatible`, or
