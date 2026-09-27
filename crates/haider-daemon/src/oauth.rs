@@ -7529,4 +7529,4 @@ mod openai_tests;
 mod tests;
 
 #[cfg(test)]
-pub(crate) use tests::non_live_issued_broker_for_sendpoint;
+pub(crate) use tests::{live_issued_broker_for_sendpoint, non_live_issued_broker_for_sendpoint};

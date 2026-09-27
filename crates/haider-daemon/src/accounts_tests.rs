@@ -22,6 +22,59 @@ use crate::oauth::{
 
 struct RefuseRemoteDiscovery(std::sync::atomic::AtomicUsize);
 
+struct RecordRemoteDiscovery(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl ProviderModelDiscoverer for RecordRemoteDiscovery {
+    fn destination(&self, _: &CatalogSource) -> CatalogDestination {
+        CatalogDestination::Remote
+    }
+
+    async fn discover(
+        &self,
+        _: CatalogSource,
+        _: CatalogDestination,
+        token: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<DiscoveredCatalog, CatalogError> {
+        self.0
+            .lock()
+            .expect("recorded tokens")
+            .push(token.expect("credential passed").to_owned());
+        Ok(DiscoveredCatalog {
+            models: Vec::new(),
+            etag: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn all_live_oauth_catalog_sendpoints_reach_mock_remote_endpoint() {
+    for (provider, source) in [
+        (
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            CatalogSource::AnthropicSubscription,
+        ),
+        (
+            OPENAI_OAUTH_PROVIDER_NAME,
+            CatalogSource::OpenAiSubscription,
+        ),
+        (KIMI_OAUTH_PROVIDER_NAME, CatalogSource::KimiOAuth),
+        (GROK_OAUTH_PROVIDER_NAME, CatalogSource::GrokOAuth),
+    ] {
+        let (broker, descriptor, token) = crate::oauth::live_issued_broker_for_sendpoint(provider);
+        let discoverer = RecordRemoteDiscovery(std::sync::Mutex::new(Vec::new()));
+        let result =
+            discover_models_with_account(&broker, &descriptor, &discoverer, source, None).await;
+        assert!(matches!(
+            result,
+            ProviderModelsRefreshResult::Discovery(Ok(_))
+        ));
+        assert_eq!(*discoverer.0.lock().expect("recorded tokens"), vec![token]);
+        assert!(broker.shutdown().await);
+    }
+}
+
 #[async_trait::async_trait]
 impl ProviderModelDiscoverer for RefuseRemoteDiscovery {
     fn destination(&self, _: &CatalogSource) -> CatalogDestination {
@@ -146,6 +199,60 @@ async fn turn_factory_refuses_non_live_issued_bundle() {
         .await
         .expect_err("turn credential refused");
     assert_eq!(error.code, ErrorCode::Unauthorized);
+}
+
+#[test]
+fn custom_catalog_refuses_an_oauth_bundle_before_vault_or_discovery() {
+    let vault = VaultTouchCounter::new();
+    let alias = CredentialAlias::new("custom-catalog-crosswire");
+    let bundle = haider_accounts::OAuthTokenBundleV1::new(
+        "customprov".into(),
+        "http://127.0.0.1:45678".into(),
+        "synthetic-audience".into(),
+        None,
+        "Bearer".into(),
+        Zeroizing::new(b"fake-custom-catalog-access".to_vec()),
+        None,
+        u64::MAX - 1,
+        None,
+        Vec::new(),
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "synthetic-subject".into(),
+            display_identity: "Synthetic".into(),
+        },
+        1,
+    )
+    .expect("synthetic bundle");
+    vault
+        .put(&alias, &bundle.encode().expect("encode"))
+        .expect("seed bundle");
+    let mut descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: "customprov".into(),
+        base_url: Some("http://127.0.0.1:9".into()),
+        auth_method: AuthMethod::OAuth,
+        identity: "Synthetic".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    assert!(matches!(
+        custom_catalog_api_key(&vault, &descriptor)
+            .expect_err("OAuth bundle cannot supply a custom catalog API key"),
+        CustomCatalogKeyError::WrongAuthMethod
+    ));
+    assert_eq!(vault.resolves(), 0, "no secret reached the discoverer");
+
+    descriptor.auth_method = AuthMethod::ApiKey;
+    vault.put(&alias, b"synthetic-api-key").expect("seed key");
+    assert_eq!(
+        custom_catalog_api_key(&vault, &descriptor)
+            .expect("API key still resolves")
+            .expose_secret(),
+        b"synthetic-api-key"
+    );
 }
 
 #[tokio::test]

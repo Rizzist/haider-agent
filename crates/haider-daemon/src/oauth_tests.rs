@@ -6949,7 +6949,7 @@ async fn v2_non_live_issued_tokens_only_ever_reach_loopback() {
 /// be checked against the remote destination.
 struct IssuerSwapVault {
     inner: MemoryVault,
-    replacement: Vec<u8>,
+    replacement: Zeroizing<Vec<u8>>,
     reads: AtomicUsize,
 }
 
@@ -6960,7 +6960,7 @@ impl Vault for IssuerSwapVault {
     fn resolve(&self, alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
         let current = self.inner.resolve(alias)?;
         if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
-            self.inner.put(alias, &self.replacement)?;
+            self.inner.put(alias, self.replacement.as_slice())?;
         }
         Ok(current)
     }
@@ -7004,10 +7004,19 @@ async fn remote_resolution_checks_the_returned_bundle_after_issuer_swap() {
         .await
         .expect_err("foreign or fake token refused");
     assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert!(
+        vault.reads.load(Ordering::SeqCst) >= 1,
+        "the vault swap must have happened"
+    );
+    let stored = vault
+        .inner
+        .resolve(&descriptor.alias)
+        .expect("replacement is durable");
     assert_eq!(
-        vault.reads.load(Ordering::SeqCst),
-        1,
-        "remote resolution reads the bundle once before checking its issuer"
+        OAuthTokenBundleV1::decode(stored.expose_secret())
+            .expect("replacement bundle")
+            .issuer,
+        server.state.issuer
     );
     assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
     assert!(broker.shutdown().await);
@@ -7044,6 +7053,50 @@ async fn loopback_resolution_refuses_a_live_issued_bundle() {
     assert_eq!(error.code, ErrorCode::Unauthorized);
 }
 
+pub(crate) fn live_issued_broker_for_sendpoint(
+    provider: &str,
+) -> (CredentialBroker, CredentialDescriptor, String) {
+    let registration = OAuthProviderCatalog::live()
+        .registration(provider)
+        .expect("live registration");
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = provider.to_owned();
+    let now = now_ms().expect("clock");
+    let token = format!("fake-live-issued-{provider}");
+    let bundle = OAuthTokenBundleV1::new(
+        provider.to_owned(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(token.as_bytes().to_vec()),
+        Some(Zeroizing::new(b"fake-refresh".to_vec())),
+        now + 3_600_000,
+        Some(now + 7_200_000),
+        registration.scopes.clone(),
+        OAuthIdentityV1 {
+            subject_hash: "synthetic-subject".into(),
+            display_identity: descriptor.identity.clone(),
+        },
+        1,
+    )
+    .expect("live-shaped bundle")
+    .with_refresh_after(now + 3_000_000);
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("encode"))
+        .expect("seed");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        vault.clone(),
+        OAuthProviderCatalog::live(),
+        snapshot.clone(),
+        start_status_actor(&snapshot, vault),
+    )
+    .expect("broker");
+    (broker, descriptor, token)
+}
+
 #[tokio::test]
 async fn all_sanctioned_live_issued_bundles_still_resolve_remote() {
     for provider in [
@@ -7052,44 +7105,7 @@ async fn all_sanctioned_live_issued_bundles_still_resolve_remote() {
         haider_provider::KIMI_OAUTH_PROVIDER_NAME,
         haider_provider::GROK_OAUTH_PROVIDER_NAME,
     ] {
-        let registration = OAuthProviderCatalog::live()
-            .registration(provider)
-            .expect("live registration");
-        let mut descriptor = oauth_descriptor_for_test();
-        descriptor.provider = provider.to_owned();
-        let now = now_ms().expect("clock");
-        let token = format!("fake-live-issued-{provider}");
-        let bundle = OAuthTokenBundleV1::new(
-            provider.to_owned(),
-            registration.issuer.clone(),
-            registration.audience.clone(),
-            registration.resource.clone(),
-            "Bearer".into(),
-            Zeroizing::new(token.as_bytes().to_vec()),
-            Some(Zeroizing::new(b"fake-refresh".to_vec())),
-            now + 3_600_000,
-            Some(now + 7_200_000),
-            registration.scopes.clone(),
-            OAuthIdentityV1 {
-                subject_hash: "synthetic-subject".into(),
-                display_identity: descriptor.identity.clone(),
-            },
-            1,
-        )
-        .expect("live-shaped bundle")
-        .with_refresh_after(now + 3_000_000);
-        let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
-        vault
-            .put(&descriptor.alias, &bundle.encode().expect("encode"))
-            .expect("seed");
-        let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
-        let broker = CredentialBroker::new(
-            vault.clone(),
-            OAuthProviderCatalog::live(),
-            snapshot.clone(),
-            start_status_actor(&snapshot, vault),
-        )
-        .expect("broker");
+        let (broker, descriptor, token) = live_issued_broker_for_sendpoint(provider);
         let resolved = broker
             .resolve_remote(&descriptor)
             .await

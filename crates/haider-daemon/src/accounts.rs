@@ -5477,6 +5477,26 @@ fn respond_provider_probe_error(route: &LoginRoute, provider: &str, error: Catal
     );
 }
 
+/// A custom catalog may receive a user-configured API key, never an OAuth
+/// bundle from a mismatched account row. Check the row before touching vault.
+#[derive(Debug)]
+enum CustomCatalogKeyError {
+    WrongAuthMethod,
+    Vault(HaiderError),
+}
+
+fn custom_catalog_api_key(
+    vault: &dyn Vault,
+    descriptor: &CredentialDescriptor,
+) -> Result<SecretHandle, CustomCatalogKeyError> {
+    if descriptor.auth_method != AuthMethod::ApiKey {
+        return Err(CustomCatalogKeyError::WrongAuthMethod);
+    }
+    vault
+        .resolve(&descriptor.alias)
+        .map_err(CustomCatalogKeyError::Vault)
+}
+
 async fn handle_provider_configure(
     context: ProviderConfigureContext<'_>,
     mut job: ProviderConfigureJob,
@@ -5747,9 +5767,18 @@ async fn handle_provider_configure(
                             );
                             return;
                         };
-                        let credential = match vault.resolve(&descriptor.alias) {
+                        let credential = match custom_catalog_api_key(vault, descriptor) {
                             Ok(credential) => credential,
-                            Err(error) => {
+                            Err(CustomCatalogKeyError::WrongAuthMethod) => {
+                                respond_error(
+                                    &job.route,
+                                    ERROR_CODE_UNAUTHORIZED,
+                                    "provider model discovery requires an API key",
+                                    false,
+                                );
+                                return;
+                            }
+                            Err(CustomCatalogKeyError::Vault(error)) => {
                                 respond_error(
                                     &job.route,
                                     ERROR_CODE_CREDENTIAL_MISSING,
