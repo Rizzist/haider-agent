@@ -144,6 +144,23 @@ def _pe(imports=(), delay_imports=(), *, pe32=False, legacy_delay=False, zero_si
 SYSTEM_IMPORTS = ("KERNEL32.dll", "ntdll.dll", "bcryptprimitives.dll", "ws2_32.dll")
 
 
+def _with_directory_count(data: bytes, count: int, *, shorten: bool) -> bytes:
+    """Declare count directories, optionally moving the section table left."""
+    image = bytearray(data)
+    pe = struct.unpack_from("<I", image, 0x3C)[0]
+    optional = pe + 24
+    fixed_size = 96 if struct.unpack_from("<H", image, optional)[0] == 0x10B else 112
+    struct.pack_into("<I", image, optional + fixed_size - 4, count)
+    if shorten:
+        old_size = struct.unpack_from("<H", image, pe + 20)[0]
+        new_size = fixed_size + 8 * count
+        section_table = bytes(image[optional + old_size:optional + old_size + 40])
+        image[optional + new_size:0x200] = bytes(0x200 - optional - new_size)
+        image[optional + new_size:optional + new_size + 40] = section_table
+        struct.pack_into("<H", image, pe + 20, new_size)
+    return bytes(image)
+
+
 class ChocolateyReleaseTests(unittest.TestCase):
     def test_repository_template_has_every_required_placeholder_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -405,17 +422,65 @@ class WindowsCrtImportTests(unittest.TestCase):
                     ):
                         release_packaging.windows_pe_imports(image, "malformed-fixture")
 
-    def test_missing_import_directory_slots_fail_closed(self):
-        for count in (0, 8, 13):
-            with self.subTest(count=count):
-                image = bytearray(_pe(SYSTEM_IMPORTS, ("VCRUNTIME140.dll",)))
+    def test_short_directory_tables_and_header_bounds_through_cli(self):
+        for pe32 in (False, True):
+            for count in (0, 1, 2, 8, 13):
+                for shorten in (False, True):
+                    with self.subTest(pe32=pe32, count=count, shorten=shorten), tempfile.TemporaryDirectory() as temporary:
+                        # Counts 0 and 1 leave the OS import bytes undeclared;
+                        # the loader and verifier must both ignore that slot.
+                        image = _with_directory_count(_pe(SYSTEM_IMPORTS, pe32=pe32), count, shorten=shorten)
+                        path = self.write(Path(temporary), "os.exe", image)
+                        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            self.assertEqual(release_packaging.main(["verify-windows-imports", str(path)]), 0)
+            for count, delay in ((2, False), (13, False), (14, True)):
+                for shorten in (False, True):
+                    with self.subTest(pe32=pe32, count=count, delay=delay, shorten=shorten), tempfile.TemporaryDirectory() as temporary:
+                        image = _pe(SYSTEM_IMPORTS if delay else ("VCRUNTIME140.dll",),
+                                    ("VCRUNTIME140.dll",) if delay else (), pe32=pe32)
+                        path = self.write(Path(temporary), "crt.exe", _with_directory_count(image, count, shorten=shorten))
+                        output, errors = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                            self.assertEqual(release_packaging.main(["verify-windows-imports", str(path)]), 1)
+                        self.assertIn("VCRUNTIME140.dll", errors.getvalue())
+            for count, allocated in ((16, 2), (17, 16)):
+                with self.subTest(pe32=pe32, count=count, allocated=allocated), tempfile.TemporaryDirectory() as temporary:
+                    image = bytearray(_with_directory_count(_pe(SYSTEM_IMPORTS, pe32=pe32), allocated, shorten=allocated == 2))
+                    pe = struct.unpack_from("<I", image, 0x3C)[0]
+                    fixed_size = 96 if pe32 else 112
+                    struct.pack_into("<I", image, pe + 24 + fixed_size - 4, count)
+                    path = self.write(Path(temporary), "invalid.exe", bytes(image))
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(release_packaging.main(["verify-windows-imports", str(path)]), 1)
+                    with self.assertRaisesRegex(release_packaging.PackagingError, "cannot hold"):
+                        release_packaging.windows_pe_imports(bytes(image), "invalid")
+            with self.subTest(pe32=pe32, truncated_optional=True):
+                image = bytearray(_pe(SYSTEM_IMPORTS, pe32=pe32))
                 pe = struct.unpack_from("<I", image, 0x3C)[0]
-                struct.pack_into("<I", image, pe + 24 + 108, count)
-                with self.assertRaisesRegex(
-                    release_packaging.PackagingError,
-                    f"directory-count: PE optional header has only {count} data directories",
-                ):
-                    release_packaging.windows_pe_imports(bytes(image), "directory-count")
+                struct.pack_into("<H", image, pe + 20, 0xFFFF)
+                with self.assertRaisesRegex(release_packaging.PackagingError, "truncated PE optional header"):
+                    release_packaging.windows_pe_imports(bytes(image), "invalid")
+
+    def test_crt_aliases_and_os_names_in_each_import_mode(self):
+        modes = ((False, False, False), (True, False, False),
+                 (False, True, False), (True, True, False), (True, True, True))
+        forbidden = ("VCRUNTIME140", "VCRUNTIME140.", "VCRUNTIME140.dll.",
+                     "VCRUNTIME140..", r"C:\runtime\VCRUNTIME140")
+        allowed = ("KERNEL32", "KERNEL32.dll", "kernel32.DLL",
+                   "api-ms-win-core-synch-l1-2-0", "api-ms-win-core-synch-l1-2-0.dll",
+                   r"C:\Windows\System32\KERNEL32")
+        for pe32, delayed, legacy in modes:
+            for name in (*forbidden, *allowed):
+                expected = int(name in forbidden)
+                with self.subTest(pe32=pe32, delayed=delayed, legacy=legacy, name=name), tempfile.TemporaryDirectory() as temporary:
+                    image = _pe(SYSTEM_IMPORTS if delayed else (name,),
+                                (name,) if delayed else (), pe32=pe32, legacy_delay=legacy)
+                    path = self.write(Path(temporary), "alias.exe", image)
+                    output, errors = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                        self.assertEqual(release_packaging.main(["verify-windows-imports", str(path)]), expected)
+                    if expected:
+                        self.assertIn(name, errors.getvalue())
 
     def test_every_redistributable_crt_import_fails(self):
         for forbidden in (
@@ -517,6 +582,36 @@ class WindowsCrtImportTests(unittest.TestCase):
     def test_published_dynamic_crt_bundle_fails(self):
         with self.assertRaisesRegex(release_packaging.PackagingError, "VCRUNTIME140.dll"):
             release_packaging.verify_windows_imports([Path(os.environ["HAIDER_DYNAMIC_CRT_WINDOWS_ZIP"])])
+
+    @unittest.skipUnless(os.environ.get("HAIDER_DYNAMIC_CRT_WINDOWS_ZIP"), "set HAIDER_DYNAMIC_CRT_WINDOWS_ZIP")
+    def test_published_crt_names_without_dll_suffix_fail(self):
+        with zipfile.ZipFile(os.environ["HAIDER_DYNAMIC_CRT_WINDOWS_ZIP"]) as archive:
+            member = next(name for name in archive.namelist() if name.endswith("/haider.exe"))
+            original = archive.read(member)
+        image = release_packaging._PeImage(original, "972 haider.exe")
+        rva, _ = image.directory(1)
+        cursor = image.offset(rva)
+        mutated = bytearray(original)
+        changed = 0
+        while True:
+            descriptor = image._read(cursor, 20)
+            if descriptor == bytes(20):
+                break
+            name_rva = int.from_bytes(descriptor[12:16], "little")
+            name = image.string(name_rva)
+            if release_packaging.FORBIDDEN_WINDOWS_IMPORT.fullmatch(name):
+                dot = image.offset(name_rva) + len(name) - 4
+                self.assertEqual(mutated[dot:dot + 4].lower(), b".dll")
+                mutated[dot] = 0
+                changed += 1
+            cursor += 20
+        self.assertEqual(changed, 9)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.write(Path(temporary), "mutated-972.exe", bytes(mutated))
+            output, errors = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                self.assertEqual(release_packaging.main(["verify-windows-imports", str(path)]), 1)
+            self.assertIn("VCRUNTIME140", errors.getvalue())
 
     def test_windows_msvc_targets_link_the_crt_statically(self):
         # Plain-text parse: tomllib is 3.11+, and these tests also run on 3.9.

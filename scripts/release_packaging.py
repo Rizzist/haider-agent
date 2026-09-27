@@ -662,18 +662,21 @@ class _PeImage:
         optional = coff + 20
         magic = self._u16(optional)
         if magic == 0x10B:
-            self.image_base = self._u32(optional + 28)
             directories = optional + 96
         elif magic == 0x20B:
-            self.image_base = self._u64(optional + 24)
             directories = optional + 112
         else:
             raise PackagingError(f"{source}: unknown PE optional-header magic {magic:#x}")
+        fixed_size = directories - optional
+        if optional_size < fixed_size or optional + optional_size > len(data):
+            raise PackagingError(f"{source}: truncated PE optional header")
+        self.image_base = (
+            self._u32(optional + 28) if magic == 0x10B else self._u64(optional + 24)
+        )
         self.directory_count = self._u32(directories - 4)
-        if self.directory_count <= _PE_DELAY_IMPORT_DIRECTORY:
+        if self.directory_count > 16 or fixed_size + self.directory_count * 8 > optional_size:
             raise PackagingError(
-                f"{source}: PE optional header has only {self.directory_count} data directories; "
-                "cannot inspect both import tables"
+                f"{source}: PE optional header cannot hold {self.directory_count} data directories"
             )
         self.directories = directories
         table = optional + optional_size
@@ -706,6 +709,8 @@ class _PeImage:
 
     def directory(self, index: int) -> tuple[int, int]:
         if index >= self.directory_count:
+            # An undeclared directory is absent to the loader too:
+            # RtlImageDirectoryEntryToData returns NULL for that index.
             return 0, 0
         entry = self.directories + index * 8
         rva, size = self._u32(entry), self._u32(entry + 4)
@@ -783,12 +788,22 @@ def windows_pe_imports(data: bytes, source: str) -> dict[str, list[str]]:
 
 
 def forbidden_windows_imports(imports: dict[str, list[str]]) -> list[str]:
+    def normalized_dll_name(name: str) -> str:
+        # Win32 can strip trailing dots, while a final dot can suppress the
+        # loader's usual .dll append. Conservatively strip all trailing dots
+        # before classification so no dotted CRT alias escapes the gate.
+        # Extensionless components get the loader's usual .dll suffix.
+        component = re.split(r"[/\\]", name)[-1].casefold().rstrip(".")
+        if "." not in component:
+            component += ".dll"
+        return component
+
     return sorted(
         {
             name
             for names in imports.values()
             for name in names
-            if FORBIDDEN_WINDOWS_IMPORT.fullmatch(name)
+            if FORBIDDEN_WINDOWS_IMPORT.fullmatch(normalized_dll_name(name))
         },
         key=str.lower,
     )
