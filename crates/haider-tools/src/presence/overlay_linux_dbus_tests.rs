@@ -253,7 +253,7 @@ async fn linux_real_helper_queues_stop_before_close_reply() {
     until(|| posted.lock().unwrap().len() == 3).await;
     let latest = posted.lock().unwrap()[2].clone();
     assert_eq!(latest.1, "updated label");
-    assert!(latest.2.contains("Last action: type"));
+    assert!(latest.2.contains("Last action: Haider · typing"));
     stop_on_close.store(true, Ordering::SeqCst);
     command(
         &mut helper,
