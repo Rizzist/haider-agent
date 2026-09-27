@@ -788,22 +788,30 @@ def windows_pe_imports(data: bytes, source: str) -> dict[str, list[str]]:
 
 
 def forbidden_windows_imports(imports: dict[str, list[str]]) -> list[str]:
-    def normalized_dll_name(name: str) -> str:
-        # Win32 can strip trailing dots, while a final dot can suppress the
-        # loader's usual .dll append. Conservatively strip all trailing dots
-        # before classification so no dotted CRT alias escapes the gate.
-        # Extensionless components get the loader's usual .dll suffix.
-        component = re.split(r"[/\\]", name)[-1].casefold().rstrip(".")
-        if "." not in component:
-            component += ".dll"
-        return component
+    def is_forbidden(name: str) -> bool:
+        # Wine's build_import_name strips trailing spaces before appending .dll;
+        # Win32 path normalization (collapse_path / RtlDosPathNameToNtPathName)
+        # trims spaces and dots and collapses path segments. Check every segment
+        # conservatively so a path alias cannot hide a loadable CRT import.
+        for segment in re.split(r"[/\\]", name.rstrip(" ")):
+            component = segment.split(":", 1)[0].rstrip(" .")
+            if not component or component in (".", ".."):
+                continue
+            component = component.casefold()
+            if "." not in component:
+                component += ".dll"
+            # Wine's get_apiset_entry ignores the suffix after the last hyphen
+            # and stops at the first dot; only the CRT API-set family is banned.
+            if component.startswith("api-ms-win-crt-") or FORBIDDEN_WINDOWS_IMPORT.fullmatch(component):
+                return True
+        return False
 
     return sorted(
         {
             name
             for names in imports.values()
             for name in names
-            if FORBIDDEN_WINDOWS_IMPORT.fullmatch(normalized_dll_name(name))
+            if is_forbidden(name)
         },
         key=str.lower,
     )
@@ -852,7 +860,7 @@ def verify_windows_imports(paths: list[Path]) -> list[str]:
                 f"delay={','.join(imports['delay_imports']) or '-'}"
             )
             if forbidden:
-                failures.append(f"{source}: imports {', '.join(forbidden)}")
+                failures.append(f"{source}: imports {', '.join(map(repr, forbidden))}")
     if failures:
         raise PackagingError(
             "Windows PE imports the dynamic MSVC C runtime (link with "

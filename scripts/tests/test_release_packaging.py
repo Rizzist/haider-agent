@@ -465,10 +465,25 @@ class WindowsCrtImportTests(unittest.TestCase):
         modes = ((False, False, False), (True, False, False),
                  (False, True, False), (True, True, False), (True, True, True))
         forbidden = ("VCRUNTIME140", "VCRUNTIME140.", "VCRUNTIME140.dll.",
-                     "VCRUNTIME140..", r"C:\runtime\VCRUNTIME140")
+                     "VCRUNTIME140..", r"C:\runtime\VCRUNTIME140",
+                     "vcruntime140.", "MSVCP140", "api-ms-win-crt-runtime-l1-1-0",
+                     r"x\..\VCRUNTIME140.dll", "C:/Windows/System32/vcruntime140.dll",
+                     "VCRUNTIME140 ", "VCRUNTIME140.dll ", "VCRUNTIME140.dll   ",
+                     "MSVCP140 ", "api-ms-win-crt-runtime-l1-1-0 ",
+                     "api-ms-win-crt-runtime-l1-1-0.dll ", "VCRUNTIME140.dll. ",
+                     "VCRUNTIME140.dll .", "VCRUNTIME140.dll\\.",
+                     "VCRUNTIME140.dll/.", "VCRUNTIME140.dll\\x\\..",
+                     "VCRUNTIME140.dll::$DATA",
+                     "api-ms-win-crt-runtime-l1-1-0.xyz",
+                     "api-ms-win-crt-runtime-l1-1-9.dll",
+                     "API-MS-WIN-CRT-HEAP-L1-1-0.foo")
         allowed = ("KERNEL32", "KERNEL32.dll", "kernel32.DLL",
                    "api-ms-win-core-synch-l1-2-0", "api-ms-win-core-synch-l1-2-0.dll",
-                   r"C:\Windows\System32\KERNEL32")
+                   r"C:\Windows\System32\KERNEL32",
+                   "api-ms-win-core-winrt-string-l1-1-0.dll",
+                   "ext-ms-win-ntuser-window-l1-1-0.dll",
+                   "msvcrt", "msvcrt.dll", "atl.dll", "Microsoft.VisualStudio.Setup.dll",
+                   "vcruntime.dll", "mfc.dll", "msvcr.dll")
         for pe32, delayed, legacy in modes:
             for name in (*forbidden, *allowed):
                 expected = int(name in forbidden)
@@ -480,7 +495,7 @@ class WindowsCrtImportTests(unittest.TestCase):
                     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                         self.assertEqual(release_packaging.main(["verify-windows-imports", str(path)]), expected)
                     if expected:
-                        self.assertIn(name, errors.getvalue())
+                        self.assertIn(repr(name), errors.getvalue())
 
     def test_every_redistributable_crt_import_fails(self):
         for forbidden in (
@@ -519,13 +534,13 @@ class WindowsCrtImportTests(unittest.TestCase):
                 archive.writestr("top/haider-tui.exe", _pe(SYSTEM_IMPORTS))
                 archive.writestr("top/haiderd.EXE", _pe((*SYSTEM_IMPORTS, "VCRUNTIME140.dll")))
                 archive.writestr("top/README.txt", b"readme")
-            with self.assertRaisesRegex(release_packaging.PackagingError, r"haiderd\.EXE: imports VCRUNTIME140\.dll"):
+            with self.assertRaisesRegex(release_packaging.PackagingError, r"haiderd\.EXE: imports 'VCRUNTIME140\.dll'"):
                 release_packaging.verify_windows_imports([bundle])
             directory = root / "bin"
             (directory / "nested").mkdir(parents=True)
             self.write(directory, "haider.exe", _pe(SYSTEM_IMPORTS))
             self.write(directory / "nested", "helper.dll", _pe(("MSVCP140.dll",)))
-            with self.assertRaisesRegex(release_packaging.PackagingError, r"helper\.dll: imports MSVCP140\.dll"):
+            with self.assertRaisesRegex(release_packaging.PackagingError, r"helper\.dll: imports 'MSVCP140\.dll'"):
                 release_packaging.verify_windows_imports([directory])
 
     def test_inputs_without_a_real_pe_fail_closed(self):
