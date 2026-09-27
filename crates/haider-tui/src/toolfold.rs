@@ -1258,7 +1258,9 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
             }
         }
         "fs_read" | "read" | "read_file" | "file_read" => {
-            let mut summary = path.map(str::to_owned).unwrap_or_else(|| arg_summary(args));
+            let mut summary = path
+                .map(crate::live::workspace_display_path)
+                .unwrap_or_else(|| arg_summary(args));
             if let Some(range) = text("line_range").or_else(|| text("lines")) {
                 summary.push_str(" · ");
                 summary.push_str(range);
@@ -1293,7 +1295,9 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
             }
         }
         "fs_edit" | "edit" | "write" | "file_edit" => {
-            let mut summary = path.map(str::to_owned).unwrap_or_else(|| arg_summary(args));
+            let mut summary = path
+                .map(crate::live::workspace_display_path)
+                .unwrap_or_else(|| arg_summary(args));
             if let Some(operation) = text("operation").or_else(|| text("action"))
                 && !operation.is_empty()
                 && operation != "edit"

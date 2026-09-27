@@ -180,6 +180,14 @@ fn semantic_tool_rows_keep_tool_specific_context_compact() {
         semantic_summary("task", &json!({"label":"verify", "state":"running"})),
         "verify · running"
     );
+    assert_eq!(
+        semantic_summary("fs_read", &json!({"path":"/Users/bob/private"})),
+        "/Users/<user>/private"
+    );
+    assert_eq!(
+        semantic_summary("fs_edit", &json!({"path":"/Users/bob/private"})),
+        "/Users/<user>/private"
+    );
 }
 
 #[test]

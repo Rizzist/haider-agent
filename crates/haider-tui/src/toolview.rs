@@ -202,7 +202,22 @@ pub fn shell_command(args: &serde_json::Value) -> Option<String> {
 #[must_use]
 pub fn header_args(name: &str, args: &serde_json::Value, paths: &PathContext) -> String {
     let path = arg_text(args, &["path", "file_path", "file"]).map(|path| paths.shorten(path));
-    let fallback = || one_line(&crate::toolfold::semantic_summary(name, args));
+    let fallback = || {
+        arg_text(
+            args,
+            &[
+                "path",
+                "file_path",
+                "file",
+                "cwd",
+                "root",
+                "directory",
+                "workspace",
+            ],
+        )
+        .map(|path| paths.shorten(path))
+        .unwrap_or_else(|| one_line(&crate::toolfold::semantic_summary(name, args)))
+    };
     match tool_kind(name) {
         ToolKind::Read | ToolKind::Write | ToolKind::Edit => path.unwrap_or_else(fallback),
         ToolKind::Search => {

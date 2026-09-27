@@ -111,6 +111,10 @@ fn tool_headers_share_the_home_and_other_account_projection() {
         "\"needle\" in /Users/<user>/repo"
     );
     assert_eq!(
+        tv::header_args("custom_tool", &json!({"cwd": "/Users/bob/repo"}), &context),
+        "/Users/<user>/repo"
+    );
+    assert_eq!(
         context.shorten("/Users/alice/dev/haider/src/lib.rs"),
         "src/lib.rs"
     );
