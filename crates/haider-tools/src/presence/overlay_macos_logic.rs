@@ -1,5 +1,7 @@
 //! Visibility state shared by the macOS panels and cross-platform tests.
 
+use super::PresenceEvent;
+
 #[derive(Default)]
 pub(super) struct MacVisibility {
     pub(super) visible: bool,
@@ -10,6 +12,21 @@ pub(super) struct MacVisibility {
 /// window numbers appears in the window server's on-screen list.
 pub(super) fn panels_absent_in_window_list(panels: &[u32; 3], on_screen: &[u32]) -> bool {
     panels.iter().all(|number| !on_screen.contains(number))
+}
+
+/// Keep the panel hide, window-server verification and acknowledgement in
+/// one ordered operation. An unverified hide is a typed failure, never Ack.
+pub(super) fn conceal_after_hide<T>(
+    seq: u64,
+    state: &mut T,
+    hide: impl FnOnce(&mut T),
+    verify: impl FnOnce(&T) -> Result<(), String>,
+) -> PresenceEvent {
+    hide(state);
+    match verify(state) {
+        Ok(()) => PresenceEvent::Ack { seq },
+        Err(message) => PresenceEvent::ConcealFailed { seq, message },
+    }
 }
 
 impl MacVisibility {
@@ -38,6 +55,51 @@ impl MacVisibility {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn conceal_acks_only_after_hide_and_verification() {
+        #[derive(Default)]
+        struct Fake {
+            hidden: bool,
+            verified: Cell<bool>,
+        }
+        let mut fake = Fake::default();
+        let event = conceal_after_hide(
+            41,
+            &mut fake,
+            |fake| fake.hidden = true,
+            |fake| {
+                assert!(fake.hidden, "all panels must be hidden before verification");
+                fake.verified.set(true);
+                Ok(())
+            },
+        );
+        assert!(fake.verified.get(), "Ack requires the verifier to run");
+        assert_eq!(event, PresenceEvent::Ack { seq: 41 });
+    }
+
+    #[test]
+    fn conceal_verification_timeout_fails_closed() {
+        let mut hidden = false;
+        let event = conceal_after_hide(
+            42,
+            &mut hidden,
+            |hidden| *hidden = true,
+            |hidden| {
+                assert!(*hidden);
+                Err("display refresh deadline elapsed".into())
+            },
+        );
+        assert!(hidden);
+        assert_eq!(
+            event,
+            PresenceEvent::ConcealFailed {
+                seq: 42,
+                message: "display refresh deadline elapsed".into(),
+            }
+        );
+    }
 
     #[test]
     fn conceal_window_list_requires_pointer_ring_and_badge_absent() {

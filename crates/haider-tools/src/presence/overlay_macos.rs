@@ -18,7 +18,7 @@
 //! boundary below uses reviewed FFI. A Stop click whose Quartz event carries
 //! [`SYNTHETIC_INPUT_TAG`] was posted by Haider itself and is ignored.
 
-use super::overlay_macos_logic::{MacVisibility, panels_absent_in_window_list};
+use super::overlay_macos_logic::{MacVisibility, conceal_after_hide, panels_absent_in_window_list};
 use super::{
     PresenceCommand, PresenceEvent, PresenceMark, PresencePoint, SYNTHETIC_INPUT_TAG, art,
     encode_event, parse_command_line,
@@ -513,36 +513,42 @@ impl Overlay {
             // that are sharing-none are already absent from captures.
             PresenceCommand::Conceal { seq, .. } => {
                 if evidence_capturable() {
-                    self.visibility.conceal();
-                    NSAnimationContext::beginGrouping();
-                    NSAnimationContext::currentContext().setDuration(0.0);
-                    CATransaction::begin();
-                    CATransaction::setDisableActions(true);
-                    self.pointer.orderOut(None);
-                    self.ring.orderOut(None);
-                    self.badge.orderOut(None);
-                    CATransaction::commit();
-                    NSAnimationContext::endGrouping();
-                    CATransaction::flush();
-                    let numbers = [
-                        self.pointer.windowNumber(),
-                        self.ring.windowNumber(),
-                        self.badge.windowNumber(),
-                    ];
-                    let numbers = numbers.map(u32::try_from);
-                    let result = numbers
-                        .into_iter()
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|_| "invalid presence panel window number".to_owned())
-                        .and_then(|numbers| {
-                            verify_panels_absent(&[numbers[0], numbers[1], numbers[2]])
-                        });
-                    if let Err(message) = result {
-                        emit(&PresenceEvent::ConcealFailed { seq, message });
-                        return;
-                    }
+                    let event = conceal_after_hide(
+                        seq,
+                        self,
+                        |renderer| {
+                            renderer.visibility.conceal();
+                            NSAnimationContext::beginGrouping();
+                            NSAnimationContext::currentContext().setDuration(0.0);
+                            CATransaction::begin();
+                            CATransaction::setDisableActions(true);
+                            renderer.pointer.orderOut(None);
+                            renderer.ring.orderOut(None);
+                            renderer.badge.orderOut(None);
+                            CATransaction::commit();
+                            NSAnimationContext::endGrouping();
+                            CATransaction::flush();
+                        },
+                        |renderer| {
+                            let numbers = [
+                                renderer.pointer.windowNumber(),
+                                renderer.ring.windowNumber(),
+                                renderer.badge.windowNumber(),
+                            ];
+                            let numbers = numbers.map(u32::try_from);
+                            numbers
+                                .into_iter()
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(|_| "invalid presence panel window number".to_owned())
+                                .and_then(|numbers| {
+                                    verify_panels_absent(&[numbers[0], numbers[1], numbers[2]])
+                                })
+                        },
+                    );
+                    emit(&event);
+                } else {
+                    emit(&PresenceEvent::Ack { seq });
                 }
-                emit(&PresenceEvent::Ack { seq });
             }
             PresenceCommand::Reveal { .. } => {
                 if self.visibility.reveal() {
