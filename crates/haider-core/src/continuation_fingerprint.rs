@@ -17,10 +17,11 @@
 //!   items are sorted, then lines are sorted, so a reordered list is a repeat.
 //! - Assistant text also folds case; text and argument strings cap runs of one
 //!   punctuation character at [`MAX_PUNCTUATION_RUN`].
-//! - Typed computer/mobile screen steps ([`ui_step`]) compare with
-//!   [`screen_result`] instead: digits are kept and order matters, because a
-//!   numeric list page (prices, IDs, dates) scrolling by is a real screen
-//!   change, while an identical tree still repeats.
+//! - Trusted, completed computer/mobile screen observations ([`ui_step`])
+//!   with a reading compare with [`screen_result`] instead: digits are kept
+//!   and order matters, because a numeric list page (prices, IDs, dates)
+//!   scrolling by is a real screen change. Failed results and navigation
+//!   outcomes use the ordinary result normalization.
 //! - Tool arguments keep canonical JSON (sorted keys, exact numbers); only
 //!   string values are normalized, and their digits are never masked: a call
 //!   with different arguments is a different call.
