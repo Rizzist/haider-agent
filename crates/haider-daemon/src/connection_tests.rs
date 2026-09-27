@@ -2727,7 +2727,7 @@ fn gate_f2_legacy_event_frame_strips_metrics_activity() {
             );
             assert!(
                 serde_json::to_string(&frame)
-                    .unwrap()
+                    .expect("activity frame fixture")
                     .contains("\"activity\"")
             );
             let bytes = uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("encodes");
@@ -2825,17 +2825,20 @@ fn legacy_event_strips_typed_tool_activity_but_modern_keeps_it() {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).unwrap().into(),
+            payload: serde_json::to_value(payload)
+                .expect("activity frame fixture")
+                .into(),
         },
     };
     for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
         let mut legacy = frame.clone();
         omit_fleet_identity(&mut legacy);
-        let modern = serde_json::to_string(&frame).unwrap();
-        let old = serde_json::to_string(&legacy).unwrap();
+        let modern = serde_json::to_string(&frame).expect("activity frame fixture");
+        let old = serde_json::to_string(&legacy).expect("activity frame fixture");
         assert!(modern.contains("\"activity\":\"read\""));
         assert!(!old.contains("\"activit"));
-        let bytes = uds_codec::encode_with(&legacy, 1_048_576, encoding).unwrap();
+        let bytes =
+            uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("activity frame fixture");
         assert!(!bytes.windows(7).any(|part| part == b"activit"));
     }
 }
@@ -2880,7 +2883,7 @@ fn legacy_recovery_event_keeps_the_previous_network_shape() {
                     ..intent.clone()
                 }),
             ))
-            .unwrap()
+            .expect("activity frame fixture")
             .into(),
         },
     };
@@ -2892,13 +2895,14 @@ fn legacy_recovery_event_keeps_the_previous_network_shape() {
     omit_fleet_identity(&mut legacy);
     for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
         assert_eq!(
-            uds_codec::encode_with(&legacy, 1_048_576, encoding).unwrap(),
-            uds_codec::encode_with(&historical, 1_048_576, encoding).unwrap(),
+            uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("activity frame fixture"),
+            uds_codec::encode_with(&historical, 1_048_576, encoding)
+                .expect("activity frame fixture"),
         );
     }
     assert!(
         serde_json::to_string(&modern)
-            .unwrap()
+            .expect("activity frame fixture")
             .contains("provider_transport")
     );
 }
@@ -2942,13 +2946,14 @@ fn legacy_running_tool_event_omits_live_activity_metadata() {
     omit_fleet_identity(&mut legacy);
     for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
         assert_eq!(
-            uds_codec::encode_with(&legacy, 1_048_576, encoding).unwrap(),
-            uds_codec::encode_with(&historical, 1_048_576, encoding).unwrap(),
+            uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("activity frame fixture"),
+            uds_codec::encode_with(&historical, 1_048_576, encoding)
+                .expect("activity frame fixture"),
         );
     }
     assert!(
         serde_json::to_string(&modern)
-            .unwrap()
+            .expect("activity frame fixture")
             .contains("activity_kind")
     );
 }
