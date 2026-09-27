@@ -129,6 +129,34 @@ fn tool_headers_share_the_home_and_other_account_projection() {
 }
 
 #[test]
+fn workspace_root_cannot_shorten_away_another_account_mask() {
+    for workspace in ["/", "/Users", "/Users/"] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec!["/Users/alice".into()],
+        };
+        assert_eq!(
+            context.shorten("/Users/bob/private"),
+            "/Users/<user>/private"
+        );
+        assert_eq!(
+            tv::header_args("fs_read", &json!({"path": "/Users/bob/private"}), &context),
+            "/Users/<user>/private"
+        );
+        assert_eq!(context.shorten("/Users/alice/private"), "~/private");
+    }
+    let windows = PathContext {
+        workspace: Some("C:/Users".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    assert_eq!(
+        windows.shorten("C:/Users/bob/private"),
+        "C:/Users/<user>/private"
+    );
+    assert_eq!(windows.shorten("C:/Users/alice/private"), "~/private");
+}
+
+#[test]
 fn a_path_context_change_changes_its_fingerprint() {
     let mut other = paths();
     assert_eq!(paths().fingerprint(), other.fingerprint());

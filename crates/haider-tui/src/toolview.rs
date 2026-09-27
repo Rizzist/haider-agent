@@ -119,11 +119,32 @@ pub struct PathContext {
 }
 
 impl PathContext {
-    /// Shorten an absolute path for display: workspace-relative when it is
-    /// inside the workspace, `~/…` when it is inside home, unchanged
-    /// otherwise. Component-aware — `/Users/alice2` is not under `~alice`.
+    /// Mask another account before workspace shortening. Keep `~/…` when a
+    /// broad workspace root would expose the name of the current account.
+    /// Otherwise use a workspace-relative label inside the workspace.
+    /// Component-aware — `/Users/alice2` is not under `~alice`.
     #[must_use]
     pub fn shorten(&self, path: &str) -> String {
+        let homes = self.homes.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        let Ok(projection) = haider_client::launch_origin::sanitize_origin_path_with_homes(
+            Some(Path::new(path)),
+            &homes,
+        ) else {
+            return "<workspace path unavailable>".to_owned();
+        };
+        let kind = projection.kind;
+        let display = projection
+            .display
+            .unwrap_or_else(|| "<workspace path unavailable>".to_owned());
+        if kind == haider_client::launch_origin::OriginPathKind::Redacted
+            || kind == haider_client::launch_origin::OriginPathKind::HomeRelative
+                && self
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|root| !haider_client::launch_origin::usable_home(Path::new(root)))
+        {
+            return display;
+        }
         if let Some(rest) = self
             .workspace
             .as_deref()
@@ -136,7 +157,7 @@ impl PathContext {
                 haider_client::launch_origin::display_path_with_homes(Path::new(rest), &[])
             };
         }
-        haider_client::launch_origin::display_path_with_homes(Path::new(path), &self.homes)
+        display
     }
 
     /// A stable fingerprint for cache invalidation.
