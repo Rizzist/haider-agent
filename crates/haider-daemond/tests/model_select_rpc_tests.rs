@@ -447,6 +447,63 @@ fn committed_budget(
     *budget
 }
 
+#[tokio::test]
+async fn session_create_above_global_ceiling_returns_typed_model_output_limit() {
+    let root = test_root("create-over-global-ceiling-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "create-over-global-ceiling",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let fake = Arc::new(FakeProvider::new(text_turn("must not dispatch")));
+    let task =
+        ready_with_dependencies(&config, routed_dependencies(&[("fake", fake.clone())])).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "global-ceiling-client",
+        "global-ceiling-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    send(
+        &mut client,
+        &config,
+        "create-over",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("create-over-global"),
+            cwd: workspace.display().to_string(),
+            provider: "fake".into(),
+            model: "unknown-model".into(),
+            max_tokens: 384_001,
+        },
+    )
+    .await;
+    let response = next_response(&mut client).await;
+    assert!(
+        matches!(
+            &response,
+            ResponseBody::Error {
+                data: Some(ErrorData::ModelOutputLimit {
+                    requested: 384_001,
+                    // The injected fake row's 30,000 ceiling is tighter than
+                    // the global 384,000 bound; the typed refusal reports
+                    // the effective model ceiling.
+                    max_output_tokens: 30_000,
+                    ..
+                }),
+                ..
+            }
+        ),
+        "typed global refusal: {response:?}"
+    );
+    assert!(fake.requests().is_empty());
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
 /// D1 (973 output cap): a DERIVED session budget follows the selected model.
 /// A default session (clients send 0) on a 30,000-budget model switches to
 /// gpt-4o (16,384) and to an unknown custom model (8,192) without a refusal,

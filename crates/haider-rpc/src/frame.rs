@@ -5336,6 +5336,8 @@ pub enum ResponseBody {
         account: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {

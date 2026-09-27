@@ -6119,6 +6119,7 @@ async fn provider_rebind_initial_rotation_is_durable_before_target_request() {
             account: Some(rotation.to.clone()),
             account_incarnation: Some(2),
             context_window: None,
+            max_tokens: 4096,
             cached_input_is_subset: false,
             provider_request_state: Default::default(),
             auth_scope: "api_key".into(),
@@ -6209,6 +6210,7 @@ async fn provider_rebind_cannot_refund_or_drop_consumed_rotation_budget() {
                 account: Some(CredentialAlias::new("rebind-b")),
                 account_incarnation: Some(2),
                 context_window: None,
+                max_tokens: 4096,
                 cached_input_is_subset: false,
                 provider_request_state: Default::default(),
                 auth_scope: "api_key".into(),
@@ -6263,6 +6265,53 @@ async fn provider_rebind_cannot_refund_or_drop_consumed_rotation_budget() {
 }
 
 struct OneRebindResolver(Mutex<Option<ProviderRebindTarget>>);
+
+#[tokio::test]
+async fn provider_rebind_replaces_active_request_output_budget() {
+    let store = Arc::new(MemoryStore::new());
+    let initial = Arc::new(FakeProvider::new(Vec::new()));
+    let rebound = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "bounded".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut cfg = config();
+    cfg.max_tokens = 20_000;
+    cfg.reserved_output_tokens = 20_000;
+    cfg.provider_rebind_resolver = Some(Arc::new(OneRebindResolver(Mutex::new(Some(
+        ProviderRebindTarget {
+            provider: rebound.clone(),
+            provider_name: "fake".into(),
+            account: None,
+            account_incarnation: None,
+            context_window: Some(200_000),
+            max_tokens: 8_192,
+            cached_input_is_subset: false,
+            provider_request_state: Default::default(),
+            auth_scope: "none".into(),
+            attempt_resolver: None,
+            route_epoch: "bounded-rebind".into(),
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+        },
+    )))));
+    let handle = HarnessActor::spawn(cfg, initial.clone(), store);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("rebind output budget"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert!(initial.requests().is_empty());
+    assert_eq!(rebound.requests().len(), 1);
+    assert_eq!(rebound.requests()[0].max_tokens, 8_192);
+    handle.stop().await.expect("actor stops");
+}
 
 impl std::fmt::Debug for OneRebindResolver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

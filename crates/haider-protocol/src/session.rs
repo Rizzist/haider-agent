@@ -373,6 +373,8 @@ pub struct SessionProviderRebound {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget: Option<crate::output_budget::SessionOutputBudgetV1>,
 }
 
 /// Additive replay fact emitted atomically with a committed live-session
@@ -537,5 +539,9 @@ impl SessionProviderRebound {
         metadata.provider.clone_from(&self.provider);
         metadata.provider_base_url.clone_from(&self.base_url);
         metadata.account_alias.clone_from(&self.account);
+        if let Some(budget) = self.output_budget {
+            metadata.max_tokens = budget.max_tokens;
+            metadata.max_tokens_source = Some(budget.source);
+        }
     }
 }

@@ -550,6 +550,91 @@ fn model_summary(provider: &str, models: &[&str]) -> ProviderSummaryWire {
     }
 }
 
+#[tokio::test]
+async fn selected_child_pair_reapplies_parent_budget_and_plain_child_inherits_it() {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    let fake_a = Arc::new(FakeProvider::new(Vec::new()));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let mut destination = model_summary("fake-b", &["model-b"]);
+    destination.model_details = vec![
+        serde_json::from_value(serde_json::json!({
+            "name":"model-b", "context_window":1_048_576,
+            "max_output_tokens":8192, "max_output_tokens_source":"declared"
+        }))
+        .expect("declared model detail"),
+    ];
+    let world = PairSwitchWorld::boot_with_catalog(
+        "child-output-budget",
+        fake_a,
+        fake_b,
+        vec![model_summary("fake-a", &["model-a"]), destination],
+    )
+    .await;
+    let delegation = crate::delegation::DelegationHandle::new(world.hub.clone());
+    let request: haider_tools::SpawnSubagent = serde_json::from_value(serde_json::json!({
+        "task":"check budget", "prompt":"report", "model":"model-b", "provider":"fake-b"
+    }))
+    .expect("selected child request");
+    let plain: haider_tools::SpawnSubagent = serde_json::from_value(serde_json::json!({
+        "task":"inherit budget", "prompt":"report"
+    }))
+    .expect("plain child request");
+    for (ordinal, source, parent_tokens, child_tokens) in [
+        (
+            1,
+            SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+            20_000,
+            8_192,
+        ),
+        (2, SessionOutputBudgetSourceV1::Derived, 30_000, 8_192),
+    ] {
+        let mut command = world.select_command(&format!("child-budget-{ordinal}"));
+        command.provider = "fake-a".into();
+        command.model = "model-a".into();
+        command.output_budget = Some(SessionOutputBudgetV1 {
+            max_tokens: parent_tokens,
+            source,
+            clamped: None,
+        });
+        command.request_json = serde_json::json!({
+            "session_id": world.session_id, "worker_generation": world.store.worker_generation(),
+            "provider":"fake-a", "model":"model-a", "max_tokens":parent_tokens,
+        })
+        .to_string();
+        command.request_digest = blake3::hash(command.request_json.as_bytes())
+            .to_hex()
+            .to_string();
+        world
+            .hub
+            .select_session_model(command)
+            .await
+            .expect("set parent budget");
+        let parent = world
+            .store
+            .session_metadata(&world.session_id)
+            .await
+            .expect("parent metadata")
+            .expect("typed parent");
+        let selected = delegation
+            .resolve_child_metadata(&parent, &request)
+            .expect("resolve")
+            .expect("valid destination");
+        assert_eq!(
+            (selected.provider.as_str(), selected.model.as_str()),
+            ("fake-b", "model-b")
+        );
+        assert_eq!(selected.max_tokens, child_tokens);
+        assert_eq!(selected.max_tokens_source, Some(source));
+        let inherited = delegation
+            .resolve_child_metadata(&parent, &plain)
+            .expect("resolve")
+            .expect("inherit current pair");
+        assert_eq!(inherited.max_tokens, parent_tokens);
+        assert_eq!(inherited.max_tokens_source, Some(source));
+    }
+    world.shutdown().await;
+}
+
 /// ITEM #3 strand regression: `start_turn` must resolve the immutable Loom
 /// revision named by GraphPinned, not the registry's newer current row.
 #[tokio::test]
@@ -1152,22 +1237,52 @@ async fn fuzzy_bare_selector_spawns_on_the_single_canonical_catalog_row() {
         },
     ]));
     let fake_b = Arc::new(FakeProvider::new(text_turn("child report")));
+    let mut destination = model_summary("fake-b", &["glm-4.7-flashx"]);
+    destination.model_details = vec![
+        serde_json::from_value(serde_json::json!({
+            "name":"glm-4.7-flashx", "context_window":1_048_576,
+            "max_output_tokens":8192, "max_output_tokens_source":"declared"
+        }))
+        .expect("declared child row"),
+    ];
     let world = PairSwitchWorld::boot_with_catalog(
         "modelcat-fuzzy",
         fake_a.clone(),
         fake_b.clone(),
-        vec![
-            model_summary("fake-a", &["model-a"]),
-            model_summary("fake-b", &["glm-4.7-flashx"]),
-        ],
+        vec![model_summary("fake-a", &["model-a"]), destination],
     )
     .await;
+
+    let mut parent_budget = world.select_command("fuzzy-child-parent-budget");
+    parent_budget.provider = "fake-a".into();
+    parent_budget.model = "model-a".into();
+    parent_budget.output_budget = Some(haider_protocol::output_budget::SessionOutputBudgetV1 {
+        max_tokens: 20_000,
+        source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+            requested: 20_000,
+        },
+        clamped: None,
+    });
+    parent_budget.request_json = serde_json::json!({
+        "session_id": world.session_id, "worker_generation": world.store.worker_generation(),
+        "provider":"fake-a", "model":"model-a", "max_tokens":20_000,
+    })
+    .to_string();
+    parent_budget.request_digest = blake3::hash(parent_budget.request_json.as_bytes())
+        .to_hex()
+        .to_string();
+    world
+        .hub
+        .select_session_model(parent_budget)
+        .await
+        .expect("set parent budget");
 
     world.run_turn("modelcat-fuzzy-turn", "delegate").await;
 
     let b_requests = fake_b.requests();
     assert_eq!(b_requests.len(), 1, "exactly one child request uses B");
     assert_eq!(b_requests[0].model, "glm-4.7-flashx");
+    assert_eq!(b_requests[0].max_tokens, 8_192);
     assert!(
         fake_a
             .requests()
@@ -1189,6 +1304,14 @@ async fn fuzzy_bare_selector_spawns_on_the_single_canonical_catalog_row() {
         .expect("spawn manifest");
     assert_eq!(manifest.model_profile, "glm-4.7-flashx");
     assert_eq!(manifest.provider(), Some("fake-b"));
+    assert_eq!(
+        manifest.coordinates.as_ref().expect("coordinates")["output_budget"],
+        serde_json::json!({
+            "max_tokens":8192,
+            "source":{"kind":"user_set","requested":20000},
+            "clamped":{"requested":20000,"max_output_tokens":8192}
+        })
+    );
     let child_session = manifest
         .coordinates
         .as_ref()

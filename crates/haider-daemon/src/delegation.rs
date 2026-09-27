@@ -431,11 +431,29 @@ impl DelegationHandle {
                 request.model.as_deref(),
                 request.provider.as_deref(),
             )
-            .map(|(provider, model)| {
+            .and_then(|(provider, model)| {
                 let mut child = parent.clone();
+                if child.provider != provider || child.model != model {
+                    let validated = authority.validate_selection_with_status(
+                        &parent.provider,
+                        Some(&provider),
+                        &model,
+                    )?;
+                    let budget =
+                        haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                            parent.max_tokens_source,
+                            parent.max_tokens,
+                        )
+                        .apply(
+                            validated.max_output_tokens,
+                            validated.explicit_max_output_tokens,
+                        );
+                    child.max_tokens = budget.max_tokens;
+                    child.max_tokens_source = Some(budget.source);
+                }
                 child.provider = provider;
                 child.model = model;
-                child
+                Ok(child)
             }))
     }
 
@@ -662,6 +680,26 @@ impl DelegationHandle {
             "lockdown": child_lockdown,
             "auto_hermetic": coordinates.auto_hermetic,
         });
+        if request.model.is_some()
+            && let Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                requested,
+            }) = coordinates.metadata.max_tokens_source
+            && requested > coordinates.metadata.max_tokens
+        {
+            // A model-selected child has no CLI response. Publish the same
+            // typed clamp notice in its durable spawn fact for observers.
+            manifest_coordinates["output_budget"] =
+                serde_json::json!(haider_protocol::output_budget::SessionOutputBudgetV1 {
+                    max_tokens: coordinates.metadata.max_tokens,
+                    source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                        requested,
+                    },
+                    clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                        requested,
+                        max_output_tokens: coordinates.metadata.max_tokens,
+                    }),
+                });
+        }
         // Display identity is not new retry semantics. Reuse the first
         // durable value (including legacy absence) after a registry edit;
         // grants/CLI scope still undergo the existing semantics check.
@@ -761,6 +799,7 @@ impl DelegationHandle {
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
             "max_tokens": coordinates.metadata.max_tokens,
+            "max_tokens_source": coordinates.metadata.max_tokens_source,
             "permission_overrides": child_overrides,
             "delegation_agent": agent_id,
             // G3 (LE6): the child inherits the parent's CURRENT tuning; the

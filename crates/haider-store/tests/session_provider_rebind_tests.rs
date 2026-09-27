@@ -44,6 +44,9 @@ fn command(store: &Store) -> SessionProviderRebindCommand {
         provider: "proxy".into(),
         base_url: Some("http://127.0.0.1:4242/v1".into()),
         account: Some("row-account".into()),
+        max_tokens: 4096,
+        max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        clamped: None,
         event_id: EventId::new("rebound-1"),
         device_id: DeviceId::new("test-device"),
     }
@@ -55,7 +58,14 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
     let store = Store::open(root.path()).expect("open");
     create(&store, "session-a");
     create(&store, "session-b");
-    let command = command(&store);
+    let mut command = command(&store);
+    command.max_tokens = 8192;
+    command.max_tokens_source =
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { requested: 20_000 };
+    command.clamped = Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+        requested: 20_000,
+        max_output_tokens: 8192,
+    });
     let mut replayed_metadata = store
         .session_metadata(&command.session_id)
         .expect("read metadata")
@@ -71,6 +81,9 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
     };
     assert_eq!(envelope.seq, 2);
     assert_eq!(selected.selected_seq, envelope.seq);
+    assert_eq!(selected.max_tokens, 8192);
+    assert_eq!(selected.max_tokens_source, command.max_tokens_source);
+    assert_eq!(selected.clamped, command.clamped);
     assert!(matches!(envelope.render.prompt, PromptRender::Omit));
     assert_eq!(envelope.payload["type"], "session_provider_rebound");
     let fact =
@@ -78,6 +91,11 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
     fact.apply_to_metadata(&mut replayed_metadata);
     assert_eq!(replayed_metadata.model, "test-model");
     assert_eq!(replayed_metadata.provider, "proxy");
+    assert_eq!(replayed_metadata.max_tokens, 8192);
+    assert_eq!(
+        replayed_metadata.max_tokens_source,
+        Some(command.max_tokens_source)
+    );
     assert_eq!(replayed_metadata.provider_base_url, command.base_url);
     assert_eq!(replayed_metadata.account_alias, command.account);
     assert_eq!(
@@ -197,7 +215,10 @@ fn provider_rebind_omitted_coordinates_clear_only_the_session_override() {
     };
     assert_eq!(
         *envelope.payload,
-        serde_json::json!({"type":"session_provider_rebound","rebind_id":"rebind-2","provider":"proxy"})
+        serde_json::json!({
+            "type":"session_provider_rebound", "rebind_id":"rebind-2", "provider":"proxy",
+            "output_budget":{"max_tokens":4096,"source":{"kind":"derived"}}
+        })
     );
     let metadata = store
         .session_metadata(&command.session_id)

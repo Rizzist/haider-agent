@@ -15,6 +15,7 @@ pub(super) async fn pin_headless_turn_metadata(
     store: &HubStoreHandle,
     run_id: &RunId,
 ) -> Result<(), HaiderError> {
+    let stored_budget = (metadata.max_tokens, metadata.max_tokens_source);
     metadata.model.clone_from(&spec.model);
     metadata.max_tokens = spec.max_output_tokens;
     metadata.effort.clone_from(&spec.effort);
@@ -30,6 +31,8 @@ pub(super) async fn pin_headless_turn_metadata(
     // selection may instead be queued for the next turn. Scan only explicitly
     // rebound runs, leaving ordinary turn startup's reads unchanged.
     let mut cursor = 0;
+    let mut first_run_seq = None;
+    let mut rebound_budget = None;
     loop {
         let page = store
             .read_for(
@@ -42,9 +45,18 @@ pub(super) async fn pin_headless_turn_metadata(
         let page_len = page.len();
         for envelope in page {
             cursor = envelope.seq;
+            if let Some(rebound) =
+                haider_protocol::session::SessionProviderRebound::from_payload_value(
+                    &envelope.payload,
+                )
+                && metadata.provider_rebind_id.as_deref() == Some(rebound.rebind_id.as_str())
+            {
+                rebound_budget = Some((envelope.seq, rebound.output_budget));
+            }
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
             }
+            first_run_seq.get_or_insert(envelope.seq);
             let Ok(EventPayload::Item(ItemEvent::Completed {
                 item: TurnItem::Extension { kind, data },
                 ..
@@ -66,9 +78,56 @@ pub(super) async fn pin_headless_turn_metadata(
             }
         }
         if page_len < 256 {
-            return Ok(());
+            break;
         }
     }
+    let run_rebound =
+        rebound_budget.is_some_and(|(seq, _)| first_run_seq.is_some_and(|first| seq > first));
+    if !run_rebound {
+        return Ok(());
+    }
+    if let Some((_, Some(budget))) = rebound_budget {
+        metadata.max_tokens = budget.max_tokens;
+        metadata.max_tokens_source = Some(budget.source);
+    } else {
+        // Older rebind facts had no budget field. Keep the durable metadata
+        // as the best available pair-specific value for that legacy run.
+        metadata.max_tokens = stored_budget.0;
+        metadata.max_tokens_source = stored_budget.1;
+    }
+    if let Some(view) = store
+        .hub()
+        .accounts()
+        .map_err(hub_error)?
+        .and_then(|accounts| accounts.management.read())
+    {
+        let selection = crate::model_select::ModelSelectionAuthority::new(
+            store.hub().creatable_providers().map_err(hub_error)?,
+            view.providers,
+        )
+        .validate_selection_with_status(&spec.provider, Some(&metadata.provider), &metadata.model)
+        .map_err(|refusal| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "recovered provider rebind rejected the active model: {}",
+                    refusal.message()
+                ),
+                false,
+            )
+        })?;
+        let budget = haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+            metadata.max_tokens_source,
+            metadata.max_tokens,
+        )
+        .apply(
+            selection.max_output_tokens,
+            selection.explicit_max_output_tokens,
+        );
+        metadata.max_tokens = budget.max_tokens;
+        metadata.max_tokens_source = Some(budget.source);
+    }
+    Ok(())
 }
 
 /// Recovery retains the accepted run's authority identity. An explicit Full
@@ -222,7 +281,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             .map_err(hub_error)?
             .and_then(|accounts| accounts.management.read())
         {
-            crate::model_select::ModelSelectionAuthority::new(
+            let selection = crate::model_select::ModelSelectionAuthority::new(
                 self.store.hub().creatable_providers().map_err(hub_error)?,
                 view.providers,
             )
@@ -241,6 +300,19 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
                     false,
                 )
             })?;
+            // A pending ordinary model selection may differ from this run's
+            // active model. The receipt budgets the durable next-turn pair;
+            // the refreshed adapter must budget the pair it will dispatch.
+            let budget = haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                metadata.max_tokens_source,
+                metadata.max_tokens,
+            )
+            .apply(
+                selection.max_output_tokens,
+                selection.explicit_max_output_tokens,
+            );
+            metadata.max_tokens = budget.max_tokens;
+            metadata.max_tokens_source = Some(budget.source);
         }
         let resolved = self
             .factory
@@ -298,6 +370,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
                 .map(haider_protocol::ids::CredentialAlias::new),
             account_incarnation: resolved.account_incarnation,
             context_window: resolved.context_window,
+            max_tokens: metadata.max_tokens,
             cached_input_is_subset: cached_input_is_subset_for_provider(&metadata.provider),
             provider_request_state: request_state,
             auth_scope,

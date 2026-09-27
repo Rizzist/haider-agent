@@ -126,13 +126,15 @@ impl HubConnection {
             self.hub.creatable_providers()?,
             view.providers.clone(),
         );
-        if let Err(refusal) = authority.validate_selection_with_status(
+        let validated = match authority.validate_selection_with_status(
             &current.provider,
             Some(&provider),
             &current.model,
         ) {
-            return self.respond_selection_refusal(request_id, &refusal);
-        }
+            Ok(selection) => selection,
+            Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+        };
+        let budget = super::rpc::reapply_session_output_budget(&current, &validated);
         // Admission shares this lock. Compare against the ACTIVE run's
         // frozen ceiling: session.select_model can already describe the next
         // turn, and is not evidence of the current turn's authority.
@@ -160,6 +162,9 @@ impl HubConnection {
             provider,
             base_url,
             account,
+            max_tokens: budget.max_tokens,
+            max_tokens_source: budget.source,
+            clamped: budget.clamped,
             event_id: EventId::new(random_id("session-provider-rebound")?),
             device_id: self.hub.inner.device_id.clone(),
         };
@@ -190,6 +195,13 @@ impl HubConnection {
                 account: selected.account,
                 selected_seq: selected.selected_seq,
                 worker_generation: selected.worker_generation,
+                output_budget: (selected.max_tokens != 0).then_some(
+                    haider_protocol::output_budget::SessionOutputBudgetV1 {
+                        max_tokens: selected.max_tokens,
+                        source: selected.max_tokens_source,
+                        clamped: selected.clamped,
+                    },
+                ),
             },
         })
     }

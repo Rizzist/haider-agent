@@ -2246,6 +2246,7 @@ pub fn provider_rebind_transcript() -> Vec<WireFrame> {
                 account: Some("benchmark-account".into()),
                 selected_seq: 17,
                 worker_generation: 3,
+                output_budget: None,
             },
         },
     ]

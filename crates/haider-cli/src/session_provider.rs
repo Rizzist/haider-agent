@@ -155,11 +155,21 @@ async fn execute(
             account,
             selected_seq,
             worker_generation,
-        } if returned == session_id => Ok(serde_json::json!({
-            "schema": "haider.session_provider_rebind.v1", "session_id": returned,
-            "provider": provider, "base_url": base_url, "account": account,
-            "selected_seq": selected_seq, "worker_generation": worker_generation,
-        })),
+            output_budget,
+        } if returned == session_id => {
+            if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
+                eprintln!("haider session provider rebind: {}", clamp.notice());
+            }
+            let mut result = serde_json::json!({
+                "schema": "haider.session_provider_rebind.v1", "session_id": returned,
+                "provider": provider, "base_url": base_url, "account": account,
+                "selected_seq": selected_seq, "worker_generation": worker_generation,
+            });
+            if let Some(budget) = output_budget {
+                result["output_budget"] = serde_json::json!(budget);
+            }
+            Ok(result)
+        }
         ResponseBody::Error { code, message, .. } => Err(format!("{code}: {message}")),
         _ => Err("unexpected session.provider.rebind response".into()),
     }

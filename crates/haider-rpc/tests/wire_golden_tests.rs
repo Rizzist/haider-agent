@@ -4189,6 +4189,47 @@ fn session_select_model_output_budget_fields_are_golden() {
     );
 }
 
+#[test]
+fn session_provider_rebind_output_budget_is_additive_and_golden() {
+    use haider_rpc::haider_protocol::output_budget::{
+        OutputBudgetClampV1, SessionOutputBudgetSourceV1, SessionOutputBudgetV1,
+    };
+    let old = r#"{"method":"session.provider.rebind","session_id":"session-1","provider":"haider-code","base_url":null,"account":null,"selected_seq":43,"worker_generation":7}"#;
+    let decoded: ResponseBody = serde_json::from_str(old).expect("older response decodes");
+    assert!(matches!(
+        decoded,
+        ResponseBody::SessionProviderRebind {
+            output_budget: None,
+            ..
+        }
+    ));
+    let body = ResponseBody::SessionProviderRebind {
+        session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+        provider: "haider-code".into(),
+        base_url: None,
+        account: None,
+        selected_seq: 43,
+        worker_generation: 7,
+        output_budget: Some(SessionOutputBudgetV1 {
+            max_tokens: 8_192,
+            source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+            clamped: Some(OutputBudgetClampV1 {
+                requested: 20_000,
+                max_output_tokens: 8_192,
+            }),
+        }),
+    };
+    let encoded = serde_json::to_string(&body).expect("encode new response");
+    assert_eq!(
+        encoded,
+        r#"{"method":"session.provider.rebind","session_id":"session-1","provider":"haider-code","base_url":null,"account":null,"selected_seq":43,"worker_generation":7,"output_budget":{"max_tokens":8192,"source":{"kind":"user_set","requested":20000},"clamped":{"requested":20000,"max_output_tokens":8192}}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ResponseBody>(&encoded).expect("decode new response"),
+        body
+    );
+}
+
 /// The full pair-selection request and its response are golden: the request
 /// carries the optional provider attribute of the selected model row, and
 /// the response reports the RESOLVED pair plus committed fact coordinates.

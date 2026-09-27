@@ -16775,15 +16775,11 @@ impl HubConnection {
                 None,
             );
         }
-        if model.trim().is_empty() || max_tokens > haider_provider::MAX_OUTPUT_LIMIT {
+        if model.trim().is_empty() {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                &format!(
-                    "session model must be non-empty and max_tokens must be in 0..={} \
-                     (0 derives the model default)",
-                    haider_provider::MAX_OUTPUT_LIMIT
-                ),
+                "session model must be non-empty",
                 false,
                 None,
             );

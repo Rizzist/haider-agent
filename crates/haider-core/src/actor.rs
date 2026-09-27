@@ -3230,6 +3230,8 @@ pub struct ProviderRebindTarget {
     pub account: Option<CredentialAlias>,
     pub account_incarnation: Option<u64>,
     pub context_window: Option<u64>,
+    /// Effective output budget committed with the durable pair rebind.
+    pub max_tokens: u64,
     pub cached_input_is_subset: bool,
     pub provider_request_state: ProviderDerivedRequestState,
     pub auth_scope: String,
@@ -5460,6 +5462,8 @@ impl HarnessActor {
                             &mut latest_compaction_summary_end,
                         );
                         self.config.context_window = target.context_window;
+                        self.config.max_tokens = target.max_tokens;
+                        self.config.reserved_output_tokens = target.max_tokens;
                         self.config.cached_input_is_subset = target.cached_input_is_subset;
                         self.config
                             .install_provider_derived_request_state(&target.provider_request_state);

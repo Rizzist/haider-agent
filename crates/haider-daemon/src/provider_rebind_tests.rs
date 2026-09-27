@@ -87,6 +87,9 @@ async fn commit_test_rebind(
         provider: "fake".into(),
         base_url: Some("http://127.0.0.1:31701/v1".into()),
         account: Some("selected-account".into()),
+        max_tokens: 4096,
+        max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        clamped: None,
         event_id: EventId::new(format!("rebound-{session_id}-{ordinal}")),
         device_id: DeviceId::new("rebind-test-device"),
     })
@@ -310,6 +313,55 @@ fn rebound_recovery_headless_spec() -> HeadlessRunSpecV1 {
     .expect("headless spec")
 }
 
+#[tokio::test]
+async fn headless_recovery_keeps_accepted_budget_when_rebind_predates_run() {
+    let root = tempfile::tempdir().expect("store root");
+    let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+        .await
+        .expect("hub");
+    let session_id = SessionId::new("prebound-headless-budget");
+    create_rebind_test_session(&hub, &session_id).await;
+    commit_test_rebind(&hub, &session_id, store.worker_generation(), 1).await;
+    let run_id = RunId::new("prebound-headless-run");
+    hub.accept_internal_turn(haider_core::TurnAcceptCommand {
+        command_id: "prebound-accept".into(),
+        request_digest: "prebound-accept-digest".into(),
+        request_json: "{}".into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: run_id.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: "headless pinned request".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+        queued_event_id: EventId::new("prebound-queued"),
+        user_event_id: EventId::new("prebound-user"),
+        active_event_id: EventId::new("prebound-active"),
+        device_id: DeviceId::new("prebound-device"),
+    })
+    .await
+    .expect("accepted run");
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("lease");
+    let mut metadata = lease
+        .session_metadata()
+        .await
+        .expect("read")
+        .expect("typed");
+    assert_eq!(metadata.max_tokens, 4096);
+    let spec = rebound_recovery_headless_spec();
+    super::pin_headless_turn_metadata(&mut metadata, &spec, &lease, &run_id)
+        .await
+        .expect("pin earlier rebind");
+    assert_eq!(metadata.max_tokens, 513);
+    drop(lease);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// MUTATION CHECK: restore the old headless provider, use mutable metadata's
 /// pending model, or call the generic lockdown binder with the rebound provider.
 /// Any of those changes prevents the resumed turn from sending this request.
@@ -446,6 +498,15 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
             provider: "fake-b".into(),
             base_url: Some("http://127.0.0.1:31702/v1".into()),
             account: Some("fake-b-account".into()),
+            max_tokens: 8192,
+            max_tokens_source:
+                haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                    requested: 20_000,
+                },
+            clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                requested: 20_000,
+                max_output_tokens: 8192,
+            }),
             event_id: EventId::new("recovery-rebound"),
             device_id: device_id.clone(),
         })
@@ -535,11 +596,12 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
         if headless {
             assert_eq!(calls[0].effort.as_deref(), Some("high"));
             assert!(calls[0].fast);
-            assert_eq!(calls[0].max_tokens, 513);
+            assert_eq!(calls[0].max_tokens, 8192);
         }
         let requests = provider.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].model, expected_model);
+        assert_eq!(requests[0].max_tokens, 8192);
         assert_eq!(
             hub.bound_lockdown_run(&session_id, &run_id)
                 .expect("frozen authority"),

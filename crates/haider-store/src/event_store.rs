@@ -1421,6 +1421,9 @@ pub struct SessionProviderRebindCommand {
     pub provider: String,
     pub base_url: Option<String>,
     pub account: Option<String>,
+    pub max_tokens: u64,
+    pub max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1,
+    pub clamped: Option<haider_protocol::output_budget::OutputBudgetClampV1>,
     pub event_id: EventId,
     pub device_id: DeviceId,
 }
@@ -1436,6 +1439,12 @@ pub struct ReboundSessionProvider {
     pub account: Option<String>,
     pub selected_seq: u64,
     pub worker_generation: u64,
+    #[serde(default)]
+    pub max_tokens: u64,
+    #[serde(default)]
+    pub max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clamped: Option<haider_protocol::output_budget::OutputBudgetClampV1>,
 }
 
 /// Atomic metadata/event/receipt outcome for one session provider rebind.
@@ -10903,11 +10912,24 @@ impl Store {
         &self,
         command: &SessionProviderRebindCommand,
     ) -> StoreResult<SessionProviderRebindOutcome> {
+        if command.max_tokens == 0 {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "rebind output budget must be positive",
+                false,
+            ));
+        }
+        let output_budget = haider_protocol::output_budget::SessionOutputBudgetV1 {
+            max_tokens: command.max_tokens,
+            source: command.max_tokens_source,
+            clamped: command.clamped,
+        };
         let rebound = SessionProviderRebound {
             rebind_id: command.command_id.clone(),
             provider: command.provider.clone(),
             base_url: command.base_url.clone(),
             account: command.account.clone(),
+            output_budget: Some(output_budget),
         };
         let fact = rebound.to_payload_value().map_err(|error| {
             store_error(
@@ -10940,6 +10962,9 @@ impl Store {
                 account: command.account.clone(),
                 selected_seq,
                 worker_generation: generation,
+                max_tokens: output_budget.max_tokens,
+                max_tokens_source: output_budget.source,
+                clamped: output_budget.clamped,
             },
         )?;
         Ok(match outcome {
