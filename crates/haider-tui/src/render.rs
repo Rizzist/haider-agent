@@ -10769,7 +10769,10 @@ fn render_subagent(
     let menu = if model.login.is_some() {
         None
     } else {
-        chip.question_menu()
+        chip.question_menu().filter(|menu| {
+            !crate::app::is_deferred_approval(menu)
+                || model.visible_spend_card().as_ref() == Some(&menu.id)
+        })
     };
     let needed_input = menu.map_or_else(
         || composer_height(model, area.width),

@@ -430,6 +430,7 @@ fn a_selected_api_key_account_triggers_model_discovery() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let pass = live_pass(

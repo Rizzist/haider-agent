@@ -1,8 +1,9 @@
-//! `usage.reset_apply` and the human answer to its deferred approval menu.
+//! `usage.reset_apply` and the accepted answer to its deferred approval menu.
 //! The two-phase contract is documented in [`crate::usage_reset`].
 
 use super::*;
 use crate::usage_reset;
+use haider_protocol::credential::UsageResetAccountBinding;
 use haider_protocol::effect::{AuthorizationVerdict, EffectOutcome};
 use haider_protocol::usage::{
     USAGE_RESET_APPLY_RESULT_EXTENSION, UsageResetApplyResultV1, UsageResetApplyStatusV1,
@@ -77,6 +78,21 @@ impl HubConnection {
                 None,
             );
         }
+        if let Some(parked) = self.parked_usage_reset(&session_id, &approval_id).await? {
+            if parked.account != account {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "command id was already used for another usage reset account",
+                    false,
+                    None,
+                );
+            }
+            let terminal = self
+                .terminal_usage_reset_result(&session_id, &approval_id, parked.seq)
+                .await?;
+            return self.send_usage_reset_response(request_id, approval_id, parked, terminal);
+        }
         let Some(service) = self.hub.usage_report_service()? else {
             return self.respond_error(
                 request_id,
@@ -95,25 +111,15 @@ impl HubConnection {
                 None,
             );
         }
-        if let Some(parked) = self.parked_usage_reset(&session_id, &approval_id).await? {
-            if parked.account != account {
-                return self.respond_error(
-                    request_id,
-                    ERROR_CODE_INVALID_ARGUMENT,
-                    "command id was already used for another usage reset account",
-                    false,
-                    None,
-                );
-            }
-            return self.send_usage_reset_pending(
+        let Some(binding) = service.reset_binding(&account) else {
+            return self.respond_error(
                 request_id,
-                approval_id,
-                account,
-                parked.menu_id,
-                parked.seq,
-                parked.worker_generation,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "reset account identity is incomplete",
+                false,
+                None,
             );
-        }
+        };
 
         let latest_seq = self.hub.inner.store.latest_seq(&session_id).await?;
         let mut head = self
@@ -136,7 +142,8 @@ impl HubConnection {
                 None,
             );
         };
-        let menu = usage_reset::approval_menu(&approval_id, &account);
+        let intent = usage_reset::bound_intent(&approval_id, &account, Some(&binding));
+        let menu = usage_reset::bound_approval_menu(&approval_id, &account, Some(&binding));
         let menu_id = menu.id.clone();
         let effect = intent.effect.clone();
         let scope = ResetEventScope {
@@ -172,13 +179,16 @@ impl HubConnection {
         )?;
         self.hub.append(&mut envelopes).await?;
         let opening = &envelopes[2];
-        self.send_usage_reset_pending(
+        self.send_usage_reset_response(
             request_id,
             approval_id,
-            account,
-            menu_id,
-            opening.seq,
-            opening.worker_generation,
+            ParkedApproval {
+                account,
+                menu_id,
+                seq: opening.seq,
+                worker_generation: opening.worker_generation,
+            },
+            None,
         )
     }
 
@@ -214,6 +224,7 @@ impl HubConnection {
                             approval_id: stored_id,
                             effect: EffectClass::UsageResetApply,
                             account: Some(account),
+                            ..
                         },
                     id: menu_id,
                     ..
@@ -236,26 +247,73 @@ impl HubConnection {
         }
     }
 
-    fn send_usage_reset_pending(
+    /// Repeated commands return their existing terminal fact, including
+    /// after a restart. Search from the matching opening forward.
+    async fn terminal_usage_reset_result(
+        &self,
+        session_id: &SessionId,
+        approval_id: &str,
+        opening_seq: u64,
+    ) -> Result<Option<UsageResetApplyResultV1>, SessionHubError> {
+        let mut cursor = opening_seq.saturating_sub(1);
+        loop {
+            let page = self
+                .hub
+                .inner
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    session_id,
+                    cursor,
+                    REPLAY_PAGE_SIZE,
+                )
+                .await?;
+            if page.is_empty() {
+                return Ok(None);
+            }
+            let page_len = page.len();
+            cursor = page.last().map_or(cursor, |event| event.seq);
+            for event in page {
+                let Ok(EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data },
+                    ..
+                })) = event.payload.decode_event()
+                else {
+                    continue;
+                };
+                if kind == USAGE_RESET_APPLY_RESULT_EXTENSION
+                    && let Ok(result) = serde_json::from_value::<UsageResetApplyResultV1>(data)
+                    && result.approval_id == approval_id
+                {
+                    return Ok(Some(result));
+                }
+            }
+            if page_len < REPLAY_PAGE_SIZE {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn send_usage_reset_response(
         &self,
         request_id: RequestId,
         approval_id: String,
-        account: CredentialAlias,
-        menu_id: MenuId,
-        request_seq: u64,
-        worker_generation: u64,
+        parked: ParkedApproval,
+        terminal: Option<UsageResetApplyResultV1>,
     ) -> Result<(), SessionHubError> {
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::UsageResetApply {
-                result: usage_reset::result(
-                    &approval_id,
-                    &account,
-                    UsageResetApplyStatusV1::ApprovalPending,
-                ),
-                menu_id,
-                request_seq,
-                worker_generation,
+                result: terminal.unwrap_or_else(|| {
+                    usage_reset::result(
+                        &approval_id,
+                        &parked.account,
+                        UsageResetApplyStatusV1::ApprovalPending,
+                    )
+                }),
+                menu_id: parked.menu_id,
+                request_seq: parked.seq,
+                worker_generation: parked.worker_generation,
             },
         })
     }
@@ -291,7 +349,7 @@ impl HubConnection {
         Ok(menu.id == *menu_id && matches!(menu.kind, MenuKind::DeferredApproval { .. }))
     }
 
-    /// Claims one committed human answer. The durable `Dispatched` fact is
+    /// Claims one committed menu answer. The durable `Dispatched` fact is
     /// written before handing provider work to a hub-owned task. A restart
     /// never resumes that task, even when its provider outcome is unknown.
     pub(super) async fn finish_usage_reset_approval(
@@ -299,13 +357,22 @@ impl HubConnection {
         answered: &RawEnvelope,
         account: &CredentialAlias,
         approval_id: &str,
+        binding: Option<&UsageResetAccountBinding>,
         answer: &DurableMenuAnswer,
     ) -> Result<(), SessionHubError> {
         let approved = usage_reset::answered_option_key(answer.option_key.as_deref())
             == usage_reset::APPROVE_OPTION_KEY;
+        let account_changed = match (binding, self.hub.usage_report_service()?) {
+            (Some(binding), Some(service)) => !service.reset_binding_matches(account, binding),
+            _ => true,
+        };
         let effect = usage_reset::effect_id(approval_id);
         let scope = ResetEventScope::after(answered);
-        let final_verdict = if approved {
+        let final_verdict = if account_changed {
+            AuthorizationVerdict::Deny {
+                reason: usage_reset::ACCOUNT_CHANGED_REASON.into(),
+            }
+        } else if approved {
             AuthorizationVerdict::Allow
         } else {
             AuthorizationVerdict::Deny {
@@ -320,7 +387,7 @@ impl HubConnection {
             }),
             PromptRender::Omit,
         )];
-        if approved {
+        if approved && !account_changed {
             authorization.push((
                 "dispatched",
                 EventPayload::Effect(EffectPhase::Dispatched {
@@ -334,6 +401,19 @@ impl HubConnection {
                 .usage_reset_envelopes(&scope, approval_id, "authorization", authorization)?;
         self.hub.append(&mut authorization).await?;
 
+        if account_changed {
+            let result =
+                usage_reset::failed(approval_id, account, usage_reset::ACCOUNT_CHANGED_REASON);
+            let delivered = self
+                .hub
+                .notify_usage_reset_result(&answered.session_id, approval_id, &result)
+                .await?;
+            self.hub
+                .record_usage_reset_terminal(answered, approval_id, false, &result, delivered)
+                .await?;
+            return Ok(());
+        }
+
         // The hub joins these tasks during graceful shutdown (before closing
         // session actors) and aborts them on forced shutdown. An aborted POST
         // remains unconfirmed in the journal and is deliberately never retried
@@ -346,9 +426,16 @@ impl HubConnection {
                 let answered = answered.clone();
                 let account = account.clone();
                 let approval_id = approval_id.to_owned();
+                let binding = binding.cloned();
                 tasks.push(tokio::spawn(async move {
                     if let Err(error) = hub
-                        .complete_usage_reset_approval(&answered, &account, &approval_id, approved)
+                        .complete_usage_reset_approval(
+                            &answered,
+                            &account,
+                            &approval_id,
+                            approved,
+                            binding.as_ref(),
+                        )
                         .await
                     {
                         tracing::error!(%approval_id, ?error, "usage reset completion failed");
@@ -384,9 +471,10 @@ impl SessionHub {
         account: &CredentialAlias,
         approval_id: &str,
         approved: bool,
+        binding: Option<&UsageResetAccountBinding>,
     ) -> Result<(), SessionHubError> {
         let result = if approved {
-            self.apply_approved_usage_reset(account, approval_id)
+            self.apply_approved_usage_reset(account, approval_id, binding)
                 .await?
         } else {
             usage_reset::result(approval_id, account, UsageResetApplyStatusV1::Denied)
@@ -471,7 +559,15 @@ impl SessionHub {
         &self,
         account: &CredentialAlias,
         approval_id: &str,
+        binding: Option<&UsageResetAccountBinding>,
     ) -> Result<UsageResetApplyResultV1, SessionHubError> {
+        let Some(binding) = binding else {
+            return Ok(usage_reset::failed(
+                approval_id,
+                account,
+                usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        };
         let Some(service) = self.usage_report_service()? else {
             return Ok(usage_reset::failed(
                 approval_id,
@@ -479,13 +575,18 @@ impl SessionHub {
                 "usage_subsystem_unavailable",
             ));
         };
-        Ok(match service.apply_reset(account, approval_id).await {
-            Ok(windows_reset) => UsageResetApplyResultV1 {
-                windows_reset: Some(windows_reset),
-                ..usage_reset::result(approval_id, account, UsageResetApplyStatusV1::Applied)
+        Ok(
+            match service
+                .apply_bound_reset(account, approval_id, binding)
+                .await
+            {
+                Ok(windows_reset) => UsageResetApplyResultV1 {
+                    windows_reset: Some(windows_reset),
+                    ..usage_reset::result(approval_id, account, UsageResetApplyStatusV1::Applied)
+                },
+                Err(error) => usage_reset::failed(approval_id, account, error.reason),
             },
-            Err(error) => usage_reset::failed(approval_id, account, error.reason),
-        })
+        )
     }
 
     /// Steers the result into the session's active run, if any. A delivery

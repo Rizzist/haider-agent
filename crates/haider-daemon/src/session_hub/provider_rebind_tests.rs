@@ -160,6 +160,7 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         };
         hub.install_accounts(crate::accounts::AccountsFacade {

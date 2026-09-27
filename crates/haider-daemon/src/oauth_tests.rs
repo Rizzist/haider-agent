@@ -1742,6 +1742,7 @@ async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let vault = Arc::new(MemoryVault::new());
@@ -1783,6 +1784,7 @@ async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
         active: false,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let now = now_ms().expect("clock");
@@ -3778,6 +3780,7 @@ fn oauth_descriptor_for_test() -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -6063,6 +6066,7 @@ async fn auth_aware_broker_keeps_api_keys_raw_and_never_treats_bundle_as_bearer(
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     vault
@@ -6239,6 +6243,7 @@ async fn late_refresh_failure_after_remove_readd_cannot_expire_the_replacement()
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     *snapshot.lock().expect("snapshot") = vec![replacement.clone()];

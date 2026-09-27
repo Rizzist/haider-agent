@@ -29,6 +29,7 @@ fn oauth_descriptor(provider: &str, alias: &str) -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
 }

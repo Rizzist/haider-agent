@@ -1,15 +1,22 @@
-//! Credit safety for the nonblocking, agent-initiated usage-reset card: it
-//! must never steal composer keystrokes, and no positional default (Enter, a
-//! typed digit, a stale selection) may ever answer `approve`.
+//! Credit safety for the nonblocking, agent-initiated usage-reset card:
+//! only local gestures on its visible rows may answer it, and no positional
+//! default (Enter, a typed digit, a stale selection) may answer `approve`.
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
 use haider_protocol::effect::EffectClass;
-use haider_protocol::ids::{CredentialAlias, MenuId};
+use haider_protocol::ids::{CredentialAlias, MenuId, SessionId};
 use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
-use haider_tui::app::{AppEvent, AppModel, ChipModel, ChipQuestion, Screen};
+use haider_rpc::SurfaceInjectOp;
+use haider_tui::app::{
+    AppEvent, AppModel, AppRequest, ChipModel, ChipQuestion, Hit, RuntimeMode, Screen,
+};
+use haider_tui::clipboard::FakeClipboard;
+use haider_tui::live::{LiveDriver, LiveReply};
+use haider_tui::runtime::{attach_read_effects, clipboard_paste_effects};
 use haider_tui::script::{ChipDisplayState, ChipSeed};
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{Terminal, backend::TestBackend};
 
 mod common;
 use common::{key, launcher_model, submit};
@@ -22,6 +29,7 @@ fn reset_card() -> Menu {
             approval_id: "usage-reset-card-test".into(),
             effect: EffectClass::UsageResetApply,
             account: Some(CredentialAlias::new("work-chatgpt")),
+            binding: None,
         },
         title: "Apply a usage reset credit?".into(),
         body: vec!["Account: work-chatgpt".into()],
@@ -51,6 +59,7 @@ fn session_with_card(typed: &str) -> AppModel {
     let mut model = launcher_model();
     submit(&mut model, "work on the repo");
     model.outbox.clear();
+    model.requests.clear();
     for c in typed.chars() {
         model.handle(key(KeyCode::Char(c)));
     }
@@ -313,4 +322,646 @@ fn chip_view_reset_card_needs_an_explicit_down() {
     model.handle(key(KeyCode::Down));
     model.handle(key(KeyCode::Enter));
     assert_eq!(answered_keys(&model), vec![Some("approve".to_owned())]);
+}
+
+fn assert_injected_submit_does_not_answer(navigate: bool) {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    let session = SessionId::new("synthetic-reset-session");
+    model.active_session = Some(session.clone());
+    if navigate {
+        model.handle(key(KeyCode::Down));
+    }
+    let mut driver = LiveDriver::new("synthetic-reset-client");
+    driver.apply(
+        &mut model,
+        LiveReply::InputInjected {
+            session,
+            op: SurfaceInjectOp::Submit,
+        },
+    );
+    assert!(answered_keys(&model).is_empty());
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::SubmitText { .. }))
+    );
+}
+
+#[test]
+fn injected_submit_on_fresh_deny_answers_nothing() {
+    assert_injected_submit_does_not_answer(false);
+}
+
+#[test]
+fn injected_submit_after_local_down_answers_nothing() {
+    assert_injected_submit_does_not_answer(true);
+}
+
+fn assert_remote_edit_clear_then_submit(edit: SurfaceInjectOp) {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    let session = SessionId::new("synthetic-reset-session");
+    model.active_session = Some(session.clone());
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Char('x')));
+    let mut driver = LiveDriver::new("synthetic-reset-client");
+    driver.apply(
+        &mut model,
+        LiveReply::InputInjected {
+            session: session.clone(),
+            op: edit,
+        },
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::InputInjected {
+            session: session.clone(),
+            op: SurfaceInjectOp::Clear,
+        },
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::InputInjected {
+            session,
+            op: SurfaceInjectOp::Submit,
+        },
+    );
+    assert!(answered_keys(&model).is_empty());
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("card")),
+        0
+    );
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(answered_keys(&model), vec![Some("deny".to_owned())]);
+}
+
+#[test]
+fn injected_clear_after_draft_does_not_restore_apply() {
+    assert_remote_edit_clear_then_submit(SurfaceInjectOp::Set { text: "x".into() });
+}
+
+#[test]
+fn injected_set_empty_after_draft_does_not_restore_apply() {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    let session = SessionId::new("synthetic-reset-session");
+    model.active_session = Some(session.clone());
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Char('x')));
+    let mut driver = LiveDriver::new("synthetic-reset-client");
+    driver.apply(
+        &mut model,
+        LiveReply::InputInjected {
+            session: session.clone(),
+            op: SurfaceInjectOp::Set {
+                text: String::new(),
+            },
+        },
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::InputInjected {
+            session,
+            op: SurfaceInjectOp::Submit,
+        },
+    );
+    assert!(answered_keys(&model).is_empty());
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("card")),
+        0
+    );
+}
+
+#[test]
+fn injected_insert_then_clear_does_not_restore_apply() {
+    assert_remote_edit_clear_then_submit(SurfaceInjectOp::Insert {
+        text: "synthetic".into(),
+    });
+}
+
+#[test]
+fn injected_submit_cannot_answer_a_chip_spend_card() {
+    let mut model = chip_view_with_card();
+    model.mode = RuntimeMode::Live;
+    let session = SessionId::new("synthetic-reset-session");
+    model.active_session = Some(session.clone());
+    model.handle(key(KeyCode::Down));
+    let mut driver = LiveDriver::new("synthetic-reset-client");
+    driver.apply(
+        &mut model,
+        LiveReply::InputInjected {
+            session,
+            op: SurfaceInjectOp::Submit,
+        },
+    );
+    assert!(answered_keys(&model).is_empty());
+}
+
+#[test]
+fn remote_clear_and_mirror_replacement_retire_apply_navigation() {
+    for mirror in [false, true] {
+        let mut model = session_with_card_no_history();
+        model.mode = RuntimeMode::Live;
+        let session = SessionId::new("synthetic-reset-session");
+        model.active_session = Some(session.clone());
+        model.handle(key(KeyCode::Down));
+        model.handle(key(KeyCode::Char('x')));
+        assert!(model.select_menu().is_none());
+        if mirror {
+            model.handle(AppEvent::SurfaceInputReplace {
+                text: String::new(),
+            });
+        } else {
+            let mut driver = LiveDriver::new("synthetic-reset-client");
+            driver.apply(
+                &mut model,
+                LiveReply::InputInjected {
+                    session,
+                    op: SurfaceInjectOp::Clear,
+                },
+            );
+        }
+        assert_eq!(
+            model.menu_display_selection(model.select_menu().expect("visible card")),
+            0
+        );
+        model.handle(key(KeyCode::Enter));
+        assert_eq!(answered_keys(&model), vec![Some("deny".to_owned())]);
+    }
+}
+
+#[test]
+fn paste_and_newline_chords_keep_the_composer_as_the_target() {
+    for event in [
+        AppEvent::Paste("synthetic pasted message".to_owned().into()),
+        AppEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+        AppEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+    ] {
+        let mut model = session_with_card_no_history();
+        model.handle(key(KeyCode::Down));
+        model.handle(event);
+        assert!(model.select_menu().is_none());
+        assert!(!model.composer.is_empty());
+        assert!(answered_keys(&model).is_empty());
+        model.handle(key(KeyCode::Enter));
+        assert!(answered_keys(&model).is_empty());
+    }
+}
+
+#[test]
+fn bracketed_paste_behind_card_submits_as_a_message() {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(SessionId::new("synthetic-reset-session"));
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::Paste(
+        "synthetic bracketed paste".to_owned().into(),
+    ));
+    model.handle(key(KeyCode::Enter));
+    assert!(answered_keys(&model).is_empty());
+    assert!(model.requests.iter().any(|request| matches!(request,
+        AppRequest::SubmitText { text, .. } if text == "synthetic bracketed paste")));
+}
+
+#[test]
+fn alt_enter_behind_card_inserts_newline_without_answer() {
+    let mut model = session_with_card_no_history();
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::ALT,
+    )));
+    assert_eq!(model.composer.text(), "\n");
+    assert!(answered_keys(&model).is_empty());
+}
+
+#[test]
+fn shift_enter_behind_card_inserts_newline_without_answer() {
+    let mut model = session_with_card_no_history();
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::SHIFT,
+    )));
+    assert_eq!(model.composer.text(), "\n");
+    assert!(answered_keys(&model).is_empty());
+}
+
+fn attach_synthetic_file(model: &mut AppModel) -> tempfile::TempDir {
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned());
+    model.daemon_version = Some("0.0.972".to_owned());
+    let directory = tempfile::tempdir().expect("synthetic attachment directory");
+    let path = directory.path().join("synthetic.txt");
+    std::fs::write(&path, b"synthetic attachment body\n").expect("synthetic attachment file");
+    submit(model, &format!("/attach {}", path.display()));
+    assert!(model.requests.iter().any(|request| matches!(request,
+        AppRequest::AttachRead { path: requested } if requested.as_str() == path.to_string_lossy().as_ref())));
+    attach_read_effects(model, &path.to_string_lossy());
+    assert_eq!(model.composer.attachments().len(), 1);
+    directory
+}
+
+fn assert_attachment_only_draft(ready: bool) {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(SessionId::new("synthetic-reset-session"));
+    model.handle(key(KeyCode::Down));
+    let _directory = attach_synthetic_file(&mut model);
+    if ready {
+        let upload = model.composer.attachments()[0].upload;
+        let surface = model.surface_key();
+        let mut driver = LiveDriver::new("synthetic-reset-client");
+        driver.apply(
+            &mut model,
+            LiveReply::ArtifactUploaded {
+                upload,
+                surface,
+                artifact: haider_protocol::ids::ArtifactRef::new("synthetic-cas-ref"),
+            },
+        );
+    }
+    assert!(model.select_menu().is_none());
+    model.handle(key(KeyCode::Enter));
+    assert!(answered_keys(&model).is_empty());
+    if ready {
+        assert!(model.requests.iter().any(|request| matches!(request,
+            AppRequest::SubmitText { text, attachments, .. }
+                if text.is_empty() && attachments.len() == 1)));
+    } else {
+        assert!(
+            !model
+                .requests
+                .iter()
+                .any(|request| matches!(request, AppRequest::SubmitText { .. }))
+        );
+    }
+}
+
+#[test]
+fn inflight_file_attachment_hides_card_without_submission() {
+    assert_attachment_only_draft(false);
+}
+
+#[test]
+fn ready_file_attachment_submits_without_answering_card() {
+    assert_attachment_only_draft(true);
+}
+
+#[test]
+fn pending_image_without_text_hides_spend_card() {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(SessionId::new("synthetic-reset-session"));
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned());
+    model.daemon_version = Some("0.0.972".to_owned());
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('v'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(
+        model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::ClipboardRead))
+    );
+    clipboard_paste_effects(&mut model, &FakeClipboard::image(2, 2));
+    assert_eq!(model.composer.attachments().len(), 1);
+    assert!(model.select_menu().is_none());
+    model.handle(key(KeyCode::Enter));
+    assert!(answered_keys(&model).is_empty());
+}
+
+#[test]
+fn stale_spending_card_hit_and_hover_do_not_act_after_draft_hides_it() {
+    let mut model = session_with_card_no_history();
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Char('x')));
+    let hit = Hit::MenuOption {
+        menu: reset_card().id,
+        index: 1,
+    };
+    model.handle_hover(Some(hit.clone()));
+    model.handle_hit(hit);
+    assert!(answered_keys(&model).is_empty());
+    assert_eq!(
+        model.menu_selection, 1,
+        "the prior raw row may remain, but hover cannot change it"
+    );
+    model.handle(key(KeyCode::Backspace));
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("visible card")),
+        0
+    );
+}
+
+#[test]
+fn hidden_card_hit_does_not_change_the_prior_raw_selection() {
+    let mut model = session_with_card_no_history();
+    model.handle(key(KeyCode::Down));
+    assert_eq!(model.menu_selection, 1);
+    model.handle(key(KeyCode::Char('x')));
+    model.handle_hit(Hit::MenuOption {
+        menu: reset_card().id,
+        index: 0,
+    });
+    assert_eq!(model.menu_selection, 1);
+    assert!(answered_keys(&model).is_empty());
+}
+
+#[test]
+fn chip_up_without_down_cannot_grant_hover_selection_ownership() {
+    let mut model = chip_view_with_card();
+    model.handle(key(KeyCode::Up));
+    model.handle_hover(Some(Hit::MenuOption {
+        menu: reset_card().id,
+        index: 1,
+    }));
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        answered_keys(&model)
+            .iter()
+            .all(|answer| answer.as_deref() != Some("approve"))
+    );
+}
+
+#[test]
+fn foreign_empty_replacement_while_card_is_navigated_retires_apply() {
+    let mut model = session_with_card_no_history();
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::SurfaceInputReplace {
+        text: String::new(),
+    });
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("card")),
+        0
+    );
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(answered_keys(&model), vec![Some("deny".to_owned())]);
+}
+
+#[test]
+fn pasting_then_deleting_to_empty_restores_deny() {
+    let mut model = session_with_card_no_history();
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::Paste("x".to_owned().into()));
+    model.handle(key(KeyCode::Backspace));
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("card")),
+        0
+    );
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(answered_keys(&model), vec![Some("deny".to_owned())]);
+}
+
+#[test]
+fn newline_then_deleting_to_empty_restores_deny() {
+    let mut model = session_with_card_no_history();
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::ALT,
+    )));
+    model.handle(key(KeyCode::Backspace));
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("card")),
+        0
+    );
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(answered_keys(&model), vec![Some("deny".to_owned())]);
+}
+
+#[test]
+fn removed_attachment_restores_deny_without_apply_navigation() {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(SessionId::new("synthetic-reset-session"));
+    model.handle(key(KeyCode::Down));
+    let _directory = attach_synthetic_file(&mut model);
+    assert!(model.select_menu().is_none());
+    model.handle(key(KeyCode::Backspace));
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("card")),
+        0
+    );
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(answered_keys(&model), vec![Some("deny".to_owned())]);
+}
+
+#[test]
+fn replaced_card_drops_old_frame_hit_and_hover() {
+    let mut model = session_with_card_no_history();
+    let old_id = reset_card().id;
+    let mut replacement = reset_card();
+    replacement.id = MenuId::new("replacement-reset-card");
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+        replacement,
+    ))));
+    let old_hit = Hit::MenuOption {
+        menu: old_id,
+        index: 1,
+    };
+    model.handle_hover(Some(old_hit.clone()));
+    model.handle_hit(old_hit);
+    assert!(answered_keys(&model).is_empty());
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("new card")),
+        0
+    );
+}
+
+#[test]
+fn overlay_drops_stale_apply_hit() {
+    let mut model = session_with_card_no_history();
+    model.handle(key(KeyCode::Down));
+    model.help_open = true;
+    model.handle_hit(Hit::MenuOption {
+        menu: reset_card().id,
+        index: 1,
+    });
+    assert!(answered_keys(&model).is_empty());
+    model.help_open = false;
+    assert_eq!(
+        model.menu_display_selection(model.select_menu().expect("card")),
+        0
+    );
+}
+
+fn assert_clipboard_text_stays_a_message(chord: Option<KeyModifiers>) {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(SessionId::new("synthetic-reset-session"));
+    model.handle(key(KeyCode::Down));
+    if let Some(modifiers) = chord {
+        model.handle(AppEvent::Key(KeyEvent::new(KeyCode::Char('v'), modifiers)));
+    } else {
+        // The runtime's captured right-click dispatches this same read.
+        model.request_clipboard_paste();
+    }
+    assert!(
+        model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::ClipboardRead))
+    );
+    clipboard_paste_effects(
+        &mut model,
+        &FakeClipboard::text_with("synthetic clipboard text"),
+    );
+    assert!(model.select_menu().is_none());
+    model.handle(key(KeyCode::Enter));
+    assert!(answered_keys(&model).is_empty());
+    assert!(model.requests.iter().any(|request| matches!(request,
+        AppRequest::SubmitText { text, .. } if text == "synthetic clipboard text")));
+}
+
+#[test]
+fn ctrl_v_on_visible_spend_card_inserts_clipboard_text() {
+    assert_clipboard_text_stays_a_message(Some(KeyModifiers::CONTROL));
+}
+
+#[test]
+fn cmd_v_on_visible_spend_card_inserts_clipboard_text() {
+    assert_clipboard_text_stays_a_message(Some(KeyModifiers::SUPER));
+}
+
+#[test]
+fn ctrl_shift_v_on_visible_spend_card_inserts_clipboard_text() {
+    assert_clipboard_text_stays_a_message(Some(KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+}
+
+#[test]
+fn cmd_shift_v_on_visible_spend_card_inserts_clipboard_text() {
+    assert_clipboard_text_stays_a_message(Some(KeyModifiers::SUPER | KeyModifiers::SHIFT));
+}
+
+#[test]
+fn captured_right_click_on_visible_spend_card_inserts_clipboard_text() {
+    assert_clipboard_text_stays_a_message(None);
+}
+
+#[test]
+fn large_multiline_paste_behind_card_submits_its_full_body() {
+    let mut model = session_with_card_no_history();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(SessionId::new("synthetic-reset-session"));
+    model.handle(key(KeyCode::Down));
+    let payload = format!("{}\nsecond\nthird\nfourth", "🔹".repeat(160));
+    model.handle(AppEvent::Paste(payload.clone().into()));
+    assert!(model.select_menu().is_none());
+    model.handle(key(KeyCode::Enter));
+    assert!(answered_keys(&model).is_empty());
+    assert!(model.requests.iter().any(|request| matches!(request,
+        AppRequest::SubmitText { text, .. } if text == &payload)));
+}
+
+#[test]
+fn chip_spend_card_paste_uses_the_composer() {
+    let mut model = chip_view_with_card();
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::Paste("chip synthetic paste".to_owned().into()));
+    assert_eq!(model.composer.text(), "chip synthetic paste");
+    assert!(!model.composer.is_empty());
+    model.handle(key(KeyCode::Enter));
+    assert!(answered_keys(&model).is_empty());
+}
+
+fn assert_chip_newline(modifiers: KeyModifiers) {
+    let mut model = chip_view_with_card();
+    model.handle(key(KeyCode::Down));
+    model.handle(AppEvent::Key(KeyEvent::new(KeyCode::Enter, modifiers)));
+    assert!(model.composer.text().contains('\n'));
+    assert!(!model.composer.is_empty());
+    assert!(answered_keys(&model).is_empty());
+}
+
+#[test]
+fn chip_spend_card_alt_enter_is_a_newline() {
+    assert_chip_newline(KeyModifiers::ALT);
+}
+
+#[test]
+fn chip_spend_card_shift_enter_is_a_newline() {
+    assert_chip_newline(KeyModifiers::SHIFT);
+}
+
+#[test]
+fn chip_spend_card_attachment_only_hides_card() {
+    let mut model = chip_view_with_card();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(SessionId::new("synthetic-reset-session"));
+    model.handle(key(KeyCode::Down));
+    model.screen = Screen::Session;
+    let _directory = attach_synthetic_file(&mut model);
+    model.screen = Screen::Subagent;
+    assert!(!model.composer.is_empty());
+    model.handle(key(KeyCode::Enter));
+    assert!(answered_keys(&model).is_empty());
+}
+
+#[test]
+fn chip_spend_card_stale_hit_and_hover_are_dropped() {
+    let mut model = chip_view_with_card();
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Char('x')));
+    let hit = Hit::MenuOption {
+        menu: reset_card().id,
+        index: 1,
+    };
+    model.handle_hover(Some(hit.clone()));
+    model.handle_hit(hit);
+    assert!(answered_keys(&model).is_empty());
+    model.handle(key(KeyCode::Backspace));
+    assert_eq!(
+        model.menu_display_selection(
+            model
+                .viewed_chip()
+                .and_then(ChipModel::question_menu)
+                .expect("card")
+        ),
+        0
+    );
+}
+
+#[test]
+fn replayed_pending_card_in_fresh_model_paints_and_answers_deny() {
+    let mut before_restart = session_with_card_no_history();
+    before_restart.handle(key(KeyCode::Down));
+    let pending = before_restart
+        .projection
+        .open_menu()
+        .expect("pending card")
+        .clone();
+
+    let mut resumed = launcher_model();
+    submit(&mut resumed, "resume synthetic session");
+    resumed.outbox.clear();
+    resumed.composer = haider_tui::composer::Composer::default();
+    resumed.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+        pending,
+    ))));
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            haider_tui::render::render(&resumed, frame);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let painted = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("❯ 1. Deny"), "{painted}");
+    resumed.handle(key(KeyCode::Enter));
+    assert_eq!(answered_keys(&resumed), vec![Some("deny".to_owned())]);
 }

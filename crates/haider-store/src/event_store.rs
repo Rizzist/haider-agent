@@ -11592,10 +11592,10 @@ impl Store {
             &command.request_digest,
             &command.request_json,
         )?;
-        if command.text.is_empty() {
+        if command.text.is_empty() && command.attachments.is_empty() {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
-                "turn text must not be empty",
+                "turn message content must not be empty",
                 false,
             ));
         }

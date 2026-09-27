@@ -169,6 +169,7 @@ fn models_json_vocabulary_is_stable() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     assert_eq!(

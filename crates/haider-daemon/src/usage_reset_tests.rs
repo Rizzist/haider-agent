@@ -49,6 +49,7 @@ fn approval_menu_is_nonblocking_human_only_and_secret_free() {
             approval_id: "usage-reset-abc".into(),
             effect: EffectClass::UsageResetApply,
             account: Some(account.clone()),
+            binding: None,
         }
     );
     assert!(!menu.blocking);
@@ -94,9 +95,51 @@ fn reset_policy_denial_precedes_a_deferred_menu_even_with_auto_allow() {
     );
 }
 
-/// LAW: only the explicit `approve` key approves. A keyless answer declines
-/// at EVERY index, so a positional default (Enter, `1`, an old client that
-/// answers by index) can never spend a reset credit.
+#[test]
+fn bound_reset_intent_and_menu_pin_account_id_and_incarnation() {
+    let alias = CredentialAlias::new("work-chatgpt");
+    let binding = haider_protocol::credential::UsageResetAccountBinding {
+        provider: "openai-oauth".into(),
+        account_id: "workspace-a".into(),
+        incarnation: 7,
+    };
+    let menu = bound_approval_menu("approval-a", &alias, Some(&binding));
+    assert!(matches!(menu.kind, MenuKind::DeferredApproval {
+        binding: Some(ref captured), ..
+    } if captured == &binding));
+    assert!(menu.body[0].contains("workspace-a"));
+    let first = bound_intent("approval-a", &alias, Some(&binding));
+    let mut changed = binding.clone();
+    changed.incarnation += 1;
+    assert_ne!(
+        first.args_digest,
+        bound_intent("approval-a", &alias, Some(&changed)).args_digest
+    );
+    changed = binding.clone();
+    changed.account_id = "workspace-b".into();
+    assert_ne!(
+        first.args_digest,
+        bound_intent("approval-a", &alias, Some(&changed)).args_digest
+    );
+    for account_id in ["WORKSPACE-A", "workspace-a ", "workspace-a\0"] {
+        changed.account_id = account_id.into();
+        assert_ne!(
+            first.args_digest,
+            bound_intent("approval-a", &alias, Some(&changed)).args_digest
+        );
+    }
+    let long = "same-label-prefix-1234567890-a";
+    changed.account_id = long.into();
+    let long_intent = bound_intent("approval-a", &alias, Some(&changed));
+    changed.account_id = "same-label-prefix-1234567890-b".into();
+    assert_ne!(
+        long_intent.args_digest,
+        bound_intent("approval-a", &alias, Some(&changed)).args_digest
+    );
+}
+
+/// LAW: only the explicit `approve` key approves. A keyless wire answer is
+/// rejected before this helper, so a positional default cannot spend.
 ///
 /// MUTATION CHECK: map a keyless index-0 (or index-1) answer to approve.
 #[test]

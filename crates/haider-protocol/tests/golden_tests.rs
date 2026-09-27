@@ -1476,6 +1476,7 @@ fn golden_credentials() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
     );
@@ -1493,6 +1494,7 @@ fn golden_credentials() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
     );
@@ -2509,6 +2511,11 @@ fn deferred_approval_menu_is_explicitly_nonblocking_and_account_scoped() {
             approval_id: "approval-redacted".into(),
             effect: haider_protocol::effect::EffectClass::UsageResetApply,
             account: Some(CredentialAlias::new("openai-oauth")),
+            binding: Some(haider_protocol::credential::UsageResetAccountBinding {
+                provider: "openai-oauth".into(),
+                account_id: "synthetic-workspace".into(),
+                incarnation: 7,
+            }),
         },
         title: "Apply a usage reset credit?".into(),
         body: Vec::new(),
@@ -2522,7 +2529,22 @@ fn deferred_approval_menu_is_explicitly_nonblocking_and_account_scoped() {
     let value = serde_json::to_value(&menu).expect("menu json");
     assert_eq!(value["kind"]["kind"], "deferred_approval");
     assert_eq!(value["kind"]["effect"]["class"], "usage_reset_apply");
+    assert_eq!(
+        value["kind"]["binding"]["account_id"],
+        "synthetic-workspace"
+    );
+    assert_eq!(value["kind"]["binding"]["incarnation"], 7);
     assert_eq!(value["blocking"], false);
     let decoded: Menu = serde_json::from_value(value).expect("menu round trip");
     assert_eq!(decoded, menu);
+    let mut legacy = serde_json::to_value(&menu).expect("legacy menu json");
+    legacy["kind"]
+        .as_object_mut()
+        .expect("kind object")
+        .remove("binding");
+    let legacy: Menu = serde_json::from_value(legacy).expect("legacy menu round trip");
+    assert!(matches!(
+        legacy.kind,
+        MenuKind::DeferredApproval { binding: None, .. }
+    ));
 }

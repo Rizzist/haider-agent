@@ -110,6 +110,10 @@ pub enum MenuKind {
         effect: crate::effect::EffectClass,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<CredentialAlias>,
+        /// Present for spending cards opened after account binding was added.
+        /// Legacy pending cards without it fail closed on answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<crate::credential::UsageResetAccountBinding>,
     },
 }
 

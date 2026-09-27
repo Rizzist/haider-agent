@@ -59,6 +59,10 @@ impl AccountIdentity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialDescriptor {
     pub alias: CredentialAlias,
+    /// Durable daemon-minted identity for this concrete account record.
+    /// Zero only appears in pre-migration wire or stored rows.
+    #[serde(default, skip_serializing_if = "incarnation_is_zero")]
+    pub incarnation: u64,
     pub provider: String,
     /// Optional provider API root for endpoint-addressed adapters.
     ///
@@ -85,6 +89,19 @@ pub struct CredentialDescriptor {
     /// written before v0.0.964 retain `None` rather than inventing a date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
+}
+
+fn incarnation_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Immutable reset target captured when a spending card opens. The alias is
+/// carried separately by the menu for display; this is the dispatch fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageResetAccountBinding {
+    pub provider: String,
+    pub account_id: String,
+    pub incarnation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

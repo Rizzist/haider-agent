@@ -4,18 +4,19 @@
 //! 1. `usage.reset_apply` (RPC) or the `usage_reset_apply` agent tool
 //!    journals the effect intent, an `Ask` authorization and a nonblocking
 //!    [`MenuKind::DeferredApproval`] menu, then returns `approval_pending`.
-//! 2. Only a committed human menu answer, handled by the session-hub RPC,
+//! 2. A committed menu answer with accepted coordinates, handled by the session-hub RPC,
 //!    authorizes the effect. Approval journals `Dispatched` before the single
 //!    provider call and then a terminal typed result extension, which the
 //!    agent reads by polling with the returned approval id.
 //!
-//! Identifiers here are derived from request coordinates only. Nothing in
-//! this module carries tokens, provider account ids, emails or credit ids.
+//! Identifiers here are derived from request coordinates only. The durable
+//! approval binding carries a provider account id, never a bearer or credit id.
 
 #[cfg(test)]
 #[path = "usage_reset_tests.rs"]
 mod tests;
 
+use haider_protocol::credential::UsageResetAccountBinding;
 use haider_protocol::effect::{EffectClass, EffectIntent};
 use haider_protocol::ids::{CredentialAlias, EffectId, EventId, MenuId};
 use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
@@ -27,6 +28,7 @@ pub(crate) const DENY_OPTION_KEY: &str = "deny";
 /// Terminal reason when graceful drain fenced a claimed reset before its
 /// provider task was admitted; no provider request was sent.
 pub(crate) const DRAIN_FENCED_REASON: &str = "daemon_draining_provider_not_called";
+pub(crate) const ACCOUNT_CHANGED_REASON: &str = "account_changed";
 
 /// Both reset entry points check the same policy decision before parking an
 /// approval. Ordinary Allow still proceeds to a human decision.
@@ -71,34 +73,83 @@ pub(crate) fn notification_id(approval_id: &str) -> &str {
 }
 
 pub(crate) fn intent(approval_id: &str, account: &CredentialAlias) -> EffectIntent {
+    bound_intent(approval_id, account, None)
+}
+
+pub(crate) fn bound_intent(
+    approval_id: &str,
+    account: &CredentialAlias,
+    binding: Option<&UsageResetAccountBinding>,
+) -> EffectIntent {
+    let args_digest = if let Some(binding) = binding {
+        let mut hasher = blake3::Hasher::new();
+        for field in [
+            account.as_str(),
+            binding.provider.as_str(),
+            binding.account_id.as_str(),
+        ] {
+            hasher.update(&(field.len() as u64).to_be_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.update(&binding.incarnation.to_be_bytes());
+        format!("blake3:{}", hasher.finalize().to_hex())
+    } else {
+        format!(
+            "blake3:{}",
+            blake3::hash(account.as_str().as_bytes()).to_hex()
+        )
+    };
     EffectIntent {
         effect: effect_id(approval_id),
         class: EffectClass::UsageResetApply,
         summary: format!("apply one usage reset credit for {account}"),
-        args_digest: format!(
-            "blake3:{}",
-            blake3::hash(account.as_str().as_bytes()).to_hex()
-        ),
+        args_digest,
         workspace_revision: None,
     }
 }
 
+#[cfg(test)]
 pub(crate) fn approval_menu(approval_id: &str, account: &CredentialAlias) -> Menu {
+    bound_approval_menu(approval_id, account, None)
+}
+
+pub(crate) fn bound_approval_menu(
+    approval_id: &str,
+    account: &CredentialAlias,
+    binding: Option<&UsageResetAccountBinding>,
+) -> Menu {
+    let account_label = binding.map_or_else(
+        || format!("Account: {account}"),
+        |binding| {
+            let short: String = binding
+                .account_id
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(24)
+                .collect();
+            let suffix = if binding.account_id.chars().count() > 24 {
+                "…"
+            } else {
+                ""
+            };
+            format!("Account: {account} · {short}{suffix}")
+        },
+    );
     Menu {
         id: menu_id(approval_id),
         kind: MenuKind::DeferredApproval {
             approval_id: approval_id.to_owned(),
             effect: EffectClass::UsageResetApply,
             account: Some(account.clone()),
+            binding: binding.cloned(),
         },
         title: "Apply a usage reset credit?".into(),
         body: vec![
-            format!("Account: {account}"),
+            account_label,
             "This spends one limited provider-issued reset credit. Work continues while this decision is pending.".into(),
         ],
-        // Deny is option 0: the default selection, Enter, a `1` and any
-        // keyless answer all decline. Spending requires the explicit
-        // `approve` key.
+        // Deny is option 0 and the default local Enter selection. Keyless
+        // wire answers are rejected as invalid_frame, without a Deny event.
         options: vec![
             MenuOption {
                 key: DENY_OPTION_KEY.into(),
@@ -122,8 +173,8 @@ pub(crate) fn approval_menu(approval_id: &str, account: &CredentialAlias) -> Men
 }
 
 /// The option key a committed answer selected. Only the explicit `approve`
-/// key approves: an answer that names no key is a decline, whatever its
-/// index, so no positional default can ever spend a credit.
+/// key approves. The wire rejects keyless answers before this helper; the
+/// fallback remains conservative for historical journal reads.
 pub(crate) fn answered_option_key(option_key: Option<&str>) -> &str {
     option_key.unwrap_or(DENY_OPTION_KEY)
 }

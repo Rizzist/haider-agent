@@ -904,7 +904,16 @@ async fn run_provider_budget_case_inner(
             status: haider_protocol::credential::CredentialStatus::Ok,
             active: true,
             label: None,
-            account_identity: None,
+            account_identity: Some(haider_protocol::credential::AccountIdentity {
+                email: Some("synthetic@example.test".into()),
+                display_name: None,
+                account_id: Some("synthetic-account".into()),
+                plan: None,
+                issuer: None,
+                captured_at: 1,
+                verified: false,
+            }),
+            incarnation: 1,
             created_at_ms: None,
         };
         hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(

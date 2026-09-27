@@ -159,6 +159,7 @@ fn oauth_receipts_mask_the_identity_always() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
     );
@@ -197,6 +198,7 @@ fn launcher_header_carries_the_alias_never_the_identity() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
         1,

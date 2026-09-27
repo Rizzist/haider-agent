@@ -2199,6 +2199,7 @@ impl DemoDriver {
                     active: true,
                     label: None,
                     account_identity: None,
+                    incarnation: 0,
                     created_at_ms: None,
                 };
                 let revision = model.accounts.revision.map_or(1, |current| current + 1);

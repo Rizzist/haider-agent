@@ -58,6 +58,7 @@ fn descriptor(alias: &str, provider: &str, identity: &str) -> CredentialDescript
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
 }

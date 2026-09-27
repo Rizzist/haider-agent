@@ -5699,23 +5699,27 @@ impl LiveDriver {
                 // live input surface: the session is active and a session
                 // surface is on screen. Anything else ignores the op — the
                 // absence of a republish tells the injector it did not land.
-                // rev933c/d finding 4: an injected op lands only when the
-                // PLAIN session composer is the live Enter target — the
-                // single predicate that mirrors key-dispatch precedence
-                // (no login/talk-setup/engaged-talk card, no menu, no help,
-                // not the child-messaging subagent view). A synthesized
-                // Submit can therefore never activate a card row.
+                // Edits may target the composer while a deferred card is
+                // showing. Submit requires the composer to own Enter.
                 if model.active_session.as_ref() == Some(&session) && model.accepts_injected_input()
                 {
                     match op {
                         haider_rpc::SurfaceInjectOp::Set { text } => {
+                            model.retire_spend_card_navigation();
                             model.composer.set_text(text);
                         }
                         haider_rpc::SurfaceInjectOp::Insert { text } => {
+                            model.retire_spend_card_navigation();
                             model.composer.insert_str(&text);
                         }
-                        haider_rpc::SurfaceInjectOp::Clear => model.composer.clear(),
+                        haider_rpc::SurfaceInjectOp::Clear => {
+                            model.retire_spend_card_navigation();
+                            model.composer.clear();
+                        }
                         haider_rpc::SurfaceInjectOp::Submit => {
+                            if model.visible_spend_card().is_some() {
+                                return Vec::new();
+                            }
                             // Exactly the Enter path — mid-turn queue modes,
                             // command dispatch, and drafts all keep their
                             // ordinary meaning.

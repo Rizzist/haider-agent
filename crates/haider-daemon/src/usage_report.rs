@@ -38,6 +38,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentMetricsSnapshot, AgentUsageBreakdown, AgentUsageMetrics};
 use haider_protocol::credential::{
     AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
+    UsageResetAccountBinding,
 };
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
@@ -580,18 +581,24 @@ impl UsageReportService {
     }
 
     /// Applies one provider-issued reset credit. The caller must already hold
-    /// a committed human approval; this service deliberately has no policy
+    /// a committed menu approval; this service deliberately has no policy
     /// bypass or auto-approval path of its own.
-    pub(crate) async fn apply_reset(
+    pub(crate) async fn apply_bound_reset(
         &self,
         account_alias: &CredentialAlias,
         approval_id: &str,
+        binding: &UsageResetAccountBinding,
     ) -> Result<u64, MeterUnavailable> {
         let descriptor = self
             .descriptors()
             .into_iter()
             .find(|descriptor| &descriptor.alias == account_alias)
-            .ok_or_else(|| MeterUnavailable::new("account_not_found"))?;
+            .ok_or_else(|| MeterUnavailable::new(crate::usage_reset::ACCOUNT_CHANGED_REASON))?;
+        if self.binding_for_descriptor(&descriptor).as_ref() != Some(binding) {
+            return Err(MeterUnavailable::new(
+                crate::usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        }
         if !supports_reset_apply(&descriptor) {
             return Err(MeterUnavailable::new("provider_reset_not_supported"));
         }
@@ -599,12 +606,29 @@ impl UsageReportService {
             return Err(MeterUnavailable::new("credential_broker_unavailable"));
         };
         let token = tokens.bearer(&descriptor).await?;
-        let account_id = descriptor
+        // Token resolution can await refresh. Re-read the descriptor after
+        // that await and check the same snapshot used for the request header.
+        let current = self
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| &descriptor.alias == account_alias)
+            .ok_or_else(|| MeterUnavailable::new(crate::usage_reset::ACCOUNT_CHANGED_REASON))?;
+        if self.binding_for_descriptor(&current).as_ref() != Some(binding) {
+            return Err(MeterUnavailable::new(
+                crate::usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        }
+        let account_id = current
             .account_identity
             .as_ref()
             .and_then(|identity| identity.account_id.as_deref())
             .and_then(openai_workspace_account_id)
             .ok_or_else(|| MeterUnavailable::new("credential_identity_incomplete"))?;
+        if account_id != binding.account_id.as_str() {
+            return Err(MeterUnavailable::new(
+                crate::usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        }
         let response = self
             .http
             .post_json(
@@ -652,6 +676,58 @@ impl UsageReportService {
             .lock()
             .map(|descriptors| descriptors.clone())
             .unwrap_or_default()
+    }
+
+    fn binding_for_descriptor(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Option<UsageResetAccountBinding> {
+        let account_id = descriptor
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref())
+            .and_then(openai_workspace_account_id)?;
+        (descriptor.incarnation != 0 && supports_reset_apply(descriptor)).then(|| {
+            UsageResetAccountBinding {
+                provider: descriptor.provider.clone(),
+                account_id: account_id.to_owned(),
+                incarnation: descriptor.incarnation,
+            }
+        })
+    }
+
+    pub(crate) fn reset_binding(
+        &self,
+        account_alias: &CredentialAlias,
+    ) -> Option<UsageResetAccountBinding> {
+        self.descriptors()
+            .iter()
+            .find(|descriptor| &descriptor.alias == account_alias)
+            .and_then(|descriptor| self.binding_for_descriptor(descriptor))
+    }
+
+    pub(crate) fn reset_binding_matches(
+        &self,
+        account_alias: &CredentialAlias,
+        binding: &UsageResetAccountBinding,
+    ) -> bool {
+        self.reset_binding(account_alias).as_ref() == Some(binding)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn apply_reset(
+        &self,
+        account_alias: &CredentialAlias,
+        approval_id: &str,
+    ) -> Result<u64, MeterUnavailable> {
+        if !self.reset_apply_supported(account_alias) {
+            return Err(MeterUnavailable::new("provider_reset_not_supported"));
+        }
+        let binding = self
+            .reset_binding(account_alias)
+            .ok_or_else(|| MeterUnavailable::new("credential_identity_incomplete"))?;
+        self.apply_bound_reset(account_alias, approval_id, &binding)
+            .await
     }
 
     pub(crate) fn reset_apply_supported(&self, account_alias: &CredentialAlias) -> bool {
@@ -906,14 +982,14 @@ impl UsageReportService {
 /// that helper when both lanes land.
 fn openai_workspace_account_id(coordinate: &str) -> Option<&str> {
     let Some(rest) = coordinate.strip_prefix("user:") else {
-        return (!coordinate.is_empty()).then_some(coordinate);
+        return (!coordinate.trim().is_empty()).then_some(coordinate);
     };
     let (length, rest) = rest.split_once(':')?;
     let length = length.parse::<usize>().ok()?;
     let suffix = rest.get(length..)?.strip_prefix(";workspace:")?;
     let (workspace_length, workspace) = suffix.split_once(':')?;
     let workspace_length = workspace_length.parse::<usize>().ok()?;
-    (workspace_length == workspace.len() && !workspace.is_empty()).then_some(workspace)
+    (workspace_length == workspace.len() && !workspace.trim().is_empty()).then_some(workspace)
 }
 
 #[cfg(test)]
@@ -936,6 +1012,8 @@ mod account_coordinate_tests {
         );
         for malformed in [
             "",
+            "   ",
+            "user:1:u;workspace:1: ",
             "user:9:only-user;workspace:0:",
             "user:x:u;workspace:1:w",
             "user:1:u;workspace:2:w",

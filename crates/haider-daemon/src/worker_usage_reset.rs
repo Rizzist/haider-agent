@@ -38,6 +38,15 @@ impl BrokerToolDispatcher {
         if let Some(reason) = policy_denial {
             return Ok(self.permission_denial_result(reason).await);
         }
+        if let Some(approval_id) = request.approval_id.as_deref() {
+            let result = self
+                .usage_reset_status(&request.account, approval_id)
+                .await?
+                .unwrap_or_else(|| {
+                    usage_reset::failed(approval_id, &request.account, "approval_not_found")
+                });
+            return usage_reset_tool_result(&result);
+        }
         let service = self
             .output
             .store
@@ -58,16 +67,6 @@ impl BrokerToolDispatcher {
                 "provider_reset_not_supported",
             ));
         }
-        if let Some(approval_id) = request.approval_id.as_deref() {
-            let result = self
-                .usage_reset_status(&request.account, approval_id)
-                .await?
-                .unwrap_or_else(|| {
-                    usage_reset::failed(approval_id, &request.account, "approval_not_found")
-                });
-            return usage_reset_tool_result(&result);
-        }
-
         let approval_id = usage_reset::approval_id(&[
             self.session_id.as_str(),
             run_id.as_str(),
@@ -80,8 +79,15 @@ impl BrokerToolDispatcher {
         {
             return usage_reset_tool_result(&existing);
         }
-        let menu = usage_reset::approval_menu(&approval_id, &request.account);
-        let intent = usage_reset::intent(&approval_id, &request.account);
+        let Some(binding) = service.reset_binding(&request.account) else {
+            return usage_reset_tool_result(&usage_reset::failed(
+                &approval_id,
+                &request.account,
+                "credential_identity_incomplete",
+            ));
+        };
+        let menu = usage_reset::bound_approval_menu(&approval_id, &request.account, Some(&binding));
+        let intent = usage_reset::bound_intent(&approval_id, &request.account, Some(&binding));
         let effect = intent.effect.clone();
         append_payloads(
             &self.output.store,
@@ -146,6 +152,7 @@ impl BrokerToolDispatcher {
                                 approval_id: stored_id,
                                 effect: EffectClass::UsageResetApply,
                                 account: Some(stored_account),
+                                ..
                             },
                         id,
                         ..

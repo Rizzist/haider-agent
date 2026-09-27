@@ -41,8 +41,171 @@ fn descriptor(
         active,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
+}
+
+#[test]
+fn account_incarnation_is_durable_and_never_reused_after_alias_recreation() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    let alias = CredentialAlias::new("synthetic-a");
+    let mut accounts = AccountStore::new(store.clone()).unwrap();
+    accounts
+        .add(descriptor(
+            "synthetic-a",
+            "openai-oauth",
+            CredentialStatus::Ok,
+            true,
+        ))
+        .unwrap();
+    let first = accounts.get(&alias).unwrap().incarnation;
+    assert!(first > 0);
+    drop(accounts);
+    let mut accounts = AccountStore::new(store.clone()).unwrap();
+    assert_eq!(accounts.get(&alias).unwrap().incarnation, first);
+    accounts.remove(&alias).unwrap();
+    drop(accounts);
+    let mut accounts = AccountStore::new(store.clone()).unwrap();
+    accounts
+        .add(descriptor(
+            "synthetic-a",
+            "openai-oauth",
+            CredentialStatus::Ok,
+            true,
+        ))
+        .unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > first);
+}
+
+#[test]
+fn reserved_incarnation_survives_a_crash_before_descriptor_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    let abandoned = store.reserve_incarnation(0).unwrap();
+    let mut accounts = AccountStore::new(store).unwrap();
+    accounts
+        .add(descriptor(
+            "after-crash",
+            "openai-oauth",
+            CredentialStatus::Ok,
+            true,
+        ))
+        .unwrap();
+    assert!(
+        accounts
+            .get(&CredentialAlias::new("after-crash"))
+            .unwrap()
+            .incarnation
+            > abandoned
+    );
+}
+
+#[test]
+fn concurrent_store_instances_reserve_distinct_incarnations() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                store.reserve_incarnation(0).unwrap()
+            })
+        })
+        .collect();
+    let mut reserved: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    reserved.sort_unstable();
+    assert_eq!(reserved, (1..=8).collect::<Vec<_>>());
+    assert_eq!(store.reserve_incarnation(0).unwrap(), 9);
+}
+
+#[test]
+fn replacement_keeps_only_a_proven_same_account_incarnation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let alias = CredentialAlias::new("synthetic-a");
+    let mut row = descriptor("synthetic-a", "openai-oauth", CredentialStatus::Ok, true);
+    row.auth_method = AuthMethod::OAuth;
+    row.account_identity = Some(AccountIdentity {
+        email: Some("a@example.test".into()),
+        display_name: None,
+        account_id: Some("workspace-a".into()),
+        plan: None,
+        issuer: Some("fake-issuer".into()),
+        captured_at: 1,
+        verified: false,
+    });
+    accounts.add(row.clone()).unwrap();
+    let first = accounts.get(&alias).unwrap().incarnation;
+    row.account_identity.as_mut().unwrap().captured_at = 2;
+    accounts.replace(row.clone()).unwrap();
+    assert_eq!(accounts.get(&alias).unwrap().incarnation, first);
+    row.account_identity.as_mut().unwrap().email = Some("b@example.test".into());
+    accounts.replace(row.clone()).unwrap();
+    let second = accounts.get(&alias).unwrap().incarnation;
+    assert!(second > first, "changed user in one workspace must mint");
+    row.account_identity.as_mut().unwrap().account_id = Some("workspace-b".into());
+    accounts.replace(row).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > second);
+}
+
+#[test]
+fn legacy_zero_incarnation_is_minted_once_on_load() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    std::fs::write(
+        store.path(),
+        serde_json::to_vec(&vec![descriptor(
+            "legacy",
+            "openai-oauth",
+            CredentialStatus::Ok,
+            true,
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    let first = AccountStore::new(store.clone())
+        .unwrap()
+        .get(&CredentialAlias::new("legacy"))
+        .unwrap()
+        .incarnation;
+    assert!(first > 0);
+    let second = AccountStore::new(store)
+        .unwrap()
+        .get(&CredentialAlias::new("legacy"))
+        .unwrap()
+        .incarnation;
+    assert_eq!(first, second);
+}
+
+#[test]
+fn verified_workspace_without_user_or_email_does_not_prove_continuity() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let alias = CredentialAlias::new("workspace-only");
+    let mut row = descriptor("workspace-only", "openai-oauth", CredentialStatus::Ok, true);
+    row.auth_method = AuthMethod::OAuth;
+    row.account_identity = Some(AccountIdentity {
+        email: None,
+        display_name: None,
+        account_id: Some("shared-workspace".into()),
+        plan: None,
+        issuer: Some("fake-issuer".into()),
+        captured_at: 1,
+        verified: true,
+    });
+    accounts.add(row.clone()).unwrap();
+    let first = accounts.get(&alias).unwrap().incarnation;
+    row.account_identity.as_mut().unwrap().captured_at = 2;
+    accounts.replace(row).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > first);
 }
 
 #[test]

@@ -1300,6 +1300,7 @@ fn seed_cli_account(command: &mut HaiderCommand, alias: &str) -> Vec<u8> {
         active: true,
         label: Some("SECRET-LABEL-SENTINEL".into()),
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }];
     let mut bytes = serde_json::to_vec_pretty(&descriptors).expect("account fixture JSON");

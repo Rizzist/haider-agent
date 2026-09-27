@@ -2070,6 +2070,9 @@ pub struct HubConnection {
     accounts_watch: Mutex<Option<JoinHandle<()>>>,
     /// One ticker serves a bounded set of per-session volatile watches.
     surface_watch: Mutex<Option<SurfaceWatchState>>,
+    /// Content state of acknowledged input injections not yet reflected by
+    /// the owner's surface publication. Preserves Set→Submit ordering.
+    spend_injection_shadow: Mutex<HashMap<SessionId, (String, u64, bool)>>,
     /// One required-delivery, cursor-replayable monitor stream. A new
     /// `monitor.watch` replaces the prior registration on this connection.
     monitor_watch: Mutex<Option<MonitorWatchState>>,
@@ -4760,6 +4763,7 @@ impl SessionHub {
             roster_watch: Mutex::new(None),
             accounts_watch: Mutex::new(None),
             surface_watch: Mutex::new(None),
+            spend_injection_shadow: Mutex::new(HashMap::new()),
             monitor_watch: Mutex::new(None),
             loom_registry_watch: Mutex::new(None),
             loom_registry_watch_serial: tokio::sync::Mutex::new(()),

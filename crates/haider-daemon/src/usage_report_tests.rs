@@ -58,6 +58,7 @@ fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> Credentia
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 1,
         created_at_ms: None,
     }
 }
@@ -907,6 +908,103 @@ async fn reset_apply_uses_verified_endpoint_account_scope_and_idempotency_key() 
         post[0].2,
         serde_json::json!({"redeem_request_id": "approval-idempotency-key"})
     );
+}
+
+#[tokio::test]
+async fn bound_reset_rejects_changed_id_or_incarnation_before_post() {
+    let http = Arc::new(ApplyHttp::replying(
+        200,
+        br#"{"code":"reset","windows_reset":1}"#,
+    ));
+    let service = reset_apply_service(
+        Arc::clone(&http),
+        openai_descriptor("work-chatgpt", "workspace-b"),
+    );
+    let alias = CredentialAlias::new("work-chatgpt");
+    let mut binding = service.reset_binding(&alias).expect("current binding");
+    binding.account_id = "workspace-a".into();
+    assert_eq!(
+        service
+            .apply_bound_reset(&alias, "approval-old", &binding)
+            .await
+            .expect_err("changed account id")
+            .reason,
+        "account_changed"
+    );
+    binding.account_id = "workspace-b".into();
+    binding.incarnation += 1;
+    assert_eq!(
+        service
+            .apply_bound_reset(&alias, "approval-old", &binding)
+            .await
+            .expect_err("changed incarnation")
+            .reason,
+        "account_changed"
+    );
+    assert_eq!(http.posts(), 0);
+}
+
+struct PausingTokens {
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait::async_trait]
+impl MeterTokenSource for PausingTokens {
+    async fn bearer(
+        &self,
+        _descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, MeterUnavailable> {
+        self.entered.wait().await;
+        self.release.wait().await;
+        Ok(secret(b"synthetic-token"))
+    }
+}
+
+#[tokio::test]
+async fn bound_reset_rechecks_replacement_or_removal_after_token_resolution() {
+    for change in ["incarnation", "account_id", "remove"] {
+        let descriptors = snapshot(vec![openai_descriptor("work-chatgpt", "workspace-a")]);
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let http = Arc::new(ApplyHttp::replying(
+            200,
+            br#"{"code":"reset","windows_reset":1}"#,
+        ));
+        let service = super::UsageReportService::with_clock(
+            Arc::clone(&descriptors),
+            Some(Arc::new(PausingTokens {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })),
+            Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+            Box::new(|| 9_000_000),
+        );
+        let alias = CredentialAlias::new("work-chatgpt");
+        let binding = service.reset_binding(&alias).expect("original binding");
+        let mutate = async {
+            entered.wait().await;
+            {
+                let mut rows = descriptors.lock().expect("snapshot lock");
+                if change == "remove" {
+                    rows.clear();
+                } else {
+                    if change == "account_id" {
+                        rows[0] = openai_descriptor("work-chatgpt", "workspace-b");
+                    } else {
+                        rows[0].incarnation = binding.incarnation + 1;
+                    }
+                }
+            }
+            release.wait().await;
+        };
+        let (result, ()) = tokio::join!(
+            service.apply_bound_reset(&alias, "approval-old", &binding),
+            mutate,
+        );
+        assert_eq!(result.expect_err("stale binding").reason, "account_changed");
+        assert_eq!(http.posts(), 0, "change={change}");
+    }
 }
 
 #[tokio::test]

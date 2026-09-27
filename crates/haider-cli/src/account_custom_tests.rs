@@ -84,6 +84,7 @@ fn descriptor() -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
 }

@@ -199,6 +199,7 @@ fn cancel_closes_and_late_replies_are_ghosts() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let message_before = model.accounts.message.clone();

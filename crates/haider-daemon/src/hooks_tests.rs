@@ -2601,6 +2601,7 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let provider = ProviderSummaryWire {

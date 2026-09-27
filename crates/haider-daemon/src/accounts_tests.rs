@@ -176,6 +176,7 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed descriptor");
@@ -242,6 +243,7 @@ async fn startup_backfill_decodes_only_the_vaulted_id_token_without_network() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed descriptor");
@@ -300,6 +302,7 @@ async fn startup_backfill_marks_missing_oauth_secret_as_source_gone() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed descriptor");
@@ -328,6 +331,7 @@ async fn startup_backfill_synthesizes_stable_anthropic_meter_identity() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed descriptor");
@@ -533,6 +537,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
@@ -545,6 +550,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
@@ -557,6 +563,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
@@ -569,6 +576,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
     ]));
@@ -676,6 +684,7 @@ fn selected_session_account_bypasses_mutable_active_account() {
         active: false,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let active = CredentialDescriptor {
@@ -729,6 +738,7 @@ pub(super) fn adapter_cache_descriptor(provider: &str, alias: &str) -> Credentia
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -1019,6 +1029,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: Some(42),
     };
     let summary = ProviderSummaryWire {
@@ -1231,6 +1242,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let vault = Arc::new(MemoryVault::default());
@@ -1450,6 +1462,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
@@ -1698,6 +1711,7 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let mut accounts = memory_accounts();
@@ -1954,6 +1968,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         active,
         label: None,
         account_identity: None,
+        incarnation: if active { 1 } else { 2 },
         created_at_ms: None,
     };
     let descriptors = vec![
@@ -2060,6 +2075,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
@@ -2072,6 +2088,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
     ];
@@ -2261,6 +2278,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("limited descriptor");
@@ -2275,6 +2293,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             active: false,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("alternate descriptor");
@@ -2289,6 +2308,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("refresh-failed descriptor");
@@ -2303,6 +2323,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             active: false,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("refresh backup descriptor");
@@ -2446,6 +2467,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let openai_descriptor = descriptor(openai_alias.clone(), OPENAI_OAUTH_PROVIDER_NAME);
@@ -4034,6 +4056,7 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     store
@@ -4239,6 +4262,7 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     store
@@ -4802,6 +4826,7 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
         active,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
 
@@ -4947,6 +4972,7 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
                         active: true,
                         label: None,
                         account_identity: None,
+                        incarnation: 0,
                         created_at_ms: None,
                     },
                 },
@@ -5044,6 +5070,7 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
             active: false,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("add other descriptor");
@@ -5435,6 +5462,7 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         active,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let mut accounts = memory_accounts();
@@ -5847,6 +5875,7 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
             active: true,
             label: Some("operator label".into()),
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed API descriptor");
@@ -6497,6 +6526,7 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("custom descriptor");
@@ -7074,6 +7104,7 @@ async fn pending_remove_reconciliation_retries_orphan_deletion_before_release() 
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("descriptor");
@@ -7913,6 +7944,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let gemini_alias = CredentialAlias::new("gemini-refresh-key");
@@ -7926,6 +7958,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let mut accounts = memory_accounts();
@@ -8189,6 +8222,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let mut accounts = memory_accounts();
@@ -9249,6 +9283,7 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let bundle = haider_accounts::OAuthTokenBundleV1::new(
@@ -9760,6 +9795,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     accounts.add(expired.clone()).expect("seed expired account");
@@ -9854,6 +9890,7 @@ async fn oauth_import_repairs_an_expired_default_alias_in_place() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     accounts
@@ -10831,6 +10868,7 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
                 active,
                 label: None,
                 account_identity: None,
+                incarnation: 0,
                 created_at_ms: None,
             })
             .expect("blocking descriptor");
@@ -11909,6 +11947,7 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         };
         let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
@@ -12046,6 +12085,7 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let refreshed = broker
@@ -12090,6 +12130,7 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let refused = broker
@@ -12585,6 +12626,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
@@ -12597,6 +12639,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         },
     ]));
@@ -12757,6 +12800,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         active,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
 
@@ -13444,6 +13488,7 @@ fn linked_and_native_grok_accounts_coexist_without_sharing_alias_or_credential()
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("native descriptor");
@@ -13684,6 +13729,7 @@ fn antigravity_descriptor(alias: &str) -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -13947,6 +13993,7 @@ fn account_selection_pins_one_google_alias_and_refuses_another_providers_alias()
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let snapshot = Arc::new(StdMutex::new(vec![
@@ -14139,6 +14186,7 @@ async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_va
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let management = ManagementSnapshot::new(
@@ -14514,6 +14562,7 @@ async fn customprov_probe_rejects_claimed_origin_before_resolving_or_sending_key
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         })
         .expect("existing custom account");
@@ -15073,6 +15122,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
                 active: true,
                 label: None,
                 account_identity: None,
+                incarnation: 0,
                 created_at_ms: None,
             })
             .expect("test descriptor without secret");

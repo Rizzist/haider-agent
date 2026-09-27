@@ -2658,6 +2658,7 @@ pub fn golden_descriptor() -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -2691,6 +2692,7 @@ pub fn golden_oauth_descriptor() -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     }
 }

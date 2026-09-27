@@ -1,4 +1,5 @@
 # id	platform	package	suite	test	source
+accounts-incarnation-reservation	all	haider-accounts	test:accounts_tests	concurrent_store_instances_reserve_distinct_incarnations	crates/haider-accounts/tests/accounts_tests.rs
 android-completion-waiters	linux	haider-android	lib	concurrent_waiters_share_the_same_failure_receipt	crates/haider-android/src/completion_tests.rs
 store-menu-answer-race	linux	haider-store	test:menu_resolution_tests	n_way_race_commits_exactly_one_answer_and_returns_one_resolution_coordinate	crates/haider-store/tests/menu_resolution_tests.rs
 store-queue-remove-race	linux	haider-store	test:queue_control_tests	two_same_revision_removes_race_to_exactly_one_commit	crates/haider-store/tests/queue_control_tests.rs

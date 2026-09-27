@@ -685,6 +685,13 @@ impl StoreLike for DescriptorStore {
             Self::Injected(store) => store.save(descriptors),
         }
     }
+
+    fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+        match self {
+            Self::Json(store) => store.reserve_incarnation(floor),
+            Self::Injected(store) => store.reserve_incarnation(floor),
+        }
+    }
 }
 
 // ─────────────────────────── staged secrets ────────────────────────────────
@@ -7026,6 +7033,7 @@ async fn handle_gcloud_import(
             active: true,
             label: None,
             account_identity: Some(account_identity),
+            incarnation: 0,
             created_at_ms: None,
         })
     };
@@ -8065,6 +8073,7 @@ fn oauth_descriptor_for(
         account_identity: bundle.account_identity.clone(),
         // AccountStore::add owns the record-creation timestamp. Replacement
         // preserves the prior value, including None for pre-964 rows.
+        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -8176,6 +8185,7 @@ fn descriptor_for(
         // AccountStore::add owns the first-commit timestamp for every auth
         // method. Replacement preserves the prior value, including legacy
         // None, instead of turning a re-key into a new account.
+        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -9876,6 +9886,7 @@ impl AccountsProviderFactory {
             active: true,
             label: None,
             account_identity: None,
+            incarnation: 0,
             created_at_ms: None,
         };
         let credential = keyless_construction_credential().ok()?;
@@ -9921,7 +9932,7 @@ impl AccountsProviderFactory {
                 false,
             ));
         };
-        let accounts = AccountStore::new(ReadOnlySnapshotStore(descriptors))?;
+        let accounts = AccountStore::from_read_only_snapshot(ReadOnlySnapshotStore(descriptors))?;
         let active = accounts
             .active_for_provider(provider)
             .cloned()
@@ -11827,10 +11838,22 @@ fn reconcile_credential_sources(
                     ),
                     label: None,
                     account_identity: material.identity,
+                    incarnation: 0,
                     created_at_ms: None,
                 };
-                if accounts.get(&alias).is_some() {
-                    accounts.replace(descriptor)?;
+                if let Some(previous) = accounts.get(&alias) {
+                    // An unchanged linked-source projection is a rescan, not
+                    // a new import. It must not mint an incarnation merely
+                    // because the provider exposes no account proof.
+                    if previous.provider != descriptor.provider
+                        || previous.auth_method != descriptor.auth_method
+                        || previous.base_url != descriptor.base_url
+                        || previous.identity != descriptor.identity
+                        || previous.status != descriptor.status
+                        || previous.account_identity != descriptor.account_identity
+                    {
+                        accounts.replace(descriptor)?;
+                    }
                 } else {
                     accounts.add(descriptor)?;
                 }
@@ -12144,6 +12167,7 @@ fn import_bedrock_env_bearer(
         active: true,
         label: None,
         account_identity,
+        incarnation: 0,
         created_at_ms: None,
     };
     if accounts.add(descriptor).is_err() {

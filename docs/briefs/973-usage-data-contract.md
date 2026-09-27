@@ -38,23 +38,34 @@ of that same published percentage.
 The active-account refresh timer continues without an attached provider
 session, so the held meter is refreshed at the provider cadence.
 
-## Human-only deferred approval
+## Deferred spending approval
 
 `EffectClass::UsageResetApply` is a sensitive finite-resource class. Ordinary
 allow rules, remembered/session grants, autonomous mode, and `auto_allow`
 cannot approve it. A request opens `MenuKind::DeferredApproval` with only
 deny (option 0, the default) and approve-once (option 1) choices. Only an
-answer carrying the explicit `approve` key approves; a keyless answer at any
-index declines. The TUI card never captures composer keystrokes: it yields to
-a non-empty composer, ignores digits, and Enter declines unless the user
-moved the selection on that card. The menu is session-scoped and
+answer carrying the explicit `approve` key and matching option index approves;
+a keyless answer is rejected as `invalid_frame` with no durable Deny event.
+The TUI answers a spending card only from a deliberate local gesture while the
+card is visible. Composer text, attachments, paste, newline chords, and remote
+input do not answer it. Enter selects Deny by default; a fresh local Down can
+select Apply. An attachment alone is composer content and submits as a message
+without answering the card. The menu is session-scoped and
 `blocking: false`; the initiating RPC/tool immediately returns
 `approval_pending` and the run continues.
 Both entry points apply the same session policy denial before opening a menu;
 read-only and hard-denied sessions receive a typed refusal.
 
-The committed `menu_answer` is the human authorization fact. On approval the
-daemon calls the provider with the same opaque approval id as OpenAI's
+The committed `menu_answer` proves accepted menu coordinates, not human origin.
+Same-UID self-approval remains deferred to lane 975 (registry #165). The card
+captures the provider, provider-issued account id used for the consume header,
+and daemon-minted account incarnation when it opens. Replacement, removal and
+recreation, or missing legacy binding closes the old approval with typed
+`account_changed`, without a consume request. A proven same-account credential
+rotation keeps the incarnation and may complete the pending approval.
+An import without qualifying provider account proof mints a new incarnation,
+so its earlier approval closes even if the display alias is unchanged.
+On approval the daemon calls the provider with the same opaque approval id as OpenAI's
 idempotency key, then publishes a `usage_reset_apply_result_v1` extension
 (`applied`, `denied`, or `failed`) to the existing session event stream. An
 active run receives the same typed result through the existing durable steer
@@ -64,7 +75,7 @@ the durable state. Denial never sends a consume request. A failed or lost
 provider response can leave the spending outcome unknown.
 
 The only consume caller is the hub-owned completion task launched by a committed
-human `menu_answer` in `session_hub/usage_reset_rpc.rs`. The RPC persists
+`menu_answer` in `session_hub/usage_reset_rpc.rs`. The RPC persists
 `Dispatched` before handing off the single POST and replies without waiting
 for the provider or steer delivery. Graceful shutdown joins accepted reset
 tasks while their session actors remain open, allowing a completed POST's
@@ -81,7 +92,7 @@ does not reissue the POST. The same approval id is sent as OpenAI's
 `redeem_request_id` for provider-side idempotency. At integration with lane
 973-deferred-approval, replace the local `DeferredApproval` menu opening and
 `finish_usage_reset_approval` callback with that lane's durable pending
-approval mechanism; retain the human-only policy and dispatch-before-POST
+approval mechanism; retain the finite-credit confirmation policy and dispatch-before-POST
 ordering.
 An interrupted approval with no durable dispatch is reported as
 `approval_interrupted_before_dispatch`; it is safe to open a fresh approval.

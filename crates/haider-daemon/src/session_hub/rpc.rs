@@ -4078,7 +4078,7 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_input_inject(request_id, session_id, op)
+                self.session_input_inject(request_id, session_id, op).await
             }
             RequestBody::SessionPipePath { session_id } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
@@ -8244,6 +8244,7 @@ impl HubConnection {
                 roster_watch: Mutex::new(None),
                 accounts_watch: Mutex::new(None),
                 surface_watch: Mutex::new(None),
+                spend_injection_shadow: Mutex::new(std::collections::HashMap::new()),
                 monitor_watch: Mutex::new(None),
                 loom_registry_watch: Mutex::new(None),
                 loom_registry_watch_serial: tokio::sync::Mutex::new(()),
@@ -15097,11 +15098,11 @@ impl HubConnection {
             trust_hooks,
             headless_spec,
         } = input;
-        if command_id.as_str().is_empty() || text.trim().is_empty() {
+        if command_id.as_str().is_empty() || (text.trim().is_empty() && attachments.is_empty()) {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                "turn command id and text must not be empty",
+                "turn command id and message content must not be empty",
                 false,
                 None,
             );
@@ -17573,7 +17574,7 @@ impl HubConnection {
         Ok(())
     }
 
-    fn session_input_inject(
+    async fn session_input_inject(
         &self,
         request_id: RequestId,
         session_id: SessionId,
@@ -17618,7 +17619,72 @@ impl HubConnection {
                 );
             }
         };
-        let delivered = self.hub.inject_session_input(&session_id, op)?;
+        // An injection ack precedes the owner's next surface publication.
+        // Keep the last acknowledged edit's content state until that
+        // publication advances, so Set(nonempty)→Submit remains a message
+        // even when those requests arrive back-to-back.
+        let input = self
+            .hub
+            .live_surface_snapshot(&session_id)?
+            .and_then(|snapshot| snapshot.input);
+        let shadow = {
+            let mut shadows = lock(&self.spend_injection_shadow)?;
+            let pending = shadows.get(&session_id).cloned();
+            if pending.as_ref().is_some_and(|(owner, revision, _)| {
+                input.as_ref().is_none_or(|input| {
+                    input.owner.as_str() != owner.as_str() || input.revision > *revision
+                })
+            }) {
+                shadows.remove(&session_id);
+                None
+            } else {
+                pending
+            }
+        };
+        let surface_has_text = shadow.as_ref().map_or_else(
+            || input.as_ref().is_some_and(|input| !input.text.is_empty()),
+            |(_, _, has_text)| *has_text,
+        );
+        // The volatile input owner is transport routing, not authority to
+        // press a spending card. Refuse an empty-composer Submit before it
+        // reaches the TUI; the TUI repeats the ownership check at dispatch.
+        let empty_surface = input
+            .as_ref()
+            .is_some_and(|input| !surface_has_text && input.attachments.is_empty());
+        let refused_spend_submit = matches!(op, SurfaceInjectOp::Submit)
+            && empty_surface
+            && self.pending_spend_card_is_latest_menu(&session_id).await?;
+        let delivered = if refused_spend_submit {
+            false
+        } else {
+            let delivered = self.hub.inject_session_input(&session_id, op.clone())?;
+            if delivered {
+                let next_text = match &op {
+                    SurfaceInjectOp::Set { text } => Some(!text.is_empty()),
+                    SurfaceInjectOp::Insert { text } => Some(surface_has_text || !text.is_empty()),
+                    SurfaceInjectOp::Clear => Some(false),
+                    SurfaceInjectOp::Submit => {
+                        lock(&self.spend_injection_shadow)?.remove(&session_id);
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(has_text) = next_text {
+                    let (owner, revision) = shadow.map_or_else(
+                        || {
+                            input.as_ref().map_or_else(
+                                || (String::new(), 0),
+                                |input| (input.owner.clone(), input.revision),
+                            )
+                        },
+                        |(owner, revision, _)| (owner, revision),
+                    );
+                    lock(&self.spend_injection_shadow)?
+                        .insert(session_id.clone(), (owner, revision, has_text));
+                }
+            }
+            delivered
+        };
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionInputInjectAck {
@@ -17626,6 +17692,61 @@ impl HubConnection {
                 delivered,
             },
         })
+    }
+
+    async fn pending_spend_card_is_latest_menu(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, SessionHubError> {
+        let mut cursor = 0;
+        let mut open: Vec<(MenuId, bool)> = Vec::new();
+        loop {
+            let page = self
+                .hub
+                .inner
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    session_id,
+                    cursor,
+                    REPLAY_PAGE_SIZE,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            cursor = page.last().map_or(cursor, |event| event.seq);
+            for event in page {
+                let Ok(payload) = event.payload.decode_event() else {
+                    continue;
+                };
+                match payload {
+                    EventPayload::MenuOpened(menu) => {
+                        let spend = matches!(
+                            menu.kind,
+                            MenuKind::DeferredApproval {
+                                effect: EffectClass::UsageResetApply,
+                                ..
+                            }
+                        );
+                        open.retain(|(id, _)| *id != menu.id);
+                        open.push((menu.id, spend));
+                    }
+                    EventPayload::MenuAnswered(answer) => {
+                        open.retain(|(id, _)| *id != answer.menu);
+                    }
+                    EventPayload::MenuClosed { menu, .. } => {
+                        open.retain(|(id, _)| *id != menu);
+                    }
+                    _ => {}
+                }
+            }
+            if page_len < REPLAY_PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(open.last().is_some_and(|(_, spend)| *spend))
     }
 
     fn surface_text_too_large(
@@ -18936,12 +19057,14 @@ impl HubConnection {
                     approval_id,
                     effect: EffectClass::UsageResetApply,
                     account: Some(account),
+                    binding,
                 } = &menu.kind
                     && let Err(error) = self
                         .finish_usage_reset_approval(
                             envelope,
                             account,
                             approval_id,
+                            binding.as_ref(),
                             &recovery_answer,
                         )
                         .await

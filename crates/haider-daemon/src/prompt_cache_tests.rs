@@ -189,6 +189,7 @@ async fn run_fixture(cache_on: bool) -> Vec<serde_json::Value> {
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let report = UsageReportService::new(

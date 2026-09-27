@@ -2154,6 +2154,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         active: false,
         label: None,
         account_identity: None,
+        incarnation: 0,
         created_at_ms: None,
     };
     let mut provider = provider_summary("fake");
@@ -3468,7 +3469,16 @@ async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
             status: haider_protocol::credential::CredentialStatus::Ok,
             active: true,
             label: None,
-            account_identity: None,
+            account_identity: Some(haider_protocol::credential::AccountIdentity {
+                email: Some("synthetic@example.test".into()),
+                display_name: None,
+                account_id: Some("synthetic-account".into()),
+                plan: None,
+                issuer: None,
+                captured_at: 1,
+                verified: false,
+            }),
+            incarnation: 1,
             created_at_ms: None,
         },
     ]));
@@ -3563,6 +3573,7 @@ async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
             approval_id: seen,
             effect: EffectClass::UsageResetApply,
             account: Some(seen_account),
+            ..
         } if seen == approval_id && seen_account == account
     ));
     assert!(
@@ -3865,6 +3876,7 @@ fn reset_test_descriptor(
             captured_at: 1,
             verified: false,
         }),
+        incarnation: 1,
         created_at_ms: None,
     }
 }

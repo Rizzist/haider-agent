@@ -6178,6 +6178,7 @@ impl AppModel {
         session: SessionId,
         attachments: Vec<haider_protocol::hook::HookAttachmentMetadata>,
     ) {
+        self.retire_spend_card_navigation();
         self.mirrored_input_attachments = Some((session, attachments));
         self.dirty = true;
     }
@@ -6227,6 +6228,7 @@ impl AppModel {
         kind: crate::composer::PendingKind,
         label: String,
     ) {
+        self.retire_spend_card_navigation();
         self.upload_seq += 1;
         let upload = self.upload_seq;
         self.composer
@@ -6839,7 +6841,8 @@ impl AppModel {
             // A SELECT menu replaces the composer; a zero-option free-text
             // ask KEEPS it — the composer is the answer line (owner
             // report: the resistor question rendered unanswerable). A
-            // deferred spend-approval card never takes the composer.
+            // deferred spend-approval card leaves text editing with the
+            // composer and takes only local card gestures while visible.
             return false;
         }
         !(self.screen == Screen::Subagent
@@ -7458,6 +7461,9 @@ impl AppModel {
 
     /// Deterministic clock seam for rapid Esc backtracking laws.
     pub fn handle_at(&mut self, event: AppEvent, now: std::time::Instant) {
+        // A card that ceased to own the painted input slot cannot carry its
+        // old Apply navigation into a later appearance.
+        self.retire_hidden_spend_card_navigation();
         match event {
             AppEvent::Key(key) => {
                 self.dirty = true;
@@ -7617,10 +7623,11 @@ impl AppModel {
                     && self
                         .projection
                         .open_menu()
-                        .is_some_and(|menu| !menu.options.is_empty())
+                        .is_some_and(|menu| !menu.options.is_empty() && !is_deferred_approval(menu))
                 {
                     return;
                 }
+                self.retire_spend_card_navigation();
                 if self.screen == Screen::Loom {
                     if self
                         .loom_authoring
@@ -7662,6 +7669,7 @@ impl AppModel {
                 if self.screen == Screen::Loom {
                     return;
                 }
+                self.retire_spend_card_navigation();
                 self.composer.set_text(text);
                 self.dirty = true;
             }
@@ -8876,9 +8884,10 @@ impl AppModel {
                 self.scroll_back.set(0);
                 return;
             }
-            if self
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some())
+            if let Some(menu) = self.viewed_chip().and_then(ChipModel::question_menu)
+                && (!is_deferred_approval(menu)
+                    || (self.visible_spend_card().as_ref() == Some(&menu.id)
+                        && self.deferred_card_takes(menu, key)))
             {
                 self.handle_chip_menu_key(key.code);
                 return;
@@ -9294,7 +9303,9 @@ impl AppModel {
         // only its navigation keys, and only while the composer is empty.
         if self.screen == Screen::Session
             && let Some(menu) = self.select_menu()
-            && (!is_deferred_approval(menu) || self.deferred_card_takes(menu, key.code))
+            && (!is_deferred_approval(menu)
+                || (self.visible_spend_card().as_ref() == Some(&menu.id)
+                    && self.deferred_card_takes(menu, key)))
         {
             self.handle_menu_key(key.code);
             return;
@@ -9696,17 +9707,10 @@ impl AppModel {
         }
     }
 
-    /// The composer is the live input target: no boot screen, no help
-    /// overlay, no blocking menu owning the keys (session card or the
-    /// viewed chip's question). Gates the TUI5 editing keys so ⌃K on a
-    /// menu can never eat a hidden draft.
+    /// Injection may edit the session composer beneath a deferred card.
+    /// Submit separately refuses while the visible card owns confirmation;
+    /// blocking menus and modals exclude composer injection altogether.
     #[must_use]
-    /// rev933d finding 4: injection from an embedding client applies only
-    /// when the PLAIN session composer is the live Enter target — no card
-    /// (login, `/talk` setup, an engaged talk session), no menu, no help,
-    /// and never the subagent view (whose composer messages the child).
-    /// This mirrors the key-dispatch precedence exactly, so a synthesized
-    /// Submit can never activate a card row or answer a question.
     pub fn accepts_injected_input(&self) -> bool {
         self.screen == Screen::Session
             && self.login.is_none()
@@ -9752,15 +9756,65 @@ impl AppModel {
             return false;
         }
         !(self.screen == Screen::Subagent
-            && self
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
+            && self.viewed_chip().is_some_and(|chip| {
+                chip.question_menu()
+                    .is_some_and(|menu| !is_deferred_approval(menu))
+            }))
+    }
+
+    /// The spending card that owns the painted input band right now. This
+    /// single predicate is the future `InputOwner::SpendCard { menu }` seam.
+    /// A draft, attachment, or higher overlay makes the card unanswerable.
+    #[must_use]
+    pub(crate) fn visible_spend_card(&self) -> Option<haider_protocol::ids::MenuId> {
+        if self.help_open
+            || self.inbox_open
+            || self.shells_open
+            || self.ssh_open
+            || self.ssh_form.is_some()
+            || self.ssh_terminal.is_some()
+            || self.monitors_open
+            || self.lockdown_overlay
+            || self.login.is_some()
+            || self.talk_setup.is_some()
+            || self.talk.engaged()
+            || self.model_picker.is_some()
+            || self.theme_picker.is_some()
+            || self.effort_picker.is_some()
+            || self.backtrack.is_some()
+            || self.transcript_search.is_some()
+            || !self.composer.is_empty()
+            || !self.mirrored_input_attachments().is_empty()
+        {
+            return None;
+        }
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        }?;
+        (is_deferred_approval(menu) && !menu.options.is_empty()).then(|| menu.id.clone())
+    }
+
+    pub(crate) fn retire_spend_card_navigation(&mut self) {
+        self.menu_selection_owner = None;
+    }
+
+    fn retire_hidden_spend_card_navigation(&mut self) {
+        if self.menu_selection_owner.is_some()
+            && self.visible_spend_card().as_ref() != self.menu_selection_owner.as_ref()
+        {
+            self.retire_spend_card_navigation();
+        }
     }
 
     /// The composer-edit epilogue every text-changing key shares (the sim
     /// resets suggestion state on any change): palette selection/scroll
     /// reset + a dismissed palette re-opens.
     fn note_composer_edit(&mut self) {
+        if !self.composer.is_empty() {
+            self.retire_spend_card_navigation();
+        }
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
@@ -9996,6 +10050,7 @@ impl AppModel {
         // Slash submits take SILENTLY — execute_slash records the
         // canonical form (review P3-9, one entry per invocation).
         let is_slash = self.composer.text().trim().starts_with('/');
+        let has_attachments = self.composer.has_attachments();
         // escretract: a `turn.retract` is on the wire and its outcome is not
         // known yet. The prompt may still be accepted, so a second Enter here
         // would resend a turn that is still in flight — and the retract
@@ -10009,7 +10064,7 @@ impl AppModel {
         if !is_slash
             && self.retract_pending
             && self.screen == Screen::Session
-            && self.projection.open_menu().is_none()
+            && self.select_menu().is_none()
         {
             self.flash = Some("· retracting the prompt — a moment".to_owned());
             self.dirty = true;
@@ -10023,7 +10078,7 @@ impl AppModel {
         if !is_slash
             && self.screen == Screen::Session
             && !self.mode.fabricates_locally()
-            && self.projection.open_menu().is_none()
+            && self.select_menu().is_none()
             && self.composer.has_uploading_attachment()
         {
             self.flash = Some("· attachment still uploading — a moment".to_owned());
@@ -10040,7 +10095,7 @@ impl AppModel {
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
-        if display.is_empty() {
+        if display.is_empty() && !has_attachments {
             // Empty ⏎ on the launcher re-attaches the most recently left
             // session (a port law; the detach model keeps it honest by id).
             if self.screen == Screen::Launcher
@@ -15191,12 +15246,15 @@ impl AppModel {
         };
         let option_count = menu.options.len();
         let deferred = is_deferred_approval(&menu);
+        if deferred && self.visible_spend_card().as_ref() != Some(&menu.id) {
+            return;
+        }
         let shown = self.menu_display_selection(&menu);
         match code {
             // A spend-approval card never wraps and ignores digits; Enter
             // answers option 0 (deny) unless the user moved the selection on
             // this card — the same rules as the session card.
-            KeyCode::Up if deferred && option_count > 0 => {
+            KeyCode::Up if deferred && option_count > 0 && shown > 0 => {
                 self.menu_selection = shown.min(option_count - 1).saturating_sub(1);
                 self.menu_selection_owner = Some(menu.id.clone());
             }
@@ -15229,6 +15287,9 @@ impl AppModel {
     }
 
     fn answer_chip_menu(&mut self, menu: &Menu) {
+        if is_deferred_approval(menu) && self.visible_spend_card().as_ref() != Some(&menu.id) {
+            return;
+        }
         let Some(option) = menu.options.get(self.menu_selection) else {
             return;
         };
@@ -17307,6 +17368,9 @@ impl AppModel {
         let Some(menu) = self.projection.open_menu() else {
             return;
         };
+        if is_deferred_approval(menu) && self.visible_spend_card().as_ref() != Some(&menu.id) {
+            return;
+        }
         let option_count = menu.options.len();
         // OWNER DIRECTIVE (supersedes the sim's swallow law): esc on a
         // blocking card INTERRUPTS the run — the daemon's cancellation
@@ -17403,10 +17467,13 @@ impl AppModel {
     /// than the (empty) composer. ↑ belongs to the card only while the user
     /// has moved THIS card's selection off `deny`; otherwise it keeps its
     /// composer meaning (history recall), so ↑ then Enter can never approve.
-    fn deferred_card_takes(&self, menu: &Menu, code: KeyCode) -> bool {
-        match code {
+    fn deferred_card_takes(&self, menu: &Menu, key: KeyEvent) -> bool {
+        match key.code {
             KeyCode::Up => self.menu_display_selection(menu) > 0,
-            KeyCode::Down | KeyCode::Enter | KeyCode::Esc => true,
+            KeyCode::Enter => !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL),
+            KeyCode::Down | KeyCode::Esc => true,
             _ => false,
         }
     }
@@ -17418,7 +17485,9 @@ impl AppModel {
     #[must_use]
     pub fn select_menu(&self) -> Option<&Menu> {
         self.projection.open_menu().filter(|menu| {
-            !menu.options.is_empty() && (!is_deferred_approval(menu) || self.composer.is_empty())
+            !menu.options.is_empty()
+                && (!is_deferred_approval(menu)
+                    || self.visible_spend_card().as_ref() == Some(&menu.id))
         })
     }
 
@@ -17426,6 +17495,9 @@ impl AppModel {
         let Some(menu) = self.projection.open_menu() else {
             return;
         };
+        if is_deferred_approval(menu) && self.visible_spend_card().as_ref() != Some(&menu.id) {
+            return;
+        }
         let Some(option) = menu.options.get(self.menu_selection) else {
             return;
         };
@@ -19343,11 +19415,30 @@ impl AppModel {
             .find(|entry| entry.ui_gen == generation)
     }
 
+    fn menu_hit_is_live(&self, id: &haider_protocol::ids::MenuId, index: usize) -> bool {
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        menu.is_some_and(|menu| {
+            menu.id == *id
+                && index < menu.options.len()
+                && (!is_deferred_approval(menu) || self.visible_spend_card().as_ref() == Some(id))
+        })
+    }
+
     /// A left-click resolved through the frame's hit map. The map may be
     /// one frame stale (review r2 P2-2): hits carry values and every
     /// context-sensitive hit re-checks its context — activate exactly what
     /// was clicked, or drop the click.
     pub fn handle_hit(&mut self, hit: Hit) {
+        self.retire_hidden_spend_card_navigation();
+        if let Hit::MenuOption { ref menu, index } = hit
+            && !self.menu_hit_is_live(menu, index)
+        {
+            return;
+        }
         self.dirty = true;
         self.flash = None;
         // A visible overlay owns the screen; hits from the covered frame
@@ -19541,32 +19632,19 @@ impl AppModel {
                     self.activate_model_picker_row(&row);
                 }
             }
-            Hit::MenuOption { menu, index } => {
-                // Only the SAME menu the row was rendered for may answer —
-                // and on the subagent screen that menu is the CHIP's card,
-                // which the session projection knows nothing about (review
-                // P2-7: chip-question clicks were silently dead).
+            Hit::MenuOption { index, .. } => {
+                // The event-time ownership check above already matched the
+                // card id, option row, surface, and deferred visibility.
                 if self.screen == Screen::Subagent {
                     let card = self
                         .viewed_chip()
                         .and_then(ChipModel::question_menu)
-                        .filter(|m| m.id == menu && index < m.options.len())
                         .cloned();
                     if let Some(card) = card {
                         self.menu_selection = index;
                         self.answer_chip_menu(&card);
                     }
-                } else if self.screen == Screen::Session
-                    && self
-                        .projection
-                        .open_menu()
-                        .is_some_and(|m| m.id == menu && index < m.options.len())
-                {
-                    // The card is only answerable while its own surface is
-                    // showing: Back leaves the projection (and its card)
-                    // intact, so without this a queued click on the old
-                    // option rect would answer an invisible card and start
-                    // its parked continuation (review r2 P1-2).
+                } else if self.screen == Screen::Session {
                     self.menu_selection = index;
                     self.submit_menu_answer();
                 }
@@ -20064,6 +20142,12 @@ impl AppModel {
     /// on hover (sim onMouseEnter, tui.js:2992/3073); everything else is
     /// hover chrome the renderer paints from [`Self::hovered`].
     pub fn handle_hover(&mut self, hit: Option<Hit>) {
+        self.retire_hidden_spend_card_navigation();
+        if let Some(Hit::MenuOption { ref menu, index }) = hit
+            && !self.menu_hit_is_live(menu, index)
+        {
+            return;
+        }
         // TUI6.2c (verifier finding 4): modals own hover exactly as they
         // own hits and keys — with the help overlay or the login card up,
         // hover must not move palette/menu selections beneath the modal.
@@ -20085,24 +20169,9 @@ impl AppModel {
                     self.scroll_palette_into_view(count);
                 }
             }
-            Some(Hit::MenuOption { menu, index }) => {
-                // Hover moves the selection on BOTH card surfaces (sim
-                // `onMouseEnter` on `.imo`, tui.js:3093 — review P2-7).
-                let valid = if self.screen == Screen::Subagent {
-                    self.viewed_chip()
-                        .and_then(ChipModel::question_menu)
-                        .is_some_and(|m| m.id == menu && index < m.options.len())
-                } else {
-                    // Same surface gate as the click (review r2 P1-2).
-                    self.screen == Screen::Session
-                        && self
-                            .projection
-                            .open_menu()
-                            .is_some_and(|m| m.id == menu && index < m.options.len())
-                };
-                if valid {
-                    self.menu_selection = index;
-                }
+            Some(Hit::MenuOption { index, .. }) => {
+                // The ownership check above rejects stale or hidden cards.
+                self.menu_selection = index;
             }
             // Hover moves the `/theme` picker's highlight — and with it
             // the live PREVIEW (the picker's whole point).
