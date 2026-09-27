@@ -31,9 +31,10 @@ use objc2_app_kit::{
     NSTextField, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowSharingType,
     NSWindowStyleMask,
 };
-use objc2_core_foundation::{CFArray, CFNumber, CFRetained};
+use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGMainDisplayID, CGWindowListCreate, CGWindowListOption, kCGNullWindowID,
+    CGEvent, CGEventField, CGMainDisplayID, CGWindowListCopyWindowInfo, CGWindowListOption,
+    kCGNullWindowID, kCGWindowNumber,
 };
 use objc2_core_video::{CVDisplayLink, CVOptionFlags, CVTimeStamp, kCVReturnSuccess};
 use objc2_foundation::{NSData, NSDate, NSPoint, NSRect, NSSize, NSString};
@@ -75,17 +76,25 @@ unsafe extern "C-unwind" fn display_tick(
 }
 
 fn panels_absent(numbers: &[u32; 3]) -> Result<bool, String> {
-    let windows = CGWindowListCreate(CGWindowListOption::OptionOnScreenOnly, kCGNullWindowID)
-        .ok_or("window server did not return the on-screen window list")?;
+    let windows =
+        CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, kCGNullWindowID)
+            .ok_or("window server did not return the on-screen window list")?;
     if windows.is_empty() {
         return Err("window server returned an empty on-screen window list".into());
     }
-    // SAFETY: CGWindowListCreate's returned CFArray contains CFNumberRefs
-    // representing CGWindowIDs (CoreGraphics API contract). It is immutable.
-    let windows: CFRetained<CFArray<CFNumber>> = unsafe { CFRetained::cast_unchecked(windows) };
+    // SAFETY: CopyWindowInfo returns an array of CFDictionaryRefs; dictionary
+    // values can have different types, so inspect kCGWindowNumber at runtime.
+    let windows: CFRetained<CFArray<CFDictionary<CFString, CFType>>> =
+        unsafe { CFRetained::cast_unchecked(windows) };
     let mut listed = Vec::with_capacity(windows.len());
-    for item in windows.iter() {
-        let number = item
+    // SAFETY: CoreGraphics exports this process-lifetime dictionary key.
+    let window_number_key = unsafe { kCGWindowNumber };
+    for window in windows.iter() {
+        let number = window
+            .get(window_number_key)
+            .ok_or("window server omitted a window id")?
+            .downcast_ref::<CFNumber>()
+            .ok_or("window server returned a nonnumeric window id")?
             .as_i64()
             .and_then(|value| u32::try_from(value).ok())
             .ok_or("window server returned an invalid window id")?;

@@ -77,7 +77,7 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGDirectDisplay",
     "CGWindow",
 ] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray", "CFNumber"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFNumber", "CFString"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["CVBase", "CVDisplayLink", "CVReturn", "objc2-core-graphics"] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["CATransaction"] }
 
