@@ -72,7 +72,7 @@ try {
   $PresentAfterFailure = Get-ExactPackagePresence
 } catch {
   "haider $Version was NOT pushed (choco exit $PushExit); post-push feed status unknown." >> $env:GITHUB_STEP_SUMMARY
-  Write-Error "choco push failed (exit $PushExit); post-push feed query failed: $_"
+  Write-Output "::error::choco push failed (exit $PushExit); post-push feed query failed: $_"
   exit $PushExit
 }
 if ($PresentAfterFailure) {

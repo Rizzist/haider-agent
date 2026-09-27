@@ -469,6 +469,7 @@ try {
             ("409 now present", "404,200", "fake", True, 19, "409 Conflict", 0, 1),
             ("409 still absent", "404,404", "fake", True, 19, "409 Conflict", 19, 1),
             ("push 500", "404,404", "fake", True, 19, "500 Server Error", 19, 1),
+            ("post-push feed error", "404,503", "fake", True, 19, "409 Conflict", 19, 1),
             ("feed query error", "503", "fake", True, 0, "", 1, 0),
         ]
         with tempfile.TemporaryDirectory() as temporary:
@@ -493,7 +494,7 @@ try {
                                             env=env, capture_output=True, text=True)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                     self.assertEqual(trace.read_text().count("push"), pushes)
-                    if name in ("missing key", "push 401", "push 403", "409 still absent", "push 500"):
+                    if name in ("missing key", "push 401", "push 403", "409 still absent", "push 500", "post-push feed error"):
                         self.assertIn("NOT pushed", summary.read_text())
 
 
