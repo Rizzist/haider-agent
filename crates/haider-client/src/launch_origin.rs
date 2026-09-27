@@ -189,14 +189,22 @@ pub(crate) fn sanitize_with(
     homes: &[&Path],
     canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<SanitizedOriginPath, OriginSanitizeError> {
-    sanitize_with_canonicalizers(path, homes, canonicalize, canonicalize)
+    sanitize_with_canonicalizers(path, homes, canonicalize, &|candidate| MaskPath {
+        resolved: canonicalize(candidate),
+        denied: false,
+    })
+}
+
+struct MaskPath {
+    resolved: Option<PathBuf>,
+    denied: bool,
 }
 
 fn sanitize_with_canonicalizers(
     path: Option<&Path>,
     homes: &[&Path],
     canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
-    canonicalize_for_mask: &impl Fn(&Path) -> Option<PathBuf>,
+    canonicalize_for_mask: &impl Fn(&Path) -> MaskPath,
 ) -> Result<SanitizedOriginPath, OriginSanitizeError> {
     let Some(path) = path else {
         return Ok(SanitizedOriginPath {
@@ -287,18 +295,27 @@ fn sanitize_with_canonicalizers(
     if let Some((_, display)) = best {
         return bounded(OriginPathKind::HomeRelative, escape_display(&display));
     }
-    let masking_path = canonical_path.or_else(|| {
-        if parsed.absolute && !parsed.had_parent {
-            canonicalize_for_mask(path).map(|resolved| DisplayPath::parse(&resolved))
-        } else {
-            None
-        }
-    });
+    let (masking_path, denied) = if let Some(canonical_path) = canonical_path {
+        (Some(canonical_path), false)
+    } else if parsed.absolute && !parsed.had_parent {
+        let lookup = canonicalize_for_mask(path);
+        (
+            lookup
+                .resolved
+                .map(|resolved| DisplayPath::parse(&resolved)),
+            lookup.denied,
+        )
+    } else {
+        (None, false)
+    };
     if let Some(masked) = parsed
         .mask_other_user()
         .or_else(|| masking_path.as_ref().and_then(DisplayPath::mask_other_user))
     {
         return bounded(OriginPathKind::Redacted, escape_display(&masked));
+    }
+    if denied {
+        return bounded(OriginPathKind::Redacted, "<path unavailable>".to_owned());
     }
     bounded(OriginPathKind::Absolute, escape_display(&parsed.render()))
 }
@@ -312,24 +329,31 @@ fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
 
 /// A denied descendant may still have an accessible symlink/firmlink
 /// ancestor. Use that ancestor only to find a maskable account root.
-fn canonicalize_masking_prefix(path: &Path) -> Option<PathBuf> {
+fn canonicalize_masking_prefix(path: &Path) -> MaskPath {
     canonicalize_masking_prefix_with(path, &Path::canonicalize)
 }
 
 fn canonicalize_masking_prefix_with(
     path: &Path,
     canonicalize: &impl Fn(&Path) -> std::io::Result<PathBuf>,
-) -> Option<PathBuf> {
+) -> MaskPath {
     if !path.is_absolute() {
-        return None;
+        return MaskPath {
+            resolved: None,
+            denied: false,
+        };
     }
     let mut existing = path;
     let mut unseen = Vec::new();
+    let mut denied = false;
     loop {
         match canonicalize(existing) {
             Ok(mut canonical) => {
                 canonical.extend(unseen.iter().rev());
-                return Some(canonical);
+                return MaskPath {
+                    resolved: Some(canonical),
+                    denied,
+                };
             }
             Err(error)
                 if matches!(
@@ -337,10 +361,28 @@ fn canonicalize_masking_prefix_with(
                     ErrorKind::NotFound | ErrorKind::PermissionDenied
                 ) =>
             {
-                unseen.push(existing.file_name()?);
-                existing = existing.parent()?;
+                denied |= error.kind() == ErrorKind::PermissionDenied;
+                let Some(name) = existing.file_name() else {
+                    return MaskPath {
+                        resolved: None,
+                        denied,
+                    };
+                };
+                unseen.push(name);
+                let Some(parent) = existing.parent() else {
+                    return MaskPath {
+                        resolved: None,
+                        denied,
+                    };
+                };
+                existing = parent;
             }
-            Err(_) => return None,
+            Err(_) => {
+                return MaskPath {
+                    resolved: None,
+                    denied,
+                };
+            }
         }
     }
 }

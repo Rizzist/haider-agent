@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use super::{
-    ORIGIN_DISPLAY_MAX_BYTES, OriginPathKind, OriginSanitizeError, SanitizedOriginPath,
+    MaskPath, ORIGIN_DISPLAY_MAX_BYTES, OriginPathKind, OriginSanitizeError, SanitizedOriginPath,
     canonicalize_existing_prefix_with, canonicalize_masking_prefix_with,
     display_homes_from_profile, sanitize_origin_path, sanitize_origin_path_with_homes,
     sanitize_with, sanitize_with_canonicalizers, usable_home,
@@ -447,10 +447,9 @@ fn ancestor_walk_continues_only_for_not_found() {
         }
     };
     assert_eq!(canonicalize_existing_prefix_with(path, &denied_child), None);
-    assert_eq!(
-        canonicalize_masking_prefix_with(path, &denied_child),
-        Some(resolved.to_path_buf())
-    );
+    let mask_walk = canonicalize_masking_prefix_with(path, &denied_child);
+    assert_eq!(mask_walk.resolved, Some(resolved.to_path_buf()));
+    assert!(mask_walk.denied);
     assert_eq!(
         canonicalize_existing_prefix_with(Path::new("relative/path"), &|_| panic!("relative walk")),
         None
@@ -461,10 +460,10 @@ fn ancestor_walk_continues_only_for_not_found() {
 #[test]
 fn inaccessible_alias_uses_only_its_resolved_ancestor_for_masking() {
     use std::io::{Error, ErrorKind};
-    let path = Path::new("/Volumes/alias/Users/bob/private/x");
+    let path = Path::new("/tmp/alias/bob/private/x");
     let resolved = sanitize_with_canonicalizers(Some(path), &[], &|_| None, &|candidate| {
         canonicalize_masking_prefix_with(candidate, &|probe| {
-            if probe == Path::new("/Volumes/alias/Users") {
+            if probe == Path::new("/tmp/alias") {
                 Ok(Path::new("/Users").to_path_buf())
             } else {
                 Err(Error::from(ErrorKind::PermissionDenied))
@@ -495,10 +494,26 @@ fn aliased_multiuser_home_cannot_collapse_another_account() {
                 None
             }
         },
-        &|_| Some(Path::new("/Users/bob/x").to_path_buf()),
+        &|_| MaskPath {
+            resolved: Some(Path::new("/Users/bob/x").to_path_buf()),
+            denied: false,
+        },
     )
     .unwrap();
     assert_eq!(projected.display.as_deref(), Some("/Users/<user>/x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn denied_alias_without_a_known_account_root_declines_its_label() {
+    let path = Path::new("/tmp/bob/private");
+    let result = sanitize_with_canonicalizers(Some(path), &[], &|_| None, &|_| MaskPath {
+        resolved: Some(path.to_path_buf()),
+        denied: true,
+    })
+    .unwrap();
+    assert_eq!(result.kind, OriginPathKind::Redacted);
+    assert_eq!(result.display.as_deref(), Some("<path unavailable>"));
 }
 
 #[test]
