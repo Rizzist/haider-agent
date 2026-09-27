@@ -21,6 +21,7 @@
 pub mod art;
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 #[path = "presence/overlay_macos.rs"]
 mod overlay_macos;
 
@@ -72,7 +73,8 @@ pub const PRESENCE_HELPER_ENV: &str = "HAIDER_CU_PRESENCE_HELPER";
 pub const PRESENCE_DISABLE_ENV: &str = "HAIDER_CU_PRESENCE";
 
 /// Evidence-only (macOS): `1` makes the overlay capturable so documentation
-/// screenshots can show it. Model-facing captures then include it too.
+/// screenshots can show it. The helper must then prove all panels absent
+/// before acknowledging each model-facing capture.
 pub const PRESENCE_EVIDENCE_CAPTURABLE_ENV: &str = "HAIDER_CU_PRESENCE_EVIDENCE_CAPTURABLE";
 
 /// Value written into every input event Haider synthesises (macOS
@@ -88,7 +90,7 @@ pub const PRESENCE_IDLE_TIMEOUT: Duration = Duration::from_secs(CU_PRESENCE_IDLE
 pub const STOPPED_LEASE_RETENTION: Duration = Duration::from_secs(600);
 
 /// Upper bound the daemon waits for a surface to take capturable UI off
-/// screen before a model-facing capture. Missing acks never block capture.
+/// screen before a model-facing capture. Missing acks refuse capture.
 pub const CONCEAL_ACK_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// Upper bound the daemon waits for an overlay to acknowledge a pointer
@@ -302,6 +304,12 @@ pub enum PresenceEvent {
     },
     Ack {
         seq: u64,
+    },
+    /// The helper could not prove that every capturable panel has left the
+    /// capture boundary. The daemon must refuse this capture.
+    ConcealFailed {
+        seq: u64,
+        message: String,
     },
     /// The human pressed Stop.
     Stop,

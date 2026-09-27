@@ -101,7 +101,9 @@ again.
   sequence. Late, duplicate, unsent and retired-renderer acknowledgements
   cannot release a later capture, and old sequences are removed when a new
   conceal is sent. Conceal sequence rollover stays in its reserved high
-  range, away from pointer acknowledgements. The hold ends immediately when
+  range, away from pointer acknowledgements. A typed `conceal_failed` event,
+  a helper death, or an ack timeout refuses the capture before backend execute.
+  The hold ends immediately when
   the screenshot or inspect backend returns, before image admission,
   journaling and observation work.
 * Helpers keep a concealed state until `reveal`: the Windows fallback (and
@@ -160,6 +162,7 @@ Wire (`haider_tools::presence`):
 ```json
 {"event":"ready","platform":"macos","capture_excluded":true}
 {"event":"ack","seq":7}
+{"event":"conceal_failed","seq":7,"message":"…"}
 {"event":"stop"}
 {"event":"error","message":"…"}
 ```
@@ -178,9 +181,9 @@ badge with red live dot and red **Stop** button) is rasterised once in
 | Platform | Mechanism | Deterministic? |
 | --- | --- | --- |
 | macOS | every panel sets `NSWindowSharingNone`; the backend captures with `CGDisplayCreateImage`, which omits sharing-none windows | yes — verified live on macOS 26 (Darwin 25.6): with the overlay on screen (window server lists it at level 1000, sharing state 0) the model-facing CAS image contains neither pointer nor badge, and `screencapture` omits it too |
-| Windows | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on every overlay window (Windows 10 2004+), which Windows documents as excluding the window from capture | by the OS contract on 2004+ — **not runtime-verified here** (cross-compiled and Clippy-checked only); `ready.capture_excluded=false` is reported when the OS refuses |
+| Windows | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on every overlay window (Windows 10 2004+); if refused, `SW_HIDE` on all three, `IsWindowVisible` checks, and a bounded `DwmFlush` before ack | fallback cross-compiled and unit-tested; native Windows capture remains unverified |
 | Linux | no pointer overlay; the notification popup is concealed (closed) around each model-facing capture (below) | no — best effort, see below |
-| any helper reporting `capture_excluded:false` | the daemon sends `conceal` before each `screenshot`/`inspect` and waits ≤ 600 ms for the ack, then `reveal` afterwards | best effort (the helper takes its UI off screen) |
+| any helper reporting `capture_excluded:false` | the daemon sends `conceal` before each `screenshot`/`inspect` and waits ≤ 600 ms for verification; missing or failed verification refuses capture | fail closed on verification failure |
 
 The overlay is click-through everywhere except the badge (`ignoresMouseEvents`
 / `WS_EX_TRANSPARENT`).
@@ -188,11 +191,11 @@ The overlay is click-through everywhere except the badge (`ignoresMouseEvents`
 Because sharing-none also hides the overlay from every screenshot and screen
 recording (that is the point), documenting what the human sees needs
 `HAIDER_CU_PRESENCE_EVIDENCE_CAPTURABLE=1`, an evidence-only switch that uses
-`NSWindowSharingReadOnly` and reports `ready.capture_excluded=false`. Observed
-on this Mac: even in that mode the daemon's own `CGDisplayCreateImage` capture
-still omitted the overlay (only `screencapture` showed it), apparently because
-the helper is the capturing process's own child; production does not rely on
-this and keeps sharing-none.
+`NSWindowSharingReadOnly` and reports `ready.capture_excluded=false`. In this
+mode the helper disables AppKit animations, orders all three panels out,
+flushes the layer transaction, checks their window numbers against the
+window server's on-screen list, and waits for a display refresh before acking.
+Failure is reported as `conceal_failed`; production keeps sharing-none.
 
 ### Linux
 
@@ -220,7 +223,8 @@ this and keeps sharing-none.
     `capture_excluded:false`, so the daemon asks it to `conceal` before every
     model-facing `screenshot`/`inspect`: it closes the notification, waits
     200 ms for the desktop to retire the popup, acks, and re-posts it on
-    `reveal`. This is best effort: a desktop that animates the popup out more
+    `reveal`. A close error or timeout sends `conceal_failed` and refuses the
+    capture. This is best effort: a desktop that animates the popup out more
     slowly, or keeps closed notifications on screen, can still leak it into a
     capture; the model then sees Haider's own notification (not user data).
     The notification is also briefly absent from the list during a capture.

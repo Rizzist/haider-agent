@@ -36,6 +36,7 @@ struct FakeNotifications {
     next: AtomicU32,
     posted: Arc<Mutex<Vec<(u32, String, String)>>>,
     stop_on_close: Arc<AtomicBool>,
+    delay_close: Arc<AtomicBool>,
 }
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
@@ -70,6 +71,9 @@ impl FakeNotifications {
         id: u32,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
+        if self.delay_close.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
         if self.stop_on_close.load(Ordering::SeqCst) {
             // The signal is on the bus before the method reply, which is the
             // exact queued-click interleaving the helper must preserve.
@@ -129,10 +133,12 @@ async fn linux_real_helper_queues_stop_before_close_reply() {
     assert!(!address.is_empty());
     let posted = Arc::new(Mutex::new(Vec::new()));
     let stop_on_close = Arc::new(AtomicBool::new(false));
+    let delay_close = Arc::new(AtomicBool::new(false));
     let server = FakeNotifications {
         next: AtomicU32::new(0),
         posted: Arc::clone(&posted),
         stop_on_close: Arc::clone(&stop_on_close),
+        delay_close: Arc::clone(&delay_close),
     };
     let connection = zbus::connection::Builder::address(address.as_str())
         .unwrap()
@@ -303,6 +309,39 @@ async fn linux_real_helper_queues_stop_before_close_reply() {
         3,
         "concealed Stop cannot re-post"
     );
+    stop_on_close.store(false, Ordering::SeqCst);
+    command(
+        &mut helper,
+        &PresenceCommand::Hide {
+            surface: screen,
+            reason: super::super::PresenceEndReason::RunEnded,
+        },
+    );
+    command(&mut helper, &show("slow close"));
+    until(|| posted.lock().unwrap().len() == 4).await;
+    delay_close.store(true, Ordering::SeqCst);
+    command(
+        &mut helper,
+        &PresenceCommand::Conceal {
+            surface: screen,
+            seq: 703,
+        },
+    );
+    let failed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let line = rx.recv().await.unwrap();
+            assert!(
+                !line.contains("\"event\":\"ack\",\"seq\":703"),
+                "late close acknowledged"
+            );
+            if line.contains("\"event\":\"conceal_failed\",\"seq\":703") {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("slow close must fail closed");
+    assert!(failed.contains("timed out"), "{failed}");
     drop(helper.stdin.take());
     let status = helper.wait().unwrap();
     assert!(status.success(), "helper process: {status}");

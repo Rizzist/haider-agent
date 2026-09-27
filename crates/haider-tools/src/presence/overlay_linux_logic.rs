@@ -1,6 +1,20 @@
 //! Posting state for the Linux notification helper. The D-Bus loop owns the
 //! actual notification and Stop router; this state decides if it may post.
 
+use std::future::Future;
+use std::time::Duration;
+
+/// A close that never receives the notification server's reply cannot
+/// authorize an image capture. The caller emits the typed failure on Err.
+pub(super) async fn confirm_close<F>(close: F, deadline: Duration) -> Result<(), String>
+where
+    F: Future<Output = Result<(), String>>,
+{
+    tokio::time::timeout(deadline, close)
+        .await
+        .map_err(|_| "desktop notification close timed out".to_owned())?
+}
+
 #[derive(Default)]
 pub(super) struct LinuxPopupState {
     concealed: bool,
@@ -38,6 +52,28 @@ impl LinuxPopupState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn close_timeout_and_error_fail_closed() {
+        assert!(
+            confirm_close(async { Ok(()) }, Duration::from_millis(5))
+                .await
+                .is_ok()
+        );
+        assert!(
+            confirm_close(
+                async { Err("server refused".into()) },
+                Duration::from_millis(5)
+            )
+            .await
+            .is_err()
+        );
+        let timed_out = confirm_close(std::future::pending(), Duration::from_millis(5)).await;
+        assert_eq!(
+            timed_out,
+            Err("desktop notification close timed out".into())
+        );
+    }
 
     #[test]
     fn cross_session_updates_are_recorded_but_never_posted_during_conceal() {

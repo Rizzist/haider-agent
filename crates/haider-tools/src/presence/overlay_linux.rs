@@ -19,7 +19,7 @@
 //! screen; it is posted with low urgency so the desktop retires the popup
 //! into its notification list quickly, where Stop stays available.
 
-use super::overlay_linux_logic::LinuxPopupState;
+use super::overlay_linux_logic::{LinuxPopupState, confirm_close};
 use super::{
     LinuxNotificationPlan, LinuxStopRouter, PresenceCommand, PresenceEvent, PresenceMark,
     encode_event, parse_command_line,
@@ -114,12 +114,11 @@ impl Notifier {
 
     /// Closes the current notification. Its id stays live in the router
     /// until `Hide`: a Stop already queued on the bus still counts.
-    async fn close(&mut self) {
+    async fn close(&mut self) -> Result<(), String> {
         if self.id == 0 {
-            return;
+            return Ok(());
         }
-        let _ = self
-            .connection
+        self.connection
             .call_method(
                 Some(DESTINATION),
                 PATH,
@@ -127,8 +126,10 @@ impl Notifier {
                 "CloseNotification",
                 &(self.id,),
             )
-            .await;
+            .await
+            .map_err(|error| format!("desktop notification close failed: {error}"))?;
         self.id = 0;
+        Ok(())
     }
 }
 
@@ -237,13 +238,16 @@ async fn run_async() -> i32 {
                         PresenceCommand::Hide { .. } => {
                             router.hide();
                             popup.hide();
-                            notifier.close().await;
+                            let _ = notifier.close().await;
                         }
                         // The popup is an ordinary window: close it around a
                         // model-facing capture, then post it again.
                         PresenceCommand::Conceal { seq, .. } => {
                             popup.conceal();
-                            notifier.close().await;
+                            if let Err(message) = confirm_close(notifier.close(), Duration::from_millis(300)).await {
+                                emit(&PresenceEvent::ConcealFailed { seq, message });
+                                continue;
+                            }
                             tokio::time::sleep(CONCEAL_SETTLE).await;
                             emit(&PresenceEvent::Ack { seq });
                         }
@@ -279,7 +283,7 @@ async fn run_async() -> i32 {
             }
         }
     }
-    notifier.close().await;
+    let _ = notifier.close().await;
     0
 }
 

@@ -135,6 +135,12 @@ impl OverlayWindow for win::Layered {
     fn hide(&self) {
         win::Layered::hide(self);
     }
+    fn is_hidden(&self) -> bool {
+        win::Layered::is_hidden(self)
+    }
+    fn flush_capture(&self, deadline: Instant) -> bool {
+        win::Layered::flush_capture(deadline)
+    }
     fn set_image(&self, bitmap: &art::Bitmap, alpha: u8) -> Result<(), String> {
         win::Layered::set_image(self, bitmap, alpha)
     }
@@ -155,6 +161,7 @@ mod win {
     use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+    use windows_sys::Win32::Graphics::Dwm::DwmFlush;
     use windows_sys::Win32::Graphics::Gdi::{
         AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
         BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
@@ -168,9 +175,9 @@ mod win {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageExtraInfo, HWND_TOPMOST,
-        MA_NOACTIVATE, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-        RegisterClassExW, SPI_GETWORKAREA, SW_HIDE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW,
-        SetWindowDisplayAffinity, SetWindowPos, ShowWindow, SystemParametersInfoW,
+        IsWindowVisible, MA_NOACTIVATE, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW,
+        QS_ALLINPUT, RegisterClassExW, SPI_GETWORKAREA, SW_HIDE, SWP_NOACTIVATE, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow, SystemParametersInfoW,
         TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_LBUTTONDOWN,
         WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
@@ -510,6 +517,25 @@ mod win {
         pub(super) fn hide(&self) {
             // SAFETY: `hwnd` is live.
             unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        }
+
+        pub(super) fn is_hidden(&self) -> bool {
+            // SAFETY: hwnd remains live for this helper's lifetime.
+            unsafe { IsWindowVisible(self.hwnd) == 0 }
+        }
+
+        pub(super) fn flush_capture(deadline: Instant) -> bool {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let spawned = std::thread::Builder::new()
+                .name("presence-dwm-flush".into())
+                .spawn(move || {
+                    // SAFETY: DwmFlush has no pointer arguments; it waits for DWM.
+                    let _ = sender.send(unsafe { DwmFlush() } == 0);
+                });
+            spawned.is_ok()
+                && receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(false)
         }
     }
 }

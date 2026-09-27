@@ -10,6 +10,8 @@ use std::rc::Rc;
 struct FakeWindow {
     name: &'static str,
     visible: Rc<Cell<bool>>,
+    hidden_verified: Rc<Cell<bool>>,
+    flush_ok: Rc<Cell<bool>>,
     shows: Rc<RefCell<Vec<&'static str>>>,
 }
 
@@ -18,6 +20,8 @@ impl FakeWindow {
         Self {
             name,
             visible: Rc::default(),
+            hidden_verified: Rc::new(Cell::new(true)),
+            flush_ok: Rc::new(Cell::new(true)),
             shows: Rc::clone(shows),
         }
     }
@@ -30,6 +34,12 @@ impl OverlayWindow for FakeWindow {
     }
     fn hide(&self) {
         self.visible.set(false);
+    }
+    fn is_hidden(&self) -> bool {
+        !self.visible.get() && self.hidden_verified.get()
+    }
+    fn flush_capture(&self, _deadline: Instant) -> bool {
+        self.flush_ok.get()
     }
     fn set_image(&self, _bitmap: &art::Bitmap, _alpha: u8) -> Result<(), String> {
         Ok(())
@@ -92,6 +102,65 @@ fn pointer(seq: u64, mark: PresenceMark, point: Option<(f64, f64)>) -> PresenceC
 
 fn anything_visible(h: &Harness) -> bool {
     h.pointer.visible.get() || h.ring.visible.get() || h.badge.visible.get()
+}
+
+#[test]
+fn conceal_acks_only_after_all_three_windows_and_flush_verify() {
+    let mut h = harness(false);
+    h.overlay.apply(
+        PresenceCommand::Show {
+            surface: PresenceSurface::Screen,
+            label: "run".into(),
+        },
+        Instant::now(),
+    );
+    h.overlay.apply(
+        PresenceCommand::Conceal {
+            surface: PresenceSurface::Screen,
+            seq: 41,
+        },
+        Instant::now(),
+    );
+    assert_eq!(
+        h.overlay.take_events(),
+        vec![PresenceEvent::Ack { seq: 41 }]
+    );
+    assert!(!anything_visible(&h));
+}
+
+#[test]
+fn conceal_verification_timeout_and_flush_failure_never_ack() {
+    for failed in ["pointer", "ring", "badge", "flush"] {
+        let mut h = harness(false);
+        h.overlay.apply(
+            PresenceCommand::Show {
+                surface: PresenceSurface::Screen,
+                label: "run".into(),
+            },
+            Instant::now(),
+        );
+        match failed {
+            "pointer" => h.pointer.hidden_verified.set(false),
+            "ring" => h.ring.hidden_verified.set(false),
+            "badge" => h.badge.hidden_verified.set(false),
+            _ => h.pointer.flush_ok.set(false),
+        }
+        h.overlay.apply(
+            PresenceCommand::Conceal {
+                surface: PresenceSurface::Screen,
+                seq: 42,
+            },
+            Instant::now(),
+        );
+        assert!(
+            matches!(
+                h.overlay.take_events().as_slice(),
+                [PresenceEvent::ConcealFailed { seq: 42, .. }]
+            ),
+            "{failed}"
+        );
+        assert!(!anything_visible(&h), "{failed}");
+    }
 }
 
 /// Verifier finding B1 (8c614f6c): on the refused-exclusion fallback a

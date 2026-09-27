@@ -75,6 +75,7 @@ struct CaptureConceal {
     outstanding_seq: Option<u64>,
     /// Whether the current Conceal has been acknowledged.
     acked: tokio::sync::watch::Sender<bool>,
+    failed: bool,
 }
 
 impl Default for CaptureConceal {
@@ -84,6 +85,7 @@ impl Default for CaptureConceal {
             sent: false,
             outstanding_seq: None,
             acked: tokio::sync::watch::Sender::new(false),
+            failed: false,
         }
     }
 }
@@ -273,6 +275,7 @@ impl CuPresence {
             let capture = state.captures.entry(surface).or_default();
             capture.sent = true;
             capture.outstanding_seq = Some(seq);
+            capture.failed = false;
             capture.acked.send_replace(false);
         }
         sent
@@ -290,6 +293,9 @@ impl CuPresence {
         let first = {
             let capture = state.captures.entry(surface).or_default();
             capture.holders += 1;
+            if capture.holders == 1 {
+                capture.failed = false;
+            }
             capture.holders == 1
         };
         if first && !self.send_conceal(&mut state, surface) {
@@ -299,6 +305,9 @@ impl CuPresence {
                 renderer.close();
             }
             state.conceal_acks.retain(|_, pending| *pending != surface);
+            let capture = state.captures.entry(surface).or_default();
+            capture.failed = true;
+            capture.acked.send_replace(true);
         }
         let capture = state.captures.entry(surface).or_default();
         (capture.sent && !*capture.acked.borrow()).then(|| capture.acked.subscribe())
@@ -319,6 +328,38 @@ impl CuPresence {
         };
         if reveal && let Some(renderer) = state.renderers.get_mut(&surface) {
             let _ = renderer.send(&PresenceCommand::Reveal { surface });
+        }
+    }
+
+    fn capture_verified(&self, surface: PresenceSurface) -> bool {
+        let state = lock(&self.state);
+        state
+            .captures
+            .get(&surface)
+            .is_some_and(|capture| !capture.failed && (!capture.sent || *capture.acked.borrow()))
+    }
+
+    fn fail_capture_seq(&self, surface: PresenceSurface, seq: u64) {
+        let mut state = lock(&self.state);
+        if state.conceal_acks.get(&seq) != Some(&surface)
+            || !state
+                .captures
+                .get(&surface)
+                .is_some_and(|capture| capture.outstanding_seq == Some(seq))
+        {
+            return;
+        }
+        if let Some(capture) = state.captures.get_mut(&surface) {
+            capture.failed = true;
+            capture.acked.send_replace(true);
+        }
+    }
+
+    fn fail_capture_wait(&self, surface: PresenceSurface) {
+        let mut state = lock(&self.state);
+        if let Some(capture) = state.captures.get_mut(&surface) {
+            capture.failed = true;
+            capture.acked.send_replace(true);
         }
     }
 
@@ -361,6 +402,10 @@ impl CuPresence {
                         capture.acked.send_replace(true);
                     }
                 }
+            }
+            PresenceEvent::ConcealFailed { seq, message } => {
+                tracing::warn!(%message, surface = ?surface, seq, "presence conceal verification failed");
+                self.fail_capture_seq(surface, seq);
             }
             PresenceEvent::Ready {
                 platform,
@@ -476,6 +521,7 @@ impl CuPresence {
                 if let Some(capture) = state.captures.get_mut(&surface) {
                     capture.sent = false;
                     capture.outstanding_seq = None;
+                    capture.failed = true;
                     capture.acked.send_replace(true);
                 }
             }
@@ -629,23 +675,33 @@ impl PresenceLease {
     }
 
     /// Conceals capturable presence UI (Linux notification popup, refused
-    /// Windows exclusion) for the duration of one model-facing screenshot.
+    /// Windows exclusion, or macOS evidence panels) for one model-facing
+    /// screenshot. Failed or missing verification refuses the capture.
     ///
     /// The capture hold — and the guard that releases it — is taken
     /// synchronously, BEFORE the first await: if the caller is cancelled
     /// while waiting for the helper's ack (Esc, Stop), dropping this future
     /// drops the guard and the indicator is revealed (unless another capture
     /// still holds the surface).
-    pub(crate) async fn conceal_for_capture(&self) -> RevealGuard {
+    pub(crate) async fn conceal_for_capture(&self) -> Result<RevealGuard, String> {
         let ack = self.presence.begin_capture(PresenceSurface::Screen);
         let guard = RevealGuard {
             presence: Arc::clone(&self.presence),
             surface: PresenceSurface::Screen,
         };
         if let Some(mut ack) = ack {
-            let _ = tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack.wait_for(|acked| *acked)).await;
+            if !matches!(
+                tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack.wait_for(|acked| *acked)).await,
+                Ok(Ok(_))
+            ) {
+                self.presence.fail_capture_wait(PresenceSurface::Screen);
+            }
         }
-        guard
+        if self.presence.capture_verified(PresenceSurface::Screen) {
+            Ok(guard)
+        } else {
+            Err("presence panels could not be verified absent from the capture".into())
+        }
     }
 
     /// Whether the human already stopped this run. Checked right after

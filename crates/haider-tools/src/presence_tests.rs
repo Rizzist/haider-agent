@@ -394,6 +394,14 @@ fn wire_vocabulary_round_trips_and_rejects_unknown_fields() {
             .is_err()
     );
     assert_eq!(encode_event(&PresenceEvent::Stop), r#"{"event":"stop"}"#);
+    let failure = PresenceEvent::ConcealFailed {
+        seq: CONCEAL_ACK_SEQ_START,
+        message: "window still visible".into(),
+    };
+    assert_eq!(
+        serde_json::from_str::<PresenceEvent>(&encode_event(&failure)).expect("failure roundtrip"),
+        failure
+    );
     let ready: PresenceEvent =
         serde_json::from_str(r#"{"event":"ready","platform":"macos","capture_excluded":true}"#)
             .expect("ready");

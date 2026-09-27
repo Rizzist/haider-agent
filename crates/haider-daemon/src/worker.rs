@@ -23529,7 +23529,21 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         haider_protocol::computer::ComputerAction::Screenshot
                             | haider_protocol::computer::ComputerAction::Inspect { .. }
                     ) {
-                        Some(self.cu_presence.conceal_for_capture().await)
+                        match self.cu_presence.conceal_for_capture().await {
+                            Ok(guard) => Some(guard),
+                            Err(message) => {
+                                let error = ComputerError::Backend { message };
+                                broker
+                                    .journal_computer_outcome(
+                                        &intent,
+                                        EffectOutcome::Failed {
+                                            error: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                return Ok(computer_failure_result(&error));
+                            }
+                        }
                     } else {
                         None
                     };

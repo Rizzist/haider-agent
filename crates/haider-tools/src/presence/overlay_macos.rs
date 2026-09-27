@@ -14,11 +14,11 @@
 //!
 //! The helper runs a manual event loop instead of `NSApplication::run`: every
 //! event is inspected before dispatch, which is how a Stop click is detected
-//! without defining an Objective-C subclass (and therefore without any
-//! `unsafe` code). A Stop click whose Quartz event carries
+//! without defining an Objective-C subclass. The CoreVideo display-link
+//! boundary below uses reviewed FFI. A Stop click whose Quartz event carries
 //! [`SYNTHETIC_INPUT_TAG`] was posted by Haider itself and is ignored.
 
-use super::overlay_macos_logic::MacVisibility;
+use super::overlay_macos_logic::{MacVisibility, panels_absent_in_window_list};
 use super::{
     PresenceCommand, PresenceEvent, PresenceMark, PresencePoint, SYNTHETIC_INPUT_TAG, art,
     encode_event, parse_command_line,
@@ -26,15 +26,22 @@ use super::{
 use objc2::rc::Retained;
 use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly as _};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEventMask,
-    NSEventType, NSFont, NSImage, NSImageView, NSPanel, NSScreen, NSTextAlignment, NSTextField,
-    NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
+    NSAnimationContext, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
+    NSEventMask, NSEventType, NSFont, NSImage, NSImageView, NSPanel, NSScreen, NSTextAlignment,
+    NSTextField, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowSharingType,
+    NSWindowStyleMask,
 };
-use objc2_core_graphics::{CGEvent, CGEventField};
+use objc2_core_foundation::{CFArray, CFNumber, CFRetained};
+use objc2_core_graphics::{
+    CGEvent, CGEventField, CGMainDisplayID, CGWindowListCreate, CGWindowListOption, kCGNullWindowID,
+};
+use objc2_core_video::{CVDisplayLink, CVOptionFlags, CVTimeStamp, kCVReturnSuccess};
 use objc2_foundation::{NSData, NSDate, NSPoint, NSRect, NSSize, NSString};
+use objc2_quartz_core::CATransaction;
 use std::collections::VecDeque;
 use std::io::{BufRead as _, Write as _};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,6 +57,86 @@ const CAPTION_FRAME: (f64, f64, f64, f64) = (22.0, 20.0, 120.0, 17.0);
 const BADGE_MARGIN: f64 = 10.0;
 /// Pointer targets this close to the badge move it to the other edge.
 const BADGE_AVOID_MARGIN: f64 = 28.0;
+const CONCEAL_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
+static DISPLAY_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// A real display-link callback, rather than a wall-clock delay, marks the
+/// compositor refresh after the window server reports every panel absent.
+unsafe extern "C-unwind" fn display_tick(
+    _: NonNull<CVDisplayLink>,
+    _: NonNull<CVTimeStamp>,
+    _: NonNull<CVTimeStamp>,
+    _: CVOptionFlags,
+    _: NonNull<CVOptionFlags>,
+    _: *mut std::ffi::c_void,
+) -> i32 {
+    DISPLAY_TICKS.fetch_add(1, Ordering::Release);
+    kCVReturnSuccess
+}
+
+fn panels_absent(numbers: &[u32; 3]) -> Result<bool, String> {
+    let windows = CGWindowListCreate(CGWindowListOption::OptionOnScreenOnly, kCGNullWindowID)
+        .ok_or("window server did not return the on-screen window list")?;
+    if windows.is_empty() {
+        return Err("window server returned an empty on-screen window list".into());
+    }
+    // SAFETY: CGWindowListCreate's returned CFArray contains CFNumberRefs
+    // representing CGWindowIDs (CoreGraphics API contract). It is immutable.
+    let windows: CFRetained<CFArray<CFNumber>> = unsafe { CFRetained::cast_unchecked(windows) };
+    let mut listed = Vec::with_capacity(windows.len());
+    for item in windows.iter() {
+        let number = item
+            .as_i64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("window server returned an invalid window id")?;
+        listed.push(number);
+    }
+    Ok(panels_absent_in_window_list(numbers, &listed))
+}
+
+#[allow(deprecated)] // CVDisplayLink supplies the actual display refresh boundary.
+fn verify_panels_absent(numbers: &[u32; 3]) -> Result<(), String> {
+    let deadline = Instant::now() + CONCEAL_VERIFY_TIMEOUT;
+    let mut raw_link = std::ptr::null_mut();
+    // SAFETY: raw_link is writable and remains live for this call.
+    if unsafe {
+        CVDisplayLink::create_with_cg_display(CGMainDisplayID(), NonNull::from(&mut raw_link))
+    } != kCVReturnSuccess
+    {
+        return Err("could not create a display refresh link".into());
+    }
+    let raw_link = NonNull::new(raw_link).ok_or("display refresh link was null")?;
+    // SAFETY: CoreVideo's successful Create transfers a retained reference.
+    let link: CFRetained<CVDisplayLink> = unsafe { CFRetained::from_raw(raw_link) };
+    // SAFETY: callback accesses only the process-lifetime DISPLAY_TICKS.
+    if unsafe { link.set_output_callback(Some(display_tick), std::ptr::null_mut()) }
+        != kCVReturnSuccess
+        || link.start() != kCVReturnSuccess
+    {
+        return Err("could not start a display refresh link".into());
+    }
+    let result = (|| {
+        while Instant::now() < deadline {
+            if panels_absent(numbers)? {
+                let first = DISPLAY_TICKS.load(Ordering::Acquire);
+                // Require a full subsequent refresh, then check again so a
+                // panel ordered front in the meantime cannot be acknowledged.
+                while DISPLAY_TICKS.load(Ordering::Acquire) == first && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                if DISPLAY_TICKS.load(Ordering::Acquire) != first && panels_absent(numbers)? {
+                    return Ok(());
+                }
+            }
+            std::thread::yield_now();
+        }
+        Err("presence panels remained on screen past the conceal deadline".into())
+    })();
+    if link.stop() != kCVReturnSuccess {
+        return Err("could not stop the display refresh link".into());
+    }
+    result
+}
 
 pub(super) fn run() -> i32 {
     let Some(mtm) = MainThreadMarker::new() else {
@@ -108,8 +195,8 @@ pub(super) fn run() -> i32 {
 
 /// Evidence-only switch: with `HAIDER_CU_PRESENCE_EVIDENCE_CAPTURABLE=1` the
 /// overlay is capturable so a human-view screenshot can document what it looks
-/// like. It then also appears in model-facing screenshots, which `Ready`
-/// reports honestly as `capture_excluded: false`. Never set in production.
+/// like. `Ready` reports `capture_excluded: false`; captures therefore wait
+/// for verified Conceal. Never set in production.
 fn evidence_capturable() -> bool {
     std::env::var_os(super::PRESENCE_EVIDENCE_CAPTURABLE_ENV).is_some_and(|value| value == "1")
 }
@@ -163,6 +250,7 @@ fn panel(mtm: MainThreadMarker, size: (f64, f64), clickable: bool) -> Retained<N
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
     panel.setHidesOnDeactivate(false);
     panel.setFloatingPanel(true);
+    panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
     panel.setBecomesKeyOnlyIfNeeded(true);
     panel.setWorksWhenModal(true);
     // After setFloatingPanel, which resets the level to NSFloatingWindowLevel.
@@ -417,9 +505,33 @@ impl Overlay {
             PresenceCommand::Conceal { seq, .. } => {
                 if evidence_capturable() {
                     self.visibility.conceal();
+                    NSAnimationContext::beginGrouping();
+                    NSAnimationContext::currentContext().setDuration(0.0);
+                    CATransaction::begin();
+                    CATransaction::setDisableActions(true);
                     self.pointer.orderOut(None);
                     self.ring.orderOut(None);
                     self.badge.orderOut(None);
+                    CATransaction::commit();
+                    NSAnimationContext::endGrouping();
+                    CATransaction::flush();
+                    let numbers = [
+                        self.pointer.windowNumber(),
+                        self.ring.windowNumber(),
+                        self.badge.windowNumber(),
+                    ];
+                    let numbers = numbers.map(u32::try_from);
+                    let result = numbers
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| "invalid presence panel window number".to_owned())
+                        .and_then(|numbers| {
+                            verify_panels_absent(&[numbers[0], numbers[1], numbers[2]])
+                        });
+                    if let Err(message) = result {
+                        emit(&PresenceEvent::ConcealFailed { seq, message });
+                        return;
+                    }
                 }
                 emit(&PresenceEvent::Ack { seq });
             }

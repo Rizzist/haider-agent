@@ -476,8 +476,9 @@ async fn capturable_indicators_are_concealed_around_model_captures_only() {
             )
             .await
             .expect("begin");
-        // Nobody acks: the bounded wait elapses, the capture proceeds.
+        // Nobody acks: a capturable capture is refused after the bound.
         let guard = lease.conceal_for_capture().await;
+        assert_eq!(guard.is_err(), capturable);
         drop(guard);
         drop(action);
         let commands = recorded.commands.lock().unwrap().clone();
@@ -867,6 +868,7 @@ async fn regression_hide_while_awaiting_ack_releases_wait_no_leak() {
         started.elapsed() < Duration::from_millis(300),
         "released by the Hide"
     );
+    assert!(guard.is_err(), "renderer retirement refuses capture");
     drop(guard);
     assert_eq!(presence.capture_holders(PresenceSurface::Screen), 0);
     assert_eq!(
@@ -1021,8 +1023,9 @@ async fn retired_renderer_ack_cannot_release_recreated_renderer_conceal() {
     assert!(poll_once(capture.as_mut()));
     let old_seq = conceal_seq(&recorded);
     let old_sink = recorded.sink.lock().unwrap().clone().expect("old sink");
+    old_sink(PresenceEvent::Ack { seq: old_seq });
+    let guard = capture.await.expect("first helper verified conceal");
     a.end(true); // Hide retires the first helper while the hold remains.
-    let guard = capture.await;
     let (stop_b, _) = counting_hook();
     let b = PresenceLease::new(Arc::clone(&presence), "s/restart-b".into(), stop_b);
     drop(
@@ -1081,8 +1084,12 @@ async fn failed_reconceal_never_shows_the_recreated_renderer() {
     let capture = a.conceal_for_capture();
     tokio::pin!(capture);
     assert!(poll_once(capture.as_mut()));
+    let first_sink = recorded.sink.lock().unwrap().clone().expect("first sink");
+    first_sink(PresenceEvent::Ack {
+        seq: conceal_seq(&recorded),
+    });
+    let guard = capture.await.expect("first helper verified conceal");
     a.end(true);
-    let guard = capture.await;
     let (stop_b, _) = counting_hook();
     let b = PresenceLease::new(Arc::clone(&presence), "s/dead-b".into(), stop_b);
     drop(
@@ -1144,6 +1151,7 @@ async fn failed_first_conceal_retires_the_renderer_before_capture() {
     );
     let guard = lease.conceal_for_capture().await;
     assert_eq!(recorded.closed.load(Ordering::SeqCst), 1);
+    assert!(guard.is_err(), "failed send must refuse capture");
     assert!(
         !lock(&presence.state)
             .renderers
@@ -1170,12 +1178,86 @@ async fn only_the_latest_conceal_ack_is_retained_across_timeouts() {
     );
     for _ in 0..3 {
         let guard = lease.conceal_for_capture().await;
+        assert!(guard.is_err(), "timeout must refuse the capture");
         drop(guard);
         let seq = conceal_seq(&recorded);
         let state = lock(&presence.state);
         assert_eq!(state.conceal_acks.len(), 1, "previous seqs are purged");
         assert_eq!(state.conceal_acks.get(&seq), Some(&PresenceSurface::Screen));
     }
+    lease.end(false);
+}
+
+#[tokio::test]
+async fn typed_conceal_failure_rejects_capture_without_replacing_visible_renderer() {
+    let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
+    let (stop, _) = counting_hook();
+    let lease = PresenceLease::new(Arc::clone(&presence), "s/verify-failed".into(), stop);
+    drop(
+        lease
+            .begin_computer(
+                &ComputerAction::Screenshot,
+                None,
+                &haider_tools::ComputerCancelToken::new(),
+            )
+            .await
+            .expect("begin"),
+    );
+    let capture = lease.conceal_for_capture();
+    tokio::pin!(capture);
+    assert!(poll_once(capture.as_mut()));
+    let seq = conceal_seq(&recorded);
+    let sink = recorded.sink.lock().unwrap().clone().expect("sink");
+    sink(PresenceEvent::ConcealFailed {
+        seq,
+        message: "window still visible".into(),
+    });
+    assert!(
+        capture.await.is_err(),
+        "failed verification must refuse capture"
+    );
+    assert_eq!(recorded.closed.load(Ordering::SeqCst), 0);
+    assert_eq!(conceal_log(&recorded), vec!["conceal", "reveal"]);
+    lease.end(false);
+}
+
+#[tokio::test]
+async fn stale_conceal_failure_cannot_reject_a_new_capture() {
+    let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
+    let (stop, _) = counting_hook();
+    let lease = PresenceLease::new(Arc::clone(&presence), "s/stale-failure".into(), stop);
+    drop(
+        lease
+            .begin_computer(
+                &ComputerAction::Screenshot,
+                None,
+                &haider_tools::ComputerCancelToken::new(),
+            )
+            .await
+            .expect("begin"),
+    );
+    let sink = recorded.sink.lock().unwrap().clone().expect("sink");
+    let first = lease.conceal_for_capture();
+    tokio::pin!(first);
+    assert!(poll_once(first.as_mut()));
+    let old_seq = conceal_seq(&recorded);
+    sink(PresenceEvent::Ack { seq: old_seq });
+    drop(first.await.expect("verified first capture"));
+    let second = lease.conceal_for_capture();
+    tokio::pin!(second);
+    assert!(poll_once(second.as_mut()));
+    let new_seq = conceal_seq(&recorded);
+    sink(PresenceEvent::ConcealFailed {
+        seq: old_seq,
+        message: "stale".into(),
+    });
+    assert_eq!(recorded.closed.load(Ordering::SeqCst), 0);
+    sink(PresenceEvent::Ack { seq: new_seq });
+    drop(
+        second
+            .await
+            .expect("stale failure did not reject current capture"),
+    );
     lease.end(false);
 }
 

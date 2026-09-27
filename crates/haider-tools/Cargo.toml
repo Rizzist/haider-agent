@@ -53,6 +53,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "objc2-core-foundation",
     "objc2-core-graphics",
     "NSApplication",
+    "NSAnimationContext",
     "NSColor",
     "NSControl",
     "NSEvent",
@@ -73,7 +74,12 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "std",
     "CGEvent",
     "CGEventTypes",
+    "CGDirectDisplay",
+    "CGWindow",
 ] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray", "CFNumber"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["CVBase", "CVDisplayLink", "CVReturn", "objc2-core-graphics"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["CATransaction"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 futures-util.workspace = true
@@ -88,6 +94,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

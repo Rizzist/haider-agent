@@ -6,6 +6,12 @@ pub(super) struct MacVisibility {
     concealed: bool,
 }
 
+/// The capture boundary may acknowledge only when none of its three panel
+/// window numbers appears in the window server's on-screen list.
+pub(super) fn panels_absent_in_window_list(panels: &[u32; 3], on_screen: &[u32]) -> bool {
+    panels.iter().all(|number| !on_screen.contains(number))
+}
+
 impl MacVisibility {
     pub(super) fn show(&mut self) -> bool {
         self.visible = true;
@@ -32,6 +38,16 @@ impl MacVisibility {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conceal_window_list_requires_pointer_ring_and_badge_absent() {
+        let panels = [11, 12, 13];
+        for present in panels {
+            assert!(!panels_absent_in_window_list(&panels, &[99, present]));
+        }
+        assert!(panels_absent_in_window_list(&panels, &[98, 99]));
+        assert!(panels_absent_in_window_list(&panels, &[]));
+    }
 
     #[test]
     fn show_pointer_animation_and_ring_stay_hidden_until_reveal() {

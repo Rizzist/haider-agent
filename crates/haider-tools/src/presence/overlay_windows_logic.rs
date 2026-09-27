@@ -19,6 +19,10 @@ pub(super) const MOVE_DURATION: Duration = Duration::from_millis(160);
 pub(super) const RING_DURATION: Duration = Duration::from_millis(450);
 const BADGE_MARGIN: f64 = 10.0;
 const BADGE_AVOID_MARGIN: f64 = 28.0;
+#[cfg(not(test))]
+const CONCEAL_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const CONCEAL_VERIFY_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// Badge text run: text, rectangle `(left, top, right, bottom)`, centred.
 pub(super) type BadgeText<'a> = (&'a str, (f64, f64, f64, f64), bool);
@@ -27,6 +31,8 @@ pub(super) type BadgeText<'a> = (&'a str, (f64, f64, f64, f64), bool);
 pub(super) trait OverlayWindow {
     fn show_at(&self, x: i32, y: i32);
     fn hide(&self);
+    fn is_hidden(&self) -> bool;
+    fn flush_capture(&self, deadline: Instant) -> bool;
     fn set_image(&self, bitmap: &art::Bitmap, alpha: u8) -> Result<(), String>;
     fn set_image_with_text(
         &self,
@@ -189,6 +195,31 @@ impl<W: OverlayWindow> Overlay<W> {
                     self.pointer.hide();
                     self.ring.hide();
                     self.badge.hide();
+                    let deadline = Instant::now() + CONCEAL_VERIFY_TIMEOUT;
+                    while Instant::now() < deadline {
+                        if self.pointer.is_hidden()
+                            && self.ring.is_hidden()
+                            && self.badge.is_hidden()
+                        {
+                            if !self.pointer.flush_capture(deadline) {
+                                break;
+                            }
+                            if self.pointer.is_hidden()
+                                && self.ring.is_hidden()
+                                && self.badge.is_hidden()
+                            {
+                                self.emit(PresenceEvent::Ack { seq });
+                                return;
+                            }
+                        }
+                        std::thread::yield_now();
+                    }
+                    self.emit(PresenceEvent::ConcealFailed {
+                        seq,
+                        message: "Windows presence panels did not leave the capture boundary"
+                            .into(),
+                    });
+                    return;
                 }
                 self.emit(PresenceEvent::Ack { seq });
             }
