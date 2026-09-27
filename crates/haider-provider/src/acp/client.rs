@@ -283,19 +283,85 @@ impl AcpError {
         }
     }
 
-    /// Converts to the crate's terminal error type, attaching the bounded
-    /// stderr tail as operator detail. The tail is already OAuth-redacted by
-    /// [`StderrRing`].
+    /// Converts to the crate's terminal error type. The RPC error text and
+    /// the bounded stderr tail are child-controlled: the RPC message is
+    /// published only when it matches a known template, and everything else
+    /// reaches only the owner-local `provider_raw_detail`. The other variants'
+    /// texts are Haider-authored.
     pub fn into_provider_error(self, stderr_tail: &str) -> ProviderError {
         let kind = self.kind();
-        let message = self.to_string();
-        let error = ProviderError::new(kind, message.clone());
-        if stderr_tail.is_empty() {
-            error
-        } else {
-            error.with_provider_detail(&format!("{message} Agent stderr tail: {stderr_tail}"))
+        let raw = self.to_string();
+        let known = match &self {
+            Self::Rpc(error) => {
+                crate::error_templates::render_known_provider_message(&error.message)
+            }
+            _ => None,
+        };
+        let message = match &self {
+            // Auth-method ids are protocol identifiers the operator needs
+            // verbatim. Only short identifier-shaped ids are shown.
+            Self::AuthMethodUnavailable { advertised } => {
+                let ids = advertised
+                    .iter()
+                    .map(|id| {
+                        if acp_identifier(id) {
+                            id.as_str()
+                        } else {
+                            "[REDACTED]"
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                format!(
+                    "the ACP agent does not advertise the oauth-personal auth method; it advertised: {}",
+                    if ids.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        ids.join(", ")
+                    }
+                )
+            }
+            Self::Rpc(_) => known.as_ref().map_or_else(
+                || crate::provider_default_detail(kind),
+                |known| format!("the ACP agent returned an error: {known}"),
+            ),
+            _ => raw.clone(),
+        };
+        let mut error = ProviderError::new(kind, message);
+        // Line breaks are framing in the stderr ring; join its lines.
+        let tail = stderr_tail
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let child_text = matches!(self, Self::Rpc(_) | Self::AuthMethodUnavailable { .. });
+        if tail.is_empty() {
+            if child_text && known.is_none() {
+                error.provider_raw_detail = Some(crate::error_detail::local_raw_detail(&raw));
+            }
+            return error;
+        }
+        let local = format!("{raw} Agent stderr tail: {tail}");
+        match &self {
+            Self::Rpc(rpc) if known.is_some() => error
+                .with_provider_detail(&rpc.message)
+                .with_local_raw_detail(crate::error_detail::local_raw_detail(&local)),
+            _ => error.with_provider_detail(&local),
         }
     }
+}
+
+/// A published protocol identifier: at most 64 bytes of lower-case ASCII
+/// letters, digits, `-` or `_`, in short segments (each under 16 bytes), so
+/// it cannot carry an email, URL, or opaque token.
+fn acp_identifier(id: &str) -> bool {
+    id.len() <= 64
+        && id
+            .split(['-', '_'])
+            .all(|segment| (1..16).contains(&segment.len()))
+        && id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 // ---------------------------------------------------------------------------

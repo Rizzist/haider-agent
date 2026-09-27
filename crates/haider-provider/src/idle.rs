@@ -24,6 +24,18 @@ pub struct ProviderIdleTimeout {
     pub cause: Option<Box<ProviderError>>,
 }
 
+impl ProviderIdleTimeout {
+    /// Copy whose preceding cause carries only its public message, for the
+    /// durable `haider.provider.idle_timeout.v1` extension.
+    #[must_use]
+    pub fn shareable(&self) -> Self {
+        Self {
+            cause: self.cause.as_ref().map(|cause| Box::new(cause.shareable())),
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Debug)]
 struct State {
     budget: Duration,

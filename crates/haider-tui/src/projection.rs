@@ -120,6 +120,12 @@ pub struct ItemBlock {
     pub output_decode_error: bool,
     /// Bounded terminal reason joined from the matching `ToolResult` fact.
     pub tool_reason: Option<String>,
+    /// The matching `ToolResult` fact itself, kept WHOLE (973-tui-toolview):
+    /// its preview is the output a non-streaming tool (`fs_read`,
+    /// `fs_search`, …) produced, its reason is unshortened, and its typed
+    /// data carries counts. The full-detail view reads it; nothing here is
+    /// truncated beyond what the tool itself bounded.
+    pub tool_result: Option<Box<haider_protocol::tool::BoundedResult>>,
     /// The block was produced during a voice turn — the agent header tags
     /// ` · ♪ speaking` (sim tui.js:3895-3897; demo-local voice surface).
     pub spoken: bool,
@@ -143,6 +149,7 @@ impl ItemBlock {
             output_truncated: false,
             output_decode_error: false,
             tool_reason: None,
+            tool_result: None,
             spoken: false,
             agent_line_starts,
         }
@@ -160,6 +167,268 @@ impl ItemBlock {
     #[must_use]
     pub fn output_text(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.output_tail)
+    }
+
+    /// What a tool row shows as its output: the streamed tail when the tool
+    /// streamed one, otherwise the joined result's payload (the preview
+    /// without its truncation marker line). Command rows only ever stream.
+    #[must_use]
+    pub fn tool_output(&self) -> std::borrow::Cow<'_, str> {
+        self.compact_output().text
+    }
+
+    /// What the FULL-DETAIL view shows as output (973-tui-toolview repair).
+    ///
+    /// The streamed tail is capped at [`OUTPUT_TAIL_MAX`]; the joined
+    /// `ToolResult` is the tool's own authoritative payload. A complete
+    /// (uncut) stream is shown as streamed. A stream the cap cut is replaced
+    /// by the joined result whenever one exists, so the view shows the
+    /// output from its FIRST byte instead of an 8 KiB tail. The returned
+    /// [`OutputView`] says which source it is and what bounds it still
+    /// carries, so the renderer never presents a bounded text as complete.
+    #[must_use]
+    pub fn detail_output(&self) -> OutputView<'_> {
+        let result_payload = self
+            .tool_result
+            .as_ref()
+            .map(|result| result.payload_text())
+            .filter(|payload| !payload.is_empty());
+        if let Some(payload) = result_payload
+            && (self.output_tail.is_empty() || self.output_truncated)
+        {
+            let (text, limit_reached) = readable_payload(payload);
+            return OutputView {
+                text,
+                tail_cut: false,
+                stream_replaced: self.output_truncated,
+                result_bound: self.result_bound(),
+                limit_reached,
+            };
+        }
+        OutputView {
+            text: self.output_text(),
+            tail_cut: self.output_truncated,
+            stream_replaced: false,
+            result_bound: None,
+            limit_reached: false,
+        }
+    }
+
+    /// What a COLLAPSED or inline-expanded row shows: the compact streamed
+    /// tail while a tool streams, the joined result otherwise — with the
+    /// same honesty facts as [`Self::detail_output`].
+    #[must_use]
+    pub fn compact_output(&self) -> OutputView<'_> {
+        if self.output_tail.is_empty()
+            && let Some(result) = &self.tool_result
+        {
+            let (text, limit_reached) = readable_payload(result.payload_text());
+            return OutputView {
+                text,
+                tail_cut: false,
+                stream_replaced: false,
+                result_bound: self.result_bound(),
+                limit_reached,
+            };
+        }
+        OutputView {
+            text: self.output_text(),
+            tail_cut: self.output_truncated,
+            stream_replaced: false,
+            result_bound: None,
+            limit_reached: false,
+        }
+    }
+
+    /// The joined result's TYPED truncation, when it declared one. Carries
+    /// byte counts and whether a continuation exists — never the digest or
+    /// the artifact id (provenance the transcript has no reason to print).
+    #[must_use]
+    pub fn result_bound(&self) -> Option<ResultBound> {
+        let result = self.tool_result.as_ref()?;
+        let declared = result.truncation.as_ref().filter(|t| t.truncated);
+        if !result.truncated && declared.is_none() {
+            return None;
+        }
+        Some(ResultBound {
+            shown_bytes: declared.map(|t| t.payload_bytes),
+            original_bytes: declared.map(|t| t.original_bytes),
+            pageable: result.cursor.is_some(),
+            stored: result.artifact.is_some(),
+        })
+    }
+
+    /// The spans the edit tool measured while applying this call
+    /// (973-tui-toolview repair 4) — the ONLY source an edit's diff rows are
+    /// numbered from. Empty for other tools and for journals written before
+    /// the tools recorded them.
+    #[must_use]
+    pub fn edit_spans(&self) -> &[haider_protocol::tool::EditSpanV1] {
+        self.tool_result
+            .as_ref()
+            .and_then(|result| {
+                result
+                    .effects
+                    .iter()
+                    .find(|effect| !effect.edit_spans.is_empty())
+            })
+            .map_or(&[], |effect| effect.edit_spans.as_slice())
+    }
+
+    /// The typed search match count, when the joined result carries one.
+    #[must_use]
+    pub fn search_matches(&self) -> Option<usize> {
+        match self.tool_result.as_ref()?.data.as_ref()? {
+            haider_protocol::tool::ToolResultData::FsSearch { matches, .. } => Some(matches.len()),
+            _ => None,
+        }
+    }
+}
+
+/// A tool row's output as one surface shows it, with its honesty facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputView<'a> {
+    pub text: std::borrow::Cow<'a, str>,
+    /// The text is the streamed tail and the cap cut its front.
+    pub tail_cut: bool,
+    /// The streamed output was capped, so the view shows the joined result
+    /// in its place.
+    pub stream_replaced: bool,
+    /// The shown text is a result the tool itself declared bounded.
+    pub result_bound: Option<ResultBound>,
+    /// The tool's own envelope says it stopped at its output limit.
+    pub limit_reached: bool,
+}
+
+/// Payloads larger than this are shown raw rather than parsed.
+const READABLE_PAYLOAD_MAX: usize = 4 * 1024 * 1024;
+
+/// Keys of the daemon's EXECUTION envelope (`process_exec`, `ssh_shell`,
+/// `test_run`, `!` commands): the output it carries plus provenance.
+const EXECUTION_ENVELOPE_KEYS: &[&str] = &[
+    "status",
+    "effect_id",
+    "exit_code",
+    "signal",
+    "output_bytes",
+    "command_arg_digest",
+    "transcript_digest",
+    "workspace_revision",
+    "subject_digest",
+    "process_signal",
+    "output",
+    "output_adapter",
+    "test_summary",
+    "artifact",
+    "capture",
+    "limit_reached",
+    "limits",
+    "escalation_note",
+    "context_savings_detail",
+];
+
+/// Keys of the daemon's WORKSPACE-MUTATION envelope (`fs_write`, `fs_edit`,
+/// `fs_path` and their aliases): the tool's sentence plus provenance.
+const MUTATION_ENVELOPE_KEYS: &[&str] = &[
+    "result",
+    "mutation_digest",
+    "workspace_revision",
+    "subject_digest",
+    "workspace_mutation",
+];
+
+/// A tool result's human-readable text (973-tui-toolview).
+///
+/// The daemon wraps execution and workspace-mutation results in JSON
+/// ENVELOPES (`{"output": "…", "command_arg_digest": …}` /
+/// `{"result": "edited …", "mutation_digest": …}`). A payload is unwrapped
+/// by its SHAPE — every key belongs to one envelope's schema and that
+/// envelope's identifying keys are present — never by the tool's name, so
+/// `fs_path` and `test_run` render their text too, while a file or API
+/// response that merely has an `output` key is content and is shown
+/// exactly as sent. The second value is the envelope's `limit_reached`.
+fn readable_payload(payload: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    let raw = (std::borrow::Cow::Borrowed(payload), false);
+    if !payload.trim_start().starts_with('{') || payload.len() > READABLE_PAYLOAD_MAX {
+        return raw;
+    }
+    let Ok(serde_json::Value::Object(envelope)) =
+        serde_json::from_str::<serde_json::Value>(payload)
+    else {
+        return raw;
+    };
+    let shaped = |schema: &[&str], text_key: &str, identifying: &[&str]| {
+        envelope.keys().all(|key| schema.contains(&key.as_str()))
+            && identifying.iter().all(|key| envelope.contains_key(*key))
+            && envelope
+                .get(text_key)
+                .is_some_and(serde_json::Value::is_string)
+    };
+    let text_key = if shaped(
+        EXECUTION_ENVELOPE_KEYS,
+        "output",
+        &["effect_id", "command_arg_digest", "transcript_digest"],
+    ) {
+        "output"
+    } else if shaped(
+        MUTATION_ENVELOPE_KEYS,
+        "result",
+        &["mutation_digest", "workspace_mutation"],
+    ) {
+        "result"
+    } else {
+        return raw;
+    };
+    let limit_reached = envelope
+        .get("limit_reached")
+        .is_some_and(|value| !value.is_null() && value != &serde_json::Value::Bool(false));
+    match envelope.get(text_key).and_then(serde_json::Value::as_str) {
+        Some(text) => (std::borrow::Cow::Owned(text.to_owned()), limit_reached),
+        None => raw,
+    }
+}
+
+/// A tool result's declared bound, as the transcript may show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultBound {
+    pub shown_bytes: Option<u64>,
+    pub original_bytes: Option<u64>,
+    /// The result carries a continuation cursor for paging the rest.
+    pub pageable: bool,
+    /// The full result is stored as an artifact.
+    pub stored: bool,
+}
+
+impl ResultBound {
+    /// One line naming the bound: counts when declared, and how the rest
+    /// can be reached.
+    #[must_use]
+    pub fn note(&self) -> String {
+        let mut note = match (self.shown_bytes, self.original_bytes) {
+            (Some(shown), Some(total)) => format!(
+                "⋯ result is bounded — {} of {} shown",
+                human_bytes(shown),
+                human_bytes(total)
+            ),
+            _ => "⋯ result is bounded by the tool — not the complete output".to_owned(),
+        };
+        if self.pageable {
+            note.push_str(" · the rest is pageable (continuation cursor)");
+        }
+        if self.stored {
+            note.push_str(" · full content kept as an artifact");
+        }
+        note
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -1384,6 +1653,7 @@ impl SessionProjection {
                 } if known == call_id => {
                     *status = result.status.item_status();
                     block.tool_reason = reason.clone();
+                    block.tool_result = Some(Box::new(result.clone()));
                     Some((block.item_id.clone(), is_screen_control_item(&block.item)))
                 }
                 _ => None,
@@ -2500,12 +2770,37 @@ pub const FACT_RANK_RESET: u8 = 1;
 pub const FACT_RANK_ACTIONS: u8 = 2;
 pub const FACT_RANK_HTTP: u8 = 3;
 pub const FACT_RANK_REQUEST: u8 = 4;
+pub const FACT_RANK_ERROR_TYPE: u8 = 5;
+
+/// The expanded error card's full-length provider identity lines (provider
+/// error type, the unshortened request id, then the owner-local raw
+/// provider text), shared by the transcript card, recovery menus and the
+/// plain renderer so every TUI error surface shows the same facts. Absent
+/// fields produce no line.
+#[must_use]
+pub fn error_identity_lines(presentation: &ErrorPresentation) -> Vec<String> {
+    let mut lines = Vec::with_capacity(3);
+    if let Some(error_type) = &presentation.provider_error_type {
+        lines.push(format!("Provider error type: {error_type}"));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        lines.push(format!("Request id: {request_id}"));
+    }
+    if let Some(raw) = &presentation.provider_raw_detail {
+        lines.push(format!(
+            "{}: {raw}",
+            haider_protocol::error::PROVIDER_RAW_DETAIL_LABEL
+        ));
+    }
+    lines
+}
 
 /// The compact fact line's segments, display-ordered (`subcode · HTTP 429
-/// · req 8f3a2c1d… · resets in 2m 14s`), each with its shed rank. A
+/// · Request id: 8f3a2c1d… · resets in 2m 14s`), each with its shed rank. A
 /// missing datum DROPS its whole segment — never a placeholder. The
 /// request id is shortened to its first 8 chars (the journal keeps the
-/// full id; the transcript string renders it whole). The reset segment is
+/// full id; the transcript string and expanded card render it whole). The
+/// provider error type is a separate, shedable segment. The reset segment is
 /// LIVE when the caller supplies the daemon clock (`reset_at_ms − now`)
 /// and otherwise the static provider delay recorded at failure time.
 #[must_use]
@@ -2535,6 +2830,7 @@ fn build_error_fact_segments(
     let capacity = 1
         + usize::from(presentation.provider_http_status.is_some())
         + usize::from(presentation.provider_request_id.is_some())
+        + usize::from(presentation.provider_error_type.is_some())
         + usize::from(reset.is_some())
         + additional_capacity;
     let mut segments = Vec::with_capacity(capacity);
@@ -2544,8 +2840,14 @@ fn build_error_fact_segments(
     }
     if let Some(request_id) = &presentation.provider_request_id {
         segments.push((
-            format!("req {}", short_request_id(request_id)),
+            format!("Request id: {}", short_request_id(request_id)),
             FACT_RANK_REQUEST,
+        ));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        segments.push((
+            format!("Provider error type: {error_type}"),
+            FACT_RANK_ERROR_TYPE,
         ));
     }
     if let Some(reset) = reset {
@@ -2662,8 +2964,8 @@ fn short_request_id(request_id: &str) -> String {
 }
 
 /// The canonical flattened formatter for typed failures and the
-/// plain/greppable authority. Shape: `{title} — {detail} [{subcode}] · HTTP {status} · req {id}
-/// · {resets in …} · actions: {…}` — provider facts additive after the
+/// plain/greppable authority. Shape: `{title} — {detail} [{subcode}] · HTTP {status} · Request id: {id}
+/// · Provider error type: {provider type} · {resets in …} · actions: {…}` — provider facts additive after the
 /// subcode (full request id here; the styled fact line shortens it), the
 /// reset human-readable via the h/m/s vocabulary, absent facts dropping
 /// their whole segment.
@@ -2687,7 +2989,10 @@ pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
         let _ = write!(out, " · HTTP {status}");
     }
     if let Some(request_id) = &presentation.provider_request_id {
-        let _ = write!(out, " · req {request_id}");
+        let _ = write!(out, " · Request id: {request_id}");
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        let _ = write!(out, " · Provider error type: {error_type}");
     }
     if let Some(retry_after) = presentation.retry_after_ms {
         out.push_str(" · ");
@@ -2695,6 +3000,15 @@ pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
     }
     out.push_str(" · actions: ");
     push_error_actions(&mut out, &presentation.allowed_actions);
+    // The TUI is an owner-local surface: unknown provider text is shown here
+    // (never in exports or shareable output, which strip the field).
+    if let Some(raw) = &presentation.provider_raw_detail {
+        let _ = write!(
+            out,
+            " · {}: {raw}",
+            haider_protocol::error::PROVIDER_RAW_DETAIL_LABEL
+        );
+    }
     out
 }
 

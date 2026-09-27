@@ -2255,6 +2255,8 @@ pub struct HarnessConfig {
     /// workflows enable this bit so actor-owned tools cannot bypass a dynamic
     /// dispatcher grant merely by naming an unadvertised tool.
     pub enforce_advertised_tool_ceiling: bool,
+    /// Strip provider prose from durable failures for restricted providers.
+    pub provider_lockdown: bool,
     /// Local equivalents advertised after one exact provider-hosted-tool
     /// rejection. Empty means this provider has no safe fallback pack.
     pub provider_tool_fallback_tools: Vec<ToolDefinition>,
@@ -2463,6 +2465,7 @@ impl HarnessConfig {
             tool_exposure: None,
             tool_pack_digest: None,
             enforce_advertised_tool_ceiling: false,
+            provider_lockdown: false,
             provider_tool_fallback_tools: Vec::new(),
             shared_provider_tool_fallback_tools: None,
             provider_tool_fallback_digest: None,
@@ -4202,6 +4205,10 @@ pub struct HarnessActor {
     /// when providers interleave item kinds.
     pending_item_delta: Option<PendingItemDelta>,
     pending_item_delta_deadline: Option<tokio::time::Instant>,
+    /// What the latest provider request carried (model id, tool-call ids):
+    /// the only values a provider error template may echo in its
+    /// `{model}` / `{tool_call_id}` slots.
+    provider_slot_evidence: haider_provider::ProviderSlotEvidence,
 }
 
 /// See [`HarnessActor::plan`].
@@ -4287,6 +4294,7 @@ impl HarnessActor {
                 next_node: 0,
                 next_menu: 0,
                 tree_head_initialized: false,
+                provider_slot_evidence: haider_provider::ProviderSlotEvidence::default(),
                 tree_head: None,
                 deferred_commands: VecDeque::new(),
                 pending_nudges: Vec::new(),
@@ -5800,6 +5808,8 @@ impl HarnessActor {
                 cache_metadata: Some(cache_metadata.clone()),
                 tool_result_image_projection: request_image_projection,
             };
+            self.provider_slot_evidence =
+                haider_provider::ProviderSlotEvidence::from_request(&provider_request);
             let projected_input_tokens =
                 estimate_if_budget_guarded(self.config.provider_budget_guard.as_deref(), || {
                     estimate_provider_request_input_tokens(
@@ -6405,6 +6415,13 @@ impl HarnessActor {
                 if opened.is_err() {
                     drop(provider_budget_permit.take());
                 }
+                // Corroborate template slots with what this request carried
+                // before any consumer (output-limit retry, recovery card,
+                // RunFailed) reads the error.
+                let opened = opened.map_err(|mut error| {
+                    error.corroborate_slots(&self.provider_slot_evidence);
+                    error
+                });
                 match opened {
                     Ok(stream) => {
                         if let (Some(trace), Some(started)) =
@@ -6884,11 +6901,16 @@ impl HarnessActor {
                         )
                         .await;
                 }
-                let next = next.unwrap_or_else(|| {
-                    Err(provider_stream_interrupted(
-                        "provider stream closed before a finish event",
-                    ))
-                });
+                let next = next
+                    .unwrap_or_else(|| {
+                        Err(provider_stream_interrupted(
+                            "provider stream closed before a finish event",
+                        ))
+                    })
+                    .map_err(|mut error| {
+                        error.corroborate_slots(&self.provider_slot_evidence);
+                        error
+                    });
                 let event = match next {
                     Ok(event) => {
                         if !first_provider_event_seen {
@@ -7197,7 +7219,11 @@ impl HarnessActor {
                                 .await;
                         }
                         if message.as_ref().is_some_and(|partial| !partial.is_empty()) {
-                            let presentation = stream_interruption_presentation(&error);
+                            let mut presentation = stream_interruption_presentation(&error);
+                            apply_provider_detail_lockdown(
+                                self.config.provider_lockdown,
+                                &mut presentation,
+                            );
                             let (source_item, partial) = match self
                                 .complete_incomplete_message(
                                     &run_id,
@@ -9962,21 +9988,24 @@ impl HarnessActor {
             .retry_after_ms
             .is_some_and(|delay| delay > MAX_PROVIDER_RETRY_AFTER_MS)
         {
-            let capped = ProviderError {
-                kind: error.kind,
-                message: format!(
+            let mut capped = ProviderError::new(
+                error.kind,
+                format!(
                     "provider retry-after {}ms exceeds the {}ms respect cap",
                     error.retry_after_ms.unwrap_or_default(),
                     MAX_PROVIDER_RETRY_AFTER_MS
                 ),
-                retryable: true,
-                retry_after_ms: error.retry_after_ms,
-                opened_within_ms: error.opened_within_ms,
-                budget_ms: error.budget_ms,
-                timeout_reason: error.timeout_reason,
-                idle_timeout: error.idle_timeout.clone(),
-                presentation: error.presentation.clone(),
-            };
+            )
+            .with_presentation(error.presentation.clone());
+            capped.retryable = true;
+            capped.retry_after_ms = error.retry_after_ms;
+            capped.opened_within_ms = error.opened_within_ms;
+            capped.budget_ms = error.budget_ms;
+            capped.timeout_reason = error.timeout_reason;
+            capped.idle_timeout.clone_from(&error.idle_timeout);
+            capped
+                .provider_raw_detail
+                .clone_from(&error.provider_raw_detail);
             return Err(DriveError::Provider(capped));
         }
         let reason = match error.kind {
@@ -12680,6 +12709,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
+        provider_error.corroborate_slots(&self.provider_slot_evidence);
         if let Some(error) = self.latched_terminal_failure().await {
             return self
                 .errored_outcome_with_items(run_id, message, reasoning, tools, error)
@@ -12709,6 +12739,14 @@ impl HarnessActor {
             }
         }
         specialize_provider_presentation(&self.config.usage_scope.auth_scope, &mut provider_error);
+        if self.config.provider_lockdown {
+            // Lockdown shows templates only: no owner-local raw text.
+            provider_error.provider_raw_detail = None;
+        }
+        apply_provider_detail_lockdown(
+            self.config.provider_lockdown,
+            &mut provider_error.presentation,
+        );
         if let Some(card) = recovery_card_kind(&provider_error.presentation) {
             let menu = recovery_menu(
                 self.next_menu_id(),
@@ -12727,14 +12765,14 @@ impl HarnessActor {
                 return errored_outcome(error);
             }
         }
-        self.errored_outcome_with_items(
-            run_id,
-            message,
-            reasoning,
-            tools,
-            provider_error_to_haider(provider_error),
-        )
-        .await
+        // Gate again AFTER the conversion: nothing in the mapped failure may
+        // carry owner-local text on a lockdown turn.
+        let mut mapped = provider_error_to_haider(provider_error);
+        if let Some(presentation) = mapped.presentation.as_mut() {
+            apply_provider_detail_lockdown(self.config.provider_lockdown, presentation);
+        }
+        self.errored_outcome_with_items(run_id, message, reasoning, tools, mapped)
+            .await
     }
 
     async fn drive_error_outcome_with_items(
@@ -12814,7 +12852,10 @@ impl HarnessActor {
 
     /// Commits `Errored` (best effort) and reports the original error.
     async fn errored_state_outcome(&mut self, run_id: &RunId, error: HaiderError) -> TurnOutcome {
-        let error = self.latched_terminal_failure().await.unwrap_or(error);
+        let mut error = self.latched_terminal_failure().await.unwrap_or(error);
+        if let Some(presentation) = error.presentation.as_mut() {
+            apply_provider_detail_lockdown(self.config.provider_lockdown, presentation);
+        }
         if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);
         }
@@ -15013,7 +15054,14 @@ fn delegated_child_wait_timed_out(error: &HaiderError) -> bool {
             == Some("delegated_child_wait_timeout")
 }
 
-fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
+/// The single publication boundary from a provider failure to a durable
+/// `HaiderError`: the message is [`ProviderError::public_message`] (template
+/// or Haider-authored text only), the presentation carries the adapter's
+/// safe detail, and unknown provider text survives only in the owner-local
+/// `provider_raw_detail`. Every provider failure that can reach `RunFailed`
+/// (turn drive, context summarization, AI Loom drafting) uses this.
+pub fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
+    let local_raw = provider_error.local_message_detail();
     let code = if provider_error.timeout_reason == Some(ProviderTimeoutReason::IdleTimeout) {
         ErrorCode::IdleTimeout
     } else if provider_error.presentation.subcode.as_str() == "provider-timeout" {
@@ -15021,7 +15069,11 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
     } else {
         ErrorCode::ProviderError
     };
-    let mut error = HaiderError::new(code, provider_error.to_string(), provider_error.retryable);
+    let mut error = HaiderError::new(
+        code,
+        provider_error.public_message(),
+        provider_error.retryable,
+    );
     error.details = Some(serde_json::json!({
         "provider_error_kind": format!("{:?}", provider_error.kind),
         "retry_after_ms": provider_error.retry_after_ms,
@@ -15035,9 +15087,15 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
             .as_mut()
             .and_then(serde_json::Value::as_object_mut)
     {
-        details.insert("idle_timeout".into(), serde_json::json!(idle));
+        // The durable idle-timeout extension serializes the preceding cause;
+        // it carries only public messages.
+        details.insert("idle_timeout".into(), serde_json::json!(idle.shareable()));
     }
-    error.presentation = Some(provider_error.presentation);
+    error.presentation = Some(
+        provider_error
+            .presentation
+            .with_provider_raw_detail(local_raw.as_deref()),
+    );
     error
 }
 
@@ -15080,6 +15138,52 @@ fn run_state_is_provider_retry(run_state: Option<&RunState>) -> bool {
                 }
         )
     )
+}
+
+/// Every core path that publishes a provider presentation uses this gate.
+/// Lockdown shows provider templates only: `detail` is already a known
+/// template rendering or the default explanation plus "details withheld",
+/// and the owner-local raw provider text is removed.
+fn apply_provider_detail_lockdown(lockdown: bool, presentation: &mut ErrorPresentation) {
+    if lockdown {
+        presentation.strip_local_only();
+    }
+}
+
+#[cfg(test)]
+mod provider_detail_lockdown_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn one_gate_keeps_templates_and_drops_local_raw_under_lockdown() {
+        let presentation = || {
+            ErrorPresentation::new(
+                "permission-denied",
+                "Provider access denied",
+                "The active account is not allowed to make this request. · details withheld",
+                ErrorScope::Account,
+                [ErrorAction::SwitchAccount],
+            )
+            .with_provider_raw_detail(Some("Denied for organization quillmere."))
+        };
+        let mut locked = presentation();
+        apply_provider_detail_lockdown(true, &mut locked);
+        assert!(locked.provider_raw_detail.is_none());
+        assert!(locked.detail.ends_with("details withheld"));
+        assert!(
+            !serde_json::to_string(&locked)
+                .expect("json")
+                .contains("quillmere")
+        );
+        let mut open = presentation();
+        apply_provider_detail_lockdown(false, &mut open);
+        assert_eq!(
+            open.provider_raw_detail.as_deref(),
+            Some("Denied for organization quillmere.")
+        );
+    }
 }
 
 fn specialize_provider_presentation(auth_scope: &str, error: &mut ProviderError) {
@@ -15226,6 +15330,9 @@ fn copy_provider_metadata(target: &mut ErrorPresentation, source: &ErrorPresenta
     target
         .provider_request_id
         .clone_from(&source.provider_request_id);
+    target
+        .provider_error_type
+        .clone_from(&source.provider_error_type);
     target.retry_after_ms = source.retry_after_ms;
     target.reset_at_ms = source.reset_at_ms;
     target.opened_within_ms = source.opened_within_ms;
@@ -15240,6 +15347,7 @@ fn recovery_card_kind(presentation: &ErrorPresentation) -> Option<ErrorRecoveryC
         "account-deleted" | "account-unavailable" => Some(ErrorRecoveryCardKind::AccountDeleted),
         "rate-limited" => Some(ErrorRecoveryCardKind::RateLimit),
         "quota-exhausted" => Some(ErrorRecoveryCardKind::QuotaExhausted),
+        "permission-denied" => Some(ErrorRecoveryCardKind::Generic),
         "keychain-relink-required" => Some(ErrorRecoveryCardKind::KeychainRelink),
         _ => None,
     }
@@ -15251,18 +15359,24 @@ fn recovery_menu(
     source_run: &RunId,
     source_item: Option<ItemId>,
     card: ErrorRecoveryCardKind,
-    presentation: ErrorPresentation,
+    mut presentation: ErrorPresentation,
     provider: Option<String>,
     account: Option<CredentialAlias>,
     blocking: bool,
 ) -> Menu {
+    // Menus are answered by hooks and projected to every client; they carry
+    // no owner-local provider text.
+    presentation.strip_local_only();
     let mut body = vec![presentation.detail.clone()];
     let title = presentation.title.clone();
     if let Some(status) = presentation.provider_http_status {
-        body.push(format!("Provider HTTP status: {status}"));
+        body.push(format!("HTTP {status}"));
     }
     if let Some(request_id) = &presentation.provider_request_id {
-        body.push(format!("Request ID: {request_id}"));
+        body.push(format!("Request id: {request_id}"));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        body.push(format!("Provider error type: {error_type}"));
     }
     if let Some(retry_after_ms) = presentation.retry_after_ms {
         let seconds = retry_after_ms.div_ceil(1_000);
@@ -17491,6 +17605,64 @@ mod cu1_actor_tests {
         let presentation = error.presentation.expect("provider presentation");
         assert_eq!(presentation.opened_within_ms, Some(60_000));
         assert_eq!(presentation.budget_ms, Some(60_000));
+    }
+
+    #[test]
+    fn provider_message_is_scrubbed_before_run_failed_journaling() {
+        let private = "robin.verify2@synthetic.example";
+        let provider_error =
+            haider_provider::acp::client::AcpError::Rpc(haider_provider::acp::wire::JsonRpcError {
+                code: -32000,
+                message: format!("Permission denied for {private}"),
+                data: None,
+            })
+            .into_provider_error(&format!("agent stderr: account {private}"));
+        let error = provider_error_to_haider(provider_error);
+        let payload = EventPayload::RunFailed {
+            code: error.code,
+            message: sanitized_failure_message(&error.message),
+            retryable: error.retryable,
+            presentation: Some(presentation_for_haider_error(&error)),
+        };
+        // The owner's local journal keeps the unknown text only in the
+        // local-only field; every shareable projection strips it.
+        let EventPayload::RunFailed {
+            message,
+            presentation: Some(presentation),
+            ..
+        } = &payload
+        else {
+            panic!("run failure payload");
+        };
+        assert!(!message.contains(private), "{message}");
+        assert!(!presentation.detail.contains(private));
+        assert!(
+            presentation
+                .provider_raw_detail
+                .as_deref()
+                .is_some_and(|raw| raw.contains("Agent stderr tail"))
+        );
+        let mut shareable = serde_json::to_value(&payload).expect("serialize run failure");
+        haider_protocol::error::strip_local_only_fields(&mut shareable);
+        assert!(!shareable.to_string().contains(private), "{shareable}");
+    }
+
+    #[test]
+    fn untrusted_frame_message_is_public_only_through_templates() {
+        let provider_error = ProviderError::new(
+            haider_provider::ProviderErrorKind::MalformedFrame,
+            "Anthropic SSE `quillmere` data is not valid JSON",
+        )
+        .with_untrusted_message();
+        let error = provider_error_to_haider(provider_error);
+        assert!(!error.message.contains("quillmere"), "{}", error.message);
+        let presentation = error.presentation.expect("presentation");
+        assert!(!presentation.detail.contains("quillmere"));
+        assert!(
+            presentation
+                .provider_raw_detail
+                .is_some_and(|raw| raw.contains("quillmere"))
+        );
     }
 
     #[tokio::test]

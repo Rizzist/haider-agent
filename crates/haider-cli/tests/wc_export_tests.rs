@@ -1039,3 +1039,57 @@ fn since_cursor_yields_the_exact_suffix() {
             .map(str::to_owned)),
     );
 }
+
+/// Ruling 2 registry surface: every export format (masked AND unmasked,
+/// native and foreign) is a shareable artifact. A journaled RunFailed whose
+/// presentation carries owner-local raw provider text must not leak it.
+#[test]
+fn every_export_format_strips_owner_local_provider_text() {
+    let presentation = haider_protocol::error::ErrorPresentation::new(
+        "permission-denied",
+        "Provider access denied",
+        "The active account is not allowed to make this request. · details withheld",
+        haider_protocol::error::ErrorScope::Account,
+        [haider_protocol::error::ErrorAction::SwitchAccount],
+    )
+    .with_provider_raw_detail(Some("Denied for organization quillexport."));
+    let mut events = fixture_events();
+    let mut failed = node_env(
+        5,
+        CREATED_MS + 4_000,
+        NodeKind::UserTurn {
+            text: "placeholder".to_owned(),
+            attachments: Vec::new(),
+        },
+    );
+    failed.payload = serde_json::to_value(EventPayload::RunFailed {
+        code: haider_protocol::error::ErrorCode::ProviderError,
+        message: "PermissionDenied: OpenAI HTTP 403 returned a permission error".into(),
+        retryable: false,
+        presentation: Some(presentation),
+    })
+    .expect("payload")
+    .into();
+    events.push(failed);
+    let export = SessionExport::project(fixture_meta(), &events);
+    for masked in [true, false] {
+        let rendered = [
+            ("markdown", export.to_markdown(masked)),
+            ("json", export.to_json(masked)),
+            ("pipe", export.to_pipe(masked)),
+            ("codex", export.to_codex(masked).rollout_jsonl),
+            ("claude-code", export.to_claude_code(masked).jsonl),
+            ("opencode", format!("{:?}", export.to_opencode(masked))),
+        ];
+        for (format, text) in rendered {
+            assert!(
+                !text.contains("quillexport"),
+                "{format} (masked={masked}) leaked owner-local text"
+            );
+        }
+        assert!(
+            export.to_json(masked).contains("details withheld"),
+            "masked={masked}"
+        );
+    }
+}
