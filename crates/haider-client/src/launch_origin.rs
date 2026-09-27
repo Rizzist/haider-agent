@@ -184,6 +184,7 @@ pub fn preferred_process_home() -> Option<PathBuf> {
     process_display_homes().into_iter().next()
 }
 
+#[cfg(test)]
 pub(crate) fn sanitize_with(
     path: Option<&Path>,
     homes: &[&Path],
