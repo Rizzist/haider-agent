@@ -217,7 +217,11 @@ fn sanitize_with_canonicalizers(
         return bounded(OriginPathKind::Absolute, String::new());
     }
     let spelling = path.to_string_lossy();
-    if spelling.starts_with(r"\\.\pipe\") {
+    let pipe_prefix = r"\\.\pipe\";
+    if spelling
+        .get(..pipe_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(pipe_prefix))
+    {
         return bounded(
             OriginPathKind::Absolute,
             escape_display_with_backslashes(&spelling),

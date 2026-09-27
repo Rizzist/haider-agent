@@ -520,6 +520,8 @@ fn denied_alias_without_a_known_account_root_declines_its_label() {
 fn named_pipes_and_literal_unix_question_mark_dirs_keep_their_spelling() {
     let pipe = r"\\.\pipe\haider-0123";
     assert_eq!(projected(pipe, &[]).1, pipe);
+    let upper_pipe = r"\\.\PIPE\Haider-0123";
+    assert_eq!(projected(upper_pipe, &[]).1, upper_pipe);
     assert_eq!(
         projected("\\\\.\\pipe\\haider-\n0123", &[]).1,
         "\\\\.\\pipe\\haider-\\u{000a}0123"
