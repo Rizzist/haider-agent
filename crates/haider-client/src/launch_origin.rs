@@ -209,7 +209,10 @@ fn sanitize_with_canonicalizers(
     }
     let spelling = path.to_string_lossy();
     if spelling.starts_with(r"\\.\pipe\") {
-        return bounded(OriginPathKind::Absolute, spelling.into_owned());
+        return bounded(
+            OriginPathKind::Absolute,
+            escape_display_with_backslashes(&spelling),
+        );
     }
     let parsed = DisplayPath::parse(path);
     // A terminal '..' has no reliable meaning when the preceding component
@@ -746,11 +749,19 @@ impl DisplayPath {
 }
 
 fn escape_display(text: &str) -> String {
+    escape_display_with(text, false)
+}
+
+fn escape_display_with_backslashes(text: &str) -> String {
+    escape_display_with(text, true)
+}
+
+fn escape_display_with(text: &str, preserve_backslashes: bool) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         let code = character as u32;
         let is_bidi = matches!(code, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069);
-        if character.is_control() || is_bidi || character == '\\' {
+        if character.is_control() || is_bidi || (!preserve_backslashes && character == '\\') {
             use std::fmt::Write;
             let _ = write!(escaped, "\\u{{{code:04x}}}");
         } else {

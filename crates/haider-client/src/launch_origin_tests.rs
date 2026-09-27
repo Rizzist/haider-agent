@@ -505,6 +505,10 @@ fn aliased_multiuser_home_cannot_collapse_another_account() {
 fn named_pipes_and_literal_unix_question_mark_dirs_keep_their_spelling() {
     let pipe = r"\\.\pipe\haider-0123";
     assert_eq!(projected(pipe, &[]).1, pipe);
+    assert_eq!(
+        projected("\\\\.\\pipe\\haider-\n0123", &[]).1,
+        "\\\\.\\pipe\\haider-\\u{000a}0123"
+    );
     #[cfg(unix)]
     for literal in ["/??/x", "//?/x", "/??/Users/bob", "//?/Users/bob"] {
         assert_eq!(projected(literal, &[]).1, literal);
