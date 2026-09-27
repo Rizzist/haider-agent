@@ -264,7 +264,8 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         let frozen = self
             .store
             .hub()
-            .bound_session_lockdown(self.store.session_id())
+            .bound_session_lockdown_blocking(self.store.session_id())
+            .await
             .map_err(hub_error)?;
         if !frozen.as_ref().is_some_and(|(provider, frozen)| {
             frozen.binding_bits() == policy.binding_bits()

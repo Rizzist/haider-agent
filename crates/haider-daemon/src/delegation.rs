@@ -458,11 +458,13 @@ impl DelegationHandle {
         let handoff_dir = if coordinates.lockdown {
             let relative =
                 Path::new("handoff").join(handoff_session_short(&coordinates.parent_session_id));
-            crate::lockdown::global()
-                .and_then(|manager| {
-                    manager.sandbox_location(&coordinates.metadata.provider, &relative)
-                })
-                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?
+            let provider = coordinates.metadata.provider.clone();
+            crate::lockdown::on_blocking_pool(move || {
+                crate::lockdown::global()
+                    .and_then(|manager| manager.sandbox_location(&provider, &relative))
+            })
+            .await
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?
         } else {
             self.ensure_handoff_dir(&coordinates.metadata.cwd, &coordinates.parent_session_id)
                 .await?
@@ -900,23 +902,36 @@ impl DelegationHandle {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if persisted_lockdown {
-            self.hub
-                .bind_lockdown_turn(
-                    &record.child_session_id,
-                    &record.child_run_id,
-                    &coordinates.metadata.provider,
+            let hub = self.hub.clone();
+            let child_session = record.child_session_id.clone();
+            let child_run = record.child_run_id.clone();
+            let provider = coordinates.metadata.provider.clone();
+            crate::lockdown::on_blocking_pool_result(move || {
+                hub.bind_lockdown_turn(
+                    &child_session,
+                    &child_run,
+                    &provider,
                     crate::auto_hermetic::ProviderLockdownPolicy::from_binding(
                         persisted_lockdown,
                         persisted_auto_hermetic,
                     ),
                 )
-                .map_err(|error| {
-                    HaiderError::new(
-                        ErrorCode::Internal,
-                        format!("cannot bind child provider ceiling: {error}"),
-                        true,
-                    )
-                })?;
+            })
+            .await
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("child lockdown binding task failed: {error}"),
+                    true,
+                )
+            })?
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot bind child provider ceiling: {error}"),
+                    true,
+                )
+            })?;
         }
         self.hub
             .notify_roster_session(record.child_session_id.clone());

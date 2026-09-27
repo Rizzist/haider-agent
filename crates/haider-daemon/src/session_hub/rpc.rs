@@ -2809,39 +2809,46 @@ async fn session_observe_digest(
         digest.tasks = Some(hub.task_registry().observe_tasks(&digest.session_id));
         digest.shells = Some(hub.shell_registry().inventory());
     }
-    digest.lockdown = active_provider
-        .as_deref()
-        .map(|provider| observed_lockdown_status(hub, Some(&digest.session_id), provider))
-        .transpose()?
-        .flatten();
+    let observed_session_id = digest.session_id.clone();
+    digest.lockdown = match active_provider.as_deref() {
+        Some(provider) => {
+            observed_lockdown_status(hub, Some(&observed_session_id), provider).await?
+        }
+        None => None,
+    };
     for subagent in &mut digest.subagents {
         let active_child = hub.delegation(subagent.agent_id.clone()).await?;
         if let (Some(provider), Some(child)) = (subagent.provider.as_deref(), active_child) {
-            subagent.lockdown =
-                observed_lockdown_status(hub, Some(&child.child_session_id), provider)?;
+            let status =
+                observed_lockdown_status(hub, Some(&child.child_session_id), provider).await?;
+            subagent.lockdown = status;
             continue;
         }
-        subagent.lockdown = match (
+        let status = match (
             subagent.provider.as_deref(),
             subagent.lockdown_bound,
             subagent.lockdown_auto_hermetic_bound,
         ) {
-            (Some(provider), Some(true), auto_hermetic) => observed_lockdown_manager_status(
-                provider,
-                crate::auto_hermetic::ProviderLockdownPolicy::from_binding(
-                    true,
-                    auto_hermetic.unwrap_or(false),
-                ),
-            )?,
+            (Some(provider), Some(true), auto_hermetic) => {
+                observed_lockdown_manager_status(
+                    provider,
+                    crate::auto_hermetic::ProviderLockdownPolicy::from_binding(
+                        true,
+                        auto_hermetic.unwrap_or(false),
+                    ),
+                )
+                .await?
+            }
             (_, Some(false), _) => None,
-            (Some(provider), None, _) => observed_lockdown_status(hub, None, provider)?,
+            (Some(provider), None, _) => observed_lockdown_status(hub, None, provider).await?,
             (None, _, _) => None,
         };
+        subagent.lockdown = status;
     }
     Ok(Some(digest))
 }
 
-fn observed_lockdown_status(
+async fn observed_lockdown_status(
     hub: &SessionHub,
     session_id: Option<&SessionId>,
     provider: &str,
@@ -2849,7 +2856,7 @@ fn observed_lockdown_status(
     let (provider, policy) = match session_id {
         Some(session_id) => {
             let active_binding = if crate::lockdown::global_if_initialized().is_some() {
-                hub.bound_session_lockdown(session_id)?
+                hub.bound_session_lockdown_blocking(session_id).await?
             } else {
                 None
             };
@@ -2866,24 +2873,25 @@ fn observed_lockdown_status(
     if !policy.is_lockdown() {
         return Ok(None);
     }
-    observed_lockdown_manager_status(&provider, policy)
+    observed_lockdown_manager_status(&provider, policy).await
 }
 
-fn observed_lockdown_manager_status(
+async fn observed_lockdown_manager_status(
     provider: &str,
     policy: crate::auto_hermetic::ProviderLockdownPolicy,
 ) -> Result<Option<haider_rpc::LockdownStatusWire>, SessionHubError> {
-    let Some(manager) = crate::lockdown::global_if_initialized() else {
-        // The quota ledger is machine-user-global and may already contain
-        // data, so a pre-start projection cannot truthfully invent usage.
-        // Absence is the wire's backward-compatible "not projected" state.
-        return Ok(None);
-    };
-    manager
-        .status(Some(provider))
-        .map(|status| lockdown_status_wire(status, Some(policy), true))
-        .map(Some)
-        .map_err(|error| SessionHubError::Task(error.to_string()))
+    let provider = provider.to_owned();
+    crate::lockdown::on_blocking_pool(move || {
+        let Some(manager) = crate::lockdown::global_if_initialized() else {
+            // The quota ledger is machine-user-global and may already contain
+            // data, so a pre-start projection cannot truthfully invent usage.
+            return Ok(None);
+        };
+        manager.status(Some(&provider)).map(Some)
+    })
+    .await
+    .map(|status| status.map(|status| lockdown_status_wire(status, Some(policy), true)))
+    .map_err(|error| SessionHubError::Task(error.to_string()))
 }
 
 impl ObserveProjection {
@@ -6329,7 +6337,7 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.lockdown_status(request_id, provider.as_deref())
+                self.lockdown_status(request_id, provider.as_deref()).await
             }
             RequestBody::LockdownSetQuota { command_id, bytes } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -10192,7 +10200,7 @@ impl HubConnection {
         )
     }
 
-    fn lockdown_status(
+    async fn lockdown_status(
         &self,
         request_id: RequestId,
         provider: Option<&str>,
@@ -10212,7 +10220,12 @@ impl HubConnection {
                 );
             }
         };
-        match crate::lockdown::global().and_then(|manager| manager.status(provider)) {
+        let provider_owned = provider.map(str::to_owned);
+        match crate::lockdown::on_blocking_pool(move || {
+            crate::lockdown::global().and_then(|manager| manager.status(provider_owned.as_deref()))
+        })
+        .await
+        {
             Ok(status) => self.send(WireFrame::Response {
                 request_id,
                 body: ResponseBody::LockdownStatus {
@@ -10236,7 +10249,8 @@ impl HubConnection {
         let Some(metadata) = self.hub.session_metadata(session_id).await? else {
             return Ok(None);
         };
-        let (provider, policy) = self.hub.bound_session_lockdown(session_id)?.unwrap_or((
+        let binding = self.hub.bound_session_lockdown_blocking(session_id).await?;
+        let (provider, policy) = binding.unwrap_or((
             metadata.provider.clone(),
             self.hub
                 .provider_lockdown_policy_detail(&metadata.provider)?,
@@ -10341,8 +10355,12 @@ impl HubConnection {
                 None,
             );
         }
-        match crate::lockdown::global()
-            .and_then(|manager| manager.set_quota_command(command_id.as_str(), bytes))
+        let command_id_owned = command_id.as_str().to_owned();
+        match crate::lockdown::on_blocking_pool(move || {
+            crate::lockdown::global()
+                .and_then(|manager| manager.set_quota_command(&command_id_owned, bytes))
+        })
+        .await
         {
             Ok(status) => {
                 self.journal_lockdown_quota(command_id.as_str(), &status)
@@ -10414,10 +10432,14 @@ impl HubConnection {
             let Some(metadata) = self.hub.inner.store.session_metadata(&session_id).await? else {
                 continue;
             };
-            let lockdown = self.hub.bound_session_lockdown(&session_id)?.map_or_else(
-                || providers.contains(&metadata.provider),
-                |(_, policy)| policy.is_lockdown(),
-            );
+            let lockdown = self
+                .hub
+                .bound_session_lockdown_blocking(&session_id)
+                .await?
+                .map_or_else(
+                    || providers.contains(&metadata.provider),
+                    |(_, policy)| policy.is_lockdown(),
+                );
             if !lockdown {
                 continue;
             }

@@ -25,6 +25,56 @@ const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 const LEDGER_VERSION: u32 = 1;
 static GLOBAL_MANAGER: OnceLock<LockdownManager> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_IO_HOOK: std::cell::RefCell<Option<std::sync::Arc<PublicationIoCounts>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PublicationIoCounts {
+    pub(crate) writes: std::sync::atomic::AtomicUsize,
+    pub(crate) syncs: std::sync::atomic::AtomicUsize,
+    pub(crate) full_syncs: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+pub(crate) fn with_publication_io_hook<T>(
+    counts: std::sync::Arc<PublicationIoCounts>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    PUBLICATION_IO_HOOK.with(|hook| {
+        assert!(hook.borrow().is_none(), "publication I/O hooks cannot nest");
+        *hook.borrow_mut() = Some(counts);
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PUBLICATION_IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    operation()
+}
+
+#[cfg(test)]
+fn count_publication_io(sync_policy: Option<SyncPolicy>) {
+    use std::sync::atomic::Ordering;
+    PUBLICATION_IO_HOOK.with(|hook| {
+        if let Some(counts) = hook.borrow().as_ref() {
+            if let Some(policy) = sync_policy {
+                counts.syncs.fetch_add(1, Ordering::Relaxed);
+                if policy == SyncPolicy::Full {
+                    counts.full_syncs.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                counts.writes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 pub(crate) const ALLOWED_TOOLS: &[&str] = &[
     "fs_read",
     "fs_glob",
@@ -71,6 +121,9 @@ pub(crate) enum LockdownError {
     InvalidLedger {
         path: PathBuf,
         reason: String,
+    },
+    Task {
+        message: String,
     },
     TurnBindingConflict {
         session_id: String,
@@ -122,6 +175,7 @@ impl fmt::Display for LockdownError {
                 "invalid lockdown quota ledger {}: {reason}",
                 path.display()
             ),
+            Self::Task { message } => write!(formatter, "lockdown blocking task failed: {message}"),
             Self::TurnBindingConflict {
                 session_id,
                 run_id,
@@ -345,7 +399,7 @@ impl LockdownManager {
     ) -> Result<(String, bool, bool), LockdownError> {
         self.with_global_lock(|| {
             let mut ledger = self.load_turn_bindings()?;
-            let (binding, _) = Self::bind_turn_in_ledger(
+            let (binding, changed) = Self::bind_turn_in_ledger(
                 &mut ledger,
                 profile_id,
                 session_id,
@@ -354,6 +408,10 @@ impl LockdownManager {
                 proposed_lockdown,
                 proposed_auto_hermetic,
             )?;
+            let already_active = Self::binding_is_active(&ledger, &binding);
+            if !changed && already_active {
+                return Ok((binding.provider, binding.lockdown, binding.auto_hermetic));
+            }
             ledger.active.retain(|active| {
                 active.profile_id != profile_id || active.session_id != session_id
             });
@@ -361,6 +419,16 @@ impl LockdownManager {
             self.persist_turn_bindings(&ledger)?;
             Ok((binding.provider, binding.lockdown, binding.auto_hermetic))
         })
+    }
+
+    fn binding_is_active(ledger: &TurnBindingLedger, binding: &DurableTurnBinding) -> bool {
+        let mut session_active = ledger.active.iter().filter(|active| {
+            active.profile_id == binding.profile_id && active.session_id == binding.session_id
+        });
+        session_active
+            .next()
+            .is_some_and(|active| active == binding)
+            && session_active.next().is_none()
     }
 
     fn bind_turn_in_ledger(
@@ -469,6 +537,9 @@ impl LockdownManager {
                         "turn {session_id}/{run_id} was activated before its durable binding"
                     ),
                 })?;
+            if Self::binding_is_active(&ledger, &binding) {
+                return Ok(());
+            }
             ledger.active.retain(|active| {
                 active.profile_id != profile_id || active.session_id != session_id
             });
@@ -913,6 +984,26 @@ pub(crate) fn global() -> Result<&'static LockdownManager, LockdownError> {
         })
 }
 
+/// Runs filesystem, quota, and binding work away from a Tokio worker. The
+/// caller still awaits completion before it may publish or execute a turn.
+pub(crate) async fn on_blocking_pool<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, LockdownError> + Send + 'static,
+) -> Result<T, LockdownError> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| LockdownError::Task {
+            message: error.to_string(),
+        })?
+}
+
+/// Keeps a caller's domain error while mapping a failed blocking worker to
+/// the typed lockdown task error before the caller translates it to its API.
+pub(crate) async fn on_blocking_pool_result<T: Send + 'static, E: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<Result<T, E>, LockdownError> {
+    on_blocking_pool(move || Ok(operation())).await
+}
+
 /// Returns the process-global manager only after daemon startup installed it.
 /// Read-only projections use this door so constructing an in-process hub does
 /// not open machine-user-global state as a side effect.
@@ -1235,7 +1326,10 @@ fn atomic_write_named(
     check_path_budget(&temporary)?;
     check_path_budget(&target)?;
     write_and_replace(&temporary, &target, contents)?;
-    haider_platform::fs::sync_directory(parent, SyncPolicy::Full)
+    let sync_policy = SyncPolicy::Full;
+    #[cfg(all(test, unix))]
+    count_publication_io(Some(sync_policy));
+    haider_platform::fs::sync_directory(parent, sync_policy)
         .map_err(|source| io_error("sync directory", parent, source))
 }
 
@@ -1251,9 +1345,14 @@ fn write_and_replace(
         .open(temporary)
         .map_err(|source| io_error("create", temporary, source))?;
     let write_result = (|| {
+        #[cfg(test)]
+        count_publication_io(None);
         file.write_all(contents)
             .map_err(|source| io_error("write", temporary, source))?;
-        haider_platform::sync_file(&file, SyncPolicy::Full)
+        let sync_policy = SyncPolicy::Full;
+        #[cfg(test)]
+        count_publication_io(Some(sync_policy));
+        haider_platform::sync_file(&file, sync_policy)
             .map_err(|source| io_error("sync", temporary, source))?;
         drop(file);
         haider_platform::replace_file(temporary, target)

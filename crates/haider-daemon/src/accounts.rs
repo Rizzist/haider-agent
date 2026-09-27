@@ -6326,12 +6326,17 @@ async fn provider_management_events(
         let Some(metadata) = store.session_metadata(&session_id).await? else {
             continue;
         };
-        let bound_provider = match crate::lockdown::global() {
-            Ok(manager) => manager
-                .latest_session_provider(&profile_id, session_id.as_str())
-                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?,
-            Err(_) => None,
-        };
+        let binding_profile = profile_id.clone();
+        let binding_session = session_id.as_str().to_owned();
+        let bound_provider = crate::lockdown::on_blocking_pool(move || {
+            crate::lockdown::global()
+                .ok()
+                .map(|manager| manager.latest_session_provider(&binding_profile, &binding_session))
+                .transpose()
+                .map(Option::flatten)
+        })
+        .await
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
         if metadata.provider != provider && bound_provider.as_deref() != Some(provider) {
             continue;
         }
