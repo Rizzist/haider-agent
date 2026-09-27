@@ -841,6 +841,8 @@ async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and
     store
         .put_provider_models("haider-code", &models_json, None, fetched_at_ms)
         .expect("seed public Haider Code inventory");
+    // Store::open holds the profile lock; release it before daemon startup.
+    drop(store);
     let kimi = Arc::new(FakeProvider::new(
         [
             text_turn("kimi one"),
