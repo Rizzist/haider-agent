@@ -8,7 +8,8 @@
 //!
 //! * live activity: an effect's typed [`EffectClass`], opened when the effect
 //!   is `Dispatched` (authorized, crossing the dispatch boundary) and closed
-//!   at its `Outcome`;
+//!   at its `Outcome`; effectless registered routes open through typed
+//!   metadata on the accepted `RunningTool` state and close at settlement;
 //! * completed activity: a `ToolCall` / `CommandExecution` item whose status
 //!   is `completed` and whose activity came from a registered route or
 //!   closed provider adapter, plus the daemon-authored
@@ -367,6 +368,9 @@ pub struct ActivityTracker {
     /// Dispatched, unfinished effects: (effect id, kind). Bounded by
     /// [`ACTIVITY_MAX_IN_FLIGHT`].
     in_flight: Vec<(String, ActivityKind)>,
+    /// Effectless registered tool calls opened by a typed running-tool
+    /// metadata fact. They do not enter used history until successful close.
+    open_tools: Vec<(String, ActivityKind)>,
     /// Delegated children spawned and not yet reported (agent ids).
     children: Vec<String>,
     /// Journaled but not yet dispatched effect intents: (effect id, kind).
@@ -400,15 +404,17 @@ impl ActivityTracker {
     /// Apply one item lifecycle event. A `ToolCall` item carries the name
     /// the MODEL requested — it may be unadvertised, ungranted, malformed or
     /// refused — so it never opens or touches an activity on its own. Only a
-    /// SUCCESSFULLY completed call (which proves a real route ran; this also
-    /// covers provider-executed server tools, whose only fact is their
-    /// completed item) and the daemon-authored typed items count. Live
-    /// in-flight activity comes from dispatched effects (see
-    /// [`Self::observe_effect`]).
+    /// SUCCESSFULLY completed call with a typed route/adapter discriminator
+    /// and the daemon-authored typed items count. Live in-flight activity
+    /// comes from dispatched effects or a typed accepted `RunningTool`
+    /// metadata fact (see [`Self::observe_effect`] and [`Self::observe_raw`]).
     pub fn observe_item(&mut self, event: &ItemEvent, at_ms: u64) {
         let ItemEvent::Completed { item, .. } = event else {
             return;
         };
+        if let TurnItem::ToolCall { call_id, .. } = item {
+            self.open_tools.retain(|(open, _)| open != call_id);
+        }
         // A delegated child is outstanding from the daemon-authored
         // `ChildSpawn` fact until its `ChildResult`: the parent is
         // orchestrating the whole time it waits.
@@ -504,6 +510,7 @@ impl ActivityTracker {
                 if state.is_terminal() {
                     self.terminal = true;
                     self.in_flight.clear();
+                    self.open_tools.clear();
                     self.pending.clear();
                     self.children.clear();
                 } else {
@@ -545,6 +552,31 @@ impl ActivityTracker {
         }
         if let Ok(payload) = envelope.payload.decode_event() {
             self.observe(&payload, envelope.committed_at_ms);
+            if kind == Some("run_state")
+                && envelope
+                    .payload
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("running_tool")
+                && let (Some(call_id), Some(activity)) = (
+                    envelope
+                        .payload
+                        .get("activity_call_id")
+                        .and_then(serde_json::Value::as_str),
+                    envelope
+                        .payload
+                        .get("activity_kind")
+                        .and_then(|kind| serde_json::from_value::<ActivityKind>(kind.clone()).ok()),
+                )
+                && !call_id.is_empty()
+                && activity != ActivityKind::Unknown
+            {
+                self.open_tools.retain(|(open, _)| open != call_id);
+                if self.open_tools.len() >= ACTIVITY_MAX_IN_FLIGHT {
+                    self.open_tools.remove(0);
+                }
+                self.open_tools.push((call_id.to_owned(), activity));
+            }
         }
     }
 
@@ -554,6 +586,7 @@ impl ActivityTracker {
         self.terminal = terminal;
         if terminal {
             self.in_flight.clear();
+            self.open_tools.clear();
         }
     }
 
@@ -561,6 +594,9 @@ impl ActivityTracker {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.latest.is_none()
+            && self.in_flight.is_empty()
+            && self.open_tools.is_empty()
+            && self.children.is_empty()
     }
 
     /// The current activity at `now_ms` (see the module timing contract).
@@ -575,7 +611,11 @@ impl ActivityTracker {
                 .and_then(|index| self.last_touch[index])
                 .is_some_and(|at| now_ms.saturating_sub(at) <= ACTIVITY_HOT_WINDOW_MS)
         });
-        let open = self.in_flight.iter().map(|(_, kind)| *kind);
+        let open = self
+            .in_flight
+            .iter()
+            .chain(&self.open_tools)
+            .map(|(_, kind)| *kind);
         let orchestrating =
             (live_children || !self.children.is_empty()).then_some(ActivityKind::Orchestrate);
         if let Some(best) = highest(hot.chain(open).chain(orchestrating)) {
@@ -589,7 +629,12 @@ impl ActivityTracker {
     /// The time-independent wire state.
     #[must_use]
     pub fn state(&self) -> ActivityStateV1 {
-        let mut open: Vec<ActivityKind> = self.in_flight.iter().map(|(_, kind)| *kind).collect();
+        let mut open: Vec<ActivityKind> = self
+            .in_flight
+            .iter()
+            .chain(&self.open_tools)
+            .map(|(_, kind)| *kind)
+            .collect();
         if !self.children.is_empty() {
             open.push(ActivityKind::Orchestrate);
         }

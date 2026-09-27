@@ -20988,6 +20988,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
     fn activity_for_route(&self, name: &str) -> Option<haider_protocol::activity::ActivityKind> {
         registered_tool_route(name).and_then(RegisteredToolRoute::activity)
     }
+    fn live_activity_for_route(
+        &self,
+        name: &str,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        match registered_tool_route(name)? {
+            RegisteredToolRoute::WebSearch => Some(haider_protocol::activity::ActivityKind::Web),
+            RegisteredToolRoute::SessionTranscript
+            | RegisteredToolRoute::ListModels
+            | RegisteredToolRoute::PeerList => Some(haider_protocol::activity::ActivityKind::Read),
+            _ => None,
+        }
+    }
     fn platform_tool_supported(&self, name: &str) -> bool {
         !crate::android_policy::enabled() || registered_tool_route(name).is_some()
     }

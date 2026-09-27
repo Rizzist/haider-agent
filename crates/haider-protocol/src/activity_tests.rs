@@ -457,6 +457,72 @@ fn failed_typed_rows_do_not_enter_history() {
 }
 
 #[test]
+fn registered_effectless_dispatch_is_live_until_settlement() {
+    use crate::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use crate::ids::{DeviceId, EventId, SessionId};
+    let mut payload = serde_json::to_value(EventPayload::RunState(RunState::RunningTool))
+        .expect("running state serializes");
+    payload["activity_kind"] = serde_json::json!("web");
+    payload["activity_call_id"] = serde_json::json!("registered-call");
+    let envelope = EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("registered-live"),
+        seq: 1,
+        session_id: SessionId::new("s"),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("d"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 100,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: payload.into(),
+    };
+    let mut tracker = ActivityTracker::new();
+    tracker.observe_raw(&envelope);
+    assert_eq!(tracker.current(101, false), Some(ActivityKind::Web));
+    assert!(
+        tracker.used().is_empty(),
+        "a running call is not successful history"
+    );
+    let mut failed = tool_item("failed", "web_search", ToolStatus::Rejected, true);
+    if let EventPayload::Item(ItemEvent::Completed {
+        item: TurnItem::ToolCall { call_id, .. },
+        ..
+    }) = &mut failed
+    {
+        *call_id = "registered-call".into();
+    }
+    tracker.observe(&failed, 102);
+    assert_eq!(tracker.current(102, false), None);
+    assert!(tracker.used().is_empty());
+
+    let mut successful = ActivityTracker::new();
+    successful.observe_raw(&envelope);
+    let mut completed = tool_item("ok", "web_search", ToolStatus::Completed, true);
+    if let EventPayload::Item(ItemEvent::Completed {
+        item: TurnItem::ToolCall {
+            call_id, activity, ..
+        },
+        ..
+    }) = &mut completed
+    {
+        *call_id = "registered-call".into();
+        *activity = Some(ActivityKind::Web);
+    }
+    successful.observe(&completed, 102);
+    assert_eq!(successful.current(102, false), Some(ActivityKind::Web));
+    assert_eq!(successful.used(), vec![ActivityKind::Web]);
+}
+
+#[test]
 fn gate_v4_provider_transport_recovery_has_no_agent_activity() {
     let effect = EffectId::new("provider-admission-run-1");
     let mut tracker = ActivityTracker::new();

@@ -2821,3 +2821,53 @@ fn legacy_recovery_event_keeps_the_previous_network_shape() {
             .contains("provider_transport")
     );
 }
+
+#[test]
+fn legacy_running_tool_event_omits_live_activity_metadata() {
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EventId, SessionId};
+    let base = serde_json::json!({"type":"run_state","state":"running_tool"});
+    let mut rich = base.clone();
+    rich["activity_kind"] = serde_json::json!("read");
+    rich["activity_call_id"] = serde_json::json!("registered");
+    let frame = |payload| WireFrame::Event {
+        attachment_id: AttachmentId::new("a"),
+        session_id: SessionId::new("s"),
+        envelope: EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("e"),
+            seq: 1,
+            session_id: SessionId::new("s"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("d"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: payload.into(),
+        },
+    };
+    let modern = frame(rich);
+    let historical = frame(base);
+    let mut legacy = modern.clone();
+    omit_fleet_identity(&mut legacy);
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        assert_eq!(
+            uds_codec::encode_with(&legacy, 1_048_576, encoding).unwrap(),
+            uds_codec::encode_with(&historical, 1_048_576, encoding).unwrap(),
+        );
+    }
+    assert!(
+        serde_json::to_string(&modern)
+            .unwrap()
+            .contains("activity_kind")
+    );
+}

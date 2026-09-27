@@ -1024,6 +1024,12 @@ fn omit_event_activity(envelope: &mut haider_protocol::envelope::RawEnvelope) {
                 fields.remove("activity");
             }
         }
+        Some("run_state") => {
+            if let Some(fields) = payload.as_object_mut() {
+                fields.remove("activity_kind");
+                fields.remove("activity_call_id");
+            }
+        }
         Some("effect")
             if payload.get("phase").and_then(serde_json::Value::as_str) == Some("intent") =>
         {

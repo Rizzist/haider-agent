@@ -3388,6 +3388,14 @@ pub trait ToolDispatcher: Send + Sync {
     fn activity_for_route(&self, _name: &str) -> Option<haider_protocol::activity::ActivityKind> {
         None
     }
+    /// Effectless routes may publish a live fact at the accepted dispatch
+    /// boundary. Effectful routes already have broker dispatch facts.
+    fn live_activity_for_route(
+        &self,
+        _name: &str,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        None
+    }
     /// Hard platform availability precedes actor grant/exposure handling. A false
     /// result routes to the dispatcher's normal unsupported-tool outcome.
     fn platform_tool_supported(&self, _name: &str) -> bool {
@@ -10618,9 +10626,13 @@ impl HarnessActor {
                 .map(|message| CompletedTool::Continue(Some(message)));
         }
         if let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) {
-            self.commit_state(run_id, RunState::RunningTool)
-                .await
-                .map_err(DriveError::Store)?;
+            self.commit_running_tool_activity(
+                run_id,
+                &tools[index],
+                dispatcher.live_activity_for_route(&tools[index].name),
+            )
+            .await
+            .map_err(DriveError::Store)?;
             let outcome = self
                 .execute_general_tool(
                     run_id,
@@ -12944,6 +12956,36 @@ impl HarnessActor {
         .await?;
         self.state.send_replace(Some(state));
         Ok(())
+    }
+
+    async fn commit_running_tool_activity(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        activity: Option<haider_protocol::activity::ActivityKind>,
+    ) -> Result<(), HaiderError> {
+        if let Some(activity) = activity {
+            let mut envelope = self.uncommitted_envelope(
+                run_id,
+                EventPayload::RunState(RunState::RunningTool),
+                prompt_omit_render(),
+            )?;
+            envelope.payload.insert_metadata(
+                "activity_kind",
+                serde_json::to_value(activity).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?,
+            );
+            envelope.payload.insert_metadata(
+                "activity_call_id",
+                serde_json::Value::String(tool.call_id.clone()),
+            );
+            self.append_and_publish_owned(vec![envelope]).await?;
+            self.state.send_replace(Some(RunState::RunningTool));
+            Ok(())
+        } else {
+            self.commit_state(run_id, RunState::RunningTool).await
+        }
     }
 
     async fn commit_pending_thinking(

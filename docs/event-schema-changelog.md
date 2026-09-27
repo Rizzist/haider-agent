@@ -42,6 +42,11 @@ read/search to read, edit/delete/move to edit, execute to run, fetch to web,
 and think/switch_mode/other to none. Anthropic web_search/web_fetch and the
 hard-coded OpenAI/Gemini web_search carry web; unknown provider names and
 orphan results carry none. Local calls use only a daemon-registered route.
+Effectless registered `web_search`, `session_transcript`, `list_models`
+and `peer_list` also put typed `activity_kind` and `activity_call_id`
+metadata on their existing `running_tool` state event. This opens a live
+icon at the accepted dispatch boundary; only successful completion enters
+history. Legacy peers receive the original state event without those keys.
 Provider admission recovery uses `provider_transport`, which never counts as
 agent activity. This is an additive event shape change, and a
 peer that did not negotiate `session_fleet_identity_v1` receives the exact
@@ -55,7 +60,8 @@ summaries, observe digests and fleet node metrics) gains an additive
 `latest`, `terminal`) clients evaluate on their own clock; it is likewise
 withheld from peers without `session_fleet_identity_v1`. Only work that
 really ran counts: live activity opens on a `Dispatched` effect (by its
-typed `EffectClass`) and closes at its outcome; a completed `ToolCall`
+typed `EffectClass`) or an accepted typed effectless route and closes at
+its outcome/settlement; a completed `ToolCall`
 counts only with status `completed` and a typed activity. A tool name the model merely
 requested (unadvertised, ungranted, malformed or refused) sets no icon and
 adds no history. The computer-use overlay names an acting subagent
