@@ -292,15 +292,13 @@ impl CuPresence {
             capture.holders += 1;
             capture.holders == 1
         };
-        if first {
-            if !self.send_conceal(&mut state, surface) {
-                // A renderer that cannot accept Conceal must not remain on
-                // screen while the capture proceeds without an ack.
-                if let Some(mut renderer) = state.renderers.remove(&surface) {
-                    renderer.close();
-                }
-                state.conceal_acks.retain(|_, pending| *pending != surface);
+        if first && !self.send_conceal(&mut state, surface) {
+            // A renderer that cannot accept Conceal must not remain on
+            // screen while the capture proceeds without an ack.
+            if let Some(mut renderer) = state.renderers.remove(&surface) {
+                renderer.close();
             }
+            state.conceal_acks.retain(|_, pending| *pending != surface);
         }
         let capture = state.captures.entry(surface).or_default();
         (capture.sent && !*capture.acked.borrow()).then(|| capture.acked.subscribe())

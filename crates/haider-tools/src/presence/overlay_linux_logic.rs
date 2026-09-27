@@ -68,11 +68,11 @@ mod tests {
         popup.show("initial");
         popup.conceal();
         popup.hide();
-        assert_eq!(popup.reveal(false, false), None);
         assert!(
             popup.show("new generation"),
             "Hide resets conceal for a later run"
         );
+        assert_eq!(popup.reveal(false, false), None);
         popup.conceal();
         assert_eq!(popup.reveal(true, true), None);
     }
