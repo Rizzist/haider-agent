@@ -419,7 +419,8 @@ fn model_policy_error(error: HaiderError) -> ProviderError {
         ErrorCode::InvalidArgument => ProviderErrorKind::InvalidRequest,
         _ => ProviderErrorKind::ConnectionConfiguration,
     };
-    ProviderError::new(kind, error.message)
+    // The message names agent-offered model ids (child-controlled text).
+    ProviderError::new(kind, error.message).with_untrusted_message()
 }
 
 // ---------------------------------------------------------------------------

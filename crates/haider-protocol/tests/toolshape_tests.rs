@@ -70,6 +70,7 @@ fn fixture_write_result() -> BoundedResult {
         path: "fixtures/toolshape.txt".into(),
         absolute_path: "/workspace/fixtures/toolshape.txt".into(),
         bytes: 17,
+        edit_spans: Vec::new(),
     });
     bounded
 }
@@ -286,6 +287,7 @@ fn all_effect_kinds_keep_receipt_order_instead_of_sorting_paths() {
             path: path.into(),
             absolute_path: format!("/workspace/{path}"),
             bytes,
+            edit_spans: Vec::new(),
         });
     }
     let payload = event("call-ordered-effects", bounded);

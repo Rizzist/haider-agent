@@ -4660,6 +4660,7 @@ fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> Head
         failure,
         terminal_seq: Some(9),
         background_tasks_running: Vec::new(),
+        provider_raw_detail_local: None,
     }
 }
 

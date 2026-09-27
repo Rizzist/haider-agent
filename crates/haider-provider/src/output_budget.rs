@@ -90,12 +90,19 @@ pub fn provider_stated_output_limit(error: &crate::ProviderError, requested: u64
     if error.kind != crate::ProviderErrorKind::InvalidRequest {
         return None;
     }
-    // Adapters keep the provider's own wording in the presentation detail
-    // and a sanitized summary in `message`; either may carry the statement.
-    [error.presentation.detail.as_str(), error.message.as_str()]
-        .into_iter()
-        .find_map(stated_output_limit)
-        .filter(|stated| *stated > 0 && *stated < requested)
+    // The provider's own wording is owner-local (ruling 2): published
+    // `detail`/`message` carry only a template rendering or the withheld
+    // default, so the in-memory prose and the owner-local raw text are read
+    // too. Only the parsed integer is used, locally; nothing is published.
+    [
+        error.presentation.detail.as_str(),
+        error.message.as_str(),
+        error.provider_prose().unwrap_or_default(),
+        error.provider_raw_detail.as_deref().unwrap_or_default(),
+    ]
+    .into_iter()
+    .find_map(stated_output_limit)
+    .filter(|stated| *stated > 0 && *stated < requested)
 }
 
 fn stated_output_limit(message: &str) -> Option<u64> {

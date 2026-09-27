@@ -881,6 +881,7 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
                 output_truncated,
                 output_decode_error,
                 tool_reason,
+                tool_result: None,
                 spoken,
                 agent_line_starts,
             })

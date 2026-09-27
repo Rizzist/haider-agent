@@ -175,6 +175,7 @@ fn filesystem_model_result_drops_receipt_and_preserves_journal_effects() {
             path: "src/lib.rs".into(),
             absolute_path: "/workspace/src/lib.rs".into(),
             bytes: 24,
+            edit_spans: Vec::new(),
         });
         let bytes = serde_json::to_vec(&durable).expect("journal");
         assert_eq!(
@@ -656,6 +657,7 @@ fn repaired_tool_name_preserves_declared_json_and_text_result_provenance() {
             path: "fixtures/fixture.txt".into(),
             absolute_path: "/workspace/fixtures/fixture.txt".into(),
             bytes: 7,
+            edit_spans: Vec::new(),
         });
         let legacy_corrected = tool.correct_result(bounded.clone());
         bounded.declare_truncation(ToolTruncation::from_bytes(&[b'x'; 10_000], 0));

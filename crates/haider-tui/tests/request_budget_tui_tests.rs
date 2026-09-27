@@ -100,6 +100,7 @@ fn budget_status_hides_per_request_progress_and_renders_only_actionable_bounds()
         } else {
             assert!(rendered.contains(&expected), "styled: {rendered}");
         }
+        assert!(!rendered.contains("— in progress"), "styled: {rendered}");
     }
 }
 

@@ -1001,7 +1001,24 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             if result.outcome != HeadlessOutcome::Done
                 && let Some(failure) = &result.failure
             {
-                eprintln!("haider: {}", failure.message);
+                if let Some(presentation) = &failure.presentation {
+                    eprintln!("haider: {} — {}", presentation.title, presentation.detail);
+                    for line in provider_identity_lines(presentation) {
+                        eprintln!("haider: {line}");
+                    }
+                    // Print output is an owner-local surface (this machine's
+                    // terminal); JSON/JSONL never carry this field.
+                    if options.output == RunOutput::Print
+                        && let Some(raw) = &result.provider_raw_detail_local
+                    {
+                        eprintln!(
+                            "haider: {}: {raw}",
+                            haider_protocol::error::PROVIDER_RAW_DETAIL_LABEL
+                        );
+                    }
+                } else {
+                    eprintln!("haider: {}", failure.message);
+                }
                 if matches!(
                     failure.code,
                     HeadlessFailureCode::Run(ErrorCode::CredentialMissing)
@@ -1048,6 +1065,22 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             ExitCode::from(exit_code_for_error(&error))
         }
     }
+}
+
+fn provider_identity_lines(
+    presentation: &haider_protocol::error::ErrorPresentation,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(status) = presentation.provider_http_status {
+        lines.push(format!("HTTP {status}"));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        lines.push(format!("Provider error type: {error_type}"));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        lines.push(format!("Request id: {request_id}"));
+    }
+    lines
 }
 
 #[cfg(unix)]
@@ -2198,11 +2231,21 @@ fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Res
             name: &task.name,
         })
         .collect();
+    // JSON output is shareable: the SDK already stripped owner-local fields;
+    // strip again so a caller-built result cannot leak them.
+    let shareable_presentation = result
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.presentation.clone())
+        .map(|mut presentation| {
+            presentation.strip_local_only();
+            presentation
+        });
     let error = result.failure.as_ref().map(|failure| RunJsonError {
         code: failure.code.as_str(),
         message: &failure.message,
         retryable: failure.retryable,
-        presentation: failure.presentation.as_ref(),
+        presentation: shareable_presentation.as_ref(),
     });
     serde_json::to_writer(
         &mut output,
@@ -2362,6 +2405,30 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_error_identity_includes_http_status() {
+        let presentation = haider_protocol::error::ErrorPresentation::new(
+            "provider-overloaded",
+            "Provider is overloaded",
+            "Overloaded",
+            haider_protocol::error::ErrorScope::Turn,
+            [haider_protocol::error::ErrorAction::Retry],
+        )
+        .with_http_status(503)
+        .with_provider_error_type(Some("overloaded_error"))
+        .with_request_id(Some("req_fixture503"));
+        assert_eq!(
+            provider_identity_lines(&presentation),
+            [
+                "HTTP 503",
+                "Provider error type: overloaded_error",
+                "Request id: req_fixture503",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        );
+    }
 
     #[test]
     fn request_budget_is_opt_in_and_single_flags_choose_valid_counterparts() {
@@ -2535,6 +2602,7 @@ mod tests {
             permission_denials: Vec::new(),
             terminal_seq: Some(7),
             background_tasks_running: Vec::new(),
+            provider_raw_detail_local: None,
             failure: Some(haider_client::HeadlessRunFailure {
                 code: HeadlessFailureCode::Run(ErrorCode::RequestBudgetExceeded),
                 message: message.into(),
