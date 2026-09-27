@@ -195,6 +195,10 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
     let ResponseBody::AccountOAuthImport { descriptor: b, .. } = b else {
         panic!("import B: {b:?}")
     };
+    assert!(
+        b.incarnation > a.incarnation,
+        "a different import must mint an account incarnation"
+    );
     let listed = req(
         &mut c,
         "list-b",
