@@ -710,6 +710,202 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
     assert_eq!(models.len(), 7);
 }
 
+/// Astra B1: a Kimi Code home source names the credential SOURCE
+/// (`kimi:<source suffix>`), not the account. A different account signing in
+/// at the same source (the file is rewritten, so its intake epoch advances)
+/// must start a new catalog: the previous account's live rows are cleared, a
+/// late completion started under A's key is fenced, A's durable row is never
+/// read under B's key after a restart, and this holds whether or not the
+/// sweep manages to delete A's row. An unchanged source re-read keeps its
+/// catalog.
+/// MUTATION CHECK: drop `identity_poor_oauth` from the key's epoch rule; the
+/// A and B keys become equal and every assertion after the replacement fails.
+#[tokio::test]
+async fn same_source_account_replacement_never_serves_the_previous_accounts_rows() {
+    let kimi = haider_provider::KIMI_OAUTH_PROVIDER_NAME;
+    let row = |slug: &str| DiscoveredModel {
+        slug: slug.into(),
+        display_name: slug.into(),
+        context_window: None,
+        max_output_tokens: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let source_account = |captured_at: u64| CredentialDescriptor {
+        alias: CredentialAlias::new("kimi-code-home"),
+        provider: kimi.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "kimi:0123456789abcdef".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(AccountIdentity {
+            email: None,
+            display_name: Some("Kimi Code subscription".into()),
+            account_id: Some("kimi:0123456789abcdef".into()),
+            plan: None,
+            issuer: Some("https://auth.kimi.com".into()),
+            captured_at,
+            verified: false,
+        }),
+        created_at_ms: None,
+    };
+    let registry = || {
+        ProviderRegistry::new(
+            Box::new(TestProviderStore::default()) as Box<dyn ProviderRegistryStoreLike>,
+            initial_provider_profiles(
+                &std::collections::BTreeSet::from([kimi.to_owned()]),
+                "unused",
+            ),
+            Arc::new(CachedProviderModelSource::default()),
+        )
+        .expect("provider registry")
+    };
+    let has_row = |providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>| {
+        providers
+            .summary(kimi, &|_| true)
+            .expect("kimi summary")
+            .models
+            .contains(&"a-only".to_owned())
+    };
+
+    for prune_succeeds in [true, false] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let providers = registry();
+        let mut accounts = memory_accounts();
+        accounts.add(source_account(1_000)).expect("account A");
+        let key_a = ProviderModelCacheKey::for_account(
+            kimi,
+            accounts
+                .get(&CredentialAlias::new("kimi-code-home"))
+                .expect("A"),
+        );
+        store
+            .put_provider_models(key_a.clone().into(), "[]".into(), Some("a-etag".into()), 1)
+            .await
+            .expect("A's durable catalog");
+        providers.replace_discovered_models(kimi.to_owned(), vec![row("a-only")], 1);
+        let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+
+        // An unchanged source re-read is the same account: nothing moves.
+        let before = accounts.list().to_vec();
+        accounts
+            .replace(source_account(1_000))
+            .expect("unchanged re-read");
+        finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+        assert!(has_row(&providers), "an unchanged source keeps its catalog");
+        assert!(refresh_completion_is_current(
+            kimi, &key_a, &accounts, &providers
+        ));
+
+        // Account B signs in at the same source: the file is rewritten.
+        if !prune_succeeds {
+            store
+                .clone()
+                .close()
+                .await
+                .expect("close store: the sweep will fail");
+        }
+        let before = accounts.list().to_vec();
+        accounts
+            .replace(source_account(2_000))
+            .expect("account B at the same source");
+        finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+        let key_b = ProviderModelCacheKey::for_account(
+            kimi,
+            accounts
+                .get(&CredentialAlias::new("kimi-code-home"))
+                .expect("B"),
+        );
+        assert_ne!(
+            key_a, key_b,
+            "a same-source account replacement is a new catalog"
+        );
+        assert!(
+            !has_row(&providers),
+            "A's live rows are gone at the replacement"
+        );
+        assert!(
+            !refresh_completion_is_current(kimi, &key_a, &accounts, &providers),
+            "a flight started under A's key is fenced after the replacement"
+        );
+        assert!(refresh_completion_is_current(
+            kimi, &key_b, &accounts, &providers
+        ));
+
+        // Restart hydration reads B's key only.
+        let reopened = if prune_succeeds {
+            store.clone()
+        } else {
+            open_store(dir.path()).await
+        };
+        assert!(
+            reopened
+                .provider_models(key_b.clone().into())
+                .await
+                .expect("B hydration read")
+                .is_none(),
+            "restart never hydrates A's rows as B's (prune_succeeds={prune_succeeds})"
+        );
+        assert_eq!(
+            reopened
+                .provider_models(key_a.clone().into())
+                .await
+                .expect("A row read")
+                .is_some(),
+            !prune_succeeds,
+            "a successful sweep deletes A's row; a failed one leaves it unreadable"
+        );
+        reopened.close().await.expect("close");
+    }
+}
+
+/// A login whose provider returns no account coordinate (Kimi, Grok without
+/// an ID token, Anthropic) gets a synthetic identity from its grant: stable
+/// across refresh of that grant, distinct for every new login, and Anthropic
+/// keeps its released spelling.
+#[test]
+fn grant_identity_is_a_per_login_account_boundary() {
+    let grant = |access: &[u8]| haider_accounts::OAuthIdentityV1 {
+        subject_hash: blake3::hash(access).to_hex().to_string(),
+        display_identity: "Kimi Code subscription".into(),
+    };
+    let kimi = haider_provider::KIMI_OAUTH_PROVIDER_NAME;
+    let first =
+        crate::oauth::grant_account_identity(kimi, "https://auth.kimi.com", &grant(b"a"), 1);
+    let again =
+        crate::oauth::grant_account_identity(kimi, "https://auth.kimi.com", &grant(b"a"), 1);
+    let other =
+        crate::oauth::grant_account_identity(kimi, "https://auth.kimi.com", &grant(b"b"), 2);
+    assert_eq!(first, again);
+    assert_ne!(first.account_id, other.account_id);
+    assert!(
+        first
+            .account_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("kimi-oauth:grant-"))
+    );
+    let anthropic = crate::oauth::grant_account_identity(
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        "https://claude.ai",
+        &grant(b"a"),
+        1,
+    );
+    assert!(
+        anthropic
+            .account_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("anthropic:") && !id.contains("grant"))
+    );
+}
+
 #[tokio::test]
 async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not() {
     let dir = test_store_dir();

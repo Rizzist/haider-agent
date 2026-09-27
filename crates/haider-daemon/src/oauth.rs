@@ -4761,22 +4761,23 @@ async fn token_bundle_from_response(
         account_identity.verified = true;
     }
     if account_identity.is_none()
-        && registration.provider_id == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME
+        && matches!(
+            &registration.identity_mode,
+            RuntimeIdentityMode::TokenEndpointGrant { .. }
+        )
     {
-        // Anthropic's token response has no ID token/account coordinate. Pin
-        // one synthetic identity to the login's initial grant identity; the
-        // refresh path preserves this AccountIdentity byte-for-byte, so token
-        // rotation cannot rename the account or break its meter association.
-        let stable_suffix = identity.subject_hash.chars().take(16).collect::<String>();
-        account_identity = Some(AccountIdentity {
-            email: None,
-            display_name: Some(identity.display_identity.clone()),
-            account_id: Some(format!("anthropic:{stable_suffix}")),
-            plan: None,
-            issuer: Some(registration.issuer.clone()),
-            captured_at: now,
-            verified: false,
-        });
+        // The token response has no ID token/account coordinate (Anthropic,
+        // Kimi, Grok without an ID token). Pin one synthetic identity to the
+        // login's initial grant identity; the refresh path preserves this
+        // AccountIdentity byte-for-byte, so token rotation cannot rename the
+        // account or break its meter association, while a new login is a new
+        // account boundary (catalog cache keys included).
+        account_identity = Some(grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &identity,
+            now,
+        ));
     }
     let expires_at = now
         .checked_add(response.expires_in.saturating_mul(1000))
@@ -6505,6 +6506,33 @@ fn kimi_refresh_retry_delay(error: &OAuthPublicError, attempts: usize) -> Option
         let exponent = u32::try_from(attempts.saturating_sub(1)).unwrap_or(u32::MAX);
         KIMI_REFRESH_BACKOFF_INITIAL.saturating_mul(2_u32.saturating_pow(exponent))
     })
+}
+
+/// The synthetic account identity of a login whose provider returns no
+/// account coordinate: derived from that login's initial grant, so it is
+/// stable across token refresh and distinct for every new login. Anthropic
+/// keeps its released `anthropic:<grant>` spelling (meter association).
+pub(crate) fn grant_account_identity(
+    provider: &str,
+    issuer: &str,
+    identity: &OAuthIdentityV1,
+    captured_at: u64,
+) -> AccountIdentity {
+    let stable_suffix = identity.subject_hash.chars().take(16).collect::<String>();
+    let account_id = if provider == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
+        format!("anthropic:{stable_suffix}")
+    } else {
+        format!("{provider}:grant-{stable_suffix}")
+    };
+    AccountIdentity {
+        email: None,
+        display_name: Some(identity.display_identity.clone()),
+        account_id: Some(account_id),
+        plan: None,
+        issuer: Some(issuer.to_owned()),
+        captured_at,
+        verified: false,
+    }
 }
 
 fn validate_bundle_against(

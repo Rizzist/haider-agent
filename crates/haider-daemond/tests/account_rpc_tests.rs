@@ -1180,6 +1180,195 @@ impl haider_daemon::ProviderModelDiscoverer for AccountScopedCatalog {
     }
 }
 
+/// Astra B1 through the real daemon: a Kimi Code home source names the
+/// SOURCE, not the account. Account A's fetched catalog is durable and shown;
+/// account B then signs in at the same source (the file is rewritten) and a
+/// scan runs. provider.list must immediately stop showing A's rows (the
+/// accounts view and provider summaries publish together), A's durable row is
+/// swept, and a restart never hydrates it as B's.
+/// MUTATION CHECK: drop `identity_poor_oauth` from the cache key (A and B
+/// share a key: A's row survives the sweep and rehydrates), or publish the
+/// scan with `publish_next_management_revision` (stale summaries still list
+/// A's row right after the scan).
+#[tokio::test]
+async fn same_source_kimi_account_replacement_never_shows_the_previous_rows() {
+    let root = test_root("hac-kimi-src-");
+    let config = DaemonConfig::new(
+        "profile-kimi-source",
+        root.path().join("store"),
+        root.path(),
+    );
+    let source_dir = root.path().join("kimi-source");
+    std::fs::create_dir_all(source_dir.join("credentials"))
+        .unwrap_or_else(|error| panic!("source dir: {error}"));
+    let write_source = |account: &str| {
+        let path = source_dir.join("credentials/kimi-code.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "access_token": format!("synthetic-{account}-access"),
+                "refresh_token": format!("synthetic-{account}-refresh"),
+                "expires_at": 4_102_444_800_u64,
+                "token_type": "Bearer",
+                "scope": "kimi-code",
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|error| panic!("write source: {error}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .unwrap_or_else(|error| panic!("source mode: {error}"));
+        }
+    };
+    let kimi_rows = |providers: &[haider_rpc::ProviderSummaryWire]| {
+        providers
+            .iter()
+            .find(|provider| provider.provider == "kimi-oauth")
+            .map(|provider| provider.models.clone())
+            .unwrap_or_default()
+    };
+    let fixture = AccountFixture::for_provider("kimi-oauth", Vec::new());
+
+    write_source("account-a");
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+    let added = request(
+        &mut client,
+        "kimi-source-add",
+        RequestBody::AccountSourceAdd {
+            command_id: CommandId::new("command-kimi-source-add"),
+            kind: "kimi_code_home".into(),
+            root: source_dir.display().to_string(),
+            label: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(added, ResponseBody::AccountSourceAdd { .. }),
+        "enroll the Kimi source: {added:?}"
+    );
+    drop(client);
+    task.shutdown_handle().request("seed A's catalog");
+    let _ = task.join().await;
+    let account_a = fixture
+        .descriptors
+        .dump()
+        .into_iter()
+        .find(|descriptor| descriptor.provider == "kimi-oauth")
+        .unwrap_or_else(|| panic!("source account A"));
+    let key_a = haider_store::ProviderModelCacheKey::for_account("kimi-oauth", &account_a);
+    let a_catalog = serde_json::json!([{
+        "slug": "account-a-only",
+        "display_name": "A only",
+        "supported_efforts": [],
+        "visible": true
+    }])
+    .to_string();
+    haider_store::Store::open(&config.store_dir)
+        .unwrap_or_else(|error| panic!("open store: {error:?}"))
+        .put_provider_models(
+            key_a.as_str(),
+            &a_catalog,
+            Some("a-etag"),
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+        )
+        .unwrap_or_else(|error| panic!("seed A: {error:?}"));
+
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+    let listed = request(
+        &mut client,
+        "kimi-list-a",
+        RequestBody::ProviderList {
+            provider: Some("kimi-oauth".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = listed else {
+        panic!("provider.list A: {listed:?}");
+    };
+    assert!(
+        kimi_rows(&providers).contains(&"account-a-only".to_owned()),
+        "A's fetched row is served before the replacement"
+    );
+
+    // Account B signs in at the same Kimi Code home.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_source("account-b");
+    let scanned = request(&mut client, "kimi-scan", RequestBody::AccountSourceScan).await;
+    assert!(
+        matches!(scanned, ResponseBody::AccountSourceScan { .. }),
+        "scan: {scanned:?}"
+    );
+    let listed = request(
+        &mut client,
+        "kimi-list-b",
+        RequestBody::ProviderList {
+            provider: Some("kimi-oauth".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = listed else {
+        panic!("provider.list B: {listed:?}");
+    };
+    assert!(
+        !kimi_rows(&providers).contains(&"account-a-only".to_owned()),
+        "B never sees A's rows after the scan: {:?}",
+        kimi_rows(&providers)
+    );
+    drop(client);
+    task.shutdown_handle().request("restart as B");
+    let _ = task.join().await;
+    let account_b = fixture
+        .descriptors
+        .dump()
+        .into_iter()
+        .find(|descriptor| descriptor.provider == "kimi-oauth")
+        .unwrap_or_else(|| panic!("source account B"));
+    assert_eq!(account_a.alias, account_b.alias, "same source alias");
+    let key_b = haider_store::ProviderModelCacheKey::for_account("kimi-oauth", &account_b);
+    assert_ne!(key_a, key_b, "the replacement is a new catalog boundary");
+    let store = haider_store::Store::open(&config.store_dir)
+        .unwrap_or_else(|error| panic!("reopen store: {error:?}"));
+    assert!(
+        store
+            .provider_models(key_a.as_str())
+            .unwrap_or_else(|error| panic!("read A: {error:?}"))
+            .is_none(),
+        "A's durable row was swept"
+    );
+    drop(store);
+
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+    let listed = request(
+        &mut client,
+        "kimi-list-restart",
+        RequestBody::ProviderList {
+            provider: Some("kimi-oauth".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = listed else {
+        panic!("provider.list after restart: {listed:?}");
+    };
+    assert!(
+        !kimi_rows(&providers).contains(&"account-a-only".to_owned()),
+        "a restart never hydrates A's rows as B's"
+    );
+    drop(client);
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
+}
+
 /// Catalog cache sweep through the real daemon: the startup sweep drops
 /// rows no reader uses (a legacy bare key for an account-scoped catalog, the
 /// unreleased `account:<len>:` form, an orphan `account-v2:` key), keeps every

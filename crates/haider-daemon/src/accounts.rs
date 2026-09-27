@@ -2063,11 +2063,12 @@ async fn run_account_actor(
                         )
                         .await;
                         refresh_resolver_snapshot(&snapshot, &accounts);
-                        if let Err(error) = publish_next_management_revision(
+                        if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
                             management.as_ref(),
                             &accounts,
+                            &providers,
                         )
                         .await
                         {
@@ -2143,11 +2144,12 @@ async fn run_account_actor(
                 match result {
                     Ok(()) => {
                         refresh_resolver_snapshot(&snapshot, &accounts);
-                        if let Err(error) = publish_next_management_revision(
+                        if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
                             management.as_ref(),
                             &accounts,
+                            &providers,
                         )
                         .await
                         {
@@ -2196,11 +2198,12 @@ async fn run_account_actor(
                         )
                         .await;
                         refresh_resolver_snapshot(&snapshot, &accounts);
-                        if let Err(error) = publish_next_management_revision(
+                        if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
                             management.as_ref(),
                             &accounts,
+                            &providers,
                         )
                         .await
                         {
@@ -2250,11 +2253,12 @@ async fn run_account_actor(
                     )
                     .await;
                     refresh_resolver_snapshot(&snapshot, &accounts);
-                    let _ = publish_next_management_revision(
+                    let _ = publish_next_management_revision_with_inventory(
                         &store,
                         &snapshot,
                         management.as_ref(),
                         &accounts,
+                        &providers,
                     )
                     .await;
                 }
@@ -2424,9 +2428,7 @@ async fn run_account_actor(
                 completed,
             } => {
                 refreshing_providers.remove(&provider);
-                if active_catalog_cache_key(&provider, &accounts, &providers).as_ref()
-                    != Some(&cache_key)
-                {
+                if !refresh_completion_is_current(&provider, &cache_key, &accounts, &providers) {
                     // A switch happened during the network flight. Its new
                     // discovery remains queued; never publish the old rows.
                     let completed = ProviderModelsRefreshCompletion::with_followers(
@@ -2527,11 +2529,12 @@ async fn run_account_actor(
                             &mut pending_catalog_discoveries,
                         )
                         .await;
-                        if let Err(error) = publish_next_management_revision(
+                        if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
                             management.as_ref(),
                             &accounts,
+                            &providers,
                         )
                         .await
                         {
@@ -2688,22 +2691,15 @@ async fn backfill_oauth_identities(
                     .flatten()
             })
             .or_else(|| {
-                (provider == ANTHROPIC_OAUTH_PROVIDER_NAME).then(|| {
-                    let suffix = bundle
-                        .identity
-                        .subject_hash
-                        .chars()
-                        .take(16)
-                        .collect::<String>();
-                    AccountIdentity {
-                        email: None,
-                        display_name: Some(bundle.identity.display_identity.clone()),
-                        account_id: Some(format!("anthropic:{suffix}")),
-                        plan: None,
-                        issuer: Some(bundle.issuer.clone()),
-                        captured_at: unix_ms_after(Duration::ZERO),
-                        verified: false,
-                    }
+                // Same rule as a fresh login without an account coordinate:
+                // the grant identity is the account boundary.
+                grant_identity_backfill(&provider).then(|| {
+                    crate::oauth::grant_account_identity(
+                        &provider,
+                        &bundle.issuer,
+                        &bundle.identity,
+                        unix_ms_after(Duration::ZERO),
+                    )
                 })
             });
         if let Some(identity) = identity
@@ -2715,6 +2711,17 @@ async fn backfill_oauth_identities(
         }
     }
     changed
+}
+
+/// Registered token-endpoint-grant providers whose logins carry no account
+/// coordinate of their own.
+fn grant_identity_backfill(provider: &str) -> bool {
+    matches!(
+        provider,
+        ANTHROPIC_OAUTH_PROVIDER_NAME
+            | haider_provider::KIMI_OAUTH_PROVIDER_NAME
+            | haider_provider::GROK_OAUTH_PROVIDER_NAME
+    )
 }
 
 fn adoption_notice(
@@ -3519,6 +3526,19 @@ fn catalog_cache_key(
         ProviderAuthRequirementWire::None => Some(ProviderModelCacheKey::public(provider)),
         _ => None,
     }
+}
+
+/// Late-refresh fence: a completed catalog flight may publish only when the
+/// key it was started under is still the active account's key. A switch, a
+/// re-login or a same-source account replacement (new intake epoch) during
+/// the flight rejects it.
+fn refresh_completion_is_current(
+    provider: &str,
+    started_under: &ProviderModelCacheKey,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> bool {
+    active_catalog_cache_key(provider, accounts, providers).as_ref() == Some(started_under)
 }
 
 /// Whether `provider`'s catalog rows are keyed by account (never by the
@@ -4433,6 +4453,32 @@ async fn publish_next_management_revision(
 ) -> Result<u64, HaiderError> {
     let revision = store.advance_management_revision().await?;
     publish_management_snapshot(snapshot, management, accounts, revision);
+    Ok(revision)
+}
+
+/// Account change that may have cleared live catalog rows (source
+/// enrollment, scan, reconciliation, import heal): the accounts view and the
+/// provider summaries are published together, so no reader sees the new
+/// account beside the previous account's rows.
+async fn publish_next_management_revision_with_inventory(
+    store: &SqliteStoreHandle,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Result<u64, HaiderError> {
+    let revision = store.advance_management_revision().await?;
+    let descriptors = accounts.list().to_vec();
+    if let Ok(mut view) = snapshot.lock() {
+        *view = descriptors.clone();
+    }
+    if let Some(management) = management {
+        management.publish(
+            revision,
+            descriptors,
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+        );
+    }
     Ok(revision)
 }
 

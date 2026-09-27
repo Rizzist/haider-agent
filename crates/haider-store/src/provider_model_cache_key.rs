@@ -3,8 +3,9 @@
 //! Public (credential-free) catalogs are keyed by the bare provider ID, as
 //! they were before lane 973-catalog-accuracy. Authenticated catalogs are
 //! keyed by the account identity that fetched them, so another identity —
-//! including one later reusing the same alias — never reads them, while a
-//! same-identity re-login or daemon restart derives the identical key.
+//! including one later reusing the same alias or the same credential source —
+//! never reads them, while a same-known-identity re-login, a token refresh or
+//! a daemon restart derives the identical key.
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
 
@@ -51,10 +52,21 @@ impl ProviderModelCacheKey {
             descriptor.alias.as_str(),
             auth_method_tag(descriptor.auth_method),
         );
-        if descriptor.auth_method == AuthMethod::ApiKey {
+        if descriptor.auth_method == AuthMethod::ApiKey || identity_poor_oauth(descriptor) {
             // API-key validators often return the same display identity for
             // distinct keys. The intake timestamp is retained for a same-key
             // re-login and advanced when a different key replaces it.
+            //
+            // Identity-poor OAuth records get the same boundary: their scope
+            // names the credential SOURCE or a generic label (a Kimi Code
+            // home's `kimi:<source>` id, a Claude Code import's plan label),
+            // not the account, so a different account signing in at the
+            // same source would otherwise derive the identical key. Their
+            // intake epoch is the login/import time (kept byte-for-byte by
+            // token refresh) or the linked source file's modification time,
+            // so a re-login or a source rewrite starts a new catalog while
+            // our own token refresh keeps it. Continuity that cannot be
+            // proven is treated as a new account.
             let intake_epoch = identity.map_or(0, |identity| identity.captured_at);
             material.push('\0');
             material.push_str(&intake_epoch.to_string());
@@ -81,6 +93,18 @@ impl std::fmt::Display for ProviderModelCacheKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// Whether an OAuth descriptor's identity scope cannot prove which account
+/// it is: no provider-issued email and no independently verified identity
+/// token. Such scopes are coordinates of a credential source or a login, so
+/// the key also carries the intake epoch.
+fn identity_poor_oauth(descriptor: &CredentialDescriptor) -> bool {
+    descriptor.auth_method == AuthMethod::OAuth
+        && !descriptor
+            .account_identity
+            .as_ref()
+            .is_some_and(|identity| identity.verified || identity.email.is_some())
 }
 
 /// Persisted spelling of the auth method inside key material. These are the

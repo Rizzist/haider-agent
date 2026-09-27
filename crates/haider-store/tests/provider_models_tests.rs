@@ -412,6 +412,78 @@ fn account_scoped_cache_key_derivation_is_pinned() {
             descriptor.alias.as_str()
         );
     }
+    // Identity-poor OAuth (no email, no verified ID token: a Kimi Code home
+    // source's `kimi:<source>` coordinate) carries its intake epoch, like an
+    // API key. Digests computed independently (Python blake3) from
+    // `provider\0alias\0OAuth\0issuer\0kind\0scope\0epoch`; the value
+    // WITHOUT the epoch (the B1 bug) was
+    // account-v2:28d671a54bdab641dff7fc90874de3cc249880176a647328054000ae495b7ac6.
+    let poor = |captured_at: u64| {
+        let mut descriptor = descriptor(
+            "kimi-code-home",
+            AuthMethod::OAuth,
+            Some(AccountIdentity {
+                email: None,
+                display_name: Some("Kimi Code subscription".into()),
+                account_id: Some("kimi:0123456789abcdef".into()),
+                plan: None,
+                issuer: Some("https://issuer.example".into()),
+                captured_at,
+                verified: false,
+            }),
+        );
+        descriptor.provider = "kimi-oauth".into();
+        descriptor
+    };
+    assert_eq!(
+        ProviderModelCacheKey::for_account("kimi-oauth", &poor(5)).as_str(),
+        "account-v2:eb1d89a8b95824afb4c4e6997b1b2561f7767ecdd11e05281d6156397134ceef"
+    );
+    assert_ne!(
+        ProviderModelCacheKey::for_account("kimi-oauth", &poor(5)),
+        ProviderModelCacheKey::for_account("kimi-oauth", &poor(6)),
+        "a rewritten source is a new catalog"
+    );
+    assert_eq!(
+        ProviderModelCacheKey::for_account(
+            "kimi-oauth",
+            &descriptor("kimi-code-home", AuthMethod::OAuth, None)
+        )
+        .as_str(),
+        "account-v2:4721f5724725a4cedfb342e691f45b04a612c84f780102eaf7249afca8a93d8b",
+        "OAuth without any identity also carries the (zero) epoch"
+    );
+    // A known identity (email or verified ID token) keeps one key across
+    // re-logins: the epoch is not part of it.
+    let known = |captured_at: u64, verified: bool, email: Option<&str>| {
+        descriptor(
+            "codex",
+            AuthMethod::OAuth,
+            Some(AccountIdentity {
+                email: email.map(Into::into),
+                display_name: None,
+                account_id: Some("acct-1".into()),
+                plan: None,
+                issuer: Some("https://issuer.example".into()),
+                captured_at,
+                verified,
+            }),
+        )
+    };
+    assert_eq!(
+        ProviderModelCacheKey::for_account(
+            "openai-oauth",
+            &known(1, false, Some("a@example.test"))
+        ),
+        ProviderModelCacheKey::for_account(
+            "openai-oauth",
+            &known(2, false, Some("a@example.test"))
+        )
+    );
+    assert_eq!(
+        ProviderModelCacheKey::for_account("openai-oauth", &known(1, true, None)),
+        ProviderModelCacheKey::for_account("openai-oauth", &known(2, true, None))
+    );
     assert_eq!(
         ProviderModelCacheKey::public("haider-code").as_str(),
         "haider-code",
