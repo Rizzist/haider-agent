@@ -837,7 +837,7 @@ class WindowsCrtImportTests(unittest.TestCase):
             'dwmapi.dll', 'uxtheme.dll', 'shlwapi.dll', 'winhttp.dll', 'dnsapi.dll',
             'powrprof.dll', 'psapi.dll', 'version.dll', 'setupapi.dll',
             'cfgmgr32.dll', 'rpcrt4.dll', 'shcore.dll', 'profapi.dll',
-            'netapi32.dll', 'wtsapi32.dll', 'win32u.dll', 'msvcrt.dll',
+            'netapi32.dll', 'wtsapi32.dll', 'win32u.dll', 'comctl32.dll', 'msvcrt.dll',
             'msvcp_win.dll', 'mf.dll', 'mfplat.dll',
             'api-ms-win-core-synch-l1-2-0.dll',
             'ext-ms-win-ntuser-window-l1-1-0.dll',

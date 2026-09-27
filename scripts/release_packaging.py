@@ -682,7 +682,7 @@ WINDOWS_OS_IMPORTS = frozenset({
     "dwmapi.dll", "uxtheme.dll", "shlwapi.dll", "winhttp.dll", "dnsapi.dll",
     "powrprof.dll", "psapi.dll", "version.dll", "setupapi.dll",
     "cfgmgr32.dll", "rpcrt4.dll", "shcore.dll", "profapi.dll",
-    "netapi32.dll", "wtsapi32.dll", "win32u.dll",
+    "netapi32.dll", "wtsapi32.dll", "win32u.dll", "comctl32.dll",
     # Windows compatibility and media components with OS provenance.
     "msvcrt.dll", "msvcp_win.dll", "mf.dll", "mfplat.dll",
 })
