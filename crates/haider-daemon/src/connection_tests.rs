@@ -2911,7 +2911,7 @@ fn legacy_running_tool_event_omits_live_activity_metadata() {
     let mut rich = base.clone();
     rich["activity_kind"] = serde_json::json!("read");
     rich["activity_call_id"] = serde_json::json!("registered");
-    let frame = |payload| WireFrame::Event {
+    let frame = |payload: serde_json::Value| WireFrame::Event {
         attachment_id: AttachmentId::new("a"),
         session_id: SessionId::new("s"),
         envelope: EventEnvelope {
