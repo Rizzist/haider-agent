@@ -515,14 +515,14 @@ class WindowsCrtImportTests(unittest.TestCase):
             *[(n, 0) for n in (
                 'KERNEL32.dll', 'api-ms-win-core-crt-l1-1-0.dll', 'api-ms-win-core-crt-l2-1-0.dll', 'API-MS-WIN-CORE-CRT-L1-1-0',
                 'ext-ms-win-ntuser-window-l1-1-0.dll', 'ext-ms-win-kernel32-package-current-l1-1-0.dll',
-                'msvcrt.dll', 'msvcp_win.dll',
-                'C:' + B + 'Windows' + B + 'System32' + B + 'bcrypt.dll',
-                B*2 + '?' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'ntdll.dll', 'C:KERNEL32.dll',
             )],
             *[(n, 1) for n in ('vcruntime.dll', 'mfc.dll', 'msvcr.dll', 'concrt.dll',
                                 'My_Odd Name~1+(x).dll', 'mfc42u.dll', 'msvcp110_win.dll',
                                 'msvcirt.dll', 'atl.dll', 'atlthunk.dll', 'mfcsubs.dll',
-                                'mfcans32.dll')],
+                                'mfcans32.dll', 'msvcrt.dll', 'msvcp_win.dll',
+                                'C:' + B + 'Windows' + B + 'System32' + B + 'bcrypt.dll',
+                                B*2 + '?' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'ntdll.dll',
+                                'C:KERNEL32.dll')],
             *[(n, 1) for n in ('msvcrt20.dll', 'msvcrt40.dll', 'msvcp60.dll',
                               'mfc40.dll', 'mfc40u.dll', 'mfc42.dll', 'mfc42loc.dll',
                               'msvcr120_clr0400.dll', 'vcruntime140_clr0400.dll',
@@ -777,6 +777,7 @@ class WindowsCrtImportTests(unittest.TestCase):
             'libclang_rt.asan_dynamic-aarch64.dll',
             'sqlite3.dll', 'libssl-3-x64.dll', 'thirdparty.dll',
             'mfc42u.dll', 'msvcp110_win.dll',
+            'mf.dll', 'mfplat.dll', 'profapi.dll', 'win32u.dll', 'msvcrt.dll', 'msvcp_win.dll',
         )
         modes = ((False, False, False), (True, False, False),
                  (False, True, False), (True, True, False), (True, True, True))
@@ -810,7 +811,7 @@ class WindowsCrtImportTests(unittest.TestCase):
         )
         self.assertEqual(
             release_packaging.forbidden_windows_imports({'imports': [
-                'KERNEL32.dll', r'C:\Windows\System32\bcrypt.dll',
+                'KERNEL32.dll',
                 'api-ms-win-core-synch-l1-2-0.dll',
                 'ext-ms-win-ntuser-window-l1-1-0.dll',
                 'kernel32.dll::$DATA',
@@ -819,12 +820,41 @@ class WindowsCrtImportTests(unittest.TestCase):
         )
         self.assertEqual(
             release_packaging.forbidden_windows_imports({'imports': [
+                r'C:\Windows\System32\bcrypt.dll', 'C:kernel32.dll',
                 'api-ms-win-crt-runtime-l1-1-0.dll', 'api-ms-win-core-fake.dllx',
                 'ext-ms-win-other.ocx', 'api-ms-win-crt-math-l1-1-0.xyz',
             ]}),
             ['api-ms-win-core-fake.dllx', 'api-ms-win-crt-math-l1-1-0.xyz',
-             'api-ms-win-crt-runtime-l1-1-0.dll', 'ext-ms-win-other.ocx'],
+             'api-ms-win-crt-runtime-l1-1-0.dll', r'C:\Windows\System32\bcrypt.dll',
+             'C:kernel32.dll', 'ext-ms-win-other.ocx'],
         )
+
+    def test_qualified_os_imports_fail_in_all_five_modes(self):
+        qualified = (
+            r'C:\app\kernel32.dll', 'C:kernel32.dll', 'c:KERNEL32',
+            'C:kernel32.dll::$DATA', r'\kernel32.dll',
+            r'..\bundle\user32.dll', 'vendor/kernel32.dll',
+            '//server/share/user32.dll', r'.\x\..\combase.dll',
+            r'\\server\share\ole32.dll', r'\\?\C:\Windows\System32\advapi32.dll',
+            'kernel32.dll/..', r'kernel32.dll\..\user32.dll',
+            r'C:\app\api-ms-win-core-synch-l1-2-0.dll',
+        )
+        modes = ((False, False, False), (True, False, False),
+                 (False, True, False), (True, True, False), (True, True, True))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'qualified.exe'
+            for name in qualified:
+                for pe32, delayed, legacy in modes:
+                    with self.subTest(name=name, pe32=pe32, delayed=delayed, legacy=legacy):
+                        path.write_bytes(_pe(SYSTEM_IMPORTS if delayed else (name,),
+                                             (name,) if delayed else (), pe32=pe32,
+                                             legacy_delay=legacy))
+                        with self.assertRaises(release_packaging.PackagingError) as raised:
+                            release_packaging.verify_windows_imports([path])
+                        self.assertIn(repr(name), str(raised.exception))
+        for name in ('kernel32.dll', 'KERNEL32', 'kernel32.dll ',
+                     'kernel32.dll::$DATA', 'api-ms-win-core-synch-l1-2-0.dll'):
+            self.assertEqual(release_packaging.forbidden_windows_imports({'imports': [name]}), [])
 
     def test_reviewed_os_imports_pass(self):
         # Independent release-policy mirror: a removed allowlist row breaks
@@ -836,9 +866,8 @@ class WindowsCrtImportTests(unittest.TestCase):
             'kernelbase.dll', 'secur32.dll', 'ncrypt.dll', 'iphlpapi.dll',
             'dwmapi.dll', 'uxtheme.dll', 'shlwapi.dll', 'winhttp.dll', 'dnsapi.dll',
             'powrprof.dll', 'psapi.dll', 'version.dll', 'setupapi.dll',
-            'cfgmgr32.dll', 'rpcrt4.dll', 'shcore.dll', 'profapi.dll',
-            'netapi32.dll', 'wtsapi32.dll', 'win32u.dll', 'comctl32.dll', 'msvcrt.dll',
-            'msvcp_win.dll', 'mf.dll', 'mfplat.dll',
+            'cfgmgr32.dll', 'rpcrt4.dll', 'shcore.dll',
+            'netapi32.dll', 'wtsapi32.dll', 'comctl32.dll',
             'api-ms-win-core-synch-l1-2-0.dll',
             'ext-ms-win-ntuser-window-l1-1-0.dll',
         )

@@ -681,10 +681,8 @@ WINDOWS_OS_IMPORTS = frozenset({
     "kernelbase.dll", "secur32.dll", "ncrypt.dll", "iphlpapi.dll",
     "dwmapi.dll", "uxtheme.dll", "shlwapi.dll", "winhttp.dll", "dnsapi.dll",
     "powrprof.dll", "psapi.dll", "version.dll", "setupapi.dll",
-    "cfgmgr32.dll", "rpcrt4.dll", "shcore.dll", "profapi.dll",
-    "netapi32.dll", "wtsapi32.dll", "win32u.dll", "comctl32.dll",
-    # Windows compatibility and media components with OS provenance.
-    "msvcrt.dll", "msvcp_win.dll", "mf.dll", "mfplat.dll",
+    "cfgmgr32.dll", "rpcrt4.dll", "shcore.dll",
+    "netapi32.dll", "wtsapi32.dll", "comctl32.dll",
 })
 WINDOWS_OS_API_SET = re.compile(
     r"(?:api-ms-win-core-[a-z0-9-]+|ext-ms-win-[a-z0-9-]+)\.dll",
@@ -847,8 +845,9 @@ def _is_windows_os_import(component: str) -> bool:
 
 
 def _windows_import_rejection(name: str) -> str | None:
-    # The import target is the basename before an alternate data stream. A
-    # drive-relative name (C:kernel32) has its drive prefix removed first.
+    # PE imports are bare names. Keep inspecting qualified names for a useful
+    # VC-runtime diagnostic, but never allow one through by its basename.
+    qualified = "/" in name or "\\" in name or re.match(r"^[a-zA-Z]:", name) is not None
     # Other DLL-shaped path/ADS segments are checked as well, so an embedded
     # dependency cannot hide behind a later OS basename. A non-default stream
     # is not an OS DLL import.
@@ -869,7 +868,7 @@ def _windows_import_rejection(name: str) -> str | None:
     streams = basename.split(":")[1:]
     if streams and any(stream.casefold() not in ("", "$data") for stream in streams):
         candidates.extend(_windows_import_component(stream) for stream in streams if stream)
-    if candidates and all(_is_windows_os_import(component) for component in candidates):
+    if not qualified and candidates and all(_is_windows_os_import(component) for component in candidates):
         return None
     # This table describes the failure; it never grants an import permission.
     for component in segments:
