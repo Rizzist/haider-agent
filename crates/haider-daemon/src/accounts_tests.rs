@@ -50,10 +50,135 @@ fn empty_source_snapshot() -> AccountSourcesSnapshot {
 }
 
 #[test]
+fn daemon_descriptor_store_reserves_incarnations_on_disk() {
+    let directory = test_store_dir();
+    let json = JsonFileStore::new(directory.path());
+    let counter = json.path().with_extension("incarnation-counter");
+    let mut accounts = AccountStore::new(DescriptorStore::Json(json)).unwrap();
+    let mut descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: Some("synthetic-A".into()),
+        alias: CredentialAlias::new("first"),
+        provider: "synthetic".into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "first".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    accounts.add(descriptor.clone()).unwrap();
+    let first = accounts
+        .get(&CredentialAlias::new("first"))
+        .unwrap()
+        .incarnation;
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().trim(),
+        first.to_string()
+    );
+    accounts.remove(&CredentialAlias::new("first")).unwrap();
+    drop(accounts);
+    let mut restarted =
+        AccountStore::new(DescriptorStore::Json(JsonFileStore::new(directory.path()))).unwrap();
+    descriptor.alias = CredentialAlias::new("second");
+    descriptor.credential_digest = Some("synthetic-B".into());
+    restarted.add(descriptor).unwrap();
+    assert!(
+        restarted
+            .get(&CredentialAlias::new("second"))
+            .unwrap()
+            .incarnation
+            > first
+    );
+    assert!(counter.exists());
+}
+
+#[test]
+fn poisoned_source_registry_cannot_disable_authenticated_catalog_fence() {
+    let registry = empty_source_registry();
+    let poisoned = Arc::clone(&registry);
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("fixture lock");
+            panic!("intentional registry poison");
+        })
+        .join()
+        .is_err()
+    );
+    let descriptor = CredentialDescriptor {
+        incarnation: 1,
+        credential_digest: Some("synthetic-digest".into()),
+        alias: CredentialAlias::new("linked"),
+        provider: "kimi-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "fixture".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let error = linked_source_for_catalog(&registry, Some(&descriptor))
+        .expect_err("an unavailable source registry cannot make discovery unlinked");
+    assert_eq!(error.code, ErrorCode::CredentialMissing);
+    assert!(
+        linked_source_for_catalog(&registry, None)
+            .expect("public catalog has no linked source")
+            .is_none()
+    );
+}
+
+#[test]
+fn endpoint_boundary_mints_active_and_inactive_aliases_only_for_its_provider() {
+    let mut accounts = memory_accounts();
+    for (alias, provider, active) in [
+        ("active", "custom", true),
+        ("inactive", "custom", false),
+        ("other", "unrelated", true),
+    ] {
+        accounts
+            .add(CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: Some(format!("synthetic-{alias}")),
+                alias: CredentialAlias::new(alias),
+                provider: provider.into(),
+                base_url: None,
+                auth_method: AuthMethod::ApiKey,
+                identity: alias.into(),
+                status: CredentialStatus::Ok,
+                active,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            })
+            .expect("add fixture");
+    }
+    let before = accounts
+        .list()
+        .iter()
+        .map(|row| (row.alias.clone(), row.incarnation))
+        .collect::<std::collections::HashMap<_, _>>();
+    mint_provider_incarnations(&mut accounts, "custom").expect("mint profile boundary");
+    for row in accounts.list() {
+        let prior = before[&row.alias];
+        if row.provider == "custom" {
+            assert!(row.incarnation > prior, "{}", row.alias);
+        } else {
+            assert_eq!(row.incarnation, prior);
+        }
+    }
+}
+
+#[test]
 fn authenticated_catalog_key_changes_with_same_alias_identity_but_survives_relogin() {
     let mut accounts = memory_accounts();
     let providers = test_provider_registry();
     let mut descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("reused-source-alias"),
         provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
         base_url: None,
@@ -201,6 +326,8 @@ fn subscription_availability_tracks_active_credential_health() {
     let alias = CredentialAlias::new("subscription-health");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -231,6 +358,8 @@ fn subscription_availability_tracks_active_credential_health() {
     ));
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("offline-descriptor"),
             provider: BEDROCK_PROVIDER_NAME.into(),
             base_url: None,
@@ -309,6 +438,8 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
     let alias = CredentialAlias::new("refresh-api");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "openai".into(),
             base_url: None,
@@ -375,6 +506,8 @@ async fn startup_backfill_decodes_only_the_vaulted_id_token_without_network() {
     let alias = CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME);
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -433,6 +566,8 @@ async fn startup_backfill_marks_missing_oauth_secret_as_source_gone() {
     let alias = CredentialAlias::new("legacy-missing-oauth");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -461,6 +596,8 @@ async fn startup_backfill_synthesizes_stable_anthropic_meter_identity() {
     let alias = CredentialAlias::new("legacy-anthropic-oauth");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -599,6 +736,8 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
     let store = open_store(dir.path()).await;
     let mut accounts = memory_accounts();
     let account = |name: &str, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(name),
         provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -712,14 +851,13 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
 
 /// Astra B1: a Kimi Code home source names the credential SOURCE
 /// (`kimi:<source suffix>`), not the account. A different account signing in
-/// at the same source (the file is rewritten, so its intake epoch advances)
+/// at the same source (the credential digest changes)
 /// must start a new catalog: the previous account's live rows are cleared, a
 /// late completion started under A's key is fenced, A's durable row is never
 /// read under B's key after a restart, and this holds whether or not the
 /// sweep manages to delete A's row. An unchanged source re-read keeps its
 /// catalog.
-/// MUTATION CHECK: drop `identity_poor_oauth` from the key's epoch rule; the
-/// A and B keys become equal and every assertion after the replacement fails.
+/// MUTATION CHECK: omit the incarnation from the key; A and B collide.
 #[tokio::test]
 async fn same_source_account_replacement_never_serves_the_previous_accounts_rows() {
     let kimi = haider_provider::KIMI_OAUTH_PROVIDER_NAME;
@@ -736,7 +874,9 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
         use_responses_lite: None,
         extensions: None,
     };
-    let source_account = |captured_at: u64| CredentialDescriptor {
+    let source_account = |captured_at: u64, credential: &str| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: Some(format!("synthetic-credential-{credential}")),
         alias: CredentialAlias::new("kimi-code-home"),
         provider: kimi.into(),
         base_url: None,
@@ -780,13 +920,15 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
         let store = open_store(dir.path()).await;
         let providers = registry();
         let mut accounts = memory_accounts();
-        accounts.add(source_account(1_000)).expect("account A");
+        accounts.add(source_account(1_000, "A")).expect("account A");
         let key_a = ProviderModelCacheKey::for_account(
             kimi,
             accounts
                 .get(&CredentialAlias::new("kimi-code-home"))
                 .expect("A"),
         );
+        let producer_a = catalog_producer("test-profile", kimi, &accounts, &providers)
+            .expect("A catalog producer");
         store
             .put_provider_models(key_a.clone().into(), "[]".into(), Some("a-etag".into()), 1)
             .await
@@ -797,12 +939,15 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
         // An unchanged source re-read is the same account: nothing moves.
         let before = accounts.list().to_vec();
         accounts
-            .replace(source_account(1_000))
+            .replace(source_account(1_000, "A"))
             .expect("unchanged re-read");
         finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
         assert!(has_row(&providers), "an unchanged source keeps its catalog");
         assert!(refresh_completion_is_current(
-            kimi, &key_a, &accounts, &providers
+            &producer_a,
+            "test-profile",
+            &accounts,
+            &providers
         ));
 
         // Account B signs in at the same source: the file is rewritten.
@@ -815,7 +960,7 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
         }
         let before = accounts.list().to_vec();
         accounts
-            .replace(source_account(2_000))
+            .replace(source_account(1_000, "B"))
             .expect("account B at the same source");
         finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
         let key_b = ProviderModelCacheKey::for_account(
@@ -824,6 +969,8 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
                 .get(&CredentialAlias::new("kimi-code-home"))
                 .expect("B"),
         );
+        let producer_b = catalog_producer("test-profile", kimi, &accounts, &providers)
+            .expect("B catalog producer");
         assert_ne!(
             key_a, key_b,
             "a same-source account replacement is a new catalog"
@@ -833,11 +980,14 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
             "A's live rows are gone at the replacement"
         );
         assert!(
-            !refresh_completion_is_current(kimi, &key_a, &accounts, &providers),
+            !refresh_completion_is_current(&producer_a, "test-profile", &accounts, &providers),
             "a flight started under A's key is fenced after the replacement"
         );
         assert!(refresh_completion_is_current(
-            kimi, &key_b, &accounts, &providers
+            &producer_b,
+            "test-profile",
+            &accounts,
+            &providers
         ));
 
         // Restart hydration reads B's key only.
@@ -864,6 +1014,22 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
             "a successful sweep deletes A's row; a failed one leaves it unreadable"
         );
         reopened.close().await.expect("close");
+
+        // A removed alias can later be reused with byte-identical source
+        // content. Its retired producer must still be rejected, including
+        // when the earlier prune failed.
+        accounts
+            .remove(&CredentialAlias::new("kimi-code-home"))
+            .expect("remove B");
+        accounts
+            .add(source_account(1_000, "B"))
+            .expect("re-add same alias and bytes");
+        assert!(!refresh_completion_is_current(
+            &producer_b,
+            "test-profile",
+            &accounts,
+            &providers
+        ));
     }
 }
 
@@ -913,6 +1079,8 @@ async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not(
     let providers = test_provider_registry();
     let mut accounts = memory_accounts();
     let descriptor = |alias: &str, identity: &str, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
         base_url: None,
@@ -1262,6 +1430,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         .unwrap_or_else(|error| panic!("{error:?}"));
     let snapshot = Arc::new(StdMutex::new(vec![
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: anthropic_alias.clone(),
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -1274,6 +1444,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: openai_alias.clone(),
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -1286,6 +1458,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: gemini_alias.clone(),
             provider: GEMINI_PROVIDER_NAME.into(),
             base_url: None,
@@ -1298,6 +1472,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: compatible_alias.clone(),
             provider: OPENAI_COMPATIBLE_PROVIDER_NAME.into(),
             base_url: Some("http://127.0.0.1:11434".into()),
@@ -1406,6 +1582,8 @@ fn selected_session_account_bypasses_mutable_active_account() {
     let selected_alias = CredentialAlias::new("selected-openai");
     let active_alias = CredentialAlias::new("active-openai");
     let selected = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: selected_alias.clone(),
         provider: OPENAI_PROVIDER_NAME.into(),
         base_url: None,
@@ -1418,6 +1596,8 @@ fn selected_session_account_bypasses_mutable_active_account() {
         created_at_ms: None,
     };
     let active = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: active_alias,
         identity: "active fixture".into(),
         active: true,
@@ -1459,6 +1639,8 @@ pub(super) fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderS
 
 pub(super) fn adapter_cache_descriptor(provider: &str, alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.to_owned(),
         base_url: None,
@@ -1749,6 +1931,8 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     let provider = "custom-llama";
     let alias = CredentialAlias::new("custom-llama-key");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: Some("http://203.0.113.7/v1".to_owned()),
@@ -2079,6 +2263,8 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
     );
 
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: None,
@@ -2301,6 +2487,8 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         .put(&alias, b"stored-key-sentinel")
         .expect("seed stored key");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: None,
@@ -2550,6 +2738,8 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
     let store = open_store(dir.path()).await;
     let alias = CredentialAlias::new("fenced-oauth");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: "fake-oauth".into(),
         base_url: None,
@@ -2806,6 +2996,8 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     let primary_alias = CredentialAlias::new("wedged-primary");
     let alternate_alias = CredentialAlias::new("wedged-backup");
     let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias,
         provider: OPENAI_PROVIDER_NAME.into(),
         base_url: None,
@@ -2913,6 +3105,8 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
     let target = CredentialAlias::new("fallback-openai");
     let descriptors = vec![
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: current.clone(),
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -2925,6 +3119,8 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: target.clone(),
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -3115,6 +3311,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
     let refresh_backup_alias = CredentialAlias::new("refresh-usable-backup");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: limited_alias.clone(),
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -3129,6 +3327,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
         .expect("limited descriptor");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alternate_alias.clone(),
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -3143,6 +3343,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
         .expect("alternate descriptor");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: refresh_failed_alias.clone(),
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -3157,6 +3359,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
         .expect("refresh-failed descriptor");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: refresh_backup_alias.clone(),
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -3301,6 +3505,8 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
     let openai_alias = CredentialAlias::new("openai-oauth-dispatch");
     let anthropic_alias = CredentialAlias::new("anthropic-oauth-dispatch");
     let descriptor = |alias: CredentialAlias, provider: &str| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias,
         provider: provider.into(),
         base_url: None,
@@ -3786,7 +3992,8 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
 
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
-    let accounts = memory_accounts();
+    let mut accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = MemoryVault::new();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
@@ -3795,8 +4002,10 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
+            profile_id: "test-profile",
             store: &store,
-            accounts: &accounts,
+            accounts: &mut accounts,
+            snapshot: &snapshot,
             vault: &vault,
             management: Some(&management),
             providers: &mut providers,
@@ -3888,7 +4097,8 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
 
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
-    let accounts = memory_accounts();
+    let mut accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let discoverer = UnusedDiscovery;
@@ -3896,8 +4106,10 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
+            profile_id: "test-profile",
             store: &store,
-            accounts: &accounts,
+            accounts: &mut accounts,
+            snapshot: &snapshot,
             vault: &vault,
             management: None,
             providers: &mut providers,
@@ -4892,6 +5104,8 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
 
     // Finalize commits the descriptor response; a replay returns it.
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(identity.physical_alias.clone()),
         provider: "anthropic".into(),
         base_url: None,
@@ -5097,6 +5311,8 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
     let descriptor_d = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(identity_d.physical_alias.clone()),
         provider: "anthropic".into(),
         base_url: None,
@@ -5660,6 +5876,8 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
         replace_existing: false,
     };
     let descriptor = |alias: &CredentialAlias, identity: &str, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: "anthropic".into(),
         base_url: None,
@@ -5805,6 +6023,8 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
                 "readd-removed".into(),
                 AccountAddReceiptResponse {
                     descriptor: CredentialDescriptor {
+                        incarnation: 0,
+                        credential_digest: None,
                         alias: removed_alias.clone(),
                         provider: "fake-oauth".into(),
                         base_url: None,
@@ -5902,6 +6122,8 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
     let other_alias = CredentialAlias::new("other-oauth-account");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: other_alias.clone(),
             provider: captured.provider.clone(),
             base_url: None,
@@ -5920,6 +6142,11 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
     accounts
         .select(&other_alias)
         .expect("change active selection");
+    let prior_incarnation = accounts.get(&alias).expect("captured account").incarnation;
+    let prior_catalog_key = ProviderModelCacheKey::for_account(
+        &captured.provider,
+        accounts.get(&alias).expect("captured account"),
+    );
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = Arc::new(MemoryVault::new());
     vault
@@ -5962,6 +6189,15 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
     .await
     .expect("benign fields do not fence rotation");
     let current = accounts.get(&alias).expect("descriptor remains");
+    assert_eq!(
+        current.incarnation, prior_incarnation,
+        "token refresh keeps the account incarnation"
+    );
+    assert_eq!(
+        ProviderModelCacheKey::for_account(&captured.provider, current),
+        prior_catalog_key,
+        "token refresh keeps the durable catalog key",
+    );
     assert!(!current.active);
     assert!(matches!(
         current.status,
@@ -6293,6 +6529,8 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
     let primary_alias = CredentialAlias::new("oauth-primary");
     let removed_alias = CredentialAlias::new("oauth-removed");
     let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias,
         provider: "fake-oauth".into(),
         base_url: None,
@@ -6705,6 +6943,8 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
     let mut accounts = memory_accounts();
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "anthropic".into(),
             base_url: None,
@@ -7358,6 +7598,8 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
     let mut accounts = memory_accounts();
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "custom".to_owned(),
             base_url: Some(old_origin.to_owned()),
@@ -7935,6 +8177,8 @@ async fn pending_remove_reconciliation_retries_orphan_deletion_before_release() 
     let mut accounts = memory_accounts();
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "anthropic".into(),
             base_url: None,
@@ -8134,7 +8378,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
         ManagementClaim::Fresh
     ));
 
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut providers)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut providers)
         .await
         .expect("legacy receipt reconciliation");
     assert_eq!(store.management_revision().await.expect("revision"), 2);
@@ -8206,6 +8450,14 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
     };
     let (request_json, request_digest) = command_json(&identity).expect("configure identity");
     let recovery = ProviderConfigureRecovery {
+        catalog_producer: configure_catalog_producer(
+            "test-profile",
+            "recovered-router",
+            Some("https://router.example.invalid/v1"),
+            ProviderAuthRequirementWire::None,
+            &memory_accounts(),
+        ),
+        previous_origin: None,
         input,
         previous_auth_requirement: None,
         discovered_models: Some(vec![haider_provider::DiscoveredModel {
@@ -8240,7 +8492,7 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
         ManagementClaim::Fresh
     ));
 
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut providers)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut providers)
         .await
         .expect("reconcile custom configure");
     let summary = providers
@@ -8287,6 +8539,8 @@ async fn recovered_authenticated_custom_catalog_without_account_has_no_durable_r
     })
     .expect("configure identity");
     let recovery = ProviderConfigureRecovery {
+        catalog_producer: None,
+        previous_origin: None,
         input,
         previous_auth_requirement: None,
         discovered_models: Some(vec![DiscoveredModel {
@@ -8317,7 +8571,7 @@ async fn recovered_authenticated_custom_catalog_without_account_has_no_durable_r
         )
         .await
         .expect("claim");
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut providers)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut providers)
         .await
         .expect("reconcile");
     assert!(
@@ -8333,6 +8587,86 @@ async fn recovered_authenticated_custom_catalog_without_account_has_no_durable_r
             .expect("summary")
             .models
             .contains(&"remote-model".into())
+    );
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn legacy_staged_configure_receipt_restores_only_explicit_models() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let mut providers =
+        ProviderRegistry::new(provider_store, Vec::new(), model_source).expect("provider registry");
+    let requested = ProviderConfigureInput {
+        provider: "legacy-staged-router".into(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some("https://router.example.invalid/v1".into()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models: vec!["explicit-static".into()],
+        default_model: Some("explicit-static".into()),
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        trust: None,
+    };
+    let (request_json, request_digest) = command_json(&ProviderConfigureIdentity {
+        input: requested.clone(),
+        expected_revision: 0,
+    })
+    .expect("request identity");
+    let mut contaminated = requested;
+    contaminated.models = vec!["staged-B-private".into()];
+    contaminated.default_model = Some("staged-B-private".into());
+    let recovery = ProviderConfigureRecovery {
+        input: contaminated,
+        previous_auth_requirement: None,
+        previous_origin: None,
+        discovered_models: Some(vec![DiscoveredModel {
+            slug: "staged-B-private".into(),
+            display_name: "staged B".into(),
+            context_window: None,
+            max_output_tokens: None,
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            use_responses_lite: None,
+            extensions: None,
+        }]),
+        discovered_etag: None,
+        catalog_producer: None,
+        revision_unchanged: false,
+        revision_unchanged_response: None,
+    };
+    store
+        .management_claim_receipt::<ProviderReceipt>(
+            "legacy-staged".into(),
+            PROVIDER_CONFIGURE_METHOD.into(),
+            request_digest,
+            request_json,
+            Some(serde_json::to_string(&recovery).expect("recovery JSON")),
+            Some(0),
+        )
+        .await
+        .expect("claim receipt");
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut providers)
+        .await
+        .expect("recover legacy configure");
+    let summary = providers
+        .summary("legacy-staged-router", &|_| false)
+        .expect("summary");
+    assert!(summary.models.contains(&"explicit-static".into()));
+    assert!(!summary.models.contains(&"staged-B-private".into()));
+    assert!(
+        store
+            .provider_models("legacy-staged-router".into())
+            .await
+            .expect("catalog")
+            .is_none()
     );
     store.close().await.expect("close");
 }
@@ -8777,6 +9111,43 @@ fn refresh_oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
     .expect("model refresh bundle")
 }
 
+#[test]
+fn oauth_intake_digest_covers_refresh_and_id_token_bytes() {
+    let first = refresh_oauth_bundle();
+    assert_eq!(
+        oauth_credential_digest(&first),
+        oauth_credential_digest(&refresh_oauth_bundle())
+    );
+    let changed_refresh = haider_accounts::OAuthTokenBundleV1::new(
+        OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        "http://127.0.0.1:32111".to_owned(),
+        "model-refresh-audience".to_owned(),
+        Some("model-refresh-resource".to_owned()),
+        "Bearer".to_owned(),
+        Zeroizing::new(b"MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_vec()),
+        Some(Zeroizing::new(b"different-synthetic-refresh".to_vec())),
+        u64::MAX - 1,
+        Some(u64::MAX),
+        vec!["inference".to_owned()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "model-refresh-subject".to_owned(),
+            display_identity: "model refresh fixture".to_owned(),
+        },
+        2,
+    )
+    .expect("changed refresh bundle");
+    assert_ne!(
+        oauth_credential_digest(&first),
+        oauth_credential_digest(&changed_refresh)
+    );
+    let changed_id =
+        refresh_oauth_bundle().with_id_token(Zeroizing::new(b"synthetic-id-token".to_vec()));
+    assert_ne!(
+        oauth_credential_digest(&first),
+        oauth_credential_digest(&changed_id)
+    );
+}
+
 /// MUTATION CHECK (W5g-5b): drop the custom-profile arm from
 /// `catalog_source`. Expected runtime failure: the first refresh answers
 /// unavailable instead of publishing `custom-key-model` in its summary.
@@ -8857,6 +9228,8 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
 
     let alias = CredentialAlias::new("custom-refresh-key");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: key_provider.to_owned(),
         base_url: Some("http://203.0.113.7/descriptor-decoy".to_owned()),
@@ -8870,6 +9243,8 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
     };
     let gemini_alias = CredentialAlias::new("gemini-refresh-key");
     let gemini_descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: gemini_alias.clone(),
         provider: GEMINI_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -9167,6 +9542,8 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     let store = open_store(dir.path()).await;
     let alias = CredentialAlias::new("model-refresh-active");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -10232,6 +10609,8 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
         ))
     ));
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME),
         provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -10743,6 +11122,8 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     let vault = Arc::new(MemoryVault::new());
     let mut accounts = memory_accounts();
     let expired = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME),
         provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -10837,6 +11218,8 @@ async fn oauth_import_repairs_an_expired_default_alias_in_place() {
     let mut accounts = memory_accounts();
     let alias = CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME);
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias,
         provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -11884,7 +12267,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
     )
     .expect("restart loads stale projection");
     assert!(restarted.get("custom-lab").is_some());
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut restarted)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut restarted)
         .await
         .expect("removal receipt reconciles restart");
     assert!(restarted.get("custom-lab").is_none());
@@ -11921,6 +12304,8 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
     for (alias, active) in [("zeta-key", true), ("alpha-key", false)] {
         accounts
             .add(CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: None,
                 alias: CredentialAlias::new(alias),
                 provider: "custom-in-use".to_owned(),
                 base_url: None,
@@ -13005,6 +13390,8 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
             .put(&alias, b"ENTERPRISE_BEARER_SENTINEL_1f2e")
             .unwrap_or_else(|error| panic!("seed key: {error:?}"));
         let descriptor = CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: provider.to_owned(),
             base_url: None,
@@ -13151,6 +13538,8 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
     .expect("install scripted source before sharing");
 
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: "vertex".to_owned(),
         base_url: None,
@@ -13195,6 +13584,8 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
     // Every OTHER ApiKey descriptor keeps the classic refusal — and never
     // touches the shell-out source.
     let plain = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("vertex-key"),
         provider: "vertex".to_owned(),
         base_url: None,
@@ -13753,6 +14144,8 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
     }
     let snapshot = Arc::new(StdMutex::new(vec![
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: anthropic_alias,
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -13765,6 +14158,8 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: openai_alias,
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -13926,6 +14321,8 @@ async fn each_turn_resolves_the_currently_active_account() {
     let first = CredentialAlias::new("switch-first");
     let second = CredentialAlias::new("switch-second");
     let descriptor = |alias: &CredentialAlias, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: Some("http://127.0.0.1:11434/v1".to_owned()),
@@ -14356,6 +14753,187 @@ fn write_linked_kimi_source(root: &std::path::Path, access_token: &str, file_nam
     .expect("write Kimi source");
 }
 
+fn kimi_rewrite_with_mtime_mints_incarnation(
+    first: std::time::SystemTime,
+    second: std::time::SystemTime,
+) {
+    let profile = test_store_dir();
+    let root = profile.path().join("kimi-source");
+    let file = root.join("credentials/kimi-code.json");
+    let write = |access: &str, modified: std::time::SystemTime| {
+        write_linked_kimi_source(&root, access, "kimi-code.json");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .expect("open source")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("set source mtime");
+    };
+    write("synthetic-A", first);
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::KimiCodeHome, &root, None)
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("A scan");
+    let first = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    write("synthetic-B", second);
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("B scan");
+    assert!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation
+            > first
+    );
+}
+
+#[test]
+fn linked_kimi_equal_mtime_rewrite_mints_incarnation() {
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    kimi_rewrite_with_mtime_mints_incarnation(time, time);
+}
+
+#[test]
+fn linked_kimi_zero_mtime_rewrite_mints_incarnation() {
+    kimi_rewrite_with_mtime_mints_incarnation(std::time::UNIX_EPOCH, std::time::UNIX_EPOCH);
+}
+
+#[test]
+#[cfg(unix)]
+fn linked_kimi_unrepresentable_mtime_rewrite_mints_incarnation() {
+    let time = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+    kimi_rewrite_with_mtime_mints_incarnation(time, time);
+}
+
+#[test]
+fn linked_kimi_nanosecond_mtime_collision_mints_incarnation() {
+    let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    kimi_rewrite_with_mtime_mints_incarnation(
+        base + std::time::Duration::from_nanos(100),
+        base + std::time::Duration::from_nanos(200),
+    );
+}
+
+#[test]
+fn vanished_linked_source_reappearing_with_identical_bytes_keeps_a_new_incarnation() {
+    let profile = test_store_dir();
+    let root = profile.path().join("kimi-source");
+    let file = root.join("credentials/kimi-code.json");
+    write_linked_kimi_source(&root, "synthetic-A", "kimi-code.json");
+    let bytes = std::fs::read(&file).expect("read original credential bytes");
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::KimiCodeHome, &root, None)
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("initial scan");
+    let original = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    std::fs::remove_file(&file).expect("remove source file");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("missing scan");
+    let vanished = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    assert!(vanished > original);
+    assert!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .credential_digest
+            .is_none()
+    );
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("repeat missing scan");
+    assert_eq!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation,
+        vanished
+    );
+    std::fs::write(&file, bytes).expect("restore same credential bytes");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("return scan");
+    assert_eq!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation,
+        vanished
+    );
+}
+
+#[test]
+fn malformed_linked_source_invalidates_once_before_a_recovered_intake() {
+    let profile = test_store_dir();
+    let root = profile.path().join("kimi-source");
+    let file = root.join("credentials/kimi-code.json");
+    write_linked_kimi_source(&root, "synthetic-A", "kimi-code.json");
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::KimiCodeHome, &root, None)
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("initial scan");
+    let original = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    std::fs::write(&file, b"{").expect("partial rewrite");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("invalid scan");
+    let invalidated = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    assert!(invalidated > original);
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("repeat invalid scan");
+    assert_eq!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation,
+        invalidated
+    );
+    write_linked_kimi_source(&root, "synthetic-B", "kimi-code.json");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("recovered scan");
+    let recovered = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap();
+    assert!(recovered.incarnation > original);
+    assert!(recovered.credential_digest.is_some());
+}
+
+#[test]
+fn linked_codex_retained_last_refresh_mints_for_different_account() {
+    let profile = test_store_dir();
+    let root = profile.path().join("codex-source");
+    write_linked_codex_source(&root, "workspace-A", "a@example.test");
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::CodexHome, &root, None)
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("A scan");
+    let first = accounts
+        .active_for_provider(OPENAI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    write_linked_codex_source(&root, "workspace-B", "b@example.test");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("B scan");
+    assert!(
+        accounts
+            .active_for_provider(OPENAI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation
+            > first
+    );
+}
+
 /// The operator vocabulary for `haider account source add`. Every durable
 /// kind name plus its short alias resolves; anything else is refused.
 #[test]
@@ -14616,6 +15194,8 @@ fn linked_and_native_grok_accounts_coexist_without_sharing_alias_or_credential()
     let mut accounts = memory_accounts();
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: native_alias.clone(),
             provider: GROK_OAUTH_PROVIDER_NAME.to_owned(),
             base_url: None,
@@ -14856,6 +15436,8 @@ impl Vault for VaultTouchCounter {
 
 fn antigravity_descriptor(alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: GOOGLE_ANTIGRAVITY_PROVIDER_NAME.into(),
         base_url: None,
@@ -15120,6 +15702,8 @@ fn account_selection_pins_one_google_alias_and_refuses_another_providers_alias()
     let work = antigravity_descriptor("google-antigravity-work");
     let personal = antigravity_descriptor("google-antigravity-personal");
     let gemini_key = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("gemini-api-key"),
         provider: GEMINI_PROVIDER_NAME.into(),
         base_url: None,
@@ -15313,6 +15897,8 @@ async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_va
 
     let supervised = antigravity_descriptor("google-antigravity-attempt");
     let gemini = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: gemini_alias,
         provider: GEMINI_PROVIDER_NAME.into(),
         base_url: None,
@@ -15580,14 +16166,15 @@ impl ProviderModelDiscoverer for CustomprovNoSecondDiscovery {
     }
 }
 
-/// The complete chosen picker list survives create in the durable cache and
-/// modelcat's list_models projection. An edit can also choose a manual id
+/// The complete chosen picker list survives create as provider configuration
+/// and in modelcat's list_models projection. An edit can also choose a manual id
 /// after a failed probe even when the old endpoint's cached list disagrees.
 #[tokio::test]
 async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_without_reprobe() {
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
-    let accounts = memory_accounts();
+    let mut accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = MemoryVault::new();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
@@ -15599,8 +16186,10 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
         let (sink, mut frames) = channel_sink();
         handle_provider_configure(
             ProviderConfigureContext {
+                profile_id: "test-profile",
                 store: &store,
-                accounts: &accounts,
+                accounts: &mut accounts,
+                snapshot: &snapshot,
                 vault: &vault,
                 management: Some(&management),
                 providers: &mut providers,
@@ -15651,19 +16240,13 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
             }
             other => panic!("unexpected confirm reply: {other:?}"),
         }
-        let cached = store
-            .provider_models("customprov-confirm".into())
-            .await
-            .expect("cache read")
-            .expect("confirmed cache");
-        let cached: Vec<haider_provider::DiscoveredModel> =
-            serde_json::from_str(&cached.models_json).expect("cached model rows");
-        assert_eq!(
-            cached
-                .iter()
-                .map(|model| model.slug.as_str())
-                .collect::<Vec<_>>(),
-            ids
+        assert!(
+            store
+                .provider_models("customprov-confirm".into())
+                .await
+                .expect("cache read")
+                .is_none(),
+            "explicit configured models must not become fetched inventory"
         );
         let view = management.read().expect("published management");
         let catalog = crate::model_select::ModelSelectionAuthority::new(None, view.providers)
@@ -15690,6 +16273,8 @@ async fn customprov_probe_rejects_claimed_origin_before_resolving_or_sending_key
     let alias = CredentialAlias::new("customprov-repoint-key");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "custom-a".into(),
             base_url: None,
@@ -15764,6 +16349,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
     let mut accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
@@ -15771,8 +16357,10 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
+            profile_id: "test-profile",
             store: &store,
-            accounts: &accounts,
+            accounts: &mut accounts,
+            snapshot: &snapshot,
             vault: &vault,
             management: Some(&management),
             providers: &mut providers,
@@ -15994,7 +16582,7 @@ async fn provider_trust_multiple_sessions_is_atomic_replayable_and_restored_afte
         reopened.get(OPENAI_PROVIDER_NAME).expect("provider").trust,
         ProviderTrustWire::Full
     );
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut reopened)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut reopened)
         .await
         .expect("restore committed trust");
     assert_eq!(
@@ -16070,7 +16658,7 @@ async fn provider_trust_second_session_append_failure_rolls_back_events_receipt_
     store.close().await.expect("close");
     let store = open_store(dir.path()).await;
     let mut reopened = test_provider_registry();
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut reopened)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut reopened)
         .await
         .expect("restart after failed operation");
     assert_eq!(
@@ -16254,6 +16842,8 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         let mut invalid_accounts = memory_accounts();
         invalid_accounts
             .add(CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: None,
                 alias: CredentialAlias::new("catalog-test-account"),
                 provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
                 base_url: None,

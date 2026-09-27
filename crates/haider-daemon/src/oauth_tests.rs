@@ -1733,6 +1733,8 @@ async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
         "fallback remains approximately 15 minutes"
     );
     let imported_descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("openai-oauth"),
         provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -1774,6 +1776,8 @@ async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
 
     let pkce_alias = CredentialAlias::new("openai-oauth-2");
     let pkce_descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: pkce_alias.clone(),
         provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -3769,6 +3773,8 @@ impl Vault for ResolveCountingVault {
 
 fn oauth_descriptor_for_test() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("work-oauth"),
         provider: "fake-oauth".into(),
         base_url: None,
@@ -6054,6 +6060,8 @@ async fn auth_aware_broker_keeps_api_keys_raw_and_never_treats_bundle_as_bearer(
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let vault = Arc::new(MemoryVault::new());
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("fake-api"),
         provider: "fake-oauth".into(),
         base_url: None,
@@ -6230,6 +6238,8 @@ async fn late_refresh_failure_after_remove_readd_cannot_expire_the_replacement()
 
     broker.invalidate(&descriptor.alias);
     let replacement = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: descriptor.alias.clone(),
         provider: "replacement-provider".into(),
         base_url: Some("https://replacement.invalid".into()),

@@ -89,6 +89,8 @@ fn provider_model_cache_is_durable_provider_scoped_and_replaced() {
 fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
     let root = tempfile::tempdir().expect("tempdir");
     let descriptor = |alias: &str, account_id: &str| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: "openai-oauth".into(),
         base_url: None,
@@ -137,6 +139,12 @@ fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
         .as_mut()
         .expect("identity")
         .captured_at = 2;
+    assert_eq!(
+        first_api_key,
+        ProviderModelCacheKey::for_account("gemini", &api_key),
+        "timestamps are never cache identity"
+    );
+    api_key.incarnation += 1;
     assert_ne!(
         first_api_key,
         ProviderModelCacheKey::for_account("gemini", &api_key),
@@ -168,7 +176,7 @@ fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
             .provider_models("account:12:openai-oauth:shared-alias")
             .expect("old alias key")
             .is_some(),
-        "the migration leaves old rows present but no v2 key reads them"
+        "the migration leaves old rows present but no v3 key reads them"
     );
     assert_eq!(
         store.provider_models("openai-oauth").expect("legacy key"),
@@ -223,9 +231,10 @@ fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
 fn catalog_prune_bounds_replaced_and_removed_accounts_and_unread_legacy_rows() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("store");
-    let live = "account-v2:live";
+    let live = "account-v3:live";
     for key in [
         live,
+        "account-v3:replaced",
         "account-v2:replaced",
         "account-v2:removed-custom-provider",
         "account:12:openai-oauth:old",
@@ -240,6 +249,7 @@ fn catalog_prune_bounds_replaced_and_removed_accounts_and_unread_legacy_rows() {
         .prune_provider_model_caches(&[live.into()], &["openai-oauth".into()])
         .expect("prune");
     for key in [
+        "account-v3:replaced",
         "account-v2:replaced",
         "account-v2:removed-custom-provider",
         "account:12:openai-oauth:old",
@@ -260,6 +270,33 @@ fn catalog_prune_bounds_replaced_and_removed_accounts_and_unread_legacy_rows() {
         .prune_provider_model_caches(&[], &[])
         .expect("remove last account");
     assert!(store.provider_models(live).expect("removed read").is_none());
+}
+
+#[test]
+fn v2_account_catalog_rows_are_pruned_after_v3_migration() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    store
+        .put_provider_models("account-v2:legacy", "[]", None, 1)
+        .expect("legacy row");
+    store
+        .put_provider_models("account-v3:current", "[]", None, 1)
+        .expect("current row");
+    store
+        .prune_provider_model_caches(&["account-v3:current".into()], &[])
+        .expect("prune");
+    assert!(
+        store
+            .provider_models("account-v2:legacy")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .provider_models("account-v3:current")
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// The production migration rejects impossible pre-epoch timestamps.
@@ -341,13 +378,13 @@ fn provider_model_catalog_and_management_revision_roll_back_together() {
 /// Account-scoped cache keys are durable SQLite row keys: a same-identity
 /// restart or re-login must derive byte-identical keys across releases.
 ///
-/// The digests were computed independently from the e8fd8aaf derivation
-/// (`"{provider}\0{alias}\0{auth:?}\0{issuer}\0{scope_kind}\0{scope}"`, plus
-/// `"\0{captured_at}"` for API keys, BLAKE3-hex under `account-v2:`).
+/// The v3 digests were computed independently with Python blake3 from the
+/// provider, alias, auth, incarnation, origin, issuer, account ID, and email
+/// fields, length-prefixed as little-endian u64 values. Timestamps and display
+/// labels are absent.
 ///
 /// MUTATION CHECK: rename an `auth_method_tag` spelling, reorder the key
-/// material, or drop the API-key intake epoch. Expected runtime failure: one
-/// of the pinned `account-v2:` digests differs.
+/// material, or drop the incarnation. Expected failure: a pinned v3 digest.
 #[test]
 fn account_scoped_cache_key_derivation_is_pinned() {
     let identity = |account_id: Option<&str>, email: Option<&str>, captured_at: u64| {
@@ -363,6 +400,8 @@ fn account_scoped_cache_key_derivation_is_pinned() {
     };
     let descriptor =
         |alias: &str, auth_method: AuthMethod, account_identity| CredentialDescriptor {
+            incarnation: 42,
+            credential_digest: None,
             alias: CredentialAlias::new(alias),
             provider: "ignored-descriptor-provider".into(),
             base_url: None,
@@ -382,7 +421,7 @@ fn account_scoped_cache_key_derivation_is_pinned() {
                 AuthMethod::OAuth,
                 identity(Some("acct-1"), Some("a@example.test"), 3),
             ),
-            "account-v2:6ab0f3cf9a175581fcfa0f4f7836e961c3c5a2efabd78bcf476d2553bd1b5320",
+            "account-v3:e0c2a37947fd25a05ebabc981037c9d1d18fc1f716c8b7ec5fbbd40835d54c5d",
         ),
         (
             "anthropic-oauth",
@@ -391,17 +430,17 @@ fn account_scoped_cache_key_derivation_is_pinned() {
                 AuthMethod::OAuth,
                 identity(None, Some("a@example.test"), 3),
             ),
-            "account-v2:e491e14e5ddca8b4895248e20cb0f43685be44749ce7c7863d6a7bcf91cf4f0a",
+            "account-v3:6645ed7e42c70cdca9243a176e65cb8f1af2122ab538270dbd0bb668d479ffc2",
         ),
         (
             "gemini",
             descriptor("gemini-key", AuthMethod::ApiKey, identity(None, None, 7)),
-            "account-v2:9697064daf2c69eefc438c6868ea8d18177d9c7520ceabb8ea521c7edf4e2e2d",
+            "account-v3:18dd388b7a94c920ad1e747e616fc8d99d81f28838c00185fe62ad0c286b3a74",
         ),
         (
             "gemini",
             descriptor("gemini-key", AuthMethod::ApiKey, None),
-            "account-v2:d3006aea71942e00ae8ba8a5727c67e76129631665a731e51943ec9809946ad2",
+            "account-v3:ee6b660d20db7f39a1dd7448195d70c25eed31b10e5dd0453de5733282f7e6e9",
         ),
     ];
     for (provider, descriptor, expected) in cases {
@@ -412,12 +451,7 @@ fn account_scoped_cache_key_derivation_is_pinned() {
             descriptor.alias.as_str()
         );
     }
-    // Identity-poor OAuth (no email, no verified ID token: a Kimi Code home
-    // source's `kimi:<source>` coordinate) carries its intake epoch, like an
-    // API key. Digests computed independently (Python blake3) from
-    // `provider\0alias\0OAuth\0issuer\0kind\0scope\0epoch`; the value
-    // WITHOUT the epoch (the B1 bug) was
-    // account-v2:28d671a54bdab641dff7fc90874de3cc249880176a647328054000ae495b7ac6.
+    // A source-derived identity remains scoped by its durable incarnation.
     let poor = |captured_at: u64| {
         let mut descriptor = descriptor(
             "kimi-code-home",
@@ -437,12 +471,18 @@ fn account_scoped_cache_key_derivation_is_pinned() {
     };
     assert_eq!(
         ProviderModelCacheKey::for_account("kimi-oauth", &poor(5)).as_str(),
-        "account-v2:eb1d89a8b95824afb4c4e6997b1b2561f7767ecdd11e05281d6156397134ceef"
+        "account-v3:7252e0017b41641ba7a615eeb7e7bc29dfeeff133097e74a46bcf38c122e531e"
     );
-    assert_ne!(
+    assert_eq!(
         ProviderModelCacheKey::for_account("kimi-oauth", &poor(5)),
         ProviderModelCacheKey::for_account("kimi-oauth", &poor(6)),
-        "a rewritten source is a new catalog"
+        "a timestamp change alone cannot change the catalog coordinate"
+    );
+    let mut new_incarnation = poor(5);
+    new_incarnation.incarnation += 1;
+    assert_ne!(
+        ProviderModelCacheKey::for_account("kimi-oauth", &poor(5)),
+        ProviderModelCacheKey::for_account("kimi-oauth", &new_incarnation),
     );
     assert_eq!(
         ProviderModelCacheKey::for_account(
@@ -450,8 +490,8 @@ fn account_scoped_cache_key_derivation_is_pinned() {
             &descriptor("kimi-code-home", AuthMethod::OAuth, None)
         )
         .as_str(),
-        "account-v2:4721f5724725a4cedfb342e691f45b04a612c84f780102eaf7249afca8a93d8b",
-        "OAuth without any identity also carries the (zero) epoch"
+        "account-v3:3ece8d45f26267409d42680faa1e89a05dccc7aab46cf1379f3ec649c4cfd6a1",
+        "OAuth without identity still carries the incarnation"
     );
     // A known identity (email or verified ID token) keeps one key across
     // re-logins: the epoch is not part of it.
@@ -488,5 +528,88 @@ fn account_scoped_cache_key_derivation_is_pinned() {
         ProviderModelCacheKey::public("haider-code").as_str(),
         "haider-code",
         "credential-free catalogs keep their pre-973 provider-ID row key"
+    );
+}
+
+#[test]
+fn openai_user_coordinate_and_workspace_email_both_scope_catalog_keys() {
+    let descriptor = |id: &str, email: Option<&str>, captured_at: u64| CredentialDescriptor {
+        incarnation: 81,
+        credential_digest: None,
+        alias: CredentialAlias::new("team-user"),
+        provider: "openai-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "same display".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(AccountIdentity {
+            email: email.map(str::to_owned),
+            display_name: None,
+            account_id: Some(id.into()),
+            plan: None,
+            issuer: Some("https://auth.openai.com".into()),
+            captured_at,
+            verified: true,
+        }),
+        created_at_ms: None,
+    };
+    let user1 = descriptor("user:6:user-1;workspace:6:acct-1", None, 1);
+    let user2 = descriptor("user:6:user-2;workspace:6:acct-1", None, 1);
+    let key = |d: &CredentialDescriptor| ProviderModelCacheKey::for_account("openai-oauth", d);
+    assert_ne!(key(&user1), key(&user2));
+    assert_eq!(
+        key(&user1),
+        key(&descriptor("user:6:user-1;workspace:6:acct-1", None, 2))
+    );
+    assert_eq!(
+        key(&user2),
+        key(&descriptor("user:6:user-2;workspace:6:acct-1", None, 2))
+    );
+    assert_ne!(
+        key(&descriptor("acct-1", Some("one@example.test"), 1)),
+        key(&descriptor("acct-1", Some("two@example.test"), 1)),
+    );
+}
+
+#[test]
+fn account_scope_components_are_length_prefixed_and_byte_exact() {
+    let descriptor = |account_id: &str, email: &str| CredentialDescriptor {
+        incarnation: 9,
+        credential_digest: None,
+        alias: CredentialAlias::new("alias"),
+        provider: "openai-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "display".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(AccountIdentity {
+            email: Some(email.into()),
+            display_name: None,
+            account_id: Some(account_id.into()),
+            plan: None,
+            issuer: Some("issuer".into()),
+            captured_at: 0,
+            verified: false,
+        }),
+        created_at_ms: None,
+    };
+    let key =
+        |id, email| ProviderModelCacheKey::for_account("openai-oauth", &descriptor(id, email));
+    assert_ne!(key("a\0b", "c"), key("a", "b\0c"));
+    assert_ne!(key("User", "a@example.test"), key("user", "a@example.test"));
+    assert_ne!(
+        key("user", "a@example.test"),
+        key("user", " a@example.test")
+    );
+    let mut renamed = descriptor("", "");
+    renamed.identity = "renamed display label".into();
+    assert_eq!(
+        ProviderModelCacheKey::for_account("openai-oauth", &descriptor("", "")),
+        ProviderModelCacheKey::for_account("openai-oauth", &renamed),
+        "a display label is never account proof",
     );
 }

@@ -206,6 +206,7 @@ struct CodexAuthClaims {
 /// One source-owned credential generation. `encoded_bundle` is an ephemeral
 /// access-only broker input: external refresh credentials are never copied.
 pub(crate) struct LinkedSourceMaterial {
+    pub credential_digest: Option<String>,
     pub identity: Option<AccountIdentity>,
     pub display_identity: String,
     pub last_refreshed_at_ms: Option<u64>,
@@ -248,12 +249,13 @@ pub(crate) fn read_linked_source(
         return Err(LinkedSourceReadFailure::RequiresOriginClient);
     }
     let (path, bytes, metadata) = read_enrolled_file(source)?;
+    let source_digest = blake3::hash(&bytes).to_hex().to_string();
     let last_refreshed_at_ms = metadata
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-    match source.kind {
+    let mut material = match source.kind {
         CredentialSourceKind::CodexHome => {
             linked_codex_material(&path, bytes, store_mode, last_refreshed_at_ms)
         }
@@ -266,7 +268,9 @@ pub(crate) fn read_linked_source(
         CredentialSourceKind::KimiCodeHome => {
             linked_kimi_material(bytes, store_mode, last_refreshed_at_ms, &source.id)
         }
-    }
+    }?;
+    material.credential_digest = Some(source_digest);
+    Ok(material)
 }
 
 /// Whether a linked kind yields a read-through access bundle at resolution
@@ -464,6 +468,7 @@ fn linked_codex_material(
         CredentialSourceHealth::Ready
     };
     Ok(LinkedSourceMaterial {
+        credential_digest: None,
         identity: Some(identity),
         display_identity,
         last_refreshed_at_ms,
@@ -493,6 +498,7 @@ fn linked_claude_metadata(
         &source_id[source_id.len().saturating_sub(16)..]
     );
     Ok(LinkedSourceMaterial {
+        credential_digest: None,
         identity: Some(AccountIdentity {
             email: None,
             display_name: Some(display_name.to_owned()),
@@ -658,6 +664,7 @@ fn linked_kimi_material(
         // `scope`/`token_type`. A reader that only checks "file exists"
         // would report a logged-out store as a usable credential.
         return Ok(LinkedSourceMaterial {
+            credential_digest: None,
             identity: Some(kimi_identity(&account_id, last_refreshed_at_ms)),
             display_identity: account_id,
             last_refreshed_at_ms,
@@ -753,6 +760,7 @@ pub(crate) fn source_owned_refresh_bundle(
         identity,
         generation,
     )
+    .map(|bundle| bundle.with_refresh_after(expires_at_unix_ms.saturating_sub(300_000)))
 }
 
 /// Builds the ACCESS-ONLY broker input shared by every read-through kind.
@@ -794,6 +802,7 @@ fn linked_access_material(
         .encode()
         .map_err(|_| LinkedSourceReadFailure::Invalid)?;
     Ok(LinkedSourceMaterial {
+        credential_digest: None,
         identity: Some(identity),
         display_identity,
         last_refreshed_at_ms,

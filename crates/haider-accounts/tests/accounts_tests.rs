@@ -32,6 +32,8 @@ fn descriptor(
     active: bool,
 ) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.to_owned(),
         base_url: None,
@@ -43,6 +45,347 @@ fn descriptor(
         account_identity: None,
         created_at_ms: None,
     }
+}
+
+#[test]
+fn account_incarnation_is_durable_monotonic_and_never_reused_after_remove() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    let first = {
+        let mut accounts = AccountStore::new(store.clone()).unwrap();
+        accounts
+            .add(descriptor("same", "provider", CredentialStatus::Ok, true))
+            .unwrap();
+        let first = accounts
+            .get(&CredentialAlias::new("same"))
+            .unwrap()
+            .incarnation;
+        accounts.remove(&CredentialAlias::new("same")).unwrap();
+        first
+    };
+    let second = {
+        let mut accounts = AccountStore::new(store.clone()).unwrap();
+        accounts
+            .add(descriptor("same", "provider", CredentialStatus::Ok, true))
+            .unwrap();
+        accounts
+            .get(&CredentialAlias::new("same"))
+            .unwrap()
+            .incarnation
+    };
+    assert!(second > first);
+    let third = AccountStore::new(store).unwrap();
+    assert_eq!(
+        third
+            .get(&CredentialAlias::new("same"))
+            .unwrap()
+            .incarnation,
+        second
+    );
+}
+
+#[test]
+fn reserved_incarnation_survives_an_unclean_descriptor_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    let reserved = store.reserve_incarnation(0).unwrap();
+    // Simulate the process dying after the counter fsync and before an
+    // accounts.json write. A restart must skip the reserved coordinate.
+    let mut restarted = AccountStore::new(store).unwrap();
+    restarted
+        .add(descriptor(
+            "after-crash",
+            "provider",
+            CredentialStatus::Ok,
+            true,
+        ))
+        .unwrap();
+    assert!(
+        restarted
+            .get(&CredentialAlias::new("after-crash"))
+            .unwrap()
+            .incarnation
+            > reserved
+    );
+}
+
+#[test]
+fn legacy_account_row_gets_a_fresh_incarnation_before_use() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    store
+        .save(&[descriptor("legacy", "provider", CredentialStatus::Ok, true)])
+        .unwrap();
+    let first = AccountStore::new(store.clone()).unwrap();
+    let incarnation = first
+        .get(&CredentialAlias::new("legacy"))
+        .unwrap()
+        .incarnation;
+    assert!(incarnation > 0);
+    drop(first);
+    let second = AccountStore::new(store).unwrap();
+    assert_eq!(
+        second
+            .get(&CredentialAlias::new("legacy"))
+            .unwrap()
+            .incarnation,
+        incarnation
+    );
+}
+
+#[test]
+fn identical_api_key_digest_preserves_incarnation_and_replacement_mints() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let mut first = descriptor("key", "provider", CredentialStatus::Ok, true);
+    first.credential_digest = Some("digest-A".into());
+    accounts.add(first.clone()).unwrap();
+    let alias = CredentialAlias::new("key");
+    let incarnation = accounts.get(&alias).unwrap().incarnation;
+    accounts.replace(first.clone()).unwrap();
+    assert_eq!(accounts.get(&alias).unwrap().incarnation, incarnation);
+    first.credential_digest = Some("digest-B".into());
+    accounts.replace(first).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > incarnation);
+}
+
+#[test]
+fn auth_method_switch_mints_even_with_identical_credential_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let mut row = descriptor("mode", "provider", CredentialStatus::Ok, true);
+    row.credential_digest = Some("identical-synthetic-bytes".into());
+    accounts.add(row.clone()).unwrap();
+    let alias = CredentialAlias::new("mode");
+    let api_key_incarnation = accounts.get(&alias).unwrap().incarnation;
+
+    row.auth_method = AuthMethod::OAuth;
+    accounts.replace(row.clone()).unwrap();
+    let oauth_incarnation = accounts.get(&alias).unwrap().incarnation;
+    assert!(oauth_incarnation > api_key_incarnation);
+
+    row.auth_method = AuthMethod::ApiKey;
+    accounts.replace(row).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > oauth_incarnation);
+}
+
+#[test]
+fn configuration_boundary_mints_once_then_identical_key_keeps_that_incarnation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let mut key = descriptor("configured", "provider", CredentialStatus::Ok, true);
+    key.credential_digest = Some("same-synthetic-key-digest".into());
+    accounts.add(key.clone()).unwrap();
+    let alias = CredentialAlias::new("configured");
+    let first = accounts.get(&alias).unwrap().incarnation;
+    accounts.mint_incarnation(&alias).unwrap();
+    let boundary = accounts.get(&alias).unwrap().incarnation;
+    assert!(boundary > first);
+    accounts.replace(key).unwrap();
+    assert_eq!(accounts.get(&alias).unwrap().incarnation, boundary);
+}
+
+fn oauth_incarnation_fixture(
+    provider: &str,
+    account_id: &str,
+    email: Option<&str>,
+    digest: &str,
+    captured_at: u64,
+) -> CredentialDescriptor {
+    let mut row = descriptor("linked", provider, CredentialStatus::Ok, true);
+    row.auth_method = AuthMethod::OAuth;
+    row.identity = "same display".into();
+    row.account_identity = Some(AccountIdentity {
+        email: email.map(str::to_owned),
+        display_name: Some("same display".into()),
+        account_id: Some(account_id.into()),
+        plan: None,
+        issuer: Some("synthetic-issuer".into()),
+        captured_at,
+        verified: false,
+    });
+    row.credential_digest = Some(digest.into());
+    row
+}
+
+#[test]
+fn linked_source_equal_and_colliding_timestamps_use_credential_continuity() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let a = oauth_incarnation_fixture("kimi-oauth", "kimi:source", None, "A", 1000);
+    accounts.add(a.clone()).unwrap();
+    let alias = CredentialAlias::new("linked");
+    let first = accounts.get(&alias).unwrap().incarnation;
+    let mut identical = a.clone();
+    identical.account_identity.as_mut().unwrap().captured_at = 1001;
+    accounts.replace(identical).unwrap();
+    assert_eq!(accounts.get(&alias).unwrap().incarnation, first);
+    let b = oauth_incarnation_fixture("kimi-oauth", "kimi:source", None, "B", 1000);
+    accounts.replace(b).unwrap();
+    let second = accounts.get(&alias).unwrap().incarnation;
+    assert!(second > first);
+    // A source without a representable filesystem timestamp projects zero;
+    // that shared sentinel is not an identity coordinate either.
+    let unavailable = oauth_incarnation_fixture("kimi-oauth", "kimi:source", None, "C", 0);
+    accounts.replace(unavailable).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > second);
+}
+
+#[test]
+fn stable_grok_user_and_openai_user_coordinates_preserve_incarnation() {
+    for (provider, account_id, email) in [
+        ("grok-oauth", "xai:user-1", None),
+        ("openai-oauth", "user:6:user-1;workspace:6:acct-1", None),
+        ("openai-oauth", "acct-1", Some("one@example.test")),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+        accounts
+            .add(oauth_incarnation_fixture(
+                provider, account_id, email, "A", 1,
+            ))
+            .unwrap();
+        let alias = CredentialAlias::new("linked");
+        let first = accounts.get(&alias).unwrap().incarnation;
+        accounts
+            .replace(oauth_incarnation_fixture(
+                provider, account_id, email, "B", 2,
+            ))
+            .unwrap();
+        assert_eq!(
+            accounts.get(&alias).unwrap().incarnation,
+            first,
+            "{provider}/{account_id}"
+        );
+    }
+}
+
+#[test]
+fn verified_openai_workspace_without_user_or_email_cannot_prove_continuity() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let mut a = oauth_incarnation_fixture("openai-oauth", "acct-1", None, "A", 1);
+    a.account_identity.as_mut().unwrap().verified = true;
+    accounts.add(a.clone()).unwrap();
+    let alias = CredentialAlias::new("linked");
+    let first = accounts.get(&alias).unwrap().incarnation;
+    a.credential_digest = Some("B".into());
+    accounts.replace(a).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > first);
+}
+
+#[test]
+fn whitespace_only_account_components_do_not_prove_continuity() {
+    for (account_id, email) in [("user: ", None), ("workspace", Some(" "))] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+        let mut row = oauth_incarnation_fixture("openai-oauth", account_id, email, "A", 1);
+        row.account_identity.as_mut().unwrap().verified = true;
+        accounts.add(row.clone()).unwrap();
+        let alias = CredentialAlias::new("linked");
+        let first = accounts.get(&alias).unwrap().incarnation;
+        row.credential_digest = Some("B".into());
+        accounts.replace(row).unwrap();
+        assert!(
+            accounts.get(&alias).unwrap().incarnation > first,
+            "{account_id:?}/{email:?}"
+        );
+    }
+}
+
+#[test]
+fn truncated_identity_coordinates_do_not_prove_continuity() {
+    let long_user = format!("user:{}", "u".repeat(507));
+    let long_email = format!("{}@x.test", "e".repeat(505));
+    let long_issuer = format!("https://{}", "i".repeat(504));
+    assert_eq!(long_user.chars().count(), 512);
+    assert_eq!(long_email.chars().count(), 512);
+    assert_eq!(long_issuer.chars().count(), 512);
+    for (account_id, email, issuer) in [
+        (long_user.as_str(), None, "https://issuer.example"),
+        (
+            "acct-1",
+            Some(long_email.as_str()),
+            "https://issuer.example",
+        ),
+        (
+            "user:6:user-1;workspace:6:acct-1",
+            None,
+            long_issuer.as_str(),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+        let mut row = oauth_incarnation_fixture("openai-oauth", account_id, email, "A", 1);
+        row.account_identity.as_mut().unwrap().issuer = Some(issuer.into());
+        row.account_identity.as_mut().unwrap().verified = true;
+        accounts.add(row.clone()).unwrap();
+        let alias = CredentialAlias::new("linked");
+        let first = accounts.get(&alias).unwrap().incarnation;
+        row.credential_digest = Some("B".into());
+        accounts.replace(row).unwrap();
+        assert!(accounts.get(&alias).unwrap().incarnation > first);
+    }
+}
+
+#[test]
+fn source_removal_invalidates_even_if_same_path_and_bytes_return() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let row = oauth_incarnation_fixture("kimi-oauth", "kimi:source", None, "A", 1);
+    accounts.add(row.clone()).unwrap();
+    let alias = CredentialAlias::new("linked");
+    let first = accounts.get(&alias).unwrap().incarnation;
+    accounts.invalidate_incarnation(&alias).unwrap();
+    accounts.replace(row).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > first);
+}
+
+#[test]
+fn manual_identity_refresh_mints_for_changed_scope_and_keeps_proven_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    accounts
+        .add(oauth_incarnation_fixture(
+            "openai-oauth",
+            "workspace-A",
+            Some("a@example.test"),
+            "A",
+            1,
+        ))
+        .unwrap();
+    let alias = CredentialAlias::new("linked");
+    let first = accounts.get(&alias).unwrap().incarnation;
+    let same = accounts.get(&alias).unwrap().account_identity.clone();
+    accounts
+        .reconcile_identity(&alias, same, Some("B".into()))
+        .unwrap();
+    assert_eq!(accounts.get(&alias).unwrap().incarnation, first);
+    let mut changed = accounts
+        .get(&alias)
+        .unwrap()
+        .account_identity
+        .clone()
+        .unwrap();
+    changed.account_id = Some("workspace-B".into());
+    accounts
+        .reconcile_identity(&alias, Some(changed), Some("B".into()))
+        .unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > first);
+}
+
+#[test]
+fn claude_direct_import_equal_intake_time_mints_incarnation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let mut a = oauth_incarnation_fixture("anthropic-oauth", "same-plan-label", None, "A", 1000);
+    a.account_identity.as_mut().unwrap().account_id = None;
+    accounts.add(a.clone()).unwrap();
+    let alias = CredentialAlias::new("linked");
+    let first = accounts.get(&alias).unwrap().incarnation;
+    a.credential_digest = Some("B".into());
+    accounts.replace(a).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > first);
 }
 
 #[test]

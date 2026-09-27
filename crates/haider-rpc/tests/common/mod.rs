@@ -2704,6 +2704,8 @@ fn append_workspace_allocation_tail(frames: &mut Vec<WireFrame>) {
 /// identity in `identity`, never secret material.
 pub fn golden_descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("anthropic-0123456789abcdef01234567"),
         provider: "anthropic".into(),
         base_url: None,
@@ -2737,6 +2739,8 @@ pub fn golden_account_source() -> AccountSourceWire {
 
 pub fn golden_oauth_descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("fake-oauth-0123456789abcdef01234567"),
         provider: "fake-oauth".into(),
         base_url: None,

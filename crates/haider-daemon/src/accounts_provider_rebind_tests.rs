@@ -76,6 +76,8 @@ fn rebind_factory_fixture() -> RebindFactoryFixture {
     selected.active = false;
     selected.base_url = Some("http://127.0.0.1:31401/v1".into());
     let active = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("active-a"),
         active: true,
         ..selected.clone()

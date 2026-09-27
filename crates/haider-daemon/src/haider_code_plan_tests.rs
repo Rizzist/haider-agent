@@ -22,6 +22,8 @@ use super::haider_code_plan::{
 
 fn descriptor(alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: "haider-code".into(),
         base_url: None,

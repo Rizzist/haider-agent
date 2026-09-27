@@ -421,6 +421,8 @@ fn a_selected_api_key_account_triggers_model_discovery() {
     // The trigger runs on the ACCOUNTS reply path — feed the api-key
     // account through it (a pre-seeded row would be replaced).
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("probe-api"),
         provider: "custom-llama".to_owned(),
         base_url: Some("http://127.0.0.1:18123/v1".to_owned()),

@@ -49,6 +49,8 @@ const ANTHROPIC_LIVE_BODY: &str = r#"{"five_hour":{"utilization":60.0,"resets_at
 
 fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.into(),
         base_url: None,

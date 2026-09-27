@@ -2594,6 +2594,8 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
     // makes a fresh live lookup say Full, but cannot rewrite the adapter the
     // worker already selected.
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("late-fake-key"),
         provider: "fake".to_owned(),
         base_url: None,

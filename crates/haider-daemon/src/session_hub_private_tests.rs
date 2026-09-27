@@ -2367,6 +2367,8 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let selected_alias = haider_protocol::ids::CredentialAlias::new("selected-fake");
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: selected_alias.clone(),
         provider: "fake".into(),
         base_url: None,
@@ -2382,6 +2384,8 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     provider.models = vec!["fake-v1".into()];
     provider.default_model = Some("fake-v1".into());
     let active_other = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("active-other"),
         provider: "other".into(),
         active: true,

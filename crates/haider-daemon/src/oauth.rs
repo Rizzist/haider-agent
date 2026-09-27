@@ -2221,9 +2221,15 @@ fn codex_import_bundle(
         generation,
     )
     .map_err(|_| invalid_import(path, "codex"))?;
-    if let Some(identity) = account_identity {
-        bundle = bundle.with_account_identity(identity);
-    }
+    let account_identity = account_identity.unwrap_or_else(|| {
+        grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &bundle.identity,
+            captured_at,
+        )
+    });
+    bundle = bundle.with_account_identity(account_identity);
     if let Some(id_token) = id_token {
         bundle = bundle.with_id_token(id_token);
     }
@@ -2320,16 +2326,15 @@ fn claude_import_bundle(
         generation,
     )
     .map(|bundle| {
+        let mut account = grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &bundle.identity,
+            captured_at,
+        );
+        account.plan = plan.map(str::to_owned);
         bundle
-            .with_account_identity(AccountIdentity {
-                email: None,
-                display_name: Some(display_identity.to_owned()),
-                account_id: None,
-                plan: plan.map(str::to_owned),
-                issuer: Some(registration.issuer.clone()),
-                captured_at,
-                verified: false,
-            })
+            .with_account_identity(account)
             .with_import_source_access_fingerprint(source_access_fingerprint)
     })
     .map_err(|_| invalid_import(path, "claude-code"))
@@ -2454,7 +2459,14 @@ fn kimi_import_bundle(
         generation,
     )
     .map(|bundle| {
+        let account = grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &bundle.identity,
+            now_ms().unwrap_or(0),
+        );
         bundle
+            .with_account_identity(account)
             .with_import_source_access_fingerprint(source_access_fingerprint)
             .with_refresh_after(
                 expires_at_unix_ms.saturating_sub(refresh_threshold.saturating_mul(1000)),
@@ -2532,7 +2544,17 @@ fn grok_import_bundle(
         },
         generation,
     )
-    .map(|bundle| bundle.with_import_source_access_fingerprint(source_access_fingerprint))
+    .map(|bundle| {
+        let account = grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &bundle.identity,
+            now,
+        );
+        bundle
+            .with_account_identity(account)
+            .with_import_source_access_fingerprint(source_access_fingerprint)
+    })
     .map_err(|_| invalid_import(path, "grok-cli"))
 }
 

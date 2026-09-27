@@ -2008,6 +2008,12 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn delete_provider_models(&self, provider: String) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.delete_provider_models(&provider)))
+            .await
+    }
+
     /// Replaces a provider's durable last-known model catalog.
     pub async fn put_provider_models(
         &self,

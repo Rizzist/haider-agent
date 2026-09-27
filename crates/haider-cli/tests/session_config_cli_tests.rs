@@ -197,6 +197,8 @@ fn models_json_vocabulary_is_stable() {
     let mut provider = provider_summary("xai");
     provider.auth_methods = vec![AuthMethod::ApiKey];
     let active = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("xai-main"),
         provider: "xai".into(),
         base_url: None,

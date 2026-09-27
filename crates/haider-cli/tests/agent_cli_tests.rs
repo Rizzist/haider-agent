@@ -837,6 +837,8 @@ fn agent_spawn_provider_only_resolves_model_through_daemon_session_authority() {
     // descriptor and its matching catalog before startup; xAI has no seeded
     // default. The injected daemon factory routes the pair to the fake script.
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("xai-fixture"),
         provider: "xai".into(),
         base_url: None,

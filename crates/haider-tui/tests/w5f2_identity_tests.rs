@@ -22,6 +22,8 @@ use common::{launcher_model, run_slash};
 
 fn oauth_descriptor(provider: &str, alias: &str, active: bool) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.to_owned(),
         base_url: None,

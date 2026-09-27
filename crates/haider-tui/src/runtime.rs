@@ -2190,6 +2190,8 @@ impl DemoDriver {
                     return;
                 };
                 let descriptor = haider_protocol::credential::CredentialDescriptor {
+                    incarnation: 0,
+                    credential_digest: None,
                     alias: haider_protocol::ids::CredentialAlias::new(row.alias),
                     provider: row.provider,
                     base_url: row.base_url,

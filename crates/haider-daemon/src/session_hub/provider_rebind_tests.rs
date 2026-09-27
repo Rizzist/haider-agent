@@ -153,6 +153,8 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
         );
         drop(selection);
         let descriptor = haider_protocol::credential::CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: haider_protocol::ids::CredentialAlias::new("pending-account"),
             provider: "pending-provider".into(),
             base_url: None,

@@ -7,12 +7,14 @@
 //! both the view and the file untouched, and a snapshot that violates the
 //! invariant is rejected on load as `StoreCorrupt`.
 //!
-//! Descriptors are display metadata only; secret bytes live behind `Vault`.
+//! Descriptors contain only secret-free metadata and catalog coordinates;
+//! secret bytes live behind `Vault`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use haider_protocol::credential::{AccountIdentity, CredentialDescriptor, CredentialStatus};
@@ -31,6 +33,22 @@ pub trait StoreLike: Send + Sync {
 
     /// Atomically replaces the entire descriptor snapshot.
     fn save(&self, descriptors: &[CredentialDescriptor]) -> AccountsResult<()>;
+
+    /// Reserve an incarnation before committing a descriptor. Gaps after a
+    /// failed descriptor write are intentional: a value is never recycled.
+    fn reserve_incarnation(&self, floor: u64) -> AccountsResult<u64> {
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut current = TEST_COUNTER.load(Ordering::SeqCst);
+        loop {
+            let next = current.max(floor).checked_add(1).ok_or_else(|| {
+                accounts_error(ErrorCode::Internal, "account incarnation exhausted", false)
+            })?;
+            match TEST_COUNTER.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Ok(next),
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 /// JSON account snapshot stored beside the profile's other metadata.
@@ -116,6 +134,49 @@ impl StoreLike for JsonFileStore {
         haider_platform::sync_directory(parent)
             .map_err(|error| file_error("sync parent directory of", &self.path, error))
     }
+
+    fn reserve_incarnation(&self, floor: u64) -> AccountsResult<u64> {
+        // The profile daemon is the sole writer of this account store. Keep
+        // the counter in a separate fsynced file so a removed last alias or
+        // an interrupted descriptor commit cannot recycle its coordinate.
+        let path = self.path.with_extension("incarnation-counter");
+        let current = match fs::read_to_string(&path) {
+            Ok(value) => value.trim().parse::<u64>().map_err(|_| {
+                accounts_error(
+                    ErrorCode::StoreCorrupt,
+                    "invalid account incarnation counter",
+                    false,
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(file_error("read", &path, error)),
+        };
+        let next = current.max(floor).checked_add(1).ok_or_else(|| {
+            accounts_error(ErrorCode::Internal, "account incarnation exhausted", false)
+        })?;
+        let parent = path.parent().ok_or_else(|| {
+            accounts_error(
+                ErrorCode::InvalidArgument,
+                "account counter has no parent",
+                false,
+            )
+        })?;
+        fs::create_dir_all(parent)
+            .map_err(|error| file_error("create parent for", &path, error))?;
+        let temporary_path = path.with_extension("incarnation-counter.tmp");
+        let mut temporary = open_temporary(&temporary_path)?;
+        temporary
+            .write_all(next.to_string().as_bytes())
+            .and_then(|()| temporary.write_all(b"\n"))
+            .and_then(|()| temporary.sync_all())
+            .map_err(|error| file_error("write", &temporary_path, error))?;
+        drop(temporary);
+        haider_platform::replace_file(&temporary_path, &path)
+            .map_err(|error| file_error("replace", &path, error))?;
+        haider_platform::sync_directory(parent)
+            .map_err(|error| file_error("sync parent directory of", &path, error))?;
+        Ok(next)
+    }
 }
 
 /// Boxed stores forward verbatim, so the daemon can inject test persistence
@@ -128,6 +189,10 @@ impl StoreLike for Box<dyn StoreLike> {
     fn save(&self, descriptors: &[CredentialDescriptor]) -> AccountsResult<()> {
         self.as_ref().save(descriptors)
     }
+
+    fn reserve_incarnation(&self, floor: u64) -> AccountsResult<u64> {
+        self.as_ref().reserve_incarnation(floor)
+    }
 }
 
 /// Shared stores forward verbatim (cloneable injection seam).
@@ -138,6 +203,10 @@ impl StoreLike for std::sync::Arc<dyn StoreLike> {
 
     fn save(&self, descriptors: &[CredentialDescriptor]) -> AccountsResult<()> {
         self.as_ref().save(descriptors)
+    }
+
+    fn reserve_incarnation(&self, floor: u64) -> AccountsResult<u64> {
+        self.as_ref().reserve_incarnation(floor)
     }
 }
 
@@ -165,6 +234,96 @@ fn file_error(
     )
 }
 
+/// Only provider-issued account coordinates or identical ingested bytes
+/// establish continuity. Labels, source paths and timestamps never do.
+fn proven_same_account(previous: &CredentialDescriptor, next: &CredentialDescriptor) -> bool {
+    if previous.provider != next.provider
+        || previous.auth_method != next.auth_method
+        || previous.base_url != next.base_url
+    {
+        return false;
+    }
+    if let (Some(a), Some(b)) = (&previous.credential_digest, &next.credential_digest)
+        && a == b
+    {
+        return true;
+    }
+    if identity_coordinates_conflict(previous, next) {
+        return false;
+    }
+    if previous.auth_method == haider_protocol::credential::AuthMethod::ApiKey {
+        return false;
+    }
+    let (Some(a), Some(b)) = (&previous.account_identity, &next.account_identity) else {
+        return false;
+    };
+    if a.issuer != b.issuer || !a.issuer.as_deref().is_some_and(complete_coordinate) {
+        return false;
+    }
+    let id = a.account_id.as_deref().filter(|id| complete_coordinate(id));
+    if let Some(id) = id
+        && b.account_id.as_deref() == Some(id)
+    {
+        if provider_user_coordinate(id) {
+            return true;
+        }
+        if a.email.as_deref().is_some_and(complete_coordinate) && a.email == b.email {
+            return true;
+        }
+        if a.verified && b.verified && previous.provider != "openai-oauth" {
+            return true;
+        }
+    }
+    a.verified
+        && b.verified
+        && a.email.as_deref().is_some_and(complete_coordinate)
+        && a.email == b.email
+}
+
+fn complete_coordinate(value: &str) -> bool {
+    // AccountIdentity::sanitized_field caps fields at this length. An
+    // exactly-full coordinate may have lost a distinguishing suffix.
+    !value.trim().is_empty() && value.chars().count() < AccountIdentity::MAX_FIELD_CHARS
+}
+
+fn provider_user_coordinate(id: &str) -> bool {
+    ["user:", "xai:"].into_iter().any(|prefix| {
+        id.strip_prefix(prefix)
+            .is_some_and(|value| complete_coordinate(id) && !value.trim().is_empty())
+    })
+}
+
+fn identity_coordinates_conflict(
+    previous: &CredentialDescriptor,
+    next: &CredentialDescriptor,
+) -> bool {
+    let (Some(a), Some(b)) = (&previous.account_identity, &next.account_identity) else {
+        return false;
+    };
+    if a.issuer == b.issuer
+        && a.account_id == b.account_id
+        && a.account_id
+            .as_deref()
+            .is_some_and(provider_user_coordinate)
+    {
+        return false;
+    }
+    a.issuer != b.issuer
+        || matches!((&a.account_id, &b.account_id), (Some(a), Some(b)) if a != b)
+        || matches!((&a.email, &b.email), (Some(a), Some(b)) if a != b)
+}
+
+fn identity_scope_changed(previous: &CredentialDescriptor, next: &CredentialDescriptor) -> bool {
+    previous
+        .account_identity
+        .as_ref()
+        .map(|identity| (&identity.issuer, &identity.account_id, &identity.email))
+        != next
+            .account_identity
+            .as_ref()
+            .map(|identity| (&identity.issuer, &identity.account_id, &identity.email))
+}
+
 /// In-memory account view backed by a whole-snapshot persistence port.
 pub struct AccountStore<S> {
     store: S,
@@ -174,8 +333,27 @@ pub struct AccountStore<S> {
 impl<S: StoreLike> AccountStore<S> {
     /// Loads and validates descriptors from `store`.
     pub fn new(store: S) -> AccountsResult<Self> {
-        let descriptors = store.load()?;
+        let mut descriptors = store.load()?;
         validate_snapshot(&descriptors)?;
+        // Old descriptor arrays have no incarnation. Assign one to every
+        // alias before any caller can derive a v3 catalog key from the row.
+        if descriptors
+            .iter()
+            .any(|descriptor| descriptor.incarnation == 0)
+        {
+            let mut floor = descriptors
+                .iter()
+                .map(|descriptor| descriptor.incarnation)
+                .max()
+                .unwrap_or(0);
+            for descriptor in &mut descriptors {
+                if descriptor.incarnation == 0 {
+                    floor = store.reserve_incarnation(floor)?;
+                    descriptor.incarnation = floor;
+                }
+            }
+            store.save(&descriptors)?;
+        }
         Ok(Self { store, descriptors })
     }
 
@@ -226,6 +404,8 @@ impl<S: StoreLike> AccountStore<S> {
                     })?,
             );
         }
+
+        descriptor.incarnation = self.next_incarnation()?;
 
         let mut next = self.descriptors.clone();
         if descriptor.active {
@@ -307,6 +487,66 @@ impl<S: StoreLike> AccountStore<S> {
         Ok(updated)
     }
 
+    /// Manual identity reconciliation. A changed or unprovable account
+    /// coordinate starts a new catalog generation, even when the alias and
+    /// source timestamp are unchanged.
+    pub fn reconcile_identity(
+        &mut self,
+        alias: &CredentialAlias,
+        identity: Option<AccountIdentity>,
+        credential_digest: Option<String>,
+    ) -> AccountsResult<CredentialDescriptor> {
+        let index = self
+            .descriptors
+            .iter()
+            .position(|existing| &existing.alias == alias)
+            .ok_or_else(|| missing_alias(alias))?;
+        let previous = &self.descriptors[index];
+        let mut next = self.descriptors.clone();
+        next[index].account_identity = identity;
+        next[index].credential_digest = credential_digest;
+        if identity_scope_changed(previous, &next[index])
+            || !proven_same_account(previous, &next[index])
+        {
+            next[index].incarnation = self.next_incarnation()?;
+        }
+        let updated = next[index].clone();
+        self.store.save(&next)?;
+        self.descriptors = next;
+        Ok(updated)
+    }
+
+    /// A removed source may later be enrolled at the same path and alias;
+    /// reserve its next incarnation before it can be observed again.
+    pub fn invalidate_incarnation(&mut self, alias: &CredentialAlias) -> AccountsResult<()> {
+        self.bump_incarnation(alias, true)
+    }
+
+    /// A profile configuration boundary changes the serving account context
+    /// while retaining its credential. Keep the digest so an identical key
+    /// entered later still proves continuity within the new context.
+    pub fn mint_incarnation(&mut self, alias: &CredentialAlias) -> AccountsResult<()> {
+        self.bump_incarnation(alias, false)
+    }
+
+    fn bump_incarnation(
+        &mut self,
+        alias: &CredentialAlias,
+        forget_credential: bool,
+    ) -> AccountsResult<()> {
+        let index = self
+            .descriptors
+            .iter()
+            .position(|descriptor| &descriptor.alias == alias)
+            .ok_or_else(|| missing_alias(alias))?;
+        let mut next = self.descriptors.clone();
+        next[index].incarnation = self.next_incarnation()?;
+        if forget_credential {
+            next[index].credential_digest = None;
+        }
+        self.commit(next)
+    }
+
     /// Atomically replaces one descriptor without changing its active slot.
     ///
     /// OAuth token rotation uses this after its new bundle is durable. The
@@ -355,9 +595,24 @@ impl<S: StoreLike> AccountStore<S> {
         // Creation is the first Haider commit, not the latest refresh or
         // re-login. Pre-964 rows deliberately keep their unknown timestamp.
         descriptor.created_at_ms = previous.created_at_ms;
+        descriptor.incarnation = if proven_same_account(previous, &descriptor) {
+            previous.incarnation
+        } else {
+            self.next_incarnation()?
+        };
         let mut next = self.descriptors.clone();
         next[index] = descriptor;
         self.commit(next)
+    }
+
+    fn next_incarnation(&self) -> AccountsResult<u64> {
+        self.store.reserve_incarnation(
+            self.descriptors
+                .iter()
+                .map(|descriptor| descriptor.incarnation)
+                .max()
+                .unwrap_or(0),
+        )
     }
 
     /// Makes `alias` the active account for its provider.

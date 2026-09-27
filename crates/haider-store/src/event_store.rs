@@ -4603,8 +4603,9 @@ impl Store {
         let keep: HashSet<&str> = keep_account_keys.iter().map(String::as_str).collect();
         let legacy: HashSet<&str> = authenticated_providers.iter().map(String::as_str).collect();
         for key in keys {
-            let unread_account =
-                key.starts_with(ACCOUNT_SCOPED_PREFIX) || key.starts_with("account:");
+            let unread_account = key.starts_with(ACCOUNT_SCOPED_PREFIX)
+                || key.starts_with("account-v2:")
+                || key.starts_with("account:");
             if (unread_account && !keep.contains(key.as_str())) || legacy.contains(key.as_str()) {
                 transaction
                     .execute("DELETE FROM provider_models WHERE provider = ?1", [&key])
@@ -4637,6 +4638,18 @@ impl Store {
                     etag,
                     to_sqlite_integer(fetched_at_ms)?
                 ],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    /// Removes one catalog coordinate after a configuration boundary.
+    pub fn delete_provider_models(&self, provider: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "DELETE FROM provider_models WHERE provider = ?1",
+                [provider],
             )
             .map_err(map_sqlite_error)?;
         Ok(())

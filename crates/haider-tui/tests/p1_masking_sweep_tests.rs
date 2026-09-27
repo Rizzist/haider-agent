@@ -150,6 +150,8 @@ fn oauth_receipts_mask_the_identity_always() {
     model.oauth_add_completed(
         attempt,
         &CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("openai-oauth"),
             provider: "openai-oauth".into(),
             base_url: None,
@@ -188,6 +190,8 @@ fn launcher_header_carries_the_alias_never_the_identity() {
     // Selecting the account adopts its ALIAS into the header identity.
     model.apply_account_selected(
         &CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("work-chatgpt"),
             provider: "openai".into(),
             base_url: None,
