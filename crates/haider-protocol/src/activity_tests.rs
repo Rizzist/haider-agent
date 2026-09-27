@@ -520,6 +520,67 @@ fn registered_effectless_dispatch_is_live_until_settlement() {
     successful.observe(&completed, 102);
     assert_eq!(successful.current(102, false), Some(ActivityKind::Web));
     assert_eq!(successful.used(), vec![ActivityKind::Web]);
+
+    // Two accepted calls can overlap. Closing one must not erase the other;
+    // a duplicate start replaces only its own typed fact during replay.
+    let mut concurrent = ActivityTracker::new();
+    concurrent.observe_raw(&envelope);
+    let mut second = envelope.clone();
+    second.seq = 2;
+    second.payload.insert_metadata(
+        "activity_call_id",
+        serde_json::json!("second-registered-call"),
+    );
+    second
+        .payload
+        .insert_metadata("activity_kind", serde_json::json!("read"));
+    concurrent.observe_raw(&second);
+    concurrent.observe_raw(&second);
+    assert_eq!(
+        concurrent.state().open,
+        vec![ActivityKind::Web, ActivityKind::Read]
+    );
+    let mut rejected = tool_item("one", "web_search", ToolStatus::Rejected, true);
+    if let EventPayload::Item(ItemEvent::Completed {
+        item: TurnItem::ToolCall { call_id, .. },
+        ..
+    }) = &mut rejected
+    {
+        *call_id = "registered-call".into();
+    }
+    concurrent.observe(&rejected, 103);
+    assert_eq!(
+        concurrent.current(100 + ACTIVITY_LINGER_MS * 3, false),
+        Some(ActivityKind::Read),
+        "an accepted live call survives both time decay and another call's rejection"
+    );
+    assert!(concurrent.used().is_empty());
+    concurrent.observe(&EventPayload::RunState(RunState::Done), 104);
+    assert_eq!(concurrent.current(104, false), None);
+    assert!(concurrent.state().open.is_empty());
+
+    for (call_id, kind) in [("", "web"), ("unknown", "teleport")] {
+        let mut invalid = envelope.clone();
+        invalid
+            .payload
+            .insert_metadata("activity_call_id", serde_json::json!(call_id));
+        invalid
+            .payload
+            .insert_metadata("activity_kind", serde_json::json!(kind));
+        let mut replay = ActivityTracker::new();
+        replay.observe_raw(&invalid);
+        assert!(replay.is_empty(), "invalid live metadata: {call_id}/{kind}");
+    }
+    let mut old_journal = envelope.clone();
+    old_journal.payload = serde_json::to_value(EventPayload::RunState(RunState::RunningTool))
+        .expect("old run state serializes")
+        .into();
+    let mut replay = ActivityTracker::new();
+    replay.observe_raw(&old_journal);
+    assert!(
+        replay.is_empty(),
+        "old journals cannot invent live activity"
+    );
 }
 
 #[test]
