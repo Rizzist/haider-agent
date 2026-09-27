@@ -1228,16 +1228,37 @@ fn a_cross_provider_child_meters_against_its_own_provider() {
 fn a_listed_session_first_opens_on_its_own_model() {
     let (mut model, mut driver) = two_attached_sessions();
     let listed = session_id("s-meter-listed");
+    let summary = listed_summary(&listed, "anthropic-oauth", "claude-sonnet-4-6", 30_000);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.identity.model_short, "claude-opus-5-5", "viewing A");
+    model.open_session(&listed);
+    assert_eq!(model.identity.model_short, "claude-sonnet-4-6");
+    assert!(status_left_string(&model, 118).contains("of 200k"));
+}
+
+/// The daemon's `session.list` row for `session` with typed metadata.
+fn listed_summary(
+    session: &haider_protocol::ids::SessionId,
+    provider: &str,
+    slug: &str,
+    max_tokens: u64,
+) -> haider_rpc::SessionSummary {
     let metadata = haider_protocol::session::SessionMetadataV1 {
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
         provider_rebind_id: None,
         cwd: "/tmp/meter".to_owned(),
-        provider: "anthropic-oauth".into(),
+        provider: provider.into(),
         account_alias: None,
-        model: "claude-sonnet-4-6".to_owned(),
-        max_tokens: 30_000,
+        model: slug.to_owned(),
+        max_tokens,
         max_tokens_source: None,
         system_prompt_version: Some("test-v1".into()),
         permission_overrides: None,
@@ -1250,8 +1271,8 @@ fn a_listed_session_first_opens_on_its_own_model() {
         context_economy: Default::default(),
         created_at_ms: 1,
     };
-    let summary = haider_rpc::SessionSummary {
-        session_id: listed.clone(),
+    haider_rpc::SessionSummary {
+        session_id: session.clone(),
         head_seq: 0,
         worker_generation: 7,
         run_state: None,
@@ -1278,16 +1299,44 @@ fn a_listed_session_first_opens_on_its_own_model() {
         fast: None,
         account_alias: None,
         forked_from: None,
-    };
+    }
+}
+
+/// B3 across surfaces: a model switched from ANOTHER surface lands as a
+/// bare journal fact (no budget). The daemon's typed metadata for the same
+/// pair (the `session.list` the driver asks for after a model fact) then
+/// supplies the committed budget: a user-set 50k that fits eq-mid projects
+/// 50k, not the derivation's 70k.
+#[test]
+fn a_fact_switch_learns_the_committed_budget_from_session_metadata() {
+    let (mut model, mut driver, s) = equal_window_session();
+    let next = deliver_footprint(&mut driver, &mut model, &s, 1, &user_set_footprint());
+    deliver_model_fact(&mut driver, &mut model, &s, next, "eq-oauth", "eq-mid");
+    let meter = model.context_meter();
+    assert!(meter.threshold_projected);
+    assert_eq!(
+        meter.auto_compact_at,
+        Some(70_000),
+        "derived until the list"
+    );
+    assert_eq!(meter.turns_to_threshold, None);
     driver.apply(
         &mut model,
         LiveReply::Listed {
-            sessions: vec![summary],
+            sessions: vec![listed_summary(&s, "eq-oauth", "eq-mid", 50_000)],
             next_cursor: None,
         },
     );
-    assert_eq!(model.identity.model_short, "claude-opus-5-5", "viewing A");
-    model.open_session(&listed);
-    assert_eq!(model.identity.model_short, "claude-sonnet-4-6");
-    assert!(status_left_string(&model, 118).contains("of 200k"));
+    let meter = model.context_meter();
+    assert!(meter.threshold_projected);
+    assert_eq!(meter.auto_compact_at, Some(50_000));
+    // Metadata for a DIFFERENT pair never rewrites this epoch's budget.
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![listed_summary(&s, "eq-oauth", "eq-small", 8_192)],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.context_meter().auto_compact_at, Some(50_000));
 }

@@ -18620,14 +18620,30 @@ impl AppModel {
         // previously viewed session left behind. A session this process has
         // not bound yet (first open) binds the current pair below.
         let epoch = std::mem::take(&mut slot.meter_epoch);
-        if let Some((provider, model)) = epoch.pair.clone() {
+        let mut pair_changed = false;
+        if let Some((provider, model)) = epoch.pair.clone()
+            && (self.identity.provider != provider || self.identity.model_short != model)
+        {
             self.identity.provider = provider;
             self.identity.model_short = model;
+            pair_changed = true;
         }
         self.meter_epoch = epoch;
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
-        self.refresh_context_window();
+        if pair_changed {
+            // A different model: its own declared window (never the one
+            // the previous session's model left in the identity).
+            self.refresh_context_window();
+        } else {
+            // Same pair: the window stands; bind a never-viewed session.
+            let pair = (
+                self.identity.provider.clone(),
+                self.identity.model_short.clone(),
+            );
+            self.meter_epoch
+                .bind(pair, self.projection.latest_footprint());
+        }
         self.menu_selection = 0;
         self.view_path.clear();
         // CG-M1: read this session's graph reduction so the strip reflects a

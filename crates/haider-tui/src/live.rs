@@ -2137,6 +2137,11 @@ struct InputMirrorState {
 /// The live driver. See the module charter.
 #[derive(Debug)]
 pub struct LiveDriver {
+    /// 973-context-meter-fixes: a `session.list` asked for after a model
+    /// fact, so the meter learns the daemon's COMMITTED output budget for a
+    /// selection made on another surface (the fact carries none). One in
+    /// flight at a time; cleared by the list reply or a lost connection.
+    meter_list_pending: bool,
     /// Round 4: monotone connection epoch — bumped on every Disconnected.
     /// Reads that must not cross a reconnect (loom.list) carry it out and
     /// their replies echo it back; a mismatch installs nothing.
@@ -2443,6 +2448,7 @@ impl LiveDriver {
     #[must_use]
     pub fn new(instance: impl Into<String>) -> Self {
         Self {
+            meter_list_pending: false,
             connection_epoch: 0,
             input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
@@ -3355,6 +3361,7 @@ impl LiveDriver {
                 sessions,
                 next_cursor,
             } => {
+                self.meter_list_pending = false;
                 for summary in sessions {
                     let workspace_display = summary
                         .workspace_cwd
@@ -5663,6 +5670,7 @@ impl LiveDriver {
             }
             LiveReply::Disconnected { reason } => {
                 self.connected = false;
+                self.meter_list_pending = false;
                 self.binding_worker_generation = None;
                 self.attaching.clear();
                 // Review round 2: the Loom registry snapshot is CONNECTION
@@ -6349,9 +6357,10 @@ impl LiveDriver {
         }
         let outcome = model.route_raw(envelope);
         let applied = matches!(outcome, RawOutcome::Applied);
+        let mut model_fact = false;
         if applied {
             self.record_menu(session, envelope);
-            self.apply_tuning_fact(model, session, envelope);
+            model_fact = self.apply_tuning_fact(model, session, envelope);
             if model.compatibility_diagnostic.is_some() {
                 let mut observed = format!(
                     "observed payload type {} at seq {}",
@@ -6385,6 +6394,10 @@ impl LiveDriver {
         // only an APPLIED envelope can have moved the tree.
         if applied {
             let mut commands = self.fleet_event_chase(model, session);
+            if model_fact && self.connected && !self.meter_list_pending {
+                self.meter_list_pending = true;
+                commands.push(LiveCommand::List { cursor: None });
+            }
             // The graph strip's event-cadence chase: keep the reduction
             // current while a graph is unfinished, and catch every graph
             // fact (pin/completion/abandon flips the strip's presence).
@@ -6434,13 +6447,25 @@ impl LiveDriver {
     /// journal, and the latest fact wins in replay order. Select replies
     /// land the same values; both writers agree because both are committed
     /// daemon truth.
-    fn apply_tuning_fact(&self, model: &mut AppModel, session: &SessionId, envelope: &RawEnvelope) {
+    /// Returns whether a model or provider-rebind fact applied (the meter's
+    /// committed budget is then re-read through `session.list`).
+    fn apply_tuning_fact(
+        &self,
+        model: &mut AppModel,
+        session: &SessionId,
+        envelope: &RawEnvelope,
+    ) -> bool {
         let Ok(payload) = envelope
             .payload
             .decode::<haider_protocol::session::SessionConfigEventPayload>()
         else {
-            return;
+            return false;
         };
+        let model_fact = matches!(
+            payload,
+            haider_protocol::session::SessionConfigEventPayload::ModelSelected(_)
+                | haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(_)
+        );
         if model.active_session.as_ref() != Some(session) {
             // 973-context-meter-fixes B1: a PARKED session's model facts
             // bind its own meter epoch (never the identity on screen).
@@ -6453,7 +6478,7 @@ impl LiveDriver {
                 ) => model.note_parked_provider_rebound(session, &rebound.provider),
                 _ => {}
             }
-            return;
+            return model_fact;
         }
         match payload {
             haider_protocol::session::SessionConfigEventPayload::EffortSelected(selected) => {
@@ -6524,6 +6549,7 @@ impl LiveDriver {
             // roster summary remains the sole local attention display truth.
             | haider_protocol::session::SessionConfigEventPayload::SessionSeen { .. } => {}
         }
+        model_fact
     }
 
     /// Record a menu's COMMITTED opening coordinates, and retire its answer
@@ -7173,6 +7199,7 @@ impl LiveDriver {
                 model.stream_diagnostics.clear();
                 model.stream_observations.clear();
                 self.connected = false;
+                self.meter_list_pending = false;
                 vec![LiveCommand::Reconnect]
             }
             // The request's `after_seq` is the reducer's own last fully
