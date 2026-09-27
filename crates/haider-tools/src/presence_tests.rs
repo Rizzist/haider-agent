@@ -68,8 +68,10 @@ fn first_action_shows_the_surface_once_and_every_action_moves_the_pointer() {
 
 #[test]
 fn pointer_sequence_wraps_below_the_reserved_conceal_range() {
-    let mut machine = PresenceMachine::<String>::default();
-    machine.next_seq = CONCEAL_ACK_SEQ_START - 1;
+    let mut machine = PresenceMachine::<String> {
+        next_seq: CONCEAL_ACK_SEQ_START - 1,
+        ..Default::default()
+    };
     let now = Instant::now();
     let (last, _) = machine
         .begin_action(
