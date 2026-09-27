@@ -5216,14 +5216,7 @@ impl HarnessActor {
         // TURN-scoped — a pause_turn boundary can split a server call from
         // its result across requests, and the bounded sources list journals
         // exactly once, under the finished message.
-        let mut server_calls: HashMap<
-            String,
-            (
-                String,
-                serde_json::Value,
-                Option<haider_protocol::activity::ActivityKind>,
-            ),
-        > = HashMap::new();
+        let mut server_calls: HashMap<String, ServerCall> = HashMap::new();
         let mut web_sources: Vec<WebSource> = Vec::new();
         // These are one logical provider response, not one physical transport
         // attempt. A reconnect keeps them alive while replay filtering skips
@@ -5296,8 +5289,14 @@ impl HarnessActor {
                         args,
                         activity,
                     } => {
-                        server_calls
-                            .insert(call_id.clone(), (name.clone(), args.clone(), *activity));
+                        server_calls.insert(
+                            call_id.clone(),
+                            ServerCall {
+                                name: name.clone(),
+                                args: args.clone(),
+                                activity: *activity,
+                            },
+                        );
                     }
                     StreamEvent::ServerToolResult { call_id, .. } => {
                         server_calls.remove(call_id);
@@ -7810,7 +7809,14 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
-                        server_calls.insert(call_id, (name, args, activity));
+                        server_calls.insert(
+                            call_id,
+                            ServerCall {
+                                name,
+                                args,
+                                activity,
+                            },
+                        );
                         Ok(None)
                     }
                     StreamEvent::ServerToolResult {
@@ -7818,12 +7824,14 @@ impl HarnessActor {
                         preview,
                         is_error,
                     } => {
-                        let (name, args, activity) = server_calls
-                            .remove(&call_id)
-                            .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null, None));
+                        let call = server_calls.remove(&call_id).unwrap_or_else(|| ServerCall {
+                            name: "web_tool".into(),
+                            args: serde_json::Value::Null,
+                            activity: None,
+                        });
                         let result_preview = preview.clone();
-                        let result_name = name.clone();
-                        let result_args = args.clone();
+                        let result_name = call.name.clone();
+                        let result_args = call.args.clone();
                         async {
                             self.complete_text(&run_id, &mut message, false).await?;
                             self.complete_text(&run_id, &mut reasoning, true).await?;
@@ -7856,10 +7864,8 @@ impl HarnessActor {
                                 }),
                                 orchestration: None,
                             };
-                            self.commit_server_tool_row(
-                                &run_id, &call_id, name, args, activity, status, &result,
-                            )
-                            .await?;
+                            self.commit_server_tool_row(&run_id, &call_id, call, status, &result)
+                                .await?;
                             continuation_progress.observe_server_tool(
                                 &result_name,
                                 &result_args,
@@ -13143,12 +13149,15 @@ impl HarnessActor {
         &mut self,
         run_id: &RunId,
         call_id: &str,
-        name: String,
-        args: serde_json::Value,
-        activity: Option<haider_protocol::activity::ActivityKind>,
+        call: ServerCall,
         status: ToolStatus,
         result: &BoundedResult,
     ) -> Result<(), DriveError> {
+        let ServerCall {
+            name,
+            args,
+            activity,
+        } = call;
         let item_id = self.next_item_id();
         let started = TurnItem::ToolCall {
             call_id: call_id.to_owned(),
@@ -14625,6 +14634,13 @@ struct PendingItemDelta {
     run_id: RunId,
     item_id: ItemId,
     delta: ItemDelta,
+}
+
+/// One provider-executed, display-only tool row awaiting its result.
+struct ServerCall {
+    name: String,
+    args: serde_json::Value,
+    activity: Option<haider_protocol::activity::ActivityKind>,
 }
 
 /// One in-flight tool call; `args` collects the streamed JSON fragments.

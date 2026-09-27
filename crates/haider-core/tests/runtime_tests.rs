@@ -8337,7 +8337,7 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
             call_id: "srvtoolu_1".into(),
             name: "web_search".into(),
             args: serde_json::json!({"query": "rust sse"}),
-            activity: None,
+            activity: Some(haider_protocol::activity::ActivityKind::Web),
         },
         FakeStep::Finish {
             reason: FinishReason::PauseTurn,
@@ -8465,10 +8465,10 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
                         name,
                         args,
                         status,
-                        ..
+                        activity,
                     },
                 ..
-            }) => Some((call_id, name, args, status)),
+            }) => Some((call_id, name, args, status, activity)),
             _ => None,
         })
         .expect("completed server row");
@@ -8479,6 +8479,7 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
             "web_search".into(),
             serde_json::json!({"query": "rust sse"}),
             ToolStatus::Completed,
+            Some(haider_protocol::activity::ActivityKind::Web),
         )
     );
 

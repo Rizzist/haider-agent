@@ -1041,13 +1041,18 @@ fn omit_event_activity(envelope: &mut haider_protocol::envelope::RawEnvelope) {
                 && class.get("class").and_then(serde_json::Value::as_str)
                     == Some("provider_transport")
             {
-                *class = serde_json::json!({
-                    "class": "network",
-                    "host": "provider-request",
-                })
-                .as_object()
-                .expect("object")
-                .clone();
+                *class = [
+                    (
+                        "class".to_owned(),
+                        serde_json::Value::String("network".into()),
+                    ),
+                    (
+                        "host".to_owned(),
+                        serde_json::Value::String("provider-request".into()),
+                    ),
+                ]
+                .into_iter()
+                .collect();
             }
         }
         _ => {}
