@@ -468,26 +468,26 @@ class WindowsCrtImportTests(unittest.TestCase):
         cases = [
             # drive-relative (Wine contains_path: name[1] == ':' is a path; RtlDosPathNameToNtPathName resolves
             # it against the drive's current directory)
-            ('C:VCRUNTIME140.dll', 'must-reject'), ('c:vcruntime140', 'must-reject'), ('C:MSVCP140.dll', 'must-reject'),
-            ('C:api-ms-win-crt-runtime-l1-1-0.dll', 'must-reject'), ('C:VCRUNTIME140.dll ', 'must-reject'),
-            ('D:ucrtbase.dll', 'must-reject'), ('C:..' + B + 'VCRUNTIME140.dll', 'must-reject'),
+            ('C:VCRUNTIME140.dll', 1), ('c:vcruntime140', 1), ('C:MSVCP140.dll', 1),
+            ('C:api-ms-win-crt-runtime-l1-1-0.dll', 1), ('C:VCRUNTIME140.dll ', 1),
+            ('D:ucrtbase.dll', 1), ('C:..' + B + 'VCRUNTIME140.dll', 1),
             # absolute / UNC / device namespace paths
-            (B*2 + 'server' + B + 'share' + B + 'VCRUNTIME140.dll', 'must-reject'),
-            (B*2 + '?' + B + 'C:' + B + 'x' + B + 'VCRUNTIME140.dll', 'must-reject'),
-            (B*2 + '.' + B + 'C:' + B + 'x' + B + 'VCRUNTIME140.dll', 'must-reject'),
-            (B + '??' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'vcruntime140.dll', 'must-reject'),
-            (B*2 + '?' + B + 'GLOBALROOT' + B + 'Device' + B + 'HarddiskVolume3' + B + 'Windows' + B + 'System32' + B + 'vcruntime140.dll', 'must-reject'),
-            (B*2 + '?' + B + 'UNC' + B + 'server' + B + 'share' + B + 'msvcp140.dll', 'must-reject'),
-            ('C:' + B + 'VCRUNTIME140.dll', 'must-reject'), (B + 'VCRUNTIME140.dll', 'must-reject'),
+            (B*2 + 'server' + B + 'share' + B + 'VCRUNTIME140.dll', 1),
+            (B*2 + '?' + B + 'C:' + B + 'x' + B + 'VCRUNTIME140.dll', 1),
+            (B*2 + '.' + B + 'C:' + B + 'x' + B + 'VCRUNTIME140.dll', 1),
+            (B + '??' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'vcruntime140.dll', 1),
+            (B*2 + '?' + B + 'GLOBALROOT' + B + 'Device' + B + 'HarddiskVolume3' + B + 'Windows' + B + 'System32' + B + 'vcruntime140.dll', 1),
+            (B*2 + '?' + B + 'UNC' + B + 'server' + B + 'share' + B + 'msvcp140.dll', 1),
+            ('C:' + B + 'VCRUNTIME140.dll', 1), (B + 'VCRUNTIME140.dll', 1),
             # case
-            ('VcRuNtImE140.DlL', 'must-reject'), ('VCRUNTIME140.DLL', 'must-reject'), ('UCRTBASE.DLL', 'must-reject'),
+            ('VcRuNtImE140.DlL', 1), ('VCRUNTIME140.DLL', 1), ('UCRTBASE.DLL', 1),
             # streams
-            ('VCRUNTIME140.dll:stream', 'must-reject'), ('VCRUNTIME140:$DATA', 'must-reject'),
+            ('VCRUNTIME140.dll:stream', 1), ('VCRUNTIME140:$DATA', 1),
             # extension spellings that stay the CRT via API-set resolution
-            ('api-ms-win-crt-runtime-l1-1-0.ocx', 'must-reject'), ('api-ms-win-crt-stdio-l1-1-0.drv', 'must-reject'),
-            ('API-MS-WIN-CRT-MATH-L1-1-0', 'must-reject'),
+            ('api-ms-win-crt-runtime-l1-1-0.ocx', 1), ('api-ms-win-crt-stdio-l1-1-0.drv', 1),
+            ('API-MS-WIN-CRT-MATH-L1-1-0', 1),
             # known alias vocabulary
-            *[(n, 'must-reject') for n in (
+            *[(n, 1) for n in (
                 'vcruntime140.dll', 'vcruntime140_1.dll', 'vcruntime140_threads.dll', 'vcruntime140d.dll', 'vcruntime140_1d.dll',
                 'vcruntime140_threadsd.dll', 'vcruntime140_app.dll', 'vcruntime140_1_app.dll', 'vcruntime140d_app.dll',
                 'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll',
@@ -499,29 +499,29 @@ class WindowsCrtImportTests(unittest.TestCase):
                 'vcamp140d.dll', 'libomp140.x86_64.dll', 'libomp140d.x86_64.dll', 'libomp140.aarch64.dll',
                 'api-ms-win-crt-runtime-l1-1-0.dll', 'api-ms-win-crt-private-l1-1-0.dll', 'api-ms-win-crt-conio-l1-1-0.dll')],
             # candidate vocabulary gaps (source-derived: Microsoft.VCLibs appx framework DLLs, C++/CLI msvcm)
-            *[(n, 'regex-gap') for n in (
+            *[(n, 1) for n in (
                 'concrt140_app.dll', 'vccorlib140_app.dll', 'vcomp140_app.dll', 'vcamp140_app.dll', 'concrt140d_app.dll',
                 'msvcr120_app.dll', 'msvcr110_app.dll', 'vccorlib120_app.dll', 'msvcm90.dll', 'msvcm80.dll', 'msvcm90d.dll',
                 'msvci70.dll')],
             # 8.3 short names
-            ('VCRUNT~1.DLL', '8.3-short'), ('VCRUNT~2.DLL', '8.3-short'), ('MSVCP1~1.DLL', '8.3-short'), ('API-MS~1.DLL', '8.3-short'),
-            ('UCRTBA~1.DLL', '8.3-short'), ('VCRUNT~1', '8.3-short'),
+            ('VCRUNT~1.DLL', 0), ('VCRUNT~2.DLL', 0), ('MSVCP1~1.DLL', 0), ('API-MS~1.DLL', 0),
+            ('UCRTBA~1.DLL', 0), ('VCRUNT~1', 0),
             # different files to the loader
-            ('VCRUNTIME140.ocx', 'not-alias'), ('VCRUNTIME140.drv', 'not-alias'), ('VCRUNTIME140.dll.dll', 'not-alias'),
-            ('VCRUNTIME140.exe', 'not-alias'), (' VCRUNTIME140.dll', 'not-alias'), ('VCRUNTIME140 .dll', 'not-alias'),
-            ('xVCRUNTIME140.dll', 'not-alias'), ('foo.dll:VCRUNTIME140.dll', 'not-alias'), ('NUL', 'not-alias'),
-            ('CON.dll', 'not-alias'), (B*2 + '.' + B + 'NUL', 'not-alias'), ('libomp140.x86_64', 'not-alias'),
-            ('api-ms-win-crt.dll', 'not-alias'),
+            ('VCRUNTIME140.ocx', 0), ('VCRUNTIME140.drv', 0), ('VCRUNTIME140.dll.dll', 0),
+            ('VCRUNTIME140.exe', 0), (' VCRUNTIME140.dll', 0), ('VCRUNTIME140 .dll', 0),
+            ('xVCRUNTIME140.dll', 0), ('foo.dll:VCRUNTIME140.dll', 1), ('NUL', 0),
+            ('CON.dll', 0), (B*2 + '.' + B + 'NUL', 0), ('libomp140.x86_64', 0),
+            ('api-ms-win-crt.dll', 0),
             # legitimate OS names
-            *[(n, 'os') for n in (
+            *[(n, 0) for n in (
                 'KERNEL32.dll', 'api-ms-win-core-crt-l1-1-0.dll', 'api-ms-win-core-crt-l2-1-0.dll', 'API-MS-WIN-CORE-CRT-L1-1-0',
                 'ext-ms-win-ntuser-window-l1-1-0.dll', 'ext-ms-win-kernel32-package-current-l1-1-0.dll',
                 'msvcrt.dll', 'msvcrt20.dll', 'msvcrt40.dll', 'msvcirt.dll', 'atl.dll', 'ucrtbase_clr0400.dll',
                 'msvcr120_clr0400.dll', 'ucrtbase_enclave.dll', 'C:' + B + 'Windows' + B + 'System32' + B + 'bcrypt.dll',
                 B*2 + '?' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'ntdll.dll', 'C:KERNEL32.dll',
-                'vcruntime.dll', 'mfc.dll', 'msvcr.dll', 'concrt.dll', 'vcomp.dll', 'My_Odd Name~1+(x).dll')],
+                'vcruntime.dll', 'mfc.dll', 'msvcr.dll', 'concrt.dll', 'My_Odd Name~1+(x).dll')],
             # OS-shipped but flagged by the pre-existing vocabulary
-            *[(n, 'os-overcorrect') for n in ('msvcp60.dll', 'mfc42.dll', 'mfc42u.dll', 'vcruntime140_clr0400.dll', 'mfc40.dll')],
+            *[(n, 0) for n in ('msvcp60.dll', 'mfc42.dll', 'mfc42u.dll', 'vcruntime140_clr0400.dll', 'mfc40.dll')],
         ]
         malformed = [('tab', 'VCRUNTIME140.dll', b'\t'), ('trailing CR', 'VCRUNTIME140.dll', b'\r'),
                      ('U+0130 dotted I', 'VCRUNTXXME140.dll', '\u0130'.encode()), ('U+212A Kelvin in KERNEL32', 'XXXERNEL32.dll', '\u212a'.encode()),
@@ -529,52 +529,42 @@ class WindowsCrtImportTests(unittest.TestCase):
 
         cases.extend([
             # Additional drive/stream separators and suffix forms for this repair.
-            ('C:VCRUNTIME140', 'must-reject'),
-            ('c:vcruntime140.dll', 'must-reject'),
-            (r'C:x/..\VCRUNTIME140.dll', 'must-reject'),
-            ('C:x:y:MSVCP140.dll', 'must-reject'),
-            ('x:y:vcruntime140', 'must-reject'),
-            (r'\\?\C:VCRUNTIME140.dll', 'must-reject'),
-            ('C. :VCRUNTIME140.dll', 'must-reject'),
-            ('C:VCRUNTIME140.dll:stream:$DATA', 'must-reject'),
-            ('vcomp140d_app.dll', 'regex-gap'),
-            ('vccorlib140d_app.dll', 'regex-gap'),
-            ('vcamp140d_app.dll', 'regex-gap'),
-            ('msvcr120d_app.dll', 'regex-gap'),
-            ('msvcm80d.dll', 'regex-gap'),
-            ('msvci70d.dll', 'regex-gap'),
-            ('VCRUNTIME140..', 'must-reject'),
-            (r'C:\runtime\VCRUNTIME140', 'must-reject'),
-            ('api-ms-win-crt-runtime-l1-1-0.xyz', 'must-reject'),
-            ('api-ms-win-crt-runtime-l1-1-9.dll', 'must-reject'),
-            ('API-MS-WIN-CRT-HEAP-L1-1-0.foo', 'must-reject'),
-            ('msvcp60.dll', 'os'),
-            ('mfc40.dll', 'os'),
-            ('mfc42.dll', 'os'),
-            ('mfc42u.dll', 'os'),
-            ('msvcr120_clr0400.dll', 'os'),
-            ('vcruntime140_clr0400.dll', 'os'),
-            (r'C:\Windows\System32\mfc42.dll', 'os'),
-            ('C:mfc42.dll', 'os'),
-            (r'C:\Windows\System32\msvcp60.dll', 'os'),
-            ('C:msvcp60.dll', 'os'),
-            (r'C:\Windows\System32\vcruntime140_clr0400.dll', 'os'),
-            ('C:vcruntime140_clr0400.dll', 'os'),
-            (r'C:\Windows\System32\mfc40.dll', 'os'),
-            ('C:mfc40.dll', 'os'),
-            (r'C:\Windows\System32\mfc42u.dll', 'os'),
-            ('C:mfc42u.dll', 'os'),
-            (r'C:\Windows\System32\msvcr120_clr0400.dll', 'os'),
-            ('C:msvcr120_clr0400.dll', 'os'),
-            ('C:KERNEL32.dll', 'os'),
-            ('msvcirt.dll', 'os'),
-            ('ucrtbase_clr0400.dll', 'os'),
-            ('ucrtbase_enclave.dll', 'os'),
+            ('C:VCRUNTIME140', 1),
+            ('c:vcruntime140.dll', 1),
+            (r'C:x/..\VCRUNTIME140.dll', 1),
+            ('C:x:y:MSVCP140.dll', 1),
+            ('x:y:vcruntime140', 1),
+            (r'\\?\C:VCRUNTIME140.dll', 1),
+            ('C. :VCRUNTIME140.dll', 1),
+            ('C:VCRUNTIME140.dll:stream:$DATA', 1),
+            ('vcomp140d_app.dll', 1),
+            ('vccorlib140d_app.dll', 1),
+            ('vcamp140d_app.dll', 1),
+            ('msvcr120d_app.dll', 1),
+            ('msvcm80d.dll', 1),
+            ('msvci70d.dll', 1),
+            ('VCRUNTIME140..', 1),
+            (r'C:\runtime\VCRUNTIME140', 1),
+            ('api-ms-win-crt-runtime-l1-1-0.xyz', 1),
+            ('api-ms-win-crt-runtime-l1-1-9.dll', 1),
+            ('API-MS-WIN-CRT-HEAP-L1-1-0.foo', 1),
+            (r'C:\Windows\System32\mfc42.dll', 0),
+            ('C:mfc42.dll', 0),
+            (r'C:\Windows\System32\msvcp60.dll', 0),
+            ('C:msvcp60.dll', 0),
+            (r'C:\Windows\System32\vcruntime140_clr0400.dll', 0),
+            ('C:vcruntime140_clr0400.dll', 0),
+            (r'C:\Windows\System32\mfc40.dll', 0),
+            ('C:mfc40.dll', 0),
+            (r'C:\Windows\System32\mfc42u.dll', 0),
+            ('C:mfc42u.dll', 0),
+            (r'C:\Windows\System32\msvcr120_clr0400.dll', 0),
+            ('C:msvcr120_clr0400.dll', 0),
         ])
+        self.assertEqual(len(cases), len(set(cases)))
         for pe32, delayed, legacy in modes:
-            for name, kind in cases:
-                expected = int(kind in ('must-reject', 'regex-gap') or name == 'foo.dll:VCRUNTIME140.dll')
-                with self.subTest(pe32=pe32, delayed=delayed, legacy=legacy, name=name, kind=kind), tempfile.TemporaryDirectory() as temporary:
+            for name, expected in cases:
+                with self.subTest(pe32=pe32, delayed=delayed, legacy=legacy, name=name, expected=expected), tempfile.TemporaryDirectory() as temporary:
                     image = _pe(SYSTEM_IMPORTS if delayed else (name,),
                                 (name,) if delayed else (), pe32=pe32, legacy_delay=legacy)
                     path = self.write(Path(temporary), 'alias.exe', image)
@@ -597,6 +587,95 @@ class WindowsCrtImportTests(unittest.TestCase):
                     path = self.write(Path(temporary), 'malformed.exe', image)
                     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), 1)
+
+    def test_inventory_vocabulary_in_each_import_mode(self):
+        # Independent literal representatives: removing a production family row
+        # cannot silently remove its coverage from this list.
+        forbidden = (
+            'msvcrt10.dll', 'msvcrt21.dll', 'msvcrtd.dll', 'msvcirtd.dll',
+            'msvcr40d.dll', 'msvcr70.dll', 'msvcr71d.dll', 'msvcr80.dll',
+            'msvcr90d.dll', 'msvcr100.dll', 'msvcr110_app.dll', 'msvcr120d_app.dll',
+            'msvcp50.dll', 'msvcp60d.dll', 'msvcp70.dll', 'msvcp71d.dll',
+            'msvcp80.dll', 'msvcp90d.dll', 'msvcp100.dll', 'msvcp110d.dll',
+            'msvcp120_app.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
+            'msvcp140_atomic_wait.dll', 'msvcp140d_codecvt_ids.dll',
+            'msvci70.dll', 'msvci70d.dll', 'msvci71.dll', 'msvci71d.dll',
+            'msvcm80.dll', 'msvcm90d.dll',
+            'vcruntime140.dll', 'vcruntime140_1d.dll',
+            'vcruntime140_threads.dll', 'vcruntime140d_app.dll',
+            'appcrt140.dll', 'appcrt140d.dll', 'desktopcrt140.dll',
+            'desktopcrt140d.dll',
+            'concrt100.dll', 'concrt110d.dll', 'concrt120.dll', 'concrt140d_app.dll',
+            'vccorlib110.dll', 'vccorlib120_app.dll', 'vccorlib140d.dll',
+            'vcamp110.dll', 'vcamp120d.dll', 'vcamp140_app.dll',
+            'vcomp.dll', 'vcompd.dll', 'vcomp90.dll', 'vcomp100d.dll',
+            'vcomp110.dll', 'vcomp120d.dll', 'vcomp140_app.dll', 'vcomp100ui.dll',
+            'libomp140.x86_64.dll', 'libomp140d.aarch64.dll',
+            'mfc30.dll', 'mfc40ud.dll', 'mfc42d.dll', 'mfc70.dll', 'mfc71u.dll',
+            'mfc80d.dll', 'mfc90ud.dll', 'mfc100chs.dll', 'mfc110jpn.dll',
+            'mfc120enu.dll', 'mfc140rus.dll', 'mfcm80.dll', 'mfcm90ud.dll',
+            'mfcm100.dll', 'mfcm110u.dll', 'mfcm120d.dll', 'mfcm140ud.dll',
+            'mfcd40d.dll', 'mfcd40ud.dll', 'mfcn40d.dll', 'mfcn40ud.dll',
+            'mfco40d.dll', 'mfco40ud.dll', 'mfcd42d.dll', 'mfcd42ud.dll',
+            'mfcn42d.dll', 'mfcn42ud.dll', 'mfco42d.dll', 'mfco42ud.dll',
+            'mfcmifc80.dll', 'atl70.dll', 'atl71d.dll', 'atl80.dll',
+            'atl90d.dll', 'atl100.dll', 'atl110d.dll', 'atl140.dll',
+            'clang_rt.asan_dynamic-x86_64.dll',
+            'clang_rt.asan_dbg_dynamic-x86_64.dll',
+            'ucrtbase.dll', 'ucrtbased.dll', 'api-ms-win-crt-heap-l1-1-0.dll',
+            'msvcr100d_clr0400.dll', 'msvcr110d_clr0400.dll',
+            'msvcr120d_clr0400.dll', 'msvcp100_clr0400.dll',
+            'msvcp140_1_clr0400.dll',
+        )
+        self.assertEqual(len(forbidden), len(set(forbidden)))
+        modes = ((False, False, False), (True, False, False),
+                 (False, True, False), (True, True, False), (True, True, True))
+        with tempfile.TemporaryDirectory() as temporary:
+            for pe32, delayed, legacy in modes:
+                for name in forbidden:
+                    with self.subTest(name=name, pe32=pe32, delayed=delayed, legacy=legacy):
+                        image = _pe(SYSTEM_IMPORTS if delayed else (name,),
+                                    (name,) if delayed else (), pe32=pe32, legacy_delay=legacy)
+                        path = self.write(Path(temporary), 'inventory.exe', image)
+                        output, errors = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                            self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), 1)
+                        self.assertIn(repr(name), errors.getvalue())
+
+    def test_exact_os_inventory_and_siblings_in_each_import_mode(self):
+        exempt = (
+            'msvcp60.dll', 'mfc40.dll', 'mfc40u.dll', 'mfc42.dll',
+            'mfc42u.dll', 'mfc42loc.dll',
+            'msvcp110_win.dll', 'msvcp110_clr0400.dll',
+            'msvcr100_clr0400.dll', 'msvcr110_clr0400.dll',
+            'msvcr120_clr0400.dll', 'msvcp120_clr0400.dll',
+            'msvcp140_clr0400.dll', 'vcruntime140_clr0400.dll',
+            'vcruntime140_1_clr0400.dll',
+        )
+        siblings = (
+            'msvcp60d.dll', 'mfc40ud.dll', 'mfc42d.dll', 'msvcp110.dll',
+            'msvcp110d.dll', 'msvcp120.dll', 'msvcp140.dll',
+            'msvcr120d_clr0400.dll', 'vcruntime140d_clr0400.dll',
+        )
+        names = [(name, 0) for base in exempt for name in (
+            base, base[:-4], base.upper(), 'C:' + base.upper(),
+            'C:\\Windows\\System32\\' + base + ' .', base + '::$DATA')]
+        names += [(name, 1) for name in siblings]
+        modes = ((False, False, False), (True, False, False),
+                 (False, True, False), (True, True, False), (True, True, True))
+        with tempfile.TemporaryDirectory() as temporary:
+            for pe32, delayed, legacy in modes:
+                for name, expected in names:
+                    with self.subTest(name=name, pe32=pe32, delayed=delayed, legacy=legacy):
+                        image = _pe(SYSTEM_IMPORTS if delayed else (name,),
+                                    (name,) if delayed else (), pe32=pe32, legacy_delay=legacy)
+                        path = self.write(Path(temporary), 'exempt.exe', image)
+                        output, errors = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                            self.assertEqual(release_packaging.main(['verify-windows-imports', str(path)]), expected)
+                        if expected:
+                            self.assertIn(repr(name), errors.getvalue())
+        self.assertEqual(set(exempt), release_packaging.WINDOWS_SYSTEM_RUNTIME_IMPORTS)
 
     def test_every_redistributable_crt_import_fails(self):
         for forbidden in (
