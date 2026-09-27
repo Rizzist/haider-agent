@@ -2087,6 +2087,23 @@ async fn gate_v1_acp_title_never_overrides_typed_kind() {
                 .await;
         }
         agent
+            .send_update(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-13",
+                "title": "computer",
+                "kind": "other",
+                "status": "in_progress",
+            }))
+            .await;
+        agent
+            .send_update(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-13",
+                "kind": "read",
+                "status": "completed",
+            }))
+            .await;
+        agent
             .send(&json!({
                 "jsonrpc": "2.0",
                 "id": prompt["id"],
@@ -2124,7 +2141,22 @@ async fn gate_v1_acp_title_never_overrides_typed_kind() {
             None,
             None,
             None,
+            None,
+            Some(A::Read),
         ]
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Ok(StreamEvent::ServerToolUse { name, activity, .. }) => {
+                    Some((name.as_str(), *activity))
+                }
+                _ => None,
+            })
+            .last(),
+        Some(("computer", Some(A::Read))),
+        "a kind update changes the typed activity without replacing its display title",
     );
     let _ = script.await;
 }
