@@ -725,15 +725,11 @@ impl DisplayPath {
             {
                 Some(4)
             } else if self.parts.len() >= 4
-                && lower(&self.parts[0], "Volumes")
                 && lower(&self.parts[2], "Users")
-            {
-                Some(3)
-            } else if self.parts.len() >= 4
-                && lower(&self.parts[0], "mnt")
-                && self.parts[1].len() == 1
-                && self.parts[1].as_bytes()[0].is_ascii_alphabetic()
-                && lower(&self.parts[2], "Users")
+                && (lower(&self.parts[0], "Volumes")
+                    || lower(&self.parts[0], "mnt")
+                        && self.parts[1].len() == 1
+                        && self.parts[1].as_bytes()[0].is_ascii_alphabetic())
             {
                 Some(3)
             } else if self.parts.len() >= 3
@@ -750,14 +746,9 @@ impl DisplayPath {
                 .position(|part| lower(part, "Users"))
                 .map(|index| index + 1)
         } else if self.root.ends_with(':') || self.root.starts_with("//") {
-            if self.parts.first().is_some_and(|p| lower(p, "Users")) {
-                Some(1)
-            } else if self.root.ends_with(':')
-                && self
-                    .parts
-                    .first()
-                    .is_some_and(|p| lower(p, "Documents and Settings"))
-            {
+            if self.parts.first().is_some_and(|p| {
+                lower(p, "Users") || self.root.ends_with(':') && lower(p, "Documents and Settings")
+            }) {
                 Some(1)
             } else if self.root.starts_with("//")
                 && self
