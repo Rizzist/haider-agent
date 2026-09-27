@@ -18,6 +18,7 @@
 //! `unsafe` code). A Stop click whose Quartz event carries
 //! [`SYNTHETIC_INPUT_TAG`] was posted by Haider itself and is ignored.
 
+use super::overlay_macos_logic::MacVisibility;
 use super::{
     PresenceCommand, PresenceEvent, PresenceMark, PresencePoint, SYNTHETIC_INPUT_TAG, art,
     encode_event, parse_command_line,
@@ -237,7 +238,8 @@ struct Overlay {
     badge: Retained<NSPanel>,
     badge_text: Retained<NSTextField>,
     stop_text: Retained<NSTextField>,
-    visible: bool,
+    /// Capture visibility; no panel is ordered front between Conceal and Reveal.
+    visibility: MacVisibility,
     stopping: bool,
     badge_at_top: bool,
     position: Option<(f64, f64)>,
@@ -248,9 +250,6 @@ struct Overlay {
     ring_on_arrival: bool,
     ring_started: Option<Instant>,
     caption_until: Option<Instant>,
-    /// Between Conceal and Reveal (evidence-capturable mode only): no panel
-    /// may be ordered front, including by animation frames.
-    concealed: bool,
 }
 
 impl Overlay {
@@ -347,7 +346,7 @@ impl Overlay {
             badge,
             badge_text,
             stop_text,
-            visible: false,
+            visibility: MacVisibility::default(),
             stopping: false,
             badge_at_top: true,
             position: None,
@@ -358,7 +357,6 @@ impl Overlay {
             ring_on_arrival: false,
             ring_started: None,
             caption_until: None,
-            concealed: false,
         })
     }
 
@@ -396,10 +394,10 @@ impl Overlay {
                 self.badge_text.setStringValue(&NSString::from_str(&label));
                 self.stop_text.setStringValue(&NSString::from_str("Stop"));
                 self.stopping = false;
-                self.visible = true;
+                let may_show = self.visibility.show();
                 self.badge
                     .setFrame_display(self.badge_frame(self.badge_at_top), true);
-                if !self.concealed {
+                if may_show {
                     self.badge.orderFrontRegardless();
                     if self.position.is_some() {
                         self.pointer.orderFrontRegardless();
@@ -418,7 +416,7 @@ impl Overlay {
             // that are sharing-none are already absent from captures.
             PresenceCommand::Conceal { seq, .. } => {
                 if evidence_capturable() {
-                    self.concealed = true;
+                    self.visibility.conceal();
                     self.pointer.orderOut(None);
                     self.ring.orderOut(None);
                     self.badge.orderOut(None);
@@ -426,7 +424,7 @@ impl Overlay {
                 emit(&PresenceEvent::Ack { seq });
             }
             PresenceCommand::Reveal { .. } => {
-                if std::mem::take(&mut self.concealed) && self.visible {
+                if self.visibility.reveal() {
                     self.badge.orderFrontRegardless();
                     if self.position.is_some() {
                         self.pointer.orderFrontRegardless();
@@ -454,7 +452,7 @@ impl Overlay {
         self.move_to = target;
         self.move_started = Some(Instant::now());
         self.ring_on_arrival = mark.posts_pointer_input();
-        if self.visible && !self.concealed {
+        if self.visibility.may_show() {
             self.pointer.orderFrontRegardless();
         }
         if mark.posts_pointer_input() && from != target {
@@ -511,7 +509,7 @@ impl Overlay {
                 if let Some(seq) = self.ack_on_arrival.take() {
                     emit(&PresenceEvent::Ack { seq });
                 }
-                if std::mem::take(&mut self.ring_on_arrival) && self.visible && !self.concealed {
+                if std::mem::take(&mut self.ring_on_arrival) && self.visibility.may_show() {
                     let (x, y) = self.cocoa(self.move_to);
                     let half = art::RING_SIZE / 2.0;
                     self.ring.setFrameOrigin(NSPoint::new(x - half, y - half));
@@ -539,7 +537,7 @@ impl Overlay {
     }
 
     fn hide(&mut self) {
-        self.visible = false;
+        self.visibility.hide();
         self.stopping = false;
         self.move_started = None;
         self.ring_started = None;
@@ -554,7 +552,7 @@ impl Overlay {
     /// Returns true when `event` was a human Stop click (consumed).
     fn consume_stop_click(&mut self, event: &objc2_app_kit::NSEvent) -> bool {
         if event.r#type() != NSEventType::LeftMouseDown
-            || !self.visible
+            || !self.visibility.visible
             || event.windowNumber() != self.badge.windowNumber()
         {
             return false;

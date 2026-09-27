@@ -43,7 +43,7 @@ use haider_store::{
 use haider_tools::{
     ComputerBackend, ComputerCancelToken, ComputerError, ComputerInspection,
     ComputerInspectionBounds, ComputerOutput, ComputerPermissionPoll, ComputerResult,
-    ExcludeRegionScreenshotRedaction, ScreenshotRedactionRegion,
+    ExcludeRegionScreenshotRedaction, ScreenshotRedactionPolicy, ScreenshotRedactionRegion,
 };
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
@@ -2261,6 +2261,28 @@ struct LoggingBackend {
     log: OrderLog,
 }
 
+/// Parks the first image admission after the backend has returned. This
+/// exposes whether Reveal was sent before post-processing starts.
+struct ParkFirstRedaction {
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    first: AtomicBool,
+}
+
+impl ScreenshotRedactionPolicy for ParkFirstRedaction {
+    fn redact_png<'a>(&self, png: &'a [u8]) -> ComputerResult<std::borrow::Cow<'a, [u8]>> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            self.entered.send(()).expect("redaction observer");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("redaction release");
+        }
+        Ok(std::borrow::Cow::Borrowed(png))
+    }
+}
+
 #[async_trait]
 impl ComputerBackend for LoggingBackend {
     async fn execute(
@@ -2387,9 +2409,19 @@ async fn dispatcher_conceals_capturable_presence_around_screenshot_and_inspect()
         }),
     );
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let redaction = Arc::new(ParkFirstRedaction {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        first: AtomicBool::new(true),
+    });
     let factory: Arc<dyn TurnToolFactory> = Arc::new(
-        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
-            .with_presence(Arc::clone(&presence)),
+        BrokerToolFactory::with_computer_backend_and_redaction(
+            Arc::clone(&backend) as Arc<dyn ComputerBackend>,
+            redaction,
+        )
+        .with_presence(Arc::clone(&presence)),
     );
     let manager = WorkerManager::start(
         hub.clone(),
@@ -2420,6 +2452,16 @@ async fn dispatcher_conceals_capturable_presence_around_screenshot_and_inspect()
         device_id.clone(),
     )
     .await;
+    timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("image admission entered")
+        .expect("redaction observer");
+    assert_eq!(
+        log.lock().expect("log").clone(),
+        vec!["conceal", "capture:screenshot", "reveal"],
+        "Reveal must precede slow image admission"
+    );
+    release_tx.send(()).expect("release redaction");
     wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
     let log = log.lock().expect("log").clone();
     assert_eq!(

@@ -95,10 +95,23 @@ again.
   never reveal each other's capture, and a capture cancelled while waiting
   for the ack (Esc, Stop) still releases its hold, so another session that
   keeps the surface gets its indicator and Stop back. A renderer recreated
-  while a capture holds the surface is concealed right after its `Show`.
+  while a capture holds the surface receives `Conceal` before its first
+  `Show` or `Pointer`; a renderer that rejects `Conceal` is retired.
+  The capture waits only for the acknowledgement of its current `Conceal`
+  sequence. Late, duplicate, unsent and retired-renderer acknowledgements
+  cannot release a later capture, and old sequences are removed when a new
+  conceal is sent. Conceal sequence rollover stays in its reserved high
+  range, away from pointer acknowledgements. The hold ends immediately when
+  the screenshot or inspect backend returns, before image admission,
+  journaling and observation work.
 * Helpers keep a concealed state until `reveal`: the Windows fallback (and
   macOS evidence mode) never re-show the pointer, ring or badge from an
   animation frame, a `Show`, or a badge relocation while concealed.
+  The Linux helper likewise records Show labels and Pointer bodies without
+  posting notifications during conceal. Reveal posts the latest state once;
+  Hide leaves nothing to restore. Stop actions already queued for a closed
+  notification still reach the daemon during conceal; a Show label refresh
+  does not re-arm a Stop in the same notification generation.
 * Pre-existing turn-cancel race, fixed at the source: when a cancellation
   (Stop *or* Esc) is committed while a just-finished tool's result is being
   settled, the journal refuses the settlement ("durably cancelling; only

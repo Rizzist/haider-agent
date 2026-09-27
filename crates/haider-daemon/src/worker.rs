@@ -23524,7 +23524,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     };
                     // A capturable indicator (Linux notification popup) is
                     // taken off screen for the model-facing capture.
-                    let _revealed_after_capture = if matches!(
+                    let revealed_after_capture = if matches!(
                         operation.action(),
                         haider_protocol::computer::ComputerAction::Screenshot
                             | haider_protocol::computer::ComputerAction::Inspect { .. }
@@ -23533,7 +23533,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     } else {
                         None
                     };
-                    match self.computer.execute(operation.action(), &action_cancel).await {
+                    let execution = self.computer.execute(operation.action(), &action_cancel).await;
+                    // The model-facing pixels exist when execute returns. Restore
+                    // Stop before redaction, bounding, journaling or recording.
+                    drop(revealed_after_capture);
+                    match execution {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
                             let stored = self
                                 .admit_computer_screenshot_region(png, &action_cancel, operation.region())

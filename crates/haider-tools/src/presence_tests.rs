@@ -67,6 +67,33 @@ fn first_action_shows_the_surface_once_and_every_action_moves_the_pointer() {
 }
 
 #[test]
+fn pointer_sequence_wraps_below_the_reserved_conceal_range() {
+    let mut machine = PresenceMachine::<String>::default();
+    machine.next_seq = CONCEAL_ACK_SEQ_START - 1;
+    let now = Instant::now();
+    let (last, _) = machine
+        .begin_action(
+            key("seq"),
+            PresenceSurface::Screen,
+            PresenceMark::Move,
+            None,
+            now,
+        )
+        .expect("last pointer sequence");
+    let (first, _) = machine
+        .begin_action(
+            key("seq"),
+            PresenceSurface::Screen,
+            PresenceMark::Move,
+            None,
+            now,
+        )
+        .expect("wrapped pointer sequence");
+    assert_eq!(last, CONCEAL_ACK_SEQ_START - 1);
+    assert_eq!(first, 1);
+}
+
+#[test]
 fn run_end_and_cancel_hide_only_after_the_last_lease_on_that_surface() {
     let mut machine = PresenceMachine::<String>::default();
     let now = Instant::now();
@@ -551,11 +578,17 @@ fn linux_stale_stop_never_reaches_a_later_generation() {
     router.show();
     router.posted(10);
     assert!(router.on_action(9, "stop"));
-    // Stopping then Show (a new run on the surface) re-arms Stop.
+    // A label refresh cannot re-arm Stop in the same generation.
     router.stopping();
     router.show();
+    assert!(router.is_stopping());
+    assert!(!router.on_action(10, "stop"));
+    // Only Hide followed by Show starts a new generation.
+    router.hide();
+    router.show();
+    router.posted(11);
     assert!(!router.is_stopping());
-    assert!(router.on_action(10, "stop"));
+    assert!(router.on_action(11, "stop"));
     // A failed Notify (id 0) never becomes live.
     let mut router = LinuxStopRouter::default();
     router.show();

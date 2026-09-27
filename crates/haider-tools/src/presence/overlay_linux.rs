@@ -19,6 +19,7 @@
 //! screen; it is posted with low urgency so the desktop retires the popup
 //! into its notification list quickly, where Stop stays available.
 
+use super::overlay_linux_logic::LinuxPopupState;
 use super::{
     LinuxNotificationPlan, LinuxStopRouter, PresenceCommand, PresenceEvent, PresenceMark,
     encode_event, parse_command_line,
@@ -66,7 +67,6 @@ struct Notifier {
     id: u32,
     label: String,
     last_update: Option<Instant>,
-    last_body: String,
     plan: LinuxNotificationPlan,
 }
 
@@ -74,7 +74,6 @@ impl Notifier {
     /// Posts (or replaces) the notification and records its id with the
     /// Stop router of the active generation.
     async fn notify(&mut self, body: &str, router: &mut LinuxStopRouter) {
-        self.last_body = body.to_owned();
         let body = self.plan.body(body);
         let body = body.as_str();
         let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
@@ -203,10 +202,10 @@ async fn run_async() -> i32 {
         id: 0,
         label: "Haider is controlling this screen".into(),
         last_update: None,
-        last_body: String::new(),
         plan,
     };
     let mut router = LinuxStopRouter::default();
+    let mut popup = LinuxPopupState::default();
     loop {
         tokio::select! {
             line = lines.recv() => {
@@ -217,34 +216,39 @@ async fn run_async() -> i32 {
                             notifier.label = label;
                             router.show();
                             let body = notifier.plan.intro_body();
-                            notifier.notify(body, &mut router).await;
+                            if popup.show(body) {
+                                notifier.notify(body, &mut router).await;
+                            }
                         }
                         PresenceCommand::Pointer { seq, mark, point, .. } => {
                             emit(&PresenceEvent::Ack { seq });
                             let due = notifier.last_update.is_none_or(|last| last.elapsed() >= UPDATE_INTERVAL);
-                            if router.is_active() && due && mark != PresenceMark::Observe {
+                            if router.is_active() && mark != PresenceMark::Observe {
                                 let body = point.map_or_else(
                                     || format!("Last action: {}", mark.caption()),
                                     |point| format!("Last action: {} at ({:.0}, {:.0})", mark.caption(), point.x, point.y),
                                 );
-                                notifier.notify(&body, &mut router).await;
+                                if popup.pointer(&body, due) {
+                                    notifier.notify(&body, &mut router).await;
+                                }
                             }
                         }
                         PresenceCommand::Stopping { .. } => router.stopping(),
                         PresenceCommand::Hide { .. } => {
                             router.hide();
+                            popup.hide();
                             notifier.close().await;
                         }
                         // The popup is an ordinary window: close it around a
                         // model-facing capture, then post it again.
                         PresenceCommand::Conceal { seq, .. } => {
+                            popup.conceal();
                             notifier.close().await;
                             tokio::time::sleep(CONCEAL_SETTLE).await;
                             emit(&PresenceEvent::Ack { seq });
                         }
                         PresenceCommand::Reveal { .. } => {
-                            if router.is_active() && !router.is_stopping() {
-                                let body = notifier.last_body.clone();
+                            if let Some(body) = popup.reveal(router.is_active(), router.is_stopping()) {
                                 notifier.notify(&body, &mut router).await;
                             }
                         }
@@ -278,3 +282,7 @@ async fn run_async() -> i32 {
     notifier.close().await;
     0
 }
+
+#[cfg(test)]
+#[path = "overlay_linux_dbus_tests.rs"]
+mod dbus_tests;

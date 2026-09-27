@@ -39,12 +39,24 @@ mod overlay_windows_logic;
 #[path = "presence/overlay_linux.rs"]
 mod overlay_linux;
 
+/// Linux notification posting decisions, shared with tests on every host.
+#[cfg(any(target_os = "linux", test))]
+#[path = "presence/overlay_linux_logic.rs"]
+mod overlay_linux_logic;
+
+#[cfg(any(target_os = "macos", test))]
+#[path = "presence/overlay_macos_logic.rs"]
+mod overlay_macos_logic;
+
 use haider_protocol::computer::{CU_PRESENCE_IDLE_SECS, ComputerAction};
 use haider_protocol::mobile::MobileAction;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Upper sequence range reserved for capture Conceal acknowledgements.
+pub const CONCEAL_ACK_SEQ_START: u64 = 1 << 62;
 
 /// Hidden `haiderd` argument that runs the desktop overlay helper instead of
 /// the daemon. Reusing the shipped daemon executable means no new release
@@ -384,7 +396,11 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             });
         }
         let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        self.next_seq = if seq >= CONCEAL_ACK_SEQ_START - 1 {
+            1
+        } else {
+            seq + 1
+        };
         commands.push(PresenceCommand::Pointer {
             surface,
             seq,
@@ -618,9 +634,9 @@ impl LinuxStopRouter {
     pub fn show(&mut self) {
         if !self.active {
             self.live.clear();
+            self.stopping = false;
         }
         self.active = true;
-        self.stopping = false;
     }
 
     /// The server returned `id` for a notification of this generation.

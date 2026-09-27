@@ -20,9 +20,9 @@
 use haider_protocol::computer::ComputerAction;
 use haider_protocol::mobile::MobileAction;
 use haider_tools::presence::{
-    CONCEAL_ACK_TIMEOUT, POINTER_ACK_TIMEOUT, PRESENCE_IDLE_TIMEOUT, PresenceCommand,
-    PresenceEndReason, PresenceEvent, PresenceMachine, PresenceMark, PresencePoint,
-    PresenceRefusal, PresenceSurface,
+    CONCEAL_ACK_SEQ_START, CONCEAL_ACK_TIMEOUT, POINTER_ACK_TIMEOUT, PRESENCE_IDLE_TIMEOUT,
+    PresenceCommand, PresenceEndReason, PresenceEvent, PresenceMachine, PresenceMark,
+    PresencePoint, PresenceRefusal, PresenceSurface,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +71,8 @@ struct CaptureConceal {
     holders: usize,
     /// A Conceal is in effect on the current renderer (Reveal owed).
     sent: bool,
+    /// The sole Conceal whose acknowledgement may release this hold.
+    outstanding_seq: Option<u64>,
     /// Whether the current Conceal has been acknowledged.
     acked: tokio::sync::watch::Sender<bool>,
 }
@@ -80,6 +82,7 @@ impl Default for CaptureConceal {
         Self {
             holders: 0,
             sent: false,
+            outstanding_seq: None,
             acked: tokio::sync::watch::Sender::new(false),
         }
     }
@@ -124,7 +127,7 @@ impl CuPresence {
             factories: StdMutex::new(BTreeMap::new()),
             ticker_running: AtomicBool::new(false),
             tick_interval,
-            next_conceal_seq: std::sync::atomic::AtomicU64::new(1 << 62),
+            next_conceal_seq: std::sync::atomic::AtomicU64::new(CONCEAL_ACK_SEQ_START),
             stop_cancel_delay: StdMutex::new(Duration::ZERO),
             me: me.clone(),
         })
@@ -237,26 +240,42 @@ impl CuPresence {
     }
 
     /// Sends Conceal to `surface`'s renderer if it is capturable, and marks
-    /// the Conceal as owed a Reveal. Caller holds the state lock.
-    fn send_conceal(&self, state: &mut State, surface: PresenceSurface) {
+    /// the Conceal as owed a Reveal. Returns false if a capturable renderer
+    /// rejected it, so a recreated renderer is retired before any Show.
+    /// Caller holds the state lock.
+    fn send_conceal(&self, state: &mut State, surface: PresenceSurface) -> bool {
         let capturable = state
             .renderers
             .get(&surface)
             .is_some_and(|renderer| renderer.capturable());
         if !capturable {
-            return;
+            return true;
         }
-        let seq = self.next_conceal_seq.fetch_add(1, Ordering::Relaxed);
+        // Stay in the Conceal sequence range even at u64 rollover. A pointer
+        // acknowledgement must never alias a Conceal acknowledgement.
+        let seq = self
+            .next_conceal_seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current == u64::MAX {
+                    CONCEAL_ACK_SEQ_START
+                } else {
+                    current + 1
+                })
+            })
+            .unwrap_or(CONCEAL_ACK_SEQ_START);
         let sent = state
             .renderers
             .get_mut(&surface)
             .is_some_and(|renderer| renderer.send(&PresenceCommand::Conceal { surface, seq }));
         if sent {
+            state.conceal_acks.retain(|_, pending| *pending != surface);
             state.conceal_acks.insert(seq, surface);
             let capture = state.captures.entry(surface).or_default();
             capture.sent = true;
+            capture.outstanding_seq = Some(seq);
             capture.acked.send_replace(false);
         }
+        sent
     }
 
     /// Takes one capture hold on `surface`, synchronously (so a caller that
@@ -274,7 +293,14 @@ impl CuPresence {
             capture.holders == 1
         };
         if first {
-            self.send_conceal(&mut state, surface);
+            if !self.send_conceal(&mut state, surface) {
+                // A renderer that cannot accept Conceal must not remain on
+                // screen while the capture proceeds without an ack.
+                if let Some(mut renderer) = state.renderers.remove(&surface) {
+                    renderer.close();
+                }
+                state.conceal_acks.retain(|_, pending| *pending != surface);
+            }
         }
         let capture = state.captures.entry(surface).or_default();
         (capture.sent && !*capture.acked.borrow()).then(|| capture.acked.subscribe())
@@ -288,6 +314,9 @@ impl CuPresence {
                 return;
             };
             capture.holders = capture.holders.saturating_sub(1);
+            if capture.holders == 0 {
+                capture.outstanding_seq = None;
+            }
             capture.holders == 0 && std::mem::take(&mut capture.sent)
         };
         if reveal && let Some(renderer) = state.renderers.get_mut(&surface) {
@@ -322,10 +351,17 @@ impl CuPresence {
                 let mut state = lock(&self.state);
                 if let Some(sender) = state.acks.remove(&seq) {
                     let _ = sender.send(());
-                } else if let Some(surface) = state.conceal_acks.remove(&seq)
-                    && let Some(capture) = state.captures.get(&surface)
+                } else if state.conceal_acks.get(&seq) == Some(&surface)
+                    && state
+                        .captures
+                        .get(&surface)
+                        .is_some_and(|capture| capture.sent && capture.outstanding_seq == Some(seq))
                 {
-                    capture.acked.send_replace(true);
+                    state.conceal_acks.remove(&seq);
+                    if let Some(capture) = state.captures.get_mut(&surface) {
+                        capture.outstanding_seq = None;
+                        capture.acked.send_replace(true);
+                    }
                 }
             }
             PresenceEvent::Ready {
@@ -380,6 +416,7 @@ impl CuPresence {
     fn dispatch(&self, state: &mut State, commands: Vec<PresenceCommand>) {
         for command in commands {
             let surface = command.surface();
+            let mut initialized = true;
             if let std::collections::btree_map::Entry::Vacant(slot) = state.renderers.entry(surface)
             {
                 // Only a Show or a Pointer on a surface that should be
@@ -396,7 +433,12 @@ impl CuPresence {
                 else {
                     continue;
                 };
-                if matches!(command, PresenceCommand::Pointer { .. })
+                let held = state
+                    .captures
+                    .get(&surface)
+                    .is_some_and(|capture| capture.holders > 0);
+                if !held
+                    && matches!(command, PresenceCommand::Pointer { .. })
                     && !renderer.send(&PresenceCommand::Show {
                         surface,
                         label: surface.badge_label().to_owned(),
@@ -405,25 +447,26 @@ impl CuPresence {
                     continue;
                 }
                 slot.insert(renderer);
-                // A renderer (re)created while a capture is in progress must
-                // not appear in it: conceal it right after its Show.
-                if state
-                    .captures
-                    .get(&surface)
-                    .is_some_and(|capture| capture.holders > 0)
-                {
-                    let _ = state
-                        .renderers
-                        .get_mut(&surface)
-                        .map(|renderer| renderer.send(&command));
-                    self.send_conceal(state, surface);
-                    continue;
+                // A renderer recreated during a capture must be concealed
+                // BEFORE its first Show/Pointer, so it cannot flash in the
+                // in-flight screenshot even for one frame.
+                if held {
+                    initialized = self.send_conceal(state, surface);
+                    if initialized && matches!(command, PresenceCommand::Pointer { .. }) {
+                        initialized = state.renderers.get_mut(&surface).is_some_and(|renderer| {
+                            renderer.send(&PresenceCommand::Show {
+                                surface,
+                                label: surface.badge_label().to_owned(),
+                            })
+                        });
+                    }
                 }
             }
-            let alive = state
-                .renderers
-                .get_mut(&surface)
-                .is_some_and(|renderer| renderer.send(&command));
+            let alive = initialized
+                && state
+                    .renderers
+                    .get_mut(&surface)
+                    .is_some_and(|renderer| renderer.send(&command));
             if !alive || matches!(command, PresenceCommand::Hide { .. }) {
                 if let Some(mut renderer) = state.renderers.remove(&surface) {
                     renderer.close();
@@ -434,6 +477,7 @@ impl CuPresence {
                 state.conceal_acks.retain(|_, pending| *pending != surface);
                 if let Some(capture) = state.captures.get_mut(&surface) {
                     capture.sent = false;
+                    capture.outstanding_seq = None;
                     capture.acked.send_replace(true);
                 }
             }
