@@ -516,13 +516,17 @@ class WindowsCrtImportTests(unittest.TestCase):
             *[(n, 0) for n in (
                 'KERNEL32.dll', 'api-ms-win-core-crt-l1-1-0.dll', 'api-ms-win-core-crt-l2-1-0.dll', 'API-MS-WIN-CORE-CRT-L1-1-0',
                 'ext-ms-win-ntuser-window-l1-1-0.dll', 'ext-ms-win-kernel32-package-current-l1-1-0.dll',
-                'msvcrt.dll', 'msvcrt20.dll', 'msvcrt40.dll', 'msvcirt.dll', 'msvcp_win.dll',
-                'atl.dll', 'atlthunk.dll', 'mfcsubs.dll', 'mfcans32.dll', 'ucrtbase_clr0400.dll',
-                'msvcr120_clr0400.dll', 'ucrtbase_enclave.dll', 'C:' + B + 'Windows' + B + 'System32' + B + 'bcrypt.dll',
+                'msvcrt.dll', 'msvcirt.dll', 'msvcp_win.dll',
+                'atl.dll', 'atlthunk.dll', 'mfcsubs.dll', 'mfcans32.dll',
+                'C:' + B + 'Windows' + B + 'System32' + B + 'bcrypt.dll',
                 B*2 + '?' + B + 'C:' + B + 'Windows' + B + 'System32' + B + 'ntdll.dll', 'C:KERNEL32.dll',
                 'vcruntime.dll', 'mfc.dll', 'msvcr.dll', 'concrt.dll', 'My_Odd Name~1+(x).dll')],
-            # OS-shipped but flagged by the pre-existing vocabulary
-            *[(n, 0) for n in ('msvcp60.dll', 'mfc42.dll', 'mfc42u.dll', 'vcruntime140_clr0400.dll', 'mfc40.dll')],
+            # Exact x64 System32 exemptions and fail-closed former exemptions.
+            *[(n, 0) for n in ('mfc42u.dll', 'msvcp110_win.dll')],
+            *[(n, 1) for n in ('msvcrt20.dll', 'msvcrt40.dll', 'msvcp60.dll',
+                              'mfc40.dll', 'mfc40u.dll', 'mfc42.dll', 'mfc42loc.dll',
+                              'msvcr120_clr0400.dll', 'vcruntime140_clr0400.dll',
+                              'ucrtbase_clr0400.dll', 'ucrtbase_enclave.dll')],
         ]
         malformed = [('tab', 'VCRUNTIME140.dll', b'\t'), ('trailing CR', 'VCRUNTIME140.dll', b'\r'),
                      ('U+0130 dotted I', 'VCRUNTXXME140.dll', '\u0130'.encode()), ('U+212A Kelvin in KERNEL32', 'XXXERNEL32.dll', '\u212a'.encode()),
@@ -538,6 +542,8 @@ class WindowsCrtImportTests(unittest.TestCase):
             (r'\\?\C:VCRUNTIME140.dll', 1),
             ('C. :VCRUNTIME140.dll', 1),
             ('C:VCRUNTIME140.dll:stream:$DATA', 1),
+            ('mfc42u.dll:vcruntime140.dll', 1),
+            ('vcruntime140.dll' + B + '..' + B + 'msvcp60.dll', 1),
             ('vcomp140d_app.dll', 1),
             ('vccorlib140d_app.dll', 1),
             ('vcamp140d_app.dll', 1),
@@ -549,18 +555,18 @@ class WindowsCrtImportTests(unittest.TestCase):
             ('api-ms-win-crt-runtime-l1-1-0.xyz', 1),
             ('api-ms-win-crt-runtime-l1-1-9.dll', 1),
             ('API-MS-WIN-CRT-HEAP-L1-1-0.foo', 1),
-            (r'C:\Windows\System32\mfc42.dll', 0),
-            ('C:mfc42.dll', 0),
-            (r'C:\Windows\System32\msvcp60.dll', 0),
-            ('C:msvcp60.dll', 0),
-            (r'C:\Windows\System32\vcruntime140_clr0400.dll', 0),
-            ('C:vcruntime140_clr0400.dll', 0),
-            (r'C:\Windows\System32\mfc40.dll', 0),
-            ('C:mfc40.dll', 0),
+            (r'C:\Windows\System32\mfc42.dll', 1),
+            ('C:mfc42.dll', 1),
+            (r'C:\Windows\System32\msvcp60.dll', 1),
+            ('C:msvcp60.dll', 1),
+            (r'C:\Windows\System32\vcruntime140_clr0400.dll', 1),
+            ('C:vcruntime140_clr0400.dll', 1),
+            (r'C:\Windows\System32\mfc40.dll', 1),
+            ('C:mfc40.dll', 1),
             (r'C:\Windows\System32\mfc42u.dll', 0),
             ('C:mfc42u.dll', 0),
-            (r'C:\Windows\System32\msvcr120_clr0400.dll', 0),
-            ('C:msvcr120_clr0400.dll', 0),
+            (r'C:\Windows\System32\msvcr120_clr0400.dll', 1),
+            ('C:msvcr120_clr0400.dll', 1),
         ])
         self.assertEqual(len(cases), len(set(cases)))
         for pe32, delayed, legacy in modes:
@@ -619,11 +625,16 @@ class WindowsCrtImportTests(unittest.TestCase):
             'mfcd40d.dll', 'mfcd40ud.dll', 'mfcn40d.dll', 'mfcn40ud.dll',
             'mfco40d.dll', 'mfco40ud.dll', 'mfcd42d.dll', 'mfcd42ud.dll',
             'mfcn42d.dll', 'mfcn42ud.dll', 'mfco42d.dll', 'mfco42ud.dll',
-            'mfcmifc80.dll', 'atl70.dll', 'atl71d.dll', 'atl80.dll',
+            'mfcmifc80.dll', 'mfcmifc90.dll', 'mfcmifc90d.dll',
+            'mfcmifc150_app.dll', 'atl70.dll', 'atl71d.dll', 'atl80.dll',
             'atl90d.dll', 'atl100.dll', 'atl110d.dll', 'atl140.dll',
             'clang_rt.asan_dynamic-x86_64.dll',
             'clang_rt.asan_dbg_dynamic-x86_64.dll',
-            'ucrtbase.dll', 'ucrtbased.dll', 'api-ms-win-crt-heap-l1-1-0.dll',
+            'ucrtbase.dll', 'ucrtbased.dll', 'ucrtbase_clr0400.dll',
+            'ucrtbase_app.dll', 'ucrtbase_future.dll', 'ucrtbase_150.dll',
+            'ucrtbase_enclave.dll', 'api-ms-win-crt-heap-l1-1-0.dll',
+            'pgort100.dll', 'pgort140.dll', 'pgort140d.dll',
+            'pgort150.dll', 'pgort150_app.dll', 'PGORT140',
             'msvcr100d_clr0400.dll', 'msvcr110d_clr0400.dll',
             'msvcr120d_clr0400.dll', 'msvcp100_clr0400.dll',
             'msvcp140_1_clr0400.dll',
@@ -690,11 +701,11 @@ class WindowsCrtImportTests(unittest.TestCase):
                         self.assertIn(repr(name), errors.getvalue())
 
     def test_exact_os_inventory_and_siblings_in_each_import_mode(self):
-        exempt = (
-            'msvcrt20.dll', 'msvcrt40.dll',
-            'msvcp60.dll', 'mfc40.dll', 'mfc40u.dll', 'mfc42.dll',
-            'mfc42u.dll', 'mfc42loc.dll',
-            'msvcp110_win.dll', 'msvcp110_clr0400.dll',
+        exempt = ('mfc42u.dll', 'msvcp110_win.dll')
+        removed = (
+            'msvcrt20.dll', 'msvcrt40.dll', 'msvcp60.dll',
+            'mfc40.dll', 'mfc40u.dll', 'mfc42.dll', 'mfc42loc.dll',
+            'msvcp110_clr0400.dll',
             'msvcr100_clr0400.dll', 'msvcr110_clr0400.dll',
             'msvcr120_clr0400.dll', 'msvcp120_clr0400.dll',
             'msvcp140_clr0400.dll', 'vcruntime140_clr0400.dll',
@@ -706,6 +717,9 @@ class WindowsCrtImportTests(unittest.TestCase):
             'msvcr120d_clr0400.dll', 'vcruntime140d_clr0400.dll',
         )
         names = [(name, 0) for base in exempt for name in (
+            base, base[:-4], base.upper(), 'C:' + base.upper(),
+            'C:\\Windows\\System32\\' + base + ' .', base + '::$DATA')]
+        names += [(name, 1) for base in removed for name in (
             base, base[:-4], base.upper(), 'C:' + base.upper(),
             'C:\\Windows\\System32\\' + base + ' .', base + '::$DATA')]
         names += [(name, 1) for name in siblings]

@@ -634,7 +634,7 @@ def _verify_release_bundle(artifact: Path, target: str, *, legacy: bool) -> None
 # The api-ms-win-crt-* API sets and ucrtbase.dll are OS components on Windows
 # 10+, but this gate also uses them to detect /MD (registry #176). The entries
 # below describe runtime *families* across toolset versions. Unknown future
-# version numbers fail closed; only exact Windows/.NET names below are exempt.
+# version numbers fail closed; only exact x64 Windows names below are exempt.
 # Sources: https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute
 # and https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features
 FORBIDDEN_WINDOWS_IMPORT_FAMILIES = (
@@ -643,51 +643,37 @@ FORBIDDEN_WINDOWS_IMPORT_FAMILIES = (
     (r"msvcrt\d+d?(?:_[a-z0-9_]+)?\.dll", "VC 1.x/2.x CRT and versioned debug siblings", "https://ftp.zx.net.nz/pub/archive/ftp.microsoft.com/MISC/KB/en-us/115/082.HTM"),
     (r"msvcrtd\.dll", "VC 4/5 debug CRT", "https://ftp.zx.net.nz/pub/archive/ftp.microsoft.com/MISC/KB/en-us/154/753.HTM"),
     (r"msvcirtd\.dll", "VC 4/5 debug iostreams", "https://ftp.zx.net.nz/pub/archive/ftp.microsoft.com/MISC/KB/en-us/165/685.HTM"),
-    (r"msvcr\d+d?(?:_[a-z0-9_]+)?\.dll", "versioned VC CRT", "https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features"),
+    (r"msvcr\d+d?(?:_[a-z0-9_]+)?\.dll", "versioned VC CRT", "https://learn.microsoft.com/en-us/visualstudio/releases/2012/2012-redistribution-vs"),
     (r"msvcp\d+d?(?:_[a-z0-9_]+)?\.dll", "VC C++ library and satellites", "https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features"),
-    (r"msvci\d+d?(?:_[a-z0-9_]+)?\.dll", "VC iostreams", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
-    (r"msvcm\d+d?(?:_[a-z0-9_]+)?\.dll", "mixed-mode C++/CLI CRT", "https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features"),
-    (r"vcruntime\d+d?(?:_[a-z0-9_]+)?\.dll", "VC runtime and satellites", "https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features"),
+    (r"msvci\d+d?(?:_[a-z0-9_]+)?\.dll", "VC iostreams", "https://support.sas.com/documentation/installcenter/eguide/4.1/sreq.pdf"),
+    (r"msvcm\d+d?(?:_[a-z0-9_]+)?\.dll", "mixed-mode C++/CLI CRT", "https://learn.microsoft.com/en-us/cpp/dotnet/create-a-partially-trusted-application"),
+    (r"vcruntime\d+d?(?:_[a-z0-9_]+)?\.dll", "VC runtime and satellites", "https://learn.microsoft.com/en-us/cpp/parallel/concrt/overview-of-the-concurrency-runtime"),
     (r"(?:appcrt|desktopcrt)\d+d?(?:_[a-z0-9_]+)?\.dll", "VS14 preview split CRT", "https://devblogs.microsoft.com/cppblog/the-great-c-runtime-crt-refactoring/"),
     (r"concrt\d+d?(?:_[a-z0-9_]+)?\.dll", "Concurrency Runtime", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
     (r"vccorlib\d+d?(?:_[a-z0-9_]+)?\.dll", "C++/CX runtime", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
     (r"vcamp\d+d?(?:_[a-z0-9_]+)?\.dll", "C++ AMP runtime", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
     (r"vcomp(?:d(?:_[a-z0-9_]+)?|\d+d?(?:_[a-z0-9_]+)?)?\.dll", "VC OpenMP, including VC8 unversioned", "https://jacobfilipp.com/MSDN/2005_10/OpenMP/chm.htm"),
     (r"vcomp\d+ui(?:_[a-z0-9_]+)?\.dll", "VC OpenMP UI resources", "https://support.microsoft.com/en-us/topic/visual-studio-fix-module-state-is-corrupted-in-a-visual-c-2010-mfc-application-that-is-running-in-windows-8-774d1687-eb29-3468-b68a-df5d8517300e"),
+    (r"pgort\d+d?(?:_[a-z0-9_]+)?\.dll", "VC PGO instrumentation runtime", "https://learn.microsoft.com/en-us/windows/uwp/debug-test-perf/pgo-for-uwp"),
     (r"libomp[a-z0-9_.-]*\.dll", "LLVM OpenMP", "https://devblogs.microsoft.com/cppblog/openmp-updates-and-fixes-for-cpp-in-visual-studio-2019-16-10/"),
     (r"mfc\d+(?:u|d|ud|[a-z]{3})?(?:_[a-z0-9_]+)?\.dll", "MFC, Unicode, debug, and localized resources", "https://learn.microsoft.com/en-us/cpp/windows/redistributing-the-mfc-library"),
     (r"mfcm\d+(?:u|d|ud)?(?:_[a-z0-9_]+)?\.dll", "managed MFC", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
     (r"mfc[don]\d+(?:u?d?)(?:_[a-z0-9_]+)?\.dll", "split VC4/5 MFC", "https://ftp.zx.net.nz/pub/archive/ftp.microsoft.com/MISC/KB/en-us/165/685.HTM"),
-    (r"mfcmifc80\.dll", "managed MFC interface assembly", "https://learn.microsoft.com/en-us/cpp/windows/redistributing-the-mfc-library"),
-    (r"atl\d+d?(?:_[a-z0-9_]+)?\.dll", "versioned ATL", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
+    (r"mfcmifc\d+d?(?:_[a-z0-9_]+)?\.dll", "managed MFC interface assembly", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
+    (r"atl\d+d?(?:_[a-z0-9_]+)?\.dll", "versioned ATL", "https://learn.microsoft.com/en-us/security-updates/securitybulletins/2007/ms07-012"),
     (r"clang_rt\.asan_(?:dbg_)?dynamic-[a-z0-9_]+\.dll", "VS AddressSanitizer runtime", "https://learn.microsoft.com/en-us/cpp/sanitizers/asan-runtime"),
-    (r"ucrtbase(?:d(?:_[a-z0-9_]+)?)?\.dll", "UCRT and debug UCRT; /MD policy", "https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features"),
-    (r"api-ms-win-crt-[a-z0-9-]+\.dll", "UCRT API sets; /MD policy", "https://learn.microsoft.com/en-us/cpp/porting/upgrade-your-code-to-the-universal-crt"),
+    (r"ucrtbased?(?:_[a-z0-9_]+)?\.dll", "UCRT and debug UCRT; /MD policy", "https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features"),
+    (r"api-ms-win-crt-[a-z0-9-]+\.dll", "UCRT API sets; /MD policy", "https://learn.microsoft.com/en-us/uwp/win32-and-com/win32-extension-apis"),
 )
 FORBIDDEN_WINDOWS_IMPORT = re.compile(
     "|".join(f"(?:{pattern})" for pattern, _, _ in FORBIDDEN_WINDOWS_IMPORT_FAMILIES),
     re.IGNORECASE,
 )
-# Exact Windows/.NET component names. The CLR entries depend on the installed
-# Framework update; they do not claim availability on every stock Windows SKU.
+# Only the two owner-ruled exact Windows names below are exempt. Framework-
+# servicing and 32-bit compatibility names fail closed.
 WINDOWS_SYSTEM_RUNTIME_IMPORTS = {
-    "msvcrt20.dll",  # Windows legacy CRT (32-bit); https://learn.microsoft.com/en-us/answers/questions/2489142/extremely-slow-reboot
-    "msvcrt40.dll",  # Windows compatibility forwarder (32-bit); https://learn.microsoft.com/en-us/answers/questions/5577929/msvcrt40-dll-missing-when-installing-software
-    "msvcp60.dll",  # Windows VC6 compatibility; https://learn.microsoft.com/en-us/security-updates/securitybulletins/2007/ms07-012
-    "mfc40.dll",  # Windows MFC 4.0; https://support.microsoft.com/en-gb/topic/ms10-074-vulnerability-in-microsoft-foundation-classes-could-allow-remote-code-execution-591ee7a4-48a6-5f55-4822-42419f51ef49
-    "mfc40u.dll",  # Windows Unicode MFC 4.0; https://learn.microsoft.com/en-us/security-updates/securitybulletins/2007/ms07-012
-    "mfc42.dll",  # Windows MFC 4.2; https://learn.microsoft.com/en-us/security-updates/securitybulletins/2007/ms07-012
-    "mfc42u.dll",  # Windows Unicode MFC 4.2; https://learn.microsoft.com/en-us/security-updates/securitybulletins/2007/ms07-012
-    "mfc42loc.dll",  # Windows XP MFC locale resources; https://learn.microsoft.com/en-us/archive/msdn-magazine/2001/september/under-the-hood-new-vectored-exception-handling-in-windows-xp
-    "msvcp110_win.dll",  # Windows VC11 compatibility; https://learn.microsoft.com/en-us/answers/questions/950582/is-msvcp110-win-specific-to-a-visual-studio-versio
-    "msvcp110_clr0400.dll",  # Windows 8/.NET 4.5 CLR; https://www.nirsoft.net/dll_information/windows8/m.html
-    "msvcr100_clr0400.dll",  # Windows 8/.NET 4.x CLR; https://www.nirsoft.net/dll_information/windows8/m.html
-    "msvcr110_clr0400.dll",  # Windows 8/.NET 4.x CLR; https://www.nirsoft.net/dll_information/windows8/m.html
-    "msvcr120_clr0400.dll",  # .NET 4.x CLR; https://support.microsoft.com/en-us/topic/security-only-update-for-net-framework-4-5-2-for-windows-8-1-and-windows-server-2012-r2-kb4565581-6389d650-54a8-56dd-96cb-33298264d11f
-    "msvcp120_clr0400.dll",  # .NET 4.x CLR; https://support.microsoft.com/tr-tr/servicing/dotnetframework/windows-10/1809/2019/01/december-5-2018-kb4469041-preview-of-cumulative-update-for-net-framework-3-5-and-4-7-2-for-windows-1
-    "msvcp140_clr0400.dll",  # .NET 4.8 WPF; https://github.com/microsoft/microsoft-ui-xaml/issues/9158
-    "vcruntime140_clr0400.dll",  # .NET 4.8 CLR; https://github.com/microsoft/microsoft-ui-xaml/issues/9158
-    "vcruntime140_1_clr0400.dll",  # .NET 4.8 CLR; https://github.com/microsoft/microsoft-ui-xaml/issues/9158
+    "mfc42u.dll",  # MS07-012 x64 file table: Mfc42u.dll 6.5.9146.0 on XP x64 / Server 2003 x64; https://learn.microsoft.com/en-us/security-updates/securitybulletins/2007/ms07-012
+    "msvcp110_win.dll",  # Microsoft staff: Windows component, not VC redist; https://learn.microsoft.com/en-us/answers/questions/950582/is-msvcp110-win-specific-to-a-visual-studio-versio
 }
 _PE_IMPORT_DIRECTORY = 1
 _PE_DELAY_IMPORT_DIRECTORY = 13
