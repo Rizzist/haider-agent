@@ -11,7 +11,15 @@ use super::{
 
 fn projected(path: &str, homes: &[&str]) -> (OriginPathKind, String) {
     let homes = homes.iter().map(Path::new).collect::<Vec<_>>();
-    let value = sanitize_origin_path_with_homes(Some(Path::new(path)), &homes).unwrap();
+    let value = if path.starts_with(r"\\srv\")
+        || path.starts_with(r"\\Users\")
+        || path.starts_with(r"\\?\UNC\srv\")
+        || path.starts_with(r"\\?\unc\SRV\")
+    {
+        sanitize_with(Some(Path::new(path)), &homes, &|_| None).unwrap()
+    } else {
+        sanitize_origin_path_with_homes(Some(Path::new(path)), &homes).unwrap()
+    };
     (value.kind, value.display.unwrap())
 }
 
@@ -244,7 +252,6 @@ fn every_known_other_user_root_and_case_are_masked() {
         ("/Users/bo\nb/x", "/Users/<user>/x"),
         ("/Users/bo\u{202e}b/x", "/Users/<user>/x"),
         ("/Users/bob//x/", "/Users/<user>/x"),
-        ("//Users//bob//x", "/Users/<user>/x"),
     ] {
         assert_eq!(
             projected(input, &[]),
@@ -256,6 +263,16 @@ fn every_known_other_user_root_and_case_are_masked() {
     assert_eq!(
         projected("//users/ME/x", &["/Users/me"]),
         (OriginPathKind::Redacted, "/users/<user>/x".into())
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        projected("//Users//bob//x", &[]),
+        (OriginPathKind::Redacted, "/Users/<user>/x".into())
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        projected(r"\\Users\bob\x", &[]),
+        (OriginPathKind::Absolute, "//Users/bob/x".into())
     );
     // A bare root has no account component to conceal.
     assert_eq!(
@@ -344,17 +361,29 @@ fn relative_path_never_uses_process_cwd_for_canonical_identity() {
 #[test]
 fn ancestor_walk_continues_only_for_not_found() {
     use std::io::{Error, ErrorKind};
-    let path = Path::new("/root/missing/leaf");
+    let (path, existing, resolved) = if cfg!(windows) {
+        (
+            Path::new("C:/root/missing/leaf"),
+            Path::new("C:/root"),
+            Path::new("C:/canonical/missing/leaf"),
+        )
+    } else {
+        (
+            Path::new("/root/missing/leaf"),
+            Path::new("/root"),
+            Path::new("/canonical/missing/leaf"),
+        )
+    };
     let canonicalize = |candidate: &Path| {
-        if candidate == Path::new("/root") {
-            Ok(Path::new("/canonical").to_path_buf())
+        if candidate == existing {
+            Ok(resolved.parent().unwrap().parent().unwrap().to_path_buf())
         } else {
             Err(Error::from(ErrorKind::NotFound))
         }
     };
     assert_eq!(
         canonicalize_existing_prefix_with(path, &canonicalize),
-        Some(Path::new("/canonical/missing/leaf").to_path_buf())
+        Some(resolved.to_path_buf())
     );
     for kind in [
         ErrorKind::PermissionDenied,
