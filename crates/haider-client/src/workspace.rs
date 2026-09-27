@@ -710,7 +710,7 @@ pub fn workspace_allocation(
     let daily_root_path = std::fs::canonicalize(&plan.daily_root).map_err(|error| {
         WorkspaceError::InvalidBase(format!(
             "cannot canonicalize daily workspace root {}: {error}",
-            plan.daily_root.display()
+            crate::launch_origin::display_path(&plan.daily_root)
         ))
     })?;
     let leaf_name = plan
