@@ -200,6 +200,44 @@ pub struct ToolFileEffect {
     pub path: String,
     pub absolute_path: String,
     pub bytes: u64,
+    /// Where each SINGLE-LOCATION replacement of an edit landed, measured by
+    /// the tool WHILE applying it (973-tui-toolview). A `replace_all` that
+    /// matched more than once records no span (repair 5): no reader numbers
+    /// such an edit, and one span per occurrence grew the result with the
+    /// match count. Additive and optional: omitted when empty, ignored by
+    /// older readers, absent in older journals — and a reader without a span
+    /// for an edit shows no line numbers rather than inferring them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edit_spans: Vec<EditSpanV1>,
+}
+
+/// One applied single-location replacement of an edit call, in application
+/// order (a multi-occurrence `replace_all` has none — see
+/// [`ToolFileEffect::edit_spans`]).
+///
+/// Line numbers are 1-based and counted in `'\n'` bytes (a CRLF file counts
+/// the same lines; a final line without a newline is still a line). A side
+/// is `None` exactly when its number would not be TRUE: the replaced text
+/// was not one contiguous run of the pre-edit file (an earlier replacement
+/// in the same call produced part of it), or the inserted text does not
+/// survive intact in the post-edit file (a later replacement changed it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditSpanV1 {
+    /// Index of the requested edit (`edits[i]`, or 0 for a single edit).
+    pub edit_index: u32,
+    /// Always 0 since repair 5 (a span is only recorded for an edit that
+    /// replaced exactly once); kept for wire compatibility.
+    pub occurrence: u32,
+    /// First line of the replaced text in the PRE-edit file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_start_line: Option<u32>,
+    /// Lines the replaced text spans (`str::lines` count).
+    pub old_line_count: u32,
+    /// First line of the inserted text in the POST-edit file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_start_line: Option<u32>,
+    /// Lines the inserted text spans (`str::lines` count; 0 for a deletion).
+    pub new_line_count: u32,
 }
 
 impl BoundedResult {
