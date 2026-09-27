@@ -902,7 +902,10 @@ async fn configuration_boundary_case(repoint: bool) {
     else {
         panic!("provider list unavailable")
     };
-    assert!(providers[0].models.contains(&"explicit-static".into()));
+    assert_eq!(
+        providers[0].default_model.as_deref(),
+        Some("explicit-static")
+    );
     assert!(!providers[0].models.contains(&"astra-api-A-only".into()));
     if !repoint {
         reconfigure_boundary(
@@ -994,15 +997,17 @@ async fn read_through_credential_must_match_catalog_identity_snapshot() {
     std::fs::create_dir_all(source.join("credentials")).unwrap();
     let file = source.join("credentials/kimi-code.json");
     let write = |who: &str, modified: Option<std::time::SystemTime>| {
-        private_write(&file,serde_json::json!({"access_token":format!("synthetic-{who}"),"expires_at":4_102_444_800_u64,"scope":"kimi-code","token_type":"Bearer"}).to_string()).unwrap();
+        let staged = file.with_extension("next");
+        private_write(&staged,serde_json::json!({"access_token":format!("synthetic-{who}"),"expires_at":4_102_444_800_u64,"scope":"kimi-code","token_type":"Bearer"}).to_string()).unwrap();
         if let Some(t) = modified {
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(&file)
+                .open(&staged)
                 .unwrap()
                 .set_times(std::fs::FileTimes::new().set_modified(t))
                 .unwrap();
         }
+        std::fs::rename(staged, &file).unwrap();
     };
     write("A", None);
     let a_time = std::fs::metadata(&file).unwrap().modified().unwrap();
@@ -1064,7 +1069,9 @@ async fn read_through_credential_must_match_catalog_identity_snapshot() {
         matches!(r, ResponseBody::ProviderModelsRefresh { .. }),
         "A positive control: {r:?}"
     );
-    write("B", Some(a_time + std::time::Duration::from_secs(1)));
+    // Keep the same size and mtime: the source watcher sees an unchanged
+    // fingerprint while the credential reader must detect the new bytes.
+    write("B", Some(a_time));
     c.send(
         &WireFrame::Request {
             request_id: RequestId::new("race-fetch-B"),
@@ -1075,9 +1082,8 @@ async fn read_through_credential_must_match_catalog_identity_snapshot() {
         DEFAULT_FRAME_LIMIT,
     )
     .await;
-    // Give the broker a bounded window to observe B, shorter than the
-    // source watcher's coalescing period. A correct implementation rejects
-    // B before the discoverer sees it; the old implementation blocks there.
+    // Give the broker a bounded window to observe B. A correct implementation
+    // rejects B before the discoverer sees it; the old one blocks there.
     let reached_discoverer =
         tokio::time::timeout(std::time::Duration::from_millis(75), arrived.notified())
             .await
@@ -1149,7 +1155,8 @@ async fn read_through_credential_must_match_catalog_identity_snapshot() {
         "B's read-through credential reached discovery under A's descriptor"
     );
     assert!(
-        matches!(reply, ResponseBody::Error { .. }),
+        matches!(&reply, ResponseBody::Error { message, .. }
+            if message.contains("linked credential changed before catalog discovery")),
         "the changed linked credential must abort this A-generation refresh: {reply:?}"
     );
     assert!(

@@ -459,6 +459,9 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
         .expect("seed key");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let management = ManagementSnapshot::new(0, accounts.list().to_vec(), Vec::new());
+    let providers = test_provider_registry();
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+    let source_registry = empty_source_registry();
     let (sink, mut frames) = channel_sink();
 
     handle_refresh_identity(
@@ -467,6 +470,9 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
         &vault,
         &snapshot,
         Some(&management),
+        &providers,
+        &mut pending,
+        &source_registry,
         RefreshIdentityJob {
             alias: alias.as_str().to_owned(),
             route: LoginRoute {
@@ -1080,7 +1086,8 @@ async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not(
     let mut accounts = memory_accounts();
     let descriptor = |alias: &str, identity: &str, active: bool| CredentialDescriptor {
         incarnation: 0,
-        credential_digest: None,
+        // This fixture uses `identity` as the synthetic credential bytes.
+        credential_digest: Some(blake3::hash(identity.as_bytes()).to_hex().to_string()),
         alias: CredentialAlias::new(alias),
         provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
         base_url: None,
@@ -2657,6 +2664,7 @@ async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_availabl
     let before = providers
         .summary("ollama", &|_| false)
         .expect("pre-discovery summary");
+    assert_eq!(before.models, vec!["llama3.1:8b"]);
     assert_eq!(
         before.availability,
         haider_rpc::ProviderAvailabilityWire::Unavailable,
@@ -2996,7 +3004,9 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     let primary_alias = CredentialAlias::new("wedged-primary");
     let alternate_alias = CredentialAlias::new("wedged-backup");
     let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
-        incarnation: 0,
+        // The refusing store cannot perform a legacy-row migration. Seed
+        // already-migrated rows to exercise the intended rotation failure.
+        incarnation: if active { 1 } else { 2 },
         credential_digest: None,
         alias,
         provider: OPENAI_PROVIDER_NAME.into(),
@@ -8405,7 +8415,11 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
     let summary = providers
         .summary("legacy-configure", &|_| false)
         .expect("legacy summary");
-    assert!(summary.models.is_empty());
+    assert_eq!(summary.models, vec!["frontier-legacy-new"]);
+    assert_eq!(
+        summary.availability,
+        haider_rpc::ProviderAvailabilityWire::Unavailable
+    );
     // A custom OpenAI-compatible provider's configured default survives an empty
     // discovered catalog (v0.0.958 defect-1 fix: discovery is advisory inventory,
     // it cannot erase the configured wire model). Pre-958 this was erroneously None.
@@ -9555,9 +9569,12 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         account_identity: None,
         created_at_ms: None,
     };
-    let cache_key = ProviderModelCacheKey::for_account(OPENAI_OAUTH_PROVIDER_NAME, &descriptor);
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
+    let cache_key = ProviderModelCacheKey::for_account(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        accounts.get(&alias).expect("persisted descriptor"),
+    );
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = Arc::new(MemoryVault::new());
     vault
@@ -13944,8 +13961,9 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         "vertex",
         accounts.get(&alias).expect("first vertex account"),
     );
+    let offline_cache_key = ProviderModelCacheKey::public("vertex");
     store
-        .put_provider_models(first_cache_key.clone().into(), "[]".into(), None, 1)
+        .put_provider_models(offline_cache_key.clone().into(), "[]".into(), None, 1)
         .await
         .expect("seed vertex cache");
     match frames.try_recv().expect("import response") {
@@ -14030,9 +14048,9 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     );
     assert!(
         store
-            .provider_models(first_cache_key.clone().into())
+            .provider_models(offline_cache_key.clone().into())
             .await
-            .expect("same account cache read")
+            .expect("offline catalog cache read")
             .is_some()
     );
     gcloud.set_account_id("other-account@example.invalid");
@@ -14072,6 +14090,14 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
             .await
             .expect("replaced cache read")
             .is_none()
+    );
+    assert!(
+        store
+            .provider_models(offline_cache_key.into())
+            .await
+            .expect("offline cache read")
+            .is_some(),
+        "Vertex's offline catalog stays public across account changes"
     );
     store.close().await.expect("close store");
 }
@@ -14869,12 +14895,13 @@ fn vanished_linked_source_reappearing_with_identical_bytes_keeps_a_new_incarnati
     );
     std::fs::write(&file, bytes).expect("restore same credential bytes");
     reconcile_credential_sources(&mut registry, &mut accounts).expect("return scan");
-    assert_eq!(
+    assert!(
         accounts
             .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
             .unwrap()
-            .incarnation,
-        vanished
+            .incarnation
+            > vanished,
+        "re-adoption after a missing source is another unproven intake"
     );
 }
 
@@ -16699,6 +16726,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         Arc::new(CachedProviderModelSource::default()),
     )
     .expect("providers");
+    let source_registry = empty_source_registry();
     let discoverer = Arc::new(BlockingModelDiscoverer {
         started: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -16733,6 +16761,8 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         &store,
         &accounts,
         &providers,
+        "test-profile",
+        &source_registry,
         None,
         &discoverer_trait,
         &commands,
@@ -16773,6 +16803,8 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         &store,
         &accounts,
         &providers,
+        "test-profile",
+        &source_registry,
         None,
         &discoverer_trait,
         &commands,
@@ -16801,6 +16833,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         cached,
         result,
         completed,
+        ..
     } = completion
     else {
         panic!("refresh completion");
@@ -16871,6 +16904,8 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             &store,
             &invalid_accounts,
             &providers,
+            "test-profile",
+            &source_registry,
             None,
             &discoverer_trait,
             &commands,
