@@ -1003,7 +1003,11 @@ fn omit_fleet_identity(frame: &mut WireFrame) {
 
 fn omit_event_activity(envelope: &mut haider_protocol::envelope::RawEnvelope) {
     let payload = &mut envelope.payload;
-    match payload.get("type").and_then(serde_json::Value::as_str) {
+    let kind = payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    match kind.as_deref() {
         Some("agent_metrics") => {
             if let Some(fields) = payload.as_object_mut() {
                 fields.remove("activity");
