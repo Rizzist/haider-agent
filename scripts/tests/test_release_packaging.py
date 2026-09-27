@@ -10,6 +10,7 @@ import http.server
 import io
 import json
 import os
+import re
 import subprocess
 import textwrap
 import shutil
@@ -39,6 +40,14 @@ SHAS = {
         start=1,
     )
 }
+
+
+def _reported_elapsed_ms(stdout: str, label: str) -> int:
+    """Read the one stopwatch result emitted at a feed decision's end."""
+    matches = [line for line in stdout.splitlines() if line.startswith(label + "=")]
+    if len(matches) != 1 or not re.fullmatch(rf"{re.escape(label)}=[0-9]+", matches[0]):
+        raise ValueError(f"expected exactly one valid {label} line in {stdout!r}")
+    return int(matches[0].split("=", 1)[1])
 
 
 def _template(root: Path, newline: bytes) -> Path:
@@ -517,15 +526,44 @@ try {
                            "GITHUB_STEP_SUMMARY": str(summary),
                            "CHOCO_CONFIRM_TIMEOUT_SECONDS": setting or "1",
                            "CHOCO_CONFIRM_POLL_INTERVAL_MS": "100"}
-                    result = subprocess.run(["pwsh", "-NoProfile", "-File", str(harness_path)],
-                                            env=env, capture_output=True, text=True)
+                    try:
+                        result = subprocess.run(["pwsh", "-NoProfile", "-File", str(harness_path)],
+                                                env=env, capture_output=True, text=True, timeout=45)
+                    except subprocess.TimeoutExpired as error:
+                        self.fail(f"{name}: publish harness exceeded 45 s watchdog: {error}")
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    if check:
+                        self.assertLess(_reported_elapsed_ms(result.stdout, "CHOCO_PREFLIGHT_ELAPSED_MS"), 8000)
+                    else:
+                        self.assertNotIn("CHOCO_PREFLIGHT_ELAPSED_MS=", result.stdout)
+                    if pushes:
+                        confirmation_ms = _reported_elapsed_ms(result.stdout, "CHOCO_CONFIRM_ELAPSED_MS")
+                        self.assertLess(confirmation_ms, 5000)
+                        if name == "late exact unconfirmed":
+                            self.assertGreaterEqual(confirmation_ms, 1000)
+                    else:
+                        self.assertNotIn("CHOCO_CONFIRM_ELAPSED_MS=", result.stdout)
                     events = trace.read_text().splitlines()
                     self.assertEqual(events.count("push"), pushes)
                     if pushes:
                         self.assertGreaterEqual(len(events[events.index("push") + 1:]), post_queries)
                     if summary_fragment:
                         self.assertIn(summary_fragment, summary.read_text())
+
+
+class PublishElapsedLineTests(unittest.TestCase):
+    def test_missing_duplicate_and_invalid_lines_fail(self) -> None:
+        label = "CHOCO_CONFIRM_ELAPSED_MS"
+        for stdout in ("", f"{label}=1\n{label}=2", f"{label}=-1", f"{label}=1.5",
+                       f"{label}=garbage", f"{label}=1 ms"):
+            with self.subTest(stdout=stdout), self.assertRaises(ValueError):
+                _reported_elapsed_ms(stdout, label)
+
+    def test_boundary_values_are_preserved(self) -> None:
+        label = "CHOCO_CONFIRM_ELAPSED_MS"
+        for value in (0, 999, 1000, 1999, 2000, 2001, 4999, 5000):
+            with self.subTest(value=value):
+                self.assertEqual(_reported_elapsed_ms(f"noise\n{label}={value}\n", label), value)
 
 
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell is required for real HTTP deadline tests")
@@ -558,7 +596,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                 scenario = server.scenario
                 server.requests += 1
                 if scenario == "slow headers":
-                    server.release.wait(8)
+                    server.release.wait(60)
                     if server.release.is_set():
                         return
                 self.send_response(200)
@@ -577,7 +615,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                     else:
                         self.wfile.write(body[:1])
                         self.wfile.flush()
-                        server.release.wait(8)
+                        server.release.wait(60)
                         if scenario == "delayed body":
                             self.wfile.write(body[1:])
                 except (BrokenPipeError, ConnectionResetError):
@@ -618,18 +656,34 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                                            str(harness_path) if launch == "File" else f". '{harness_path}'"]
                                 started = time.monotonic()
                                 try:
-                                    result = subprocess.run(command, env=env, capture_output=True,
-                                                            text=True, timeout=7)
+                                    try:
+                                        result = subprocess.run(command, env=env, capture_output=True,
+                                                                text=True, timeout=45)
+                                    except subprocess.TimeoutExpired as error:
+                                        self.fail(f"{scenario}: request exceeded 45 s watchdog: {error}")
                                     elapsed = time.monotonic() - started
                                     expected = 0 if scenario == "immediate" else (
                                         1 if scenario == "preflight stalled" or push_exit == 0 or launch == "Command"
                                         else 19)
                                     self.assertEqual(result.returncode, expected,
                                                      f"{scenario}: {result.stdout} {result.stderr}")
-                                    # 2 s confirmation + 3 s startup/scheduling slack. Preflight:
-                                    # 3 * 0.3 s requests + 1 + 2 s sleeps + 3 s slack.
-                                    self.assertLess(elapsed, 7 if scenario == "preflight stalled" else 5)
+                                    label = ("CHOCO_PREFLIGHT_ELAPSED_MS" if scenario == "preflight stalled"
+                                             else "CHOCO_CONFIRM_ELAPSED_MS")
+                                    reported_ms = _reported_elapsed_ms(result.stdout, label)
+                                    # The script stopwatch excludes pwsh startup; the generous outer
+                                    # bound only distinguishes the 60 s stalled fixture from cancellation.
+                                    self.assertLess(reported_ms, 8000 if scenario == "preflight stalled" else 5000)
+                                    self.assertLess(elapsed, 25 if scenario == "preflight stalled" else 20)
+                                    if scenario == "immediate":
+                                        self.assertLess(reported_ms, 2000)
+                                    elif scenario != "preflight stalled":
+                                        self.assertGreaterEqual(reported_ms, 1500)
                                     self.assertGreaterEqual(server.requests, 1)
+                                    if timing_file := os.environ.get("CHOCO_TIMING_RESULTS_FILE"):
+                                        with open(timing_file, "a", encoding="utf-8") as timings:
+                                            timings.write(json.dumps({"scenario": scenario, "push_exit": push_exit,
+                                                "launch": launch, "outer_ms": round(elapsed * 1000),
+                                                "internal_ms": reported_ms}) + "\n")
                                     text = summary.read_text()
                                     if scenario == "immediate":
                                         self.assertIn("confirmed", text)

@@ -68,16 +68,23 @@ function Get-ExactPackageStatus([int]$TimeoutMilliseconds = 30000) {
 }
 
 function Get-ExactPackagePresence {
-  $RequestTimeoutMs = 30000
-  if ($env:CHOCO_TEST_FEED_URI -and $env:CHOCO_TEST_PREFLIGHT_TIMEOUT_MS) {
-    $RequestTimeoutMs = Read-PositiveSetting 'CHOCO_TEST_PREFLIGHT_TIMEOUT_MS' 30000 30000
-  }
-  for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
-    $Status = Get-ExactPackageStatus -TimeoutMilliseconds $RequestTimeoutMs
-    if ($Status -eq 'present') { return $true }
-    if ($Status -eq 'absent') { return $false }
-    if ($Attempt -eq 3) { throw "Could not establish whether haider $Version exists after 3 preflight queries" }
-    Start-Sleep -Seconds $Attempt
+  # This measures only the preflight decision, excluding pwsh startup.
+  $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+  try {
+    $RequestTimeoutMs = 30000
+    if ($env:CHOCO_TEST_FEED_URI -and $env:CHOCO_TEST_PREFLIGHT_TIMEOUT_MS) {
+      $RequestTimeoutMs = Read-PositiveSetting 'CHOCO_TEST_PREFLIGHT_TIMEOUT_MS' 30000 30000
+    }
+    for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+      $Status = Get-ExactPackageStatus -TimeoutMilliseconds $RequestTimeoutMs
+      if ($Status -eq 'present') { return $true }
+      if ($Status -eq 'absent') { return $false }
+      if ($Attempt -eq 3) { throw "Could not establish whether haider $Version exists after 3 preflight queries" }
+      Start-Sleep -Seconds $Attempt
+    }
+  } finally {
+    $Clock.Stop()
+    Write-Host "CHOCO_PREFLIGHT_ELAPSED_MS=$($Clock.ElapsedMilliseconds)"
   }
 }
 
@@ -96,21 +103,26 @@ function Confirm-ExactPackage([int]$TimeoutSeconds, [int]$InitialIntervalMs) {
   # Only absence and transient transport/server failures are retried until the deadline.
   # A malformed or mismatched 200 and any non-transient HTTP error fail closed.
   $Clock = [System.Diagnostics.Stopwatch]::StartNew()
-  $IntervalMs = $InitialIntervalMs
-  do {
-    $RemainingMs = $TimeoutSeconds * 1000 - $Clock.ElapsedMilliseconds
-    if ($RemainingMs -le 0) { break }
-    $RequestMs = [int][Math]::Min(30000, $RemainingMs)
-    $Status = Get-ExactPackageStatus -TimeoutMilliseconds $RequestMs
-    # A complete exact entity received after the deadline is unconfirmed.
-    if ($Clock.ElapsedMilliseconds -ge $TimeoutSeconds * 1000) { break }
-    if ($Status -eq 'present') { return $true }
-    $RemainingMs = $TimeoutSeconds * 1000 - $Clock.ElapsedMilliseconds
-    if ($RemainingMs -le 0) { break }
-    Start-Sleep -Milliseconds ([int][Math]::Min($IntervalMs, $RemainingMs))
-    $IntervalMs = [Math]::Min(60000, $IntervalMs * 2)
-  } while ($true)
-  return $false
+  try {
+    $IntervalMs = $InitialIntervalMs
+    do {
+      $RemainingMs = $TimeoutSeconds * 1000 - $Clock.ElapsedMilliseconds
+      if ($RemainingMs -le 0) { break }
+      $RequestMs = [int][Math]::Min(30000, $RemainingMs)
+      $Status = Get-ExactPackageStatus -TimeoutMilliseconds $RequestMs
+      # A complete exact entity received after the deadline is unconfirmed.
+      if ($Clock.ElapsedMilliseconds -ge $TimeoutSeconds * 1000) { break }
+      if ($Status -eq 'present') { return $true }
+      $RemainingMs = $TimeoutSeconds * 1000 - $Clock.ElapsedMilliseconds
+      if ($RemainingMs -le 0) { break }
+      Start-Sleep -Milliseconds ([int][Math]::Min($IntervalMs, $RemainingMs))
+      $IntervalMs = [Math]::Min(60000, $IntervalMs * 2)
+    } while ($true)
+    return $false
+  } finally {
+    $Clock.Stop()
+    Write-Host "CHOCO_CONFIRM_ELAPSED_MS=$($Clock.ElapsedMilliseconds)"
+  }
 }
 
 if ($Mode -eq 'Check') {
