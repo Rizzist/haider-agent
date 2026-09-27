@@ -1253,7 +1253,10 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
         "fs_search" | "grep" | "ripgrep" | "search" | "file_search" => {
             let mut summary = match (query, glob, path) {
                 (Some(query), Some(glob), _) => format!("\"{query}\" {glob}"),
-                (Some(query), None, Some(path)) => format!("\"{query}\" in {path}"),
+                (Some(query), None, Some(path)) => format!(
+                    "\"{query}\" in {}",
+                    crate::live::workspace_display_path(path)
+                ),
                 (Some(query), None, None) => format!("\"{query}\""),
                 _ => arg_summary(args),
             };

@@ -730,7 +730,7 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
                 entry.head_ros = Some(claimed.ros);
             }
         }
-        entry.dir = s.dir;
+        entry.dir = crate::live::workspace_display_path(&s.dir);
         entry.model_short = s.model_short;
         entry.device = s.device;
         entry.ago = s.ago;
@@ -760,10 +760,10 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
     vfs.extend(dto.vfs);
     model.vfs = vfs;
     if !dto.launcher_dir.is_empty() {
-        model.launcher_dir = dto.launcher_dir.clone();
+        model.launcher_dir = crate::live::workspace_display_path(&dto.launcher_dir);
         // The no-session scratch dir mirrors the launcher's (fresh_session
         // law) — per-session dirs rode in with their sessions above.
-        model.session_dir = dto.launcher_dir;
+        model.session_dir = model.launcher_dir.clone();
     }
     if let Some(voice) = dto.voice {
         model.voice = VoiceState {

@@ -220,6 +220,64 @@ fn ssh_form_masks_and_redacts_password_before_staging() {
 }
 
 #[test]
+fn ssh_form_projects_paths_without_changing_saved_values() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut model = live_session();
+    model.ssh_open = true;
+    let mut form = SshProfileForm::add();
+    form.credential = "/Users/bob/.ssh/id".into();
+    form.cwd = "/home/bob/work".into();
+    assert_eq!(form.credential_display(), "/Users/<user>/.ssh/id");
+    model.ssh_form = Some(form);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            crate::render::render(&model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    let painted = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("/home/<user>/work"));
+    assert!(!painted.contains("/home/bob/work"));
+    assert_eq!(model.ssh_form.as_ref().expect("form").cwd, "/home/bob/work");
+}
+
+#[test]
+fn shell_registry_projects_cwd_without_changing_wire_value() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut model = live_session();
+    model.shells_open = true;
+    let mut listed = shell("shell-1", haider_rpc::ShellKindWire::Local);
+    listed.cwd_or_host = "/Users/bob/work".into();
+    model.shells.push(listed);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            crate::render::render(&model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    let painted = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("/Users/<user>/work"));
+    assert!(!painted.contains("/Users/bob/work"));
+    assert_eq!(model.shells[0].cwd_or_host, "/Users/bob/work");
+}
+
+#[test]
 fn ssh_form_allows_plain_s_in_cwd_without_submitting() {
     let mut model = live_session();
     let mut form = SshProfileForm::add();

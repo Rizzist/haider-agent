@@ -13305,7 +13305,10 @@ fn render_composer(
                     "  "
                 };
                 Line::styled(
-                    format!(" {marker}@{}", candidate),
+                    format!(
+                        " {marker}@{}",
+                        crate::live::workspace_display_path(candidate)
+                    ),
                     if index == completion.selected {
                         theme.menu_style()
                     } else {
@@ -13550,7 +13553,10 @@ fn talk_setup_lines(card: &crate::talk::TalkSetupCard, theme: &Theme) -> Vec<Lin
                 let runtime_selected = card.selection == card.whisper.len();
                 let (runtime_text, runtime_style) = match &card.runtime {
                     RuntimeRowState::Unknown => ("checking…".to_owned(), theme.dim_style()),
-                    RuntimeRowState::Found(path) => (format!("✓ {path}"), theme.ok_style()),
+                    RuntimeRowState::Found(path) => (
+                        format!("✓ {}", crate::live::workspace_display_path(path)),
+                        theme.ok_style(),
+                    ),
                     RuntimeRowState::Missing(hint) => (
                         format!("✗ missing — ⏎ install · {hint}"),
                         theme.warn_style(),
@@ -14358,7 +14364,13 @@ fn render_shells_overlay(
             let line = Line::from(vec![
                 Span::styled(format!("{marker} {kind} · {status} · "), theme.dim_style()),
                 Span::styled(shell.title.clone(), theme.text_style()),
-                Span::styled(format!(" · {}  ", shell.cwd_or_host), theme.dim_style()),
+                Span::styled(
+                    format!(
+                        " · {}  ",
+                        crate::live::workspace_display_path(&shell.cwd_or_host)
+                    ),
+                    theme.dim_style(),
+                ),
                 Span::styled("[close]", theme.maroon_style()),
             ]);
             close_offsets.push((
@@ -14498,7 +14510,14 @@ fn render_ssh_form(
         ("port", form.port.clone()),
         ("auth", form.auth_label().to_owned()),
         ("key path / secret", form.credential_display()),
-        ("cwd", form.cwd.clone()),
+        (
+            "cwd",
+            if form.cwd.is_empty() {
+                String::new()
+            } else {
+                crate::live::workspace_display_path(&form.cwd)
+            },
+        ),
     ];
     for (index, (label, value)) in fields.into_iter().enumerate() {
         lines.push(Line::from(vec![
@@ -16150,7 +16169,10 @@ fn item_lines<'a>(
                 Span::raw("  "),
                 Span::styled("✓ ", theme.ok_style()),
                 Span::styled("fs_edit", theme.maroon_style()),
-                Span::styled(format!(" {path}"), theme.dim_style()),
+                Span::styled(
+                    format!(" {}", crate::live::workspace_display_path(path)),
+                    theme.dim_style(),
+                ),
                 Span::styled(format!(" +{added} −{removed}"), theme.dim_style()),
             ]));
         }

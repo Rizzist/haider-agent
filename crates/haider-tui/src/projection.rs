@@ -718,14 +718,17 @@ impl SessionProjection {
                 self.workspace_unavailable = Some(unavailable.clone());
                 self.push_note(format!(
                     "⚠ workspace unavailable — {} · {} ({})",
-                    unavailable.path,
+                    crate::live::workspace_display_path(&unavailable.path),
                     unavailable.reason.as_str(),
                     unavailable.detail
                 ));
             }
             WorkspaceEventPayload::WorkspaceSelected(selected) => {
                 self.workspace_unavailable = None;
-                self.push_note(format!("⇄ workspace → {}", selected.path));
+                self.push_note(format!(
+                    "⇄ workspace → {}",
+                    crate::live::workspace_display_path(&selected.path)
+                ));
             }
         }
     }

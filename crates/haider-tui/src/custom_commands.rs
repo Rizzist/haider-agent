@@ -429,14 +429,17 @@ fn load_dir(
         {
             warnings.push(format!(
                 "{}: skipped (over {MAX_COMMAND_FILE_BYTES}-byte command-file cap)",
-                path.display()
+                crate::live::workspace_display_path(&path.to_string_lossy())
             ));
             continue;
         }
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(error) => {
-                warnings.push(format!("{}: unreadable ({error})", path.display()));
+                warnings.push(format!(
+                    "{}: unreadable ({error})",
+                    crate::live::workspace_display_path(&path.to_string_lossy())
+                ));
                 continue;
             }
         };
@@ -456,7 +459,11 @@ fn load_dir(
                 );
             }
             Err(error) => {
-                warnings.push(format!("{}: {}", path.display(), error.reason()));
+                warnings.push(format!(
+                    "{}: {}",
+                    crate::live::workspace_display_path(&path.to_string_lossy()),
+                    error.reason()
+                ));
             }
         }
     }

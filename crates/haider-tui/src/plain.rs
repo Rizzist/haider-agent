@@ -658,7 +658,10 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             added,
             removed,
         } => {
-            out.push_str(&format!("± {path} +{added} -{removed}\n"));
+            out.push_str(&format!(
+                "± {} +{added} -{removed}\n",
+                crate::live::workspace_display_path(path)
+            ));
         }
         TurnItem::ChildSpawn { agent } => {
             out.push_str(&format!("◉ subagent {} spawned\n", agent.as_str()));

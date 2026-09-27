@@ -671,6 +671,20 @@ fn guarded_singles_restore_theme_vfs_dir_and_voice() {
     assert_eq!(hydrated.theme, ThemeKey::Dark, "unknown theme → default");
 }
 
+#[test]
+fn persisted_display_paths_are_projected_again_on_hydration() {
+    let mut model = launcher_model();
+    submit(&mut model, "some session");
+    let mut dto = snapshot(&model);
+    dto.launcher_dir = "/Users/bob/secret".to_owned();
+    dto.sessions[0].dir = "/home/bob/projects".to_owned();
+    let mut hydrated = launcher_model();
+    hydrate(&mut hydrated, dto);
+    assert_eq!(hydrated.launcher_dir, "/Users/<user>/secret");
+    assert_eq!(hydrated.session_dir, "/Users/<user>/secret");
+    assert_eq!(hydrated.sessions[0].dir, "/home/<user>/projects");
+}
+
 // ---- The dump_screens-equivalence check: seeds in, seeds out ----
 
 #[test]

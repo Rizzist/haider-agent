@@ -3973,7 +3973,10 @@ impl LiveDriver {
                 if model.active_session.as_ref() == Some(&session) {
                     model.session_dir = workspace_display_path(&path);
                     model.session_workspace_cwd = Some(path.clone());
-                    model.flash = Some(format!("· workspace re-rooted → {path}"));
+                    model.flash = Some(format!(
+                        "· workspace re-rooted → {}",
+                        workspace_display_path(&path)
+                    ));
                     model.dirty = true;
                 }
                 if retry_after {
@@ -7909,14 +7912,13 @@ impl LiveDriver {
 /// initial and renewed previews — and their fallback — are identical.
 #[must_use]
 pub fn workspace_display_path(path: &str) -> String {
-    let environment = haider_client::workspace::WorkspaceEnvironment::capture();
-    haider_client::launch_origin::sanitize_origin_path(
-        Some(std::path::Path::new(path)),
-        environment.home.as_deref(),
-    )
-    .ok()
-    .and_then(|sanitized| sanitized.display)
-    .unwrap_or_else(|| "<workspace path unavailable>".to_owned())
+    haider_client::launch_origin::display_path(std::path::Path::new(path))
+}
+
+/// Same projection with injected home candidates for executable tests.
+#[must_use]
+pub fn workspace_display_path_with_homes(path: &str, homes: &[std::path::PathBuf]) -> String {
+    haider_client::launch_origin::display_path_with_homes(std::path::Path::new(path), homes)
 }
 
 /// What to CALL a demo-only request when live mode has to refuse it — the

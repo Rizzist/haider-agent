@@ -2175,7 +2175,10 @@ impl DemoDriver {
                 model.dirty = true;
             }
             AppRequest::RevealPath { path } => {
-                model.flash = Some(format!("· reveal (demo): {path}"));
+                model.flash = Some(format!(
+                    "· reveal (demo): {}",
+                    crate::live::workspace_display_path(&path)
+                ));
                 model.dirty = true;
             }
             AppRequest::AccountSetActive { alias, .. } => {
@@ -4139,7 +4142,10 @@ pub async fn run_live(
                 }
                 ShellRequest::RevealPath(path) => {
                     if crate::browser::reveal_path(&path).is_err() {
-                        model.flash = Some(format!("· couldn't reveal image — {path}"));
+                        model.flash = Some(format!(
+                            "· couldn't reveal image — {}",
+                            crate::live::workspace_display_path(&path)
+                        ));
                         model.dirty = true;
                     }
                 }

@@ -1,44 +1,29 @@
-//! Client-side launch-origin sanitisation
-//! (`docs/design/dated-workspace-v1.md` §4, O6).
-//!
-//! The actual launch path lives only in client memory; component-aware
-//! redaction runs BEFORE transmission or persistence, and the daemon
-//! revalidates on ingress. Redacted labels are display data, never
-//! filesystem arguments.
+//! Display-only projection of filesystem paths. Never pass its output to IO.
 
 #[cfg(test)]
 #[path = "launch_origin_tests.rs"]
 mod tests;
 
-use std::path::{Component, Path};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
-/// Upper bound on the serialized origin display (UTF-8 bytes). Over-limit
-/// registration is rejected with a visible notice, not truncated silently.
 pub const ORIGIN_DISPLAY_MAX_BYTES: usize = 4096;
 
-/// Sanitised origin path, mirroring `haider-protocol`'s wire kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizedOriginPath {
     pub kind: OriginPathKind,
-    /// Optional only for [`OriginPathKind::Unavailable`].
     pub display: Option<String>,
 }
 
-/// Wire vocabulary for the origin path (O6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginPathKind {
-    /// Own home or a descendant, shown as `~` / `~/suffix`.
     HomeRelative,
-    /// An absolute path outside any recognised home.
     Absolute,
-    /// Another user's home form with the user component masked.
     Redacted,
-    /// The launch directory could not be captured.
     Unavailable,
 }
 
 impl OriginPathKind {
-    /// The wire string for this kind.
     #[must_use]
     pub const fn as_wire(self) -> &'static str {
         match self {
@@ -50,15 +35,11 @@ impl OriginPathKind {
     }
 }
 
-/// Sanitisation refusals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OriginSanitizeError {
-    /// The escaped display exceeds [`ORIGIN_DISPLAY_MAX_BYTES`].
     DisplayTooLong(usize),
 }
 
-/// Mints the process-open namespace from the OS CSPRNG (O2). The returned
-/// lowercase-hex value contains no path/user material.
 pub fn random_open_namespace() -> std::io::Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes)
@@ -84,19 +65,118 @@ impl std::fmt::Display for OriginSanitizeError {
 
 impl std::error::Error for OriginSanitizeError {}
 
-/// Sanitises a captured launch path against the resolved home directory.
-///
-/// - `None` becomes `unavailable` with no display.
-/// - Own home and descendants become `~`/`~/suffix` using exact COMPONENT
-///   prefix checks (`/Users/alice2` is never inside `/Users/alice`).
-/// - Known other-user home forms (`/Users/<name>`, `/home/<name>`,
-///   Windows `Users\<name>`) mask the user component as `<user>` and use
-///   kind `redacted`.
-/// - Control characters, escape/newline bytes, and bidi controls are
-///   escaped as `\u{XXXX}`; distinct filenames stay distinct.
+/// A usable home must be absolute and contain a real directory component.
+/// This also accepts Windows paths in host-simulated tests on Unix.
+#[must_use]
+pub fn usable_home(home: &Path) -> bool {
+    usable_home_on(home, cfg!(windows))
+}
+
+fn usable_home_on(home: &Path, windows: bool) -> bool {
+    let parsed = DisplayPath::parse(home);
+    parsed.absolute
+        && (!windows || parsed.root.ends_with(':') || parsed.root.starts_with("//"))
+        && !parsed.parts.is_empty()
+        && !parsed.unresolved_parent
+        && !parsed.is_multiuser_ancestor()
+}
+
+/// The single path projection. HOME precedes USERPROFILE on equal or nested
+/// matches; the longest matching home wins when both are configured.
+pub fn sanitize_origin_path_with_homes(
+    path: Option<&Path>,
+    homes: &[&Path],
+) -> Result<SanitizedOriginPath, OriginSanitizeError> {
+    sanitize_with(path, homes, &|path| canonicalize_existing_prefix(path))
+}
+
+/// Display-only path label for CLI and TUI chrome. The real `Path` stays
+/// with its caller for every filesystem or daemon operation.
+#[must_use]
+pub fn display_path(path: &Path) -> String {
+    display_path_with_homes(path, &process_display_homes())
+}
+
+/// Injectable form of the one display producer for host-simulated tests.
+#[must_use]
+pub fn display_path_with_homes(path: &Path, homes: &[PathBuf]) -> String {
+    sanitize_origin_path_with_homes(
+        Some(path),
+        &homes.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+    )
+    .ok()
+    .and_then(|sanitized| sanitized.display)
+    .unwrap_or_else(|| "<workspace path unavailable>".to_owned())
+}
+
+/// Compatibility entry point for callers with one known home.
 pub fn sanitize_origin_path(
     path: Option<&Path>,
     home: Option<&Path>,
+) -> Result<SanitizedOriginPath, OriginSanitizeError> {
+    sanitize_origin_path_with_homes(path, &home.into_iter().collect::<Vec<_>>())
+}
+
+/// HOME and, on Windows, USERPROFILE. The profile snapshot is the sole
+/// environment reader for display home selection.
+#[must_use]
+pub fn process_display_homes() -> Vec<PathBuf> {
+    let env = crate::profile::ProfileEnv::capture();
+    display_homes_from_profile(&env, cfg!(windows))
+}
+
+fn display_homes_from_profile(env: &crate::profile::ProfileEnv, windows: bool) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let profile = env
+        .user_profile
+        .as_ref()
+        .filter(|home| usable_home_on(home, windows));
+    if let Some(home) = env.home.as_ref()
+        && (usable_home_on(home, windows)
+            || (windows && profile.is_some_and(|profile| redirected_home_root(home, profile))))
+    {
+        homes.push(home.clone());
+    }
+    if windows && let Some(profile) = profile {
+        homes.push(profile.clone());
+    }
+    homes
+}
+
+/// A redirected Windows HOME may be the root of a mapped drive or UNC share. Accept that
+/// root only alongside a distinct, valid USERPROFILE, never as the sole home
+/// or as the root of the profile's own volume/share.
+fn redirected_home_root(home: &Path, profile: &Path) -> bool {
+    let home = DisplayPath::parse(home);
+    let profile_usable = usable_home(profile);
+    let profile = DisplayPath::parse(profile);
+    let admin_share = home.root.rsplit('/').next().is_some_and(|share| {
+        let bytes = share.as_bytes();
+        (bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b'$')
+            || share.eq_ignore_ascii_case("admin$")
+            || share.eq_ignore_ascii_case("ipc$")
+    });
+    home.absolute
+        && home.windows
+        && (home.root.ends_with(':') || home.root.starts_with("//"))
+        && !admin_share
+        && home.parts.is_empty()
+        && profile_usable
+        && profile.windows
+        && !home.root.eq_ignore_ascii_case(&profile.root)
+}
+
+/// Used by workspace configuration when choosing one home, without changing
+/// the display rule that accepts both Windows homes.
+#[must_use]
+pub fn preferred_process_home() -> Option<PathBuf> {
+    process_display_homes().into_iter().next()
+}
+
+pub(crate) fn sanitize_with(
+    path: Option<&Path>,
+    homes: &[&Path],
+    canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<SanitizedOriginPath, OriginSanitizeError> {
     let Some(path) = path else {
         return Ok(SanitizedOriginPath {
@@ -104,66 +184,117 @@ pub fn sanitize_origin_path(
             display: None,
         });
     };
-
-    if let Some(home) = home
-        && let Some(relative) = relative_to_own_home(path, home)
-    {
-        let display = if relative.as_os_str().is_empty() {
-            "~".to_string()
-        } else {
-            format!("~/{}", escape_display(&path_to_display(&relative)))
-        };
-        return bounded(OriginPathKind::HomeRelative, display);
+    if path.as_os_str().is_empty() {
+        return bounded(OriginPathKind::Absolute, String::new());
     }
-
-    if let Some(masked) = mask_other_user_home(path) {
+    let parsed = DisplayPath::parse(path);
+    // A terminal '..' has no reliable meaning when the preceding component
+    // is missing or a symlink. Decline the label instead of guessing.
+    if parsed.unresolved_parent {
+        return bounded(OriginPathKind::Redacted, "<path unavailable>".to_owned());
+    }
+    let canonical_path = if parsed.absolute && !parsed.had_parent {
+        canonicalize(path).map(|p| DisplayPath::parse(&p))
+    } else {
+        None
+    };
+    let mut best: Option<(usize, String)> = None;
+    for home in homes
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, home)| {
+            usable_home(home)
+                || (*index == 0
+                    && homes
+                        .get(1)
+                        .is_some_and(|profile| redirected_home_root(home, profile)))
+        })
+        .map(|(_, home)| home)
+    {
+        // A redirected root may contain an own Users/<profile-name> path,
+        // but it must not turn a different account into ~/Users/<name>/....
+        let redirected_root = !usable_home(home);
+        if redirected_root && parsed.mask_other_user().is_some() {
+            let own_profile_account = homes.get(1).is_some_and(|profile| {
+                let profile = DisplayPath::parse(profile);
+                parsed.parts.get(1).zip(profile.parts.last()).is_some_and(
+                    |(path_name, profile_name)| path_name.eq_ignore_ascii_case(profile_name),
+                )
+            });
+            if !own_profile_account {
+                continue;
+            }
+        }
+        let home_parsed = DisplayPath::parse(home);
+        let relative = parsed.relative_to(&home_parsed).or_else(|| {
+            if !parsed.absolute || parsed.had_parent {
+                return None;
+            }
+            let canonical_home = canonicalize(home).map(|p| DisplayPath::parse(&p))?;
+            canonical_path.as_ref()?.relative_to(&canonical_home)
+        });
+        if let Some(mut relative) = relative {
+            if redirected_root
+                && relative
+                    .first()
+                    .is_some_and(|part| part.eq_ignore_ascii_case("Users"))
+                && relative.len() > 1
+            {
+                relative[1] = "<user>".to_owned();
+            }
+            let rank = home_parsed.parts.len();
+            if best.as_ref().is_none_or(|(previous, _)| rank > *previous) {
+                let display = if relative.is_empty() {
+                    "~".to_owned()
+                } else {
+                    format!("~/{}", relative.join("/"))
+                };
+                best = Some((rank, display));
+            }
+        }
+    }
+    if let Some((_, display)) = best {
+        return bounded(OriginPathKind::HomeRelative, escape_display(&display));
+    }
+    if let Some(masked) = parsed.mask_other_user().or_else(|| {
+        canonical_path
+            .as_ref()
+            .and_then(DisplayPath::mask_other_user)
+    }) {
         return bounded(OriginPathKind::Redacted, escape_display(&masked));
     }
-
-    bounded(
-        OriginPathKind::Absolute,
-        escape_display(&path_to_display(path)),
-    )
+    bounded(OriginPathKind::Absolute, escape_display(&parsed.render()))
 }
 
-/// Returns the component-relative own-home suffix using the caller's lexical
-/// spelling first, then canonical identities. The latter covers a symlinked
-/// HOME whose captured cwd has already been canonicalized by the OS/client,
-/// and a Windows path spelled through an 8.3 short name
-/// (`C:\Users\RUNNER~1\...` for `C:\Users\runneradmin`), which the OS
-/// expands to the long name when canonicalizing.
-///
-/// The path may not exist yet: a dated workspace leaf is previewed before its
-/// first write materialises it. The canonical comparison therefore resolves
-/// the nearest existing ancestor and re-appends the not-yet-created tail, so
-/// a lazy leaf under the own home is `~/...` exactly like its created form
-/// rather than falling through to the other-user mask.
-fn relative_to_own_home(path: &Path, home: &Path) -> Option<std::path::PathBuf> {
-    if let Ok(relative) = path.strip_prefix(home) {
-        return Some(relative.to_path_buf());
+/// Only NotFound permits walking toward an existing ancestor. Permission,
+/// ENOTDIR, EIO, and symlink loops decline canonical identity; lexical
+/// masking still applies.
+fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    canonicalize_existing_prefix_with(path, &Path::canonicalize)
+}
+
+fn canonicalize_existing_prefix_with(
+    path: &Path,
+    canonicalize: &impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
     }
-    let canonical_home = home.canonicalize().ok()?;
-    let canonical_path = canonicalize_existing_prefix(path)?;
-    canonical_path
-        .strip_prefix(canonical_home)
-        .ok()
-        .map(Path::to_path_buf)
-}
-
-/// Canonicalizes the longest existing ancestor of `path` and re-appends the
-/// remaining (not yet existing) components lexically. Gives up (`None`) on a
-/// `..` in the missing tail, whose meaning depends on directories that do not
-/// exist, and on relative paths with no existing ancestor.
-fn canonicalize_existing_prefix(path: &Path) -> Option<std::path::PathBuf> {
     let mut existing = path;
     let mut missing = Vec::new();
     loop {
-        if let Ok(mut canonical) = existing.canonicalize() {
-            canonical.extend(missing.iter().rev());
-            return Some(canonical);
+        match canonicalize(existing) {
+            Ok(mut canonical) => {
+                canonical.extend(missing.iter().rev());
+                return Some(canonical);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                missing.push(existing.file_name()?);
+                existing = existing.parent()?;
+            }
+            Err(_) => return None,
         }
-        missing.push(existing.file_name()?);
-        existing = existing.parent()?;
     }
 }
 
@@ -180,94 +311,274 @@ fn bounded(
     })
 }
 
-fn path_to_display(path: &Path) -> String {
-    // Lossy is acceptable for a display-only value; the workspace authority
-    // uses canonical paths elsewhere.
-    let mut text = String::new();
-    let mut first = true;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {
-                text.push('/');
-                first = false;
-                continue;
-            }
-            Component::Prefix(prefix) => {
-                text.push_str(&prefix.as_os_str().to_string_lossy());
-                first = false;
-                continue;
-            }
-            Component::CurDir => continue,
-            Component::ParentDir => {
-                if !first && !text.ends_with('/') {
-                    text.push('/');
-                }
-                text.push_str("..");
-                first = false;
-            }
-            Component::Normal(part) => {
-                if !first && !text.ends_with('/') {
-                    text.push('/');
-                }
-                text.push_str(&part.to_string_lossy());
-                first = false;
-            }
-        }
-    }
-    if text.is_empty() {
-        path.to_string_lossy().into_owned()
-    } else {
-        text
-    }
+#[derive(Debug)]
+struct DisplayPath {
+    root: String,
+    parts: Vec<String>,
+    absolute: bool,
+    windows: bool,
+    had_parent: bool,
+    unresolved_parent: bool,
 }
 
-/// Masks `<name>` in the recognised other-user home forms; returns `None`
-/// when the path does not match one.
-fn mask_other_user_home(path: &Path) -> Option<String> {
-    let display = path_to_display(path);
-    for prefix in ["/Users/", "/home/"] {
-        if let Some(rest) = display.strip_prefix(prefix) {
-            let mut split = rest.splitn(2, '/');
-            let user = split.next().unwrap_or("");
-            if user.is_empty() {
-                return None;
-            }
-            let suffix = split.next();
-            return Some(match suffix {
-                Some(suffix) => format!("{prefix}<user>/{suffix}"),
-                None => format!("{prefix}<user>"),
+impl DisplayPath {
+    fn is_multiuser_ancestor(&self) -> bool {
+        let roots: &[&[&str]] = if self.root == "/" {
+            &[
+                &["Users"],
+                &["home"],
+                &["var", "home"],
+                &["private", "var", "home"],
+                &["System", "Volumes", "Data", "Users"],
+            ]
+        } else {
+            &[&["Users"]]
+        };
+        roots.iter().any(|root| {
+            self.parts.len() <= root.len()
+                && self
+                    .parts
+                    .iter()
+                    .zip(*root)
+                    .all(|(part, known)| part.eq_ignore_ascii_case(known))
+        })
+    }
+
+    fn parse(path: &Path) -> Self {
+        let original = path.to_string_lossy();
+        let windows = cfg!(windows)
+            || original.starts_with(r"\\")
+            || original.starts_with(r"\??\")
+            || original.starts_with("//")
+            || (original.as_bytes().get(1) == Some(&b':')
+                && matches!(original.as_bytes().get(2).copied(), Some(b'/' | b'\\')));
+        let slash = if windows {
+            original.replace('\\', "/")
+        } else {
+            original.to_string()
+        };
+        let slash = slash
+            .strip_prefix("//?/")
+            .or_else(|| slash.strip_prefix("//./"))
+            .or_else(|| slash.strip_prefix("/??/"))
+            .map(|tail| {
+                if tail
+                    .get(..4)
+                    .is_some_and(|head| head.eq_ignore_ascii_case("UNC/"))
+                {
+                    format!("//{}", &tail[4..])
+                } else if tail.is_empty() {
+                    "/".to_owned()
+                } else if tail.as_bytes().get(1) == Some(&b':') {
+                    tail.to_owned()
+                } else {
+                    // Volume GUID and GLOBALROOT device paths are filesystem
+                    // paths too. Keep their identity without the verbatim
+                    // prefix so an embedded Users account can be masked.
+                    format!("//device/{tail}")
+                }
+            })
+            .unwrap_or(slash);
+        let drive_root =
+            slash.as_bytes().get(1) == Some(&b':') && slash.as_bytes().get(2) == Some(&b'/');
+        let doubled_unix_root = !cfg!(windows)
+            && !original.starts_with(r"\\")
+            && slash.starts_with("//")
+            && slash[2..].split('/').next().is_some_and(|head| {
+                ["Users", "home", "var", "private", "System"]
+                    .iter()
+                    .any(|root| head.eq_ignore_ascii_case(root))
             });
+        let windows = windows && !doubled_unix_root;
+        let leading = if slash.starts_with("//") && !doubled_unix_root {
+            "//"
+        } else if slash.starts_with('/') {
+            "/"
+        } else {
+            ""
+        };
+        let mut slash = format!(
+            "{leading}{}",
+            slash
+                .trim_start_matches('/')
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        if drive_root && slash.len() == 2 {
+            slash.push('/');
+        }
+        let (root, tail, absolute) = if let Some(stripped) = slash.strip_prefix("//") {
+            let mut components = stripped.split('/');
+            let server = components.next().unwrap_or("");
+            let share = components.next().unwrap_or("");
+            if !server.is_empty() && !share.is_empty() {
+                let prefix = format!("//{server}/{share}");
+                let remainder = &slash[prefix.len()..];
+                (prefix, remainder, true)
+            } else {
+                ("/".to_owned(), slash.trim_start_matches('/'), true)
+            }
+        } else if slash.as_bytes().get(1) == Some(&b':') && slash.as_bytes().get(2) == Some(&b'/') {
+            (slash[..2].to_owned(), &slash[3..], true)
+        } else if slash.starts_with('/') {
+            ("/".to_owned(), slash.trim_start_matches('/'), true)
+        } else {
+            (String::new(), slash.as_str(), false)
+        };
+        let mut parts: Vec<String> = Vec::new();
+        let mut had_parent = false;
+        let mut unresolved_parent = false;
+        for part in tail
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+        {
+            if part == ".." {
+                had_parent = true;
+                if !absolute {
+                    parts.push("..".to_owned());
+                } else if let Some(last) = parts.last()
+                    && last != ".."
+                {
+                    parts.pop();
+                } else {
+                    unresolved_parent = true;
+                }
+            } else {
+                parts.push(part.to_owned());
+            }
+        }
+        // A trailing parent may depend on a missing or symlinked last
+        // component. Decline it rather than treating that as the home.
+        if absolute && tail.trim_end_matches('/').ends_with("/..") {
+            unresolved_parent = true;
+        }
+        Self {
+            root,
+            parts,
+            absolute,
+            windows,
+            had_parent,
+            unresolved_parent,
         }
     }
-    // Windows `<drive>:\Users\<name>` arrives here with normalized
-    // component separators (`C:/Users/name`).
-    if let Some(index) = display.find(":/Users/") {
-        let (head, tail) = display.split_at(index + ":/Users/".len());
-        let mut split = tail.splitn(2, '/');
-        let user = split.next().unwrap_or("");
-        if user.is_empty() {
+
+    fn relative_to(&self, home: &Self) -> Option<Vec<String>> {
+        if !self.absolute || !home.absolute || self.parts.len() < home.parts.len() {
             return None;
         }
-        return Some(match split.next() {
-            Some(suffix) => format!("{head}<user>/{suffix}"),
-            None => format!("{head}<user>"),
-        });
+        let equal = |a: &str, b: &str| {
+            if self.windows || home.windows {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        if !equal(&self.root, &home.root)
+            || !self.parts.iter().zip(&home.parts).all(|(a, b)| equal(a, b))
+        {
+            return None;
+        }
+        Some(self.parts[home.parts.len()..].to_vec())
     }
-    None
+
+    fn render(&self) -> String {
+        if self.root == "/" {
+            return format!("/{}", self.parts.join("/"));
+        }
+        if self.root.starts_with("//") {
+            return if self.parts.is_empty() {
+                self.root.clone()
+            } else {
+                format!("{}/{}", self.root, self.parts.join("/"))
+            };
+        }
+        if self.root.ends_with(':') {
+            return format!(
+                "{}{}",
+                self.root,
+                if self.parts.is_empty() {
+                    "/".to_owned()
+                } else {
+                    format!("/{}", self.parts.join("/"))
+                }
+            );
+        }
+        if self.parts.is_empty() {
+            return if self.absolute {
+                "/".to_owned()
+            } else {
+                ".".to_owned()
+            };
+        }
+        self.parts.join("/")
+    }
+
+    fn mask_other_user(&self) -> Option<String> {
+        if !self.absolute {
+            return None;
+        }
+        let lower = |part: &str, value: &str| part.eq_ignore_ascii_case(value);
+        let index = if self.root == "/" {
+            if self
+                .parts
+                .first()
+                .is_some_and(|p| lower(p, "Users") || lower(p, "home"))
+            {
+                Some(1)
+            } else if self.parts.len() >= 2
+                && lower(&self.parts[0], "var")
+                && lower(&self.parts[1], "home")
+            {
+                Some(2)
+            } else if self.parts.len() >= 3
+                && lower(&self.parts[0], "private")
+                && lower(&self.parts[1], "var")
+                && lower(&self.parts[2], "home")
+            {
+                Some(3)
+            } else if self.parts.len() >= 4
+                && lower(&self.parts[0], "System")
+                && lower(&self.parts[1], "Volumes")
+                && lower(&self.parts[2], "Data")
+                && lower(&self.parts[3], "Users")
+            {
+                Some(4)
+            } else {
+                None
+            }
+        } else if self.root.starts_with("//device/") {
+            self.parts
+                .iter()
+                .position(|part| lower(part, "Users"))
+                .map(|index| index + 1)
+        } else if self.root.ends_with(':') || self.root.starts_with("//") {
+            if self.parts.first().is_some_and(|p| lower(p, "Users")) {
+                Some(1)
+            } else {
+                None
+            }
+        } else {
+            None
+        }?;
+        if self.parts.len() <= index {
+            return None;
+        } // bare root has no identity
+        let mut masked = self.parts.clone();
+        masked[index] = "<user>".to_owned();
+        // Rebuild from components, never substring replacement (the same
+        // spelling can occur elsewhere in the path).
+        let separator = if self.root == "/" { "" } else { "/" };
+        Some(format!("{}{separator}{}", self.root, masked.join("/")))
+    }
 }
 
-/// Escapes control characters, terminal escapes, newlines, and Unicode
-/// bidi controls as `\u{XXXX}` so a path can never smuggle terminal or
-/// prompt-direction tricks. A literal backslash is escaped too, so two
-/// distinct filenames can never collapse into the same display text.
 fn escape_display(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         let code = character as u32;
-        let is_bidi = matches!(
-            code,
-            0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
-        );
+        let is_bidi = matches!(code, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069);
         if character.is_control() || is_bidi || character == '\\' {
             use std::fmt::Write;
             let _ = write!(escaped, "\\u{{{code:04x}}}");

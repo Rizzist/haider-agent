@@ -793,6 +793,26 @@ fn opencode_requires_confirmation() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn export_summary_escapes_path_but_writes_to_real_filename() {
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join("report\nname.md");
+    let options = ExportOptions {
+        session_id: "sess-abc".to_owned(),
+        format: Format::Markdown,
+        out: Some(path.clone()),
+        masked: false,
+        confirm: false,
+        no_spawn: true,
+        since: None,
+    };
+    let summary = export::write_export(&fixture_export(), &options).expect("export");
+    assert!(path.is_file(), "real path is used for IO");
+    assert!(!summary.contains('\n'));
+    assert!(summary.contains("\\u{000a}"), "{summary}");
+}
+
 // ---------------------------------------------------------------------------
 // collision refusal (foreign files)
 // ---------------------------------------------------------------------------

@@ -2232,18 +2232,27 @@ fn monitor_interval(interval_ms: u64) -> String {
 
 /// What one monitor WATCHES, in one line: `timer 60s`,
 /// `poll gh run 123 · until conclusion`, `cli codex exec …`, `file src/x.rs`.
-/// The daemon's own `source_summary` wins when it sent one — this is the
-/// client's honest fallback for the typed source it already holds.
+/// The typed file path is projected before display. For other sources the
+/// daemon's summary wins when present.
 #[must_use]
 pub fn monitor_source_summary(monitor: &haider_rpc::MonitorRegistrationWire) -> String {
+    use haider_rpc::MonitorSourceWire as S;
+    if let S::File { path } = &monitor.source {
+        return format!(
+            "file {}",
+            monitor_excerpt(&crate::live::workspace_display_path(path))
+        );
+    }
     if !monitor.source_summary.trim().is_empty() {
         return monitor_excerpt(&monitor.source_summary);
     }
-    use haider_rpc::MonitorSourceWire as S;
     match &monitor.source {
         S::Sms => "sms".to_owned(),
         S::Process { command, .. } => format!("process {}", monitor_excerpt(command)),
-        S::File { path } => format!("file {}", monitor_excerpt(path)),
+        S::File { path } => format!(
+            "file {}",
+            monitor_excerpt(&crate::live::workspace_display_path(path))
+        ),
         S::Poll {
             command,
             interval_ms,
@@ -3311,7 +3320,10 @@ impl SshProfileForm {
                 "•".repeat(self.secret.chars().count())
             }
             SshFormAuthKind::Agent | SshFormAuthKind::Keep => "—".into(),
-            SshFormAuthKind::KeyFile => self.credential.clone(),
+            SshFormAuthKind::KeyFile if !self.credential.is_empty() => {
+                crate::live::workspace_display_path(&self.credential)
+            }
+            SshFormAuthKind::KeyFile => String::new(),
         }
     }
 
@@ -7355,11 +7367,10 @@ impl AppModel {
                 }
             }
         };
-        let cwd = self
+        let real_cwd = self
             .session_workspace_cwd
             .as_deref()
-            .or_else(|| (!self.session_dir.is_empty()).then_some(self.session_dir.as_str()));
-        let real_cwd = cwd.filter(|path| std::path::Path::new(path).is_dir());
+            .filter(|path| std::path::Path::new(path).is_dir());
         let mut scan_truncated = false;
         if let Some(cwd) = real_cwd {
             let root = std::path::Path::new(cwd);
@@ -8335,7 +8346,10 @@ impl AppModel {
             }
             let path = self.cwd.clone();
             let retry_after = self.projection.run_errored() || self.projection.retrying().is_some();
-            self.flash = Some(format!("· /retry — re-root to {path}"));
+            self.flash = Some(format!(
+                "· /retry — re-root to {}",
+                crate::live::workspace_display_path(&path)
+            ));
             self.retry_inflight = true;
             self.requests.push(AppRequest::WorkspaceSet {
                 session,
@@ -14269,14 +14283,9 @@ impl AppModel {
                     .or_else(|| blurb.clone())
                     .unwrap_or_else(|| entry.id.as_str().to_owned());
                 let dir = if active {
-                    self.session_workspace_cwd
-                        .clone()
-                        .unwrap_or_else(|| self.session_dir.clone())
+                    self.session_dir.clone()
                 } else {
-                    entry
-                        .workspace_cwd
-                        .clone()
-                        .unwrap_or_else(|| entry.dir.clone())
+                    entry.dir.clone()
                 };
                 let model_short = if active {
                     self.identity.model_short.clone()
@@ -16450,7 +16459,7 @@ impl AppModel {
                 kind: RowKind::Shell,
                 kind_label: RowKind::Shell.label().to_owned(),
                 name: if shell.title.trim().is_empty() {
-                    shell.cwd_or_host.clone()
+                    crate::live::workspace_display_path(&shell.cwd_or_host)
                 } else {
                     shell.title.clone()
                 },
@@ -19115,6 +19124,7 @@ impl AppModel {
             if self.active_session.as_ref() == Some(&summary.session_id) {
                 if self.session_workspace_cwd.as_ref() != Some(workspace) {
                     self.session_workspace_cwd = Some(workspace.clone());
+                    self.session_dir = crate::live::workspace_display_path(workspace);
                     self.dirty = true;
                 }
             } else if let Some(entry) = self
@@ -19124,6 +19134,7 @@ impl AppModel {
                 && entry.workspace_cwd.as_ref() != Some(workspace)
             {
                 entry.workspace_cwd = Some(workspace.clone());
+                entry.dir = crate::live::workspace_display_path(workspace);
                 self.dirty = true;
             }
         }

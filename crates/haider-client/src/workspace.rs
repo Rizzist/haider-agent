@@ -112,9 +112,7 @@ impl WorkspaceEnvironment {
             timezone: nonempty(WORKSPACE_TIMEZONE_ENV),
             ci: std::env::var_os("CI").is_some(),
             explicit_profile_dir: std::env::var_os(crate::profile::PROFILE_DIR_ENV).is_some(),
-            home: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from)),
+            home: crate::launch_origin::preferred_process_home(),
         }
     }
 }

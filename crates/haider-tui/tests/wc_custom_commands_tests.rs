@@ -87,6 +87,17 @@ fn subdirectory_becomes_a_colon_namespace() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn command_warning_escapes_control_characters_in_its_path() {
+    let temp = tempfile::tempdir().expect("temp");
+    write(temp.path(), "bad\nname.md", "");
+    let result = load(Some(temp.path()), None);
+    let warning = result.warnings.first().expect("malformed command warning");
+    assert!(!warning.contains('\n'));
+    assert!(warning.contains("\\u{000a}"), "{warning}");
+}
+
 #[test]
 fn project_wins_over_global_on_name_collision() {
     let global = tempfile::tempdir().expect("temp");
