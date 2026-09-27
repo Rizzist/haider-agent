@@ -2110,6 +2110,10 @@ pub struct SessionSummary {
     /// Present exactly when `footprint_tokens` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footprint_truth: Option<ContextFootprintTruth>,
+    /// The child's own durable snapshot, including its request selection
+    /// epoch. Older daemons omit it; totals above remain usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_footprint: Option<ContextFootprint>,
     /// Additive G2 field: the committed session title, so launcher rosters
     /// name rows without attaching. `None` for untitled sessions and when
     /// an older daemon omits the field — readers must not infer anything

@@ -37,6 +37,7 @@ fn attachment(n: usize) -> AttachmentId {
 
 fn summary(n: usize, head_seq: u64) -> SessionSummary {
     SessionSummary {
+        latest_context_footprint: None,
         session_id: sid(n),
         head_seq,
         worker_generation: 7,
@@ -420,7 +421,10 @@ fn reconnect_restores_the_working_set_after_each_sessions_last_applied_cursor() 
     let commands = driver.apply(&mut model, LiveReply::Reconnected);
     assert_eq!(
         commands.first(),
-        Some(&LiveCommand::List { cursor: None }),
+        Some(&LiveCommand::ListAt {
+            cursor: None,
+            epoch: driver.connection_epoch()
+        }),
         "a fresh connection re-lists first"
     );
     let attaches: Vec<(SessionId, u64)> = commands

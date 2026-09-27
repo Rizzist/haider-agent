@@ -7313,6 +7313,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
     assert_eq!(
         summary,
         SessionSummary {
+            latest_context_footprint: None,
             session_id: session_id.clone(),
             head_seq: 1,
             worker_generation: created.worker_generation,

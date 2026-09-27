@@ -32,6 +32,49 @@ fn create(store: &Store, session: &str) {
         .expect("create session");
 }
 
+#[test]
+fn legacy_omitted_budget_source_does_not_mint_a_noop_selection_epoch() {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    use haider_store::SessionSelectModelOutcome;
+
+    let root = tempfile::tempdir().expect("temporary store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "legacy-budget-source");
+    let command = SessionSelectModelCommand {
+        command_id: "legacy-noop".into(),
+        request_digest: "legacy-noop-digest".into(),
+        request_json: "{}".into(),
+        session_id: SessionId::new("legacy-budget-source"),
+        worker_generation: store.worker_generation(),
+        provider: "source".into(),
+        model: "test-model".into(),
+        expected_pair: None,
+        account_alias: None,
+        output_budget: Some(SessionOutputBudgetV1 {
+            max_tokens: 4096,
+            source: SessionOutputBudgetSourceV1::Derived,
+            clamped: None,
+        }),
+        event_id: EventId::new("legacy-noop-event"),
+        device_id: DeviceId::new("test-device"),
+    };
+    let SessionSelectModelOutcome::Committed { selected, .. } = store
+        .select_session_model(&command)
+        .expect("no-op selection")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(selected.selected_seq, 0);
+    assert_eq!(
+        store
+            .session_metadata(&command.session_id)
+            .expect("metadata")
+            .expect("typed")
+            .selection_epoch,
+        Some(0)
+    );
+}
+
 fn command(store: &Store) -> SessionProviderRebindCommand {
     SessionProviderRebindCommand {
         command_id: "rebind-1".into(),
@@ -197,7 +240,7 @@ fn provider_rebind_omitted_coordinates_clear_only_the_session_override() {
     };
     assert_eq!(
         *envelope.payload,
-        serde_json::json!({"type":"session_provider_rebound","rebind_id":"rebind-2","provider":"proxy"})
+        serde_json::json!({"type":"session_provider_rebound","rebind_id":"rebind-2","provider":"proxy","selection_epoch":envelope.seq})
     );
     let metadata = store
         .session_metadata(&command.session_id)
@@ -224,6 +267,7 @@ fn model_provider_switch_clears_rebind_override_but_same_provider_preserves_it()
         provider: "proxy".into(),
         model: "model-2".into(),
         expected_pair: None,
+        account_alias: None,
         output_budget: None,
         event_id: EventId::new("model-selected-1"),
         device_id: DeviceId::new("test-device"),
@@ -257,4 +301,164 @@ fn model_provider_switch_clears_rebind_override_but_same_provider_preserves_it()
     assert_eq!(switched.provider_base_url, None);
     assert_eq!(switched.provider_rebind_id, None);
     assert_eq!(switched.account_alias, None);
+}
+
+#[test]
+fn selection_epoch_survives_restart_and_advances_for_budget_model_and_route() {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    use haider_protocol::session::ModelSelected;
+    use haider_store::SessionSelectModelOutcome;
+
+    let root = tempfile::tempdir().expect("temporary store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "session-a");
+    let id = SessionId::new("session-a");
+    assert_eq!(
+        store
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .selection_epoch,
+        Some(0)
+    );
+    let mut selection = SessionSelectModelCommand {
+        command_id: "budget-1".into(),
+        request_digest: "budget-digest-1".into(),
+        request_json: r#"{"budget":20000}"#.into(),
+        session_id: id.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "source".into(),
+        model: "test-model".into(),
+        expected_pair: None,
+        account_alias: None,
+        output_budget: Some(SessionOutputBudgetV1 {
+            max_tokens: 20_000,
+            source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+            clamped: None,
+        }),
+        event_id: EventId::new("budget-event-1"),
+        device_id: DeviceId::new("test-device"),
+    };
+    let SessionSelectModelOutcome::Committed {
+        selected: budget,
+        envelope,
+    } = store
+        .select_session_model(&selection)
+        .expect("budget commit")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(budget.selected_seq, envelope.seq);
+    assert_eq!(
+        ModelSelected::from_payload_value(&envelope.payload)
+            .expect("fact")
+            .selection_epoch,
+        Some(budget.selected_seq)
+    );
+    selection.command_id = "noop-1".into();
+    selection.request_digest = "noop-digest-1".into();
+    selection.request_json = r#"{"noop":true}"#.into();
+    selection.event_id = EventId::new("noop-event-1");
+    let SessionSelectModelOutcome::Committed {
+        selected: noop,
+        envelope,
+    } = store
+        .select_session_model(&selection)
+        .expect("no-op commit")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(noop.selected_seq, budget.selected_seq);
+    assert!(envelope.seq > noop.selected_seq);
+    assert_eq!(
+        ModelSelected::from_payload_value(&envelope.payload)
+            .expect("no-op fact")
+            .selection_epoch,
+        Some(budget.selected_seq)
+    );
+    selection.command_id = "account-bind-1".into();
+    selection.request_digest = "account-bind-digest-1".into();
+    selection.request_json = r#"{"account":"account-A"}"#.into();
+    selection.account_alias = Some("account-A".into());
+    selection.event_id = EventId::new("account-bind-event-1");
+    let SessionSelectModelOutcome::Committed {
+        selected: account_bound,
+        ..
+    } = store
+        .select_session_model(&selection)
+        .expect("account binding commit")
+    else {
+        panic!("commit")
+    };
+    assert!(account_bound.selected_seq > noop.selected_seq);
+    assert_eq!(
+        store
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .account_alias
+            .as_deref(),
+        Some("account-A")
+    );
+    selection.command_id = "model-2".into();
+    selection.request_digest = "model-digest-2".into();
+    selection.request_json = r#"{"model":"another"}"#.into();
+    selection.model = "another".into();
+    selection.account_alias = None;
+    selection.event_id = EventId::new("model-event-2");
+    let SessionSelectModelOutcome::Committed {
+        selected: model, ..
+    } = store
+        .select_session_model(&selection)
+        .expect("model commit")
+    else {
+        panic!("commit")
+    };
+    assert!(model.selected_seq > budget.selected_seq);
+    let mut route = command(&store);
+    route.provider = "source".into();
+    let SessionProviderRebindOutcome::Committed {
+        selected: rebound,
+        envelope,
+    } = store.rebind_session_provider(&route).expect("route commit")
+    else {
+        panic!("commit")
+    };
+    assert!(rebound.selected_seq > model.selected_seq);
+    assert_eq!(
+        SessionProviderRebound::from_payload_value(&envelope.payload)
+            .expect("route fact")
+            .selection_epoch,
+        Some(rebound.selected_seq)
+    );
+    drop(store);
+    let reopened = Store::open(root.path()).expect("restart");
+    assert_eq!(
+        reopened
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .selection_epoch,
+        Some(rebound.selected_seq)
+    );
+    selection.command_id = "budget-3".into();
+    selection.request_digest = "budget-digest-3".into();
+    selection.request_json = r#"{"budget":12000}"#.into();
+    selection.worker_generation = reopened.worker_generation();
+    selection.output_budget = Some(SessionOutputBudgetV1 {
+        max_tokens: 12_000,
+        source: SessionOutputBudgetSourceV1::UserSet { requested: 12_000 },
+        clamped: None,
+    });
+    selection.event_id = EventId::new("budget-event-3");
+    let SessionSelectModelOutcome::Committed {
+        selected: after_restart,
+        ..
+    } = reopened
+        .select_session_model(&selection)
+        .expect("post-restart commit")
+    else {
+        panic!("commit")
+    };
+    assert!(after_restart.selected_seq > rebound.selected_seq);
 }

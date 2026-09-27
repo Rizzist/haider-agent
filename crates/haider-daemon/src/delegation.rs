@@ -760,6 +760,7 @@ impl DelegationHandle {
             "cwd": coordinates.metadata.cwd,
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
+            "account_alias": coordinates.metadata.account_alias,
             "max_tokens": coordinates.metadata.max_tokens,
             "permission_overrides": child_overrides,
             "delegation_agent": agent_id,
@@ -794,6 +795,7 @@ impl DelegationHandle {
                     device_id: self.hub.device_id(),
                 },
                 child_interaction_mode,
+                coordinates.metadata.account_alias.clone(),
             )
             .await?;
 

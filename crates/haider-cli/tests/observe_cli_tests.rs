@@ -88,6 +88,7 @@ fn digest(
         head_seq: 12,
         worker_generation: 7,
         metadata: Some(SessionMetadataV1 {
+            selection_epoch: None,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,
@@ -131,6 +132,7 @@ fn digest(
         main_head_node_id: Some(NodeId::new("node-main")),
         main_head_seq: 4,
         latest_context_footprint: Some(ContextFootprint {
+            selection_epoch: None,
             input_tokens: 800,
             output_tokens: 150,
             cached_input_tokens: 50,

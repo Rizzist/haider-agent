@@ -139,6 +139,14 @@ fn live_session(anthropic_windows: bool) -> (AppModel, LiveDriver) {
     model.identity.provider = "anthropic-oauth".to_owned();
     model.identity.model_short = "claude-opus-5-5".to_owned();
     model.refresh_context_window();
+    // These synthetic request snapshots stand in for a session whose
+    // initial daemon selection has already committed.
+    model.meter_epoch.admit(
+        ("anthropic-oauth".into(), "claude-opus-5-5".into()),
+        Some(0),
+        Some(30_000),
+        Some(false),
+    );
     (model, driver)
 }
 
@@ -151,6 +159,7 @@ fn snapshot(
 ) -> ContextFootprint {
     let reserved = 30_000;
     ContextFootprint {
+        selection_epoch: None,
         input_tokens: input,
         output_tokens: output,
         cached_input_tokens: cached,
@@ -167,6 +176,10 @@ fn snapshot(
 }
 
 fn apply_footprint(model: &mut AppModel, id: &str, footprint: &ContextFootprint) {
+    let mut footprint = footprint.clone();
+    if footprint.selection_epoch.is_none() {
+        footprint.selection_epoch = model.meter_epoch.selection_epoch;
+    }
     let item: TurnItem = footprint.extension_item().expect("carrier");
     for payload in [
         EventPayload::Item(ItemEvent::Started {
@@ -186,6 +199,18 @@ fn pick_model(model: &mut AppModel, slug: &str) {
     run_slash(model, &format!("/model {slug}"));
     model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
     assert_eq!(model.identity.model_short, slug, "picker selected {slug}");
+    // The launcher pick above is local. These meter tests then model the
+    // daemon's committed selection before checking snapshot admission.
+    let next_epoch = model.meter_epoch.selection_epoch.unwrap_or(0) + 1;
+    model.meter_epoch.admit(
+        (
+            model.identity.provider.clone(),
+            model.identity.model_short.clone(),
+        ),
+        Some(next_epoch),
+        Some(30_000),
+        Some(false),
+    );
 }
 
 fn draw(model: &AppModel, width: u16, height: u16) -> Vec<String> {
@@ -266,6 +291,13 @@ fn each_model_meters_against_its_own_window_and_trigger() {
         model.identity.provider = provider.to_owned();
         model.identity.model_short = slug.to_owned();
         model.refresh_context_window();
+        let next_epoch = model.meter_epoch.selection_epoch.unwrap_or(0) + 1;
+        model.meter_epoch.admit(
+            (provider.to_owned(), slug.to_owned()),
+            Some(next_epoch),
+            Some(30_000),
+            Some(false),
+        );
         let window_tokens = model.identity.context_window;
         // The daemon's snapshot for THIS model's request.
         apply_footprint(
@@ -374,7 +406,7 @@ fn a_switch_to_an_unknown_window_drops_the_turns_estimate_in_the_panel() {
 /// Models OUTSIDE the catalog (the daemon knows their window, the client
 /// has no row): the snapshot's window serves — but never across a switch.
 ///
-/// MUTATION CHECK: drop the `snapshot_predates` epoch check from `context_meter`.
+/// MUTATION CHECK: drop selection-epoch equality from `context_meter`.
 /// Expected runtime failure: after the switch the line keeps `of 1M`.
 #[test]
 fn a_switch_outside_the_catalog_never_keeps_the_previous_snapshot_window() {
@@ -382,6 +414,12 @@ fn a_switch_outside_the_catalog_never_keeps_the_previous_snapshot_window() {
     model.identity.provider = "anthropic".to_owned();
     model.identity.model_short = "claude-opus-5-5".to_owned();
     model.refresh_context_window();
+    model.meter_epoch.admit(
+        ("anthropic".into(), "claude-opus-5-5".into()),
+        Some(1),
+        Some(30_000),
+        Some(false),
+    );
     apply_footprint(
         &mut model,
         "fp-unlisted",
@@ -398,6 +436,12 @@ fn a_switch_outside_the_catalog_never_keeps_the_previous_snapshot_window() {
 
     model.identity.model_short = "claude-sonnet-4-6".to_owned();
     model.refresh_context_window();
+    model.meter_epoch.admit(
+        ("anthropic".into(), "claude-sonnet-4-6".into()),
+        Some(2),
+        Some(30_000),
+        Some(false),
+    );
     let switched = status_left_string(&model, 118);
     assert!(switched.contains("63k tok · window unknown"), "{switched}");
 
@@ -544,6 +588,13 @@ fn context_meter_golden() {
     );
     pick_model(&mut model, "claude-sonnet-4-6");
     golden_case(&mut model, "claude-sonnet-4-6 · after switch", &mut out);
+    let next_epoch = model.meter_epoch.selection_epoch.unwrap_or_default() + 1;
+    model.meter_epoch.admit(
+        ("openai-oauth".into(), "gpt-6-sol".into()),
+        Some(next_epoch),
+        Some(30_000),
+        Some(false),
+    );
     model.identity.provider = "openai-oauth".to_owned();
     model.identity.model_short = "gpt-6-sol".to_owned();
     model.refresh_context_window();
@@ -637,6 +688,18 @@ fn deliver_footprint(
     seq: u64,
     footprint: &ContextFootprint,
 ) -> u64 {
+    let mut footprint = footprint.clone();
+    if footprint.selection_epoch.is_none() {
+        footprint.selection_epoch = if model.active_session.as_ref() == Some(session) {
+            model.meter_epoch.selection_epoch
+        } else {
+            model
+                .sessions
+                .iter()
+                .find(|row| &row.id == session)
+                .and_then(|row| row.meter_epoch.selection_epoch)
+        };
+    }
     let item: TurnItem = footprint.extension_item().expect("carrier");
     let id = ItemId::new(format!("fp-{}-{seq}", session.as_str()));
     for (offset, payload) in [
@@ -669,6 +732,7 @@ fn deliver_model_fact(
     slug: &str,
 ) {
     let fact = haider_protocol::session::ModelSelected {
+        selection_epoch: Some(seq),
         provider: provider.to_owned(),
         model: slug.to_owned(),
     };
@@ -687,7 +751,19 @@ fn model_selected_reply(
     slug: &str,
     output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
 ) -> LiveReply {
+    model_selected_reply_at(session, provider, slug, output_budget, 3)
+}
+
+fn model_selected_reply_at(
+    session: &haider_protocol::ids::SessionId,
+    provider: &str,
+    slug: &str,
+    output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+    selected_seq: u64,
+) -> LiveReply {
     LiveReply::ModelSelected {
+        connection_epoch: None,
+        selected_seq,
         command_id: haider_rpc::CommandId::new(format!("select-{slug}")),
         session: session.clone(),
         provider: provider.to_owned(),
@@ -703,7 +779,16 @@ fn two_attached_sessions() -> (AppModel, LiveDriver) {
     let (mut model, mut driver) = live_session(true);
     model.sessions.clear();
     for name in ["s-meter-b", "s-meter-a"] {
-        model.upsert_live_session(&session_id(name));
+        let session = session_id(name);
+        model.upsert_live_session(&session);
+        model.note_session_metadata_at(
+            &session,
+            "anthropic-oauth",
+            "claude-opus-5-5",
+            30_000,
+            Some(0),
+            None,
+        );
     }
     model.open_session(&session_id("s-meter-a"));
     for name in ["s-meter-a", "s-meter-b"] {
@@ -862,7 +947,7 @@ fn a_background_model_change_binds_the_parked_session() {
     model.open_session(&a);
     driver.apply(
         &mut model,
-        model_selected_reply(&b, "openai-oauth", "gpt-6-sol", None),
+        model_selected_reply_at(&b, "openai-oauth", "gpt-6-sol", None, 4),
     );
     assert_eq!(model.identity.model_short, "claude-opus-5-5", "A untouched");
     model.open_session(&b);
@@ -912,6 +997,18 @@ fn equal_window_session() -> (AppModel, LiveDriver, haider_protocol::ids::Sessio
     let s = session_id("s-meter-eq");
     model.sessions.clear();
     model.upsert_live_session(&s);
+    model.note_session_metadata_at(
+        &s,
+        "eq-oauth",
+        "eq-wide",
+        50_000,
+        Some(0),
+        Some(
+            haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                requested: 50_000,
+            },
+        ),
+    );
     model.open_session(&s);
     driver.apply(
         &mut model,
@@ -1016,11 +1113,12 @@ fn a_same_window_switch_projects_from_the_committed_budget() {
     // derivation alone (30k) would project 70k.
     driver.apply(
         &mut model,
-        model_selected_reply(
+        model_selected_reply_at(
             &s,
             "eq-oauth",
             "eq-mid",
             Some(budget(50_000, 50_000, false)),
+            next + 1,
         ),
     );
     deliver_model_fact(&mut driver, &mut model, &s, next + 1, "eq-oauth", "eq-mid");
@@ -1085,7 +1183,7 @@ fn a_window_switch_projects_with_the_new_models_reserve() {
     assert_eq!(model.context_meter().auto_compact_at, Some(340_000));
     driver.apply(
         &mut model,
-        model_selected_reply(&s, "eq-oauth", "small-128k", None),
+        model_selected_reply_at(&s, "eq-oauth", "small-128k", None, 4),
     );
     let meter = model.context_meter();
     assert_eq!(meter.window, Some(128_000));
@@ -1250,6 +1348,7 @@ fn listed_summary(
     max_tokens: u64,
 ) -> haider_rpc::SessionSummary {
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -1272,6 +1371,7 @@ fn listed_summary(
         created_at_ms: 1,
     };
     haider_rpc::SessionSummary {
+        latest_context_footprint: None,
         session_id: session.clone(),
         head_seq: 0,
         worker_generation: 7,
@@ -1316,8 +1416,8 @@ fn a_fact_switch_learns_the_committed_budget_from_session_metadata() {
     assert!(meter.threshold_projected);
     assert_eq!(
         meter.auto_compact_at,
-        Some(70_000),
-        "derived until the list"
+        Some(50_000),
+        "carried user reserve is assumed until the list"
     );
     assert_eq!(meter.turns_to_threshold, None);
     driver.apply(

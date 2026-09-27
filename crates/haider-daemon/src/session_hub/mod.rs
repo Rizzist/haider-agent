@@ -4228,6 +4228,7 @@ impl SessionHub {
         self.create_internal_session_with_interaction_mode(
             command,
             haider_protocol::session::SessionInteractionModeV1::Interactive,
+            None,
         )
         .await
     }
@@ -4236,6 +4237,7 @@ impl SessionHub {
         &self,
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
     ) -> Result<CreatedSession, HaiderError> {
         if let Some(created) = self
             .inner
@@ -4250,7 +4252,7 @@ impl SessionHub {
             return Ok(created);
         }
         match self
-            .create_session_with_interaction_mode(command, interaction_mode, None, None)
+            .create_session_with_interaction_mode(command, interaction_mode, account_alias, None)
             .await
             .map_err(hub_error_as_store)?
         {

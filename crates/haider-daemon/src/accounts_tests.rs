@@ -1120,6 +1120,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         Arc::new(ProductionAccountBuilder::default()),
     );
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -1642,6 +1643,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     );
     let resolved = factory
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+            selection_epoch: None,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,
@@ -1836,6 +1838,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         trust: haider_rpc::ProviderTrustWire::Full,
     };
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -1991,6 +1994,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
     let origin = "http://127.0.0.1:11434/v1";
     let summary = keyless_summary(provider, origin);
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -2167,6 +2171,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
         );
         let Err(error) = factory
             .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+                selection_epoch: None,
                 launch_origin: None,
                 workspace_allocation: None,
                 provider_base_url: None,
@@ -2665,6 +2670,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     let resolver = AccountsAttemptResolver::new(
         factory,
         haider_protocol::session::SessionMetadataV1 {
+            selection_epoch: None,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,
@@ -2773,6 +2779,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         promotion_targets: HashMap::new(),
     });
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -3010,6 +3017,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
     );
     let resolved = factory
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+            selection_epoch: None,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,
@@ -3227,6 +3235,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         broker,
     );
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -12543,6 +12552,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
     use crate::accounts::{ProviderTuning, anthropic_fast_for};
 
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -12767,6 +12777,7 @@ fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummary
 
 fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session::SessionMetadataV1 {
     haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -13588,6 +13599,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         Arc::clone(&builder) as Arc<dyn AccountProviderBuilder>,
     );
     let metadata = |provider: &str| haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -13792,6 +13804,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         Arc::new(ProductionAccountBuilder::default()),
     );
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -14697,6 +14710,7 @@ fn antigravity_summary(models: &[&str], default_model: Option<&str>) -> Provider
 
 fn antigravity_metadata(model: &str) -> haider_protocol::session::SessionMetadataV1 {
     haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,

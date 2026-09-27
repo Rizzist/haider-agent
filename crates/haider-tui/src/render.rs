@@ -7492,7 +7492,43 @@ fn render_token_panel(
         main_meter,
         main_detail,
     )];
+    let mut unknown_children = Vec::new();
     for (_, chip) in crate::app::flatten_chips(&model.chips) {
+        let manifest_label = chip.provider.as_deref().map_or_else(
+            || chip.model.clone(),
+            |provider| format!("{} · {provider}", chip.model),
+        );
+        let child_label = chip
+            .child_session
+            .as_deref()
+            .and_then(|session| model.sessions.iter().find(|row| row.id.as_str() == session))
+            .map_or_else(
+                || manifest_label.clone(),
+                |row| {
+                    row.meter_epoch.pair.as_ref().map_or_else(
+                        || {
+                            if row.summary_seen {
+                                "unknown".to_owned()
+                            } else {
+                                manifest_label.clone()
+                            }
+                        },
+                        |(provider, child_model)| format!("{child_model} · {provider}"),
+                    )
+                },
+            );
+        if let Some(meter) = model.child_context_meter(chip) {
+            rows.push((
+                format!("└ {} · {child_label}", chip.name),
+                meter,
+                Vec::new(),
+            ));
+            continue;
+        }
+        if !model.mode.fabricates_locally() && chip.child_session.is_some() {
+            unknown_children.push(format!("└ {} · {child_label}  usage unknown", chip.name));
+            continue;
+        }
         // A child's window is ITS model's (973-context-meter-fixes B2): its
         // own valid snapshot first, else the catalog row for its model
         // under ITS provider. The same slug on another provider may declare
@@ -7536,6 +7572,9 @@ fn render_token_panel(
         for fact in detail {
             lines.push(Line::styled(format!("    {fact}"), theme.dim_style()));
         }
+    }
+    for label in unknown_children {
+        lines.push(Line::styled(label, theme.text_style()));
     }
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let width = area.width.saturating_sub(2).max(24);
@@ -8945,13 +8984,13 @@ fn render_subtree(
                         accent_style.add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
-                        format!(" · {remainder} · {}", chip.model),
+                        format!(" · {remainder} · {}", model.child_display_model(chip)),
                         ink,
                     ));
                 }
                 _ => {
                     spans.push(Span::styled(
-                        format!(" · {} · {}", chip.name, chip.model),
+                        format!(" · {} · {}", chip.name, model.child_display_model(chip)),
                         ink,
                     ));
                 }
@@ -11151,7 +11190,10 @@ fn render_subagent(
     let mut header_bottom = vec![Span::styled(
         format!(
             " {} · {} · {} · {}  ",
-            chip.full, chip.name, chip.model, chip.device
+            chip.full,
+            chip.name,
+            model.child_display_model(chip),
+            chip.device
         ),
         theme.dim_style(),
     )];
@@ -14898,7 +14940,10 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
     // durable occupancy snapshot beats the usage fallback, an ESTIMATED
     // snapshot wears `~`, and an unknown window reads unknown — never a
     // percentage of a guessed (or output-budget) window.
-    let meter = model.context_meter().status_text(METER_CELLS_DEFAULT);
+    let meter = model.viewed_context_meter().map_or_else(
+        || "context unknown".to_owned(),
+        |meter| meter.status_text(METER_CELLS_DEFAULT),
+    );
 
     // F2c: token usage sits DIRECTLY right of the state — the identity
     // block (model / auth / reasoning) moved to the composer's top rule.

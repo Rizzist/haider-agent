@@ -372,6 +372,7 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert_eq!(decoded.effort, None);
     assert_eq!(decoded.provider_base_url, None);
     assert_eq!(decoded.provider_rebind_id, None);
+    assert_eq!(decoded.selection_epoch, None);
     assert!(!decoded.fast);
     assert_eq!(
         decoded.interaction_mode,
@@ -385,6 +386,7 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert!(!encoded.contains("effort"));
     assert!(!encoded.contains("provider_base_url"));
     assert!(!encoded.contains("provider_rebind_id"));
+    assert!(!encoded.contains("selection_epoch"));
     assert!(!encoded.contains("fast"));
     assert!(!encoded.contains("cache_policy"));
     assert!(!encoded.contains("interaction_mode"));
@@ -397,6 +399,16 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     let encoded = serde_json::to_value(&tuned).expect("tuned encode");
     assert_eq!(encoded["effort"], "max");
     assert_eq!(encoded["fast"], true);
+    let versioned = SessionMetadataV1 {
+        selection_epoch: Some(42),
+        ..tuned.clone()
+    };
+    let versioned_json = serde_json::to_value(&versioned).expect("versioned metadata encode");
+    assert_eq!(versioned_json["selection_epoch"], 42);
+    assert_eq!(
+        serde_json::from_value::<SessionMetadataV1>(versioned_json).expect("decode versioned"),
+        versioned
+    );
 
     let mobile = SessionMetadataV1 {
         cache_policy: haider_protocol::cache::CachePolicySettingsV1 {
@@ -410,6 +422,56 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert_eq!(
         encoded["cache_policy"]["cold_cost_threshold_microusd"],
         9_000
+    );
+}
+
+#[test]
+fn selection_facts_epoch_is_additive_and_round_trips() {
+    use haider_protocol::session::{ModelSelected, SessionProviderRebound};
+    let old_model: ModelSelected = serde_json::from_value(serde_json::json!({
+        "provider": "p", "model": "m"
+    }))
+    .expect("old model fact");
+    assert_eq!(old_model.selection_epoch, None);
+    assert!(
+        serde_json::to_value(&old_model)
+            .expect("encode old model")
+            .get("selection_epoch")
+            .is_none()
+    );
+    let new_model = ModelSelected {
+        selection_epoch: Some(91),
+        ..old_model
+    };
+    assert_eq!(
+        serde_json::from_value::<ModelSelected>(
+            serde_json::to_value(&new_model).expect("encode new model")
+        )
+        .expect("decode new model"),
+        new_model
+    );
+
+    let old_rebind: SessionProviderRebound = serde_json::from_value(serde_json::json!({
+        "rebind_id": "r", "provider": "p", "base_url": null, "account": null
+    }))
+    .expect("old rebind fact");
+    assert_eq!(old_rebind.selection_epoch, None);
+    assert!(
+        serde_json::to_value(&old_rebind)
+            .expect("encode old rebind")
+            .get("selection_epoch")
+            .is_none()
+    );
+    let new_rebind = SessionProviderRebound {
+        selection_epoch: Some(92),
+        ..old_rebind
+    };
+    assert_eq!(
+        serde_json::from_value::<SessionProviderRebound>(
+            serde_json::to_value(&new_rebind).expect("encode new rebind")
+        )
+        .expect("decode new rebind"),
+        new_rebind
     );
 }
 
@@ -1763,6 +1825,7 @@ fn golden_context_footprint_exact_extension() {
     use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 
     let footprint = ContextFootprint {
+        selection_epoch: None,
         input_tokens: 118_000,
         output_tokens: 7_000,
         cached_input_tokens: 42_000,
@@ -1774,6 +1837,24 @@ fn golden_context_footprint_exact_extension() {
         truth: ContextFootprintTruth::Exact,
         accounting: None,
     };
+    let legacy = serde_json::to_value(&footprint).expect("legacy footprint encode");
+    assert!(legacy.get("selection_epoch").is_none());
+    assert_eq!(
+        serde_json::from_value::<ContextFootprint>(legacy)
+            .expect("legacy footprint decode")
+            .selection_epoch,
+        None
+    );
+    let versioned = ContextFootprint {
+        selection_epoch: Some(17),
+        ..footprint.clone()
+    };
+    let round_trip = serde_json::to_value(&versioned).expect("versioned footprint encode");
+    assert_eq!(round_trip["selection_epoch"], 17);
+    assert_eq!(
+        serde_json::from_value::<ContextFootprint>(round_trip).expect("versioned footprint decode"),
+        versioned
+    );
     golden(
         "context_footprint_exact_extension",
         &footprint.extension_item().expect("extension serializes"),

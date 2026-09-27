@@ -98,6 +98,7 @@ pub fn transcript() -> Vec<WireFrame> {
         end_seq: 9,
     };
     let fork_metadata = SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -206,6 +207,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    latest_context_footprint: None,
                     session_id: session_id.clone(),
                     head_seq: 9,
                     worker_generation: 7,
@@ -244,6 +246,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list-roster"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    latest_context_footprint: None,
                     session_id: session_id.clone(),
                     head_seq: 9,
                     worker_generation: 7,
@@ -421,6 +424,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 1,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -1877,6 +1881,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list-workspace"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    latest_context_footprint: None,
                     session_id: SessionId::new("session-workspace"),
                     head_seq: 17,
                     worker_generation: 15,
@@ -2468,6 +2473,7 @@ fn append_prompt_fork_contract_tail(frames: &mut Vec<WireFrame>, metadata: Sessi
         },
         WireFrame::SessionRosterDelta {
             summaries: vec![SessionSummary {
+                latest_context_footprint: None,
                 session_id: child_session_id,
                 head_seq: 58,
                 worker_generation: 7,

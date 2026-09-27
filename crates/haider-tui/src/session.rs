@@ -158,6 +158,9 @@ pub struct SessionState {
     /// older daemon never sets it and the row degrades to its
     /// projection-derived display (never a fabricated count).
     pub summary_counts: Option<SummaryCounts>,
+    /// A summary can establish that the child exists without reporting
+    /// counts or a selection. Its spawn manifest is no longer authority.
+    pub summary_seen: bool,
     /// W-flow inline identity: the session's bound Loom agent-type id from
     /// its `session.list` summary (`SessionSummary.agent_type`). Hydrated
     /// only from a daemon serving `session_agent_type_select_v1` — absence
@@ -190,6 +193,7 @@ pub struct SummaryCounts {
     /// (`SessionSummary::footprint_truth`) — present exactly when the
     /// token figure is.
     pub footprint_truth: Option<haider_protocol::context::ContextFootprintTruth>,
+    pub latest_context_footprint: Option<haider_protocol::context::ContextFootprint>,
 }
 
 impl SessionState {
@@ -235,6 +239,7 @@ impl SessionState {
             branches_offset: 1,
             turns_offset: 0,
             summary_counts: None,
+            summary_seen: false,
             agent_type: None,
             lockdown_provider: None,
             lockdown_boundary_known: false,
@@ -360,6 +365,21 @@ impl SessionState {
             return Some(live);
         }
         summary_tokens
+    }
+
+    /// Latest own-session durable footprint, preferring the fresher list
+    /// summary until this row has replayed through its head.
+    #[must_use]
+    pub fn latest_context_footprint(&self) -> Option<&haider_protocol::context::ContextFootprint> {
+        let summary = self
+            .summary_counts
+            .as_ref()
+            .and_then(|counts| counts.latest_context_footprint.as_ref());
+        if self.summary_is_fresher() {
+            summary.or_else(|| self.projection.latest_footprint())
+        } else {
+            self.projection.latest_footprint().or(summary)
+        }
     }
 
     /// Route one RAW envelope into this (non-attached) session — the

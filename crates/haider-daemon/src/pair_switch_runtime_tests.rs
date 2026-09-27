@@ -22,11 +22,12 @@ use haider_core::{
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
+use haider_protocol::context::ContextFootprint;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{CredentialAlias, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::provider::{Block, FinishReason};
+use haider_protocol::provider::{Block, FinishReason, Usage, UsageSource};
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
 };
@@ -462,6 +463,7 @@ impl PairSwitchWorld {
             provider: "fake-b".into(),
             model: "model-b".into(),
             expected_pair: None,
+            account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("{command_id}-event")),
             device_id: self.device_id.clone(),
@@ -1925,6 +1927,111 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
     store.close().await.expect("store close");
 }
 
+/// A request freezes the selection epoch before provider I/O. A selection
+/// committed while that request is waiting cannot turn its later footprint
+/// into current truth; the next request carries the newly committed epoch.
+#[tokio::test]
+async fn in_flight_request_footprint_keeps_its_begin_selection_epoch() {
+    let usage = Usage {
+        input: 100,
+        output: 10,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let fake_a = Arc::new(FakeProvider::new(vec![
+        FakeStep::Delay { ms: 1500 },
+        FakeStep::EmitText {
+            text: "old request completed".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: usage.clone(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let fake_b = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "new request completed".into(),
+        },
+        FakeStep::EmitUsage { usage },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let world = PairSwitchWorld::boot("inflight-epoch", fake_a.clone(), fake_b).await;
+    let (old_run, disposition) = world
+        .submit_turn(
+            "inflight-epoch-old",
+            "start before selection",
+            DeliveryMode::Queue,
+        )
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    timeout(Duration::from_secs(5), async {
+        while fake_a.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old provider request started");
+
+    let SessionSelectModelOutcome::Committed { selected, .. } = world
+        .hub
+        .select_session_model(world.select_command("inflight-epoch-select"))
+        .await
+        .expect("selection during old request")
+    else {
+        panic!("new pair must commit");
+    };
+    assert!(selected.selected_seq > 0);
+    world.await_done(&old_run).await;
+    let old_footprint = world
+        .store
+        .read(&world.session_id, 0, 512)
+        .await
+        .expect("old request journal")
+        .into_iter()
+        .filter(|event| event.seq > selected.selected_seq)
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                ContextFootprint::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("old request footprint committed after selection");
+    assert_eq!(old_footprint.selection_epoch, Some(0));
+
+    let new_run = world
+        .run_turn("inflight-epoch-new", "start after selection")
+        .await;
+    let new_footprint = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("new request journal")
+        .into_iter()
+        .filter(|event| event.run_id.as_ref() == Some(&new_run))
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                ContextFootprint::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("new request footprint");
+    assert_eq!(new_footprint.selection_epoch, Some(selected.selected_seq));
+    world.shutdown().await;
+}
+
 /// LAW (switch_during_manual_compaction_lands_after_it, F3): a pair switch
 /// COMMITS while manual compaction is in flight (and the journal visibly says
 /// `Compacting` inside the window); the compaction itself finishes on the
@@ -1988,6 +2095,22 @@ async fn switch_during_manual_compaction_lands_after_it() {
     );
     assert_eq!(fake_a.requests()[1].model, "model-a");
     assert!(fake_b.requests().is_empty());
+    let reset = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("compaction journal")
+        .into_iter()
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                ContextFootprint::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("in-flight compaction reset footprint");
+    assert_eq!(reset.selection_epoch, Some(0));
+    assert!(selected.selected_seq > 0);
 
     // The FIRST post-compaction turn resolves through the new pair.
     world

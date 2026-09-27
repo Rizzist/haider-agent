@@ -427,6 +427,9 @@ pub struct SessionProjection {
     /// journal's `context_footprint_v1` extension items — never a
     /// transcript row (one arrives per provider round).
     latest_footprint: Option<haider_protocol::context::ContextFootprint>,
+    /// Current selection's resolved denominator supplied by the owning
+    /// session before an event is reduced. `None` yields a count-free note.
+    compaction_note_window: Option<u64>,
     /// B2b-m3: the durable node → display-entry association, in commit
     /// order — `(entry index, node id)`. Recorded when a `NodeCommitted`
     /// applies (see [`Self::record_node_anchor`]); the `/tree` rows and the
@@ -2246,12 +2249,9 @@ impl SessionProjection {
         // Pre-announce (research §Q2: the sim's `· context at 85% —
         // compacting` line): percent from the latest snapshot when the
         // window is known; the honest count-free line otherwise.
-        let note = self
-            .latest_footprint
-            .as_ref()
+        let note = self.latest_footprint.as_ref()
             .and_then(|footprint| {
-                let window = footprint.context_window?;
-                (window > 0).then(|| {
+                self.compaction_note_window.map(|window| {
                     format!(
                         "· context at {}% — compacting · planned cache epoch transition; next turn history cold (summary retained · originals stay in /tree)",
                         crate::context_meter::percent_of(footprint.used_tokens, window)
@@ -2263,6 +2263,10 @@ impl SessionProjection {
             });
         self.push_note(note);
         true
+    }
+
+    pub fn set_compaction_note_window(&mut self, window: Option<u64>) {
+        self.compaction_note_window = window.filter(|window| *window > 0);
     }
 
     /// Latest context-occupancy snapshot (W7b) — the meter and /tokens

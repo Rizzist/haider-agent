@@ -10,6 +10,7 @@ fn footprint(
     reserved: u64,
 ) -> ContextFootprint {
     ContextFootprint {
+        selection_epoch: None,
         input_tokens: input,
         output_tokens: output,
         cached_input_tokens: cached,
@@ -77,7 +78,7 @@ fn a_switch_to_an_unknown_window_drops_the_previous_turns_estimate() {
     );
     // Nor across a switch to a KNOWN window (the estimate was measured
     // against the old window).
-    let meter = ContextMeter::resolve(Some(&snapshot), 0, 200_000, SnapshotEpoch::Current, cap);
+    let meter = ContextMeter::resolve(Some(&snapshot), 0, 200_000, SnapshotEpoch::Previous, cap);
     assert_eq!(meter.turns_to_threshold, None);
     // The same model keeps it.
     let meter = ContextMeter::resolve(Some(&snapshot), 0, 1_000_000, SnapshotEpoch::Current, cap);
@@ -261,43 +262,33 @@ fn a_window_switch_projects_with_the_new_models_reserve() {
     assert!(meter.threshold_projected);
 }
 
-/// The epoch's transitions: a pair change and a committed budget begin a
-/// new epoch; the reply and its journal fact are idempotent in either
-/// order; a no-op re-selection keeps the daemon's figures.
+/// Epoch admission uses the daemon's version, including for equal values.
 #[test]
 fn meter_epoch_transitions() {
     let pair = |model: &str| ("p".to_owned(), model.to_owned());
-    let old = footprint(10_000, 0, 0, Some(100_000), 30_000);
+    let mut old = footprint(10_000, 0, 0, Some(100_000), 30_000);
+    old.selection_epoch = Some(1);
     let mut epoch = MeterEpoch::default();
-    epoch.bind(pair("a"), Some(&old));
-    assert_eq!(
-        epoch.snapshot_before_change, None,
-        "first binding is no change"
-    );
-    assert!(!epoch.snapshot_predates(Some(&old)));
-
-    // Reply first, then the fact: the committed budget survives.
-    epoch.bind(pair("b"), Some(&old));
-    epoch.commit_selection(pair("b"), Some(&old), Some(8_192));
-    epoch.note_selected_fact(pair("b"), Some(&old));
-    assert!(epoch.snapshot_predates(Some(&old)));
+    assert!(epoch.admit(pair("a"), Some(1), Some(30_000), Some(false)));
+    assert_eq!(epoch.snapshot_epoch(Some(&old)), SnapshotEpoch::Current);
+    assert!(epoch.admit(pair("b"), Some(2), Some(8_192), Some(true)));
+    assert_eq!(epoch.snapshot_epoch(Some(&old)), SnapshotEpoch::Previous);
     assert_eq!(epoch.output_budget, Some(8_192));
-
-    // Fact first, then the reply.
+    assert!(!epoch.admit(pair("a"), Some(1), Some(30_000), Some(false)));
     let mut other = MeterEpoch::default();
-    other.bind(pair("a"), Some(&old));
-    other.note_selected_fact(pair("b"), Some(&old));
-    other.commit_selection(pair("b"), Some(&old), Some(8_192));
+    other.admit(pair("a"), Some(1), Some(30_000), Some(false));
+    other.admit(pair("b"), Some(2), None, None);
+    other.admit(pair("b"), Some(2), Some(8_192), Some(true));
     assert_eq!(other, epoch);
-
-    // The new model's first snapshot is current.
-    let fresh = footprint(12_000, 0, 0, Some(100_000), 8_192);
-    assert!(!epoch.snapshot_predates(Some(&fresh)));
-    // Re-selecting the same model with the reservation it already runs on
-    // changes nothing; a different committed budget starts an epoch.
-    epoch.commit_selection(pair("b"), Some(&fresh), Some(8_192));
-    assert!(!epoch.snapshot_predates(Some(&fresh)));
-    epoch.commit_selection(pair("b"), Some(&fresh), Some(4_000));
-    assert!(epoch.snapshot_predates(Some(&fresh)));
-    assert_eq!(epoch.output_budget, Some(4_000));
+    let mut fresh = footprint(12_000, 0, 0, Some(100_000), 8_192);
+    fresh.selection_epoch = Some(2);
+    assert_eq!(epoch.snapshot_epoch(Some(&fresh)), SnapshotEpoch::Current);
+    // The equal-epoch request proves its window, while the mismatched
+    // reserve cannot lend this epoch its trigger or turns.
+    let mut identical = old.clone();
+    identical.selection_epoch = Some(2);
+    assert_eq!(
+        epoch.snapshot_epoch(Some(&identical)),
+        SnapshotEpoch::CurrentReserveMismatch
+    );
 }

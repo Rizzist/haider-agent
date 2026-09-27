@@ -3846,7 +3846,7 @@ pub async fn run_live(
     {
         model.identity.provider = provider.clone();
         model.identity.model_short = model_short.clone();
-        model.identity_pinned = true;
+        model.launcher_identity_pinned = true;
         model.refresh_context_window();
         if let Some(store) = settings.as_mut() {
             store.set_last_model(Some((provider, model_short)));

@@ -10,6 +10,7 @@ use crate::cache_policy::{assess_cache_change, blocks_change, combine_cache_chan
 
 fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,

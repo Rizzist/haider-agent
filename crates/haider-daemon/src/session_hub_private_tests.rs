@@ -5820,6 +5820,7 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
     );
     fact.run_id = None;
     *fact.payload = haider_protocol::session::ModelSelected {
+        selection_epoch: None,
         provider: "fake-b".into(),
         model: "model-b".into(),
     }

@@ -237,6 +237,7 @@ async fn respond_create_and_attach_with_account(
             created_seq: 0,
             worker_generation: 7,
             metadata: SessionMetadataV1 {
+                selection_epoch: None,
                 launch_origin: None,
                 workspace_allocation: None,
                 provider_base_url: None,
@@ -463,6 +464,7 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
                 created_seq: 0,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,

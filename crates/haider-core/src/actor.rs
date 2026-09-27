@@ -2194,6 +2194,8 @@ pub fn unregister_turn_trace_for_envelopes(envelopes: &[RawEnvelope]) {
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
+    /// Frozen with this request's model and reserve, before later commits.
+    pub selection_epoch: Option<u64>,
     /// Durable operator delegation; drives the canonical tool path without
     /// requesting a parent model response.
     pub agent_spawn: Option<haider_protocol::headless::AgentSpawnSpecV1>,
@@ -2441,6 +2443,7 @@ impl HarnessConfig {
     ) -> Self {
         let cache_diagnostic_key = CacheDiagnosticKey::ephemeral(&session_id, &device_id);
         Self {
+            selection_epoch: None,
             session_id,
             agent_spawn: None,
             branch_id: None,
@@ -3170,7 +3173,8 @@ pub struct ProviderPairSwitch {
 
 #[async_trait]
 pub trait ProviderPairSwitchCommitter: Send + Sync + std::fmt::Debug {
-    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError>;
+    /// Returns the durable selection epoch for requests made after the switch.
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError>;
 }
 
 /// Result of consulting the daemon at an eligible pre-first-event failure.
@@ -9470,6 +9474,11 @@ impl HarnessActor {
                 "automatic provider/model switch did not change the active pair",
             )));
         }
+        // The actor is one accepted turn. Its request provenance was frozen
+        // before the provider call, so even an automatic mid-turn pair switch
+        // cannot relabel this turn's eventual footprint as a request begun
+        // under the newly committed selection. The next turn gets a fresh
+        // config from durable metadata and may claim the new epoch.
         committer.commit(&switch).await.map_err(DriveError::Store)?;
         *provider_pair_switch_ordinal = next_switch_ordinal;
 
@@ -16438,6 +16447,7 @@ fn context_footprint(
         })
     });
     ContextFootprint {
+        selection_epoch: config.selection_epoch,
         input_tokens,
         output_tokens,
         cached_input_tokens,

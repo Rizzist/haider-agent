@@ -305,6 +305,7 @@ fn project_facts(
 
 fn metadata(cwd: String) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        selection_epoch: None,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,

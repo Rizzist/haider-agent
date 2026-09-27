@@ -168,6 +168,12 @@ pub enum LiveCommand {
     List {
         cursor: Option<String>,
     },
+    /// A list issued by the live driver; the reply must return on this
+    /// connection before it may update any session's selection metadata.
+    ListAt {
+        cursor: Option<String>,
+        epoch: u64,
+    },
     Attach {
         session: SessionId,
         after_seq: u64,
@@ -191,6 +197,7 @@ pub enum LiveCommand {
         command_id: CommandId,
         cwd: String,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        account_alias: Option<haider_protocol::ids::CredentialAlias>,
         provider: String,
         model: String,
         max_tokens: u64,
@@ -720,6 +727,10 @@ pub enum LiveCommand {
     },
     /// `account.list` for the `/accounts` screen (W5d). A read.
     AccountList,
+    /// The production read carries its issuing socket generation.
+    AccountListAt {
+        epoch: u64,
+    },
     /// `account.device_candidates` (D2) — the daemon's metadata-only
     /// discovery of first-party CLI credential stores. A read, issued on
     /// screen entry only; secrets never ride its response by D1's wire
@@ -743,11 +754,18 @@ pub enum LiveCommand {
     },
     /// `provider.list` for the `/providers` screen (W5d). A read.
     ProviderList,
+    ProviderListAt {
+        epoch: u64,
+    },
     /// `provider.models_refresh` (W5f-2d): discover the provider's live
     /// catalog from its subscription source. Triggered when an active OAuth
     /// account has no discovered models yet — the fetch needs its token.
     RefreshProviderModels {
         provider: String,
+    },
+    RefreshProviderModelsAt {
+        provider: String,
+        epoch: u64,
     },
     /// `account.oauth_start` (W5e-1). Transient — never outboxed; a lost
     /// response is answered by a fresh card, never a replay.
@@ -788,6 +806,7 @@ pub enum LiveCommand {
     /// selection. DURABLE — a reconnect resends under the same command id
     /// and the daemon replays the committed receipt.
     SelectModel {
+        connection_epoch: u64,
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
@@ -1172,14 +1191,18 @@ impl LiveCommand {
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
             Self::Reconnect
             | Self::List { .. }
+            | Self::ListAt { .. }
             | Self::CheckpointList { .. }
             | Self::Attach { .. }
             | Self::AttachWithOrigin { .. }
             | Self::Detach { .. }
             | Self::AccountList
+            | Self::AccountListAt { .. }
             | Self::DeviceCandidates
             | Self::ProviderList
+            | Self::ProviderListAt { .. }
             | Self::RefreshProviderModels { .. }
+            | Self::RefreshProviderModelsAt { .. }
             | Self::ProbeCustomModels { .. }
             | Self::OAuthStart { .. }
             | Self::OAuthStatus { .. }
@@ -1325,6 +1348,31 @@ pub enum LiveReply {
     Listed {
         sessions: Vec<SessionSummary>,
         next_cursor: Option<String>,
+    },
+    ListedAt {
+        sessions: Vec<SessionSummary>,
+        next_cursor: Option<String>,
+        epoch: u64,
+    },
+    AccountsAt {
+        descriptors: Vec<haider_protocol::credential::CredentialDescriptor>,
+        revision: Option<u64>,
+        sources: Vec<crate::app::AccountSourceRow>,
+        epoch: u64,
+    },
+    ProvidersAt {
+        providers: Vec<haider_rpc::ProviderSummaryWire>,
+        revision: u64,
+        epoch: u64,
+    },
+    ProviderModelsRefreshedAt {
+        provider: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+        epoch: u64,
+    },
+    ListFailed,
+    ListFailedAt {
+        epoch: u64,
     },
     /// `session.attach` answered. The attach RESPONSE always precedes the
     /// first event for its attachment (the daemon's register→replay seam);
@@ -1724,6 +1772,11 @@ pub enum LiveReply {
         provider: String,
         message: String,
     },
+    ModelsRefreshFailedAt {
+        provider: String,
+        message: String,
+        epoch: u64,
+    },
     /// `account.remove` committed.
     AccountRemoved {
         command_id: CommandId,
@@ -1844,6 +1897,8 @@ pub enum LiveReply {
     /// `session.select_model` committed (F2a): the RESOLVED pair — never
     /// an echo of the request.
     ModelSelected {
+        connection_epoch: Option<u64>,
+        selected_seq: u64,
         command_id: CommandId,
         session: SessionId,
         provider: String,
@@ -2142,6 +2197,8 @@ pub struct LiveDriver {
     /// selection made on another surface (the fact carries none). One in
     /// flight at a time; cleared by the list reply or a lost connection.
     meter_list_pending: bool,
+    meter_list_started: HashMap<SessionId, u64>,
+    meter_list_dirty: HashMap<SessionId, u64>,
     /// Round 4: monotone connection epoch — bumped on every Disconnected.
     /// Reads that must not cross a reconnect (loom.list) carry it out and
     /// their replies echo it back; a mismatch installs nothing.
@@ -2449,6 +2506,8 @@ impl LiveDriver {
     pub fn new(instance: impl Into<String>) -> Self {
         Self {
             meter_list_pending: false,
+            meter_list_started: HashMap::new(),
+            meter_list_dirty: HashMap::new(),
             connection_epoch: 0,
             input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
@@ -2623,16 +2682,24 @@ impl LiveDriver {
     /// The boot sequence: list sessions. Attaching happens on SELECTION —
     /// entering live mode must not attach to everything it can see.
     #[must_use]
-    pub fn boot(&self) -> Vec<LiveCommand> {
+    pub fn boot(&mut self) -> Vec<LiveCommand> {
         // The FIRST connect needs the same front-door truth as a redial:
         // the identity bootstrap fires when account/provider snapshots
         // APPLY, and `resume()` only runs on reconnects — the live probe
         // caught the launcher sitting on demo seeds because boot never
         // asked (W5f-2c).
+        self.meter_list_pending = true;
         vec![
-            LiveCommand::List { cursor: None },
-            LiveCommand::AccountList,
-            LiveCommand::ProviderList,
+            LiveCommand::ListAt {
+                cursor: None,
+                epoch: self.connection_epoch,
+            },
+            LiveCommand::AccountListAt {
+                epoch: self.connection_epoch,
+            },
+            LiveCommand::ProviderListAt {
+                epoch: self.connection_epoch,
+            },
         ]
     }
 
@@ -3022,7 +3089,67 @@ impl LiveDriver {
     /// shell must now issue.
     #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
+        let reply = match reply {
+            LiveReply::ListedAt {
+                sessions,
+                next_cursor,
+                epoch,
+            } if self.connected && epoch == self.connection_epoch => LiveReply::Listed {
+                sessions,
+                next_cursor,
+            },
+            LiveReply::ListFailedAt { epoch }
+                if self.connected && epoch == self.connection_epoch =>
+            {
+                LiveReply::ListFailed
+            }
+            LiveReply::AccountsAt {
+                descriptors,
+                revision,
+                sources,
+                epoch,
+            } if self.connected && epoch == self.connection_epoch => LiveReply::Accounts {
+                descriptors,
+                revision,
+                sources,
+            },
+            LiveReply::ProvidersAt {
+                providers,
+                revision,
+                epoch,
+            } if self.connected && epoch == self.connection_epoch => LiveReply::Providers {
+                providers,
+                revision,
+            },
+            LiveReply::ProviderModelsRefreshedAt {
+                provider,
+                revision,
+                epoch,
+            } if self.connected && epoch == self.connection_epoch => {
+                LiveReply::ProviderModelsRefreshed { provider, revision }
+            }
+            LiveReply::ModelsRefreshFailedAt {
+                provider,
+                message,
+                epoch,
+            } if self.connected && epoch == self.connection_epoch => {
+                LiveReply::ModelsRefreshFailed { provider, message }
+            }
+            LiveReply::ListedAt { .. } | LiveReply::ListFailedAt { .. } => return Vec::new(),
+            LiveReply::AccountsAt { .. }
+            | LiveReply::ProvidersAt { .. }
+            | LiveReply::ProviderModelsRefreshedAt { .. }
+            | LiveReply::ModelsRefreshFailedAt { .. } => return Vec::new(),
+            other => other,
+        };
         match reply {
+            LiveReply::ListedAt { .. } | LiveReply::ListFailedAt { .. } => {
+                unreachable!("normalized above")
+            }
+            LiveReply::AccountsAt { .. }
+            | LiveReply::ProvidersAt { .. }
+            | LiveReply::ProviderModelsRefreshedAt { .. }
+            | LiveReply::ModelsRefreshFailedAt { .. } => unreachable!("normalized above"),
             LiveReply::SurfaceWatching {
                 session,
                 input,
@@ -3361,8 +3488,17 @@ impl LiveDriver {
                 sessions,
                 next_cursor,
             } => {
-                self.meter_list_pending = false;
+                if next_cursor.is_none() {
+                    self.meter_list_pending = false;
+                }
                 for summary in sessions {
+                    if self
+                        .generations
+                        .get(&summary.session_id)
+                        .is_some_and(|known| summary.worker_generation < *known)
+                    {
+                        continue;
+                    }
                     let workspace_display = summary
                         .workspace_cwd
                         .as_deref()
@@ -3375,12 +3511,21 @@ impl LiveDriver {
                         .map(workspace_display_path);
                     model.upsert_live_session(&summary.session_id);
                     if let Some(metadata) = summary.metadata.as_ref() {
-                        model.note_session_metadata(
-                            &summary.session_id,
-                            &metadata.provider,
-                            &metadata.model,
-                            metadata.max_tokens,
-                        );
+                        // The list's head is the snapshot watermark. A
+                        // selection cannot be committed beyond that head.
+                        if metadata
+                            .selection_epoch
+                            .is_none_or(|epoch| epoch <= summary.head_seq)
+                        {
+                            model.note_session_metadata_at(
+                                &summary.session_id,
+                                &metadata.provider,
+                                &metadata.model,
+                                metadata.max_tokens,
+                                metadata.selection_epoch,
+                                metadata.max_tokens_source,
+                            );
+                        }
                         self.workspace_paths
                             .insert(summary.session_id.clone(), metadata.cwd.clone());
                         if metadata.workspace_allocation.is_some() {
@@ -3390,6 +3535,20 @@ impl LiveDriver {
                             self.origin_revisions
                                 .insert(summary.session_id.clone(), origin.revision);
                         }
+                    } else if let (Some(provider), Some(model_name)) =
+                        (summary.provider.as_deref(), summary.last_model.as_deref())
+                    {
+                        // Legacy rows may have only the session's own folded
+                        // pair. It is useful for projection, never proof that
+                        // an epochless footprint is current.
+                        model.note_session_metadata_at(
+                            &summary.session_id,
+                            provider,
+                            model_name,
+                            0,
+                            None,
+                            None,
+                        );
                     }
                     self.binding_worker_generation = Some(summary.worker_generation);
                     if let Some(display) = workspace_display {
@@ -3433,11 +3592,23 @@ impl LiveDriver {
                             Some(format!("· --session: {} is not a known session", target));
                     }
                 }
+                let last_page = next_cursor.is_none();
                 let mut follow = next_cursor.map_or_else(Vec::new, |cursor| {
-                    vec![LiveCommand::List {
+                    vec![LiveCommand::ListAt {
                         cursor: Some(cursor),
+                        epoch: self.connection_epoch,
                     }]
                 });
+                if last_page && !self.meter_list_dirty.is_empty() {
+                    self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
+                    self.meter_list_pending = true;
+                    follow.push(LiveCommand::ListAt {
+                        cursor: None,
+                        epoch: self.connection_epoch,
+                    });
+                } else if last_page {
+                    self.meter_list_started.clear();
+                }
                 // D1: hydrate the Loom registry once per connection — the
                 // typed-chip colors and graph annotations read from it.
                 // Round 4: the dedup latch (`loom_requested`) is separate
@@ -3450,6 +3621,21 @@ impl LiveDriver {
                     });
                 }
                 follow
+            }
+            LiveReply::ListFailed => {
+                self.meter_list_pending = false;
+                self.meter_list_started.clear();
+                if self.connected && !self.meter_list_dirty.is_empty() {
+                    self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
+                    self.meter_list_pending = true;
+                    vec![LiveCommand::ListAt {
+                        cursor: None,
+                        epoch: self.connection_epoch,
+                    }]
+                } else {
+                    self.meter_list_dirty.clear();
+                    Vec::new()
+                }
             }
             LiveReply::Attached {
                 session,
@@ -3539,11 +3725,26 @@ impl LiveDriver {
                 // a freshly created session's first turn, and any durable
                 // mutation the outbox is still holding for this session
                 // (the reconnect resend — review P1-4).
+                let worker_generation_for_attach = worker_generation;
                 let mut commands: Vec<LiveCommand> = self
                     .outbox
                     .iter()
                     .filter(|pending| command_session(&pending.command) == Some(&session))
-                    .map(|pending| pending.command.clone())
+                    .map(|pending| {
+                        let mut command =
+                            with_connection_epoch(pending.command.clone(), self.connection_epoch);
+                        // A child selection queued before its first attach
+                        // had no worker generation yet. The command has not
+                        // been sent; the attach supplies its first valid one.
+                        if let LiveCommand::SelectModel {
+                            worker_generation, ..
+                        } = &mut command
+                            && *worker_generation == 0
+                        {
+                            *worker_generation = worker_generation_for_attach;
+                        }
+                        command
+                    })
                     .collect();
                 if let Some(text) = self.pending_first_turn.remove(&session) {
                     // A freshly created session's founding turn is always
@@ -4100,7 +4301,14 @@ impl LiveDriver {
                     None => format!("removed `{removed_alias}`"),
                 });
                 model.dirty = true;
-                vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+                vec![
+                    LiveCommand::AccountListAt {
+                        epoch: self.connection_epoch,
+                    },
+                    LiveCommand::ProviderListAt {
+                        epoch: self.connection_epoch,
+                    },
+                ]
             }
             LiveReply::ProviderRemoved {
                 command_id,
@@ -4117,7 +4325,9 @@ impl LiveDriver {
                 model.providers.revision = Some(revision);
                 model.providers.message = Some(format!("removed `{provider}`"));
                 model.dirty = true;
-                vec![LiveCommand::ProviderList]
+                vec![LiveCommand::ProviderListAt {
+                    epoch: self.connection_epoch,
+                }]
             }
             LiveReply::ProviderTrustSet {
                 command_id,
@@ -4492,7 +4702,10 @@ impl LiveDriver {
                     // AccountList is raised by the shared successful-login
                     // reducer seam; these providers additionally refresh
                     // their model catalogs after validating the key.
-                    vec![LiveCommand::RefreshProviderModels { provider }]
+                    vec![LiveCommand::RefreshProviderModelsAt {
+                        provider,
+                        epoch: self.connection_epoch,
+                    }]
                 } else {
                     Vec::new()
                 }
@@ -4573,8 +4786,12 @@ impl LiveDriver {
                 ));
                 model.dirty = true;
                 vec![
-                    LiveCommand::AccountList,
-                    LiveCommand::ProviderList,
+                    LiveCommand::AccountListAt {
+                        epoch: self.connection_epoch,
+                    },
+                    LiveCommand::ProviderListAt {
+                        epoch: self.connection_epoch,
+                    },
                     LiveCommand::DeviceCandidates,
                 ]
             }
@@ -4631,6 +4848,8 @@ impl LiveDriver {
                 Vec::new()
             }
             LiveReply::ModelSelected {
+                connection_epoch,
+                selected_seq,
                 command_id,
                 session,
                 provider,
@@ -4638,7 +4857,19 @@ impl LiveDriver {
                 worker_generation,
                 output_budget,
             } => {
+                if connection_epoch
+                    .is_some_and(|epoch| epoch != self.connection_epoch || !self.connected)
+                {
+                    return Vec::new();
+                }
                 self.retire(&command_id);
+                if self
+                    .generations
+                    .get(&session)
+                    .is_some_and(|known| worker_generation < *known)
+                {
+                    return Vec::new();
+                }
                 if self
                     .pending_model_select
                     .as_ref()
@@ -4646,11 +4877,12 @@ impl LiveDriver {
                 {
                     self.pending_model_select = None;
                 }
-                model.apply_session_model_selected(
+                model.apply_session_model_selected_at(
                     &session,
                     &provider,
                     &model_name,
                     output_budget.as_ref(),
+                    Some(selected_seq),
                 );
                 self.generations.insert(session, worker_generation);
                 Vec::new()
@@ -5520,7 +5752,8 @@ impl LiveDriver {
                     self.retire(id);
                     model.custom_add_failed(pending.attempt, &message);
                     if code == haider_rpc::ERROR_CODE_REVISION_CONFLICT {
-                        return vec![self.enqueue(LiveCommand::ProviderList)];
+                        let epoch = self.connection_epoch;
+                        return vec![self.enqueue(LiveCommand::ProviderListAt { epoch })];
                     }
                     return Vec::new();
                 }
@@ -5671,6 +5904,8 @@ impl LiveDriver {
             LiveReply::Disconnected { reason } => {
                 self.connected = false;
                 self.meter_list_pending = false;
+                self.meter_list_started.clear();
+                self.meter_list_dirty.clear();
                 self.binding_worker_generation = None;
                 self.attaching.clear();
                 // Review round 2: the Loom registry snapshot is CONNECTION
@@ -6037,6 +6272,7 @@ impl LiveDriver {
     /// pending row owns the fixed three-attempt bound; unrelated traffic is
     /// never required to wake it.
     pub(crate) fn busy_retries_due(&mut self) -> Vec<LiveCommand> {
+        let epoch = self.connection_epoch;
         self.outbox
             .iter_mut()
             .filter_map(|pending| {
@@ -6045,7 +6281,7 @@ impl LiveDriver {
                     .filter(|deadline| *deadline <= self.now)
                     .map(|_| {
                         pending.retry_at = None;
-                        pending.command.clone()
+                        with_connection_epoch(pending.command.clone(), epoch)
                     })
             })
             .collect()
@@ -6394,9 +6630,35 @@ impl LiveDriver {
         // only an APPLIED envelope can have moved the tree.
         if applied {
             let mut commands = self.fleet_event_chase(model, session);
-            if model_fact && self.connected && !self.meter_list_pending {
-                self.meter_list_pending = true;
-                commands.push(LiveCommand::List { cursor: None });
+            if model_fact && self.connected {
+                let selection_epoch = if model.active_session.as_ref() == Some(session) {
+                    model.meter_epoch.selection_epoch
+                } else {
+                    model
+                        .sessions
+                        .iter()
+                        .find(|row| &row.id == session)
+                        .and_then(|row| row.meter_epoch.selection_epoch)
+                }
+                .unwrap_or(envelope.seq);
+                if self.meter_list_pending {
+                    if self
+                        .meter_list_started
+                        .get(session)
+                        .is_none_or(|started| selection_epoch > *started)
+                    {
+                        self.meter_list_dirty
+                            .insert(session.clone(), selection_epoch);
+                    }
+                } else {
+                    self.meter_list_pending = true;
+                    self.meter_list_started
+                        .insert(session.clone(), selection_epoch);
+                    commands.push(LiveCommand::ListAt {
+                        cursor: None,
+                        epoch: self.connection_epoch,
+                    });
+                }
             }
             // The graph strip's event-cadence chase: keep the reduction
             // current while a graph is unfinished, and catch every graph
@@ -6471,11 +6733,20 @@ impl LiveDriver {
             // bind its own meter epoch (never the identity on screen).
             match payload {
                 haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) => {
-                    model.note_parked_model_selected(session, &selected.provider, &selected.model);
+                    model.note_parked_model_selected_at(
+                        session,
+                        &selected.provider,
+                        &selected.model,
+                        selected.selection_epoch.or(Some(envelope.seq)),
+                    );
                 }
                 haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(
                     rebound,
-                ) => model.note_parked_provider_rebound(session, &rebound.provider),
+                ) => model.note_parked_provider_rebound_at(
+                    session,
+                    &rebound.provider,
+                    rebound.selection_epoch.or(Some(envelope.seq)),
+                ),
                 _ => {}
             }
             return model_fact;
@@ -6506,6 +6777,15 @@ impl LiveDriver {
             // transcript note so every later turn reads under the model
             // that served it.
             haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) => {
+                // An older daemon omits the additive field, but a durable
+                // selection fact's envelope still has an ordered journal
+                // sequence. Use it to order the pair; its epochless request
+                // footprints remain projected.
+                let selected_epoch = selected.selection_epoch.or(Some(envelope.seq));
+                if !model.meter_epoch.admit((selected.provider.clone(), selected.model.clone()),
+                    selected_epoch, None, None) {
+                    return false;
+                }
                 if model.identity.model_short != selected.model
                     || model.identity.provider != selected.provider
                 {
@@ -6513,7 +6793,6 @@ impl LiveDriver {
                     model.identity.model_short = selected.model.clone();
                     model.refresh_context_window();
                 }
-                model.note_model_selected_fact(&selected.provider, &selected.model);
                 model.projection.push_note(format!(
                     "⇄ model → {} · {}",
                     selected.model, selected.provider
@@ -6521,6 +6800,13 @@ impl LiveDriver {
                 model.dirty = true;
             }
             haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(rebound) => {
+                let Some((_, current_model)) = model.meter_epoch.pair.clone() else {
+                    return model_fact;
+                };
+                if !model.meter_epoch.admit((rebound.provider.clone(), current_model),
+                    rebound.selection_epoch.or(Some(envelope.seq)), None, None) {
+                    return false;
+                }
                 if model.identity.provider != rebound.provider {
                     model.identity.provider = rebound.provider;
                     model.refresh_context_window();
@@ -6629,8 +6915,9 @@ impl LiveDriver {
                 continue;
             }
             self.models_requested.insert(row.provider.clone());
-            commands.push(LiveCommand::RefreshProviderModels {
+            commands.push(LiveCommand::RefreshProviderModelsAt {
                 provider: row.provider.clone(),
+                epoch: self.connection_epoch,
             });
         }
         // G4a: KEYLESS custom providers have no account row at all — their
@@ -6652,8 +6939,9 @@ impl LiveDriver {
                 continue;
             }
             self.models_requested.insert(summary.provider.clone());
-            commands.push(LiveCommand::RefreshProviderModels {
+            commands.push(LiveCommand::RefreshProviderModelsAt {
                 provider: summary.provider.clone(),
+                epoch: self.connection_epoch,
             });
         }
         commands
@@ -6663,14 +6951,22 @@ impl LiveDriver {
         // A fresh socket's daemon may answer discovery differently — let it
         // be asked again (W5f-2d).
         self.models_requested.clear();
+        self.meter_list_pending = true;
         // Account + provider truth ride the connect (W5f-2): the identity
         // bootstrap fires when their snapshots APPLY, so without asking at
         // the front door the launcher would sit on demo seeds until the
         // user happened to open /accounts. Reads, never in the outbox.
         let mut commands = vec![
-            LiveCommand::List { cursor: None },
-            LiveCommand::AccountList,
-            LiveCommand::ProviderList,
+            LiveCommand::ListAt {
+                cursor: None,
+                epoch: self.connection_epoch,
+            },
+            LiveCommand::AccountListAt {
+                epoch: self.connection_epoch,
+            },
+            LiveCommand::ProviderListAt {
+                epoch: self.connection_epoch,
+            },
         ];
         if model.daemon_serves(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1) {
             commands.push(LiveCommand::DeviceCandidates);
@@ -6684,10 +6980,21 @@ impl LiveDriver {
         {
             wanted.push(active);
         }
+        let pending_sessions: Vec<SessionId> = self
+            .outbox
+            .iter()
+            .filter_map(|pending| command_session(&pending.command).cloned())
+            .collect();
+        for session in &pending_sessions {
+            if !wanted.contains(session) {
+                wanted.push(session.clone());
+            }
+        }
         wanted.sort_by_key(|session| {
             let active = model.active_session.as_ref() == Some(session);
+            let pending = pending_sessions.contains(session);
             let hot = is_hot(model, session);
-            (!active, !hot)
+            (!active, !pending, !hot)
         });
         // The working set is REBUILT, not cleared: a second disconnect
         // before these attaches are acknowledged must not collapse it to
@@ -6724,7 +7031,9 @@ impl LiveDriver {
                     command_session(&pending.command).is_none()
                         && pending.retry_at.is_none_or(|deadline| deadline <= self.now)
                 })
-                .map(|pending| pending.command.clone()),
+                .map(|pending| {
+                    with_connection_epoch(pending.command.clone(), self.connection_epoch)
+                }),
         );
         commands
     }
@@ -6763,20 +7072,26 @@ impl LiveDriver {
                         }
                     }
                 }
-                vec![self.enqueue(
-                    LiveCommand::Create {
+                vec![
+                    self.enqueue(LiveCommand::Create {
                         command_id,
                         cwd: workspace_allocation.as_ref().map_or_else(
                             || model.cwd.clone(),
                             |allocation| allocation.leaf.clone(),
                         ),
                         workspace_allocation,
+                        account_alias: model
+                            .accounts
+                            .rows
+                            .iter()
+                            .find(|row| row.selected && row.provider == model.identity.provider)
+                            .map(|row| haider_protocol::ids::CredentialAlias::new(&row.alias)),
                         provider: model.identity.provider.clone(),
                         model: model.identity.model_short.clone(),
                         max_tokens: 0,
                         first_text: text,
-                    },
-                )]
+                    }),
+                ]
             }
             AppRequest::SubmitText {
                 text,
@@ -6885,11 +7200,15 @@ impl LiveDriver {
                 Vec::new()
             }
             // `/accounts` (W5d): a read — never in the outbox.
-            AppRequest::AccountsRefresh => vec![LiveCommand::AccountList],
+            AppRequest::AccountsRefresh => vec![LiveCommand::AccountListAt {
+                epoch: self.connection_epoch,
+            }],
             // A read — never outboxed; the reducer already gated on the
             // feature bit and pushes it on screen entry only (D2).
             AppRequest::DeviceCandidatesRefresh => vec![LiveCommand::DeviceCandidates],
-            AppRequest::ProvidersRefresh => vec![LiveCommand::ProviderList],
+            AppRequest::ProvidersRefresh => vec![LiveCommand::ProviderListAt {
+                epoch: self.connection_epoch,
+            }],
             AppRequest::OAuthAddStart {
                 provider,
                 alias,
@@ -6953,21 +7272,37 @@ impl LiveDriver {
                 confirm_new_epoch,
             } => {
                 let command_id = self.mint();
-                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                // A selection held for the first control attach must use the
+                // generation returned by that attach, even if a session list
+                // supplied an older generation before the attach completed.
+                let worker_generation = if self.is_attached(&session) {
+                    self.generations.get(&session).copied().unwrap_or_default()
+                } else {
+                    0
+                };
                 self.pending_model_select = Some((
                     command_id.clone(),
                     session.clone(),
                     provider.clone(),
                     model_name.clone(),
                 ));
-                vec![self.enqueue(LiveCommand::SelectModel {
+                let command = self.enqueue(LiveCommand::SelectModel {
+                    connection_epoch: self.connection_epoch,
                     command_id,
-                    session,
+                    session: session.clone(),
                     worker_generation,
                     model: model_name,
                     provider,
                     confirm_new_epoch,
-                })]
+                });
+                if self.is_attached(&session) {
+                    vec![command]
+                } else {
+                    // `session.select_model` requires THIS session's control
+                    // attachment. The outbox releases the command only after
+                    // Attached confirms the lease, including after reconnect.
+                    self.ensure_attached(model, &session)
+                }
             }
             AppRequest::Rename { session, title } => {
                 let command_id = self.mint();
@@ -7179,7 +7514,10 @@ impl LiveDriver {
             // keyless commit chain). A read — not outboxed, no receipt.
             AppRequest::ProviderModelsRefresh { provider } => {
                 self.models_requested.insert(provider.clone());
-                vec![LiveCommand::RefreshProviderModels { provider }]
+                vec![LiveCommand::RefreshProviderModelsAt {
+                    provider,
+                    epoch: self.connection_epoch,
+                }]
             }
             AppRequest::AccountSetActive {
                 alias,
@@ -7199,7 +7537,12 @@ impl LiveDriver {
                 model.stream_diagnostics.clear();
                 model.stream_observations.clear();
                 self.connected = false;
+                // An explicit redial also closes the old request generation.
+                // It need not wait for a separate Disconnected notification.
+                self.connection_epoch = self.connection_epoch.wrapping_add(1);
                 self.meter_list_pending = false;
+                self.meter_list_started.clear();
+                self.meter_list_dirty.clear();
                 vec![LiveCommand::Reconnect]
             }
             // The request's `after_seq` is the reducer's own last fully
@@ -7384,7 +7727,10 @@ impl LiveDriver {
             AppRequest::UsageRefresh => vec![
                 // Refresh direct/root agent snapshots through the additive
                 // SessionSummary field at the same time as account totals.
-                LiveCommand::List { cursor: None },
+                LiveCommand::ListAt {
+                    cursor: None,
+                    epoch: self.connection_epoch,
+                },
                 LiveCommand::UsageReport,
             ],
             // 954: the heatmap read — a year of daily totals through
@@ -7983,6 +8329,16 @@ const fn demo_only_label(request: &AppRequest) -> &'static str {
 
 /// The session a command is scoped to, if any. Session-scoped mutations
 /// require an established control attachment; unscoped ones do not.
+fn with_connection_epoch(mut command: LiveCommand, epoch: u64) -> LiveCommand {
+    if let LiveCommand::SelectModel {
+        connection_epoch, ..
+    } = &mut command
+    {
+        *connection_epoch = epoch;
+    }
+    command
+}
+
 const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
     match command {
         LiveCommand::Submit { session, .. }

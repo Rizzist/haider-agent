@@ -224,6 +224,10 @@ pub struct WorkspaceAllocationV1 {
 /// silently reinterpreting committed configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetadataV1 {
+    /// Durable sequence of the current model, budget, or route selection.
+    /// Zero is the initial binding before a selection fact is committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_epoch: Option<u64>,
     /// Canonical absolute UTF-8 workspace path.
     pub cwd: String,
     /// Provider adapter name (`anthropic`, `openai`, `openai-compatible`, or
@@ -336,6 +340,9 @@ fn is_false(value: &bool) -> bool {
 /// provider attribute of that row — not a change of session identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSelected {
+    /// Selection version; may remain unchanged for a true no-op command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_epoch: Option<u64>,
     /// Provider attribute of the selected model row.
     pub provider: String,
     /// The selected full model identifier.
@@ -367,6 +374,9 @@ pub struct FastModeSelected {
 /// The model and conversation are unchanged. Credentials never enter this fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProviderRebound {
+    /// Durable route-selection version, equal to this fact's journal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_epoch: Option<u64>,
     pub rebind_id: String,
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,6 +543,9 @@ impl SessionProviderRebound {
 
     /// Rebuild the routing projection from a replayed committed fact.
     pub fn apply_to_metadata(&self, metadata: &mut SessionMetadataV1) {
+        if let Some(epoch) = self.selection_epoch {
+            metadata.selection_epoch = Some(epoch);
+        }
         metadata.provider_rebind_id = Some(self.rebind_id.clone());
         metadata.provider.clone_from(&self.provider);
         metadata.provider_base_url.clone_from(&self.base_url);

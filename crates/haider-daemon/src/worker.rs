@@ -384,7 +384,7 @@ impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
 
 #[async_trait]
 impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
-    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError> {
         let live_source_policy = self
             .store
             .hub()
@@ -477,6 +477,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             // rev933b finding 7: the automatic switch observed this exact
             // pair; a concurrent explicit selection moves it and must win.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
+            account_alias: None,
             // No validated model row exists on this path: keep the stored
             // budget. An oversized budget on the fallback model is recovered
             // by the provider's one-shot `max_tokens too large` retry.
@@ -486,9 +487,9 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
         };
         match self.store.hub().select_session_model(command).await {
             Ok(
-                SessionSelectModelOutcome::Committed { .. }
-                | SessionSelectModelOutcome::IdempotentReplay { .. },
-            ) => Ok(()),
+                SessionSelectModelOutcome::Committed { selected, .. }
+                | SessionSelectModelOutcome::IdempotentReplay { selected },
+            ) => Ok(selected.selected_seq),
             Err(error) => Err(hub_error(error)),
         }
     }
@@ -502,8 +503,22 @@ fn lockdown_pair_switch_allowed(
     switch.from_provider == switch.to_provider || (!source_lockdown && !target_lockdown)
 }
 
+/// A request can claim the committed selection only when its resolved
+/// account is the account durably bound to the session. Legacy unpinned
+/// sessions and health-driven account rotation have no per-session route
+/// commit yet, so their snapshots remain projected. Keyless routes match
+/// `None == None` and keep normal current truth.
+fn frozen_selection_epoch(
+    metadata: &SessionMetadataV1,
+    resolved_account_alias: Option<&str>,
+) -> Option<u64> {
+    (metadata.account_alias.as_deref() == resolved_account_alias)
+        .then_some(metadata.selection_epoch.unwrap_or(0))
+}
+
 #[derive(Clone)]
 struct DaemonContextCompactor {
+    selection_epoch: Option<u64>,
     store: HubStoreHandle,
     provider: Arc<dyn Provider>,
     model: String,
@@ -2419,6 +2434,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 &[],
             );
             let footprint = ContextFootprint {
+                selection_epoch: self.selection_epoch,
                 input_tokens: post_compaction_input,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -7674,6 +7690,7 @@ async fn perform_manual_compaction(
     .await?
     .cache_cohort();
     let compactor = DaemonContextCompactor {
+        selection_epoch: frozen_selection_epoch(metadata, resolved.account_alias.as_deref()),
         store: lease.clone(),
         provider: resolved.provider,
         model: resolved.model,
@@ -9456,6 +9473,7 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
+    config.selection_epoch = frozen_selection_epoch(metadata, resolved.account_alias.as_deref());
     config.turn_trace = turn_trace.clone();
     config.agent_spawn = headless
         .as_ref()
@@ -9671,6 +9689,7 @@ async fn start_turn(
     // take the degraded fallback) — a cost edge, never a correctness one.
     // Re-resolving at compact time needs live-lane threading; tracked.
     config.context_compactor = Some(Arc::new(DaemonContextCompactor {
+        selection_epoch: config.selection_epoch,
         store: lease.clone(),
         provider: Arc::clone(&resolved.provider),
         model: config.model.clone(),

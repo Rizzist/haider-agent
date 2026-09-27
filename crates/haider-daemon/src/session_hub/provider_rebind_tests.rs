@@ -112,6 +112,7 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
             provider: "pending-provider".into(),
             model: "test-model".into(),
             expected_pair: None,
+            account_alias: None,
             output_budget: None,
             event_id: EventId::new("selected"),
             device_id,

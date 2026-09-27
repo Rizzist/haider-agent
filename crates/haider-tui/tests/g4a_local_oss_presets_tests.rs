@@ -179,7 +179,7 @@ fn keyless_commit_skips_the_key_card_and_chains_discovery() {
     let refresh_queued = model.requests.iter().any(|request| {
         matches!(request, AppRequest::ProviderModelsRefresh { provider } if provider == "ollama")
     }) || pass.commands.iter().any(|command| {
-        matches!(command, LiveCommand::RefreshProviderModels { provider } if provider == "ollama")
+        matches!(command, LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "ollama")
     });
     assert!(refresh_queued, "commit chains straight into discovery");
     assert!(

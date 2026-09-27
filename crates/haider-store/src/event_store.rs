@@ -1099,6 +1099,9 @@ pub struct SessionSelectModelCommand {
     /// it (a concurrent explicit selection wins). Explicit selections pass
     /// `None` — the user's latest word is unconditional.
     pub expected_pair: Option<(String, String)>,
+    /// Resolved account binding for this selection. An absent value keeps
+    /// a same-provider binding; a provider change clears the old binding.
+    pub account_alias: Option<String>,
     /// Output budget resolved by the daemon for the selected model. `None`
     /// (the automatic pair-switch path, which has no validated model row)
     /// keeps the stored budget unchanged.
@@ -8622,6 +8625,7 @@ impl Store {
         )?;
 
         let metadata = SessionMetadataV1 {
+            selection_epoch: Some(0),
             provider_base_url: None,
             provider_rebind_id: None,
             cwd: command.cwd.clone(),
@@ -9833,18 +9837,40 @@ impl Store {
                 false,
             ));
         }
+        let no_op = metadata.provider == command.provider
+            && metadata.model == command.model
+            && command
+                .account_alias
+                .as_ref()
+                .is_none_or(|alias| metadata.account_alias.as_ref() == Some(alias))
+            && command.output_budget.is_none_or(|budget| {
+                metadata.max_tokens == budget.max_tokens
+                    && haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                        metadata.max_tokens_source,
+                        metadata.max_tokens,
+                    ) == budget.source
+            });
+        let selection_epoch = if no_op {
+            metadata.selection_epoch.unwrap_or(0)
+        } else {
+            latest_seq_in_connection(&transaction, &command.session_id)?
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?
+        };
         if metadata.provider != command.provider {
-            // A route override belongs to its selected provider. A later
-            // ordinary model selection must never carry that endpoint or a
-            // rebind-pinned account into a different adapter.
-            if metadata.provider_rebind_id.is_some() {
-                metadata.account_alias = None;
-            }
+            // Accounts and route overrides belong to their selected
+            // provider. A cross-provider model choice cannot carry either
+            // into the next adapter.
+            metadata.account_alias = None;
             metadata.provider_base_url = None;
             metadata.provider_rebind_id = None;
         }
+        if let Some(alias) = &command.account_alias {
+            metadata.account_alias = Some(alias.clone());
+        }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
+        metadata.selection_epoch = Some(selection_epoch);
         if let Some(budget) = command.output_budget {
             metadata.max_tokens = budget.max_tokens;
             metadata.max_tokens_source = Some(budget.source);
@@ -9883,6 +9909,7 @@ impl Store {
             command.device_id.clone(),
             self.worker_generation,
             ModelSelected {
+                selection_epoch: Some(selection_epoch),
                 provider: command.provider.clone(),
                 model: command.model.clone(),
             }
@@ -9901,7 +9928,7 @@ impl Store {
             session_id: command.session_id.clone(),
             provider: command.provider.clone(),
             model: command.model.clone(),
-            selected_seq: envelopes[0].seq,
+            selected_seq: selection_epoch,
             worker_generation: self.worker_generation,
             output_budget: command.output_budget,
         };
@@ -9910,7 +9937,7 @@ impl Store {
             &command.command_id,
             command.session_id.as_str(),
             None,
-            Some(selected.selected_seq),
+            Some(envelopes[0].seq),
             &selected,
             now,
             "session-select-model",
@@ -10904,6 +10931,7 @@ impl Store {
         command: &SessionProviderRebindCommand,
     ) -> StoreResult<SessionProviderRebindOutcome> {
         let rebound = SessionProviderRebound {
+            selection_epoch: None,
             rebind_id: command.command_id.clone(),
             provider: command.provider.clone(),
             base_url: command.base_url.clone(),
@@ -10959,7 +10987,7 @@ impl Store {
     fn select_session_config<R: serde::Serialize + serde::de::DeserializeOwned>(
         &self,
         selection: SessionConfigSelection<'_>,
-        fact_payload: serde_json::Value,
+        mut fact_payload: serde_json::Value,
         validate: impl FnOnce(&Connection) -> StoreResult<()>,
         mutate: impl FnOnce(&mut SessionMetadataV1),
         respond: impl FnOnce(u64) -> R,
@@ -11009,6 +11037,13 @@ impl Store {
             ));
         };
         mutate(&mut metadata);
+        if selection.method == "session.provider.rebind" {
+            let epoch = latest_seq_in_connection(&transaction, selection.session_id)?
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+            metadata.selection_epoch = Some(epoch);
+            fact_payload["selection_epoch"] = serde_json::Value::from(epoch);
+        }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,

@@ -135,6 +135,7 @@ fn footprint_envelope(
 ) -> RawEnvelope {
     let mut envelope = envelope(session_id, event_id, worker_generation);
     let footprint = ContextFootprint {
+        selection_epoch: None,
         input_tokens: used_tokens,
         output_tokens: 0,
         cached_input_tokens: 0,
@@ -4642,6 +4643,7 @@ fn model_selected_envelope(
 ) -> RawEnvelope {
     let mut envelope = envelope(session_id, event_id, worker_generation);
     *envelope.payload = ModelSelected {
+        selection_epoch: None,
         provider: provider.into(),
         model: model.into(),
     }
