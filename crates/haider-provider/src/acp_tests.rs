@@ -2154,7 +2154,7 @@ async fn gate_v1_acp_title_never_overrides_typed_kind() {
                 }
                 _ => None,
             })
-            .last(),
+            .next_back(),
         Some(("computer", Some(A::Read))),
         "a kind update changes the typed activity without replacing its display title",
     );
