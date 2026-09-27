@@ -10718,6 +10718,16 @@ async fn marked_expired_import_commits_a_fresher_source_and_resolves_it() {
         receipt.command_id.starts_with("oauth-heal-") && receipt.state == "committed"
     }));
     assert!(snapshot.lock().expect("snapshot")[0].status == CredentialStatus::Ok);
+    let healed = snapshot.lock().expect("snapshot")[0].clone();
+    assert!(
+        healed.incarnation > descriptor.incarnation,
+        "an identity-poor import healed from different source bytes needs a new incarnation"
+    );
+    assert_ne!(
+        ProviderModelCacheKey::for_account(&descriptor.provider, &healed),
+        ProviderModelCacheKey::for_account(&descriptor.provider, &descriptor),
+        "the healed account must not read the previous account catalog"
+    );
 
     assert!(broker.shutdown().await);
     actor.shutdown().await;
