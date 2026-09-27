@@ -342,10 +342,10 @@ impl CuPresence {
     fn fail_capture_seq(&self, surface: PresenceSurface, seq: u64) {
         let mut state = lock(&self.state);
         if state.conceal_acks.get(&seq) != Some(&surface)
-            || !state
+            || state
                 .captures
                 .get(&surface)
-                .is_some_and(|capture| capture.outstanding_seq == Some(seq))
+                .is_none_or(|capture| capture.outstanding_seq != Some(seq))
         {
             return;
         }
@@ -689,13 +689,13 @@ impl PresenceLease {
             presence: Arc::clone(&self.presence),
             surface: PresenceSurface::Screen,
         };
-        if let Some(mut ack) = ack {
-            if !matches!(
+        if let Some(mut ack) = ack
+            && !matches!(
                 tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack.wait_for(|acked| *acked)).await,
                 Ok(Ok(_))
-            ) {
-                self.presence.fail_capture_wait(PresenceSurface::Screen);
-            }
+            )
+        {
+            self.presence.fail_capture_wait(PresenceSurface::Screen);
         }
         if self.presence.capture_verified(PresenceSurface::Screen) {
             Ok(guard)
