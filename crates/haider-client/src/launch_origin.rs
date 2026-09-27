@@ -587,7 +587,8 @@ impl DisplayPath {
         }
         let equal = |a: &str, b: &str| {
             if self.windows || home.windows {
-                a.eq_ignore_ascii_case(b)
+                a.trim_end_matches(['.', ' '])
+                    .eq_ignore_ascii_case(b.trim_end_matches(['.', ' ']))
             } else {
                 a == b
             }

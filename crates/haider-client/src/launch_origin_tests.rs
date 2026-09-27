@@ -297,6 +297,11 @@ fn every_known_other_user_root_and_case_are_masked() {
         projected(r"\\Users\bob\x", &[]),
         (OriginPathKind::Absolute, "//Users/bob/x".into())
     );
+    #[cfg(windows)]
+    assert_eq!(
+        projected("//Users//bob//x", &[]),
+        (OriginPathKind::Absolute, "//Users/bob/x".into())
+    );
     // A bare root has no account component to conceal.
     assert_eq!(
         projected("/Users", &[]),
@@ -356,6 +361,10 @@ fn verbatim_plain_unc_and_redirected_homes_share_one_projection() {
     );
     assert_eq!(
         projected("C:/Users/alice/x", &[r"\\?\C:\Users\alice"]),
+        (OriginPathKind::HomeRelative, "~/x".into())
+    );
+    assert_eq!(
+        projected(r"C:\Users.\alice\x", &[r"C:\Users\alice"]),
         (OriginPathKind::HomeRelative, "~/x".into())
     );
     assert_eq!(
