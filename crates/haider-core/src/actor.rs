@@ -1939,7 +1939,8 @@ mod continuation_progress_tests {
         );
         assert_eq!(steers.len(), 1);
         assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
-        // Swipe + identical screenshot: both repeat, so the stop comes sooner.
+        // Swipe + identical screenshot: both repeat after the two distinct
+        // call fingerprints are established.
         let (stop, _) = drive(600, |progress, request| {
             if request % 2 == 1 {
                 tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
@@ -1954,16 +1955,19 @@ mod continuation_progress_tests {
                 );
             }
         });
-        assert!(matches!(
+        // Swipe and screenshot establish two distinct fingerprints. The 62nd
+        // completed call makes 60 repeats, so the limit precedes request 63.
+        assert_eq!(
             stop,
             Some((
-                _,
+                63,
                 LoopLimitV1::RepeatedToolCalls {
                     repeated_calls: 60,
-                    ..
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
                 }
             ))
-        ));
+        );
     }
 
     fn a11y_tree_args() -> serde_json::Value {
@@ -2027,8 +2031,8 @@ mod continuation_progress_tests {
     }
 
     /// A truly identical numeric tree (stuck at the end of the list) still
-    /// repeats: steered before request 32, stopped before request 62; with
-    /// swipes in between the stop comes sooner.
+    /// repeats: steered before request 32, stopped before request 62. An
+    /// alternating swipe/tree loop first establishes two distinct calls.
     #[test]
     fn identical_numeric_a11y_tree_still_stops_at_61() {
         let tree = numeric_tree("100042");
@@ -2055,16 +2059,19 @@ mod continuation_progress_tests {
                 tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
             }
         });
-        assert!(matches!(
+        // Swipe and tree establish two distinct call fingerprints. The 62nd
+        // completed call makes 60 repeats, so the limit precedes request 63.
+        assert_eq!(
             stop,
             Some((
-                _,
+                63,
                 LoopLimitV1::RepeatedToolCalls {
                     repeated_calls: 60,
-                    ..
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
                 }
             ))
-        ));
+        );
     }
 
     /// Ordinary text-tool numeric polling keeps the accepted digit mask: an

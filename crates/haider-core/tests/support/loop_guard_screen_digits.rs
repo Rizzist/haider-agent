@@ -193,7 +193,9 @@ async fn identical_numeric_a11y_tree_still_stops() {
         "repeated_tool_calls"
     );
     assert_eq!(run.steers, 1);
-    assert!(run.requests < 202, "{}", run.requests);
+    // The first tree and swipe are distinct. Sixty repeats finish on call 62;
+    // the guard stops before the next provider request.
+    assert_eq!(run.requests, 62);
 }
 
 /// 100 `pause_turn` responses whose only change is an attempt counter
