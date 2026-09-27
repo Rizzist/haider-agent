@@ -6,9 +6,44 @@ $Version = $env:PACKAGE_VERSION
 if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Invalid PACKAGE_VERSION '$Version'" }
 $Uri = "https://community.chocolatey.org/api/v2/Packages(Id='haider',Version='$Version')"
 
-function Get-ExactPackageStatus([int]$TimeoutSeconds = 30) {
+# Mock-feed tests can supply this one function before invoking the script.
+# Real HTTP tests use the loopback-only override; identity keeps the production URI.
+if (-not (Get-Command Invoke-FeedRequest -CommandType Function -ErrorAction SilentlyContinue)) {
+function Invoke-FeedRequest([string]$RequestUri, [int]$TimeoutMilliseconds) {
+  $TransportUri = $RequestUri
+  if ($env:CHOCO_TEST_FEED_URI) {
+    $Loopback = $null
+    if (-not [Uri]::TryCreate($env:CHOCO_TEST_FEED_URI, [UriKind]::Absolute, [ref]$Loopback) -or
+        $Loopback.Scheme -ne 'http' -or $Loopback.Host -notin @('127.0.0.1', 'localhost') -or
+        -not [string]::IsNullOrEmpty($Loopback.UserInfo)) {
+      throw 'CHOCO_TEST_FEED_URI must be an HTTP loopback URI'
+    }
+    $TransportUri = $Loopback.AbsoluteUri
+  }
+  $Client = [System.Net.Http.HttpClient]::new()
+  $Client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
+  $Cancellation = [System.Threading.CancellationTokenSource]::new()
+  $Request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $TransportUri)
+  $Response = $null
   try {
-    $Response = Invoke-WebRequest -Uri $Uri -TimeoutSec $TimeoutSeconds -SkipHttpErrorCheck
+    $Cancellation.CancelAfter($TimeoutMilliseconds)
+    $Response = $Client.SendAsync($Request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+      $Cancellation.Token).GetAwaiter().GetResult()
+    # Read the complete body while the same total-duration token is active.
+    $Content = $Response.Content.ReadAsStringAsync($Cancellation.Token).GetAwaiter().GetResult()
+    return [pscustomobject]@{ StatusCode = [int]$Response.StatusCode; Content = $Content }
+  } finally {
+    if ($null -ne $Response) { $Response.Dispose() }
+    $Request.Dispose()
+    $Cancellation.Dispose()
+    $Client.Dispose()
+  }
+}
+}
+
+function Get-ExactPackageStatus([int]$TimeoutMilliseconds = 30000) {
+  try {
+    $Response = Invoke-FeedRequest -RequestUri $Uri -TimeoutMilliseconds $TimeoutMilliseconds
   } catch {
     # Connection failures are transient. Identity and HTTP errors below are not.
     return 'transient'
@@ -33,8 +68,12 @@ function Get-ExactPackageStatus([int]$TimeoutSeconds = 30) {
 }
 
 function Get-ExactPackagePresence {
+  $RequestTimeoutMs = 30000
+  if ($env:CHOCO_TEST_FEED_URI -and $env:CHOCO_TEST_PREFLIGHT_TIMEOUT_MS) {
+    $RequestTimeoutMs = Read-PositiveSetting 'CHOCO_TEST_PREFLIGHT_TIMEOUT_MS' 30000 30000
+  }
   for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
-    $Status = Get-ExactPackageStatus
+    $Status = Get-ExactPackageStatus -TimeoutMilliseconds $RequestTimeoutMs
     if ($Status -eq 'present') { return $true }
     if ($Status -eq 'absent') { return $false }
     if ($Attempt -eq 3) { throw "Could not establish whether haider $Version exists after 3 preflight queries" }
@@ -61,8 +100,10 @@ function Confirm-ExactPackage([int]$TimeoutSeconds, [int]$InitialIntervalMs) {
   do {
     $RemainingMs = $TimeoutSeconds * 1000 - $Clock.ElapsedMilliseconds
     if ($RemainingMs -le 0) { break }
-    $RequestSeconds = [Math]::Min(30, [Math]::Max(1, [Math]::Ceiling($RemainingMs / 1000)))
-    $Status = Get-ExactPackageStatus -TimeoutSeconds $RequestSeconds
+    $RequestMs = [int][Math]::Min(30000, $RemainingMs)
+    $Status = Get-ExactPackageStatus -TimeoutMilliseconds $RequestMs
+    # A complete exact entity received after the deadline is unconfirmed.
+    if ($Clock.ElapsedMilliseconds -ge $TimeoutSeconds * 1000) { break }
     if ($Status -eq 'present') { return $true }
     $RemainingMs = $TimeoutSeconds * 1000 - $Clock.ElapsedMilliseconds
     if ($RemainingMs -le 0) { break }

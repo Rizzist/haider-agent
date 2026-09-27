@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -14,6 +15,8 @@ import textwrap
 import shutil
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -428,14 +431,15 @@ class ChocolateyPackageFixTests(unittest.TestCase):
     def test_chocolatey_publish_behavior(self) -> None:
         script = ROOT / "scripts/chocolatey_publish.ps1"
         harness = r"""
-function Invoke-WebRequest {
+function Invoke-FeedRequest {
   $index = $global:queryIndex
   $global:queryIndex++
   $statuses = $env:MOCK_STATUSES.Split(',')
   $status = $statuses[[Math]::Min($index, $statuses.Length - 1)]
   Add-Content $env:MOCK_TRACE "query:$status"
   if ($status -eq 'network') { throw 'Synthetic network failure' }
-  if ($status -in @('exact', 'wrong', 'prefix', 'malformed')) {
+  if ($status -in @('exact', 'lateexact', 'wrong', 'prefix', 'malformed')) {
+    if ($status -eq 'lateexact') { Start-Sleep -Seconds 2 }
     $version = $env:PACKAGE_VERSION
     if ($status -eq 'wrong') { $version = '0.0.972' }
     if ($status -eq 'prefix') { $version += '0' }
@@ -471,6 +475,7 @@ try {
             ("check incomplete", "404", "fake", False, 0, 1, 0, 0, "", None),
             ("present before push", "exact", "fake", True, 0, 0, 0, 0, "push skipped", None),
             ("push confirmed", "404,exact", "fake", True, 0, 0, 1, 1, "pushed and confirmed", None),
+            ("late exact unconfirmed", "404,lateexact", "fake", True, 0, 1, 1, 1, "NOT confirmed", None),
             ("push absent", "404", "fake", True, 0, 1, 1, 2, "NOT confirmed", None),
             ("push 503", "404,503", "fake", True, 0, 1, 1, 2, "NOT confirmed", None),
             ("push 501", "404,501", "fake", True, 0, 1, 1, 2, "NOT confirmed", None),
@@ -521,6 +526,120 @@ try {
                         self.assertGreaterEqual(len(events[events.index("push") + 1:]), post_queries)
                     if summary_fragment:
                         self.assertIn(summary_fragment, summary.read_text())
+
+
+@unittest.skipUnless(shutil.which("pwsh"), "PowerShell is required for real HTTP deadline tests")
+class PublishHttpDeadlineTests(unittest.TestCase):
+    """Exercise the production transport with a loopback server and dummy choco."""
+
+    def test_complete_request_deadlines(self) -> None:
+        version = FIX_VERSION
+        uri = f"https://community.chocolatey.org/api/v2/Packages(Id='haider',Version='{version}')"
+        body = ("<entry xmlns='http://www.w3.org/2005/Atom' "
+                "xmlns:d='http://schemas.microsoft.com/ado/2007/08/dataservices' "
+                "xmlns:m='http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'>"
+                f"<id>{uri}</id><title>haider</title><m:properties>"
+                f"<d:Version>{version}</d:Version></m:properties></entry>").encode()
+        harness = """
+function choco {
+  $global:LASTEXITCODE = [int]$env:MOCK_PUSH_EXIT
+  'synthetic push; no upload'
+}
+& $env:PUBLISH_SCRIPT -Mode $env:MOCK_MODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+"""
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                server = self.server
+                scenario = server.scenario
+                server.requests += 1
+                if scenario == "slow headers":
+                    server.release.wait(8)
+                    if server.release.is_set():
+                        return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/atom+xml")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    if scenario == "immediate":
+                        self.wfile.write(body)
+                    elif scenario == "trickle":
+                        for byte in body:
+                            if server.release.wait(0.2):
+                                return
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                    else:
+                        self.wfile.write(body[:1])
+                        self.wfile.flush()
+                        server.release.wait(8)
+                        if scenario == "delayed body":
+                            self.wfile.write(body[1:])
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness_path = root / "http-harness.ps1"
+            harness_path.write_text(textwrap.dedent(harness))
+            for scenario in ("delayed body", "stalled body", "trickle", "slow headers", "immediate", "preflight stalled"):
+                push_exits = (0,) if scenario == "preflight stalled" else (0, 19)
+                for push_exit in push_exits:
+                    for launch in ("File", "Command"):
+                        with self.subTest(scenario=scenario, push_exit=push_exit, launch=launch):
+                            with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+                                server.daemon_threads = True
+                                server.scenario = "stalled body" if scenario == "preflight stalled" else scenario
+                                server.release = threading.Event()
+                                server.requests = 0
+                                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                                thread.start()
+                                summary = root / "summary.txt"
+                                output = root / "output.txt"
+                                summary.write_text("")
+                                output.write_text("")
+                                env = {**os.environ,
+                                       "PUBLISH_SCRIPT": str(ROOT / "scripts/chocolatey_publish.ps1"),
+                                       "CHOCO_TEST_FEED_URI": f"http://127.0.0.1:{server.server_port}/entity",
+                                       "CHOCO_TEST_PREFLIGHT_TIMEOUT_MS": "300",
+                                       "CHOCO_CONFIRM_TIMEOUT_SECONDS": "2",
+                                       "CHOCO_CONFIRM_POLL_INTERVAL_MS": "100",
+                                       "PACKAGE_VERSION": version, "PACKAGE_PRESENT": "false",
+                                       "CHOCO_API_KEY": "dummy", "MOCK_PUSH_EXIT": str(push_exit),
+                                       "MOCK_MODE": "Check" if scenario == "preflight stalled" else "Push",
+                                       "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_OUTPUT": str(output)}
+                                command = ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive",
+                                           "-" + launch,
+                                           str(harness_path) if launch == "File" else f". '{harness_path}'"]
+                                started = time.monotonic()
+                                try:
+                                    result = subprocess.run(command, env=env, capture_output=True,
+                                                            text=True, timeout=7)
+                                    elapsed = time.monotonic() - started
+                                    expected = 0 if scenario == "immediate" else (
+                                        1 if scenario == "preflight stalled" or push_exit == 0 or launch == "Command"
+                                        else 19)
+                                    self.assertEqual(result.returncode, expected,
+                                                     f"{scenario}: {result.stdout} {result.stderr}")
+                                    # 2 s confirmation + 3 s startup/scheduling slack. Preflight:
+                                    # 3 * 0.3 s requests + 1 + 2 s sleeps + 3 s slack.
+                                    self.assertLess(elapsed, 7 if scenario == "preflight stalled" else 5)
+                                    self.assertGreaterEqual(server.requests, 1)
+                                    text = summary.read_text()
+                                    if scenario == "immediate":
+                                        self.assertIn("confirmed", text)
+                                    elif scenario != "preflight stalled":
+                                        self.assertIn("NOT confirmed", text)
+                                        self.assertNotIn("was pushed and confirmed", text)
+                                finally:
+                                    server.release.set()
+                                    server.shutdown()
+                                    thread.join()
 
 
 class SiblingPackagerTests(unittest.TestCase):
