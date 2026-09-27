@@ -21,6 +21,7 @@ fn fence_is_reference_counted_per_session() {
     assert!(fences.session_fenced(&session));
     assert!(fences.registration_fenced(&session, &later));
     assert!(!fences.session_fenced(&other));
+    assert!(!fences.registration_fenced(&other, &run));
     drop(first);
     assert!(
         fences.session_fenced(&session),
@@ -44,5 +45,15 @@ fn stopped_run_outlives_the_fence_until_forgotten() {
     assert!(!fences.registration_fenced(&session, &later));
     assert!(!fences.session_fenced(&session));
     fences.forget_stopped_run(&session, &run);
+    assert!(!fences.registration_fenced(&session, &run));
+}
+
+#[test]
+fn deleted_session_reclaims_unsettled_stopped_runs() {
+    let fences = MonitorStopFences::default();
+    let (session, run, _) = ids();
+    fences.mark_run_stopped(&session, &run);
+    assert!(fences.registration_fenced(&session, &run));
+    fences.forget_deleted_session(&session);
     assert!(!fences.registration_fenced(&session, &run));
 }

@@ -74,6 +74,12 @@ impl MonitorStopFences {
             state.stopped_runs.remove(&(session.clone(), run.clone()));
         });
     }
+
+    /// A deleted session can never submit another run. Reclaim any stopped
+    /// run entries that never reached a terminal observation.
+    pub(crate) fn forget_deleted_session(&self, session: &SessionId) {
+        self.with(|state| state.stopped_runs.retain(|(owner, _)| owner != session));
+    }
 }
 
 /// One stop's hold on a session's fence; dropping it lowers the fence.

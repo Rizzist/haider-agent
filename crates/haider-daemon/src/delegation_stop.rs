@@ -38,6 +38,54 @@ const STOP_CONVERGENCE_POLL: Duration = Duration::from_millis(50);
 static DETACHED_WATCHERS: LazyLock<std::sync::Mutex<HashSet<AgentId>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
+#[cfg(all(test, unix))]
+struct StopDrainPause {
+    arrived: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(all(test, unix))]
+static STOP_DRAIN_PAUSES: LazyLock<
+    std::sync::Mutex<HashMap<(SessionId, &'static str), StopDrainPause>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Test-only ordering seam after the first monitor listing has drained. It
+/// lets a client registration commit before the production final drain.
+#[cfg(all(test, unix))]
+pub(crate) fn pause_after_first_drain(
+    session: &SessionId,
+    scope: &'static str,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    STOP_DRAIN_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            (session.clone(), scope),
+            StopDrainPause {
+                arrived: arrived_tx,
+                resume: resume_rx,
+            },
+        );
+    (arrived_rx, resume_tx)
+}
+
+#[cfg(all(test, unix))]
+async fn first_drain_test_pause(session: &SessionId, scope: &'static str) {
+    let pause = STOP_DRAIN_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(session.clone(), scope));
+    if let Some(pause) = pause {
+        let _ = pause.arrived.send(());
+        let _ = pause.resume.await;
+    }
+}
+
 /// Where a stop-all walk starts.
 #[derive(Clone)]
 pub(crate) enum SubagentTreeRoot {
@@ -212,6 +260,8 @@ impl DelegationHandle {
                                 )
                                 .await,
                         );
+                        #[cfg(all(test, unix))]
+                        first_drain_test_pause(&record.child_session_id, "tree").await;
                     }
                     let snapshot = self
                         .child_session_snapshot(&record.child_session_id)
@@ -515,6 +565,8 @@ impl DelegationHandle {
         let monitors_removed = monitor
             .remove_all_for_stop(&self.hub, &record.child_session_id, command_prefix)
             .await;
+        #[cfg(all(test, unix))]
+        first_drain_test_pause(&record.child_session_id, "named").await;
         for cancelled in self.cancel_live_runs(record, command_prefix).await? {
             // The original run finished earlier; report the later run this
             // request actually stopped.

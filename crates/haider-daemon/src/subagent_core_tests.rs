@@ -1,5 +1,272 @@
 #![allow(clippy::expect_used)]
 
+/// An external monitor registration committed after the first listing must
+/// be removed by the stop's final drain. The pause is test-only and fixes the
+/// ordering, so this does not depend on scheduler timing.
+#[tokio::test]
+#[cfg(unix)]
+async fn stop_final_drain_removes_registration_after_first_listing_in_both_paths() {
+    for scope in ["tree", "named"] {
+        let harness = start_parked_child_with_wait_budgets(
+            &format!("final-drain-{scope}"),
+            ParkedChildMode::ParentWaitTimeoutHang,
+            Duration::from_secs(1),
+            Duration::from_millis(2_250),
+            Duration::from_millis(250),
+            Some(2_250),
+        )
+        .await;
+        let child = harness.child.clone();
+        let monitor = harness.hub.inner_monitor();
+        let before = monitor
+            .client_register(
+                &harness.hub,
+                crate::monitor::MonitorClientRegistrationRequest {
+                    command_id: haider_rpc::CommandId::new(format!("before-first-drain-{scope}")),
+                    session_id: child.child_session_id.clone(),
+                    worker_generation: harness.hub.worker_generation(),
+                    source: haider_rpc::MonitorSourceWire::Sms,
+                    filter: None,
+                    action: haider_rpc::MonitorActionWire {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                    lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                },
+            )
+            .await;
+        assert!(matches!(
+            before.outcome,
+            haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+        ));
+        let (arrived, resume) =
+            crate::delegation::pause_after_first_drain(&child.child_session_id, scope);
+        let hub = harness.hub.clone();
+        let parent = harness.parent_session.clone();
+        let stop = tokio::spawn(async move {
+            let coordinator = crate::delegation::DelegationHandle::new(hub.clone());
+            if scope == "tree" {
+                let stopped = coordinator
+                    .stop_subagent_tree(
+                        crate::delegation::SubagentTreeRoot::Session(parent),
+                        "test-final-drain-tree",
+                    )
+                    .await
+                    .expect("tree stop");
+                assert_eq!(
+                    stopped.monitors_removed, 2,
+                    "first listing and final drain each remove one monitor"
+                );
+            } else {
+                let request_json = serde_json::json!({
+                    "session_id": child.child_session_id,
+                    "run_id": child.child_run_id,
+                    "reason": "manual",
+                })
+                .to_string();
+                coordinator
+                    .cancel_single_subagent(
+                        &child,
+                        TurnCancelCommand {
+                            command_id: "test-final-drain-named".into(),
+                            request_digest: blake3::hash(request_json.as_bytes())
+                                .to_hex()
+                                .to_string(),
+                            request_json,
+                            session_id: child.child_session_id.clone(),
+                            worker_generation: hub.worker_generation(),
+                            run_id: child.child_run_id.clone(),
+                            cancelling_event_id: EventId::new("test-final-drain-named-cancelling"),
+                            device_id: hub.device_id(),
+                        },
+                        "test-final-drain-named",
+                    )
+                    .await
+                    .expect("named stop");
+            }
+        });
+        timeout(Duration::from_secs(15), arrived)
+            .await
+            .expect("first drain reached")
+            .expect("pause signalled");
+        assert!(
+            monitor
+                .stop_fences()
+                .session_fenced(&harness.child.child_session_id)
+        );
+        assert!(
+            !monitor
+                .stop_fences()
+                .session_fenced(&harness.parent_session),
+            "a stop fences only its child session, never the root"
+        );
+        let first_drained = monitor
+            .client_list(&harness.hub, harness.child.child_session_id.clone())
+            .await;
+        assert!(
+            matches!(first_drained.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.is_empty()),
+            "first listing removed its initial monitor"
+        );
+        let receipt = monitor
+            .client_register(
+                &harness.hub,
+                crate::monitor::MonitorClientRegistrationRequest {
+                    command_id: haider_rpc::CommandId::new(format!("after-first-drain-{scope}")),
+                    session_id: harness.child.child_session_id.clone(),
+                    worker_generation: harness.hub.worker_generation(),
+                    source: haider_rpc::MonitorSourceWire::Sms,
+                    filter: None,
+                    action: haider_rpc::MonitorActionWire {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                    lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                &receipt.outcome,
+                haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+            ),
+            "{scope}: {receipt:?}"
+        );
+        let listed = monitor
+            .client_list(&harness.hub, harness.child.child_session_id.clone())
+            .await;
+        assert!(
+            matches!(listed.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.len() == 1)
+        );
+        resume.send(()).expect("release stop");
+        timeout(Duration::from_secs(20), stop)
+            .await
+            .expect("stop completed")
+            .expect("stop task");
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let listed = monitor.client_list(&harness.hub, harness.child.child_session_id.clone()).await;
+                if matches!(listed.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("final drain removed late client monitor");
+        harness.manager.shutdown().await.expect("manager shutdown");
+        harness.hub.shutdown().await.expect("hub shutdown");
+        harness.store.close().await.expect("store close");
+    }
+}
+
+/// Replaying the same committed named cancel while its first stop is paused
+/// keeps the session fenced and returns the same durable cancellation receipt.
+#[tokio::test]
+#[cfg(unix)]
+async fn exact_named_cancel_retry_keeps_fence_and_does_not_register_again() {
+    let harness = start_parked_child_with_wait_budgets(
+        "exact-named-stop-retry",
+        ParkedChildMode::ParentWaitTimeoutHang,
+        Duration::from_secs(1),
+        Duration::from_millis(2_250),
+        Duration::from_millis(250),
+        Some(2_250),
+    )
+    .await;
+    let child = harness.child.clone();
+    let monitor = harness.hub.inner_monitor();
+    let before = monitor
+        .client_register(
+            &harness.hub,
+            crate::monitor::MonitorClientRegistrationRequest {
+                command_id: haider_rpc::CommandId::new("retry-initial-monitor"),
+                session_id: child.child_session_id.clone(),
+                worker_generation: harness.hub.worker_generation(),
+                source: haider_rpc::MonitorSourceWire::Sms,
+                filter: None,
+                action: haider_rpc::MonitorActionWire {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            },
+        )
+        .await;
+    assert!(matches!(
+        before.outcome,
+        haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+    ));
+    let (arrived, resume) =
+        crate::delegation::pause_after_first_drain(&child.child_session_id, "named");
+    let request_json = serde_json::json!({
+        "session_id": child.child_session_id,
+        "run_id": child.child_run_id,
+        "reason": "manual",
+    })
+    .to_string();
+    let command = TurnCancelCommand {
+        command_id: "retry-exact-named-cancel".into(),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        session_id: child.child_session_id.clone(),
+        worker_generation: harness.hub.worker_generation(),
+        run_id: child.child_run_id.clone(),
+        cancelling_event_id: EventId::new("retry-exact-named-cancelling"),
+        device_id: harness.hub.device_id(),
+    };
+    let coordinator = crate::delegation::DelegationHandle::new(harness.hub.clone());
+    let first_coordinator = coordinator.clone();
+    let first_child = child.clone();
+    let first_command = command.clone();
+    let first = tokio::spawn(async move {
+        first_coordinator
+            .cancel_single_subagent(&first_child, first_command, "retry-exact-named")
+            .await
+            .expect("first cancel")
+    });
+    timeout(Duration::from_secs(15), arrived)
+        .await
+        .expect("first stop reaches drain")
+        .expect("pause signalled");
+    assert!(
+        monitor
+            .stop_fences()
+            .session_fenced(&child.child_session_id)
+    );
+    let replay = timeout(
+        Duration::from_secs(15),
+        coordinator.cancel_single_subagent(&child, command, "retry-exact-named"),
+    )
+    .await
+    .expect("exact retry completes")
+    .expect("exact retry accepted");
+    assert!(
+        monitor
+            .stop_fences()
+            .session_fenced(&child.child_session_id)
+    );
+    let listed = monitor
+        .client_list(&harness.hub, child.child_session_id.clone())
+        .await;
+    assert!(matches!(
+        listed.outcome,
+        haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.is_empty()
+    ));
+    resume.send(()).expect("release first stop");
+    let original = timeout(Duration::from_secs(20), first)
+        .await
+        .expect("first stop completed")
+        .expect("first stop task");
+    assert_eq!(
+        replay, original,
+        "an exact retry replays its committed receipt"
+    );
+    harness.manager.shutdown().await.expect("manager shutdown");
+    harness.hub.shutdown().await.expect("hub shutdown");
+    harness.store.close().await.expect("store close");
+}
+
 #[tokio::test]
 async fn public_workflow_catalog_human_templates_have_explicit_headless_refusal() {
     let root = tempfile::tempdir().expect("profile");

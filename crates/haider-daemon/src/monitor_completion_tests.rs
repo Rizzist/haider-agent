@@ -358,6 +358,112 @@ async fn observe_monitor(world: &MonitorWorld, report: MonitorReport) {
         .unwrap();
 }
 
+/// Both durable obligation states are dismissed while a stop owns the
+/// session. A later replay must stay settled after the guard drops.
+#[tokio::test]
+async fn fenced_monitor_wake_dismisses_pending_and_admitting_obligations() {
+    use haider_protocol::completion::CompletionEvent;
+    for admitting in [false, true] {
+        let label = if admitting {
+            "fenced-admitting"
+        } else {
+            "fenced-pending"
+        };
+        let world = MonitorWorld::new(label).await;
+        let mut report = test_report(label, "stop wake", MonitorReportStatus::Matched);
+        report.session_id = world.session.clone();
+        observe_monitor(&world, report.clone()).await;
+        let id = format!("monitor:{label}");
+        if admitting {
+            let journal = crate::completion::load(&world.hub, &world.session)
+                .await
+                .unwrap();
+            crate::completion::append(
+                &world.hub,
+                &journal.projection.pending[&id],
+                CompletionEvent::CompletionAttempt {
+                    obligation_id: id.clone(),
+                    attempt: 1,
+                    worker_generation: world.hub.worker_generation(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let before = crate::completion::load(&world.hub, &world.session)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.projection.pending[&id].status,
+            if admitting {
+                CompletionStatus::Admitting
+            } else {
+                CompletionStatus::Pending
+            }
+        );
+        let fence = world
+            .hub
+            .inner_monitor()
+            .stop_fences()
+            .fence(&world.session);
+        let receipt = world.hub.wake_monitor_report(report.clone()).await.unwrap();
+        assert!(receipt.durable);
+        assert!(!receipt.handed_off);
+        assert_eq!(receipt.disposition, "follow_up_pending");
+        let journal = crate::completion::load(&world.hub, &world.session)
+            .await
+            .unwrap();
+        assert!(journal.projection.is_settled(&id));
+        assert_eq!(journal.events.iter().filter(|event| matches!(event,
+            CompletionEvent::CompletionDismissed { obligation_id, .. } if obligation_id == &id
+        )).count(), 1);
+        assert!(
+            !journal.events.iter().any(|event| matches!(event,
+                CompletionEvent::CompletionAdmitted { obligation_id, .. } if obligation_id == &id
+            )),
+            "dismissal must not admit a monitor run"
+        );
+        drop(fence);
+        world.hub.inner_monitor().completion_cache().await.clear();
+        let replay = world.hub.wake_monitor_report(report).await.unwrap();
+        assert!(replay.durable);
+        assert!(!replay.handed_off);
+        let journal = crate::completion::load(&world.hub, &world.session)
+            .await
+            .unwrap();
+        assert!(journal.projection.is_settled(&id));
+    }
+}
+
+#[tokio::test]
+async fn fenced_monitor_wake_without_obligation_is_retained_without_admission() {
+    let world = MonitorWorld::new("fenced-fallback").await;
+    let mut report = test_report(
+        "fenced-fallback-report",
+        "direct wake",
+        MonitorReportStatus::Matched,
+    );
+    report.session_id = world.session.clone();
+    let fence = world
+        .hub
+        .inner_monitor()
+        .stop_fences()
+        .fence(&world.session);
+    let receipt = world.hub.wake_monitor_report(report).await.unwrap();
+    assert!(receipt.durable);
+    assert!(!receipt.handed_off);
+    assert_eq!(receipt.disposition, "follow_up_pending");
+    assert!(
+        crate::completion::load(&world.hub, &world.session)
+            .await
+            .unwrap()
+            .projection
+            .pending
+            .is_empty()
+    );
+    drop(fence);
+}
+
 #[tokio::test]
 async fn interrupted_handoff_replays_the_same_durable_attempt_and_admission() {
     use haider_protocol::completion::CompletionEvent;

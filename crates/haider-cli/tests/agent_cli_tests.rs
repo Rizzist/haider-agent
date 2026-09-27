@@ -2564,19 +2564,19 @@ fn owed_result_beyond_the_display_list_is_delivered_after_restart() {
     profile.stop();
 }
 
-/// B1: a subagent that registers a monitor WHILE it is being stopped must
-/// not keep it: the stop fences registration (and wakes) for the stopped
-/// session until its runs settled and a final drain ran. Covered for named
-/// cancel, `agent cancel --all`, `run --stop` and `run --stop-subagents`.
-///
-/// MUTATION CHECK: remove the `registration_fenced` check from the monitor
-/// tool. Expected runtime failure: a late timer survives the stop and wakes
-/// the stopped child into `monitor-run-*` runs.
+/// A registration attempted during each stop scope receives its own rejected
+/// tool result. The named case uses a later messaged run so cancellation of
+/// its already terminal primary run cannot make the race vacuous.
 #[test]
 fn stop_refuses_monitors_registered_during_the_stop_for_every_scope() {
     for scope in ["named", "all", "run", "subagents"] {
         monitor_registration_race(scope);
     }
+}
+
+#[test]
+fn main_only_stop_leaves_child_monitor_registration_open() {
+    monitor_registration_race("main");
 }
 
 fn monitor_registration_race(scope: &str) {
@@ -2596,15 +2596,32 @@ fn monitor_registration_race(scope: &str) {
         discover("monitor"),
         json!({"step":"finish","reason":"tool_use"}),
         json!({"step":"expect_tool_result","call_id":"discover-monitor"}),
+    ];
+    child.extend([
         discover("process_exec"),
         json!({"step":"finish","reason":"tool_use"}),
         json!({"step":"expect_tool_result","call_id":"discover-process_exec"}),
-    ];
+    ]);
     for index in 0..MONITORS {
         let call = format!("timer-{index}");
         child.push(timer(&call, 3_600_000));
         child.push(json!({"step":"finish","reason":"tool_use"}));
         child.push(json!({"step":"expect_tool_result","call_id":call}));
+    }
+    if scope == "named" {
+        child.push(json!({"step":"emit_text","text":"first run complete"}));
+        child.push(json!({"step":"finish","reason":"end_turn"}));
+        child.extend([
+            json!({"step":"emit_tool_call","call_id":"discover-monitor-later","name":"list_tools","args":{"filter":"monitor"}}),
+            json!({"step":"finish","reason":"tool_use"}),
+            json!({"step":"expect_tool_result","call_id":"discover-monitor-later"}),
+            json!({"step":"emit_tool_call","call_id":"discover-process_exec-later","name":"list_tools","args":{"filter":"process_exec"}}),
+            json!({"step":"finish","reason":"tool_use"}),
+            json!({"step":"expect_tool_result","call_id":"discover-process_exec-later"}),
+            spawn_step("spawn-g", "named descendant", "fake-g", true),
+            json!({"step":"finish","reason":"tool_use"}),
+            json!({"step":"expect_tool_result","call_id":"spawn-g"}),
+        ]);
     }
     let gate = format!(
         "touch '{}'; while [ ! -e '{}' ]; do sleep 0.001; done",
@@ -2615,48 +2632,103 @@ fn monitor_registration_race(scope: &str) {
         json!({"step":"emit_tool_call","call_id":"gate","name":"process_exec","args":{"command":gate}}),
         json!({"step":"finish","reason":"tool_use"}),
         json!({"step":"expect_tool_result","call_id":"gate"}),
-        timer("late-timer", 2_000),
+        timer("late-timer", if scope == "main" { 3_600_000 } else { 2_000 }),
         json!({"step":"finish","reason":"tool_use"}),
         json!({"step":"expect_tool_result","call_id":"late-timer"}),
         json!({"step":"hang"}),
     ]);
+    let root_end = if scope == "main" {
+        vec![json!({"step":"hang"})]
+    } else {
+        vec![
+            json!({"step":"emit_text","text":"root done"}),
+            json!({"step":"finish","reason":"end_turn"}),
+        ]
+    };
+    let mut root = vec![
+        spawn_step("spawn-c", "monitor child", "fake-c", true),
+        json!({"step":"finish","reason":"tool_use"}),
+        json!({"step":"expect_tool_result","call_id":"spawn-c"}),
+    ];
+    root.extend(root_end);
     profile.script = json!({"by_model": {
-        "fake-model": [
-            spawn_step("spawn-c", "monitor child", "fake-c", true),
-            {"step":"finish","reason":"tool_use"},
-            {"step":"expect_tool_result","call_id":"spawn-c"},
-            {"step":"emit_text","text":"root done"},
-            {"step":"finish","reason":"end_turn"}
-        ],
+        "fake-model": root,
         "fake-c": child,
+        "fake-g": [{"step":"hang"}],
     }})
     .to_string();
-    profile.seed_models(&["fake-model", "fake-c"]);
-    let output = profile.run(&[
-        "run",
-        "--auto-allow",
-        "--provider",
-        "fake",
-        "--model",
-        "fake-model",
-        "--json",
-        "-p",
-        "monitor stop race",
-    ]);
-    assert!(
-        output.status.success(),
-        "{scope}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let body: Value = serde_json::from_slice(&output.stdout).expect("run JSON");
-    let (run_id, session) = (
-        field(&body, "run_id").to_owned(),
-        field(&body, "session_id").to_owned(),
-    );
+    profile.seed_models(&["fake-model", "fake-c", "fake-g"]);
+    let (run_id, session) = if scope == "main" {
+        profile.start_run("fake-model", "monitor stop main-only control")
+    } else {
+        let output = profile.run(&[
+            "run",
+            "--auto-allow",
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+            "-p",
+            "monitor stop race",
+        ]);
+        assert!(
+            output.status.success(),
+            "{scope}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: Value = serde_json::from_slice(&output.stdout).expect("run JSON");
+        (
+            field(&body, "run_id").to_owned(),
+            field(&body, "session_id").to_owned(),
+        )
+    };
+    wait_for("child delegation", STOP_OBSERVATION, || {
+        !profile.delegations().is_empty()
+    });
+    let c = profile.row(1);
+    if scope == "named" {
+        wait_for("first child run terminal", STOP_OBSERVATION, || {
+            profile.live_runs(&c.child_session).is_empty()
+        });
+        let messaged = profile.json(
+            &[
+                "agent",
+                "message",
+                &session,
+                &c.agent,
+                "register in later run",
+                "--json",
+                "--no-spawn",
+            ],
+            "haider.agent.message.v1",
+            0,
+        );
+        assert_eq!(
+            messaged["result"]["receipt"]["agent"].as_str(),
+            Some(c.agent.as_str())
+        );
+    }
+    let grandchild = if scope == "named" {
+        wait_for("named descendant", STOP_OBSERVATION, || {
+            profile.delegations().len() == 2
+        });
+        let grandchild = profile.row(2);
+        assert_eq!(profile.live_runs(&grandchild.child_session).len(), 1);
+        Some(grandchild)
+    } else {
+        None
+    };
     wait_for("child at its gate", Duration::from_secs(90), || {
         ready.exists()
     });
-    let c = profile.row(1);
+    if scope == "named" {
+        assert_eq!(
+            profile.all_runs(&c.child_session).len(),
+            2,
+            "named cancellation must race a later child run"
+        );
+    }
     assert_eq!(profile.monitor_count(&c.child_session), MONITORS, "{scope}");
     let args: Vec<&str> = match scope {
         "named" => vec![
@@ -2669,7 +2741,9 @@ fn monitor_registration_race(scope: &str) {
         ],
         "all" => vec!["agent", "cancel", &session, "--all", "--json", "--no-spawn"],
         "run" => vec!["run", "--stop", &run_id, "--json"],
-        _ => vec!["run", "--stop-subagents", &run_id, "--json"],
+        "subagents" => vec!["run", "--stop-subagents", &run_id, "--json"],
+        "main" => vec!["run", "--stop-main", &run_id, "--json"],
+        _ => panic!("unknown stop scope {scope}"),
     };
     let stop = profile
         .command(&args)
@@ -2677,11 +2751,20 @@ fn monitor_registration_race(scope: &str) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("stop command");
-    // Release the child right after the stop's first monitor removal, while
-    // its remaining removals and the cancel are still ahead.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && profile.monitor_count(&c.child_session) >= MONITORS {
-        thread::sleep(Duration::from_millis(1));
+    // Release the child after the first removal; the remaining removals and
+    // cancellation of its live run are still ahead.
+    if scope != "main" {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && profile.monitor_count(&c.child_session) >= MONITORS {
+            thread::sleep(Duration::from_millis(1));
+        }
+    } else {
+        wait_for("main run stopping", STOP_OBSERVATION, || {
+            matches!(
+                profile.run_state(&session, &run_id).as_deref(),
+                Some("cancelling" | "cancelled")
+            )
+        });
     }
     std::fs::write(&release, b"go").expect("release the gate");
     let stopped = stop.wait_with_output().expect("stop completes");
@@ -2691,6 +2774,41 @@ fn monitor_registration_race(scope: &str) {
         String::from_utf8_lossy(&stopped.stdout),
         String::from_utf8_lossy(&stopped.stderr)
     );
+    wait_for("late monitor tool result", STOP_OBSERVATION, || {
+        profile.journal(&c.child_session).iter().any(|event| {
+            event["payload"]["type"] == "tool_result" && event["payload"]["call_id"] == "late-timer"
+        })
+    });
+    let late = profile
+        .journal(&c.child_session)
+        .into_iter()
+        .filter(|event| {
+            event["payload"]["type"] == "tool_result" && event["payload"]["call_id"] == "late-timer"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        late.len(),
+        1,
+        "{scope}: late registration must be attempted: {late:?}"
+    );
+    if scope == "main" {
+        let preview: Value = serde_json::from_str(field(&late[0]["payload"]["result"], "preview"))
+            .expect("main-only late monitor tool preview");
+        assert_eq!(preview["status"], "registered", "{late:?}");
+        assert_eq!(profile.monitor_count(&c.child_session), MONITORS + 1);
+        assert_eq!(profile.live_runs(&c.child_session).len(), 1);
+        let cleanup = profile.run(&["agent", "cancel", &session, "--all", "--json", "--no-spawn"]);
+        assert!(cleanup.status.success());
+        profile.stop();
+        return;
+    }
+    assert_eq!(
+        late[0]["payload"]["result"]["status"], "rejected",
+        "{scope}: {late:?}"
+    );
+    let preview: Value = serde_json::from_str(field(&late[0]["payload"]["result"], "preview"))
+        .expect("late monitor tool preview");
+    assert_eq!(preview["status"], "subagent_stopping", "{scope}: {late:?}");
     wait_for("child cancelled", STOP_OBSERVATION, || {
         profile.live_runs(&c.child_session).is_empty()
     });
@@ -2706,12 +2824,24 @@ fn monitor_registration_race(scope: &str) {
     let runs = profile.all_runs(&c.child_session);
     assert_eq!(
         runs.len(),
-        1,
+        if scope == "named" { 2 } else { 1 },
         "{scope}: no monitor woke the stopped child: {runs:?}"
     );
     assert!(
-        runs[0].1.contains("cancelled"),
+        runs.iter().any(|(_, state)| state.contains("cancelled")),
         "{scope}: the child was stopped: {runs:?}"
     );
+    if let Some(grandchild) = grandchild {
+        assert_eq!(
+            profile.live_runs(&grandchild.child_session).len(),
+            1,
+            "named cancel leaves descendants running"
+        );
+        let cleanup = profile.run(&["agent", "cancel", &session, "--all", "--json", "--no-spawn"]);
+        assert!(cleanup.status.success());
+        wait_for("grandchild cleanup", STOP_OBSERVATION, || {
+            profile.live_runs(&grandchild.child_session).is_empty()
+        });
+    }
     profile.stop();
 }

@@ -685,6 +685,126 @@ impl MonitorWorld {
     }
 }
 
+/// A stopped run remains barred after the session guard is gone. Exercise
+/// the actual monitor tool path, including its rejected result, rather than
+/// only the fence registry's predicate.
+#[tokio::test]
+async fn stopped_run_registration_is_rejected_after_fence_drop_until_terminal_observation() {
+    let world = MonitorWorld::new("stopped-run-registration").await;
+    world
+        .lease
+        .append(&mut [monitor_envelope(
+            &world.session,
+            Some(&world.run),
+            None,
+            None,
+            "stopped-run-cancelling",
+            world.hub.device_id(),
+            world.hub.worker_generation(),
+            serde_json::to_value(EventPayload::RunState(RunState::Cancelling)).unwrap(),
+        )])
+        .await
+        .unwrap();
+    let fences = world.hub.inner_monitor().stop_fences().clone();
+    let fence = fences.fence(&world.session);
+    fences.mark_run_stopped(&world.session, &world.run);
+    drop(fence);
+    assert!(!fences.session_fenced(&world.session));
+    let request = MonitorRequest::Register {
+        source: MonitorSource::Sms,
+        filter: None,
+        action: MonitorAction {
+            report: true,
+            follow_up: None,
+        },
+        occurrence: MonitorOccurrence::Every,
+        lifetime: MonitorLifetime::Session,
+    };
+    let refused = world.execute("stopped-after-drop", request.clone()).await;
+    assert_eq!(refused.status, ToolResultStatus::Rejected);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&refused.preview).unwrap()["status"],
+        "subagent_stopping"
+    );
+    assert!(
+        world
+            .execute("stopped-list", MonitorRequest::List)
+            .await
+            .preview
+            .contains("\"count\":0")
+    );
+    world
+        .lease
+        .append(&mut [monitor_envelope(
+            &world.session,
+            Some(&world.run),
+            None,
+            None,
+            "stopped-run-terminal",
+            world.hub.device_id(),
+            world.hub.worker_generation(),
+            serde_json::to_value(EventPayload::RunState(RunState::Cancelled)).unwrap(),
+        )])
+        .await
+        .unwrap();
+    fences.forget_stopped_run(&world.session, &world.run);
+    let admitted = world.execute("new-after-terminal", request.clone()).await;
+    assert_eq!(admitted.status, ToolResultStatus::Completed);
+    let next_run = RunId::new("new-run-after-stopped-run");
+    world
+        .hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "new-run-after-stop-command".into(),
+            request_digest: "new-run-after-stop-digest".into(),
+            request_json: r#"{"new_run":"after_stop"}"#.into(),
+            session_id: world.session.clone(),
+            worker_generation: world.store.worker_generation(),
+            run_id: next_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "new unrelated work".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("new-run-after-stop-queued"),
+            user_event_id: EventId::new("new-run-after-stop-user"),
+            active_event_id: EventId::new("new-run-after-stop-active"),
+            device_id: world.hub.device_id(),
+        })
+        .await
+        .expect("accept new run after stop");
+    let mut coordinates = world.coordinates("new-run-register");
+    coordinates.run_id = next_run;
+    let fresh = world
+        .hub
+        .execute_monitor_tool(&world.lease, coordinates, request)
+        .await
+        .expect("new run monitor registration");
+    assert_eq!(fresh.status, ToolResultStatus::Completed);
+}
+
+#[tokio::test]
+async fn monitor_registration_in_other_session_succeeds_while_stop_fence_is_held() {
+    let world = MonitorWorld::new("unrelated-fence").await;
+    let other = SessionId::new("another-subagent-being-stopped");
+    let _fence = world.hub.inner_monitor().stop_fences().fence(&other);
+    let result = world
+        .execute(
+            "unrelated-register",
+            MonitorRequest::Register {
+                source: MonitorSource::Sms,
+                filter: None,
+                action: MonitorAction {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: MonitorOccurrence::Every,
+                lifetime: MonitorLifetime::Session,
+            },
+        )
+        .await;
+    assert_eq!(result.status, ToolResultStatus::Completed);
+}
+
 struct CapturingSink {
     reports: tokio_mpsc::UnboundedSender<MonitorReport>,
 }

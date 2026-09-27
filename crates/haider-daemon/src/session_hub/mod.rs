@@ -6626,6 +6626,10 @@ impl SessionHub {
                 // the monitor fence again. A failed delete must retain it.
                 self.inner
                     .monitors
+                    .stop_fences()
+                    .forget_deleted_session(session_id);
+                self.inner
+                    .monitors
                     .completion_cache()
                     .await
                     .remove(session_id);

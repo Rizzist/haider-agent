@@ -65,6 +65,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[path = "delegation_stop.rs"]
 mod stop;
+#[cfg(all(test, unix))]
+pub(crate) use stop::pause_after_first_drain;
 pub(crate) use stop::{SubagentStopSummary, SubagentTreeRoot};
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
