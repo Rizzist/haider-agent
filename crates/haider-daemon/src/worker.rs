@@ -171,7 +171,9 @@ use haider_provider::{
     ProviderRequestOrdinal, ResolvedAttachment, apply_tool_result_image_budget,
     canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
 };
-use haider_provider::{Provider, ProviderError, ToolDefinition, TurnRequest};
+use haider_provider::{
+    Provider, ProviderError, ToolDefinition, ToolResultImageProjection, TurnRequest,
+};
 use haider_store::{MenuResolutionCommand, MenuResolutionOutcome};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, ComputerBackend, ComputerCancelToken, ComputerError,
@@ -314,8 +316,9 @@ pub trait ProviderFactory: Send + Sync {
     /// ephemeral cache resources when a session switches wire families.
     async fn reconcile_cache_scope(&self, _session_id: &SessionId, _provider: &str) {}
 
-    /// Integration-test seam for proving the actor's request-loop budget
-    /// through the real daemon. Production factories keep the core default.
+    /// Integration-test seam for proving an explicit actor request-loop cap
+    /// through the real daemon. Production factories return `None`, leaving
+    /// any run or child pin in force (no pin means unbounded).
     #[doc(hidden)]
     fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
         None
@@ -474,6 +477,10 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             // rev933b finding 7: the automatic switch observed this exact
             // pair; a concurrent explicit selection moves it and must win.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
+            // No validated model row exists on this path: keep the stored
+            // budget. An oversized budget on the fallback model is recovered
+            // by the provider's one-shot `max_tokens too large` retry.
+            output_budget: None,
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
@@ -819,12 +826,12 @@ impl DaemonContextCompactor {
                 Ok(None) => {}
             }
         }
-        let code = if error.presentation.subcode.as_str() == "provider-timeout" {
-            ErrorCode::ProviderTimeout
-        } else {
-            ErrorCode::ProviderError
-        };
-        HaiderError::new(code, format!("{message}: {error}"), error.retryable)
+        // Same publication boundary as a turn's provider failure: public
+        // message, typed presentation (status, type, request id), and raw
+        // provider text only in the owner-local field.
+        let mut mapped = haider_core::provider_error_to_haider(error);
+        mapped.message = format!("{message}: {}", mapped.message);
+        mapped
     }
 
     async fn provider_open_error(&self, run_id: &RunId, error: ProviderError) -> HaiderError {
@@ -1551,6 +1558,7 @@ impl ContextCompactor for DaemonContextCompactor {
             covered_messages,
             retained_messages,
             attachments,
+            image_projection,
             latest_compaction_summary_end,
             economy_before,
         } = request;
@@ -1570,21 +1578,26 @@ impl ContextCompactor for DaemonContextCompactor {
         // exceptional case. Its actor projection begins with the prior brief,
         // so rebuild the intent-named original journal fragments instead of
         // ever feeding a summary back into a summary.
-        let (covered_messages, source_attachments) = if latest_compaction_summary_end.is_some() {
-            let mut original_messages = PromptHistoryCompiler::compile_compaction_source(
-                &self.store,
-                self.store.session_id(),
-                self.branch_id.as_ref(),
-                self.agent_id.as_ref(),
-                run_id,
-                intent,
-            )
-            .await?;
-            prepare_compaction_messages(&self.store, &mut original_messages).await?;
-            (original_messages, Vec::new())
-        } else {
-            (covered_messages, attachments)
-        };
+        let (covered_messages, source_attachments, source_image_projection) =
+            if latest_compaction_summary_end.is_some() {
+                let mut original_messages = PromptHistoryCompiler::compile_compaction_source(
+                    &self.store,
+                    self.store.session_id(),
+                    self.branch_id.as_ref(),
+                    self.agent_id.as_ref(),
+                    run_id,
+                    intent,
+                )
+                .await?;
+                prepare_compaction_messages(&self.store, &mut original_messages).await?;
+                (
+                    original_messages,
+                    Vec::new(),
+                    ToolResultImageProjection::default(),
+                )
+            } else {
+                (covered_messages, attachments, image_projection)
+            };
         let recovered_economy = self.store.latest_context_economy().await?;
         let economy_before = recovered_economy
             .as_ref()
@@ -1650,6 +1663,7 @@ impl ContextCompactor for DaemonContextCompactor {
             // detouring through the uncached fallback.
             attachments: source_attachments.clone(),
             cache_metadata: Some(cache_metadata.clone()),
+            tool_result_image_projection: source_image_projection.clone(),
         };
         let projected_input_tokens = estimate_provider_request_input_tokens(
             &request.messages,
@@ -1867,8 +1881,12 @@ impl ContextCompactor for DaemonContextCompactor {
                     });
                 }
                 let artifact_store = self.store.clone();
-                prepare_tool_images_for_text_only_request(&artifact_store, &mut degraded_messages)
-                    .await?;
+                let mut fallback_image_projection = prepare_tool_images_for_text_only_request(
+                    &artifact_store,
+                    &mut degraded_messages,
+                )
+                .await?;
+                fallback_image_projection.merge(&source_image_projection);
                 if let Some(tail) = &self.post_compaction_volatile_tail {
                     degraded_messages.push(Message::user_text(tail.clone()));
                 }
@@ -1888,6 +1906,7 @@ impl ContextCompactor for DaemonContextCompactor {
                     tools: Vec::new(),
                     attachments: Vec::new(),
                     cache_metadata: None,
+                    tool_result_image_projection: fallback_image_projection,
                 };
                 let fallback_projected_input_tokens = estimate_provider_request_input_tokens(
                     &fallback.messages,
@@ -6706,6 +6725,81 @@ async fn durable_queue_consumed(
     }
 }
 
+/// Agent-visible mutation receipt. A redacted mutation withholds its exact
+/// digests (they would let the agent test guesses of hidden content offline);
+/// the owner-local journal keeps them and `workspace_mutation` still resolves
+/// the durable evidence through `graph_evidence`.
+fn mutation_result_preview(
+    result: String,
+    mutation: WorkspaceMutation,
+    reference: WorkspaceMutationRef,
+) -> String {
+    if mutation.redacted_content {
+        serde_json::json!({
+            "result": result,
+            "redacted_content": true,
+            "workspace_revision": mutation.workspace_revision,
+            "workspace_mutation": reference,
+        })
+    } else {
+        serde_json::json!({
+            "result": result,
+            "mutation_digest": mutation.mutation_digest,
+            "workspace_revision": mutation.workspace_revision,
+            "subject_digest": mutation.subject_digest,
+            "workspace_mutation": reference,
+        })
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod mutation_preview_tests {
+    use super::*;
+
+    fn mutation(redacted_content: bool) -> WorkspaceMutation {
+        WorkspaceMutation {
+            effect_id: EffectId::new("effect-synthetic"),
+            mutation_digest: "blake3:synthetic-raw-content".into(),
+            workspace_revision: Some(haider_protocol::ids::WorkspaceRevision::new(
+                "workspace-revision:7",
+            )),
+            subject_digest: Some("blake3:synthetic-subject".into()),
+            redacted_content,
+        }
+    }
+
+    fn reference() -> WorkspaceMutationRef {
+        WorkspaceMutationRef {
+            run_id: RunId::new("run-synthetic"),
+            effect_id: EffectId::new("effect-synthetic"),
+        }
+    }
+
+    /// Round-4 oracle: a copy of a masked file published a raw-content
+    /// mutation digest (and a subject digest derived from it) to the model.
+    #[test]
+    fn redacted_mutation_preview_withholds_exact_digests() {
+        let preview = mutation_result_preview("copied a to b".into(), mutation(true), reference());
+        assert!(!preview.contains("synthetic-raw-content"), "{preview}");
+        assert!(!preview.contains("synthetic-subject"), "{preview}");
+        let value: serde_json::Value = serde_json::from_str(&preview).expect("json preview");
+        assert_eq!(value["redacted_content"], true);
+        assert_eq!(value["workspace_revision"], "workspace-revision:7");
+        assert_eq!(value["workspace_mutation"]["effect_id"], "effect-synthetic");
+    }
+
+    #[test]
+    fn public_mutation_preview_keeps_provenance() {
+        let preview = mutation_result_preview("copied a to b".into(), mutation(false), reference());
+        let value: serde_json::Value = serde_json::from_str(&preview).expect("json preview");
+        assert_eq!(value["mutation_digest"], "blake3:synthetic-raw-content");
+        assert_eq!(value["subject_digest"], "blake3:synthetic-subject");
+        assert!(value.get("redacted_content").is_none());
+    }
+}
+
 async fn durable_workspace_mutation(
     store: &HubStoreHandle,
     run_id: &RunId,
@@ -7356,6 +7450,8 @@ async fn perform_manual_compaction(
         lease.worker_generation(),
     );
     post_compaction_config.tools = post_compaction_tool_pack.current.as_ref().to_vec();
+    post_compaction_config.provider_lockdown = lockdown.is_some();
+    let lockdown_active = lockdown.is_some();
     if let Some(configured) = initial_tool_exposure_for_turn(
         dependencies.tool_factory.as_ref(),
         grant,
@@ -7615,6 +7711,10 @@ async fn perform_manual_compaction(
             covered_messages: messages,
             retained_messages,
             attachments: Vec::new(),
+            // Manual compaction compiles raw durable history and applies no
+            // request-time image projection, so nothing earlier was elided;
+            // the text-only fallback computes and records its own.
+            image_projection: ToolResultImageProjection::default(),
             latest_compaction_summary_end,
             economy_before: &metadata.context_economy,
         })
@@ -7628,6 +7728,9 @@ async fn perform_manual_compaction(
                 false,
             ),
         };
+        // Same lockdown gate as a turn's terminal failure: the journaled
+        // RunFailed and the RPC reply carry templates only.
+        let error = lockdown_gated_failure(error, lockdown_active);
         append_failure(
             lease,
             device_id,
@@ -7899,6 +8002,7 @@ async fn perform_shell_exec(
             .await;
         }
     };
+    broker.set_freshness_profile_scope(lease.hub().peer_device_id());
     let output_context = HubCommandOutputContext {
         store: lease.clone(),
         branch_id: pending.branch_id.clone(),
@@ -8124,7 +8228,14 @@ async fn perform_shell_exec(
         }
     };
     if let Err(error) = broker.close().await {
-        let _ = shell.add_output(result.output_bytes);
+        // Even a broker-close failure can publish a shell byte count. Derive
+        // it through the same complete-capture redaction boundary; if that
+        // boundary fails too, publish no raw count.
+        let safe_count = crate::tasks::TaskFacade::new(lease.hub().clone())
+            .retain_foreground_capture(lease.session_id(), &mut result)
+            .await
+            .map_or(0, |_| result.output_bytes);
+        let _ = shell.add_output(safe_count);
         let _ = shell.exited(result.exit_code);
         return fail_shell_exec(
             lease,
@@ -8453,6 +8564,25 @@ async fn refresh_context_economy_from_journal(
             .await?;
     }
     Ok(economy)
+}
+
+/// Applies the test-only hard-cap override while preserving a pinned tranche.
+/// Production turns use the pin unchanged and have no request cap when absent.
+fn request_budget_with_test_override(
+    pinned: Option<haider_protocol::request_budget::RequestBudgetV1>,
+    override_limit: Option<usize>,
+) -> Option<haider_protocol::request_budget::RequestBudgetV1> {
+    override_limit
+        .map(|limit| haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: pinned
+                .map_or(
+                    haider_protocol::request_budget::OPT_IN_DEFAULT_TRANCHE,
+                    |pin| pin.tranche,
+                )
+                .min(limit),
+            hard_cap: limit,
+        })
+        .or(pinned)
 }
 
 /// Assembles and starts one accepted turn: provider resolution (R6 pinning —
@@ -9111,7 +9241,7 @@ async fn start_turn(
         compile_micros = prompt_compile_started.elapsed().as_micros(),
         "prompt history compiled"
     );
-    let attachments = resolve_prompt_attachments(
+    let (attachments, prompt_image_projection) = resolve_prompt_attachments(
         lease,
         &mut messages,
         provider_capabilities.vision,
@@ -9346,43 +9476,49 @@ async fn start_turn(
     config.context_window = resolved.context_window;
     config.agent_id = agent_id;
     config.enforce_advertised_tool_ceiling = loom_provider_fenced || lockdown.is_some();
+    config.provider_lockdown = lockdown.is_some();
     config.branch_id = accepted.branch_id.clone();
     config.max_tokens = metadata.max_tokens;
     config.interaction_policy =
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
-    config.ceiling_workspace = headless
-        .as_ref()
-        .map(|_| std::path::PathBuf::from(&metadata.cwd));
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
     config.turn_ordinal = accepted.turn_ordinal;
     config.provider_request_ordinals = Some(request_ordinals.clone());
     config.provider_request_attempt_recorder = Some(provider_request_attempt_recorder.clone());
     config.recovery_request_local_usage = admission_retry;
-    // A run pin overrides the child's frozen policy; absent both, the core
-    // supplies its ordinary 32-request tranche and 64-request hard ceiling.
+    // A run pin overrides the child's frozen policy. Absent both, provider
+    // requests are unbounded; explicit token, cost, time, cancellation, and
+    // non-request-count loop guards remain independent.
     let child_request_budget = delegation_record
         .as_ref()
         .map(|record| record.manifest.request_budget())
         .transpose()
         .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?
         .flatten();
-    if let Some(budget) = headless
+    let pinned_request_budget = headless
         .as_ref()
         .and_then(|context| context.spec.budget.request_budget)
-        .or(child_request_budget)
-    {
+        .or(child_request_budget);
+    if let Some(budget) = pinned_request_budget {
         budget
             .validate()
             .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
-        config.provider_request_tranche = budget.tranche;
-        config.max_provider_requests_per_turn = budget.hard_cap;
     }
-    if let Some(limit) = dependencies
-        .provider_factory
-        .max_provider_requests_per_turn_override()
-    {
-        config.max_provider_requests_per_turn = limit;
+    // The test-factory override changes the ceiling, preserving a pinned
+    // tranche when possible (the seam's pre-973 behavior).
+    let request_budget = request_budget_with_test_override(
+        pinned_request_budget,
+        dependencies
+            .provider_factory
+            .max_provider_requests_per_turn_override(),
+    );
+    if let Some(budget) = request_budget {
+        config.provider_request_budget = Some(budget);
+        // Hard-cap workspace receipts exist only for capped headless runs.
+        config.ceiling_workspace = headless
+            .as_ref()
+            .map(|_| std::path::PathBuf::from(&metadata.cwd));
     }
     config.reserved_output_tokens = metadata.max_tokens;
     if let Some(window) = config.context_window
@@ -9513,6 +9649,7 @@ async fn start_turn(
     // decision into provider-specific behavior. G1: children do NOT retain
     // `todo_write` — the plan surface is root-only (L5).
     config.attachments = attachments;
+    config.prompt_image_projection = prompt_image_projection;
     let run_boundary_guard = Arc::new(DaemonGraphFinalizationGuard {
         store: lease.clone(),
         branch_id: accepted.branch_id.clone(),
@@ -11136,9 +11273,9 @@ async fn resolve_prompt_attachments(
     messages: &mut [Message],
     vision: FeatureResolve,
     pdf_documents: FeatureResolve,
-) -> Result<Vec<ResolvedAttachment>, HaiderError> {
+) -> Result<(Vec<ResolvedAttachment>, ToolResultImageProjection), HaiderError> {
     validate_durable_tool_images(store, messages).await?;
-    apply_tool_result_image_budget(messages);
+    let projection = apply_tool_result_image_budget(messages);
     let mut resolved = Vec::<ResolvedAttachment>::new();
     for message in &mut *messages {
         for block in &mut message.blocks {
@@ -11283,7 +11420,7 @@ async fn resolve_prompt_attachments(
     if vision == FeatureResolve::Unsupported {
         degrade_tool_result_images_to_placeholders(messages);
     }
-    Ok(resolved)
+    Ok((resolved, projection))
 }
 
 async fn validate_durable_tool_images<R>(store: &R, messages: &[Message]) -> Result<(), HaiderError>
@@ -11357,14 +11494,14 @@ where
 async fn prepare_tool_images_for_text_only_request<R>(
     store: &R,
     messages: &mut [Message],
-) -> Result<(), HaiderError>
+) -> Result<ToolResultImageProjection, HaiderError>
 where
     R: haider_core::ArtifactReader + ?Sized,
 {
     validate_durable_tool_images(store, messages).await?;
-    apply_tool_result_image_budget(messages);
+    let projection = apply_tool_result_image_budget(messages);
     degrade_tool_result_images_to_placeholders(messages);
-    Ok(())
+    Ok(projection)
 }
 
 async fn prepare_compaction_messages(
@@ -12525,6 +12662,15 @@ impl Drop for AbortOnDropTask {
     }
 }
 
+/// Lockdown shows provider templates only: the owner-local raw provider text
+/// is removed from a failure before it is journaled or returned.
+fn lockdown_gated_failure(mut error: HaiderError, lockdown: bool) -> HaiderError {
+    if lockdown && let Some(presentation) = error.presentation.as_mut() {
+        presentation.strip_local_only();
+    }
+    error
+}
+
 async fn append_failure(
     store: &HubStoreHandle,
     device_id: &DeviceId,
@@ -13639,6 +13785,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -13754,6 +13901,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -13865,6 +14013,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -13957,6 +14106,26 @@ pub(crate) struct BrokerToolFactory;
 pub(crate) struct InjectedComputerBrokerToolFactory {
     backend: Arc<dyn ComputerBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
+    /// Per-test presence controller, so a test's Stop can never reach runs
+    /// of other tests executing in the same process.
+    presence: Arc<crate::cu_presence::CuPresence>,
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+impl InjectedComputerBrokerToolFactory {
+    /// Uses `presence` (e.g. with fake renderers) instead of a fresh one.
+    pub(crate) fn with_presence(mut self, presence: Arc<crate::cu_presence::CuPresence>) -> Self {
+        self.presence = presence;
+        self
+    }
+}
+
+#[cfg(test)]
+fn isolated_test_presence() -> Arc<crate::cu_presence::CuPresence> {
+    crate::cu_presence::CuPresence::new(
+        haider_tools::presence::PRESENCE_IDLE_TIMEOUT,
+        std::time::Duration::from_secs(1),
+    )
 }
 
 #[cfg(test)]
@@ -13975,6 +14144,7 @@ impl BrokerToolFactory {
         InjectedComputerBrokerToolFactory {
             backend,
             screenshot_redaction: Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            presence: isolated_test_presence(),
         }
     }
 
@@ -13989,6 +14159,7 @@ impl BrokerToolFactory {
         InjectedComputerBrokerToolFactory {
             backend,
             screenshot_redaction,
+            presence: isolated_test_presence(),
         }
     }
 
@@ -16491,6 +16662,7 @@ impl TurnToolFactory for AndroidToolFactory {
             )),
             crate::mobile_transport::platform_mobile_backend(),
             Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            Arc::clone(crate::cu_presence::global()),
         )
         .await
     }
@@ -16560,6 +16732,7 @@ impl TurnToolFactory for BrokerToolFactory {
             haider_tools::platform_computer_backend(),
             crate::mobile_transport::platform_mobile_backend(),
             redaction,
+            Arc::clone(crate::cu_presence::global()),
         )
         .await
     }
@@ -16616,6 +16789,7 @@ impl TurnToolFactory for InjectedComputerBrokerToolFactory {
             Arc::clone(&self.backend),
             haider_tools::platform_mobile_backend(),
             Arc::clone(&self.screenshot_redaction),
+            Arc::clone(&self.presence),
         )
         .await
     }
@@ -16672,6 +16846,7 @@ impl TurnToolFactory for InjectedMobileBrokerToolFactory {
             Arc::new(haider_tools::UnavailableComputerBackend::new("mobile-test")),
             Arc::clone(&self.backend),
             Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            isolated_test_presence(),
         )
         .await
     }
@@ -16687,6 +16862,7 @@ async fn create_broker_tool_dispatcher(
     computer: Arc<dyn ComputerBackend>,
     mobile: Arc<dyn MobileBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
+    presence: Arc<crate::cu_presence::CuPresence>,
 ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
     let session_id = context.store.session_id().clone();
     let durable_terminal_failure = durable_read_only_terminal_failure(
@@ -16740,6 +16916,7 @@ async fn create_broker_tool_dispatcher(
             });
         crate::workspace::error(&unavailable)
     })?;
+    broker.set_freshness_profile_scope(context.store.hub().peer_device_id());
     broker
         .restore_freshness(durable_freshness.into_values())
         .map_err(tool_error)?;
@@ -16792,6 +16969,12 @@ async fn create_broker_tool_dispatcher(
         device_id: context.device_id.clone(),
         event_ids: Arc::clone(&context.event_ids),
     };
+    let cu_presence = crate::cu_presence::PresenceLease::for_run(
+        presence,
+        context.store.hub().clone(),
+        session_id.clone(),
+        context.run_id.clone(),
+    );
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
         pending_workspace: Mutex::new(pending_workspace),
@@ -16803,6 +16986,7 @@ async fn create_broker_tool_dispatcher(
         mobile,
         screenshot_redaction,
         active_computer_turn_cancel: StdMutex::new(None),
+        cu_presence,
         pending_terminal_failure_after_tool_results: Mutex::new(durable_terminal_failure),
         terminal_failure_after_tool_results: Mutex::new(None),
         os_permission_menus: Mutex::new(HashMap::new()),
@@ -17030,6 +17214,9 @@ struct BrokerToolDispatcher {
     /// execute future, allowing `close` to distinguish ESC from a panic or
     /// transport failure and preserve honest Cancelled vs Unknown outcomes.
     active_computer_turn_cancel: StdMutex<Option<CancelToken>>,
+    /// This run's membership in the human-visible computer-use presence
+    /// indicator; its Stop control cancels the run (see `cu_presence`).
+    cu_presence: crate::cu_presence::PresenceLease,
     pending_terminal_failure_after_tool_results: Mutex<Option<HaiderError>>,
     terminal_failure_after_tool_results: Mutex<Option<HaiderError>>,
     os_permission_menus: Mutex<HashMap<MenuId, Menu>>,
@@ -18161,8 +18348,19 @@ impl BrokerToolDispatcher {
         })?
         .map_err(ToolError::Computer)?;
         cancel.check().map_err(ToolError::Computer)?;
+        // Bound after crop so the CAS dimensions are the delivered size that
+        // model coordinates are later mapped from.
+        let bounded = tokio::task::spawn_blocking(move || {
+            haider_tools::bound_computer_screenshot_png(&redacted)
+        })
+        .await
+        .map_err(|error| ToolError::Runtime {
+            message: format!("screenshot resize worker failed: {error}"),
+        })?
+        .map_err(ToolError::Computer)?;
+        cancel.check().map_err(ToolError::Computer)?;
         let mut cas = self.cas.lock().await;
-        cas.put_image(redacted, "image/png")
+        cas.put_image(bounded, "image/png")
             .await
             .map(|image| (image, crop))
     }
@@ -18871,6 +19069,7 @@ impl BrokerToolDispatcher {
     }
 
     async fn close_effects(&self, cancelled: bool) -> Result<(), HaiderError> {
+        self.cu_presence.end(cancelled);
         self.parsed_tool_operations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -22455,14 +22654,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         timeout_s: None,
                     };
                     let (result, retain_for_approval) = self
-                        .dispatch_ssh_shell(
-                            broker,
-                            &policy,
-                            &remote,
-                            run_id,
-                            item_id,
-                            call_id,
-                        )
+                        .dispatch_ssh_shell(broker, &policy, &remote, run_id, item_id, call_id)
                         .await?;
                     if retain_for_approval {
                         operation_lease.retain_for_approval();
@@ -22489,7 +22681,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
-                    orchestration: None,
+                        orchestration: None,
                     }));
                 }
                 if *background {
@@ -22514,8 +22706,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         )
                         .await
                 } else {
-                    let effective_cwd =
-                        command_cwd(&self.metadata.cwd, requested_cwd.as_deref());
+                    let effective_cwd = command_cwd(&self.metadata.cwd, requested_cwd.as_deref());
                     let cas = self.cas.lock().await.clone();
                     let output = self.output.sink(
                         run_id.clone(),
@@ -22594,7 +22785,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             };
                             match waited {
                                 Ok(mut result) => {
-                                    let safe_output = self.tasks.retain_foreground_capture(&self.session_id, &mut result).await.map_err(tool_error)?;
+                                    let safe_output = self
+                                        .tasks
+                                        .retain_foreground_capture(&self.session_id, &mut result)
+                                        .await
+                                        .map_err(tool_error)?;
                                     let _ = shell.add_output(result.output_bytes);
                                     let _ = shell.exited(result.exit_code);
                                     match self.output.record_process_signal(run_id, &result).await {
@@ -22663,9 +22858,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     })
                     .and_then(|value| {
                         u32::try_from(value).map_err(|_| {
-                            ToolError::invalid_argument(
-                                "loom_register `expected_rev` exceeds u32",
-                            )
+                            ToolError::invalid_argument("loom_register `expected_rev` exceeds u32")
                         })
                     }) {
                     Ok(expected_rev) => expected_rev,
@@ -22691,11 +22884,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     status: ToolResultStatus::Completed,
                     reason: None,
                     presentation: None,
-                orchestration: None,
+                    orchestration: None,
                 };
-                let refusal = |error: String| {
-                    completed(serde_json::json!({ "ok": false, "error": error }))
-                };
+                let refusal =
+                    |error: String| completed(serde_json::json!({ "ok": false, "error": error }));
                 let conflict = |conflict: haider_protocol::loom::LoomRevisionConflict| {
                     completed(serde_json::json!({
                         "ok": false,
@@ -22734,17 +22926,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 .loom_register_workflow_cas(source, expected)
                                 .await
                             {
-                                Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => {
-                                    Ok(receipt("workflow", value, None))
-                                }
+                                Ok(haider_core::LoomRegistryMutation::Applied {
+                                    value, ..
+                                }) => Ok(receipt("workflow", value, None)),
                                 Ok(haider_core::LoomRegistryMutation::Conflict(value)) => {
                                     Ok(conflict(value))
                                 }
                                 Err(error) if error.code == ErrorCode::InvalidArgument => {
-                                    Ok(refusal(format!(
-                                        "registration rejected: {}",
-                                        error.message
-                                    )))
+                                    Ok(refusal(format!("registration rejected: {}", error.message)))
                                 }
                                 Err(error) => Err(ToolError::Runtime {
                                     message: error.message,
@@ -22790,7 +22979,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 .loom_register_agent_type_cas(record, expected)
                                 .await
                             {
-                                Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => Ok(receipt(
+                                Ok(haider_core::LoomRegistryMutation::Applied {
+                                    value, ..
+                                }) => Ok(receipt(
                                     "agent_type",
                                     value.registration,
                                     value.install_job_id,
@@ -22799,10 +22990,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     Ok(conflict(value))
                                 }
                                 Err(error) if error.code == ErrorCode::InvalidArgument => {
-                                    Ok(refusal(format!(
-                                        "registration rejected: {}",
-                                        error.message
-                                    )))
+                                    Ok(refusal(format!("registration rejected: {}", error.message)))
                                 }
                                 Err(error) => Err(ToolError::Runtime {
                                     message: error.message,
@@ -22886,7 +23074,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
-                    orchestration: None,
+                        orchestration: None,
                     }));
                 }
                 match broker.begin_web_fetch(operation, &policy).await {
@@ -22951,10 +23139,33 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         "transient web_fetch failure — retry 2/2 succeeded".into()
                                     }),
                                     presentation: None,
-                                orchestration: None,
+                                    orchestration: None,
                                 };
                                 if let Some(truncation) = outcome.truncation {
                                     result.declare_truncation(truncation);
+                                }
+                                let payload_chunk = haider_tools::ProcessOutputChunk {
+                                    stream: haider_protocol::item::OutputStream::Stdout,
+                                    chunk_b64: base64::engine::general_purpose::STANDARD
+                                        .encode(result.payload_text()),
+                                };
+                                let (safe_payload, masked) =
+                                    haider_tools::redact_process_output_with_redaction(&[
+                                        payload_chunk,
+                                    ])
+                                    .map_err(tool_error)?;
+                                if masked {
+                                    let was_truncated = result.truncated;
+                                    result.preview = safe_payload;
+                                    if was_truncated {
+                                        let safe_provenance =
+                                            haider_protocol::tool::ToolTruncation::from_bytes(
+                                                result.preview.as_bytes(),
+                                                result.preview.len(),
+                                            );
+                                        result.truncation = None;
+                                        result.declare_truncation(safe_provenance);
+                                    }
                                 }
                                 if result.preview.len()
                                     > haider_tools::WEB_FETCH_MODEL_PREVIEW_MAX_BYTES
@@ -23075,7 +23286,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         .await
                 {
                     self.clear_cached_operation(&operation_key);
-                    return Err(tool_error(error.with_applied_effects(result.as_ref().map_or_else(|_| Vec::new(), |result| result.effects.clone()))));
+                    return Err(tool_error(
+                        error.with_applied_effects(
+                            result
+                                .as_ref()
+                                .map_or_else(|_| Vec::new(), |result| result.effects.clone()),
+                        ),
+                    ));
                 }
                 result
             }
@@ -23216,6 +23433,16 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     let intent = broker
                         .authorize_computer(operation, &policy)
                         .await?;
+                    // Stop pressed: refuse before prepare/dispatch (nothing
+                    // reaches the OS) and let the turn cancellation that Stop
+                    // submitted settle the turn, exactly like ESC.
+                    if self.cu_presence.is_stopped() {
+                        return Ok(presence_stopped_result(
+                            cancel,
+                            computer_failure_result(&ComputerError::Cancelled),
+                        )
+                        .await);
+                    }
                     match self
                         .computer
                         .prepare(operation.action(), &action_cancel)
@@ -23287,6 +23514,37 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 return Err(error);
                             }
                         }
+                    } else {
+                        None
+                    };
+                    // Human-visible presence: show/animate the indicator,
+                    // and refuse the action outright once Stop was pressed.
+                    let presence_point = self.computer.presence_point(operation.action());
+                    let _presence = match self
+                        .cu_presence
+                        .begin_computer(operation.action(), presence_point, &action_cancel)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(haider_tools::presence::PresenceRefusal::Stopped) => {
+                            broker
+                                .journal_computer_outcome(&intent, EffectOutcome::Cancelled)
+                                .await?;
+                            return Ok(presence_stopped_result(
+                                cancel,
+                                computer_failure_result(&ComputerError::Cancelled),
+                            )
+                            .await);
+                        }
+                    };
+                    // A capturable indicator (Linux notification popup) is
+                    // taken off screen for the model-facing capture.
+                    let _revealed_after_capture = if matches!(
+                        operation.action(),
+                        haider_protocol::computer::ComputerAction::Screenshot
+                            | haider_protocol::computer::ComputerAction::Inspect { .. }
+                    ) {
+                        self.cu_presence.conceal_for_capture().await
                     } else {
                         None
                     };
@@ -23514,8 +23772,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::Mobile => {
                 async {
-                    let operation = self
-                        .cached_mobile_operation(&operation_key, args.as_ref())?;
+                    let operation = self.cached_mobile_operation(&operation_key, args.as_ref())?;
                     let ParsedToolOperation::Mobile(operation) = operation.as_ref() else {
                         return Err(ToolError::Runtime {
                             message: cached_operation_route_mismatch(route).message,
@@ -23528,6 +23785,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     }
                     let action_cancel = MobileCancelToken::new();
                     let intent = broker.authorize_mobile(operation, &policy).await?;
+                    if self.cu_presence.is_stopped() {
+                        return Ok(presence_stopped_result(
+                            cancel,
+                            mobile_failure_result(&MobileError::Cancelled),
+                        )
+                        .await);
+                    }
                     self.mobile
                         .prepare(operation.action(), &action_cancel)
                         .await
@@ -23535,7 +23799,28 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     broker
                         .dispatch_mobile(&intent, action_cancel.clone())
                         .await?;
-                    match self.mobile.execute(operation.action(), &action_cancel).await {
+                    let _presence = match self
+                        .cu_presence
+                        .begin_mobile(operation.action(), &action_cancel)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(haider_tools::presence::PresenceRefusal::Stopped) => {
+                            broker
+                                .journal_mobile_outcome(&intent, EffectOutcome::Cancelled)
+                                .await?;
+                            return Ok(presence_stopped_result(
+                                cancel,
+                                mobile_failure_result(&MobileError::Cancelled),
+                            )
+                            .await);
+                        }
+                    };
+                    match self
+                        .mobile
+                        .execute(operation.action(), &action_cancel)
+                        .await
+                    {
                         Ok(MobileOutput::Screenshot(png)) => {
                             let stored = self.admit_mobile_screenshot(png, &action_cancel).await;
                             match stored {
@@ -23558,7 +23843,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         status: ToolResultStatus::Completed,
                                         reason: None,
                                         presentation: None,
-                                    orchestration: None,
+                                        orchestration: None,
                                     })
                                 }
                                 Err(ToolError::Mobile(MobileError::Cancelled)) => {
@@ -23580,10 +23865,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 }
                             }
                         }
-                        Ok(output @ (MobileOutput::A11yTree(_)
-                        | MobileOutput::AppList(_)
-                        | MobileOutput::Ack
-                        | MobileOutput::SmsList(_))) => {
+                        Ok(
+                            output @ (MobileOutput::A11yTree(_)
+                            | MobileOutput::AppList(_)
+                            | MobileOutput::Ack
+                            | MobileOutput::SmsList(_)),
+                        ) => {
                             let preview = match serde_json::to_string(&output) {
                                 Ok(preview) => preview,
                                 Err(error) => {
@@ -23618,7 +23905,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 status: ToolResultStatus::Completed,
                                 reason: None,
                                 presentation: None,
-                            orchestration: None,
+                                orchestration: None,
                             })
                         }
                         Err(MobileError::Cancelled) => {
@@ -23713,19 +24000,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             ));
                         }
                     };
-                    let subject_digest = mutation.subject_digest.clone();
-                    let workspace_revision = mutation.workspace_revision.clone();
-                    result.preview = serde_json::json!({
-                        "result": result.preview,
-                        "mutation_digest": mutation.mutation_digest,
-                        "workspace_revision": workspace_revision,
-                        "subject_digest": subject_digest,
-                        "workspace_mutation": WorkspaceMutationRef {
+                    result.preview = mutation_result_preview(
+                        result.preview,
+                        mutation,
+                        WorkspaceMutationRef {
                             run_id: run_id.clone(),
                             effect_id: record.effect.clone(),
                         },
-                    })
-                    .to_string();
+                    );
                     Ok(result)
                 }
                 Err(error) => Err(error),
@@ -24369,6 +24651,9 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         haider_tools::ToolError::WorkspaceBoundary { .. } => ("rejected", "workspace_boundary"),
         haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
         haider_tools::ToolError::UnreadFile { .. } => ("rejected", "unread_file"),
+        haider_tools::ToolError::AnchorInRedactedContent { .. } => {
+            ("rejected", "anchor_in_redacted_content")
+        }
         haider_tools::ToolError::EditAnchor(_) => ("conflict", "edit_anchor_count"),
         haider_tools::ToolError::InvalidArgument { .. } => ("rejected", "invalid_argument"),
         haider_tools::ToolError::InvalidMenuAnswer { .. } => ("rejected", "invalid_menu_answer"),
@@ -24390,6 +24675,26 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         error,
         serde_json::Value::Null,
     ))
+}
+
+/// How long a Stop-refused CU action waits for the run's own turn
+/// cancellation (which Stop submitted) before settling as a tool result.
+const PRESENCE_STOP_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Settles a CU action refused because the human pressed Stop.
+///
+/// Stop refuses the action before the turn cancellation it submitted has
+/// committed. Returning the refusal straight away (as `Err(Cancelled)`,
+/// which the route maps to a `Cancelled` tool result) would hand that result
+/// to the provider and start ANOTHER model round — an extra request, and the
+/// model may issue further actions — until the cancellation lands. Instead
+/// wait for that cancellation: the core drops this future and settles the
+/// turn exactly like ESC. Only if it never arrives within the grace, report
+/// the `Cancelled` tool result. (The 3-repair "stuck in `cancelling`" hang
+/// was the journal/actor race fixed in haider-core, not this path.)
+async fn presence_stopped_result(cancel: &CancelToken, cancelled: BoundedResult) -> BoundedResult {
+    let _ = tokio::time::timeout(PRESENCE_STOP_CANCEL_GRACE, cancel.cancelled()).await;
+    cancelled
 }
 
 fn computer_failure_result(error: &ComputerError) -> BoundedResult {
@@ -26696,3 +27001,50 @@ mod provider_rebind;
 #[cfg(all(test, feature = "android-standalone"))]
 #[path = "android_inventory_tests.rs"]
 mod android_inventory_tests;
+
+#[cfg(test)]
+mod manual_compaction_lockdown_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// A failed manual `/compact` on a lockdown session journals RunFailed via
+    /// `append_failure` -> `presentation_for_haider_error`. The summarization
+    /// provider error keeps unknown prose only as owner-local raw text, and
+    /// the lockdown gate removes it before journaling or replying.
+    #[test]
+    fn failed_manual_compaction_under_lockdown_journals_templates_only() {
+        let body = serde_json::json!({"error": {
+            "type": "permission_error",
+            "message": "Your organization quillcompact has no access to this model."
+        }})
+        .to_string();
+        let provider_error =
+            haider_provider::replay_anthropic_http_error(403, None, body.as_bytes());
+        let summarization = || {
+            let mut mapped = haider_core::provider_error_to_haider(provider_error.clone());
+            mapped.message = format!("context summarization failed: {}", mapped.message);
+            mapped
+        };
+        let journal = |error: &HaiderError| {
+            serde_json::to_string(&EventPayload::RunFailed {
+                code: error.code,
+                message: sanitized_failure_message(&error.message),
+                retryable: error.retryable,
+                presentation: Some(presentation_for_haider_error(error)),
+            })
+            .expect("serialize run failure")
+        };
+        let locked = lockdown_gated_failure(summarization(), true);
+        let locked_journal = journal(&locked);
+        assert!(!locked_journal.contains("quillcompact"), "{locked_journal}");
+        assert!(locked_journal.contains("details withheld"));
+        let open = lockdown_gated_failure(summarization(), false);
+        assert!(
+            open.presentation
+                .as_ref()
+                .and_then(|presentation| presentation.provider_raw_detail.as_deref())
+                .is_some_and(|raw| raw.contains("quillcompact"))
+        );
+    }
+}

@@ -861,10 +861,37 @@ pub fn args_preview(args: &serde_json::Value) -> Option<String> {
 }
 
 /// Prefer a result's bounded preview and fall back to its typed reason.
+/// A stale-read refusal loses its digests first: transcripts and exports
+/// built from this preview reach agents, and a (keyed) freshness digest of
+/// redacted content would be an equality oracle there.
 #[must_use]
 pub fn result_preview(result: &BoundedResult) -> Option<String> {
-    normalize_tool_preview(&result.preview)
+    let stripped = stale_read_preview_without_digests(&result.preview);
+    normalize_tool_preview(stripped.as_deref().unwrap_or(&result.preview))
         .or_else(|| result.reason.as_deref().and_then(normalize_tool_preview))
+}
+
+/// A stale-read refusal preview without its `current_digest` and
+/// `recorded_digest` details, or `None` when `preview` is not a stale-read
+/// refusal carrying a digest. Matches the provider projection, which drops
+/// the same two fields; the owner's journal keeps the original.
+#[must_use]
+pub fn stale_read_preview_without_digests(preview: &str) -> Option<String> {
+    if !preview.contains("stale_read") || !preview.contains("_digest") {
+        return None;
+    }
+    let mut value = serde_json::from_str::<serde_json::Value>(preview).ok()?;
+    if value
+        .pointer("/error/kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("stale_read")
+    {
+        return None;
+    }
+    let details = value.pointer_mut("/error/details")?.as_object_mut()?;
+    let current = details.remove("current_digest").is_some();
+    let recorded = details.remove("recorded_digest").is_some();
+    (current || recorded).then(|| value.to_string())
 }
 
 #[derive(Serialize)]
@@ -1504,12 +1531,17 @@ fn sidecar_projection(
             unresolved_tool: None,
         }),
         EventPayload::RunFailed {
-            presentation: Some(presentation),
+            presentation: Some(mut presentation),
             ..
         } => Some(SidecarProjection {
             row: SidecarRow(SidecarRowKind::Error(ErrorRow {
                 role: "error",
-                presentation,
+                // Pipe rows are read by peers/models and back the unmasked
+                // export: owner-local provider text never enters them.
+                presentation: {
+                    presentation.strip_local_only();
+                    presentation
+                },
                 at_ms,
                 seq,
                 branch_id,
@@ -1864,6 +1896,48 @@ mod tests {
         assert!(row.get("result_preview").is_none());
     }
 
+    /// Transcripts and exports reach agents through `result_preview`; a
+    /// stale-read refusal must not carry its (keyed) digests there.
+    #[test]
+    fn result_preview_strips_stale_read_digests() {
+        let preview = serde_json::json!({
+            "status": "conflict",
+            "error": {"kind": "stale_read", "message": "refusing to mutate stale file a.txt",
+                "details": {"current_digest": "blake3k:p:synthetic-current",
+                    "recorded_digest": "blake3k:p:synthetic-recorded",
+                    "remedy": "re-read before editing"}}
+        })
+        .to_string();
+        let result = BoundedResult {
+            preview,
+            truncated: false,
+            truncation: None,
+            effects: Vec::new(),
+            data: None,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: Default::default(),
+            reason: None,
+            presentation: None,
+            orchestration: None,
+        };
+        let shown = result_preview(&result).expect("preview");
+        assert!(!shown.contains("synthetic"), "{shown}");
+        assert!(
+            shown.contains("stale_read") && shown.contains("remedy"),
+            "{shown}"
+        );
+        let plain = BoundedResult {
+            preview: r#"{"error":{"kind":"unread_file","details":{"current_digest":"x"}}}"#.into(),
+            ..result
+        };
+        assert_eq!(
+            result_preview(&plain).as_deref(),
+            Some(plain.preview.as_str())
+        );
+    }
+
     /// MUTATION CHECK (v0.0.935 #3): peek a wrong tag name, skip the peek's
     /// full-decode fallback, or treat the tag alone as a parsed result.
     /// Expected RUNTIME failure: the genuine result below stops matching, or
@@ -2068,6 +2142,25 @@ mod tests {
         );
         assert!(lines.iter().all(|line| !line.contains(['\n', '\r'])));
         assert_eq!(escape_pipe_field("a\\|\r\nb"), "|a\\\\\\|\\nb|");
+    }
+
+    #[test]
+    fn sidecar_error_rows_never_carry_owner_local_provider_text() {
+        let event = envelope(
+            9,
+            EventPayload::RunFailed {
+                code: ErrorCode::ProviderError,
+                message: "PermissionDenied: OpenAI HTTP 403 returned a permission error".into(),
+                retryable: false,
+                presentation: Some(
+                    interruption().with_provider_raw_detail(Some("Denied for org quillmere.")),
+                ),
+            },
+        );
+        let row = sidecar_row_line(&event).expect("error row");
+        assert!(!row.contains("quillmere"), "{row}");
+        let line = pipe_body_line(&event).expect("pipe line");
+        assert!(!line.contains("quillmere"), "{line}");
     }
 
     #[test]

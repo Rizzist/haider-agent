@@ -52,6 +52,61 @@ fn non_repository_receipt_is_explicitly_unknown_without_enumeration() {
     );
 }
 
+#[test]
+fn repository_receipt_does_not_export_unkeyed_secret_identity() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let workspace = fixture.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".git")).expect("repository marker");
+    std::fs::write(workspace.join("oracle.txt"), "password=violet-sunrise\n")
+        .expect("synthetic credential");
+    let receipt = workspace_state_receipt(&workspace);
+    assert_eq!(
+        receipt.coverage,
+        WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::RedactedMaterial)
+    );
+    assert!(!receipt.counts_known);
+    let published = receipt.mutation_digest();
+    assert!(published.contains("reason=redacted_material"));
+    assert!(!published.contains("violet-sunrise"));
+    assert!(!published.contains("oracle.txt"));
+    assert!(published.contains("bytes=unreported"));
+    std::fs::write(workspace.join("oracle.txt"), "password=violet-morning\n")
+        .expect("equal-length replacement");
+    let next = workspace_state_receipt(&workspace);
+    assert_eq!(
+        published,
+        next.mutation_digest(),
+        "unknown receipt cannot distinguish equal-length masked values"
+    );
+}
+
+#[test]
+fn git_status_with_sensitive_path_has_no_guessable_receipt() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let initialized = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(workspace.path())
+        .status()
+        .expect("git init");
+    assert!(initialized.success());
+    std::fs::write(workspace.path().join(".env"), "ordinary before\n").expect("synthetic file");
+    let added = std::process::Command::new("git")
+        .args(["add", ".env"])
+        .current_dir(workspace.path())
+        .status()
+        .expect("git add");
+    assert!(added.success());
+    std::fs::write(workspace.path().join(".env"), "ordinary after\n").expect("synthetic mutation");
+
+    let receipt = workspace_state_receipt(workspace.path());
+    assert_eq!(
+        receipt.coverage,
+        WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::RedactedMaterial)
+    );
+    assert!(!receipt.counts_known);
+    assert!(receipt.mutation_digest().contains("bytes=unreported"));
+}
+
 #[cfg(unix)]
 #[test]
 fn entry_limit_prevents_git_from_being_invoked() {
@@ -155,11 +210,20 @@ fn available_git_overlays_porcelain_on_the_bounded_anchored_walk() {
 
 #[test]
 fn observed_length_content_budget_is_explicitly_elided() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
     let workspace = tempfile::tempdir().expect("workspace");
     let oversized = workspace.path().join("oversized.bin");
-    let file = std::fs::File::create(&oversized).expect("oversized file");
+    let mut file = std::fs::File::create(&oversized).expect("oversized file");
     file.set_len(super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES + 1)
         .expect("sparse size");
+    // Keep each physical line below the process redactor's line ceiling.
+    // A single oversized line is itself masked and has an unknown receipt.
+    for offset in (64 * 1024 - 1..super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES).step_by(64 * 1024)
+    {
+        file.seek(SeekFrom::Start(offset)).expect("newline offset");
+        file.write_all(b"\n").expect("newline");
+    }
     drop(file);
     let reader = super::AnchoredWorkspaceReader::new(workspace.path()).expect("anchored reader");
     let mut builder = super::ReceiptBuilder::new(

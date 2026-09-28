@@ -64,10 +64,11 @@ fn provider_view(
 fn provider_attempt_envelopes(
     session_id: &SessionId,
     ledger: &ProviderViewLedgerV1,
+    ordinal: u64,
 ) -> Vec<RawEnvelope> {
     let item_id = ItemId::new("provider-view-attempt-item");
     let item = ProviderViewAttemptV1 {
-        ordinal: 1,
+        ordinal,
         view: ledger.clone(),
     }
     .extension_item()
@@ -172,7 +173,7 @@ fn provider_view_index_and_full_attempt_batch_commit_or_rollback_together() {
     create_session(&store, &session_id);
 
     let (ledger, blobs) = provider_view("fused", 64);
-    let mut incomplete = provider_attempt_envelopes(&session_id, &ledger);
+    let mut incomplete = provider_attempt_envelopes(&session_id, &ledger, 1);
     incomplete.pop();
     incomplete.extend(cache_attempt_envelopes(&session_id));
     store
@@ -192,7 +193,7 @@ fn provider_view_index_and_full_attempt_batch_commit_or_rollback_together() {
     assert_eq!(counts, (0, 0));
 
     let (ledger, blobs) = provider_view("fused-success", 64);
-    let mut envelopes = provider_attempt_envelopes(&session_id, &ledger);
+    let mut envelopes = provider_attempt_envelopes(&session_id, &ledger, 1);
     envelopes.extend(cache_attempt_envelopes(&session_id));
     let stored = store
         .persist_provider_view_and_append_owned(&session_id, ledger, blobs, 1, &mut envelopes)
@@ -434,4 +435,463 @@ fn provider_view_request_ordinal_survives_session_id_reuse() {
     store
         .verify_provider_view(&second)
         .expect("reused-session provider view");
+}
+
+/// A growing view replaces its volatile last block and adds one stable block
+/// per request, matching the real provider renderer. SQLite's
+/// checkpoint frame counter is a portable proxy for pages written since the
+/// preceding turn; the late turn must remain bounded by that delta.
+#[test]
+fn growing_provider_view_writes_delta_frames_and_replays_after_restart() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("provider-view-growing-delta");
+    create_session(&store, &session_id);
+    let observer = Connection::open(store.database_path()).expect("observer");
+    let mut early_frames = Vec::new();
+    let mut late_frames = Vec::new();
+    let mut last_envelopes = Vec::new();
+
+    for turn in 1..=64_usize {
+        let system = ProviderViewBlobV1::new(b"fixed-system".to_vec());
+        let tools = ProviderViewBlobV1::new(b"fixed-tools".to_vec());
+        let history = (1..=turn)
+            .map(|index| {
+                let text = if index == turn {
+                    format!("volatile-{index:04}")
+                } else {
+                    format!("stable-{index:04}")
+                };
+                ProviderViewBlobV1::new(text.into_bytes())
+            })
+            .collect::<Vec<_>>();
+        let mut ledger = provider_view("fixed", 16).0;
+        ledger.system_block = system.block.clone();
+        ledger.tool_schema_block = tools.block.clone();
+        ledger.history_blocks = history.iter().map(|blob| blob.block.clone()).collect();
+        ledger.stable_history_end = turn as u64;
+        ledger.current_user_start = turn as u64;
+        let mut blobs = vec![system, tools];
+        blobs.extend(history);
+        let mut envelopes = provider_attempt_envelopes(&session_id, &ledger, turn as u64);
+        for (index, envelope) in envelopes.iter_mut().enumerate() {
+            envelope.event_id = EventId::new(format!("growing-{turn}-{index}"));
+        }
+        let stored = store
+            .persist_provider_view_and_append_owned(
+                &session_id,
+                ledger,
+                blobs,
+                turn as u64,
+                &mut envelopes,
+            )
+            .expect("persist growing view and journal markers");
+        let ordinal = stored.storage.as_ref().expect("storage").request_ordinal;
+        let direct_count: i64 = observer
+            .query_row(
+                "SELECT COUNT(*) FROM provider_view_blocks
+                 WHERE session_id = ?1 AND request_ordinal = ?2",
+                params![
+                    session_id.as_str(),
+                    i64::try_from(ordinal).expect("ordinal fits i64")
+                ],
+                |row| row.get(0),
+            )
+            .expect("direct block count");
+        assert_eq!(direct_count, 2, "history references are shared by segment");
+        let segment_count: i64 = observer
+            .query_row(
+                "SELECT COUNT(*) FROM provider_view_history_blocks",
+                [],
+                |row| row.get(0),
+            )
+            .expect("segment block count");
+        let expected_rows = if turn == 1 { 1 } else { turn * 3 - 3 };
+        assert_eq!(
+            segment_count, expected_rows as i64,
+            "only confirmed stable blocks and the short volatile tail are indexed"
+        );
+        let (busy, frames, checkpointed): (i64, i64, i64) = observer
+            .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("checkpoint frame counter");
+        assert_eq!(busy, 0);
+        assert_eq!(frames, checkpointed);
+        if (5..=12).contains(&turn) {
+            early_frames.push(frames);
+        }
+        if turn >= 57 {
+            late_frames.push(frames);
+        }
+        if turn == 64 {
+            let inline_bytes: i64 = observer
+                .query_row(
+                    "SELECT MAX(length(envelope_json)) FROM events
+                     WHERE session_id = ?1 AND seq > ?2",
+                    params![
+                        session_id.as_str(),
+                        i64::try_from(envelopes[0].seq - 1).expect("sequence fits i64")
+                    ],
+                    |row| row.get(0),
+                )
+                .expect("compact journal bytes");
+            assert!(
+                inline_bytes < 4_096,
+                "attempt envelope stores a history cursor"
+            );
+            last_envelopes = envelopes;
+        }
+    }
+    assert!(
+        *late_frames.iter().max().expect("late frames")
+            <= *early_frames.iter().max().expect("early frames") + 32,
+        "WAL frames per turn grew with retained history: early={early_frames:?} late={late_frames:?}"
+    );
+    drop(observer);
+    drop(store);
+    let reopened = Store::open(root.path()).expect("restart store");
+    let start = last_envelopes[0].seq - 1;
+    assert_eq!(
+        reopened
+            .read(&session_id, start, 2)
+            .expect("replay compact attempt"),
+        last_envelopes,
+        "restart reconstructs the exact public journal events"
+    );
+    assert_eq!(
+        reopened
+            .sweep_expired_provider_views(4_000_000_000_000)
+            .expect("expire provider-view CAS indexes"),
+        64
+    );
+    assert_eq!(
+        reopened
+            .read(&session_id, start, 2)
+            .expect("replay after expiry"),
+        last_envelopes,
+        "the authoritative journal remains readable after CAS expiry"
+    );
+}
+
+#[test]
+fn changed_history_prefix_starts_a_new_immutable_segment() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("provider-view-prefix-change");
+    create_session(&store, &session_id);
+    let mut previous = Vec::new();
+    for history_text in [
+        &["first", "second", "third"][..],
+        &["first", "replacement", "third"],
+        &["first", "replacement"],
+        &["first", "replacement", "new"],
+    ] {
+        let system = ProviderViewBlobV1::new(b"system".to_vec());
+        let tools = ProviderViewBlobV1::new(b"tools".to_vec());
+        let history = history_text
+            .iter()
+            .map(|text| ProviderViewBlobV1::new(text.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let mut ledger = provider_view("fixed", 16).0;
+        ledger.system_block = system.block.clone();
+        ledger.tool_schema_block = tools.block.clone();
+        ledger.history_blocks = history.iter().map(|blob| blob.block.clone()).collect();
+        let mut blobs = vec![system, tools];
+        blobs.extend(history);
+        previous.push(
+            store
+                .persist_provider_view(&session_id, ledger, blobs)
+                .expect("persist changed view"),
+        );
+    }
+    let connection = Connection::open(store.database_path()).expect("observer");
+    let segments: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM provider_view_history_segments",
+            [],
+            |row| row.get(0),
+        )
+        .expect("segment count");
+    assert_eq!(
+        segments, 5,
+        "shortening preserves an immutable parent prefix"
+    );
+    for ledger in &previous {
+        store
+            .verify_provider_view(ledger)
+            .expect("old and new exact views remain valid");
+    }
+}
+
+#[test]
+fn pre_segment_request_rows_remain_verifiable_after_upgrade() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("provider-view-legacy-index");
+    create_session(&store, &session_id);
+    let (ledger, blobs) = provider_view("legacy", 64);
+    let stored = store
+        .persist_provider_view(&session_id, ledger, blobs)
+        .expect("persist fixture view");
+    let storage = stored.storage.as_ref().expect("storage");
+    let connection = Connection::open(store.database_path()).expect("observer");
+    connection
+        .execute(
+            "INSERT INTO provider_view_blocks(
+                provider, model, cache_epoch, session_id, request_ordinal,
+                section, block_ordinal, content_hash, byte_len, expires_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'history', 0, ?6, ?7, ?8)",
+            params![
+                &stored.provider,
+                &stored.model,
+                &stored.cache_epoch,
+                session_id.as_str(),
+                i64::try_from(storage.request_ordinal).expect("ordinal fits i64"),
+                &stored.history_blocks[0].content_hash,
+                i64::try_from(stored.history_blocks[0].byte_len).expect("length fits i64"),
+                i64::try_from(storage.expires_at_ms).expect("expiry fits i64"),
+            ],
+        )
+        .expect("restore v24 history index row");
+    connection
+        .execute(
+            "DELETE FROM provider_view_request_history
+             WHERE session_id = ?1 AND request_ordinal = ?2",
+            params![
+                session_id.as_str(),
+                i64::try_from(storage.request_ordinal).expect("ordinal fits i64")
+            ],
+        )
+        .expect("remove v32 request cursor to model an upgraded v24 row");
+    store
+        .verify_provider_view(&stored)
+        .expect("legacy index verification");
+    assert_eq!(
+        store
+            .read_provider_view_block(&stored, &stored.history_blocks[0])
+            .expect("legacy indexed block"),
+        vec![b'l'; 64]
+    );
+}
+
+fn persist_history_attempt(
+    store: &Store,
+    session_id: &SessionId,
+    history_text: &[&str],
+    attempt: u64,
+) -> Vec<RawEnvelope> {
+    let system = ProviderViewBlobV1::new(b"compact-system".to_vec());
+    let tools = ProviderViewBlobV1::new(b"compact-tools".to_vec());
+    let history = history_text
+        .iter()
+        .map(|text| ProviderViewBlobV1::new(text.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    let mut ledger = provider_view("fixed", 16).0;
+    ledger.system_block = system.block.clone();
+    ledger.tool_schema_block = tools.block.clone();
+    ledger.history_blocks = history.iter().map(|blob| blob.block.clone()).collect();
+    let mut blobs = vec![system, tools];
+    blobs.extend(history);
+    let mut envelopes = provider_attempt_envelopes(session_id, &ledger, attempt);
+    for (index, envelope) in envelopes.iter_mut().enumerate() {
+        envelope.event_id = EventId::new(format!("compact-{attempt}-{index}"));
+    }
+    store
+        .persist_provider_view_and_append_owned(session_id, ledger, blobs, attempt, &mut envelopes)
+        .expect("persist view and attempt facts");
+    envelopes
+}
+
+fn stored_record(store: &Store, session_id: &SessionId, seq: u64) -> Vec<u8> {
+    Connection::open(store.database_path())
+        .expect("observer")
+        .query_row(
+            "SELECT envelope_json FROM events WHERE session_id = ?1 AND seq = ?2",
+            params![
+                session_id.as_str(),
+                i64::try_from(seq).expect("sequence fits i64")
+            ],
+            |row| row.get(0),
+        )
+        .expect("stored journal record")
+}
+
+/// MUTATION CHECK: dropping the digest comparison in the compact-record
+/// hydration must fail the tampered read below; lowering the compaction
+/// minimum must fail the three-block inline assertion.
+#[test]
+fn compact_history_record_round_trips_and_fails_closed_on_segment_drift() {
+    const INDIRECT_RECORD_MARKER: u8 = 0xc1;
+    let root = tempfile::tempdir().expect("profile");
+    let session_id = SessionId::new("provider-view-compact-record");
+    let (short, long) = {
+        let store = Store::open(root.path()).expect("store");
+        create_session(&store, &session_id);
+        let short = persist_history_attempt(&store, &session_id, &["one", "two", "three"], 1);
+        let long =
+            persist_history_attempt(&store, &session_id, &["one", "two", "three", "four"], 2);
+        assert_ne!(
+            stored_record(&store, &session_id, short[0].seq)[0],
+            INDIRECT_RECORD_MARKER,
+            "short history ledgers stay self-contained"
+        );
+        assert_eq!(
+            stored_record(&store, &session_id, long[0].seq)[0],
+            INDIRECT_RECORD_MARKER,
+            "longer history ledgers are stored as a segment cursor"
+        );
+        (short, long)
+    };
+    let store = Store::open(root.path()).expect("reopen store");
+    assert_eq!(
+        store
+            .read(&session_id, short[0].seq - 1, 4)
+            .expect("replay inline and compact records"),
+        [short, long.clone()].concat(),
+        "hydration reproduces the exact public envelopes"
+    );
+    drop(store);
+    Connection::open(root.path().join("store.sqlite"))
+        .expect("tamper connection")
+        .execute(
+            "UPDATE provider_view_history_blocks SET byte_len = byte_len + 1",
+            [],
+        )
+        .expect("tamper segment rows");
+    let store = Store::open(root.path()).expect("reopen tampered store");
+    assert!(
+        store.read(&session_id, long[0].seq - 1, 2).is_err(),
+        "a compact record whose segment rows drifted must fail closed"
+    );
+}
+
+fn history_view(texts: &[&str]) -> (ProviderViewLedgerV1, Vec<ProviderViewBlobV1>) {
+    let system = ProviderViewBlobV1::new(b"compact-system".to_vec());
+    let tools = ProviderViewBlobV1::new(b"compact-tools".to_vec());
+    let history = texts
+        .iter()
+        .map(|text| ProviderViewBlobV1::new(text.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    let mut ledger = provider_view("fixed", 16).0;
+    ledger.system_block = system.block.clone();
+    ledger.tool_schema_block = tools.block.clone();
+    ledger.history_blocks = history.iter().map(|blob| blob.block.clone()).collect();
+    let mut blobs = vec![system, tools];
+    blobs.extend(history);
+    (ledger, blobs)
+}
+
+fn stamped_attempt_view(envelope: &RawEnvelope) -> ProviderViewLedgerV1 {
+    let payload: EventPayload =
+        serde_json::from_value(serde_json::to_value(&envelope.payload).expect("payload JSON"))
+            .expect("typed payload");
+    let EventPayload::Item(ItemEvent::Completed { item, .. }) = payload else {
+        panic!("attempt completion expected");
+    };
+    ProviderViewAttemptV1::try_from_extension_item(&item)
+        .expect("attempt decodes")
+        .expect("provider-view attempt")
+        .view
+}
+
+/// Reproduces stage 4 defect 1: an older request survives while the newer
+/// requests that grew its trunk expired first (wall-clock step backwards,
+/// as written by a profile before the monotone expiry clamp). The next
+/// request used to reuse the grown trunk and was rebuilt as
+/// `[a, x2, y1, z]`, and its compacted journal facts became unreadable.
+///
+/// MUTATION CHECK: reuse the trunk whenever `common >= trunk_end` (ignoring
+/// the surviving leaf's cutoff). Expected runtime failure: StoreCorrupt from
+/// `verify_provider_view`; with the encode guard also removed, the reopened
+/// journal read fails as well.
+#[test]
+fn out_of_order_expiry_never_reuses_a_trunk_past_the_surviving_leaf() {
+    let root = tempfile::tempdir().expect("profile");
+    let session_id = SessionId::new("provider-view-out-of-order-expiry");
+    let (r1, r4_events) = {
+        let store = Store::open(root.path()).expect("store");
+        create_session(&store, &session_id);
+        let far = 4_000_000_000_000_u64;
+        let (ledger, blobs) = history_view(&["a", "x1", "y1"]);
+        let r1 = store
+            .persist_provider_view_until(&session_id, ledger, blobs, far)
+            .expect("persist r1");
+        let mut newer = Vec::new();
+        for texts in [&["a", "x2", "y2"], &["a", "x2", "y3"]] {
+            let (ledger, blobs) = history_view(texts);
+            newer.push(
+                store
+                    .persist_provider_view_until(&session_id, ledger, blobs, far)
+                    .expect("persist newer request")
+                    .storage
+                    .expect("storage cursor")
+                    .request_ordinal,
+            );
+        }
+        let connection = Connection::open(store.database_path()).expect("observer");
+        for ordinal in newer {
+            connection
+                .execute(
+                    "UPDATE provider_view_requests SET expires_at_ms = 100
+                     WHERE session_id = ?1 AND request_ordinal = ?2",
+                    params![
+                        session_id.as_str(),
+                        i64::try_from(ordinal).expect("ordinal fits i64")
+                    ],
+                )
+                .expect("model a pre-clamp out-of-order expiry");
+        }
+        assert_eq!(
+            store.sweep_expired_provider_views(500).expect("sweep"),
+            2,
+            "both newer requests expire before the older one"
+        );
+        store.verify_provider_view(&r1).expect("r1 still valid");
+        let r4_events = persist_history_attempt(&store, &session_id, &["a", "x1", "y1", "z"], 4);
+        let r4 = stamped_attempt_view(&r4_events[1]);
+        store
+            .verify_provider_view(&r4)
+            .expect("r4 rebuilds its own ledger, not the grown trunk");
+        (r1, r4_events)
+    };
+    let store = Store::open(root.path()).expect("reopen");
+    store.verify_provider_view(&r1).expect("r1 after reopen");
+    assert_eq!(
+        store
+            .read(&session_id, r4_events[0].seq - 1, 2)
+            .expect("r4 attempt facts replay after reopen"),
+        r4_events
+    );
+    store
+        .verify_provider_view(&stamped_attempt_view(&r4_events[1]))
+        .expect("r4 after reopen");
+}
+
+/// MUTATION CHECK: drop the per-session expiry clamp in `persist_prepared`.
+/// Expected runtime failure: the later request keeps its earlier expiry and
+/// the sweep removes it before the older request.
+#[test]
+fn provider_view_expiry_never_precedes_an_earlier_request_in_its_session() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("provider-view-monotone-expiry");
+    create_session(&store, &session_id);
+    let (ledger, blobs) = history_view(&["a", "b"]);
+    let first = store
+        .persist_provider_view_until(&session_id, ledger, blobs, 1_000)
+        .expect("persist first");
+    let (ledger, blobs) = history_view(&["a", "b", "c"]);
+    let second = store
+        .persist_provider_view_until(&session_id, ledger, blobs, 100)
+        .expect("persist after a clock step backwards");
+    assert_eq!(
+        second.storage.as_ref().expect("storage").expires_at_ms,
+        1_000,
+        "a later request inherits its predecessor's expiry"
+    );
+    assert_eq!(store.sweep_expired_provider_views(500).expect("sweep"), 0);
+    store.verify_provider_view(&first).expect("first live");
+    store.verify_provider_view(&second).expect("second live");
+    assert_eq!(store.sweep_expired_provider_views(1_000).expect("sweep"), 2);
 }

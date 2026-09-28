@@ -16,7 +16,10 @@ use haider_daemon::{
 use haider_protocol::error::{ErrorAction, ErrorCode, HaiderError};
 use haider_protocol::provider::CapabilityDoc;
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
-use haider_provider::{FakeProvider, Provider, ProviderError, ProviderStream, TurnRequest};
+use haider_provider::{
+    FakeProvider, PROVIDER_DEADLINE_SAFETY_MARGIN, Provider, ProviderError, ProviderStream,
+    TurnRequest,
+};
 use std::collections::BTreeSet;
 use std::fs;
 use std::sync::Arc;
@@ -24,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use support::{ready_with_dependencies, test_root};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, timeout};
+use tokio::time::timeout;
 
 struct NeverOpensProvider {
     capabilities: FakeProvider,
@@ -139,9 +142,13 @@ async fn never_opening_provider_is_structured_terminal_before_client_deadline() 
     };
     let (output, mut events) = mpsc::channel::<HeadlessEvent>(64);
     let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-    let started = Instant::now();
+    // The request's own three-second deadline is the behavior under test.
+    // "Before the client deadline" is proven from the daemon's recorded
+    // open budget below (deterministic under load); this outer watchdog only
+    // detects a hang. A 2.9-second wall guard raced scheduler stalls on a
+    // loaded machine without testing anything the budget check does not.
     let result = timeout(
-        Duration::from_millis(2_900),
+        Duration::from_secs(10),
         run_headless(
             &profile,
             ensure,
@@ -167,9 +174,8 @@ async fn never_opening_provider_is_structured_terminal_before_client_deadline() 
         ),
     )
     .await
-    .expect("headless client exits before its three-second deadline")
+    .expect("headless client returns a terminal result")
     .expect("deadline failure is a structured run result");
-    assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(result.outcome, HeadlessOutcome::Errored);
     assert!(result.terminal_seq.is_some(), "the client reduced Errored");
     let failure = result.failure.expect("typed run failure");
@@ -180,6 +186,22 @@ async fn never_opening_provider_is_structured_terminal_before_client_deadline() 
     assert!(!failure.retryable, "no full retry fits before the deadline");
     assert!(failure.message.contains("reason=deadline_exhausted"));
     let presentation = failure.presentation.expect("provider timeout presentation");
+    // The daemon bounded the provider open by the client's own deadline minus
+    // the safety margin, and the open ran that whole budget: the structured
+    // terminal is scheduled at least one margin before the client deadline.
+    let budget_ms = presentation.budget_ms.expect("typed open budget");
+    let opened_within_ms = presentation.opened_within_ms.expect("typed open elapsed");
+    let client_deadline_ms = 3_000_u64;
+    let margin_ms = u64::try_from(PROVIDER_DEADLINE_SAFETY_MARGIN.as_millis()).expect("margin");
+    assert!(budget_ms > 0, "the open had a positive budget");
+    assert!(
+        budget_ms + margin_ms <= client_deadline_ms,
+        "daemon budget {budget_ms} ms leaves the {margin_ms} ms margin before the client deadline"
+    );
+    assert_eq!(
+        opened_within_ms, budget_ms,
+        "the never-opening request was stopped by its budget"
+    );
     assert_eq!(presentation.subcode.as_str(), "provider-timeout");
     assert_eq!(presentation.allowed_actions, vec![ErrorAction::None]);
     drain.await.expect("headless event drain");

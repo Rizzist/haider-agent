@@ -19,6 +19,7 @@ fn create_command(session: &SessionId) -> SessionCreateCommand {
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 1_024,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

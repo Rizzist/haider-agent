@@ -21,6 +21,47 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.973 — provider-request budgets become opt-in
+
+Omitting `RunBudgetV1.request_budget` or a delegated child's request policy now
+means no provider-request-count limit. Interactive turns, headless runs,
+subagents, and workflow continuations share that default. Explicit policies
+remain wire-compatible: they retain logical counts that exclude transport
+retries, the `provider_request_budget_v1` extension, soft/hard checkpoints,
+exit 78, and durable continuation coordinates. The 32 / 64 values remain only
+as convenience counterparts when a caller explicitly supplies one CLI request
+flag. TUI and plain transcript renderers suppress progress statuses while raw
+event and JSONL consumers retain them for explicitly budgeted runs.
+`session.observe` now exposes an optional `request_budget` object for the
+selected run once its first status is journaled. The TUI status strip and
+`haider session <id>` use it for a single cap label; older readers ignore the
+additive field and unbounded runs omit it.
+
+This changes no event shape, pricing, cost accounting, time budget,
+cancellation, workflow recurrence guard, or schema version.
+
+New additive extension kind `loop_suspected_v1` (`run_id`, `guard`,
+`repeated_calls`, `stop_after`, optional `tool`, `label`): a non-terminal steer
+committed once per streak, after 30 consecutive calls repeat an earlier call and
+normalized result of the same turn (`guard: "repeated_tool_calls"`), or after
+100 consecutive calls repeat an earlier (tool, arguments) pair whatever the
+results (`guard: "repeated_actions"`). A missing `guard` means
+`repeated_tool_calls`. It is model-visible and rendered as a transcript line.
+If the streak continues for 30 (respectively 100) more calls without a new
+call, the turn ends with the existing `loop_limit` error code (CLI exit 70).
+Assistant text never resets these streaks. Computer-use/mobile-use screen
+steps are exempt from the action-level count while the observed screen
+changes; the result-level count still applies to them.
+
+`ErrorPresentation` gains the additive optional field `loop_limit`, present only
+on `loop_limit` failures and tagged by `loop` (`no_progress_continuations`
+with `continuation_count`/`continuation_limit`; `repeated_tool_calls` or
+`repeated_actions` with `repeated_calls`/`suspect_after`/`stop_after_suspected`).
+It reaches the `run_failed` event payload and the `haider.run.v1`
+`error.presentation`. Readers drop an unknown `loop` value rather than
+rejecting the presentation. Serialized bytes of every other error are unchanged.
+Older readers treat the kind as an unknown extension.
+
 ### v0.0.972 — finalized tool arguments carrier
 
 New additive extension kind `tool_arguments_finalized_v1` uses the existing
@@ -640,9 +681,11 @@ Optional `RunBudgetV1.request_budget` and
 `HeadlessRunSpecV1.continuation_of` fields are omitted for legacy values.
 `spawn_subagent` can pin request policy in manifest coordinates. Capability
 `request_budget_v1` is required for explicit policies and the dedicated resume
-client so older daemons cannot silently ignore the settings. Default policy
-is 32 soft / 64 hard. The schema version remains 1; unknown extension data and
-new error codes retain the established forward-compatibility behavior.
+client so older daemons cannot silently ignore the settings. At v0.0.970 the
+default policy was 32 soft / 64 hard; v0.0.973 makes omission unbounded while
+retaining those values as explicit-policy conveniences. The schema version
+remains 1; unknown extension data and new error codes retain the established
+forward-compatibility behavior.
 
 ### v0.0.970 — tool-result truncation provenance and applied file effects
 

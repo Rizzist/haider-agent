@@ -147,3 +147,10 @@ subagent observation state may carry
 quota_limit }`. Raw Pipe
 consumers receive self-sufficient `lockdown.refused`, `lockdown.quota`, and
 `provider.trust_changed` payloads and must not reconstruct them from prose.
+
+## Provider error detail under lockdown
+
+Lockdown turns publish provider error text from known templates only. Unknown
+provider prose shows the default explanation plus "details withheld", and the
+owner-local `provider_raw_detail` is removed from the durable failure (see
+`jsonl-run-contract-v1.md`, "Provider error detail").

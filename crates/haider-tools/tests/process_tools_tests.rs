@@ -326,7 +326,9 @@ fn process_exec_runs_and_returns_output_with_a_huge_workspace_file() {
         .expect("workspace receipt must not read a huge file in full");
     assert!(digest.starts_with("blake3:"));
     assert!(
-        digest.contains("reason=content_limit") || digest.contains("reason=wall_time_limit"),
+        digest.contains("reason=content_limit")
+            || digest.contains("reason=wall_time_limit")
+            || digest.contains("reason=redacted_material"),
         "large-file receipt must expose the first hard bound reached: {digest}"
     );
 

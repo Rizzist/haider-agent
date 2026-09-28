@@ -233,6 +233,11 @@ fn render_plain_impl_with_status(
                 out.push_str(line);
                 out.push('\n');
             }
+            for line in crate::projection::error_identity_lines(presentation) {
+                out.push_str("  ");
+                out.push_str(&line);
+                out.push('\n');
+            }
             let facts = crate::projection::error_fact_segments(presentation, None);
             out.push_str("  ");
             out.push_str(&crate::projection::join_error_fact_segments(&facts));
@@ -550,13 +555,18 @@ pub fn agent_metrics_plain(model: &crate::app::AppModel) -> String {
 pub fn status_line(projection: &SessionProjection, window: u64) -> String {
     let badge = projection.badge();
     let tokens = projection.context_tokens();
+    let cap = projection
+        .request_budget()
+        .map_or_else(String::new, |budget| {
+            format!(" · {}", budget.status_label())
+        });
     if window == 0 {
-        return format!("{badge} · {} tok", fmt_tok(tokens));
+        return format!("{badge} · {} tok{cap}", fmt_tok(tokens));
     }
     #[allow(clippy::cast_precision_loss)]
     let pct = tokens as f64 / window as f64;
     format!(
-        "{badge} · {} tok · {} {}% of {}",
+        "{badge} · {} tok · {} {}% of {}{cap}",
         fmt_tok(tokens),
         meter_cells(pct, METER_CELLS_DEFAULT),
         (pct.clamp(0.0, 1.0) * 100.0).round(),
@@ -685,13 +695,15 @@ fn render_item(out: &mut String, block: &ItemBlock) {
                     &block.item,
                 )
             {
-                // 973-tui-toolview: the per-request progress tally is not
-                // rendered (the styled transcript's law); a reached bound
-                // still is — it carries the continuation.
-                if budget.phase != haider_protocol::request_budget::RequestBudgetPhaseV1::Progress {
-                    out.push_str(&budget.summary());
+                if let Some(summary) = budget.transcript_summary() {
+                    out.push_str(&summary);
                     out.push('\n');
                 }
+            } else if let Some(note) =
+                haider_protocol::loop_guard::LoopSuspectedV1::from_extension_item(&block.item)
+            {
+                out.push_str(&note.summary());
+                out.push('\n');
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
                 out.push_str(&label);
                 out.push('\n');

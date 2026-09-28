@@ -11,7 +11,9 @@ use haider_accounts::{CredentialAlias, MemoryVault, Vault};
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{Block, PrefixDigests, StreamEvent};
-use haider_protocol::tool::{AttachmentBlock, ImageBlockRef, PdfDeliveryMode};
+use haider_protocol::tool::{
+    AttachmentBlock, ImageBlockRef, PdfDeliveryMode, TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
+};
 use reqwest::header::AUTHORIZATION;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -20,8 +22,9 @@ use crate::anthropic::{
     ANTHROPIC_COMPUTER_BETA_20250124, ANTHROPIC_COMPUTER_BETA_20251124, ANTHROPIC_FAST_BETA_VALUE,
     ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE,
     ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicComputerToolVersion, AnthropicProvider,
-    SseChunkSource, anthropic_computer_tool_version, read_error_body_bounded,
-    replay_anthropic_native_computer_sse, replay_anthropic_sse, stream_sse_source,
+    AnthropicRetryPolicy, AnthropicTransportConfig, SseChunkSource,
+    anthropic_computer_tool_version, read_error_body_bounded, replay_anthropic_native_computer_sse,
+    replay_anthropic_sse, stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
 use crate::{
@@ -372,6 +375,7 @@ fn payload_request(system_prompt: Option<&str>) -> TurnRequest {
         ],
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -500,6 +504,7 @@ fn cache_control_request() -> TurnRequest {
         }],
         attachments: Vec::new(),
         cache_metadata: Some(cache_metadata("anthropic-oauth", 3)),
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -1167,8 +1172,8 @@ fn native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_act
     let screenshot = ImageBlockRef {
         artifact: ArtifactRef::new("blake3:anthropic-native-screen"),
         media_type: "image/png".into(),
-        width: 1_600,
-        height: 900,
+        width: 1_429,
+        height: 804,
         byte_len: 12,
     };
     let request = TurnRequest {
@@ -1180,7 +1185,7 @@ fn native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_act
             }]),
             Message::tool_result_with_images(
                 "toolu_screen",
-                "screenshot captured (1600x900)",
+                "screenshot captured (1429x804)",
                 false,
                 vec![screenshot.clone()],
             ),
@@ -1199,6 +1204,7 @@ fn native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_act
             data_base64: "iVBORw0KGgo=".into(),
         }],
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     let payload = model_payload_provider(false, "claude-opus-5")
         .request_payload(&request)
@@ -1209,8 +1215,8 @@ fn native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_act
         serde_json::json!({
             "type": "computer_20251124",
             "name": "computer",
-            "display_width_px": 1600,
-            "display_height_px": 900,
+            "display_width_px": 1429,
+            "display_height_px": 804,
             "display_number": 1,
         })
     );
@@ -1768,6 +1774,7 @@ fn one_line_turn(model: &str) -> TurnRequest {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -2176,6 +2183,177 @@ async fn completed_anthropic_5xx_with_reset_body_keeps_http_status_not_network_c
     );
 }
 
+/// A provider that withholds request-body reads for longer than both local
+/// response clocks reproduces the screenshot failure without external auth.
+/// Upload is transport work, not provider silence: both clocks begin only
+/// after the streamed body reaches EOF, and the next SSE response succeeds.
+#[tokio::test]
+async fn slow_request_upload_is_excluded_from_response_open_and_logical_idle() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind slow provider");
+    let address = listener.local_addr().expect("slow provider address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept slow request");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1_024];
+        let (header_end, content_length) = loop {
+            let read = socket.read(&mut chunk).await.expect("read request header");
+            assert_ne!(read, 0, "request closed before headers");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_start) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header_end = header_start + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("content length");
+            break (header_end, content_length);
+        };
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        while request.len().saturating_sub(header_end) < content_length {
+            let read = socket.read(&mut chunk).await.expect("read slow body");
+            assert_ne!(read, 0, "request closed during body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+
+        let sse = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"upload complete\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            sse.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response head");
+        socket.write_all(sse).await.expect("write SSE");
+        content_length
+    });
+
+    let provider = AnthropicProvider::new_custom_no_auth(
+        secret_credential("anthropic-slow-upload", b"unused-fixture-secret"),
+        "claude-local",
+        &format!("http://{address}"),
+    )
+    .expect("slow provider")
+    .with_transport_config(AnthropicTransportConfig {
+        retry_policy: AnthropicRetryPolicy::Never,
+        connect_timeout: Duration::from_secs(1),
+        response_open_timeout: Duration::from_millis(100),
+        chunk_idle_timeout: Duration::from_millis(200),
+        semantic_progress_timeout: Duration::from_secs(1),
+    })
+    .expect("short fixture clocks");
+    let mut request = one_line_turn("claude-local");
+    request.messages = vec![Message::user_text("x".repeat(8 * 1024 * 1024))];
+    let prepared = provider.prepare_turn_owned(&mut request);
+    let idle = crate::ProviderIdleDeadline::default();
+    idle.begin_attempt(provider.idle_timeout());
+    let opening = idle.scope(provider.stream_prepared_turn(request, prepared));
+    let mut stream = tokio::select! {
+        error = idle.wait() => panic!("upload consumed logical idle budget: {error}"),
+        opened = opening => opened.expect("response opens after slow upload"),
+    };
+    let mut saw_finish = false;
+    while let Some(item) = stream.recv().await {
+        if matches!(item.expect("valid SSE"), StreamEvent::Finish { .. }) {
+            saw_finish = true;
+        }
+    }
+    assert!(saw_finish);
+    assert!(server.await.expect("slow server task") > 8 * 1024 * 1024);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_reading_peer_hits_typed_request_upload_deadline() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled provider");
+    let address = listener.local_addr().expect("stalled provider address");
+    let (headers_seen, headers_ready) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept request");
+        let mut headers = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = socket.read(&mut chunk).await.expect("read headers");
+            assert_ne!(read, 0, "request closed before headers");
+            headers.extend_from_slice(&chunk[..read]);
+        }
+        let headers = String::from_utf8_lossy(&headers);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .expect("content length");
+        assert!(content_length > 16 * 1024 * 1024);
+        headers_seen
+            .send(content_length)
+            .expect("signal received headers");
+        // Keep the connection open and stop consuming the large body.
+        future::pending::<()>().await;
+    });
+
+    let provider = AnthropicProvider::new_custom_no_auth(
+        secret_credential("anthropic-stalled-upload", b"unused-fixture-secret"),
+        "claude-local",
+        &format!("http://{address}"),
+    )
+    .expect("stalled provider")
+    .with_transport_config(AnthropicTransportConfig {
+        retry_policy: AnthropicRetryPolicy::Never,
+        connect_timeout: Duration::from_secs(1),
+        response_open_timeout: Duration::from_secs(1),
+        chunk_idle_timeout: Duration::from_secs(1),
+        semantic_progress_timeout: Duration::from_secs(1),
+    })
+    .expect("fixture clocks");
+    let mut request = one_line_turn("claude-local");
+    request.messages = vec![Message::user_text("x".repeat(16 * 1024 * 1024))];
+    let opening = tokio::spawn(async move { provider.stream_turn(request).await });
+    let content_length = headers_ready
+        .await
+        .expect("server received request headers");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(270)).await;
+    let error = tokio::time::timeout(Duration::from_secs(1), opening)
+        .await
+        .expect("upload must have a deadline")
+        .expect("provider task")
+        .expect_err("non-reading peer must time out");
+    assert_eq!(error.kind, ProviderErrorKind::Transport);
+    assert_eq!(
+        error.timeout_reason,
+        Some(crate::ProviderTimeoutReason::RequestUpload)
+    );
+    assert!(error.message.contains("request upload did not complete"));
+    assert_eq!(
+        error.budget_ms,
+        Some(
+            u64::try_from(crate::request_upload::request_upload_budget(content_length).as_millis())
+                .expect("small fixture budget")
+        )
+    );
+    server.abort();
+}
+
 #[test]
 fn native_computer_replay_never_silently_drops_region() {
     let input = serde_json::json!({"action": "screenshot", "region": {"x": 1, "y": 2, "width": 3, "height": 4, "reference_width": 100, "reference_height": 100}});
@@ -2278,4 +2456,826 @@ async fn fable_51_oauth_body_and_non_authorization_headers_golden() {
         request.headers()["anthropic-beta"],
         "oauth-2025-04-20,prompt-caching-scope-2026-01-05,extended-cache-ttl-2025-04-11"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Signed-thinking prefix binding vs request-time screenshot elision.
+//
+// Anthropic (retrieved 2026-09-24): on Claude Fable 5.1 / Opus 5.5 a replayed
+// `thinking` block is valid only while system, tools and every earlier message
+// are unchanged; accounts created on/after 2026-08-31 get a 400 by default.
+// Pruning an earlier screenshot is such a change; the documented remedy is
+// `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` with the
+// `thinking-binding-controls-2026-08-01` beta, "set from then on".
+// https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+// https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool#manage-screenshot-history
+// ---------------------------------------------------------------------------
+
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+fn synthetic_screenshot(name: &str) -> ImageBlockRef {
+    ImageBlockRef {
+        artifact: ArtifactRef::new(format!("blake3:{name}")),
+        media_type: "image/png".into(),
+        width: 1,
+        height: 1,
+        byte_len: 8,
+    }
+}
+
+fn computer_screenshot_call(call_id: &str) -> Block {
+    Block::ToolCall {
+        call_id: call_id.into(),
+        name: "computer".into(),
+        args: serde_json::json!({"action": "screenshot"}),
+    }
+}
+
+fn screenshot_result(call_id: &str, image: &str) -> Message {
+    Message::tool_result_with_images(
+        call_id,
+        format!("screenshot {image}"),
+        false,
+        vec![synthetic_screenshot(image)],
+    )
+}
+
+/// Projects durable history the way the actor does before EVERY provider
+/// request (image budget + stale-screenshot elision on a clone) and resolves
+/// the images that remain.
+fn projected_messages(
+    durable: &[Message],
+) -> (
+    Vec<Message>,
+    Vec<ResolvedAttachment>,
+    crate::ToolResultImageProjection,
+) {
+    let mut messages = durable.to_vec();
+    let projection = crate::apply_tool_result_image_budget(&mut messages);
+    let attachments = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolResult { images, .. } => Some(images),
+            _ => None,
+        })
+        .flatten()
+        .map(|image| ResolvedAttachment {
+            artifact: image.artifact.clone(),
+            data_base64: "aGVsbG8=".into(),
+        })
+        .collect();
+    (messages, attachments, projection)
+}
+
+fn projected_turn(model: &str, durable: &[Message]) -> TurnRequest {
+    let (messages, attachments, projection) = projected_messages(durable);
+    TurnRequest {
+        messages,
+        model: model.into(),
+        max_tokens: 64,
+        system_prompt: Some("Haider system".into()),
+        tools: Vec::new(),
+        attachments,
+        cache_metadata: None,
+        tool_result_image_projection: projection,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefixVerdict {
+    status: u16,
+    beta: bool,
+    drop_policy: bool,
+    kept: Vec<String>,
+    dropped: Vec<String>,
+}
+
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, serde_json::Value) {
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    let header_end = loop {
+        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            break end + 4;
+        }
+        let mut chunk = [0_u8; 4096];
+        let count = socket.read(&mut chunk).await.expect("read headers");
+        assert_ne!(count, 0, "request closed before headers");
+        bytes.extend_from_slice(&chunk[..count]);
+    };
+    let headers = String::from_utf8(bytes[..header_end].to_vec()).expect("ASCII headers");
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .expect("content length");
+    while bytes.len() - header_end < length {
+        let mut chunk = [0_u8; 4096];
+        let count = socket.read(&mut chunk).await.expect("read body");
+        assert_ne!(count, 0, "request closed before body");
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    let body = serde_json::from_slice(&bytes[header_end..header_end + length]).expect("JSON body");
+    (headers, body)
+}
+
+/// Canonical prefix a thinking block at `messages[index].content[block]` is
+/// bound to: system, tools and everything before it. `cache_control` is
+/// ignored, as Anthropic documents moving markers as a valid change.
+fn canonical_prefix(body: &serde_json::Value, index: usize, block: usize) -> String {
+    let mut body = body.clone();
+    strip_cache_control(&mut body);
+    let messages = body["messages"].as_array().expect("messages array");
+    let mut prior = messages[..index].to_vec();
+    let mut current = messages
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"role": "assistant", "content": []}));
+    let content = current["content"].as_array().cloned().unwrap_or_default();
+    current["content"] = serde_json::Value::Array(content[..block].to_vec());
+    prior.push(current);
+    serde_json::json!({
+        "system": body.get("system"),
+        "tools": body.get("tools"),
+        "messages": prior,
+    })
+    .to_string()
+}
+
+/// Loopback Messages server that ENFORCES Anthropic's documented prefix check
+/// as for an account created on/after 2026-08-31: every signature it issues is
+/// bound to the canonical prefix before that block; replaying a block after
+/// any change to that prefix is a 400 `invalid_request_error`, unless the
+/// request sets `drop_block` WITH the beta, in which case the first failing
+/// block and every later thinking block are dropped and the request succeeds.
+/// `block_binding` without the beta is the documented 400 as well.
+async fn prefix_enforcing_fake(
+    listener: tokio::net::TcpListener,
+    requests: usize,
+) -> Vec<PrefixVerdict> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut issued = std::collections::HashMap::<String, String>::new();
+    let mut verdicts = Vec::new();
+    for _ in 0..requests {
+        let (mut socket, _) = listener.accept().await.expect("accept wire request");
+        let (headers, body) = read_http_request(&mut socket).await;
+        let beta = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.trim().eq_ignore_ascii_case("anthropic-beta"))
+            .any(|(_, value)| {
+                value
+                    .split(',')
+                    .any(|beta| beta.trim() == THINKING_BINDING_BETA)
+            });
+        let block_binding = body.pointer("/thinking/block_binding");
+        let drop_policy = block_binding
+            .and_then(|binding| binding.get("prefix_mismatch_behavior"))
+            .and_then(serde_json::Value::as_str)
+            == Some("drop_block");
+        let messages = body["messages"].as_array().expect("messages array");
+        let mut first_failure = None;
+        let mut kept = Vec::new();
+        let mut dropped = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
+            let content = message["content"].as_array().cloned().unwrap_or_default();
+            for (block, value) in content.iter().enumerate() {
+                if value["type"] != "thinking" {
+                    continue;
+                }
+                let signature = value["signature"].as_str().expect("signature").to_owned();
+                let bound = issued.get(&signature) == Some(&canonical_prefix(&body, index, block));
+                if first_failure.is_none() && bound {
+                    kept.push(signature);
+                } else {
+                    first_failure.get_or_insert(format!("messages.{index}.content.{block}"));
+                    dropped.push(signature);
+                }
+            }
+        }
+        let rejection = if block_binding.is_some() && !beta {
+            Some("block_binding: Extra inputs are not permitted".to_owned())
+        } else {
+            first_failure.as_ref().filter(|_| !drop_policy).map(|path| {
+                format!(
+                    "{path}: Invalid `signature` in `thinking` block. The block is bound to a \
+                     different conversation."
+                )
+            })
+        };
+        let response = if let Some(message) = rejection {
+            let error = serde_json::json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": message},
+            })
+            .to_string();
+            format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}",
+                error.len()
+            )
+        } else {
+            let signature = format!("sig-{}", issued.len() + 1);
+            issued.insert(
+                signature.clone(),
+                canonical_prefix(&body, messages.len(), 0),
+            );
+            let sse = format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"content\":[],\"usage\":{{\"input_tokens\":1}}}}}}\n\n\
+                 event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{signature}\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+                 event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"text_delta\",\"text\":\"ok\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+                 event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            )
+        };
+        verdicts.push(PrefixVerdict {
+            status: if response.starts_with("HTTP/1.1 200") {
+                200
+            } else {
+                400
+            },
+            beta,
+            drop_policy,
+            kept,
+            dropped,
+        });
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verdict");
+    }
+    verdicts
+}
+
+/// Streams one turn and returns the signed thinking block exactly as the
+/// actor persists it (a provider-opaque fact).
+async fn signed_thinking_turn(
+    provider: &AnthropicProvider,
+    request: TurnRequest,
+) -> Result<Block, ProviderError> {
+    let mut stream = provider.stream_turn(request).await?;
+    let mut thinking = None;
+    while let Some(item) = stream.recv().await {
+        if let StreamEvent::ProviderOpaque { provider, data } = item? {
+            thinking = Some(Block::ProviderOpaque { provider, data });
+        }
+    }
+    Ok(thinking.expect("signed thinking captured"))
+}
+
+fn prefix_fake_adapter(alias: &str, base_url: &str) -> AnthropicProvider {
+    AnthropicProvider::new_custom_no_auth(
+        secret_credential(alias, b"synthetic-only"),
+        "claude-opus-5-5",
+        base_url,
+    )
+    .expect("adapter")
+    .with_transport_config(AnthropicTransportConfig {
+        retry_policy: AnthropicRetryPolicy::Never,
+        connect_timeout: Duration::from_secs(5),
+        response_open_timeout: Duration::from_secs(30),
+        chunk_idle_timeout: Duration::from_secs(30),
+        semantic_progress_timeout: Duration::from_secs(60),
+    })
+    .expect("fixture clocks")
+}
+
+/// Screenshot A -> signed thinking -> screenshot B: the next request elides A
+/// (rewriting the prefix bound to the thinking produced after A). Against a
+/// prefix-ENFORCING fake that request is accepted only because the adapter
+/// sends the documented drop policy; the identical request without it is the
+/// 400 the owner would otherwise hit. The policy is re-derived after a
+/// "daemon restart" (fresh adapter, history reloaded from its serialized
+/// form), and append-only requests before any elision keep the exact prior
+/// wire (no `thinking` field, no binding beta).
+///
+/// MUTATION CHECK (executed): making `thinking_binding_drop_required` return
+/// false fails this test (the elided request no longer carries the policy);
+/// the control request above is exactly that wire and gets the fake's 400.
+#[tokio::test]
+async fn screenshot_elision_before_signed_thinking_survives_prefix_enforcement_and_restart() {
+    const MODEL: &str = "claude-opus-5-5";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind prefix enforcing fake");
+    let base_url = format!("http://{}", listener.local_addr().expect("fake address"));
+    let server = tokio::spawn(prefix_enforcing_fake(listener, 5));
+    let provider = prefix_fake_adapter("prefix-fake", &base_url);
+
+    let mut durable = vec![Message::user_text("inspect the screen")];
+    let first = signed_thinking_turn(&provider, projected_turn(MODEL, &durable))
+        .await
+        .expect("first turn");
+    durable.push(Message::assistant(vec![
+        first,
+        computer_screenshot_call("screenshot-a"),
+    ]));
+    durable.push(screenshot_result("screenshot-a", "a"));
+    let second = signed_thinking_turn(&provider, projected_turn(MODEL, &durable))
+        .await
+        .expect("append-only turn after screenshot A");
+    durable.push(Message::assistant(vec![
+        second,
+        computer_screenshot_call("screenshot-b"),
+    ]));
+    durable.push(screenshot_result("screenshot-b", "b"));
+
+    let elided = projected_turn(MODEL, &durable);
+    let mut without_policy = provider.request_payload(&elided).expect("elided payload");
+    assert!(
+        without_policy["messages"][2]["content"][0]["content"]
+            .as_str()
+            .expect("screenshot A elided to text")
+            .contains("computer_screenshot_history")
+    );
+    assert_eq!(
+        without_policy["thinking"],
+        serde_json::json!({
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        })
+    );
+    without_policy
+        .as_object_mut()
+        .expect("payload object")
+        .remove("thinking");
+    let control = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP client")
+        .execute(
+            provider
+                .request_body(without_policy)
+                .await
+                .expect("control request"),
+        )
+        .await
+        .expect("control response");
+    assert_eq!(control.status().as_u16(), 400);
+    assert!(
+        control
+            .text()
+            .await
+            .expect("control body")
+            .contains("Invalid `signature` in `thinking` block")
+    );
+
+    let third = signed_thinking_turn(&provider, elided)
+        .await
+        .expect("elided turn with the documented drop policy");
+    durable.push(Message::assistant(vec![
+        third,
+        Block::Text {
+            text: "screen inspected".into(),
+        },
+    ]));
+    durable.push(Message::user_text("continue"));
+
+    let stored = serde_json::to_vec(&durable).expect("durable history bytes");
+    drop(provider);
+    drop(durable);
+    let restored: Vec<Message> = serde_json::from_slice(&stored).expect("reloaded history");
+    let restarted = prefix_fake_adapter("prefix-fake-restarted", &base_url);
+    signed_thinking_turn(&restarted, projected_turn(MODEL, &restored))
+        .await
+        .expect("turn after restart");
+
+    let verdict = |status, policy: bool, kept: &[&str], dropped: &[&str]| PrefixVerdict {
+        status,
+        beta: policy,
+        drop_policy: policy,
+        kept: kept.iter().map(|value| (*value).to_owned()).collect(),
+        dropped: dropped.iter().map(|value| (*value).to_owned()).collect(),
+    };
+    assert_eq!(
+        server.await.expect("fake server"),
+        vec![
+            verdict(200, false, &[], &[]),
+            verdict(200, false, &["sig-1"], &[]),
+            verdict(400, false, &["sig-1"], &["sig-2"]),
+            verdict(200, true, &["sig-1"], &["sig-2"]),
+            verdict(200, true, &["sig-1"], &["sig-2", "sig-3"]),
+        ]
+    );
+}
+
+/// Only request-time rewrites of EARLIER results count, and only the typed
+/// projection record can report one: capability placeholders and elision
+/// markers that arrive as tool TEXT never do.
+#[test]
+fn request_time_image_rewrite_detection_is_scoped() {
+    let rewritten = |durable: &[Message]| {
+        projected_messages(durable)
+            .2
+            .rewrites_earlier_tool_results()
+    };
+    let one = vec![
+        Message::user_text("inspect"),
+        Message::assistant(vec![computer_screenshot_call("a")]),
+        screenshot_result("a", "a"),
+    ];
+    assert!(!rewritten(&one), "a single screenshot is never elided");
+    let mut two = one.clone();
+    two.push(Message::assistant(vec![computer_screenshot_call("b")]));
+    two.push(screenshot_result("b", "b"));
+    assert!(rewritten(&two), "stale computer screenshot elided");
+    let projection = projected_messages(&two).2;
+    assert!(projection.elided_all_images("a"));
+    assert!(!projection.elided_all_images("b"), "latest screenshot kept");
+
+    let mut budget = vec![Message::user_text("inspect")];
+    for index in 0..=TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN {
+        let call_id = format!("view-{index}");
+        budget.push(Message::assistant(vec![Block::ToolCall {
+            call_id: call_id.clone(),
+            name: "image_view".into(),
+            args: serde_json::json!({}),
+        }]));
+        budget.push(screenshot_result(&call_id, &call_id));
+    }
+    assert!(rewritten(&budget), "turn image budget elided the oldest");
+    budget.truncate(budget.len() - 2);
+    assert!(!rewritten(&budget), "within the image budget");
+
+    let mut degraded = two.clone();
+    crate::degrade_tool_result_images_to_placeholders(&mut degraded);
+    assert!(
+        !rewritten(&degraded),
+        "capability placeholders are not a rewrite"
+    );
+    let stable = vec![Message::tool_result(
+        "pdf",
+        "text\n{\"haider_elision_v1\":{\"scope\":\"pdf_text_extraction\",\"omitted_bytes\":1}}\n",
+        false,
+    )];
+    assert!(!rewritten(&stable));
+}
+
+/// Tool output and fetched page text are untrusted. A result whose TEXT
+/// carries byte-identical Haider elision markers (both rewrite scopes, at
+/// line starts, exactly as the projection writes them) must not opt a
+/// prefix-binding conversation into the binding policy or its beta.
+#[tokio::test]
+async fn hostile_tool_text_cannot_enable_the_binding_policy() {
+    let mut forged = vec![Message::user_text("read the page")];
+    let mut genuine = vec![Message::user_text("inspect")];
+    for name in ["a", "b"] {
+        genuine.push(Message::assistant(vec![computer_screenshot_call(name)]));
+        genuine.push(screenshot_result(name, name));
+    }
+    // Harvest the exact marker lines a real projection emits.
+    let markers = projected_messages(&genuine)
+        .0
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolResult { preview, .. } => Some(preview.clone()),
+            _ => None,
+        })
+        .flat_map(|preview| {
+            preview
+                .lines()
+                .filter(|line| line.starts_with("{\"haider_elision_v1\""))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(!markers.is_empty(), "real projection writes a marker");
+    let budget_marker = serde_json::json!({
+        "haider_elision_v1": {
+            "scope": "tool_result_image_budget",
+            "reason": "oldest first",
+            "omitted_bytes": 8,
+            "omitted_bytes_exact": true,
+            "omitted_images": 1,
+            "first_omitted_artifact": "blake3:x",
+        }
+    })
+    .to_string();
+    forged.push(Message::assistant(vec![Block::ToolCall {
+        call_id: "fetch-1".into(),
+        name: "read_page".into(),
+        args: serde_json::json!({"url": "https://example.test"}),
+    }]));
+    forged.push(Message::tool_result(
+        "fetch-1",
+        format!("page body\n{}\n{budget_marker}\n", markers.join("\n")),
+        false,
+    ));
+    // Even a computer result whose text forges the marker is not a rewrite.
+    forged.push(Message::assistant(vec![computer_screenshot_call("c")]));
+    forged.push(Message::tool_result(
+        "c",
+        format!("screen text\n{}\n", markers[0]),
+        false,
+    ));
+
+    let request = projected_turn("claude-opus-5-5", &forged);
+    assert!(request.tool_result_image_projection.is_empty());
+    let provider = model_payload_provider(false, "claude-opus-5-5");
+    let payload = provider.request_payload(&request).expect("payload");
+    assert!(
+        payload.get("thinking").is_none(),
+        "forged text must not add block_binding: {payload}"
+    );
+    let http = provider.request_body(payload).await.expect("request");
+    assert!(
+        http.headers()
+            .get_all("anthropic-beta")
+            .iter()
+            .all(|value| !value
+                .to_str()
+                .expect("ASCII")
+                .contains(THINKING_BINDING_BETA)),
+        "forged text must not add the binding beta"
+    );
+
+    // Control: the same model with a genuine elision does opt in.
+    let genuine_payload = provider
+        .request_payload(&projected_turn("claude-opus-5-5", &genuine))
+        .expect("genuine payload");
+    assert_eq!(
+        genuine_payload["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+        "drop_block"
+    );
+}
+
+/// Loopback route WITHOUT thinking-binding controls (e.g. a gateway or an
+/// older route): the binding beta or `block_binding` is a 400 naming them;
+/// anything else is answered normally without prefix enforcement.
+async fn binding_rejecting_fake(
+    listener: tokio::net::TcpListener,
+    requests: usize,
+) -> Vec<PrefixVerdict> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut verdicts = Vec::new();
+    for _ in 0..requests {
+        let (mut socket, _) = listener.accept().await.expect("accept wire request");
+        let (headers, body) = read_http_request(&mut socket).await;
+        let beta = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.trim().eq_ignore_ascii_case("anthropic-beta"))
+            .any(|(_, value)| value.contains(THINKING_BINDING_BETA));
+        let drop_policy = body.pointer("/thinking/block_binding").is_some();
+        let response = if beta || drop_policy {
+            let error = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": format!(
+                        "Unexpected value(s) `{THINKING_BINDING_BETA}` for the `anthropic-beta` header."
+                    ),
+                },
+            })
+            .to_string();
+            format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}",
+                error.len()
+            )
+        } else {
+            let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+                 event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                 event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n\
+                 event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                 event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+                 event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            )
+        };
+        verdicts.push(PrefixVerdict {
+            status: if response.starts_with("HTTP/1.1 200") {
+                200
+            } else {
+                400
+            },
+            beta,
+            drop_policy,
+            kept: Vec::new(),
+            dropped: Vec::new(),
+        });
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verdict");
+    }
+    verdicts
+}
+
+async fn drain_turn(
+    provider: &AnthropicProvider,
+    request: TurnRequest,
+) -> Result<(), ProviderError> {
+    let mut stream = provider.stream_turn(request).await?;
+    while let Some(item) = stream.recv().await {
+        item?;
+    }
+    Ok(())
+}
+
+/// A route that rejects the binding opt-in gets exactly ONE 400: the adapter
+/// resends the same turn once without the policy, latches the route, and
+/// every later request on it (same adapter or a rebuilt adapter for the same
+/// route) is sent without the policy. The fallback never loops.
+#[tokio::test]
+async fn binding_rejection_falls_back_once_and_latches_the_route() {
+    const MODEL: &str = "claude-opus-5-5";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind binding-rejecting fake");
+    let base_url = format!("http://{}", listener.local_addr().expect("fake address"));
+    let server = tokio::spawn(binding_rejecting_fake(listener, 4));
+    let provider = prefix_fake_adapter("binding-reject", &base_url);
+
+    let mut durable = vec![Message::user_text("inspect")];
+    for name in ["a", "b"] {
+        durable.push(Message::assistant(vec![computer_screenshot_call(name)]));
+        durable.push(screenshot_result(name, name));
+    }
+    let elided = projected_turn(MODEL, &durable);
+    assert_eq!(
+        provider.request_payload(&elided).expect("payload")["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+        "drop_block",
+        "the route is not latched before its first rejection"
+    );
+    drain_turn(&provider, elided.clone())
+        .await
+        .expect("one bounded fallback resend succeeds");
+    assert!(
+        provider
+            .request_payload(&elided)
+            .expect("payload")
+            .get("thinking")
+            .is_none(),
+        "latched route renders the pre-policy wire"
+    );
+    drain_turn(&provider, elided.clone())
+        .await
+        .expect("later request goes straight to the pre-policy wire");
+    let rebuilt = prefix_fake_adapter("binding-reject-rebuilt", &base_url);
+    drain_turn(&rebuilt, elided)
+        .await
+        .expect("a rebuilt adapter for the same route keeps the latch");
+
+    let verdict = |status, policy: bool| PrefixVerdict {
+        status,
+        beta: policy,
+        drop_policy: policy,
+        kept: Vec::new(),
+        dropped: Vec::new(),
+    };
+    assert_eq!(
+        server.await.expect("fake server"),
+        vec![
+            verdict(400, true),
+            verdict(200, false),
+            verdict(200, false),
+            verdict(200, false),
+        ]
+    );
+}
+
+/// Only a 400 naming the binding opt-in triggers the fallback; a
+/// prefix-mismatch rejection or any other invalid request never does.
+#[test]
+fn only_binding_opt_in_rejections_trigger_the_fallback() {
+    let envelope = |message: &str| {
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": message},
+        })
+        .to_string()
+        .into_bytes()
+    };
+    for rejected in [
+        format!("Unexpected value(s) `{THINKING_BINDING_BETA}` for the `anthropic-beta` header."),
+        "thinking.block_binding: Extra inputs are not permitted".to_owned(),
+        "thinking.block_binding.prefix_mismatch_behavior: unsupported".to_owned(),
+    ] {
+        assert!(
+            crate::anthropic::anthropic_rejects_thinking_binding(&envelope(&rejected)),
+            "{rejected}"
+        );
+    }
+    assert!(crate::anthropic::anthropic_rejects_thinking_binding(
+        b"gateway: unknown field block_binding"
+    ));
+    for other in [
+        "messages.2.content.0: Invalid `signature` in `thinking` block.",
+        "max_tokens: must be positive",
+        "prompt is too long",
+    ] {
+        assert!(
+            !crate::anthropic::anthropic_rejects_thinking_binding(&envelope(other)),
+            "{other}"
+        );
+    }
+}
+
+/// Guard for the prefix-binding seam: a native Anthropic computer tool swaps
+/// its advertised display size after the first screenshot, which would
+/// rewrite the tools prefix bound to earlier signed thinking without any
+/// elision record. No prefix-binding model may resolve to a native version.
+#[test]
+fn prefix_binding_models_never_use_the_native_computer_tool() {
+    for model in [
+        "claude-opus-5-5",
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "claude-opus-5-5-20260801",
+        "claude-fable-5-1@20260801",
+        "anthropic.claude-opus-5-5",
+    ] {
+        assert!(
+            crate::anthropic::prefix_binding_model(model),
+            "{model} is prefix-binding"
+        );
+        assert_eq!(anthropic_computer_tool_version(model), None, "{model}");
+    }
+}
+
+/// The policy is limited to documented prefix-binding models and rides the
+/// prepared (cache-planned) render too, joined into the ONE OAuth beta header.
+#[tokio::test]
+async fn drop_policy_is_model_scoped_and_rides_prepared_oauth_wire() {
+    let mut durable = vec![Message::user_text("inspect")];
+    for name in ["a", "b"] {
+        durable.push(Message::assistant(vec![computer_screenshot_call(name)]));
+        durable.push(screenshot_result(name, name));
+    }
+    let older = model_payload_provider(false, "claude-opus-5");
+    let payload = older
+        .request_payload(&projected_turn("claude-opus-5", &durable))
+        .expect("Opus 5 payload");
+    assert!(
+        payload.get("thinking").is_none(),
+        "no binding opt-in off the enforcing models"
+    );
+
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("synthetic-binding-prepared");
+    vault.put(&alias, b"synthetic-only").expect("test token");
+    let provider = AnthropicProvider::new_subscription_with_dns_resolver(
+        vault.resolve(&alias).expect("handle"),
+        "claude-fable-5-1",
+        ANTHROPIC_OAUTH_BASE_URL,
+        Arc::new(StubFixedResolver {
+            address: SocketAddr::from(([93, 184, 216, 34], 443)),
+        }),
+    )
+    .expect("provider with deterministic public DNS")
+    .with_prompt_caching_verified(true);
+    let mut request = cache_control_request();
+    request.model = "claude-fable-5-1".into();
+    request.messages.extend(durable);
+    let (messages, attachments, projection) = projected_messages(&request.messages);
+    request.messages = messages;
+    request.attachments = attachments;
+    request.tool_result_image_projection = projection;
+    let legacy = provider
+        .request_payload(&request)
+        .expect("fallback payload");
+    let prepared = provider.prepare_turn(&request).expect("prepared turn");
+    let payload = prepared
+        .wire
+        .as_ref()
+        .expect("prepared wire")
+        .payload
+        .clone();
+    let expected = serde_json::json!({
+        "type": "adaptive",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    });
+    assert_eq!(payload["thinking"], expected);
+    assert_eq!(legacy["thinking"], expected);
+    let http = provider.request_body(payload).await.expect("request");
+    let betas = http
+        .headers()
+        .get_all("anthropic-beta")
+        .iter()
+        .collect::<Vec<_>>();
+    assert_eq!(betas.len(), 1, "one comma-joined beta header");
+    let betas = betas[0]
+        .to_str()
+        .expect("ASCII")
+        .split(',')
+        .collect::<Vec<_>>();
+    assert_eq!(betas.first(), Some(&"oauth-2025-04-20"));
+    assert_eq!(betas.last(), Some(&THINKING_BINDING_BETA));
 }

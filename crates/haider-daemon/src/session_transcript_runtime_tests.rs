@@ -90,6 +90,7 @@ impl World {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: allow_exec.then_some(
                 haider_protocol::session::SessionPermissionOverridesV1 {
                     allow_exec: true,

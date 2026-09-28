@@ -422,6 +422,7 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
             expected_later_reads: 2,
             reuse_gap_ms: None,
         }),
+        tool_result_image_projection: Default::default(),
     }
 }
 

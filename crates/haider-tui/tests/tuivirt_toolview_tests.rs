@@ -419,8 +419,10 @@ fn the_collapsed_rows_speak_the_reference_vocabulary() {
         "{}",
         frame.rows[reads + 1]
     );
-    // The request tally is gone from the transcript.
-    assert!(!frame.contains("tranche"));
+    // The request tally is gone from the transcript. (The status row's
+    // `request cap N (tranche T)` policy chip is the request-budget lane's
+    // own, separate surface.)
+    assert!(!frame.contains("/ tranche"));
     assert!(!frame.contains("— in progress"));
     // The heredoc body never reaches the transcript collapsed.
     assert!(!frame.contains("2026-09-23T20:01:00Z"));

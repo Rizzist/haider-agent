@@ -47,6 +47,12 @@ pub use tool_exposure::ToolCapabilityProfile;
 mod task_outcome;
 use task_outcome::{CompletedTool, ToolSettlement};
 
+#[path = "actor_tool_repair.rs"]
+mod actor_tool_repair;
+#[cfg(test)]
+#[path = "actor_tool_repair_tests.rs"]
+mod actor_tool_repair_tests;
+
 use crate::{
     ArtifactReader, InteractionGate, InteractionResolution, InteractionResolutionPolicy,
     PromptHistoryCompiler, ProviderViewAppendRequest, StoreHandle, unix_time_ms,
@@ -80,6 +86,9 @@ use haider_protocol::ids::{
     RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolArgumentsFinalizedV1, ToolStatus, TurnItem};
+use haider_protocol::loop_guard::{
+    LOOP_SUSPECTED_EXTENSION_KIND, LoopGuardKindV1, LoopLimitV1, LoopSuspectedV1, ToolLoopGuardV1,
+};
 use haider_protocol::menu::{
     ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -112,11 +121,11 @@ use haider_provider::{
     Message, PROVIDER_DEADLINE_SAFETY_MARGIN, PromptCacheMetadata, Provider, ProviderError,
     ProviderErrorKind, ProviderRequestOrdinal, ProviderStream, ProviderStreamItem,
     ProviderTimeoutReason, ROUTE_STATE_POLL_INTERVAL, ResolvedAttachment, ToolDefinition,
-    TurnRequest, TurnTraceContext, apply_tool_result_image_budget,
+    ToolResultImageProjection, TurnRequest, TurnTraceContext, apply_tool_result_image_budget,
     before_provider_request_deadline, canonical_tool_definitions,
     canonical_tool_definitions_digest, deadline_exhausted_error,
     degrade_tool_result_images_to_placeholders, effective_request_budget,
-    validate_provider_view_prefix,
+    has_stale_computer_screenshots, validate_provider_view_prefix,
 };
 
 #[path = "actor_wake.rs"]
@@ -629,10 +638,6 @@ mod actor_ceiling;
 #[path = "actor_journalview_tests.rs"]
 mod actor_journalview_tests;
 
-// Two soft tranches cover the reported 53-round solved benchmark with 11
-// requests of headroom, while preserving a finite guard against runaway work.
-const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 64;
-
 /// Profile-scoped secret used only for diagnostic prefix fingerprints.
 /// Custom debug output is deliberately redacted so a config dump cannot
 /// disclose the key that protects short prompt components from guessing.
@@ -688,7 +693,1849 @@ pub struct PreviousCacheRequest {
     pub breakpoint_hashes: CacheBreakpointHashesV1,
     pub cache_domain_hash: Option<String>,
 }
+/// Consecutive provider continuations allowed without a new semantic result.
 const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
+
+/// Tracks distinct work within one turn for the loop guards. Request
+/// ordinals, generated call IDs, usage, opaque replay state, and the
+/// synthesized MaxTokens nudge do not prove progress. Fingerprints compare
+/// normalized content (`continuation_fingerprint`), recognizing repeats after
+/// other work.
+///
+/// Three guards read this state:
+/// - continuations: consecutive MaxTokens/PauseTurn finishes without progress
+///   ([`HarnessConfig::max_continuations_per_turn`]); new assistant text, a
+///   new call fingerprint or a new provider-side result is progress;
+/// - repeated tool calls: consecutive calls whose (tool, arguments, result)
+///   fingerprint was already seen; only a new call fingerprint resets it;
+/// - repeated actions: consecutive calls whose (tool, arguments) was already
+///   seen, whatever the result; only a new (tool, arguments) resets it.
+///
+/// The last two are configured by [`HarnessConfig::tool_loop_guard`].
+/// Assistant text never resets them: narration is not an action.
+#[derive(Default)]
+struct ContinuationProgress {
+    consecutive_without_progress: usize,
+    seen: HashSet<blake3::Hash>,
+    progress_in_response: bool,
+    /// Same (tool, arguments, result).
+    repeated_calls: RepeatStreak,
+    /// Same (tool, arguments), any result.
+    repeated_actions: RepeatStreak,
+    /// Last successful reading per (tool, arguments) fingerprint, so a screen
+    /// observation can be compared with the previous identical observation.
+    last_outcome: HashMap<blake3::Hash, blake3::Hash>,
+    /// Navigation can be exempt only after a successful changed observation.
+    ui_screen_changed: bool,
+}
+
+/// One consecutive-repeat streak and its steer state.
+#[derive(Default)]
+struct RepeatStreak {
+    count: usize,
+    /// Streak length when the `loop_suspected` steer was issued.
+    suspected_at: Option<usize>,
+    last_tool: Option<String>,
+}
+
+impl RepeatStreak {
+    fn record(&mut self, new: bool, tool: &str) {
+        if new {
+            *self = Self::default();
+        } else {
+            self.count = self.count.saturating_add(1);
+            self.last_tool = Some(tool.to_owned());
+        }
+    }
+
+    /// The steer always precedes the limit, and the limit needs
+    /// `stop_after_suspected` further repeats after the steer, so a batch of
+    /// parallel repeats cannot skip the warning.
+    fn verdict(
+        &mut self,
+        kind: LoopGuardKindV1,
+        suspect_after: usize,
+        stop_after_suspected: usize,
+        run_id: &RunId,
+    ) -> ToolLoopVerdict {
+        let repeated = self.count;
+        match self.suspected_at {
+            Some(at) if repeated >= at.saturating_add(stop_after_suspected) => {
+                ToolLoopVerdict::Limit(match kind {
+                    LoopGuardKindV1::RepeatedActions => LoopLimitV1::RepeatedActions {
+                        repeated_calls: repeated,
+                        suspect_after,
+                        stop_after_suspected,
+                    },
+                    LoopGuardKindV1::RepeatedToolCalls | LoopGuardKindV1::Unknown => {
+                        LoopLimitV1::RepeatedToolCalls {
+                            repeated_calls: repeated,
+                            suspect_after,
+                            stop_after_suspected,
+                        }
+                    }
+                })
+            }
+            None if repeated >= suspect_after => {
+                self.suspected_at = Some(repeated);
+                ToolLoopVerdict::Suspected(vec![LoopSuspectedV1 {
+                    run_id: run_id.clone(),
+                    repeated_calls: repeated,
+                    stop_after: stop_after_suspected,
+                    tool: self.last_tool.clone(),
+                    guard: kind,
+                }])
+            }
+            _ => ToolLoopVerdict::Continue,
+        }
+    }
+}
+
+/// What the tool-loop guards require before the next request.
+#[derive(Debug, PartialEq, Eq)]
+enum ToolLoopVerdict {
+    Continue,
+    /// Issue these non-terminal `loop_suspected_v1` steers (one per guard
+    /// that crossed its threshold at this boundary).
+    Suspected(Vec<LoopSuspectedV1>),
+    /// End the turn with `loop_limit`.
+    Limit(LoopLimitV1),
+}
+
+impl ContinuationProgress {
+    fn begin_response(&mut self) {
+        self.progress_in_response = false;
+    }
+
+    fn fingerprint(kind: &[u8], parts: &[&[u8]]) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(kind);
+        for part in parts {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        hasher.finalize()
+    }
+
+    /// Records one progress fingerprint; returns whether it was new. New
+    /// content resets only the continuation guard.
+    fn observe(&mut self, kind: &[u8], parts: &[&[u8]]) -> bool {
+        let new = self.seen.insert(Self::fingerprint(kind, parts));
+        if new {
+            self.consecutive_without_progress = 0;
+            self.progress_in_response = true;
+        }
+        new
+    }
+
+    /// One completed call: `args` is the canonical argument form and
+    /// `outcome` the normalized result parts. `ui` is set only for a trusted,
+    /// successful typed computer/mobile screen step, with whether the result
+    /// carried a reading (an image for screenshots).
+    ///
+    /// Screen steps are exempt from the action-level guard while the screen
+    /// changes: an observation whose outcome differs from the previous
+    /// identical observation, and navigation (swipe/scroll/tap/key) while the
+    /// latest observation was such a change. They never reset the action
+    /// streak, and the result-level guard still counts them, so identical
+    /// screenshots (stuck at the end of a list) stop at 60.
+    fn observe_call(
+        &mut self,
+        kind: &[u8],
+        name: &str,
+        args: &str,
+        outcome: &[&[u8]],
+        ui: Option<(crate::continuation_fingerprint::UiStep, bool)>,
+    ) {
+        use crate::continuation_fingerprint::UiStep;
+        let action_fingerprint =
+            Self::fingerprint(b"action", &[kind, name.as_bytes(), args.as_bytes()]);
+        let outcome_fingerprint = Self::fingerprint(b"outcome", outcome);
+        let action = self.seen.insert(action_fingerprint);
+        let screen_step_exempt = match ui {
+            Some((UiStep::Observe { .. }, reading)) => {
+                let previous = if reading {
+                    self.last_outcome
+                        .insert(action_fingerprint, outcome_fingerprint)
+                } else {
+                    None
+                };
+                let changed = reading && previous != Some(outcome_fingerprint);
+                self.ui_screen_changed = changed;
+                changed
+            }
+            Some((UiStep::Navigate, _)) => self.ui_screen_changed,
+            None => false,
+        };
+        if !screen_step_exempt {
+            self.repeated_actions.record(action, name);
+        }
+        let mut all = Vec::with_capacity(outcome.len() + 2);
+        all.push(name.as_bytes());
+        all.push(args.as_bytes());
+        all.extend_from_slice(outcome);
+        let call = self.observe(kind, &all);
+        self.repeated_calls.record(call, name);
+    }
+
+    fn observe_assistant_text(&mut self, blocks: &[Block]) {
+        let mut content = String::new();
+        for block in blocks {
+            if let Block::Text { text } = block {
+                content.push_str(&text.to_owned_string());
+            }
+        }
+        let content = crate::continuation_fingerprint::assistant_text(&content);
+        if !content.is_empty() {
+            self.observe(b"assistant_text", &[content.as_bytes()]);
+        }
+    }
+
+    fn observe_local_tools(&mut self, blocks: &[Block], results: &[Message]) {
+        for block in blocks {
+            let Block::ToolCall {
+                call_id,
+                name,
+                args,
+            } = block
+            else {
+                continue;
+            };
+            for result in results {
+                if let Some(Block::ToolResult {
+                    preview,
+                    truncated,
+                    completion_status,
+                    images,
+                    ..
+                }) = result.tool_result_for(call_id)
+                {
+                    let typed_ui = crate::continuation_fingerprint::ui_step(name, args);
+                    let succeeded = completion_status.is_some_and(|status| status.is_completed());
+                    if typed_ui.is_some() && !succeeded {
+                        self.ui_screen_changed = false;
+                    }
+                    let ui = typed_ui.filter(|_| succeeded).map(|step| {
+                        let reading = match step {
+                            crate::continuation_fingerprint::UiStep::Observe {
+                                screenshot: true,
+                            } => !images.is_empty(),
+                            _ => true,
+                        };
+                        (step, reading)
+                    });
+                    let args = crate::continuation_fingerprint::arguments(args);
+                    // Only a completed observation with a reading can prove
+                    // a new numeric screen. Navigation and missing screenshots
+                    // use the ordinary digit mask.
+                    let screen_reading = matches!(
+                        ui,
+                        Some((
+                            crate::continuation_fingerprint::UiStep::Observe { .. },
+                            true
+                        ))
+                    );
+                    let preview = if screen_reading {
+                        crate::continuation_fingerprint::screen_result(preview)
+                    } else {
+                        crate::continuation_fingerprint::result(preview)
+                    };
+                    // A failed screen receipt may still carry image references,
+                    // but those references cannot establish screen progress.
+                    let images = if typed_ui.is_some() && !succeeded {
+                        "[]".to_owned()
+                    } else {
+                        serde_json::to_string(images).unwrap_or_default()
+                    };
+                    let status = format!("{completion_status:?}");
+                    self.observe_call(
+                        b"local_tool_result",
+                        name,
+                        &args,
+                        &[
+                            preview.as_bytes(),
+                            &[*truncated as u8],
+                            images.as_bytes(),
+                            status.as_bytes(),
+                        ],
+                        ui,
+                    );
+                }
+            }
+        }
+    }
+
+    fn observe_server_tool(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        preview: &str,
+        is_error: bool,
+    ) {
+        let args = crate::continuation_fingerprint::arguments(args);
+        let preview = crate::continuation_fingerprint::result(preview);
+        self.observe_call(
+            b"server_tool_result",
+            name,
+            &args,
+            &[preview.as_bytes(), &[is_error as u8]],
+            None,
+        );
+    }
+
+    fn charge(&mut self) -> usize {
+        if !self.progress_in_response {
+            self.consecutive_without_progress = self.consecutive_without_progress.saturating_add(1);
+        }
+        self.consecutive_without_progress
+    }
+
+    /// Checked before each new logical request. A limit from either guard
+    /// wins; otherwise every guard that crossed its steer threshold steers.
+    fn tool_loop_verdict(&mut self, guard: ToolLoopGuardV1, run_id: &RunId) -> ToolLoopVerdict {
+        let calls = self.repeated_calls.verdict(
+            LoopGuardKindV1::RepeatedToolCalls,
+            guard.suspect_after,
+            guard.stop_after_suspected,
+            run_id,
+        );
+        let actions = self.repeated_actions.verdict(
+            LoopGuardKindV1::RepeatedActions,
+            guard.action_suspect_after,
+            guard.action_stop_after_suspected,
+            run_id,
+        );
+        match (calls, actions) {
+            (limit @ ToolLoopVerdict::Limit(_), _) | (_, limit @ ToolLoopVerdict::Limit(_)) => {
+                limit
+            }
+            (ToolLoopVerdict::Suspected(mut first), ToolLoopVerdict::Suspected(second)) => {
+                first.extend(second);
+                ToolLoopVerdict::Suspected(first)
+            }
+            (steer @ ToolLoopVerdict::Suspected(_), ToolLoopVerdict::Continue)
+            | (ToolLoopVerdict::Continue, steer @ ToolLoopVerdict::Suspected(_)) => steer,
+            (ToolLoopVerdict::Continue, ToolLoopVerdict::Continue) => ToolLoopVerdict::Continue,
+        }
+    }
+}
+
+#[cfg(test)]
+mod continuation_progress_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    /// One provider response in a simulated turn, mirroring the fake-provider
+    /// probes (`proof_adversarial.py`, `proof_extended_opus.py`).
+    enum Step {
+        Server {
+            query: String,
+            preview: String,
+        },
+        Text(String),
+        /// A local `fs_read` answered with `contents`, then `tool_use`.
+        Local {
+            path: String,
+            contents: String,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        /// `loop_limit` after this many provider attempts.
+        Stopped {
+            attempts: usize,
+            repeated_calls: bool,
+        },
+        /// The script ran to its end marker.
+        Completed { attempts: usize, suspected: usize },
+    }
+
+    /// Replays responses through the guards in the actor's order: before each
+    /// request the repeated-call verdict, after each MaxTokens/PauseTurn the
+    /// no-progress charge.
+    fn simulate(rounds: Vec<(Vec<Step>, FinishReason)>) -> Outcome {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("loop-guard-sim");
+        let mut progress = ContinuationProgress::default();
+        let mut attempts = 0;
+        let mut suspected = 0;
+        let mut call = 0;
+        for (steps, finish) in rounds {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => {
+                    for note in &notes {
+                        assert_eq!(
+                            note.stop_after,
+                            match note.guard {
+                                LoopGuardKindV1::RepeatedActions =>
+                                    guard.action_stop_after_suspected,
+                                _ => guard.stop_after_suspected,
+                            }
+                        );
+                    }
+                    suspected += notes.len();
+                }
+                ToolLoopVerdict::Limit(_) => {
+                    return Outcome::Stopped {
+                        attempts,
+                        repeated_calls: true,
+                    };
+                }
+            }
+            attempts += 1;
+            progress.begin_response();
+            let mut text = Vec::new();
+            for step in steps {
+                call += 1;
+                match step {
+                    Step::Server { query, preview } => progress.observe_server_tool(
+                        "web_search",
+                        &serde_json::json!({"query": query}),
+                        &preview,
+                        false,
+                    ),
+                    Step::Text(content) => text.push(Block::Text {
+                        text: content.into(),
+                    }),
+                    Step::Local { path, contents } => {
+                        let call_id = format!("call-{call}");
+                        let block = Block::ToolCall {
+                            call_id: call_id.clone(),
+                            name: "fs_read".into(),
+                            args: serde_json::json!({"path": path}),
+                        };
+                        let result = Message::tool_result(call_id, contents, false);
+                        progress.observe_local_tools(&[block], &[result]);
+                    }
+                }
+            }
+            progress.observe_assistant_text(&text);
+            if matches!(finish, FinishReason::MaxTokens | FinishReason::PauseTurn)
+                && progress.charge() > DEFAULT_MAX_CONTINUATIONS_PER_TURN
+            {
+                return Outcome::Stopped {
+                    attempts,
+                    repeated_calls: false,
+                };
+            }
+        }
+        Outcome::Completed {
+            attempts,
+            suspected,
+        }
+    }
+
+    fn server(query: &str, preview: String) -> (Vec<Step>, FinishReason) {
+        (
+            vec![Step::Server {
+                query: query.to_owned(),
+                preview,
+            }],
+            FinishReason::PauseTurn,
+        )
+    }
+
+    fn text(content: String, finish: FinishReason) -> (Vec<Step>, FinishReason) {
+        (vec![Step::Text(content)], finish)
+    }
+
+    /// A local read (tool_use round) followed by a continuation finish.
+    fn local(path: &str, finish: FinishReason) -> Vec<(Vec<Step>, FinishReason)> {
+        vec![
+            (
+                vec![Step::Local {
+                    path: path.to_owned(),
+                    contents: if path.starts_with("part-") {
+                        format!("Work item {path}: distinct successful file contents.")
+                    } else {
+                        "same stable file contents".to_owned()
+                    },
+                }],
+                FinishReason::ToolUse,
+            ),
+            (Vec::new(), finish),
+        ]
+    }
+
+    fn mixed_case(n: usize) -> String {
+        "same repeated answer"
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| {
+                if (n >> (i % 16)) & 1 == 1 {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                }
+            })
+            .collect()
+    }
+
+    const PERMUTED: [&str; 6] = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+
+    /// The 30-round scripts of the round-3 and round-4 probes, plus end marker.
+    fn case(kind: &str) -> Vec<(Vec<Step>, FinishReason)> {
+        let pause = FinishReason::PauseTurn;
+        let mut rounds = Vec::new();
+        for n in 1..=30usize {
+            let ab = if n % 2 == 1 { "A" } else { "B" };
+            match kind {
+                // Round 3 (`9-verify3/proof_adversarial.py`).
+                "alternating_ab" => rounds.push(server(ab, format!("same result {ab}"))),
+                "local_alternating_ab" => rounds.extend(local(&format!("{ab}.txt"), pause)),
+                "query_whitespace" => rounds.push(server(
+                    &format!("same topic{}", " ".repeat(n)),
+                    "same result".into(),
+                )),
+                "preview_timestamp" => rounds.push(server(
+                    "same topic",
+                    format!("same result; time=2026-09-24T00:00:{n:02}Z"),
+                )),
+                "preview_id" => {
+                    rounds.push(server("same topic", format!("same result; request_id={n}")))
+                }
+                "text_whitespace" => {
+                    rounds.push(text(format!("same answer{}", " ".repeat(n)), pause))
+                }
+                "text_blank" => rounds.push(text(" ".repeat(n), pause)),
+                "text_repeat" => rounds.push(text("same answer".into(), pause)),
+                "provider_repeat" => rounds.push(server("same topic", "same result".into())),
+                // Round 4 (`12-verify4-opus/proof_extended_opus.py`): stuck.
+                "punctuation_only" => {
+                    rounds.push(text(format!("same answer{}", ".".repeat(n)), pause))
+                }
+                "punct_alternating" => rounds.push(text(
+                    format!("same answer{}", if n % 2 == 1 { "!" } else { "?" }),
+                    pause,
+                )),
+                "case_only" => rounds.push(text(mixed_case(n), pause)),
+                "confusable_result" => rounds.push(server(
+                    "same topic",
+                    format!(
+                        "same result {}",
+                        (0..8)
+                            .map(|i| if (n >> i) & 1 == 1 { 'а' } else { 'a' })
+                            .collect::<String>()
+                    ),
+                )),
+                "reordered_list_result" => {
+                    let mut items = PERMUTED;
+                    items.rotate_left(n % 6);
+                    items.swap(0, (n / 6) % 6);
+                    rounds.push(server("same topic", format!("Found: {}", items.join(", "))));
+                }
+                "latency_ms_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result; took {}ms", 100 + n),
+                )),
+                "latency_seconds_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result (finished in {n}.{}2s)", n % 10),
+                )),
+                "nonce_free_text_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result; nonce {:06}", (n * 7919) % 1_000_003),
+                )),
+                "time_only_log_result" => {
+                    rounds.push(server("same topic", format!("[12:00:{n:02}] same result")))
+                }
+                "http_date_result" => rounds.push(server(
+                    "same topic",
+                    format!("Date: Thu, 24 Sep 2026 12:00:{n:02} GMT; same result"),
+                )),
+                "bare_epoch_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result at {}", 1_727_136_000 + n),
+                )),
+                "attempt_counter_text" => rounds.push(text(
+                    format!("Retrying the same search (attempt {n})."),
+                    pause,
+                )),
+                "max_tokens_repeat_text" => rounds.push(text(
+                    "same truncated answer".into(),
+                    FinishReason::MaxTokens,
+                )),
+                "max_tokens_latency_text" => rounds.push(text(
+                    format!("same truncated answer, took {n}ms"),
+                    FinishReason::MaxTokens,
+                )),
+                "query_case_only" => rounds.push(server(&mixed_case(n), "same result".into())),
+                "query_punct_only" => rounds.push(server(
+                    &format!("same topic{}", "?".repeat(n)),
+                    "same result".into(),
+                )),
+                "local_same_file_ab_mixed" => {
+                    rounds.extend(local(&format!("{ab}.txt"), FinishReason::MaxTokens))
+                }
+                // Digit-only changes of an identical call: no progress by rule.
+                "fp_count_progress" => {
+                    rounds.push(server("same topic", format!("Completed files: {n}")))
+                }
+                "fp_changed_contents" => rounds.push(server(
+                    "same topic",
+                    format!("contents of state.txt: stage {n} done"),
+                )),
+                "fp_new_text_each" => rounds.push(text(
+                    format!("Completed distinct work item {n} with new analysis."),
+                    pause,
+                )),
+                "fp_commit_hash_only" => {
+                    rounds.push(server("same topic", format!("HEAD is now {n:040x}")))
+                }
+                // Real progress: must keep going.
+                "short_hex_id_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result; etag {:x}", 0x00a0_b0c0 + n),
+                )),
+                "fp_build_log_new_lines" => rounds.push(server(
+                    "same topic",
+                    (1..=n)
+                        .map(|i| format!("   Compiling crate{i} v0.1.{i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )),
+                "fp_new_file_contents" => rounds.extend(local(&format!("part-{n}.txt"), pause)),
+                "fp_hash_letters" => rounds.push(server(
+                    "same topic",
+                    format!(
+                        "HEAD is now {}",
+                        blake3::hash(n.to_string().as_bytes()).to_hex()
+                    ),
+                )),
+                "fp_digit_path_only" => rounds.push(server(
+                    "same topic",
+                    format!("wrote src/mod{n}/part{n}x.rs"),
+                )),
+                "fp_path_with_digits" => rounds.push(server(
+                    "same topic",
+                    format!("wrote /tmp/out/run{n}/chunk{n}file"),
+                )),
+                _ => panic!("unknown case {kind}"),
+            }
+        }
+        rounds.push(text(
+            "PROBE_REACHED_END_AFTER_30".into(),
+            FinishReason::EndTurn,
+        ));
+        rounds
+    }
+
+    fn stopped(attempts: usize) -> Outcome {
+        Outcome::Stopped {
+            attempts,
+            repeated_calls: false,
+        }
+    }
+
+    #[test]
+    fn round_three_adversarial_repeats_stop_after_ninth_no_progress_continuation() {
+        for (kind, attempts) in [
+            ("alternating_ab", 11),
+            ("local_alternating_ab", 20),
+            ("query_whitespace", 10),
+            ("preview_timestamp", 10),
+            ("preview_id", 10),
+            ("text_whitespace", 10),
+            ("text_blank", 9),
+            ("text_repeat", 10),
+            ("provider_repeat", 10),
+        ] {
+            assert_eq!(simulate(case(kind)), stopped(attempts), "{kind}");
+        }
+    }
+
+    /// Astra final-review B2: a pause_turn/max_tokens counter written in
+    /// ASCII, Arabic-Indic or Persian digits is no fresh text; identifier
+    /// digits (`v٢x`, `abc_١`) still name something new.
+    #[test]
+    fn unicode_decimal_counters_in_continuations_stop() {
+        for zero in [0x30_u32, 0x660, 0x6f0, 0x966] {
+            for finish in [FinishReason::PauseTurn, FinishReason::MaxTokens] {
+                let mut rounds: Vec<_> = (1..=100_u32)
+                    .map(|n| {
+                        let digits: String = n
+                            .to_string()
+                            .chars()
+                            .map(|ch| char::from_u32(zero + ch.to_digit(10).unwrap()).unwrap())
+                            .collect();
+                        text(
+                            format!("Retrying the same operation (attempt {digits})."),
+                            finish,
+                        )
+                    })
+                    .collect();
+                rounds.push(text("UNREACHABLE".into(), FinishReason::EndTurn));
+                assert_eq!(simulate(rounds), stopped(10), "U+{zero:04X} {finish:?}");
+            }
+            // Identifier digits keep going (each is new assistant text).
+            let digit = |n: u32| char::from_u32(zero + n).unwrap();
+            let mut rounds: Vec<_> = (0..10_u32)
+                .map(|n| {
+                    text(
+                        format!("Wrote v{}x and abc_{}", digit(n), digit(9 - n)),
+                        FinishReason::PauseTurn,
+                    )
+                })
+                .collect();
+            rounds.push(text("DONE".into(), FinishReason::EndTurn));
+            assert_eq!(
+                simulate(rounds),
+                Outcome::Completed {
+                    attempts: 11,
+                    suspected: 0
+                },
+                "U+{zero:04X}"
+            );
+        }
+    }
+
+    /// Every stuck-loop row of the round-4 extended probe ends in loop_limit.
+    #[test]
+    fn round_four_incidental_noise_stops() {
+        for kind in [
+            "punctuation_only",
+            "punct_alternating",
+            "case_only",
+            "confusable_result",
+            "reordered_list_result",
+            "latency_ms_result",
+            "latency_seconds_result",
+            "nonce_free_text_result",
+            "time_only_log_result",
+            "http_date_result",
+            "bare_epoch_result",
+            "attempt_counter_text",
+            "max_tokens_repeat_text",
+            "max_tokens_latency_text",
+            "query_case_only",
+            "query_punct_only",
+            "local_same_file_ab_mixed",
+            // Ruling: an identical call whose result changes only in digits
+            // is not progress (indistinguishable from a clock or counter).
+            "fp_count_progress",
+            "fp_changed_contents",
+            "fp_new_text_each",
+            "fp_commit_hash_only",
+        ] {
+            assert!(
+                matches!(
+                    simulate(case(kind)),
+                    Outcome::Stopped {
+                        repeated_calls: false,
+                        ..
+                    }
+                ),
+                "{kind}: {:?}",
+                simulate(case(kind))
+            );
+        }
+    }
+
+    /// Real progress (and the accepted letter-changing residual) keeps going.
+    #[test]
+    fn round_four_real_progress_keeps_going() {
+        for (kind, attempts) in [
+            ("short_hex_id_result", 31),
+            ("fp_build_log_new_lines", 31),
+            ("fp_new_file_contents", 61),
+            ("fp_hash_letters", 31),
+            ("fp_digit_path_only", 31),
+            ("fp_path_with_digits", 31),
+        ] {
+            assert_eq!(
+                simulate(case(kind)),
+                Outcome::Completed {
+                    attempts,
+                    suspected: 0
+                },
+                "{kind}"
+            );
+        }
+    }
+
+    fn identical_reads(count: usize) -> Vec<(Vec<Step>, FinishReason)> {
+        let mut rounds = Vec::new();
+        for _ in 0..count {
+            rounds.push((
+                vec![Step::Local {
+                    path: "A.txt".into(),
+                    contents: "same stable file contents".into(),
+                }],
+                FinishReason::ToolUse,
+            ));
+        }
+        rounds.push(text("PROBE_REACHED_END".into(), FinishReason::EndTurn));
+        rounds
+    }
+
+    #[test]
+    fn identical_tool_use_loop_is_steered_at_thirty_repeats_and_stopped_at_sixty() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("identical-reads");
+        let mut progress = ContinuationProgress::default();
+        let mut steer_at = None;
+        let mut limit_at = None;
+        for request in 1..=101usize {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => {
+                    assert!(steer_at.is_none(), "one steer per loop");
+                    let [note] = notes.as_slice() else {
+                        panic!("one steer: {notes:?}");
+                    };
+                    assert_eq!(note.repeated_calls, 30);
+                    assert_eq!(note.guard, LoopGuardKindV1::RepeatedToolCalls);
+                    assert_eq!(note.tool.as_deref(), Some("fs_read"));
+                    steer_at = Some(request);
+                }
+                ToolLoopVerdict::Limit(details) => {
+                    assert_eq!(
+                        details,
+                        LoopLimitV1::RepeatedToolCalls {
+                            repeated_calls: 60,
+                            suspect_after: 30,
+                            stop_after_suspected: 30,
+                        }
+                    );
+                    limit_at = Some(request);
+                    break;
+                }
+            }
+            progress.begin_response();
+            let block = Block::ToolCall {
+                call_id: format!("loop-{request}"),
+                name: "fs_read".into(),
+                args: serde_json::json!({"path": "A.txt"}),
+            };
+            let result = Message::tool_result(
+                format!("loop-{request}"),
+                "same stable file contents",
+                false,
+            );
+            progress.observe_local_tools(&[block], &[result]);
+        }
+        // Call 1 is new; calls 2..=31 are the first 30 repeats, so the steer
+        // precedes request 32; calls 32..=61 are 30 more, so request 62 stops.
+        assert_eq!(steer_at, Some(32));
+        assert_eq!(limit_at, Some(62));
+        assert_eq!(
+            simulate(identical_reads(100)),
+            Outcome::Stopped {
+                attempts: 61,
+                repeated_calls: true
+            }
+        );
+        assert_eq!(
+            simulate(identical_reads(40)),
+            Outcome::Completed {
+                attempts: 41,
+                suspected: 1
+            }
+        );
+    }
+
+    fn read_call(progress: &mut ContinuationProgress, path: &str, contents: &str, n: usize) {
+        let block = Block::ToolCall {
+            call_id: format!("c{n}"),
+            name: "fs_read".into(),
+            args: serde_json::json!({"path": path}),
+        };
+        progress.observe_local_tools(
+            &[block],
+            &[Message::tool_result(format!("c{n}"), contents, false)],
+        );
+    }
+
+    #[test]
+    fn text_never_resets_the_repeat_streaks_but_a_new_call_does() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("reset");
+        let mut progress = ContinuationProgress::default();
+        for n in 0..=30 {
+            read_call(&mut progress, "A.txt", "same", n);
+        }
+        assert!(matches!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Suspected(_)
+        ));
+        for n in 31..=50 {
+            read_call(&mut progress, "A.txt", "same", n);
+        }
+        // New assistant text is continuation progress only (addendum 2):
+        // it must not unlock a stuck call loop.
+        progress.observe_assistant_text(&[Block::Text {
+            text: "The file never changes; trying the build log instead.".into(),
+        }]);
+        assert_eq!(progress.consecutive_without_progress, 0);
+        assert_eq!(progress.repeated_calls.count, 50);
+        assert_eq!(progress.repeated_actions.count, 50);
+        for n in 51..=60 {
+            read_call(&mut progress, "A.txt", "same", n);
+        }
+        assert!(matches!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Limit(LoopLimitV1::RepeatedToolCalls {
+                repeated_calls: 60,
+                ..
+            })
+        ));
+        // A new (tool, arguments) resets both streaks and re-arms the steers.
+        read_call(&mut progress, "B.txt", "other", 61);
+        assert_eq!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Continue
+        );
+        assert_eq!(progress.repeated_calls.suspected_at, None);
+        assert_eq!(progress.repeated_actions.count, 0);
+        // A new result for a repeated call resets only the result streak.
+        read_call(&mut progress, "B.txt", "other, changed", 62);
+        assert_eq!(progress.repeated_calls.count, 0);
+        assert_eq!(progress.repeated_actions.count, 1);
+    }
+
+    /// 14-verify5 long600 (a): an identical call with letter-novel narration
+    /// each round is stopped by the result-level guard (steer 30, stop 60).
+    #[test]
+    fn narration_does_not_unlock_an_identical_call_loop() {
+        const WORDS: [&str; 6] = ["amber", "basil", "cedar", "delta", "ember", "fable"];
+        let mut every_round = Vec::new();
+        let mut every_25th = Vec::new();
+        for n in 1..=600usize {
+            let sentence = format!(
+                "Retrying with the {} {} {} idea.",
+                WORDS[n % 6],
+                WORDS[(n / 6) % 6],
+                WORDS[(n / 36) % 6]
+            );
+            let call = Step::Local {
+                path: "A.txt".into(),
+                contents: "same stable file contents".into(),
+            };
+            every_round.push((
+                vec![Step::Text(sentence.clone()), call],
+                FinishReason::ToolUse,
+            ));
+            let call = Step::Local {
+                path: "A.txt".into(),
+                contents: "same stable file contents".into(),
+            };
+            let steps = if n % 25 == 0 {
+                vec![Step::Text(sentence), call]
+            } else {
+                vec![call]
+            };
+            every_25th.push((steps, FinishReason::ToolUse));
+        }
+        for rounds in [every_round, every_25th] {
+            assert_eq!(
+                simulate(rounds),
+                Outcome::Stopped {
+                    attempts: 61,
+                    repeated_calls: true
+                }
+            );
+        }
+    }
+
+    /// A distinct 12-letter tag (no digits, so masking never merges two).
+    fn letter_tag(n: usize) -> String {
+        blake3::hash(n.to_string().as_bytes()).as_bytes()[..12]
+            .iter()
+            .map(|byte| char::from(b'a' + byte % 26))
+            .collect()
+    }
+
+    /// Identical (tool, arguments) with a result that changes every call
+    /// (letters-only etag noise, or a genuinely growing log).
+    fn identical_call_changing_result(rounds: usize) -> Vec<(Vec<Step>, FinishReason)> {
+        let mut script: Vec<_> = (1..=rounds)
+            .map(|n| {
+                (
+                    vec![Step::Local {
+                        path: "status.txt".into(),
+                        contents: format!("status: same; etag {}", letter_tag(n)),
+                    }],
+                    FinishReason::ToolUse,
+                )
+            })
+            .collect();
+        script.push(text("PROBE_REACHED_END".into(), FinishReason::EndTurn));
+        script
+    }
+
+    /// 14-verify5 long600 (b): the action guard steers after 100 repeated
+    /// (tool, arguments) calls and stops after 200, whatever the results.
+    #[test]
+    fn identical_call_with_letter_noise_is_steered_at_100_and_stopped_at_200() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("letter-noise");
+        let mut progress = ContinuationProgress::default();
+        let mut steer = None;
+        let mut limit = None;
+        for request in 1..=600usize {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => {
+                    assert!(steer.is_none(), "one steer per loop");
+                    let [note] = notes.as_slice() else {
+                        panic!("one steer: {notes:?}");
+                    };
+                    assert_eq!(note.guard, LoopGuardKindV1::RepeatedActions);
+                    assert_eq!(note.repeated_calls, 100);
+                    assert_eq!(note.stop_after, 100);
+                    steer = Some(request);
+                }
+                ToolLoopVerdict::Limit(details) => {
+                    assert_eq!(
+                        details,
+                        LoopLimitV1::RepeatedActions {
+                            repeated_calls: 200,
+                            suspect_after: 100,
+                            stop_after_suspected: 100,
+                        }
+                    );
+                    limit = Some(request);
+                    break;
+                }
+            }
+            read_call(
+                &mut progress,
+                "status.txt",
+                &format!("status: same; etag {}", letter_tag(request)),
+                request,
+            );
+            assert_eq!(progress.repeated_calls.count, 0, "every result is new");
+        }
+        assert_eq!(steer, Some(102));
+        assert_eq!(limit, Some(202));
+        assert_eq!(
+            simulate(identical_call_changing_result(600)),
+            Outcome::Stopped {
+                attempts: 201,
+                repeated_calls: true
+            }
+        );
+        // A 150-poll of a changing resource is steered once and completes.
+        assert_eq!(
+            simulate(identical_call_changing_result(150)),
+            Outcome::Completed {
+                attempts: 151,
+                suspected: 1
+            }
+        );
+    }
+
+    #[test]
+    fn distinct_work_and_cycles() {
+        let distinct: Vec<_> = (1..=200usize)
+            .map(|n| {
+                (
+                    vec![Step::Local {
+                        path: format!("part-{n}.txt"),
+                        contents: format!("Work item {n}: distinct contents."),
+                    }],
+                    FinishReason::ToolUse,
+                )
+            })
+            .chain([text("END".into(), FinishReason::EndTurn)])
+            .collect();
+        assert_eq!(
+            simulate(distinct),
+            Outcome::Completed {
+                attempts: 201,
+                suspected: 0
+            }
+        );
+        // An A,B,C cycle repeats (tool, arguments) and results after round 3.
+        let cycle: Vec<_> = (0..150usize)
+            .map(|n| {
+                (
+                    vec![Step::Local {
+                        path: ["A.txt", "B.txt", "C.txt"][n % 3].into(),
+                        contents: "same stable file contents".into(),
+                    }],
+                    FinishReason::ToolUse,
+                )
+            })
+            .collect();
+        assert_eq!(
+            simulate(cycle),
+            Outcome::Stopped {
+                attempts: 63,
+                repeated_calls: true
+            }
+        );
+        // The same cycle with letter-noise results is bounded by the action
+        // guard instead.
+        let noisy_cycle: Vec<_> = (0..600usize)
+            .map(|n| {
+                (
+                    vec![Step::Local {
+                        path: ["A.txt", "B.txt", "C.txt"][n % 3].into(),
+                        contents: format!("etag {}", letter_tag(n)),
+                    }],
+                    FinishReason::ToolUse,
+                )
+            })
+            .collect();
+        assert_eq!(
+            simulate(noisy_cycle),
+            Outcome::Stopped {
+                attempts: 203,
+                repeated_calls: true
+            }
+        );
+    }
+
+    #[test]
+    fn parallel_repeat_batch_is_steered_before_it_is_stopped() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("batch");
+        let mut progress = ContinuationProgress::default();
+        let batch = |progress: &mut ContinuationProgress, start: usize| {
+            let blocks: Vec<Block> = (start..start + 50)
+                .map(|n| Block::ToolCall {
+                    call_id: format!("p{n}"),
+                    name: "fs_read".into(),
+                    args: serde_json::json!({"path": "A.txt"}),
+                })
+                .collect();
+            let results: Vec<Message> = (start..start + 50)
+                .map(|n| Message::tool_result(format!("p{n}"), "same", false))
+                .collect();
+            progress.observe_local_tools(&blocks, &results);
+        };
+        batch(&mut progress, 0);
+        let ToolLoopVerdict::Suspected(notes) = progress.tool_loop_verdict(guard, &run_id) else {
+            panic!("steer first");
+        };
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].repeated_calls, 49);
+        assert_eq!(notes[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        batch(&mut progress, 50);
+        assert_eq!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Limit(LoopLimitV1::RepeatedToolCalls {
+                repeated_calls: 99,
+                suspect_after: 30,
+                stop_after_suspected: 30,
+            })
+        );
+    }
+
+    /// One local call with an optional screenshot image (by content address).
+    fn tool_call(
+        progress: &mut ContinuationProgress,
+        tool: &str,
+        args: serde_json::Value,
+        preview: &str,
+        image: Option<String>,
+        n: usize,
+    ) {
+        tool_call_receipt(
+            progress,
+            tool,
+            args,
+            preview,
+            image,
+            ToolResultStatus::Completed,
+            n,
+        );
+    }
+
+    fn tool_call_receipt(
+        progress: &mut ContinuationProgress,
+        tool: &str,
+        args: serde_json::Value,
+        preview: &str,
+        image: Option<String>,
+        status: ToolResultStatus,
+        n: usize,
+    ) {
+        let call_id = format!("ui-{n}");
+        let block = Block::ToolCall {
+            call_id: call_id.clone(),
+            name: tool.into(),
+            args,
+        };
+        let images = image
+            .map(|artifact| {
+                vec![haider_protocol::tool::ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{artifact}")),
+                    media_type: "image/png".into(),
+                    width: 1080,
+                    height: 2400,
+                    byte_len: 4096,
+                }]
+            })
+            .unwrap_or_default();
+        progress.observe_local_tools(
+            &[block],
+            &[Message::tool_result_with_receipt(
+                call_id, preview, false, images, status,
+            )],
+        );
+    }
+
+    fn swipe_args() -> serde_json::Value {
+        serde_json::json!({"action": "swipe", "from": {"x": 540, "y": 1800}, "to": {"x": 540, "y": 600}})
+    }
+
+    fn screenshot_args() -> serde_json::Value {
+        serde_json::json!({"action": "screenshot"})
+    }
+
+    #[test]
+    fn unsuccessful_screen_receipts_keep_the_ordinary_result_bound() {
+        for status in [
+            ToolResultStatus::Failed,
+            ToolResultStatus::Rejected,
+            ToolResultStatus::Conflict,
+            ToolResultStatus::Cancelled,
+            ToolResultStatus::Unknown,
+        ] {
+            for (tool, args, image) in [
+                ("mobile", serde_json::json!({"action": "a11y_tree"}), false),
+                (
+                    "mobile",
+                    serde_json::json!({"action": "inspect", "element_id": "row"}),
+                    false,
+                ),
+                (
+                    "computer",
+                    serde_json::json!({"action": "inspect", "x": 1, "y": 1}),
+                    false,
+                ),
+                ("mobile", screenshot_args(), false),
+                ("mobile", screenshot_args(), true),
+                ("computer", screenshot_args(), true),
+                ("mobile", swipe_args(), false),
+                (
+                    "computer",
+                    serde_json::json!({"action": "left_click", "x": 1, "y": 1}),
+                    false,
+                ),
+            ] {
+                let (stop, steers) = drive(240, |progress, request| {
+                    tool_call_receipt(
+                        progress,
+                        tool,
+                        args.clone(),
+                        &format!("Backend unavailable (attempt {request})"),
+                        image.then(|| format!("failed-frame-{request}")),
+                        status,
+                        request,
+                    );
+                });
+                assert!(
+                    matches!(stop, Some((62, LoopLimitV1::RepeatedToolCalls { .. }))),
+                    "{status:?} {tool} {args} image={image}: {stop:?}"
+                );
+                assert_eq!(steers.len(), 1, "{status:?} {tool} {args}");
+            }
+        }
+        // A completed screenshot without a reading and a legacy result with
+        // no receipt status cannot claim screen progress either.
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                screenshot_args(),
+                &format!("capture {request}"),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        let (stop, steers) = drive(240, |progress, request| {
+            let call_id = format!("legacy-{request}");
+            progress.observe_local_tools(
+                &[Block::ToolCall {
+                    call_id: call_id.clone(),
+                    name: "mobile".into(),
+                    args: serde_json::json!({"action": "a11y_tree"}),
+                }],
+                &[Message::tool_result(
+                    call_id,
+                    format!("row {request}"),
+                    false,
+                )],
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+    }
+
+    #[test]
+    fn navigation_needs_a_successful_changed_observation_first() {
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                swipe_args(),
+                &format!("page {request}"),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                swipe_args(),
+                &format!("page {}", letter_tag(request)),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        // A failed reading cannot activate navigation's exemption, even if
+        // its preview changes on every call.
+        let (stop, steers) = drive(240, |progress, request| {
+            if request == 1 {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    serde_json::json!({"action": "a11y_tree"}),
+                    "page 1",
+                    None,
+                    ToolResultStatus::Failed,
+                    request,
+                );
+            } else {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    swipe_args(),
+                    &format!("page {}", letter_tag(request)),
+                    None,
+                    ToolResultStatus::Completed,
+                    request,
+                );
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((203, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        // A prior valid observation does not excuse a later failed action.
+        let (stop, steers) = drive(240, |progress, request| {
+            if request == 1 {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    serde_json::json!({"action": "a11y_tree"}),
+                    "page 1",
+                    None,
+                    ToolResultStatus::Completed,
+                    request,
+                );
+            } else {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    swipe_args(),
+                    &format!("failed attempt {request}"),
+                    None,
+                    ToolResultStatus::Failed,
+                    request,
+                );
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((63, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+    }
+
+    /// Runs `calls` one per provider request; returns the first terminal
+    /// verdict with its request number, and the number of steers.
+    fn drive(
+        calls: usize,
+        mut call: impl FnMut(&mut ContinuationProgress, usize),
+    ) -> (Option<(usize, LoopLimitV1)>, Vec<LoopSuspectedV1>) {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("ui");
+        let mut progress = ContinuationProgress::default();
+        let mut steers = Vec::new();
+        for request in 1..=calls + 1 {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => steers.extend(notes),
+                ToolLoopVerdict::Limit(details) => return (Some((request, details)), steers),
+            }
+            if request <= calls {
+                call(&mut progress, request);
+            }
+        }
+        (None, steers)
+    }
+
+    /// Repair 7 ruling: 300 pages of mobile swipe + screenshot (identical
+    /// arguments, genuinely changing screenshots) is productive scrolling.
+    #[test]
+    fn mobile_swipe_screenshot_paging_300_pages_completes() {
+        let (stop, steers) = drive(600, |progress, request| {
+            let page = request.div_ceil(2);
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some(format!("page-{page}")),
+                    request,
+                );
+            }
+        });
+        assert_eq!(stop, None);
+        assert!(steers.is_empty(), "{steers:?}");
+        // Computer-use scroll + screenshot pages the same way.
+        let scroll = serde_json::json!({"action": "scroll", "x": 500, "y": 400, "direction": "down", "amount": 5});
+        let (stop, steers) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(
+                    progress,
+                    "computer",
+                    scroll.clone(),
+                    "scroll completed",
+                    None,
+                    request,
+                );
+            } else {
+                tool_call(
+                    progress,
+                    "computer",
+                    screenshot_args(),
+                    "screenshot",
+                    Some(format!("desk-{request}")),
+                    request,
+                );
+            }
+        });
+        assert_eq!(stop, None);
+        assert!(steers.is_empty(), "{steers:?}");
+    }
+
+    /// Identical screenshots (stuck at the end of a list) are still caught by
+    /// the result-level guard: steer before request 32, stop before 62.
+    #[test]
+    fn stuck_at_end_of_list_identical_screenshots_stop_at_61() {
+        let (stop, steers) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                "screenshot captured",
+                Some("list-end".into()),
+                request,
+            );
+        });
+        assert_eq!(
+            stop,
+            Some((
+                62,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        // Swipe + identical screenshot: both repeat after the two distinct
+        // call fingerprints are established.
+        let (stop, _) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some("list-end".into()),
+                    request,
+                );
+            }
+        });
+        // Swipe and screenshot establish two distinct fingerprints. The 62nd
+        // completed call makes 60 repeats, so the limit precedes request 63.
+        assert_eq!(
+            stop,
+            Some((
+                63,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+    }
+
+    fn a11y_tree_args() -> serde_json::Value {
+        serde_json::json!({"action": "a11y_tree"})
+    }
+
+    /// The daemon's typed `MobileOutput::A11yTree` preview for one list row
+    /// whose visible text is `text` (stable id, resource id and bounds, as
+    /// `mobile_transport` derives node ids from resource id + index).
+    fn numeric_tree(text: &str) -> String {
+        use haider_protocol::mobile::{A11yNode, MobileOutput, Point4};
+        let output = MobileOutput::A11yTree(vec![A11yNode {
+            id: "row1".into(),
+            text: Some(text.into()),
+            content_desc: None,
+            class: "android.widget.TextView".into(),
+            resource_id: Some("example:id/row".into()),
+            bounds: Point4 {
+                left: 0,
+                top: 100,
+                right: 100,
+                bottom: 150,
+            },
+        }]);
+        serde_json::to_string(&output).unwrap()
+    }
+
+    /// Astra final-review B1: swipe + accessibility-tree paging through rows
+    /// that differ only by numbers (IDs, prices, dates) is productive: no
+    /// steer and no stop from either the action or the result-level guard.
+    #[test]
+    fn mobile_numeric_a11y_tree_paging_300_pages_completes() {
+        assert_eq!(
+            crate::continuation_fingerprint::ui_step("mobile", &a11y_tree_args()),
+            Some(crate::continuation_fingerprint::UiStep::Observe { screenshot: false })
+        );
+        let renders: [fn(usize) -> String; 3] = [
+            |page| (100_000 + page).to_string(),
+            |page| format!("${}.{:02}", 10 + page, page % 100),
+            |page| format!("2026-09-{:02} 12:{:02} #{page}", 1 + page % 28, page % 60),
+        ];
+        for render in renders {
+            let (stop, steers) = drive(600, |progress, request| {
+                let page = request.div_ceil(2);
+                if request % 2 == 1 {
+                    tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+                } else {
+                    tool_call(
+                        progress,
+                        "mobile",
+                        a11y_tree_args(),
+                        &numeric_tree(&render(page)),
+                        None,
+                        request,
+                    );
+                }
+            });
+            assert_eq!(stop, None);
+            assert!(steers.is_empty(), "{steers:?}");
+        }
+    }
+
+    /// A truly identical numeric tree (stuck at the end of the list) still
+    /// repeats: steered before request 32, stopped before request 62. An
+    /// alternating swipe/tree loop first establishes two distinct calls.
+    #[test]
+    fn identical_numeric_a11y_tree_still_stops_at_61() {
+        let tree = numeric_tree("100042");
+        let (stop, steers) = drive(600, |progress, request| {
+            tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
+        });
+        assert_eq!(
+            stop,
+            Some((
+                62,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        let (stop, _) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
+            }
+        });
+        // Swipe and tree establish two distinct call fingerprints. The 62nd
+        // completed call makes 60 repeats, so the limit precedes request 63.
+        assert_eq!(
+            stop,
+            Some((
+                63,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+    }
+
+    /// Ordinary text-tool numeric polling keeps the accepted digit mask: an
+    /// identical call whose result changes only by free-standing numbers is
+    /// no progress, even when the text is the same JSON a tree would carry.
+    #[test]
+    fn ordinary_text_numeric_polling_is_still_masked() {
+        for (tool, args) in [
+            ("fs_read", serde_json::json!({"path": "status.txt"})),
+            (
+                "process_exec",
+                serde_json::json!({"command": "cat rows.json"}),
+            ),
+            (
+                "process_exec",
+                serde_json::json!({"action": "a11y_tree", "command": "cat rows.json"}),
+            ),
+            ("mobile_screenshot", a11y_tree_args()),
+        ] {
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    args.clone(),
+                    &format!("Completed files: {request}"),
+                    None,
+                    request,
+                );
+            });
+            assert_eq!(
+                stop,
+                Some((
+                    62,
+                    LoopLimitV1::RepeatedToolCalls {
+                        repeated_calls: 60,
+                        suspect_after: 30,
+                        stop_after_suspected: 30,
+                    }
+                )),
+                "{tool}"
+            );
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    args.clone(),
+                    &numeric_tree(&(100_000 + request).to_string()),
+                    None,
+                    request,
+                );
+            });
+            assert!(
+                matches!(stop, Some((62, LoopLimitV1::RepeatedToolCalls { .. }))),
+                "{tool}: {stop:?}"
+            );
+        }
+    }
+
+    /// A screen-step exemption needs the typed tool identity: the same
+    /// action strings inside another tool's arguments are ordinary calls,
+    /// and letter-noise on text tools still stops at 201 attempts.
+    #[test]
+    fn screen_step_exemption_is_typed_and_letter_noise_still_stops() {
+        for tool in ["process_exec", "fs_read", "mobile_screenshot"] {
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    screenshot_args(),
+                    &format!("status same; etag {}", letter_tag(request)),
+                    Some(letter_tag(request)),
+                    request,
+                );
+            });
+            assert!(
+                matches!(
+                    stop,
+                    Some((
+                        202,
+                        LoopLimitV1::RepeatedActions {
+                            repeated_calls: 200,
+                            ..
+                        }
+                    ))
+                ),
+                "{tool}: {stop:?}"
+            );
+        }
+        // An argument shape the mobile parser rejects is not a screen step.
+        let (stop, _) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                serde_json::json!({"action": "screenshot", "spoof": true}),
+                "error",
+                Some(letter_tag(request)),
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        // A screenshot without an image is not a reading: counted.
+        let (stop, _) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                &format!("capture failed {}", letter_tag(request)),
+                None,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(
+            simulate(identical_call_changing_result(600)),
+            Outcome::Stopped {
+                attempts: 201,
+                repeated_calls: true
+            }
+        );
+    }
+
+    /// Mixed computer-use + text cycle: changing screenshots are exempt, but
+    /// the identical text call with letter noise still reaches the action
+    /// limit after 200 of its own repeats; screen steps never reset it.
+    #[test]
+    fn mixed_screen_and_text_cycle_still_bounds_the_text_loop() {
+        let (stop, steers) = drive(1200, |progress, request| {
+            let round = request.div_ceil(3);
+            match request % 3 {
+                1 => tool_call(
+                    progress,
+                    "fs_read",
+                    serde_json::json!({"path": "status.txt"}),
+                    &format!("status same; etag {}", letter_tag(request)),
+                    None,
+                    request,
+                ),
+                2 => tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request),
+                _ => tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some(format!("frame-{round}")),
+                    request,
+                ),
+            }
+        });
+        // fs_read repeat #200 is call 3*200+1 = 601; the next request stops.
+        assert_eq!(
+            stop,
+            Some((
+                602,
+                LoopLimitV1::RepeatedActions {
+                    repeated_calls: 200,
+                    suspect_after: 100,
+                    stop_after_suspected: 100,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedActions);
+        assert_eq!(steers[0].tool.as_deref(), Some("fs_read"));
+        // Once the screen stops changing, screen steps count again.
+        let (stop, _) = drive(1200, |progress, request| match request % 3 {
+            1 => tool_call(
+                progress,
+                "fs_read",
+                serde_json::json!({"path": "status.txt"}),
+                &format!("status same; etag {}", letter_tag(request)),
+                None,
+                request,
+            ),
+            2 => tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request),
+            _ => tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                "screenshot captured",
+                Some("frozen".into()),
+                request,
+            ),
+        });
+        assert!(
+            matches!(stop, Some((request, LoopLimitV1::RepeatedActions { .. })) if request < 300),
+            "{stop:?}"
+        );
+    }
+
+    /// A parallel batch that crosses both steer thresholds at once gets both
+    /// steers, and each guard still needs its own further repeats to stop.
+    #[test]
+    fn parallel_batch_crossing_both_thresholds_steers_for_both() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("batch-both");
+        let mut progress = ContinuationProgress::default();
+        let blocks: Vec<Block> = (0..101)
+            .map(|n| Block::ToolCall {
+                call_id: format!("q{n}"),
+                name: "fs_read".into(),
+                args: serde_json::json!({"path": "A.txt"}),
+            })
+            .collect();
+        let results: Vec<Message> = (0..101)
+            .map(|n| Message::tool_result(format!("q{n}"), "same", false))
+            .collect();
+        progress.observe_local_tools(&blocks, &results);
+        let ToolLoopVerdict::Suspected(notes) = progress.tool_loop_verdict(guard, &run_id) else {
+            panic!("steers before any stop");
+        };
+        let kinds: Vec<_> = notes.iter().map(|note| note.guard).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LoopGuardKindV1::RepeatedToolCalls,
+                LoopGuardKindV1::RepeatedActions
+            ]
+        );
+        assert_eq!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Continue
+        );
+    }
+}
 /// Maximum time a provider-stream text, reasoning, or tool-argument delta may
 /// remain in memory before it is journaled. Contiguous deltas for one item and
 /// one variant coalesce during this window; every semantic boundary flushes
@@ -722,7 +2569,8 @@ pub const CONTEXT_STRUCTURAL_TIER_ONE_PERCENT: u64 = 60;
 /// to recover headroom first.
 pub const CONTEXT_STRUCTURAL_TIER_TWO_PERCENT: u64 = 75;
 /// Existing provider-summary boundary retained for compatibility.
-pub const CONTEXT_SUMMARY_TIER_PERCENT: u64 = 85;
+pub const CONTEXT_SUMMARY_TIER_PERCENT: u64 =
+    haider_protocol::context::CONTEXT_SUMMARY_TIER_PERCENT;
 pub const CONTEXT_STRUCTURAL_TIER_ONE_RETAINED_TOOL_PAIRS: usize = 24;
 pub const CONTEXT_STRUCTURAL_TIER_TWO_RETAINED_TOOL_PAIRS: usize = 12;
 
@@ -857,6 +2705,8 @@ pub struct HarnessConfig {
     /// workflows enable this bit so actor-owned tools cannot bypass a dynamic
     /// dispatcher grant merely by naming an unadvertised tool.
     pub enforce_advertised_tool_ceiling: bool,
+    /// Strip provider prose from durable failures for restricted providers.
+    pub provider_lockdown: bool,
     /// Local equivalents advertised after one exact provider-hosted-tool
     /// rejection. Empty means this provider has no safe fallback pack.
     pub provider_tool_fallback_tools: Vec<ToolDefinition>,
@@ -874,6 +2724,11 @@ pub struct HarnessConfig {
     shared_provider_local_web_tool_names: Arc<[String]>,
     /// CAS-backed attachments resolved before crossing the provider boundary.
     pub attachments: Vec<ResolvedAttachment>,
+    /// Typed record of the image elision the daemon's prompt compile already
+    /// applied to the submitted history. Every provider request merges it
+    /// with its own projection, so a rewrite made before the actor saw the
+    /// history still reaches adapters as a typed fact.
+    pub prompt_image_projection: ToolResultImageProjection,
     /// Whether the resolved provider/model accepts vision inputs. Unsupported
     /// providers receive artifact-naming placeholders for tool images.
     pub tool_result_images_supported: bool,
@@ -954,11 +2809,9 @@ pub struct HarnessConfig {
     pub interaction_policy: InteractionResolutionPolicy,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
-    /// Hard ceiling on provider requests made by one logical turn.
-    pub max_provider_requests_per_turn: usize,
-    /// Warn the model once after this many logical requests. Transport retries
-    /// do not spend another request. A fresh continuation turn resets the budget.
-    pub provider_request_tranche: usize,
+    /// Optional logical provider-request policy for one turn. Absence is
+    /// unbounded; transport retries never spend another logical request.
+    pub provider_request_budget: Option<RequestBudgetV1>,
     /// Headless workspace for durable pre/post tree receipts at the hard cap.
     /// Embedders without a workspace leave this absent.
     pub ceiling_workspace: Option<std::path::PathBuf>,
@@ -981,8 +2834,15 @@ pub struct HarnessConfig {
     /// cumulative baseline. Keep each durable response snapshot request-local
     /// while retaining cumulative accounting inside the actor.
     pub recovery_request_local_usage: bool,
-    /// Independent guard against providers repeatedly exhausting output.
+    /// Maximum consecutive MaxTokens/PauseTurn finishes without distinct
+    /// assistant content or a new completed local/provider-side tool result.
     pub max_continuations_per_turn: usize,
+    /// Tool-loop guards: consecutive calls that repeat an earlier call and
+    /// result (30/30 by default), or an earlier (tool, arguments) pair
+    /// whatever the result (100/100), first receive a typed
+    /// `loop_suspected_v1` steer and later end in `loop_limit`. Assistant
+    /// text resets neither. `None` disables both (opt-out).
+    pub tool_loop_guard: Option<ToolLoopGuardV1>,
     /// Maximum number of submissions parked behind the active turn.
     pub deferred_command_capacity: usize,
     /// Daemon supervisors close/reconcile their effect broker before writing
@@ -1055,6 +2915,7 @@ impl HarnessConfig {
             tool_exposure: None,
             tool_pack_digest: None,
             enforce_advertised_tool_ceiling: false,
+            provider_lockdown: false,
             provider_tool_fallback_tools: Vec::new(),
             shared_provider_tool_fallback_tools: None,
             provider_tool_fallback_digest: None,
@@ -1064,6 +2925,7 @@ impl HarnessConfig {
             provider_local_web_tools: Vec::new(),
             shared_provider_local_web_tool_names: Arc::default(),
             attachments: Vec::new(),
+            prompt_image_projection: ToolResultImageProjection::default(),
             tool_result_images_supported: false,
             usage_account: None,
             account_incarnation: None,
@@ -1094,8 +2956,7 @@ impl HarnessConfig {
             interaction_policy: InteractionResolutionPolicy::default(),
             command_capacity: 8,
             broadcast_capacity: 128,
-            max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
-            provider_request_tranche: 32,
+            provider_request_budget: None,
             ceiling_workspace: None,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
@@ -1104,6 +2965,7 @@ impl HarnessConfig {
             provider_request_attempt_recorder: None,
             recovery_request_local_usage: false,
             max_continuations_per_turn: DEFAULT_MAX_CONTINUATIONS_PER_TURN,
+            tool_loop_guard: Some(ToolLoopGuardV1::default()),
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             supervisor_commits_cancelled: false,
             prompt_retraction_enabled: false,
@@ -1896,6 +3758,9 @@ pub struct ContextCompactionRequest<'a> {
     pub covered_messages: Vec<Message>,
     pub retained_messages: Vec<Message>,
     pub attachments: Vec<haider_provider::ResolvedAttachment>,
+    /// Typed image-elision record of `covered_messages` (the actor's exact
+    /// provider projection), carried onto the summary request.
+    pub image_projection: ToolResultImageProjection,
     pub latest_compaction_summary_end: Option<usize>,
     pub economy_before: &'a ContextEconomy,
 }
@@ -2790,6 +4655,10 @@ pub struct HarnessActor {
     /// when providers interleave item kinds.
     pending_item_delta: Option<PendingItemDelta>,
     pending_item_delta_deadline: Option<tokio::time::Instant>,
+    /// What the latest provider request carried (model id, tool-call ids):
+    /// the only values a provider error template may echo in its
+    /// `{model}` / `{tool_call_id}` slots.
+    provider_slot_evidence: haider_provider::ProviderSlotEvidence,
 }
 
 /// See [`HarnessActor::plan`].
@@ -2875,6 +4744,7 @@ impl HarnessActor {
                 next_node: 0,
                 next_menu: 0,
                 tree_head_initialized: false,
+                provider_slot_evidence: haider_provider::ProviderSlotEvidence::default(),
                 tree_head: None,
                 deferred_commands: VecDeque::new(),
                 pending_nudges: Vec::new(),
@@ -2890,7 +4760,7 @@ impl HarnessActor {
     async fn resolve_tool_result_images(
         &mut self,
         messages: &mut [Message],
-    ) -> Result<Vec<ResolvedAttachment>, HaiderError> {
+    ) -> Result<(Vec<ResolvedAttachment>, ToolResultImageProjection), HaiderError> {
         let mut attachments = self.config.attachments.clone();
         let images_supported = self.config.tool_result_images_supported;
 
@@ -2965,10 +4835,11 @@ impl HarnessActor {
             ));
         }
 
-        apply_tool_result_image_budget(messages);
+        let mut projection = apply_tool_result_image_budget(messages);
+        projection.merge(&self.config.prompt_image_projection);
         if !images_supported {
             degrade_tool_result_images_to_placeholders(messages);
-            return Ok(attachments);
+            return Ok((attachments, projection));
         }
 
         let mut requested = Vec::<ImageBlockRef>::new();
@@ -2990,7 +4861,7 @@ impl HarnessActor {
         }
         if requested.is_empty() {
             self.resolved_tool_images.clear();
-            return Ok(attachments);
+            return Ok((attachments, projection));
         }
         let Some(reader) = reader else {
             return Err(tool_image_corrupt(
@@ -3036,7 +4907,7 @@ impl HarnessActor {
                 attachments.push(resolved.clone());
             }
         }
-        Ok(attachments)
+        Ok((attachments, projection))
     }
 
     /// Validates every tool-produced image before its ref can enter the
@@ -3305,7 +5176,8 @@ impl HarnessActor {
         // original spelling from the already-durable provider Start markers
         // only on resume; ordinary turns perform no extra journal reads.
         let mut recovered_names = HashMap::new();
-        let mut malformed_tool_pending_repair = false;
+        let mut tool_call_repair_pending = false;
+        let mut consecutive_output_truncations = 0_u8;
         let recovery_calls: HashSet<&str> =
             checkpoint
                 .iter()
@@ -3323,7 +5195,11 @@ impl HarnessActor {
             || child_wait.is_some()
             || self.config.provider_requests_already_made > 0
         {
-            (recovered_names, malformed_tool_pending_repair) = match self
+            (
+                recovered_names,
+                tool_call_repair_pending,
+                consecutive_output_truncations,
+            ) = match self
                 .recover_tool_repair_state(&run_id, &recovery_calls)
                 .await
             {
@@ -3680,7 +5556,7 @@ impl HarnessActor {
         // Recovery reuses the durable warning, including its exact prompt text.
         // Only recovery pays for a journal scan; fresh turns start with no note.
         let mut soft_bound_emitted = false;
-        if restore_budget {
+        if restore_budget && self.config.provider_request_budget.is_some() {
             match self.restore_request_budget(&run_id).await {
                 Ok((used, note)) => {
                     provider_request_count = provider_request_count.max(used);
@@ -3694,7 +5570,7 @@ impl HarnessActor {
                 Err(error) => return self.errored_state_outcome(&run_id, error).await,
             }
         }
-        let mut continuation_count = 0usize;
+        let mut continuation_progress = ContinuationProgress::default();
         let (workspace_before, mut pending_workspace_receipt) = match self
             .prepare_ceiling_workspace(&run_id, restore_budget, &cancel)
             .await
@@ -3713,6 +5589,10 @@ impl HarnessActor {
                 .await;
         }
         let mut forced_compaction_used = false;
+        // A provider may reject `max_tokens` as larger than the model allows
+        // and state its maximum. Retry ONCE per turn at that maximum; a
+        // second rejection surfaces normally, so this can never loop.
+        let mut output_limit_retry_used = false;
         // Once an ineffective compaction promotes this turn, later request
         // rounds may use the larger hard budget but must never compact again.
         let mut compaction_guard_consumed = false;
@@ -3824,8 +5704,10 @@ impl HarnessActor {
                     }
                     StreamEvent::ToolCallEnd { call_id } => {
                         if let Some(tool) = completed_tools.remove(call_id) {
-                            let invalid =
-                                tool.result.as_ref().is_some_and(invalid_tool_call_result);
+                            let invalid = tool
+                                .result
+                                .as_ref()
+                                .is_some_and(repairable_tool_call_result);
                             assistant_blocks.push(Block::ToolCall {
                                 call_id: tool.call_id.clone(),
                                 name: tool.name.clone(),
@@ -3837,11 +5719,12 @@ impl HarnessActor {
                             });
                             if let Some(result) = tool.result.as_ref() {
                                 let projection = model_tool_result_projection(&tool.name, result);
-                                tool_results.push(Message::tool_result_with_images(
+                                tool_results.push(Message::tool_result_with_receipt(
                                     tool.call_id.clone(),
                                     projection.preview,
                                     projection.truncated,
                                     result.images.clone(),
+                                    result.status,
                                 ));
                             }
                         }
@@ -3874,12 +5757,15 @@ impl HarnessActor {
             }
         }
         'requests: loop {
-            if provider_attempt == 0 {
-                let budget = self.request_budget();
+            continuation_progress.begin_response();
+            if provider_attempt == 0
+                && let Some(budget) = self.config.provider_request_budget
+            {
                 if !soft_bound_emitted && provider_request_count >= budget.tranche {
                     let status = self.request_budget_status(
                         &run_id,
                         provider_request_count,
+                        budget,
                         RequestBudgetPhaseV1::SoftBound,
                     );
                     if let Err(error) = self.commit_request_budget_note(&run_id, &status).await {
@@ -3898,6 +5784,7 @@ impl HarnessActor {
                     let status = self.request_budget_status(
                         &run_id,
                         provider_request_count,
+                        budget,
                         RequestBudgetPhaseV1::HardBound,
                     );
                     let mut error = request_budget_error(&status);
@@ -3929,6 +5816,40 @@ impl HarnessActor {
                             error,
                         )
                         .await;
+                }
+            }
+            if provider_attempt == 0
+                && let Some(guard) = self.config.tool_loop_guard
+            {
+                match continuation_progress.tool_loop_verdict(guard, &run_id) {
+                    ToolLoopVerdict::Continue => {}
+                    ToolLoopVerdict::Suspected(notes) => {
+                        for note in notes {
+                            if let Err(error) =
+                                self.commit_loop_suspected_note(&run_id, &note).await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            messages.push(Message::user_text(note.model_note()));
+                        }
+                    }
+                    ToolLoopVerdict::Limit(details) => {
+                        if let Err(error) = self
+                            .commit_pending_thinking(&run_id, &mut thinking_pending)
+                            .await
+                        {
+                            return self.errored_state_outcome(&run_id, error).await;
+                        }
+                        return self
+                            .errored_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                tool_loop_limit_error(details),
+                            )
+                            .await;
+                    }
                 }
             }
             // The exhausted logical cap takes precedence over route refresh:
@@ -4208,7 +6129,8 @@ impl HarnessActor {
                 });
             let request_images_will_mutate = !self.config.tool_result_images_supported
                 || request_image_count > TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
-                || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN;
+                || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN
+                || has_stale_computer_screenshots(&request_messages);
             let mut request_only_tool_results =
                 if request_images_will_mutate {
                     request_messages
@@ -4233,6 +6155,14 @@ impl HarnessActor {
                 } else {
                     Vec::new()
                 };
+            // Image budgeting is request-local: durable history and its CAS
+            // refs are restored as soon as the stream opens. Computer-history
+            // elision, count/byte budgeting, and unsupported-image fallback
+            // can each rewrite previously sent provider bytes. Declare every
+            // such projection as a provider-view epoch rather than treating
+            // the rewritten prefix as append-only cache history.
+            let request_image_projection_epoch =
+                request_images_will_mutate.then(|| digest_json(&request_only_tool_results));
             let snapshot_insert_at = current_turn_start.min(request_messages.len());
             let mut request_stable_history_end = stable_history_end.min(request_messages.len());
             let mut request_cacheable_history_end =
@@ -4259,9 +6189,9 @@ impl HarnessActor {
             // the compatibility fallback instead of serializing P twice.
             let mut prefix_digests = usage_prefix_digests(&self.config, &[]);
             prefix_digests.immutable_history.clear();
-            let request_attachments =
+            let (request_attachments, request_image_projection) =
                 match self.resolve_tool_result_images(&mut request_messages).await {
-                    Ok(attachments) => attachments,
+                    Ok(resolved) => resolved,
                     Err(error) => {
                         if let Err(state_error) = self
                             .commit_pending_thinking(&run_id, &mut thinking_pending)
@@ -4280,6 +6210,10 @@ impl HarnessActor {
                             .await;
                     }
                 };
+            let request_view_snapshot = combine_provider_view_epochs(
+                volatile_context_epoch.as_deref(),
+                request_image_projection_epoch.as_deref(),
+            );
             // Cache metadata must exist before provider preparation, so this
             // is the last provider-neutral request-send boundary available to
             // the TTL selector. Sample every request at this same boundary;
@@ -4304,7 +6238,7 @@ impl HarnessActor {
                 },
                 prefix_digests.clone(),
                 usage_account.as_ref(),
-                volatile_context_epoch.as_deref(),
+                request_view_snapshot.as_deref(),
             );
             // Built-in adapters render directly from the daemon's Arc-backed
             // definitions. Standalone/injected providers retain the owned Vec
@@ -4323,7 +6257,10 @@ impl HarnessActor {
                 tools: request_tools,
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
+                tool_result_image_projection: request_image_projection,
             };
+            self.provider_slot_evidence =
+                haider_provider::ProviderSlotEvidence::from_request(&provider_request);
             let projected_input_tokens =
                 estimate_if_budget_guarded(self.config.provider_budget_guard.as_deref(), || {
                     estimate_provider_request_input_tokens(
@@ -4453,7 +6390,7 @@ impl HarnessActor {
                 },
                 prefix_digests.clone(),
                 usage_account.as_ref(),
-                volatile_context_epoch.as_deref(),
+                request_view_snapshot.as_deref(),
             );
             provider_request.cache_metadata = Some(cache_metadata.clone());
             if let Some(provider_view) = prepared
@@ -4618,13 +6555,20 @@ impl HarnessActor {
                         cache: request_attempt_data,
                         response_epoch: replay.response_epoch,
                         workspace_receipt: pending_workspace_receipt.take(),
-                        request_budget: (provider_attempt == 1).then(|| {
-                            self.request_budget_status(
-                                &run_id,
-                                provider_request_count,
-                                RequestBudgetPhaseV1::Progress,
-                            )
-                        }),
+                        // Progress is recorded once per logical request
+                        // (first attempt) and only under an explicit policy.
+                        request_budget: self
+                            .config
+                            .provider_request_budget
+                            .filter(|_| provider_attempt == 1)
+                            .map(|budget| {
+                                self.request_budget_status(
+                                    &run_id,
+                                    provider_request_count,
+                                    budget,
+                                    RequestBudgetPhaseV1::Progress,
+                                )
+                            }),
                     },
                     &mut thinking_pending,
                 )
@@ -4922,6 +6866,13 @@ impl HarnessActor {
                 if opened.is_err() {
                     drop(provider_budget_permit.take());
                 }
+                // Corroborate template slots with what this request carried
+                // before any consumer (output-limit retry, recovery card,
+                // RunFailed) reads the error.
+                let opened = opened.map_err(|mut error| {
+                    error.corroborate_slots(&self.provider_slot_evidence);
+                    error
+                });
                 match opened {
                     Ok(stream) => {
                         if let (Some(trace), Some(started)) =
@@ -4936,6 +6887,33 @@ impl HarnessActor {
                             );
                         }
                         break stream;
+                    }
+                    Err(error)
+                        if !output_limit_retry_used
+                            && haider_provider::provider_stated_output_limit(
+                                &error,
+                                self.config.max_tokens,
+                            )
+                            .is_some() =>
+                    {
+                        output_limit_retry_used = true;
+                        if let Some(stated) = haider_provider::provider_stated_output_limit(
+                            &error,
+                            self.config.max_tokens,
+                        ) {
+                            tracing::info!(
+                                requested = self.config.max_tokens,
+                                provider_maximum = stated,
+                                "provider rejected max_tokens as too large; retrying once at its stated maximum"
+                            );
+                            self.config.max_tokens = stated;
+                        }
+                        provider_attempt = 0;
+                        replay.reset_for_next_request();
+                        refusal_reason.clear();
+                        assistant_blocks.clear();
+                        tool_results.clear();
+                        continue 'requests;
                     }
                     Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {
                         let compacted = if request_projection_compacted || compaction_guard_consumed
@@ -5374,11 +7352,16 @@ impl HarnessActor {
                         )
                         .await;
                 }
-                let next = next.unwrap_or_else(|| {
-                    Err(provider_stream_interrupted(
-                        "provider stream closed before a finish event",
-                    ))
-                });
+                let next = next
+                    .unwrap_or_else(|| {
+                        Err(provider_stream_interrupted(
+                            "provider stream closed before a finish event",
+                        ))
+                    })
+                    .map_err(|mut error| {
+                        error.corroborate_slots(&self.provider_slot_evidence);
+                        error
+                    });
                 let event = match next {
                     Ok(event) => {
                         if !first_provider_event_seen {
@@ -5399,6 +7382,54 @@ impl HarnessActor {
                             provider_content_seen = true;
                         }
                         event
+                    }
+                    Err(error)
+                        if !output_limit_retry_used
+                            && !provider_content_seen
+                            && haider_provider::provider_stated_output_limit(
+                                &error,
+                                self.config.max_tokens,
+                            )
+                            .is_some() =>
+                    {
+                        if let Err(error) = release_provider_budget_request(
+                            self.config.provider_budget_guard.as_ref(),
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            request_usage.is_some(),
+                            &mut provider_budget_permit,
+                        )
+                        .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::from(error),
+                                )
+                                .await;
+                        }
+                        output_limit_retry_used = true;
+                        if let Some(stated) = haider_provider::provider_stated_output_limit(
+                            &error,
+                            self.config.max_tokens,
+                        ) {
+                            tracing::info!(
+                                requested = self.config.max_tokens,
+                                provider_maximum = stated,
+                                "provider rejected max_tokens as too large; retrying once at its stated maximum"
+                            );
+                            self.config.max_tokens = stated;
+                        }
+                        provider_attempt = 0;
+                        replay.reset_for_next_request();
+                        refusal_reason.clear();
+                        assistant_blocks.clear();
+                        tool_results.clear();
+                        continue 'requests;
                     }
                     Err(error)
                         if error.kind == ProviderErrorKind::ContextExceeded
@@ -5639,7 +7670,11 @@ impl HarnessActor {
                                 .await;
                         }
                         if message.as_ref().is_some_and(|partial| !partial.is_empty()) {
-                            let presentation = stream_interruption_presentation(&error);
+                            let mut presentation = stream_interruption_presentation(&error);
+                            apply_provider_detail_lockdown(
+                                self.config.provider_lockdown,
+                                &mut presentation,
+                            );
                             let (source_item, partial) = match self
                                 .complete_incomplete_message(
                                     &run_id,
@@ -5968,7 +8003,7 @@ impl HarnessActor {
                                 // Persist the reset before dispatch, including deferred tools.
                                 // Their results may arrive after a later malformed frame, so
                                 // result-completion order cannot reconstruct frame validity.
-                                if malformed_tool_pending_repair {
+                                if tool_call_repair_pending {
                                     if let Err(error) = self
                                         .commit_hidden_extension_marker(
                                             &run_id,
@@ -5987,7 +8022,7 @@ impl HarnessActor {
                                             )
                                             .await;
                                     }
-                                    malformed_tool_pending_repair = false;
+                                    tool_call_repair_pending = false;
                                 }
                                 assistant_blocks.push(block);
                                 let is_script = tools.iter().any(|tool| {
@@ -6175,7 +8210,7 @@ impl HarnessActor {
                                         &mut tools,
                                         &call_id,
                                         &error,
-                                        !malformed_tool_pending_repair,
+                                        !tool_call_repair_pending,
                                     )
                                     .await
                                 {
@@ -6192,7 +8227,7 @@ impl HarnessActor {
                                             .await;
                                     }
                                 };
-                                if malformed_tool_pending_repair {
+                                if tool_call_repair_pending {
                                     return self
                                         .provider_failure_outcome_with_items(
                                             &run_id,
@@ -6203,7 +8238,7 @@ impl HarnessActor {
                                         )
                                         .await;
                                 }
-                                malformed_tool_pending_repair = true;
+                                tool_call_repair_pending = true;
                                 assistant_blocks.push(block);
                                 Ok(Some(result))
                             }
@@ -6240,6 +8275,9 @@ impl HarnessActor {
                         let (name, args) = server_calls
                             .remove(&call_id)
                             .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null));
+                        let result_preview = preview.clone();
+                        let result_name = name.clone();
+                        let result_args = args.clone();
                         async {
                             self.complete_text(&run_id, &mut message, false).await?;
                             self.complete_text(&run_id, &mut reasoning, true).await?;
@@ -6276,6 +8314,12 @@ impl HarnessActor {
                                 &run_id, &call_id, name, args, status, &result,
                             )
                             .await?;
+                            continuation_progress.observe_server_tool(
+                                &result_name,
+                                &result_args,
+                                &result_preview,
+                                is_error,
+                            );
                             Ok(None)
                         }
                         .await
@@ -6583,6 +8627,93 @@ impl HarnessActor {
                                     .await;
                             }
                         }
+                        if reason == FinishReason::MaxTokens {
+                            match self
+                                .close_output_limited_tool_calls(
+                                    &run_id,
+                                    &mut tools,
+                                    &mut assistant_blocks,
+                                    &mut tool_results,
+                                    actor_tool_repair::repeated_output_truncation_on_next(
+                                        consecutive_output_truncations,
+                                    ),
+                                )
+                                .await
+                            {
+                                Ok(false) => {
+                                    if consecutive_output_truncations != 0 {
+                                        if let Err(error) = self
+                                            .commit_hidden_extension_marker(
+                                                &run_id,
+                                                OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND,
+                                                serde_json::json!({ "count": 0 }),
+                                            )
+                                            .await
+                                        {
+                                            return self
+                                                .drive_error_outcome_with_items(
+                                                    &run_id,
+                                                    &mut message,
+                                                    &mut reasoning,
+                                                    &mut tools,
+                                                    DriveError::Store(error),
+                                                )
+                                                .await;
+                                        }
+                                        consecutive_output_truncations = 0;
+                                    }
+                                }
+                                Ok(true) => {
+                                    consecutive_output_truncations =
+                                        actor_tool_repair::advance_output_truncation_count(
+                                            consecutive_output_truncations,
+                                        );
+                                    if let Err(error) = self.commit_hidden_extension_marker(
+                                        &run_id,
+                                        OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND,
+                                        serde_json::json!({ "count": consecutive_output_truncations }),
+                                    ).await {
+                                        return self.drive_error_outcome_with_items(
+                                            &run_id, &mut message, &mut reasoning, &mut tools,
+                                            DriveError::Store(error),
+                                        ).await;
+                                    }
+                                }
+                                Err(error) => {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        if reason != FinishReason::MaxTokens && consecutive_output_truncations != 0
+                        {
+                            if let Err(error) = self
+                                .commit_hidden_extension_marker(
+                                    &run_id,
+                                    OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND,
+                                    serde_json::json!({ "count": 0 }),
+                                )
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await;
+                            }
+                            consecutive_output_truncations = 0;
+                        }
                         if !buffered_script_calls.is_empty() {
                             let local_call_count = assistant_blocks
                                 .iter()
@@ -6784,6 +8915,7 @@ impl HarnessActor {
                                     .await;
                             }
                         }
+                        continuation_progress.observe_assistant_text(&assistant_blocks);
                         let current_assistant_message_index = if !assistant_blocks.is_empty() {
                             let index = messages.len();
                             messages
@@ -6847,6 +8979,10 @@ impl HarnessActor {
                                     .await;
                             }
                             provider_attempt = 0;
+                            if let Some(index) = current_assistant_message_index {
+                                continuation_progress
+                                    .observe_local_tools(&messages[index].blocks, &tool_results);
+                            }
                             messages.append(&mut tool_results);
                             thinking_pending = true;
                             replay.reset_for_next_request();
@@ -6855,11 +8991,11 @@ impl HarnessActor {
                             continue 'requests;
                         }
                         // W-B (LW2): `pause_turn` shares the MaxTokens
-                        // continuation machinery (checkpoint + cap), but the
+                        // continuation machinery (checkpoint + no-progress cap), but the
                         // paused assistant message is resent UNCHANGED — no
                         // synthesized user nudge joins the conversation.
                         if reason == FinishReason::MaxTokens || reason == FinishReason::PauseTurn {
-                            continuation_count = continuation_count.saturating_add(1);
+                            let continuation_count = continuation_progress.charge();
                             if continuation_count > self.config.max_continuations_per_turn {
                                 return self
                                     .errored_outcome_with_items(
@@ -8007,7 +10143,7 @@ impl HarnessActor {
         // Round 5: resolve tool-result images exactly as the live lane does
         // — the compactor's replay must be the bytes the provider actually
         // saw, attachments included.
-        let attachments = self
+        let (attachments, image_projection) = self
             .resolve_tool_result_images(&mut covered)
             .await
             .map_err(DriveError::Store)?;
@@ -8018,6 +10154,7 @@ impl HarnessActor {
                 covered_messages: covered,
                 retained_messages: suffix.clone(),
                 attachments,
+                image_projection,
                 latest_compaction_summary_end,
                 economy_before: &self.config.context_economy,
             })
@@ -8302,21 +10439,24 @@ impl HarnessActor {
             .retry_after_ms
             .is_some_and(|delay| delay > MAX_PROVIDER_RETRY_AFTER_MS)
         {
-            let capped = ProviderError {
-                kind: error.kind,
-                message: format!(
+            let mut capped = ProviderError::new(
+                error.kind,
+                format!(
                     "provider retry-after {}ms exceeds the {}ms respect cap",
                     error.retry_after_ms.unwrap_or_default(),
                     MAX_PROVIDER_RETRY_AFTER_MS
                 ),
-                retryable: true,
-                retry_after_ms: error.retry_after_ms,
-                opened_within_ms: error.opened_within_ms,
-                budget_ms: error.budget_ms,
-                timeout_reason: error.timeout_reason,
-                idle_timeout: error.idle_timeout.clone(),
-                presentation: error.presentation.clone(),
-            };
+            )
+            .with_presentation(error.presentation.clone());
+            capped.retryable = true;
+            capped.retry_after_ms = error.retry_after_ms;
+            capped.opened_within_ms = error.opened_within_ms;
+            capped.budget_ms = error.budget_ms;
+            capped.timeout_reason = error.timeout_reason;
+            capped.idle_timeout.clone_from(&error.idle_timeout);
+            capped
+                .provider_raw_detail
+                .clone_from(&error.provider_raw_detail);
             return Err(DriveError::Provider(capped));
         }
         let reason = match error.kind {
@@ -8562,9 +10702,11 @@ impl HarnessActor {
         &self,
         run_id: &RunId,
         calls: &HashSet<&str>,
-    ) -> Result<(HashMap<String, String>, bool), HaiderError> {
+    ) -> Result<(HashMap<String, String>, bool, u8), HaiderError> {
         let mut names = HashMap::new();
         let mut pending_repair = false;
+        let mut consecutive_output_truncations = 0_u8;
+        let mut unmarked_output_truncation = false;
         let mut cursor = 0;
         loop {
             let page = self
@@ -8579,7 +10721,13 @@ impl HarnessActor {
                 )
                 .await?;
             if page.is_empty() {
-                return Ok((names, pending_repair));
+                if unmarked_output_truncation {
+                    consecutive_output_truncations =
+                        actor_tool_repair::advance_output_truncation_count(
+                            consecutive_output_truncations,
+                        );
+                }
+                return Ok((names, pending_repair, consecutive_output_truncations));
             }
             for event in page {
                 cursor = event.seq;
@@ -8591,14 +10739,35 @@ impl HarnessActor {
                 };
                 match payload {
                     EventPayload::ToolResult { result, .. }
-                        if invalid_tool_call_result(&result) =>
+                        if consumes_malformed_tool_strike(&result) =>
                     {
                         pending_repair = true
+                    }
+                    EventPayload::ToolResult { result, .. }
+                        if matches!(
+                            result.data,
+                            Some(
+                                haider_protocol::tool::ToolResultData::OutputLimitTruncation { .. }
+                            )
+                        ) =>
+                    {
+                        unmarked_output_truncation = true;
                     }
                     EventPayload::Item(ItemEvent::Completed {
                         item: TurnItem::Extension { kind, .. },
                         ..
                     }) if kind == TOOL_CALL_REPAIR_RESET_EXTENSION_KIND => pending_repair = false,
+                    EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { kind, data },
+                        ..
+                    }) if kind == OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND => {
+                        consecutive_output_truncations = data
+                            .get("count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                            .min(3) as u8;
+                        unmarked_output_truncation = false;
+                    }
                     EventPayload::Item(ItemEvent::Completed {
                         item: TurnItem::Extension { kind, data },
                         ..
@@ -8793,69 +10962,13 @@ impl HarnessActor {
         self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
             .await?;
         tools.remove(index);
-        Ok(Message::tool_result(call_id, result.preview, false))
-    }
-
-    /// Closes a provider-authored tool call whose streamed argument buffer is
-    /// not a JSON object. Commit the failed call/result pair before permitting
-    /// one repair continuation. Raw arguments remain in the journal; the model
-    /// receives an empty object paired with an explicit invalid-call result.
-    async fn close_malformed_tool_failure(
-        &mut self,
-        run_id: &RunId,
-        tools: &mut Vec<ToolAccumulator>,
-        call_id: &str,
-        error: &ProviderError,
-        repaired: bool,
-    ) -> Result<(Block, Message), DriveError> {
-        let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
-            return Err(DriveError::Provider(provider_protocol_error(format!(
-                "provider ended unknown tool call `{call_id}`",
-            ))));
-        };
-        let tool = &tools[index];
-        let diagnostic = serde_json::json!({
-            "status": "failed",
-            "error": {
-                "kind": "invalid_tool_call",
-                "tool": tool.name,
-                "message": error.message,
-                "repair": "Resend the tool call with valid JSON object arguments matching its schema. A second consecutive malformed call terminates the run.",
-            },
-        });
-        let result = BoundedResult {
-            preview: diagnostic.to_string(),
-            truncated: false,
-            truncation: None,
-            effects: Vec::new(),
-            data: Some(haider_protocol::tool::ToolResultData::InvalidToolCall {
-                tool: tool.name.clone(),
-                message: error.message.clone(),
-                repaired: Some(repaired),
-            }),
-            artifact: None,
-            images: Vec::new(),
-            cursor: None,
-            status: ToolResultStatus::Failed,
-            reason: Some(error.message.clone()),
-            presentation: Some(tool_error_presentation(
-                "invalid-tool-call",
-                "Invalid tool call",
-                &error.message,
-            )),
-            orchestration: None,
-        };
-        let result = tool.correct_result(result);
-        self.commit_tool_result_and_completion(run_id, tool, &result)
-            .await?;
-        let block = Block::ToolCall {
-            call_id: tool.call_id.clone(),
-            name: tool.name.clone(),
-            args: serde_json::json!({}),
-        };
-        let message = Message::tool_result(tool.call_id.clone(), result.preview, false);
-        tools.remove(index);
-        Ok((block, message))
+        Ok(Message::tool_result_with_receipt(
+            call_id,
+            result.preview,
+            false,
+            result.images,
+            result.status,
+        ))
     }
 
     /// Closes the matching tool item for a provider `ToolCallEnd`.
@@ -8945,11 +11058,15 @@ impl HarnessActor {
             self.commit_tool_result_and_completion(run_id, &tools[index], &result)
                 .await?;
             tools.remove(index);
-            return Ok(CompletedTool::Continue(Some(Message::tool_result(
-                call_id,
-                result.preview,
-                false,
-            ))));
+            return Ok(CompletedTool::Continue(Some(
+                Message::tool_result_with_receipt(
+                    call_id,
+                    result.preview,
+                    false,
+                    result.images,
+                    result.status,
+                ),
+            )));
         }
         if tools[index].name == "task_outcome" {
             return self
@@ -9041,11 +11158,12 @@ impl HarnessActor {
             let projection = model_tool_result_projection(&tools[index].name, &result);
             tools.remove(index);
             return Ok(CompletedTool::Continue(Some(
-                Message::tool_result_with_images(
+                Message::tool_result_with_receipt(
                     call_id,
                     projection.preview,
                     projection.truncated,
                     result.images,
+                    result.status,
                 ),
             )));
         }
@@ -9541,11 +11659,12 @@ impl HarnessActor {
         self.commit_tool_result_and_completion(run_id, &tools[index], &result)
             .await?;
         tools.remove(index);
-        Ok(Message::tool_result_with_images(
+        Ok(Message::tool_result_with_receipt(
             call_id,
             result.preview,
             result.truncated,
             result.images,
+            result.status,
         ))
     }
 
@@ -9976,11 +12095,12 @@ impl HarnessActor {
             .await?;
         let projection = model_tool_result_projection(&tools[index].name, &result);
         tools.remove(index);
-        Ok(Message::tool_result_with_images(
+        Ok(Message::tool_result_with_receipt(
             call_id,
             projection.preview,
             projection.truncated,
             result.images,
+            result.status,
         ))
     }
 
@@ -10578,10 +12698,12 @@ impl HarnessActor {
                 .acknowledge_deferred(&pending.ticket)
                 .await
                 .map_err(DriveError::Store)?;
-            results.push(Message::tool_result(
+            results.push(Message::tool_result_with_receipt(
                 pending.call_id,
                 projection.preview,
                 projection.truncated,
+                result.images,
+                result.status,
             ));
             deferred.remove(0);
         }
@@ -11053,6 +13175,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
+        provider_error.corroborate_slots(&self.provider_slot_evidence);
         if let Some(error) = self.latched_terminal_failure().await {
             return self
                 .errored_outcome_with_items(run_id, message, reasoning, tools, error)
@@ -11082,6 +13205,14 @@ impl HarnessActor {
             }
         }
         specialize_provider_presentation(&self.config.usage_scope.auth_scope, &mut provider_error);
+        if self.config.provider_lockdown {
+            // Lockdown shows templates only: no owner-local raw text.
+            provider_error.provider_raw_detail = None;
+        }
+        apply_provider_detail_lockdown(
+            self.config.provider_lockdown,
+            &mut provider_error.presentation,
+        );
         if let Some(card) = recovery_card_kind(&provider_error.presentation) {
             let menu = recovery_menu(
                 self.next_menu_id(),
@@ -11100,14 +13231,14 @@ impl HarnessActor {
                 return errored_outcome(error);
             }
         }
-        self.errored_outcome_with_items(
-            run_id,
-            message,
-            reasoning,
-            tools,
-            provider_error_to_haider(provider_error),
-        )
-        .await
+        // Gate again AFTER the conversion: nothing in the mapped failure may
+        // carry owner-local text on a lockdown turn.
+        let mut mapped = provider_error_to_haider(provider_error);
+        if let Some(presentation) = mapped.presentation.as_mut() {
+            apply_provider_detail_lockdown(self.config.provider_lockdown, presentation);
+        }
+        self.errored_outcome_with_items(run_id, message, reasoning, tools, mapped)
+            .await
     }
 
     async fn drive_error_outcome_with_items(
@@ -11124,6 +13255,15 @@ impl HarnessActor {
                     .await
             }
             DriveError::Cancelled => {
+                self.cancelled_outcome_with_items(run_id, message, reasoning, tools)
+                    .await
+            }
+            // A committed cancellation won the race to the journal (e.g. the
+            // user pressed Esc/Stop while a finished tool's result was being
+            // settled): the refused append IS the cancellation, not a
+            // failure. Settling it as Errored is itself refused, which used
+            // to strand the run in `cancelling` until daemon shutdown.
+            DriveError::Store(ref error) if haider_store::is_durably_cancelling_refusal(error) => {
                 self.cancelled_outcome_with_items(run_id, message, reasoning, tools)
                     .await
             }
@@ -11178,7 +13318,10 @@ impl HarnessActor {
 
     /// Commits `Errored` (best effort) and reports the original error.
     async fn errored_state_outcome(&mut self, run_id: &RunId, error: HaiderError) -> TurnOutcome {
-        let error = self.latched_terminal_failure().await.unwrap_or(error);
+        let mut error = self.latched_terminal_failure().await.unwrap_or(error);
+        if let Some(presentation) = error.presentation.as_mut() {
+            apply_provider_detail_lockdown(self.config.provider_lockdown, presentation);
+        }
         if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);
         }
@@ -11496,26 +13639,16 @@ impl HarnessActor {
         Ok(())
     }
 
-    fn request_budget(&self) -> RequestBudgetV1 {
-        RequestBudgetV1 {
-            // Preserve embedders that only override the old hard-cap field.
-            tranche: self
-                .config
-                .provider_request_tranche
-                .min(self.config.max_provider_requests_per_turn),
-            hard_cap: self.config.max_provider_requests_per_turn,
-        }
-    }
-
     fn request_budget_status(
         &self,
         run_id: &RunId,
         used: usize,
+        budget: RequestBudgetV1,
         phase: RequestBudgetPhaseV1,
     ) -> RequestBudgetStatusV1 {
         RequestBudgetStatusV1 {
             used,
-            budget: self.request_budget(),
+            budget,
             phase,
             continuation: RequestBudgetContinuationV1 {
                 session_id: self.config.session_id.clone(),
@@ -11541,6 +13674,34 @@ impl HarnessActor {
         self.commit_extension_marker(
             run_id,
             PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
+            data,
+            prompt_verbatim_render(),
+        )
+        .await
+    }
+
+    async fn commit_loop_suspected_note(
+        &mut self,
+        run_id: &RunId,
+        note: &LoopSuspectedV1,
+    ) -> Result<(), HaiderError> {
+        let TurnItem::Extension { data, .. } = note.to_extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot encode loop_suspected note: {error}"),
+                false,
+            )
+        })?
+        else {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "loop_suspected note is not an extension item",
+                false,
+            ));
+        };
+        self.commit_extension_marker(
+            run_id,
+            LOOP_SUSPECTED_EXTENSION_KIND,
             data,
             prompt_verbatim_render(),
         )
@@ -12938,6 +15099,7 @@ impl ToolAccumulator {
 }
 
 const TOOL_CALL_REPAIR_RESET_EXTENSION_KIND: &str = "tool_call_repair_reset";
+const OUTPUT_TRUNCATION_COUNT_EXTENSION_KIND: &str = "output_truncation_count";
 
 fn repaired_tool_name(definitions: &[ToolDefinition], requested: &str) -> Option<String> {
     if definitions.iter().any(|tool| tool.name == requested) {
@@ -12957,11 +15119,31 @@ fn repaired_tool_name(definitions: &[ToolDefinition], requested: &str) -> Option
     matches.next().is_none().then(|| matched.name.clone())
 }
 
+/// A malformed provider tool call (`InvalidToolCall`). The AX-2
+/// malformed-call strike predicate matches exactly this; an output-limit
+/// truncation is not a malformed call and must stay outside it.
 pub(crate) fn invalid_tool_call_result(result: &BoundedResult) -> bool {
+    consumes_malformed_tool_strike(result)
+}
+
+/// AX-2 strike seam: output truncation stays outside the malformed allowance
+/// in both the live path and recovery after a restart.
+fn consumes_malformed_tool_strike(result: &BoundedResult) -> bool {
     matches!(
         result.data,
         Some(haider_protocol::tool::ToolResultData::InvalidToolCall { .. })
     )
+}
+
+/// Any unexecuted call whose arguments must be replaced with an empty object
+/// in provider history. Only `invalid_tool_call_result` consumes the malformed
+/// strike; truncation streaks use a separate durable extension marker.
+pub(crate) fn repairable_tool_call_result(result: &BoundedResult) -> bool {
+    invalid_tool_call_result(result)
+        || matches!(
+            result.data,
+            Some(haider_protocol::tool::ToolResultData::OutputLimitTruncation { .. })
+        )
 }
 
 struct RequestInputResolutionContext {
@@ -13271,17 +15453,49 @@ fn request_budget_error(status: &RequestBudgetStatusV1) -> HaiderError {
     error
 }
 
-fn continuation_limit_error(count: usize, limit: usize) -> HaiderError {
-    let mut error = HaiderError::new(
-        ErrorCode::LoopLimit,
-        format!("provider continuation limit exceeded at continuation {count} (limit {limit})"),
-        false,
-    );
-    error.details = Some(serde_json::json!({
-        "continuation_count": count,
-        "continuation_limit": limit,
-    }));
+/// `loop_limit` with typed details in both `HaiderError::details` and the
+/// presentation that `run_failed` and `haider.run.v1` carry.
+fn loop_limit_error(message: String, details: LoopLimitV1) -> HaiderError {
+    let mut error = HaiderError::new(ErrorCode::LoopLimit, message, false);
+    error.details = serde_json::to_value(details).ok();
+    error.presentation = Some(presentation_for_haider_error(&error).with_loop_limit(details));
     error
+}
+
+fn tool_loop_limit_error(details: LoopLimitV1) -> HaiderError {
+    let message = match details {
+        LoopLimitV1::RepeatedActions {
+            repeated_calls,
+            suspect_after,
+            stop_after_suspected,
+        } => format!(
+            "repeated tool-call loop limit exceeded: {repeated_calls} consecutive tool calls repeated earlier calls with the same arguments, with no new call in between (loop_suspected after {suspect_after}, limit after {stop_after_suspected} more)"
+        ),
+        LoopLimitV1::RepeatedToolCalls {
+            repeated_calls,
+            suspect_after,
+            stop_after_suspected,
+        } => format!(
+            "repeated tool-call loop limit exceeded: {repeated_calls} consecutive tool calls repeated earlier calls and results (loop_suspected after {suspect_after}, limit after {stop_after_suspected} more)"
+        ),
+        LoopLimitV1::NoProgressContinuations {
+            continuation_count,
+            continuation_limit,
+        } => return continuation_limit_error(continuation_count, continuation_limit),
+    };
+    loop_limit_error(message, details)
+}
+
+fn continuation_limit_error(count: usize, limit: usize) -> HaiderError {
+    loop_limit_error(
+        format!(
+            "provider no-progress continuation limit exceeded at consecutive continuation {count} (limit {limit})"
+        ),
+        LoopLimitV1::NoProgressContinuations {
+            continuation_count: count,
+            continuation_limit: limit,
+        },
+    )
 }
 
 fn submit_busy_error(capacity: usize) -> HaiderError {
@@ -13306,7 +15520,14 @@ fn delegated_child_wait_timed_out(error: &HaiderError) -> bool {
             == Some("delegated_child_wait_timeout")
 }
 
-fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
+/// The single publication boundary from a provider failure to a durable
+/// `HaiderError`: the message is [`ProviderError::public_message`] (template
+/// or Haider-authored text only), the presentation carries the adapter's
+/// safe detail, and unknown provider text survives only in the owner-local
+/// `provider_raw_detail`. Every provider failure that can reach `RunFailed`
+/// (turn drive, context summarization, AI Loom drafting) uses this.
+pub fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
+    let local_raw = provider_error.local_message_detail();
     let code = if provider_error.timeout_reason == Some(ProviderTimeoutReason::IdleTimeout) {
         ErrorCode::IdleTimeout
     } else if provider_error.presentation.subcode.as_str() == "provider-timeout" {
@@ -13314,7 +15535,11 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
     } else {
         ErrorCode::ProviderError
     };
-    let mut error = HaiderError::new(code, provider_error.to_string(), provider_error.retryable);
+    let mut error = HaiderError::new(
+        code,
+        provider_error.public_message(),
+        provider_error.retryable,
+    );
     error.details = Some(serde_json::json!({
         "provider_error_kind": format!("{:?}", provider_error.kind),
         "retry_after_ms": provider_error.retry_after_ms,
@@ -13328,9 +15553,15 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
             .as_mut()
             .and_then(serde_json::Value::as_object_mut)
     {
-        details.insert("idle_timeout".into(), serde_json::json!(idle));
+        // The durable idle-timeout extension serializes the preceding cause;
+        // it carries only public messages.
+        details.insert("idle_timeout".into(), serde_json::json!(idle.shareable()));
     }
-    error.presentation = Some(provider_error.presentation);
+    error.presentation = Some(
+        provider_error
+            .presentation
+            .with_provider_raw_detail(local_raw.as_deref()),
+    );
     error
 }
 
@@ -13373,6 +15604,52 @@ fn run_state_is_provider_retry(run_state: Option<&RunState>) -> bool {
                 }
         )
     )
+}
+
+/// Every core path that publishes a provider presentation uses this gate.
+/// Lockdown shows provider templates only: `detail` is already a known
+/// template rendering or the default explanation plus "details withheld",
+/// and the owner-local raw provider text is removed.
+fn apply_provider_detail_lockdown(lockdown: bool, presentation: &mut ErrorPresentation) {
+    if lockdown {
+        presentation.strip_local_only();
+    }
+}
+
+#[cfg(test)]
+mod provider_detail_lockdown_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn one_gate_keeps_templates_and_drops_local_raw_under_lockdown() {
+        let presentation = || {
+            ErrorPresentation::new(
+                "permission-denied",
+                "Provider access denied",
+                "The active account is not allowed to make this request. · details withheld",
+                ErrorScope::Account,
+                [ErrorAction::SwitchAccount],
+            )
+            .with_provider_raw_detail(Some("Denied for organization quillmere."))
+        };
+        let mut locked = presentation();
+        apply_provider_detail_lockdown(true, &mut locked);
+        assert!(locked.provider_raw_detail.is_none());
+        assert!(locked.detail.ends_with("details withheld"));
+        assert!(
+            !serde_json::to_string(&locked)
+                .expect("json")
+                .contains("quillmere")
+        );
+        let mut open = presentation();
+        apply_provider_detail_lockdown(false, &mut open);
+        assert_eq!(
+            open.provider_raw_detail.as_deref(),
+            Some("Denied for organization quillmere.")
+        );
+    }
 }
 
 fn specialize_provider_presentation(auth_scope: &str, error: &mut ProviderError) {
@@ -13519,6 +15796,9 @@ fn copy_provider_metadata(target: &mut ErrorPresentation, source: &ErrorPresenta
     target
         .provider_request_id
         .clone_from(&source.provider_request_id);
+    target
+        .provider_error_type
+        .clone_from(&source.provider_error_type);
     target.retry_after_ms = source.retry_after_ms;
     target.reset_at_ms = source.reset_at_ms;
     target.opened_within_ms = source.opened_within_ms;
@@ -13533,6 +15813,7 @@ fn recovery_card_kind(presentation: &ErrorPresentation) -> Option<ErrorRecoveryC
         "account-deleted" | "account-unavailable" => Some(ErrorRecoveryCardKind::AccountDeleted),
         "rate-limited" => Some(ErrorRecoveryCardKind::RateLimit),
         "quota-exhausted" => Some(ErrorRecoveryCardKind::QuotaExhausted),
+        "permission-denied" => Some(ErrorRecoveryCardKind::Generic),
         "keychain-relink-required" => Some(ErrorRecoveryCardKind::KeychainRelink),
         _ => None,
     }
@@ -13544,18 +15825,24 @@ fn recovery_menu(
     source_run: &RunId,
     source_item: Option<ItemId>,
     card: ErrorRecoveryCardKind,
-    presentation: ErrorPresentation,
+    mut presentation: ErrorPresentation,
     provider: Option<String>,
     account: Option<CredentialAlias>,
     blocking: bool,
 ) -> Menu {
+    // Menus are answered by hooks and projected to every client; they carry
+    // no owner-local provider text.
+    presentation.strip_local_only();
     let mut body = vec![presentation.detail.clone()];
     let title = presentation.title.clone();
     if let Some(status) = presentation.provider_http_status {
-        body.push(format!("Provider HTTP status: {status}"));
+        body.push(format!("HTTP {status}"));
     }
     if let Some(request_id) = &presentation.provider_request_id {
-        body.push(format!("Request ID: {request_id}"));
+        body.push(format!("Request id: {request_id}"));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        body.push(format!("Provider error type: {error_type}"));
     }
     if let Some(retry_after_ms) = presentation.retry_after_ms {
         let seconds = retry_after_ms.div_ceil(1_000);
@@ -13697,11 +15984,14 @@ fn provider_error_allows_retry(
     {
         return false;
     }
-    // A locally bounded response-open wait is still retryable by the caller,
-    // but an automatic replay would start the same parked request again.
-    // Preserve the typed Retry action while terminalizing this attempt under
-    // Haider's own control, independent of the configured timeout value.
-    if error.timeout_reason == Some(ProviderTimeoutReason::ResponseOpen) {
+    // A locally bounded request upload or response-open wait is still
+    // retryable by the caller, but an automatic replay would start the same
+    // parked request again. Preserve the typed Retry action while ending
+    // this attempt under Haider's own control.
+    if matches!(
+        error.timeout_reason,
+        Some(ProviderTimeoutReason::RequestUpload | ProviderTimeoutReason::ResponseOpen)
+    ) {
         return false;
     }
     let Some(deadline) = deadline else {
@@ -14294,24 +16584,10 @@ fn finalize_request_usage(
     Ok(())
 }
 
-/// Daemon/core context threshold policy. Wire clients consume the emitted
-/// threshold and must not recalculate it locally.
-#[must_use]
-pub fn context_soft_threshold_tokens(window: u64, reserved_output_tokens: u64) -> Option<u64> {
-    context_tier_threshold_tokens(window, reserved_output_tokens, CONTEXT_SUMMARY_TIER_PERCENT)
-}
-
-#[must_use]
-pub fn context_tier_threshold_tokens(
-    window: u64,
-    reserved_output_tokens: u64,
-    percent: u64,
-) -> Option<u64> {
-    let hard_fit = window.checked_sub(reserved_output_tokens)?;
-    let percentage = u64::try_from(u128::from(window).saturating_mul(u128::from(percent)) / 100)
-        .unwrap_or(u64::MAX);
-    Some(percentage.min(hard_fit))
-}
+/// Daemon/core context threshold policy: the one law lives in the protocol
+/// crate so a client can display the trigger for a newly selected model
+/// before that model's first daemon snapshot without a second copy of it.
+pub use haider_protocol::context::{context_soft_threshold_tokens, context_tier_threshold_tokens};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StructuralTrimOutcome {
@@ -15404,6 +17680,18 @@ fn tool_image_corrupt(message: impl Into<String>) -> HaiderError {
     HaiderError::new(ErrorCode::StoreCorrupt, message, false)
 }
 
+/// A request-only image projection and a volatile-context snapshot are both
+/// provider-view epochs; the request declares one digest covering whichever
+/// are present.
+fn combine_provider_view_epochs(volatile: Option<&str>, images: Option<&str>) -> Option<String> {
+    match (volatile, images) {
+        (None, None) => None,
+        (Some(volatile), None) => Some(volatile.to_owned()),
+        (None, Some(images)) => Some(images.to_owned()),
+        (Some(volatile), Some(images)) => Some(digest_json(&(volatile, images))),
+    }
+}
+
 /// E2 normalization point: every tool result passes through the actor before
 /// it is journaled, so legacy dispatchers cannot accidentally omit the typed
 /// presentation on a non-success result.
@@ -15547,6 +17835,44 @@ mod cu1_actor_tests {
         );
         config.tool_result_images_supported = images_supported;
         config
+    }
+
+    fn computer_screenshot(call_id: &str) -> [Message; 2] {
+        [
+            Message::assistant(vec![Block::ToolCall {
+                call_id: call_id.into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            }]),
+            Message::tool_result_with_images(
+                call_id,
+                "screenshot",
+                false,
+                vec![ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{call_id}")),
+                    media_type: "image/png".into(),
+                    width: 1_429,
+                    height: 804,
+                    byte_len: 1_000_000,
+                }],
+            ),
+        ]
+    }
+
+    #[test]
+    fn second_computer_screenshot_declares_request_only_history_rewrite() {
+        let first = computer_screenshot("screenshot-1");
+        assert!(!has_stale_computer_screenshots(&first));
+
+        let mut repeated = first.to_vec();
+        repeated.extend(computer_screenshot("screenshot-2"));
+        assert!(has_stale_computer_screenshots(&repeated));
+
+        repeated.push(Message::tool_result("ordinary-tool", "done", false));
+        assert!(
+            has_stale_computer_screenshots(&repeated),
+            "an unrelated result must not hide the request-local rewrite"
+        );
     }
 
     #[test]
@@ -15747,6 +18073,64 @@ mod cu1_actor_tests {
         assert_eq!(presentation.budget_ms, Some(60_000));
     }
 
+    #[test]
+    fn provider_message_is_scrubbed_before_run_failed_journaling() {
+        let private = "robin.verify2@synthetic.example";
+        let provider_error =
+            haider_provider::acp::client::AcpError::Rpc(haider_provider::acp::wire::JsonRpcError {
+                code: -32000,
+                message: format!("Permission denied for {private}"),
+                data: None,
+            })
+            .into_provider_error(&format!("agent stderr: account {private}"));
+        let error = provider_error_to_haider(provider_error);
+        let payload = EventPayload::RunFailed {
+            code: error.code,
+            message: sanitized_failure_message(&error.message),
+            retryable: error.retryable,
+            presentation: Some(presentation_for_haider_error(&error)),
+        };
+        // The owner's local journal keeps the unknown text only in the
+        // local-only field; every shareable projection strips it.
+        let EventPayload::RunFailed {
+            message,
+            presentation: Some(presentation),
+            ..
+        } = &payload
+        else {
+            panic!("run failure payload");
+        };
+        assert!(!message.contains(private), "{message}");
+        assert!(!presentation.detail.contains(private));
+        assert!(
+            presentation
+                .provider_raw_detail
+                .as_deref()
+                .is_some_and(|raw| raw.contains("Agent stderr tail"))
+        );
+        let mut shareable = serde_json::to_value(&payload).expect("serialize run failure");
+        haider_protocol::error::strip_local_only_fields(&mut shareable);
+        assert!(!shareable.to_string().contains(private), "{shareable}");
+    }
+
+    #[test]
+    fn untrusted_frame_message_is_public_only_through_templates() {
+        let provider_error = ProviderError::new(
+            haider_provider::ProviderErrorKind::MalformedFrame,
+            "Anthropic SSE `quillmere` data is not valid JSON",
+        )
+        .with_untrusted_message();
+        let error = provider_error_to_haider(provider_error);
+        assert!(!error.message.contains("quillmere"), "{}", error.message);
+        let presentation = error.presentation.expect("presentation");
+        assert!(!presentation.detail.contains("quillmere"));
+        assert!(
+            presentation
+                .provider_raw_detail
+                .is_some_and(|raw| raw.contains("quillmere"))
+        );
+    }
+
     #[tokio::test]
     async fn unsupported_actor_without_reader_degrades_refs_before_provider_projection() {
         let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new(Vec::new()));
@@ -15767,7 +18151,7 @@ mod cu1_actor_tests {
                 .collect(),
         )];
 
-        let attachments = actor
+        let (attachments, _) = actor
             .resolve_tool_result_images(&mut messages)
             .await
             .expect("unsupported provider projection");
@@ -15786,6 +18170,47 @@ mod cu1_actor_tests {
             preview.matches("unavailable to this provider").count(),
             TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
         );
+    }
+
+    /// The daemon's prompt compile elides stale screenshots BEFORE the actor
+    /// sees the history, so the actor's own projection of that history finds
+    /// nothing left to elide. The typed compile record must still reach every
+    /// provider request (it is what enables the Anthropic drop policy and the
+    /// OpenAI native-screenshot placeholder), merged with the actor's own.
+    #[tokio::test]
+    async fn prompt_compile_image_projection_reaches_every_actor_request() {
+        let mut durable = computer_screenshot("screenshot-1").to_vec();
+        durable.extend(computer_screenshot("screenshot-2"));
+        let mut compiled = durable.clone();
+        let compile_projection = apply_tool_result_image_budget(&mut compiled);
+        assert!(compile_projection.elided_all_images("screenshot-1"));
+        let mut again = compiled.clone();
+        assert!(
+            apply_tool_result_image_budget(&mut again).is_empty(),
+            "re-projecting compiled history finds nothing new"
+        );
+
+        let mut config = actor_config(false);
+        config.prompt_image_projection = compile_projection;
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new(Vec::new()));
+        let store: Arc<dyn StoreHandle> = Arc::new(MemoryStore::new());
+        let (mut actor, _handle) = HarnessActor::new(config, provider, store);
+        let mut request_messages = compiled;
+        request_messages.extend(computer_screenshot("screenshot-3"));
+        let (_, projection) = actor
+            .resolve_tool_result_images(&mut request_messages)
+            .await
+            .expect("request projection");
+        assert!(projection.rewrites_earlier_tool_results());
+        assert!(
+            projection.elided_all_images("screenshot-1"),
+            "compile record kept"
+        );
+        assert!(
+            projection.elided_all_images("screenshot-2"),
+            "actor record added"
+        );
+        assert!(!projection.elided_all_images("screenshot-3"), "latest kept");
     }
 
     #[tokio::test]
@@ -15833,7 +18258,7 @@ mod cu1_actor_tests {
             false,
             images.clone(),
         )];
-        let attachments = actor
+        let (attachments, _) = actor
             .resolve_tool_result_images(&mut messages)
             .await
             .expect("budgeted provider resolution");

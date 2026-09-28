@@ -415,6 +415,7 @@ async fn select_fast_gates_statically_and_empty_ladders_refuse() {
             model: "claude-sonnet-5".into(),
             provider: None,
             confirm_new_epoch: false,
+            max_tokens: None,
         },
     )
     .await;

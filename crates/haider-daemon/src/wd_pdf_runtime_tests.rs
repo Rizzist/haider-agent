@@ -109,7 +109,8 @@ async fn capability_split_keeps_native_pdf_bytes_and_extracts_elsewhere() {
         FeatureResolve::Native,
     )
     .await
-    .expect("native shaping");
+    .expect("native shaping")
+    .0;
     assert!(matches!(
         native[0].blocks.as_slice(),
         [Block::Attachment(AttachmentBlock::Pdf { .. })]
@@ -130,7 +131,8 @@ async fn capability_split_keeps_native_pdf_bytes_and_extracts_elsewhere() {
         FeatureResolve::ExplicitlyEmulated,
     )
     .await
-    .expect("text shaping");
+    .expect("text shaping")
+    .0;
     assert!(resolved.is_empty(), "extracted PDFs do not ship base64");
     let Block::Text { text } = &emulated[0].blocks[0] else {
         panic!("fallback must become provider-neutral text");
@@ -170,7 +172,8 @@ async fn image_only_pdf_is_typed_for_extraction_but_valid_natively() {
         FeatureResolve::Native,
     )
     .await
-    .expect("native image-only PDF remains valid");
+    .expect("native image-only PDF remains valid")
+    .0;
     assert_eq!(resolved.len(), 1);
 }
 

@@ -154,6 +154,7 @@ fn create_command(session_id: &SessionId, workspace: &std::path::Path) -> Sessio
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4_096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

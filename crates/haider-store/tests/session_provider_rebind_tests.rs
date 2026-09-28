@@ -20,6 +20,7 @@ fn create(store: &Store, session: &str) {
             provider: "source".into(),
             model: "test-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -223,6 +224,7 @@ fn model_provider_switch_clears_rebind_override_but_same_provider_preserves_it()
         provider: "proxy".into(),
         model: "model-2".into(),
         expected_pair: None,
+        output_budget: None,
         event_id: EventId::new("model-selected-1"),
         device_id: DeviceId::new("test-device"),
     };

@@ -2307,6 +2307,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -4345,6 +4346,7 @@ async fn measure_cold_fold_after_several_compactions() {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -7376,4 +7378,54 @@ async fn replacement_summary_source_never_contains_the_prior_summary() {
         ]
     );
     assert!(!text.iter().any(|value| value.contains("OLD-SUMMARY")));
+}
+
+/// Round-4 audit: a permission menu's file review carries raw old/new
+/// digests for the human Ask surface. The provider prompt never renders menu
+/// facts, even if one were journaled as prompt-verbatim.
+#[tokio::test]
+async fn file_review_digests_never_reach_the_provider_prompt() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("file-review-prompt-session");
+    let run_id = RunId::new("file-review-prompt-run");
+    let menu: haider_protocol::menu::Menu = serde_json::from_str(include_str!(
+        "../../haider-protocol/tests/fixtures/menu_permission_file_review.json"
+    ))
+    .expect("file review menu fixture");
+    assert!(
+        serde_json::to_string(&menu)
+            .expect("menu json")
+            .contains("blake3:1111")
+    );
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &run_id,
+            "file-review-user",
+            EventPayload::UserMessage {
+                text: "Edit the answer.".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &run_id,
+            "file-review-menu",
+            EventPayload::MenuOpened(menu),
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append file review log");
+    let compiled = PromptHistoryCompiler::compile(&store, &session_id, None, None, &run_id)
+        .await
+        .expect("compile prompt");
+    let prompt = serde_json::to_string(&compiled).expect("serialize prompt");
+    assert!(prompt.contains("Edit the answer."), "{prompt}");
+    for digest in ["blake3:1111", "blake3:2222"] {
+        assert!(!prompt.contains(digest), "{prompt}");
+    }
 }

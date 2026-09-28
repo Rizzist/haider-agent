@@ -1313,6 +1313,18 @@ async fn route_push(
             state.set_capabilities(push.granted);
             Ok(())
         }
+        Some("presence.stop") => {
+            // The human pressed Stop on the phone's "Haider is controlling
+            // your phone" chip or notification. Any other field is refused:
+            // the push carries no authority beyond "stop what you are doing".
+            if body.as_object().is_some_and(|object| object.len() != 1) {
+                return Err(TransportError::protocol(
+                    "presence.stop push carries unexpected fields",
+                ));
+            }
+            crate::cu_presence::global().stop(haider_tools::presence::PresenceSurface::Phone);
+            Ok(())
+        }
         Some(other) => Err(TransportError::protocol(format!(
             "unsupported mobile push type `{other}`"
         ))),
@@ -1641,6 +1653,32 @@ fn clear_transport(state: &Arc<TransportState>) {
     {
         *registered = Weak::new();
     }
+}
+
+/// Tells the connected APK that the current run's phone presence ended so
+/// it retires its overlay and ongoing notification. Fire-and-forget: an APK
+/// that predates `presence.end` answers `unsupported_request`, and the APK's
+/// own idle timeout retires the overlay regardless.
+pub(crate) fn send_presence_end(reason: haider_tools::presence::PresenceEndReason) {
+    let Some(state) = read_lock(transport_registry()).upgrade() else {
+        return;
+    };
+    if !state.connected.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let backend = ApkMobileBackend { state };
+    runtime.spawn(async move {
+        let reason = serde_json::to_value(reason).unwrap_or(Value::Null);
+        if let Err(error) = backend
+            .request(json!({"type": "presence.end", "reason": reason}))
+            .await
+        {
+            tracing::debug!(%error, "APK did not acknowledge presence.end");
+        }
+    });
 }
 
 pub(crate) fn platform_mobile_backend() -> Arc<dyn MobileBackend> {

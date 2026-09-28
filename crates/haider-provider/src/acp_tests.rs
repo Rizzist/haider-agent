@@ -153,6 +153,7 @@ fn turn_request(text: &str) -> TurnRequest {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -1106,6 +1107,49 @@ fn the_stderr_tail_never_retains_an_oauth_url() {
     assert!(!tail.contains("accounts.google.com"), "{tail}");
     assert!(!tail.contains("client_id"), "{tail}");
     assert!(!tail.contains("127.0.0.1"), "{tail}");
+}
+
+#[test]
+fn acp_stderr_tail_keeps_safe_diagnostics_and_scrubs_account_data() {
+    use crate::acp::client::AcpError;
+
+    // Ruling 2: the child's stderr tail is unknown text. Shareable surfaces
+    // get the default explanation plus "details withheld"; the joined tail
+    // (credential redactor applied) is kept only in the owner-local field.
+    let safe = AcpError::Closed.into_provider_error("agent failed to start: model unavailable");
+    assert!(safe.presentation.detail.ends_with("details withheld"));
+    assert!(safe.provider_raw_detail.as_deref().is_some_and(|raw| {
+        raw.contains("Agent stderr tail: agent failed to start: model unavailable")
+    }));
+
+    let private = AcpError::Closed.into_provider_error("agent failed for alice973@example.test");
+    assert!(
+        !private
+            .presentation
+            .detail
+            .contains("alice973@example.test")
+    );
+    assert!(!private.message.contains("alice973@example.test"));
+    let multiline = AcpError::Closed.into_provider_error(
+        "agent connection failed\nmodel unavailable for alice973@example.test",
+    );
+    assert!(
+        multiline
+            .provider_raw_detail
+            .as_deref()
+            .is_some_and(|raw| raw.contains("agent connection failed · model unavailable"))
+    );
+    assert!(
+        !multiline
+            .presentation
+            .detail
+            .contains("alice973@example.test")
+    );
+    assert!(
+        !serde_json::to_string(&multiline)
+            .expect("serialize")
+            .contains("alice973@example.test")
+    );
 }
 
 #[test]
