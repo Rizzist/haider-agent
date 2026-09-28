@@ -7715,6 +7715,14 @@ impl AppModel {
                         self.handle_ssh_form_key(key);
                         return;
                     }
+                    InputOwner::TalkSetup => {
+                        self.talk_setup_key(&key);
+                        return;
+                    }
+                    InputOwner::CustomProviderForm => {
+                        self.handle_custom_card_key(key.code);
+                        return;
+                    }
                     InputOwner::Login
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(key.code, KeyCode::Char('c' | 'C')) =>

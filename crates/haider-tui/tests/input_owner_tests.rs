@@ -2016,6 +2016,22 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
     );
     assert_eq!(accounts_model.screen, Screen::Accounts);
     assert!(accounts_model.login.is_none());
+    for mode in ["talk-setup", "custom-form"] {
+        for code in ['c', 't'] {
+            let mut card_model = model();
+            arm(&mut card_model, mode);
+            let theme = card_model.theme_choice;
+            let screen = card_model.screen;
+            key(&mut card_model, KeyCode::Char(code), KeyModifiers::CONTROL);
+            assert_eq!(
+                card_model.input_owner(),
+                expected_owner(mode),
+                "{mode} Ctrl+{code}"
+            );
+            assert_eq!(card_model.screen, screen, "{mode} Ctrl+{code}");
+            assert_eq!(card_model.theme_choice, theme, "{mode} Ctrl+{code}");
+        }
+    }
 }
 
 fn pending_visible_talk_mirror() -> (AppModel, LiveDriver) {
