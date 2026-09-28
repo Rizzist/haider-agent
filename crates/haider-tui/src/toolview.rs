@@ -119,9 +119,12 @@ pub struct PathContext {
 }
 
 impl PathContext {
-    /// Mask another account before workspace shortening. Keep `~/…` when a
-    /// broad workspace root would expose the name of the current account.
-    /// Otherwise use a workspace-relative label inside the workspace.
+    /// Mask another account before workspace shortening. A workspace root
+    /// that can contain separate accounts keeps the masked label. A path
+    /// beneath a narrower workspace can use a safe relative remainder.
+    /// Relative arguments stay lexical: there is no authority to resolve
+    /// them against the process cwd or a possibly different tool cwd.
+    /// Raw detail arguments, command text and output bodies are agent data.
     /// Component-aware — `/Users/alice2` is not under `~alice`.
     #[must_use]
     pub fn shorten(&self, path: &str) -> String {
@@ -136,13 +139,19 @@ impl PathContext {
         let display = projection
             .display
             .unwrap_or_else(|| "<workspace path unavailable>".to_owned());
-        if kind == haider_client::launch_origin::OriginPathKind::Redacted
-            || kind == haider_client::launch_origin::OriginPathKind::HomeRelative
-                && self
-                    .workspace
-                    .as_deref()
-                    .is_some_and(|root| !haider_client::launch_origin::usable_home(Path::new(root)))
-        {
+        if display == "<path unavailable>" {
+            return display;
+        }
+        let protected = matches!(
+            kind,
+            haider_client::launch_origin::OriginPathKind::Redacted
+                | haider_client::launch_origin::OriginPathKind::HomeRelative
+        );
+        let broad_workspace = protected
+            && self.workspace.as_deref().is_some_and(|root| {
+                haider_client::launch_origin::is_multiuser_workspace_root(Path::new(root))
+            });
+        if broad_workspace {
             return display;
         }
         if let Some(rest) = self

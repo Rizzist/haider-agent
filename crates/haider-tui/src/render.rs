@@ -14880,14 +14880,8 @@ fn render_ssh_form(
         ("port", form.port.clone()),
         ("auth", form.auth_label().to_owned()),
         ("key path / secret", form.credential_display()),
-        (
-            "cwd",
-            if form.cwd.is_empty() {
-                String::new()
-            } else {
-                crate::live::workspace_display_path(&form.cwd)
-            },
-        ),
+        // The cwd belongs to the remote SSH host, not this process's HOME.
+        ("cwd", form.cwd.clone()),
     ];
     for (index, (label, value)) in fields.into_iter().enumerate() {
         lines.push(Line::from(vec![

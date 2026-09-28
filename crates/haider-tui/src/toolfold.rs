@@ -1206,7 +1206,7 @@ pub fn arg_summary(args: &serde_json::Value) -> String {
         return computer_action_summary(action, args);
     }
     if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-        return path.to_owned();
+        return crate::live::workspace_display_path(path);
     }
     if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
         return match args.get("glob").and_then(|v| v.as_str()) {

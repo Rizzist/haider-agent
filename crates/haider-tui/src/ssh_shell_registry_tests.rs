@@ -220,14 +220,14 @@ fn ssh_form_masks_and_redacts_password_before_staging() {
 }
 
 #[test]
-fn ssh_form_projects_paths_without_changing_saved_values() {
+fn ssh_form_shows_remote_paths_exactly_as_typed() {
     use ratatui::{Terminal, backend::TestBackend};
     let mut model = live_session();
     model.ssh_open = true;
     let mut form = SshProfileForm::add();
     form.credential = "/Users/bob/.ssh/id".into();
     form.cwd = "/home/bob/work".into();
-    assert_eq!(form.credential_display(), "/Users/<user>/.ssh/id");
+    assert_eq!(form.credential_display(), "/Users/bob/.ssh/id");
     model.ssh_form = Some(form);
     let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
     terminal
@@ -244,8 +244,8 @@ fn ssh_form_projects_paths_without_changing_saved_values() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(painted.contains("/home/<user>/work"));
-    assert!(!painted.contains("/home/bob/work"));
+    assert!(painted.contains("/home/bob/work"));
+    assert!(painted.contains("/Users/bob/.ssh/id"));
     assert_eq!(model.ssh_form.as_ref().expect("form").cwd, "/home/bob/work");
 }
 

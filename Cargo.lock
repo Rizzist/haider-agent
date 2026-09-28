@@ -2090,6 +2090,7 @@ dependencies = [
  "haider-protocol",
  "haider-rpc",
  "haider-tui",
+ "ratatui",
  "serde_json",
  "tempfile",
  "tokio",

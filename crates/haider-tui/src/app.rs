@@ -3315,14 +3315,14 @@ impl SshProfileForm {
     }
 
     pub(crate) fn credential_display(&self) -> String {
+        // SSH form paths belong to the configured host/user and must remain
+        // exact while the owner edits them; local HOME cannot classify them.
         match self.auth {
             SshFormAuthKind::Password | SshFormAuthKind::KeyMaterial => {
                 "•".repeat(self.secret.chars().count())
             }
             SshFormAuthKind::Agent | SshFormAuthKind::Keep => "—".into(),
-            SshFormAuthKind::KeyFile if !self.credential.is_empty() => {
-                crate::live::workspace_display_path(&self.credential)
-            }
+            SshFormAuthKind::KeyFile if !self.credential.is_empty() => self.credential.clone(),
             SshFormAuthKind::KeyFile => String::new(),
         }
     }
@@ -5437,9 +5437,9 @@ pub struct AppModel {
     /// (it materialises on the first write). Set by the live driver's
     /// presence probe; the session header and origin line speak it.
     pub session_workspace_uncreated: bool,
-    /// The user's home directory, ABSOLUTE, when the host process knows it
-    /// (the executable seeds it from `HOME`). Tool rows shorten paths under
-    /// it to `~/…`; `None` (every test fixture) shortens nothing.
+    /// Valid local display homes collected by the executable from the process
+    /// environment. Tool rows use them to render own-home paths as `~/…`.
+    /// An empty list leaves home matching disabled while account masks apply.
     pub display_homes: Vec<std::path::PathBuf>,
     /// The full-detail view of one tool row (973-tui-toolview): ⌃O on a
     /// focused row, or a click on its `… +N lines` affordance. It COVERS

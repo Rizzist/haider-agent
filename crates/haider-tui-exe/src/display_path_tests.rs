@@ -8,6 +8,51 @@ use haider_tui::live::workspace_display_path_with_homes;
 use std::path::{Path, PathBuf};
 
 #[test]
+fn seeded_display_homes_reach_the_rendered_tool_row() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::ids::ItemId;
+    use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+    use haider_tui::app::AppEvent;
+    use haider_tui::mock::demo_script;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut model = AppModel::new();
+    for payload in demo_script() {
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
+    let homes = vec![PathBuf::from("C:/Users/alice")];
+    seed_display_dirs(&mut model, Path::new("C:/Users/alice/work"), &homes);
+    assert_eq!(model.display_homes, homes);
+    assert_eq!(model.tool_path_context().homes, homes);
+    assert_eq!(
+        model.tool_path_context().shorten("C:/Users/alice/notes.md"),
+        "~/notes.md"
+    );
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("home-row"),
+            item: TurnItem::ToolCall {
+                call_id: "home-row".into(),
+                name: "fs_read".into(),
+                args: serde_json::json!({"path": "C:/Users/alice/notes.md"}),
+                status: ToolStatus::InProgress,
+            },
+        }));
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            haider_tui::render::render(&model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    let painted = (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+        .collect::<String>();
+    assert!(painted.contains("Read(~/notes.md)"), "{painted}");
+}
+
+#[test]
 fn live_demo_and_origin_use_identical_path_projection() {
     for (path, homes) in [
         ("/Users/me/x", vec!["/Users/me"]),

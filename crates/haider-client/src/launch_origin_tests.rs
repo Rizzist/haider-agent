@@ -244,6 +244,12 @@ fn every_known_other_user_root_and_case_are_masked() {
             "//device/GLOBALROOT/Device/HarddiskVolume1/Users/<user>/x",
         ),
         (r"\\srv\share\Users\bob\x", "//srv/share/Users/<user>/x"),
+        // A real server called device is indistinguishable from the internal
+        // device spelling, so it takes the conservative account mask.
+        (
+            r"\\device\share\proj\Users\bob\x",
+            "//device/share/proj/Users/<user>/x",
+        ),
         (r"\\srv\Users\bob\x", "//srv/Users/<user>/x"),
         (r"\\?\UNC\srv\Users\bob\x", "//srv/Users/<user>/x"),
         (r"\\wsl$\Ubuntu\home\bob\x", "//wsl$/Ubuntu/home/<user>/x"),

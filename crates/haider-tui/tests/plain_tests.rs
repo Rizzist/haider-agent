@@ -191,6 +191,51 @@ fn semantic_tool_rows_keep_tool_specific_context_compact() {
 }
 
 #[test]
+fn plain_tool_paths_use_the_shared_account_projection() {
+    use serde_json::json;
+    for (name, args, expected) in [
+        (
+            "fs_list",
+            json!({"path": "/Users/bob/private"}),
+            "/Users/<user>/private",
+        ),
+        (
+            "glob",
+            json!({"path": "/Users/bob/private"}),
+            "/Users/<user>/private",
+        ),
+        ("ls", json!({"path": "/home/carol"}), "/home/<user>"),
+        (
+            "fs_search",
+            json!({"path": "/Users/bob/private"}),
+            "/Users/<user>/private",
+        ),
+        (
+            "custom_tool",
+            json!({"path": "/Users/bob/private"}),
+            "/Users/<user>/private",
+        ),
+        ("fs_list", json!({"path": "src"}), "src"),
+    ] {
+        let mut projection = SessionProjection::new();
+        projection.apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("path-call"),
+            item: TurnItem::ToolCall {
+                call_id: "path-call".into(),
+                name: name.into(),
+                args,
+                status: ToolStatus::InProgress,
+            },
+        }));
+        let plain = render_plain(&projection, 0, None);
+        assert!(
+            plain.contains(&format!("⚒ {name} ◐ · {expected}")),
+            "{plain}"
+        );
+    }
+}
+
+#[test]
 fn reduced_motion_freezes_only_the_spinner_frame() {
     use haider_tui::toolfold::{SPINNER, spinner_frame_for};
     assert_eq!(spinner_frame_for(2, false), SPINNER[2]);

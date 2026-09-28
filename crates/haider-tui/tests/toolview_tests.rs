@@ -12,8 +12,8 @@ use serde_json::json;
 
 fn paths() -> PathContext {
     PathContext {
-        workspace: Some("/Users/alice/dev/haider".to_owned()),
-        homes: vec!["/Users/alice".into()],
+        workspace: Some("C:/Users/alice/dev/haider".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
     }
 }
 
@@ -53,23 +53,31 @@ fn every_tool_family_reads_as_a_human_verb() {
 fn paths_shorten_to_the_workspace_then_home_and_never_across_a_component() {
     let paths = paths();
     assert_eq!(
-        paths.shorten("/Users/alice/dev/haider/state/973-LANES.md"),
+        paths.shorten("C:/Users/alice/dev/haider/state/973-LANES.md"),
         "state/973-LANES.md"
     );
-    assert_eq!(paths.shorten("/Users/alice/dev/haider"), ".");
+    assert_eq!(paths.shorten("C:/Users/alice/dev/haider"), ".");
     assert_eq!(
-        paths.shorten("/Users/alice/Developer/notes.md"),
+        paths.shorten("C:/Users/alice/Developer/notes.md"),
         "~/Developer/notes.md"
     );
-    assert_eq!(paths.shorten("/Users/alice"), "~");
+    assert_eq!(paths.shorten("C:/Users/alice"), "~");
     // Component-aware: a sibling that merely shares a prefix is NOT inside.
-    assert_eq!(paths.shorten("/Users/alice2/x.rs"), "/Users/<user>/x.rs");
     assert_eq!(
-        paths.shorten("/Users/alice/dev/haider-old/x.rs"),
+        paths.shorten("C:/Users/alice2/x.rs"),
+        "C:/Users/<user>/x.rs"
+    );
+    assert_eq!(
+        paths.shorten("C:/Users/alice/dev/haider-old/x.rs"),
         "~/dev/haider-old/x.rs"
     );
     assert_eq!(paths.shorten("/etc/hosts"), "/etc/hosts");
     assert_eq!(paths.shorten("src/app.rs"), "src/app.rs", "relative stays");
+    assert_eq!(
+        paths.shorten("../bob/secret.txt"),
+        "../bob/secret.txt",
+        "relative traversal has no authoritative tool cwd"
+    );
     // A trailing slash on the root changes nothing.
     let slashed = PathContext {
         workspace: Some("/w/".to_owned()),
@@ -83,8 +91,8 @@ fn paths_shorten_to_the_workspace_then_home_and_never_across_a_component() {
 #[test]
 fn tool_headers_share_the_home_and_other_account_projection() {
     let context = PathContext {
-        workspace: Some("/Users/alice/dev/haider".to_owned()),
-        homes: vec!["/Users/alice".into(), "C:/Users/alice".into()],
+        workspace: Some("C:/Users/alice/dev/haider".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
     };
     for tool in ["fs_read", "fs_write", "fs_edit"] {
         assert_eq!(
@@ -115,12 +123,12 @@ fn tool_headers_share_the_home_and_other_account_projection() {
         "/Users/<user>/repo"
     );
     assert_eq!(
-        context.shorten("/Users/alice/dev/haider/src/lib.rs"),
+        context.shorten("C:/Users/alice/dev/haider/src/lib.rs"),
         "src/lib.rs"
     );
     assert_eq!(
-        context.shorten("/Users/alice/dev/haider/../../../bob/private"),
-        "/Users/<user>/private"
+        context.shorten("C:/Users/alice/dev/haider/../../../bob/private"),
+        "C:/Users/<user>/private"
     );
     assert_eq!(
         context.shorten(r"\\.\pipe\haider-0123"),
@@ -133,7 +141,7 @@ fn workspace_root_cannot_shorten_away_another_account_mask() {
     for workspace in ["/", "/Users", "/Users/"] {
         let context = PathContext {
             workspace: Some(workspace.to_owned()),
-            homes: vec!["/Users/alice".into()],
+            homes: vec!["C:/Users/alice".into()],
         };
         assert_eq!(
             context.shorten("/Users/bob/private"),
@@ -143,7 +151,7 @@ fn workspace_root_cannot_shorten_away_another_account_mask() {
             tv::header_args("fs_read", &json!({"path": "/Users/bob/private"}), &context),
             "/Users/<user>/private"
         );
-        assert_eq!(context.shorten("/Users/alice/private"), "~/private");
+        assert_eq!(context.shorten("C:/Users/alice/private"), "~/private");
     }
     let windows = PathContext {
         workspace: Some("C:/Users".to_owned()),
@@ -154,6 +162,65 @@ fn workspace_root_cannot_shorten_away_another_account_mask() {
         "C:/Users/<user>/private"
     );
     assert_eq!(windows.shorten("C:/Users/alice/private"), "~/private");
+}
+
+#[test]
+fn account_shaped_workspace_keeps_safe_relative_labels() {
+    for (workspace, path) in [
+        ("/Users/Shared/proj", "/Users/Shared/proj/src/x.rs"),
+        ("/home/build/repo", "/home/build/repo/src/x.rs"),
+        ("C:/Users/Public/proj", "C:/Users/Public/proj/src/x.rs"),
+    ] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        assert_eq!(context.shorten(workspace), ".", "{workspace}");
+        assert_eq!(context.shorten(path), "src/x.rs", "{workspace}");
+        assert_eq!(
+            context.shorten(&format!("{workspace}/../bob/private")),
+            if workspace.starts_with("C:") {
+                "C:/Users/<user>/bob/private"
+            } else if workspace.starts_with("/Users") {
+                "/Users/<user>/bob/private"
+            } else {
+                "/home/<user>/bob/private"
+            },
+            "a parent traversal cannot gain a workspace label"
+        );
+    }
+    let shared = PathContext {
+        workspace: Some("/Users/Shared/proj".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    assert_eq!(
+        shared.shorten("/Users/Shared/proj-old/src/x.rs"),
+        "/Users/<user>/proj-old/src/x.rs",
+        "a sibling prefix is outside the workspace"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_alias_to_multiuser_root_keeps_the_account_mask() {
+    use std::os::unix::fs::symlink;
+    let ancestor = if cfg!(target_os = "macos") {
+        "/Users"
+    } else {
+        "/home"
+    };
+    let temp = tempfile::tempdir().expect("temporary workspace alias");
+    let alias = temp.path().join("account-roots");
+    symlink(ancestor, &alias).expect("alias");
+    let context = PathContext {
+        workspace: Some(alias.display().to_string()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    let path = alias.join("bob/private");
+    assert_eq!(
+        context.shorten(&path.to_string_lossy()),
+        format!("{ancestor}/<user>/private")
+    );
 }
 
 #[test]
@@ -187,7 +254,7 @@ fn header_arguments_are_short_and_single_line() {
     assert_eq!(
         tv::header_args(
             "fs_write",
-            &json!({"path": "/Users/alice/dev/haider/state/973-LANES.md", "content": "x"}),
+            &json!({"path": "C:/Users/alice/dev/haider/state/973-LANES.md", "content": "x"}),
             &paths
         ),
         "state/973-LANES.md"
@@ -195,7 +262,7 @@ fn header_arguments_are_short_and_single_line() {
     assert_eq!(
         tv::header_args(
             "edit",
-            &json!({"file_path": "/Users/alice/notes.md", "old_string": "a", "new_string": "b"}),
+            &json!({"file_path": "C:/Users/alice/notes.md", "old_string": "a", "new_string": "b"}),
             &paths
         ),
         "~/notes.md"
@@ -215,7 +282,7 @@ fn header_arguments_are_short_and_single_line() {
     assert_eq!(
         tv::header_args(
             "fs_search",
-            &json!({"pattern": "todos_collapsed", "path": "/Users/alice/dev/haider/src"}),
+            &json!({"pattern": "todos_collapsed", "path": "C:/Users/alice/dev/haider/src"}),
             &paths
         ),
         "\"todos_collapsed\" in src"

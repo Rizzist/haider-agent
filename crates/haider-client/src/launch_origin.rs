@@ -72,6 +72,18 @@ pub fn usable_home(home: &Path) -> bool {
     usable_home_on(home, cfg!(windows))
 }
 
+/// Whether a workspace root can contain distinct account directories.
+/// Tool rows must not shorten a path relative to such a root: doing so
+/// would remove the account mask from the displayed label.
+#[must_use]
+pub fn is_multiuser_workspace_root(root: &Path) -> bool {
+    DisplayPath::parse(root).is_multiuser_ancestor()
+        || root
+            .canonicalize()
+            .ok()
+            .is_some_and(|resolved| DisplayPath::parse(&resolved).is_multiuser_ancestor())
+}
+
 fn usable_home_on(home: &Path, windows: bool) -> bool {
     let parsed = DisplayPath::parse(home);
     parsed.absolute
@@ -744,6 +756,8 @@ impl DisplayPath {
             } else {
                 None
             }
+        // A real UNC server named `device` shares this lexical spelling.
+        // Conservatively mask any Users component there as well.
         } else if self.root.starts_with("//device/") {
             self.parts
                 .iter()
