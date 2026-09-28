@@ -2284,9 +2284,17 @@ fn i_owner_by_input_kind_matrix_keeps_parked_drafts_unchanged() {
                         },
                     );
                 }
-                "stale-composer-click" => {
-                    model.composer_press(0, DRAFT, 0, surface, revision, epoch)
-                }
+                "stale-composer-click" => stale_pointer(
+                    &mut model,
+                    Hit::ComposerText {
+                        start: 0,
+                        content: DRAFT.to_owned(),
+                        surface,
+                        revision,
+                        epoch,
+                    },
+                    MouseEventKind::Down(MouseButton::Left),
+                ),
                 _ => unreachable!(),
             }
             assert_eq!(model.composer.text(), DRAFT, "{mode} × {input}");
@@ -2330,8 +2338,18 @@ fn i_owner_by_input_kind_matrix_keeps_parked_drafts_unchanged() {
                     assert_eq!(model.composer.text(), expected, "{mode} × {input}");
                 }
                 "composer-click" => {
-                    model.composer_press(0, DRAFT, 0, surface, revision, epoch);
-                    assert_eq!(model.composer.cursor(), 0, "{mode} × {input}");
+                    stale_pointer(
+                        &mut model,
+                        Hit::ComposerText {
+                            start: 0,
+                            content: DRAFT.to_owned(),
+                            surface,
+                            revision,
+                            epoch,
+                        },
+                        MouseEventKind::Down(MouseButton::Left),
+                    );
+                    assert_eq!(model.composer.cursor(), 1, "{mode} × {input}");
                 }
                 _ => unreachable!(),
             }
