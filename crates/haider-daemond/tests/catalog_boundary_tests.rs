@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 fn private_write(
     path: impl AsRef<std::path::Path>,
     value: impl AsRef<[u8]>,
