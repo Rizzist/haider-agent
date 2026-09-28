@@ -2421,6 +2421,21 @@ fn a_mouse_selection_from_a_covered_owner_is_not_copied() {
             .iter()
             .all(|request| !matches!(request, haider_tui::app::AppRequest::CopySelection))
     );
+    let mut selected_frame = Terminal::new(TestBackend::new(118, 36)).unwrap();
+    selected_frame
+        .draw(|frame| {
+            let _ = haider_tui::render::render(&model, frame);
+        })
+        .unwrap();
+    let selected_buffer = selected_frame.backend().buffer().clone();
+    model.selection = None;
+    let mut plain_frame = Terminal::new(TestBackend::new(118, 36)).unwrap();
+    plain_frame
+        .draw(|frame| {
+            let _ = haider_tui::render::render(&model, frame);
+        })
+        .unwrap();
+    assert_eq!(selected_buffer, plain_frame.backend().buffer().clone());
 }
 
 #[test]

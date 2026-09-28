@@ -10110,7 +10110,7 @@ impl AppModel {
 
     /// Selection belongs to the currently painted surface, including an
     /// overlay selection made after that surface opened.
-    fn selection_is_visible(&self) -> bool {
+    pub(crate) fn selection_is_visible(&self) -> bool {
         self.selection.is_some()
             && match self.selection_owner {
                 Some(owner) => owner == self.input_owner(),

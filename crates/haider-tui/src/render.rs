@@ -1423,7 +1423,9 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     // The in-app selection highlight (owner item 9) paints LAST, over
     // every widget on every screen — a screen-space overlay, ground only
     // (the hover-band law: selBg shifts the ground, never the ink).
-    if let Some(selection) = &model.selection {
+    if model.selection_is_visible()
+        && let Some(selection) = &model.selection
+    {
         crate::select::apply_highlight(frame.buffer_mut(), selection, theme);
     }
     // Hit-map seam guard (review r6 P2-1b): a hit must be a real, visible
