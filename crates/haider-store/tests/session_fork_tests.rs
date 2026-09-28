@@ -349,6 +349,98 @@ fn fork_command(
     }
 }
 
+#[test]
+fn fork_and_metafork_do_not_inherit_an_explicit_account_pin() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("pinned-source");
+    create_session(&store, &source);
+    let (_, node, seq, user_seq) = source_turn(&store, &source, "source history");
+    store
+        .commit_resolved_route(
+            &source,
+            "fake",
+            "fake-model",
+            0,
+            Some("historic-account"),
+            &DeviceId::new("fork-route"),
+        )
+        .expect("source served route");
+    let connection = rusqlite::Connection::open(store.database_path()).expect("fixture db");
+    connection
+        .execute(
+            "UPDATE sessions SET meta_json = json_set(meta_json,
+             '$.account_alias', 'explicit-source',
+             '$.provider_base_url', 'https://synthetic.invalid',
+             '$.provider_rebind_id', 'explicit-rebind') WHERE id = ?1",
+            [source.as_str()],
+        )
+        .expect("explicit parent route fixture");
+    drop(connection);
+    let parent = store
+        .session_metadata(&source)
+        .expect("parent metadata")
+        .expect("typed parent");
+    assert_eq!(parent.account_alias.as_deref(), Some("explicit-source"));
+
+    let ordinary = fork_command(
+        &store,
+        "unpinned-fork-command",
+        &source,
+        "unpinned-fork-child",
+        node.clone(),
+        seq,
+        None,
+    );
+    store.fork_session(&ordinary).expect("ordinary fork");
+    let proposal = SessionMetaforkProposal {
+        removals: vec![SessionMetaforkRemoval {
+            from_seq: user_seq,
+            through_seq: user_seq,
+            reason: "remove source prompt".into(),
+            preview: None,
+            reviewed_events: Vec::new(),
+        }],
+    };
+    let mut meta = fork_command(
+        &store,
+        "unpinned-metafork-command",
+        &source,
+        "unpinned-metafork-child",
+        node,
+        seq,
+        Some(SessionMetaforkCommit {
+            description: "remove source prompt".into(),
+            model_proposal: proposal,
+            accepted_proposal_digest: String::new(),
+        }),
+    );
+    accept_metafork_review(&mut meta);
+    store.fork_session(&meta).expect("metafork");
+    for child in [&ordinary.session_id, &meta.session_id] {
+        let metadata = store
+            .session_metadata(child)
+            .expect("child metadata")
+            .expect("typed child");
+        assert_eq!(metadata.account_alias, None);
+        assert_eq!(metadata.provider_base_url, None);
+        assert_eq!(metadata.provider_rebind_id, None);
+        assert_eq!(
+            metadata.resolved_route_alias.as_deref(),
+            Some("historic-account")
+        );
+        assert!(metadata.resolved_route_seen);
+        assert_eq!(
+            (&*metadata.provider, &*metadata.model),
+            ("fake", "fake-model")
+        );
+    }
+    assert_eq!(
+        store.session_metadata(&source).expect("parent unchanged"),
+        Some(parent)
+    );
+}
+
 fn accept_metafork_review(command: &mut SessionForkCommand) -> String {
     let metafork = command.metafork.as_ref().expect("metafork command");
     let digest = SessionMetaforkReviewManifest {

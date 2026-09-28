@@ -689,7 +689,7 @@ fn document(
         effort: metadata.effort,
         speed: if metadata.fast { "fast" } else { "normal" },
         fast: metadata.fast,
-        account_alias: None,
+        account_alias: metadata.account_alias,
         agent_type: metadata.agent_type,
         context_window,
         workspace_cwd: metadata.cwd,

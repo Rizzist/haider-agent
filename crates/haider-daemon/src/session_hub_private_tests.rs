@@ -2379,7 +2379,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         created_at_ms: None,
     };
     let mut provider = provider_summary("fake");
-    provider.models = vec!["fake-v1".into()];
+    provider.models = vec!["fake-v1".into(), "fake-v2".into()];
     provider.default_model = Some("fake-v1".into());
     let active_other = haider_protocol::credential::CredentialDescriptor {
         alias: haider_protocol::ids::CredentialAlias::new("active-other"),
@@ -2478,6 +2478,19 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         metadata.interaction_mode,
         haider_protocol::session::SessionInteractionModeV1::Autonomous
     );
+    let pinned_id = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { session_id, .. },
+            } if request_id.as_str() == "resolved-create" => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("pinned id");
 
     // An ordinary create follows the provider's active account on each
     // turn. The RPC must not turn that mutable default into an explicit pin.
@@ -2522,6 +2535,149 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         })
         .expect("ordinary create response");
     assert_eq!(ordinary.account_alias, None);
+
+    let ordinary_id = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { session_id, .. },
+            } if request_id.as_str() == "ordinary-create" => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("ordinary session id");
+    connection
+        .request(
+            RequestId::new("ordinary-attach"),
+            RequestBody::SessionAttach {
+                session_id: ordinary_id.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attach");
+    let select = |command: &str, provider: Option<&str>, model: &str, max_tokens| {
+        RequestBody::SessionSelectModel {
+            command_id: haider_rpc::CommandId::new(command),
+            session_id: ordinary_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: provider.map(str::to_owned),
+            model: model.to_owned(),
+            confirm_new_epoch: true,
+            max_tokens,
+        }
+    };
+    let initial_epoch = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("initial metadata")
+        .expect("typed metadata")
+        .selection_epoch;
+    connection
+        .request(
+            RequestId::new("ordinary-noop"),
+            select("ordinary-noop-command", None, "fake-v1", None),
+        )
+        .await
+        .expect("no-op selection");
+    let no_op = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("no-op metadata")
+        .expect("typed metadata");
+    assert_eq!(no_op.account_alias, None);
+    assert_eq!(no_op.selection_epoch, initial_epoch);
+    connection
+        .request(
+            RequestId::new("ordinary-budget"),
+            select("ordinary-budget-command", None, "fake-v1", Some(2_048)),
+        )
+        .await
+        .expect("budget selection");
+    let budget = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("budget metadata")
+        .expect("typed metadata");
+    assert_eq!(budget.account_alias, None);
+    assert_eq!(budget.max_tokens, 2_048);
+    connection
+        .request(
+            RequestId::new("ordinary-model"),
+            select("ordinary-model-command", None, "fake-v2", None),
+        )
+        .await
+        .expect("model selection");
+    let model = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("model metadata")
+        .expect("typed metadata");
+    assert_eq!(model.account_alias, None);
+    assert_eq!(model.model, "fake-v2");
+    connection
+        .request(
+            RequestId::new("ordinary-provider"),
+            select("ordinary-provider-command", Some("other"), "other-v1", None),
+        )
+        .await
+        .expect("provider selection");
+    let provider = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("provider metadata")
+        .expect("typed metadata");
+    assert_eq!(provider.account_alias, None);
+    assert_eq!(
+        (&*provider.provider, &*provider.model),
+        ("other", "other-v1")
+    );
+
+    // A separate explicit create pin survives a same-provider model choice.
+    // Changing providers clears that pin, because the alias belongs to fake.
+    connection
+        .request(
+            RequestId::new("pinned-attach"),
+            RequestBody::SessionAttach {
+                session_id: pinned_id.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("pinned attach");
+    for (name, provider, model, expected_alias) in [
+        ("same", None, "fake-v2", Some("selected-fake")),
+        ("cross", Some("other"), "other-v1", None),
+    ] {
+        connection
+            .request(
+                RequestId::new(format!("pinned-{name}")),
+                RequestBody::SessionSelectModel {
+                    command_id: haider_rpc::CommandId::new(format!("pinned-{name}-command")),
+                    session_id: pinned_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    provider: provider.map(str::to_owned),
+                    model: model.to_owned(),
+                    confirm_new_epoch: true,
+                    max_tokens: None,
+                },
+            )
+            .await
+            .expect("pinned selection");
+        let metadata = store
+            .session_metadata(&pinned_id)
+            .await
+            .expect("pinned metadata")
+            .expect("typed metadata");
+        assert_eq!(metadata.account_alias.as_deref(), expected_alias);
+    }
 
     drop(connection);
     hub.shutdown().await.expect("hub shutdown");
@@ -5971,6 +6127,7 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
         selection_epoch: None,
         provider: "fake-b".into(),
         model: "model-b".into(),
+        route_only: false,
     }
     .to_payload_value()
     .expect("fact serializes");

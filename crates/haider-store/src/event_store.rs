@@ -5125,6 +5125,7 @@ impl Store {
                     selection_epoch: Some(epoch),
                     provider: metadata.provider.clone(),
                     model: metadata.model.clone(),
+                    route_only: true,
                 }
                 .to_payload_value()
                 .map_err(|error| store_error(ErrorCode::StoreCorrupt, error.to_string(), false))?,
@@ -9245,6 +9246,13 @@ impl Store {
             decode_session_metadata(command.source_session_id, &source_metadata_json)?
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
+        // The fork copies conversation and model history, not the source's
+        // explicit credential or endpoint choice. Keep the resolved route as
+        // provenance for copied footprints; the child's next turn resolves
+        // its own mutable default and advances the epoch if that route differs.
+        metadata.account_alias = None;
+        metadata.provider_base_url = None;
+        metadata.provider_rebind_id = None;
         // A fork inherits prompt history, not the source session's operational
         // savings ledger. Its first model-view reduction starts a fresh total.
         metadata.context_economy = ContextEconomy::default();
@@ -10024,6 +10032,7 @@ impl Store {
                 selection_epoch: Some(selection_epoch),
                 provider: command.provider.clone(),
                 model: command.model.clone(),
+                route_only: false,
             }
             .to_payload_value()
             .map_err(|error| {

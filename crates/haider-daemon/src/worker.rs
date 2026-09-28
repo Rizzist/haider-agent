@@ -376,6 +376,10 @@ struct DaemonProviderPairSwitchCommitter {
 
 struct DaemonProviderRouteCommitter {
     store: HubStoreHandle,
+    /// The pair and epoch admitted for this turn, including its initial
+    /// resolved route. A later selection must not donate its new epoch to
+    /// this older turn's rotation.
+    selection: haider_protocol::session::SessionMetadataV1,
 }
 
 impl std::fmt::Debug for DaemonProviderRouteCommitter {
@@ -395,22 +399,11 @@ impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
         model: &str,
         to: &haider_protocol::ids::CredentialAlias,
     ) -> Result<u64, HaiderError> {
-        let metadata = self.store.session_metadata().await?.ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::SessionNotFound,
-                "session disappeared during account rotation",
-                false,
-            )
-        })?;
-        if metadata.provider != provider || metadata.model != model {
-            return Err(HaiderError::new(
-                ErrorCode::RevisionConflict,
-                "session selection changed during account rotation",
-                true,
-            ));
+        if self.selection.provider != provider || self.selection.model != model {
+            return Ok(self.selection.selection_epoch.unwrap_or(0));
         }
         self.store
-            .commit_resolved_route(&metadata, Some(to.as_str()))
+            .commit_resolved_route(&self.selection, Some(to.as_str()))
             .await
     }
 }
@@ -9510,8 +9503,11 @@ async fn start_turn(
         .commit_resolved_route(metadata, resolved.account_alias.as_deref())
         .await?;
     config.selection_epoch = Some(route_epoch);
+    let mut route_selection = metadata.clone();
+    route_selection.selection_epoch = Some(route_epoch);
     config.provider_route_committer = Some(Arc::new(DaemonProviderRouteCommitter {
         store: lease.clone(),
+        selection: route_selection,
     }));
     config.turn_trace = turn_trace.clone();
     config.agent_spawn = headless

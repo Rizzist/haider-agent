@@ -21213,6 +21213,27 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// A resolved-account change advances provenance for a parked session
+    /// without changing its model or forgetting its committed output budget.
+    pub fn note_parked_route_selected_at(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        epoch: Option<u64>,
+    ) {
+        let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) else {
+            return;
+        };
+        let pair = (provider.to_owned(), model.to_owned());
+        let same_pair = row.meter_epoch.pair.as_ref() == Some(&pair);
+        let budget = same_pair.then_some(row.meter_epoch.output_budget).flatten();
+        let user_budget = same_pair.then_some(row.meter_epoch.user_budget);
+        if row.meter_epoch.admit(pair, epoch, budget, user_budget) {
+            self.dirty = true;
+        }
+    }
+
     /// A committed provider rebind for a PARKED session: its epoch's pair
     /// moves to the new provider (the model is unchanged).
     pub fn note_parked_provider_rebound(&mut self, session: &SessionId, provider: &str) {
@@ -21288,6 +21309,63 @@ impl AppModel {
             {
                 entry.model_short = model.to_owned();
             }
+            self.dirty = true;
+        }
+    }
+
+    /// The account label for the attached session comes from that session's
+    /// pin or last resolved route. An unserved session follows the provider's
+    /// active account, which is labelled as a default rather than a pin.
+    pub fn attached_account_label(&self) -> String {
+        let Some(session) = self.active_session.as_ref() else {
+            return self.identity.account.clone();
+        };
+        let Some(row) = self.sessions.iter().find(|row| &row.id == session) else {
+            return "unknown".to_owned();
+        };
+        if row.account_provider.as_deref() == Some(self.identity.provider.as_str()) {
+            if let Some(alias) = row.account_alias.as_deref() {
+                return format!("{alias} (pinned)");
+            }
+            if row.resolved_route_seen {
+                return row
+                    .resolved_route_alias
+                    .clone()
+                    .unwrap_or_else(|| "unbound".to_owned());
+            }
+        }
+        self.accounts
+            .rows
+            .iter()
+            .find(|account| account.provider == self.identity.provider && account.selected)
+            .map_or_else(
+                || "none (default)".to_owned(),
+                |account| format!("{} (default)", account.alias),
+            )
+    }
+
+    pub fn note_session_account(
+        &mut self,
+        session: &SessionId,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) {
+        if let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) {
+            let epoch = if self.active_session.as_ref() == Some(session) {
+                &self.meter_epoch
+            } else {
+                &row.meter_epoch
+            };
+            if epoch.pair.as_ref() != Some(&(metadata.provider.clone(), metadata.model.clone()))
+                || matches!((epoch.selection_epoch, metadata.selection_epoch),
+                    (Some(current), Some(incoming)) if incoming < current)
+            {
+                return;
+            }
+            row.account_alias.clone_from(&metadata.account_alias);
+            row.account_provider = Some(metadata.provider.clone());
+            row.resolved_route_alias
+                .clone_from(&metadata.resolved_route_alias);
+            row.resolved_route_seen = metadata.resolved_route_seen;
             self.dirty = true;
         }
     }

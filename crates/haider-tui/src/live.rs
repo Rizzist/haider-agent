@@ -731,6 +731,8 @@ pub enum LiveCommand {
     AccountListAt {
         epoch: u64,
     },
+    /// Watch daemon account revisions, including changes from another CLI.
+    AccountListWatch,
     /// `account.device_candidates` (D2) — the daemon's metadata-only
     /// discovery of first-party CLI credential stores. A read, issued on
     /// screen entry only; secrets never ride its response by D1's wire
@@ -1198,6 +1200,7 @@ impl LiveCommand {
             | Self::Detach { .. }
             | Self::AccountList
             | Self::AccountListAt { .. }
+            | Self::AccountListWatch
             | Self::DeviceCandidates
             | Self::ProviderList
             | Self::ProviderListAt { .. }
@@ -1360,6 +1363,9 @@ pub enum LiveReply {
         sources: Vec<crate::app::AccountSourceRow>,
         epoch: u64,
     },
+    AccountsChanged {
+        revision: u64,
+    },
     ProvidersAt {
         providers: Vec<haider_rpc::ProviderSummaryWire>,
         revision: u64,
@@ -1398,6 +1404,9 @@ pub enum LiveReply {
         worker_generation: u64,
         cwd: String,
         model: String,
+        /// The daemon's resolved pair, budget and account truth. `None` is
+        /// tolerated for older test/client fixtures.
+        metadata: Option<haider_protocol::session::SessionMetadataV1>,
     },
     Submitted {
         command_id: CommandId,
@@ -3525,6 +3534,7 @@ impl LiveDriver {
                                 metadata.selection_epoch,
                                 metadata.max_tokens_source,
                             );
+                            model.note_session_account(&summary.session_id, metadata);
                         }
                         self.workspace_paths
                             .insert(summary.session_id.clone(), metadata.cwd.clone());
@@ -3765,6 +3775,7 @@ impl LiveDriver {
                 worker_generation,
                 cwd,
                 model: model_name,
+                metadata,
             } => {
                 let cwd_display = workspace_display_path(&cwd);
                 self.binding_worker_generation = Some(worker_generation);
@@ -3778,6 +3789,17 @@ impl LiveDriver {
                 // daemon's own id in hand — does a row exist. Nothing was
                 // fabricated locally, so nothing has to be reconciled.
                 model.upsert_live_session(&session);
+                if let Some(metadata) = metadata.as_ref() {
+                    model.note_session_metadata_at(
+                        &session,
+                        &metadata.provider,
+                        &metadata.model,
+                        metadata.max_tokens,
+                        metadata.selection_epoch,
+                        metadata.max_tokens_source,
+                    );
+                    model.note_session_account(&session, metadata);
+                }
                 if let Some(row) = model.sessions.iter_mut().find(|row| row.id == session) {
                     // The ROW shows the display form; `cwd` is the absolute
                     // path the daemon was given.
@@ -4729,6 +4751,19 @@ impl LiveDriver {
                 // An active OAuth account with no catalog yet needs one
                 // discovered before the picker or the bootstrap can work.
                 self.provider_model_refreshes(model)
+            }
+            LiveReply::AccountsChanged { revision } => {
+                if model
+                    .accounts
+                    .revision
+                    .is_some_and(|known| revision <= known)
+                {
+                    Vec::new()
+                } else {
+                    vec![LiveCommand::AccountListAt {
+                        epoch: self.connection_epoch,
+                    }]
+                }
             }
             LiveReply::DeviceCandidates {
                 candidates,
@@ -6630,7 +6665,20 @@ impl LiveDriver {
         // only an APPLIED envelope can have moved the tree.
         if applied {
             let mut commands = self.fleet_event_chase(model, session);
-            if model_fact && self.connected {
+            // The first resolved route updates metadata without a journal
+            // fact or epoch change. Refresh it once the first turn settles so
+            // the attached header can show the session's actual account.
+            let first_route_settled = model.active_session.as_ref() == Some(session)
+                && model
+                    .sessions
+                    .iter()
+                    .find(|row| &row.id == session)
+                    .is_some_and(|row| !row.resolved_route_seen)
+                && envelope.payload.decode_event().is_ok_and(|payload| {
+                    matches!(payload,
+                        haider_protocol::EventPayload::RunState(state) if state.is_terminal())
+                });
+            if (model_fact || first_route_settled) && self.connected {
                 let selection_epoch = if model.active_session.as_ref() == Some(session) {
                     model.meter_epoch.selection_epoch
                 } else {
@@ -6642,10 +6690,11 @@ impl LiveDriver {
                 }
                 .unwrap_or(envelope.seq);
                 if self.meter_list_pending {
-                    if self
-                        .meter_list_started
-                        .get(session)
-                        .is_none_or(|started| selection_epoch > *started)
+                    if first_route_settled
+                        || self
+                            .meter_list_started
+                            .get(session)
+                            .is_none_or(|started| selection_epoch > *started)
                     {
                         self.meter_list_dirty
                             .insert(session.clone(), selection_epoch);
@@ -6733,12 +6782,21 @@ impl LiveDriver {
             // bind its own meter epoch (never the identity on screen).
             match payload {
                 haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) => {
-                    model.note_parked_model_selected_at(
-                        session,
-                        &selected.provider,
-                        &selected.model,
-                        selected.selection_epoch.or(Some(envelope.seq)),
-                    );
+                    if selected.route_only {
+                        model.note_parked_route_selected_at(
+                            session,
+                            &selected.provider,
+                            &selected.model,
+                            selected.selection_epoch.or(Some(envelope.seq)),
+                        );
+                    } else {
+                        model.note_parked_model_selected_at(
+                            session,
+                            &selected.provider,
+                            &selected.model,
+                            selected.selection_epoch.or(Some(envelope.seq)),
+                        );
+                    }
                 }
                 haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(
                     rebound,
@@ -6782,8 +6840,13 @@ impl LiveDriver {
                 // sequence. Use it to order the pair; its epochless request
                 // footprints remain projected.
                 let selected_epoch = selected.selection_epoch.or(Some(envelope.seq));
-                if !model.meter_epoch.admit((selected.provider.clone(), selected.model.clone()),
-                    selected_epoch, None, None) {
+                let pair = (selected.provider.clone(), selected.model.clone());
+                let route_only = selected.route_only;
+                let same_pair = model.meter_epoch.pair.as_ref() == Some(&pair);
+                let budget = (route_only && same_pair).then_some(model.meter_epoch.output_budget).flatten();
+                let user_budget = (route_only && same_pair).then_some(model.meter_epoch.user_budget);
+                if !model.meter_epoch.admit(pair,
+                    selected_epoch, budget, user_budget) {
                     return false;
                 }
                 if model.identity.model_short != selected.model
@@ -6793,10 +6856,12 @@ impl LiveDriver {
                     model.identity.model_short = selected.model.clone();
                     model.refresh_context_window();
                 }
-                model.projection.push_note(format!(
-                    "⇄ model → {} · {}",
-                    selected.model, selected.provider
-                ));
+                if !route_only {
+                    model.projection.push_note(format!(
+                        "⇄ model → {} · {}",
+                        selected.model, selected.provider
+                    ));
+                }
                 model.dirty = true;
             }
             haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(rebound) => {
@@ -6968,6 +7033,9 @@ impl LiveDriver {
                 epoch: self.connection_epoch,
             },
         ];
+        if model.daemon_serves(haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1) {
+            commands.push(LiveCommand::AccountListWatch);
+        }
         if model.daemon_serves(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1) {
             commands.push(LiveCommand::DeviceCandidates);
         }

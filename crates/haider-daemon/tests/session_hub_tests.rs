@@ -4646,6 +4646,7 @@ fn model_selected_envelope(
         selection_epoch: None,
         provider: provider.into(),
         model: model.into(),
+        route_only: false,
     }
     .to_payload_value()
     .expect("model selection serializes");

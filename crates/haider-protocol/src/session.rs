@@ -354,6 +354,11 @@ pub struct ModelSelected {
     pub provider: String,
     /// The selected full model identifier.
     pub model: String,
+    /// This fact advances a route epoch without changing the model pair.
+    /// Older readers may still treat it as a model selection; new readers
+    /// keep their known output budget and omit the model-change note.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub route_only: bool,
 }
 
 /// Additive replay fact emitted atomically with a committed live-session

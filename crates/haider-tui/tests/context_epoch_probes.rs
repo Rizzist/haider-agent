@@ -715,6 +715,7 @@ fn deliver_model_fact(
         selection_epoch: Some(seq),
         provider: provider.to_owned(),
         model: slug.to_owned(),
+        route_only: false,
     };
     deliver(
         driver,
@@ -1411,6 +1412,203 @@ fn listed_summary(
     }
 }
 
+#[test]
+fn launcher_create_reply_binds_pair_budget_and_account_before_first_list_refresh() {
+    let (mut model, mut driver) = live_session(true);
+    let session = session_id("launcher-created-meter");
+    let mut metadata = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000)
+        .metadata
+        .expect("typed metadata");
+    metadata.selection_epoch = Some(0);
+    driver.apply(
+        &mut model,
+        LiveReply::Created {
+            command_id: haider_rpc::CommandId::new("launcher-create"),
+            session: session.clone(),
+            worker_generation: 7,
+            cwd: metadata.cwd.clone(),
+            model: metadata.model.clone(),
+            metadata: Some(metadata.clone()),
+        },
+    );
+    assert_eq!(model.active_session.as_ref(), Some(&session));
+    assert_eq!(
+        model.meter_epoch.pair,
+        Some((metadata.provider.clone(), metadata.model.clone()))
+    );
+    assert_eq!(model.context_meter().window, Some(1_000_000));
+    assert_eq!(model.context_meter().auto_compact_at, Some(850_000));
+    assert_eq!(model.attached_account_label(), "anthropic-oauth (default)");
+    for width in [80, 118] {
+        let header = draw(&model, width, if width == 80 { 24 } else { 36 });
+        let expected = if width == 80 {
+            "@anthropic-oauth (default)"
+        } else {
+            "account anthropic-oauth (default)"
+        };
+        assert!(
+            header[..3].iter().any(|line| line.contains(expected)),
+            "{width}-column header: {header:?}"
+        );
+    }
+    let mut changed =
+        haider_tui::link::map_frame(haider_rpc::WireFrame::AccountsChanged { revision: 2 });
+    let refresh = driver.apply(&mut model, changed.pop().expect("account notice"));
+    assert!(
+        refresh
+            .iter()
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. }))
+    );
+    let mut old = oauth_descriptor("anthropic-oauth");
+    old.active = false;
+    let mut alternate = oauth_descriptor("anthropic-oauth");
+    alternate.alias = CredentialAlias::new("anthropic-alt");
+    driver.apply(
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![old.clone(), alternate],
+            revision: Some(2),
+            sources: Vec::new(),
+        },
+    );
+    assert_eq!(model.attached_account_label(), "anthropic-alt (default)");
+    old.active = true;
+    driver.apply(
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![old, oauth_descriptor("openai-oauth")],
+            revision: Some(3),
+            sources: Vec::new(),
+        },
+    );
+
+    apply_footprint(
+        &mut model,
+        "launcher-first-turn",
+        &snapshot(
+            1_000,
+            49_000,
+            1_000,
+            Some(1_000_000),
+            ContextFootprintTruth::Exact,
+        ),
+    );
+    assert_eq!(model.context_meter().used_tokens, 51_000);
+    model.back_to_launcher();
+    model.open_session(&session);
+    assert_eq!(model.context_meter().window, Some(1_000_000));
+    assert_eq!(model.context_meter().used_tokens, 51_000);
+
+    metadata.resolved_route_seen = true;
+    metadata.resolved_route_alias = Some("served-account".into());
+    model.note_session_account(&session, &metadata);
+    assert_eq!(model.attached_account_label(), "served-account");
+    assert!(
+        draw(&model, 80, 24)[..3]
+            .iter()
+            .any(|line| line.contains("@served-account"))
+    );
+    metadata.account_alias = Some("explicit-account".into());
+    model.note_session_account(&session, &metadata);
+    assert_eq!(model.attached_account_label(), "explicit-account (pinned)");
+    assert!(
+        draw(&model, 118, 36)[..3]
+            .iter()
+            .any(|line| line.contains("account explicit-account (pinned)"))
+    );
+    model.apply_session_model_selected_at(&session, "openai-oauth", "gpt-6-sol", None, Some(1));
+    assert_eq!(model.attached_account_label(), "openai-oauth (default)");
+    model.note_session_account(&session, &metadata);
+    assert_eq!(model.attached_account_label(), "openai-oauth (default)");
+}
+
+#[test]
+fn first_served_route_refreshes_the_attached_account_label() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let session = session_id("s-meter-a");
+    assert_eq!(model.attached_account_label(), "anthropic-oauth (default)");
+    let commands = deliver(
+        &mut driver,
+        &mut model,
+        &session,
+        1,
+        serde_json::to_value(haider_protocol::EventPayload::RunState(
+            haider_protocol::state::RunState::Done,
+        ))
+        .expect("terminal state"),
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ListAt { .. }))
+    );
+    let mut row = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    let metadata = row.metadata.as_mut().expect("metadata");
+    metadata.resolved_route_seen = true;
+    metadata.resolved_route_alias = Some("served-account".into());
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "served-account");
+}
+
+#[test]
+fn reconnect_subscribes_to_external_account_changes() {
+    let (mut model, mut driver) = live_session(true);
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned());
+    let commands = driver.apply(&mut model, LiveReply::Reconnected);
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::AccountListWatch))
+    );
+}
+
+#[test]
+fn same_pair_route_fact_keeps_budget_and_has_no_model_note() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let session = session_id("s-meter-a");
+    deliver_footprint(
+        &mut driver,
+        &mut model,
+        &session,
+        1,
+        &snapshot(
+            1_000,
+            49_000,
+            1_000,
+            Some(1_000_000),
+            ContextFootprintTruth::Exact,
+        ),
+    );
+    let notes_before = model.projection.entries().len();
+    deliver(
+        &mut driver,
+        &mut model,
+        &session,
+        3,
+        haider_protocol::session::ModelSelected {
+            selection_epoch: Some(3),
+            provider: "anthropic-oauth".into(),
+            model: "claude-opus-5-5".into(),
+            route_only: true,
+        }
+        .to_payload_value()
+        .expect("route fact"),
+    );
+    assert_eq!(model.projection.entries().len(), notes_before);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(3));
+    assert_eq!(model.meter_epoch.output_budget, Some(30_000));
+    assert!(!model.meter_epoch.reserve_assumed);
+    assert!(!model.context_meter().reserve_assumed);
+}
+
 /// B3 across surfaces: a model switched from ANOTHER surface lands as a
 /// bare journal fact (no budget). The daemon's typed metadata for the same
 /// pair (the `session.list` the driver asks for after a model fact) then
@@ -1716,6 +1914,7 @@ fn astra_noop_selection_fact_does_not_hide_current_daemon_truth() {
         selection_epoch: Some(0),
         provider: "eq-oauth".into(),
         model: "eq-wide".into(),
+        route_only: false,
     }
     .to_payload_value()
     .expect("no-op fact");
@@ -1907,6 +2106,7 @@ fn astra_a_fact_during_an_inflight_list_gets_a_fresh_budget_read() {
             selection_epoch: Some(epoch),
             provider: "eq-oauth".into(),
             model: m.into(),
+            route_only: false,
         }
         .to_payload_value()
         .expect("fact")
@@ -2068,6 +2268,7 @@ fn astra_failed_metadata_read_releases_the_refresh_latch() {
             selection_epoch: Some(epoch),
             provider: "eq-oauth".into(),
             model: m.into(),
+            route_only: false,
         }
         .to_payload_value()
         .expect("fact")
@@ -2124,6 +2325,7 @@ fn newer_selection_dirty_during_a_failed_list_gets_one_followup() {
             selection_epoch: Some(next + 2),
             provider: "eq-oauth".into(),
             model: "eq-small".into(),
+            route_only: false,
         }
         .to_payload_value()
         .expect("fact"),
@@ -2907,6 +3109,7 @@ fn older_daemon_selection_fact_and_metadata_bind_pair_without_claiming_snapshot_
             selection_epoch: None,
             provider: "eq-oauth".into(),
             model: "eq-mid".into(),
+            route_only: false,
         }
         .to_payload_value()
         .expect("legacy fact"),
@@ -2946,6 +3149,7 @@ fn epochless_durable_fact_after_a_selection_reply_still_advances_its_pair() {
             selection_epoch: None,
             provider: "eq-oauth".into(),
             model: "eq-mid".into(),
+            route_only: false,
         }
         .to_payload_value()
         .expect("legacy fact"),
@@ -3211,6 +3415,7 @@ fn cross_session_fact_during_paginated_list_gets_one_dirty_followup() {
             selection_epoch: Some(1),
             provider: "anthropic-oauth".into(),
             model: "claude-sonnet-4-6".into(),
+            route_only: false,
         }
         .to_payload_value()
         .expect("probe fixture"),
@@ -3244,6 +3449,7 @@ fn cross_session_fact_during_paginated_list_gets_one_dirty_followup() {
             selection_epoch: Some(1),
             provider: "anthropic-oauth".into(),
             model: "claude-sonnet-4-6".into(),
+            route_only: false,
         }
         .to_payload_value()
         .expect("probe fixture"),
@@ -3698,6 +3904,7 @@ fn boot_list_in_flight_gets_one_dirty_followup_for_a_new_selection() {
             selection_epoch: Some(1),
             provider: "eq-oauth".into(),
             model: "eq-small".into(),
+            route_only: false,
         }
         .to_payload_value()
         .expect("fact"),

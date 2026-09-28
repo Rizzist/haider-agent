@@ -724,6 +724,7 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
             worker_generation: 7,
             cwd: "/tmp/created-workspace".to_owned(),
             model: "fable-5".to_owned(),
+            metadata: None,
         },
     );
     assert_eq!(model.sessions.len(), 1, "the daemon's session became a row");
@@ -1367,6 +1368,7 @@ fn an_attached_dated_session_speaks_uncreated_until_its_leaf_exists() {
             worker_generation: 3,
             cwd: leaf_text.clone(),
             model: "fable-5".to_owned(),
+            metadata: None,
         },
     );
     assert_eq!(
@@ -1471,6 +1473,7 @@ fn rapid_session_switches_cannot_exceed_the_probe_bound() {
                 worker_generation: 1,
                 cwd: leaf.clone(),
                 model: "fable-5".to_owned(),
+                metadata: None,
             },
         );
         leaves.push(std::path::PathBuf::from(leaf));
@@ -1557,6 +1560,7 @@ fn an_absent_non_dated_workspace_never_claims_the_uncreated_cue() {
             worker_generation: 1,
             cwd: "/definitely/not/a/real/haider/workspace".to_owned(),
             model: "fable-5".to_owned(),
+            metadata: None,
         },
     );
     driver.sync_workspace_presence(&mut model, true);

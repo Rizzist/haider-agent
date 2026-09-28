@@ -93,6 +93,12 @@ pub struct SessionState {
     /// budget (973-context-meter-fixes B1). Restored with the projection on
     /// checkout; a parked session's background model change lands here.
     pub meter_epoch: crate::context_meter::MeterEpoch,
+    /// Explicit credential pin and last served route from this session's
+    /// typed metadata. The global active account is only its initial default.
+    pub account_alias: Option<String>,
+    pub account_provider: Option<String>,
+    pub resolved_route_alias: Option<String>,
+    pub resolved_route_seen: bool,
     pub projection: SessionProjection,
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
@@ -212,6 +218,10 @@ impl SessionState {
             workspace_cwd: None,
             launch_origin: None,
             meter_epoch: crate::context_meter::MeterEpoch::default(),
+            account_alias: None,
+            account_provider: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
             projection: SessionProjection::new(),
             prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),

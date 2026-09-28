@@ -12277,9 +12277,10 @@ impl HubConnection {
             provider: resolved_provider,
             model: resolved_model,
             expected_pair: None,
-            account_alias: target_descriptor
-                .as_ref()
-                .map(|descriptor| descriptor.alias.as_str().to_owned()),
+            // A model or output-budget choice never selects an account. The
+            // descriptor above is only for cache preflight; passing it to the
+            // store would turn an unpinned session into a durable pin.
+            account_alias: None,
             output_budget: Some(output_budget),
             event_id: EventId::new(random_id("model-selected")?),
             device_id: self.hub.inner.device_id.clone(),

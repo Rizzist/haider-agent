@@ -735,6 +735,7 @@ fn deliver_model_fact(
         selection_epoch: Some(seq),
         provider: provider.to_owned(),
         model: slug.to_owned(),
+        route_only: false,
     };
     deliver(
         driver,

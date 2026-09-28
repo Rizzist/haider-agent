@@ -1651,6 +1651,7 @@ pub fn request_body_for_features(
         LiveCommand::AccountList | LiveCommand::AccountListAt { .. } => {
             RequestBody::AccountList { provider: None }
         }
+        LiveCommand::AccountListWatch => RequestBody::AccountListWatch {},
         // D2: the read carries nothing; the import carries ONLY the opaque
         // candidate id — the daemon re-reads the local store itself, so no
         // credential bytes exist to send.
@@ -1951,8 +1952,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 command_id: id,
                 session: session_id,
                 worker_generation,
-                cwd: metadata.cwd,
-                model: metadata.model,
+                cwd: metadata.cwd.clone(),
+                model: metadata.model.clone(),
+                metadata: Some(metadata),
             }]
         }),
         // The branch-pinned response shape carries the same driver facts as
@@ -2920,6 +2922,7 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             high_water_seq,
         }],
         WireFrame::ServerDraining { reason, .. } => vec![LiveReply::Draining { reason }],
+        WireFrame::AccountsChanged { revision } => vec![LiveReply::AccountsChanged { revision }],
         WireFrame::SessionSurfaceDelta {
             session_id,
             input: Some(input),
@@ -2996,7 +2999,6 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         | WireFrame::Request { .. }
         | WireFrame::Response { .. }
         | WireFrame::SessionRosterDelta { .. }
-        | WireFrame::AccountsChanged { .. }
         | WireFrame::HaiderCodePlanStatus { .. }
         | WireFrame::SessionSurfaceDelta { input: None, .. }
         | WireFrame::MenuAnswer { .. }

@@ -896,6 +896,203 @@ async fn rpc_created_unpinned_session_can_rotate_and_commit_its_route_epoch() {
     world.shutdown().await;
 }
 
+/// A global default change is lazy: sessions which already served a turn
+/// retain their own recorded route and epoch until they serve again.
+#[tokio::test]
+async fn global_account_switch_does_not_advance_served_sessions() {
+    let mut steps = text_turn("first session answered");
+    steps.extend(text_turn("second session answered"));
+    let fake_a = Arc::new(FakeProvider::new(steps));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("unused")));
+    let mut world = PairSwitchWorld::boot("switch-served", fake_a, fake_b).await;
+    let first = world.session_id.clone();
+    world.run_turn("switch-served-first", "hello first").await;
+
+    let second = SessionId::new("switch-served-second-session");
+    world
+        .hub
+        .create_internal_session(SessionCreateCommand {
+            command_id: "switch-served-second-create".into(),
+            request_digest: "switch-served-second-digest".into(),
+            request_json: "{}".into(),
+            session_id: second.clone(),
+            cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake-a".into(),
+            model: "model-a".into(),
+            max_tokens: 4096,
+            max_tokens_source: None,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("switch-served-second-created"),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("second session created");
+    world.session_id = second.clone();
+    world.run_turn("switch-served-second", "hello second").await;
+
+    let mut before_rows = Vec::new();
+    for id in [first.clone(), second.clone()] {
+        let metadata = world
+            .store
+            .session_metadata(&id)
+            .await
+            .expect("metadata read")
+            .expect("typed metadata");
+        let head = world.store.latest_seq(&id).await.expect("journal head");
+        assert!(metadata.resolved_route_seen, "{id} served a turn");
+        before_rows.push((id, metadata, head));
+    }
+
+    let old = haider_protocol::credential::CredentialDescriptor {
+        alias: CredentialAlias::new("old-fake"),
+        provider: "fake-a".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "synthetic old".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let new = haider_protocol::credential::CredentialDescriptor {
+        alias: CredentialAlias::new("new-fake"),
+        active: false,
+        ..old.clone()
+    };
+    let (login, mut queued) = tokio::sync::mpsc::channel(1);
+    world
+        .hub
+        .install_accounts(crate::accounts::AccountsFacade {
+            login: Some(login),
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+            management: crate::accounts::ManagementSnapshot::new(
+                0,
+                vec![old, new],
+                vec![model_summary("fake-a", &["model-a"])],
+            ),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            sources: Arc::new(Mutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts installed");
+    let sink = Arc::new(GraphSelectionSink::default());
+    let connection = world
+        .hub
+        .open_connection(
+            BTreeSet::from([Capability::Control]),
+            sink,
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("switch connection");
+    connection
+        .request(
+            RequestId::new("switch-served-request"),
+            RequestBody::AccountSetActive {
+                command_id: CommandId::new("switch-served-command"),
+                alias: "new-fake".into(),
+                confirm_new_epoch: true,
+            },
+        )
+        .await
+        .expect("switch preflight");
+    assert!(matches!(
+        queued.try_recv(),
+        Ok(crate::accounts::AccountCommand::SetActive(_))
+    ));
+    for (id, metadata, head) in before_rows {
+        assert_eq!(
+            world
+                .store
+                .session_metadata(&id)
+                .await
+                .expect("metadata after"),
+            Some(metadata),
+            "global switch must leave {id}'s route and epoch untouched"
+        );
+        assert_eq!(world.store.latest_seq(&id).await.expect("head after"), head);
+    }
+    drop(connection);
+    world.shutdown().await;
+}
+
+/// An explicit selection can land after a turn started but before its first
+/// provider attempt rotates. The old turn may finish on the alternate; its
+/// route commit must leave the newer selection's metadata alone.
+#[tokio::test]
+async fn rotation_after_midturn_model_selection_finishes_without_overwriting_route() {
+    let fake_a = Arc::new(FakeProvider::new(vec![
+        FakeStep::Delay { ms: 500 },
+        FakeStep::Error {
+            kind: haider_provider::ProviderErrorKind::Authentication,
+            message: "old account rejected".into(),
+            retry_after_ms: None,
+        },
+    ]));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("rotated turn completed")));
+    let world = PairSwitchWorld::boot_with_rotation(
+        "midturn-rotation-selection",
+        Arc::clone(&fake_a),
+        Arc::clone(&fake_b),
+    )
+    .await;
+    let (run_id, disposition) = world
+        .submit_turn(
+            "midturn-rotation-selection-turn",
+            "hello",
+            DeliveryMode::Steer,
+        )
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    timeout(Duration::from_secs(5), async {
+        while fake_a.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first provider request started");
+    let SessionSelectModelOutcome::Committed { selected, .. } = world
+        .store
+        .select_session_model(world.select_command("midturn-rotation-explicit"))
+        .await
+        .expect("explicit model selection")
+    else {
+        panic!("new selection must commit");
+    };
+    world.await_run_state(&run_id, RunState::Done).await;
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed metadata");
+    assert_eq!(
+        (&*metadata.provider, &*metadata.model),
+        ("fake-b", "model-b")
+    );
+    assert_eq!(metadata.selection_epoch, Some(selected.selected_seq));
+    assert_ne!(
+        metadata.resolved_route_alias.as_deref(),
+        Some("fake-a-account-b")
+    );
+    assert_eq!(
+        fake_b.requests().len(),
+        1,
+        "rotated attempt served the turn"
+    );
+    world.shutdown().await;
+}
+
 /// LAW: an authentication wall with no within-provider alternate commits the
 /// exact receipted pair-selection transaction, surfaces both the cold epoch
 /// and human-readable hop reason, and finishes the SAME run on provider B.

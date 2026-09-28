@@ -289,6 +289,18 @@ fn resolved_account_route_advances_only_the_served_sessions_epoch() {
         .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-b"), &device)
         .expect("switched route");
     assert!(changed > 0);
+    let route_fact = store
+        .read(&served, 0, 16)
+        .expect("route journal")
+        .into_iter()
+        .find_map(|event| {
+            haider_protocol::session::ModelSelected::from_payload_value(&event.payload)
+        })
+        .expect("route fact");
+    assert!(
+        route_fact.route_only,
+        "same-pair route facts are not model notes"
+    );
     assert_eq!(
         store
             .commit_resolved_route(
@@ -335,13 +347,18 @@ fn resolved_account_route_advances_only_the_served_sessions_epoch() {
         event_id: EventId::new("selected-after-route"),
         device_id: DeviceId::new("daemon-test"),
     };
-    let SessionSelectModelOutcome::Committed { selected, .. } = store
+    let SessionSelectModelOutcome::Committed { selected, envelope } = store
         .select_session_model(&selection)
         .expect("model after route")
     else {
         panic!("selection was not committed")
     };
     assert!(selected.selected_seq > changed);
+    assert!(
+        !haider_protocol::session::ModelSelected::from_payload_value(&envelope.payload)
+            .expect("explicit model fact")
+            .route_only
+    );
     let parked_metadata = store
         .session_metadata(&parked)
         .expect("parked metadata")

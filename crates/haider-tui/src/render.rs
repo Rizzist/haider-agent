@@ -6493,14 +6493,31 @@ fn render_session(
             accent.add_modifier(Modifier::BOLD),
         ));
     }
-    header_bottom.push(Span::styled(
+    let account = model.attached_account_label();
+    let has_account_truth = model
+        .active_session
+        .as_ref()
+        .and_then(|session| model.sessions.iter().find(|row| &row.id == session))
+        .is_some_and(|row| row.account_provider.is_some());
+    let route_identity = if model.mode.fabricates_locally() || !has_account_truth {
         format!(
             " · branch {} · {}",
             model.active_branch_name(),
             identity.device
-        ),
-        theme.dim_style(),
-    ));
+        )
+    } else if area.width <= 90 {
+        // At owner-narrow widths the account remains visible. The branch is
+        // still present in the session controls below this fixed header.
+        format!(" · @{account}")
+    } else {
+        format!(
+            " · branch {} · account {} · {}",
+            model.active_branch_name(),
+            account,
+            identity.device
+        )
+    };
+    header_bottom.push(Span::styled(route_identity, theme.dim_style()));
     // Shed chrome renders nothing: a 1-row header keeps only the product
     // line (the area clips line 2), a 0-row header/rule disappears whole.
     let header_top_used = u16::try_from(Line::from(header_top.clone()).width()).unwrap_or(0);
