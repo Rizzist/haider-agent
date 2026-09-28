@@ -7715,11 +7715,13 @@ impl AppModel {
                         self.handle_ssh_form_key(key);
                         return;
                     }
-                    InputOwner::TalkSetup => {
+                    InputOwner::TalkSetup if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.talk_setup_key(&key);
                         return;
                     }
-                    InputOwner::CustomProviderForm => {
+                    InputOwner::CustomProviderForm
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         self.handle_custom_card_key(key.code);
                         return;
                     }
