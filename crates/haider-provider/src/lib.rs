@@ -1543,6 +1543,28 @@ impl Message {
         truncated: bool,
         images: Vec<ImageBlockRef>,
     ) -> Self {
+        Self::tool_result_with_status(call_id, preview, truncated, images, None)
+    }
+
+    /// Retains the receipt status for local guards while provider adapters
+    /// continue to render only the result's model-facing content.
+    pub fn tool_result_with_receipt(
+        call_id: impl Into<String>,
+        preview: impl Into<String>,
+        truncated: bool,
+        images: Vec<ImageBlockRef>,
+        status: haider_protocol::tool::ToolResultStatus,
+    ) -> Self {
+        Self::tool_result_with_status(call_id, preview, truncated, images, Some(status))
+    }
+
+    fn tool_result_with_status(
+        call_id: impl Into<String>,
+        preview: impl Into<String>,
+        truncated: bool,
+        images: Vec<ImageBlockRef>,
+        completion_status: Option<haider_protocol::tool::ToolResultStatus>,
+    ) -> Self {
         let call_id = call_id.into();
         Self {
             role: MessageRole::Tool,
@@ -1551,6 +1573,7 @@ impl Message {
                 call_id,
                 preview: preview.into(),
                 truncated,
+                completion_status,
                 images,
             }],
         }

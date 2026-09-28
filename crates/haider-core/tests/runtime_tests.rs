@@ -8589,6 +8589,9 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
 #[path = "support/request_budget_laws.rs"]
 mod request_budget_laws;
 
+#[path = "support/loop_guard_screen_digits.rs"]
+mod loop_guard_screen_digits;
+
 struct AppliedFailureDispatcher {
     calls: AtomicUsize,
     effects: Vec<haider_protocol::tool::ToolFileEffect>,
