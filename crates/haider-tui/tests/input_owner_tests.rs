@@ -1992,6 +1992,12 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
     key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert_eq!(model.screen, Screen::Session);
     assert!(model.login.is_none());
+    let mut model = model();
+    model.screen = Screen::Accounts;
+    arm(&mut model, "login");
+    key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(model.screen, Screen::Accounts);
+    assert!(model.login.is_none());
 }
 
 fn pending_visible_talk_mirror() -> (AppModel, LiveDriver) {
