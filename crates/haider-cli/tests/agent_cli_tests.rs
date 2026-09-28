@@ -835,9 +835,9 @@ fn agent_spawn_provider_only_resolves_model_through_daemon_session_authority() {
     let profile = Profile::new(report_script("DAEMON_RESOLVED_MODEL_REPORT"));
     // Authenticated inventories are account-scoped. Seed a synthetic active
     // descriptor and its matching catalog before startup; xAI has no seeded
-    // default. A nonzero incarnation keeps the catalog key stable across the
-    // daemon's legacy descriptor migration. The injected daemon factory
-    // routes the pair to the fake script.
+    // default. Give the fixture an already-migrated incarnation so startup
+    // does not deliberately invalidate its catalog. The injected daemon
+    // factory routes the pair to the fake script.
     let descriptor = haider_protocol::credential::CredentialDescriptor {
         incarnation: 1,
         credential_digest: None,

@@ -288,13 +288,13 @@ fn v2_account_catalog_rows_are_pruned_after_v3_migration() {
     assert!(
         store
             .provider_models("account-v2:legacy")
-            .expect("read legacy row")
+            .expect("pruned legacy read")
             .is_none()
     );
     assert!(
         store
             .provider_models("account-v3:current")
-            .expect("read current row")
+            .expect("retained current read")
             .is_some()
     );
 }
