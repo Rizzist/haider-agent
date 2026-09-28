@@ -1152,9 +1152,10 @@ impl LiveDriver {
         model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
     }
 
-    /// Deliver a refused replacement only when the visible Session input
-    /// accepts edits and its local content still matches the refusal point.
-    /// Reconnects and closed sessions also drop the slot.
+    /// Deliver a queued replacement only when the visible Session input
+    /// accepts edits and its local content still matches the queue point.
+    /// A later local edit refuses and drops it. Reconnects and closed
+    /// sessions also drop the slot.
     pub fn apply_pending_input(&mut self, model: &mut AppModel) {
         if !model.accepts_injected_edits() {
             return;
@@ -2169,7 +2170,7 @@ struct InputMirrorSession {
     /// compare only within one owner — never against our own publish counter
     /// (rev934 P1-1).
     foreign_floors: HashMap<String, u64>,
-    /// Latest refused foreign edit. It has not advanced any applied floor.
+    /// Latest queued foreign edit. It has not advanced any applied floor.
     pending: Option<PendingForeignInput>,
 }
 
@@ -2177,7 +2178,7 @@ struct InputMirrorSession {
 struct PendingForeignInput {
     input: haider_rpc::SurfaceInputWire,
     epoch: u64,
-    /// A later local edit supersedes this refused replacement.
+    /// A later local edit supersedes this queued replacement.
     composer_revision: u64,
     local_attachments: Vec<crate::composer::PendingAttachment>,
 }
