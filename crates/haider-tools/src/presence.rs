@@ -21,6 +21,7 @@
 pub mod art;
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 #[path = "presence/overlay_macos.rs"]
 mod overlay_macos;
 
@@ -29,9 +30,24 @@ mod overlay_macos;
 #[path = "presence/overlay_windows.rs"]
 mod overlay_windows;
 
+/// The Windows overlay's platform-independent state (tested everywhere).
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(all(test, not(target_os = "windows")), allow(dead_code))]
+#[path = "presence/overlay_windows_logic.rs"]
+mod overlay_windows_logic;
+
 #[cfg(target_os = "linux")]
 #[path = "presence/overlay_linux.rs"]
 mod overlay_linux;
+
+/// Linux notification posting decisions, shared with tests on every host.
+#[cfg(any(target_os = "linux", test))]
+#[path = "presence/overlay_linux_logic.rs"]
+mod overlay_linux_logic;
+
+#[cfg(any(target_os = "macos", test))]
+#[path = "presence/overlay_macos_logic.rs"]
+mod overlay_macos_logic;
 
 use haider_protocol::computer::{CU_PRESENCE_IDLE_SECS, ComputerAction};
 use haider_protocol::mobile::MobileAction;
@@ -39,6 +55,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Upper sequence range reserved for capture Conceal acknowledgements.
+pub const CONCEAL_ACK_SEQ_START: u64 = 1 << 62;
 
 /// Hidden `haiderd` argument that runs the desktop overlay helper instead of
 /// the daemon. Reusing the shipped daemon executable means no new release
@@ -54,7 +73,8 @@ pub const PRESENCE_HELPER_ENV: &str = "HAIDER_CU_PRESENCE_HELPER";
 pub const PRESENCE_DISABLE_ENV: &str = "HAIDER_CU_PRESENCE";
 
 /// Evidence-only (macOS): `1` makes the overlay capturable so documentation
-/// screenshots can show it. Model-facing captures then include it too.
+/// screenshots can show it. The helper must then prove all panels absent
+/// before acknowledging each model-facing capture.
 pub const PRESENCE_EVIDENCE_CAPTURABLE_ENV: &str = "HAIDER_CU_PRESENCE_EVIDENCE_CAPTURABLE";
 
 /// Value written into every input event Haider synthesises (macOS
@@ -70,7 +90,7 @@ pub const PRESENCE_IDLE_TIMEOUT: Duration = Duration::from_secs(CU_PRESENCE_IDLE
 pub const STOPPED_LEASE_RETENTION: Duration = Duration::from_secs(600);
 
 /// Upper bound the daemon waits for a surface to take capturable UI off
-/// screen before a model-facing capture. Missing acks never block capture.
+/// screen before a model-facing capture. Missing acks refuse capture.
 pub const CONCEAL_ACK_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// Upper bound the daemon waits for an overlay to acknowledge a pointer
@@ -285,6 +305,12 @@ pub enum PresenceEvent {
     Ack {
         seq: u64,
     },
+    /// The helper could not prove that every capturable panel has left the
+    /// capture boundary. The daemon must refuse this capture.
+    ConcealFailed {
+        seq: u64,
+        message: String,
+    },
     /// The human pressed Stop.
     Stop,
     /// A non-fatal rendering problem worth logging.
@@ -378,7 +404,11 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             });
         }
         let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        self.next_seq = if seq >= CONCEAL_ACK_SEQ_START - 1 {
+            1
+        } else {
+            seq + 1
+        };
         commands.push(PresenceCommand::Pointer {
             surface,
             seq,
@@ -559,7 +589,7 @@ impl LinuxNotificationPlan {
     #[must_use]
     pub fn actions(&self) -> Vec<&'static str> {
         if self.stop_button {
-            vec!["stop", "Stop"]
+            vec![LinuxStopRouter::STOP_ACTION, "Stop"]
         } else {
             Vec::new()
         }
@@ -583,6 +613,80 @@ impl LinuxNotificationPlan {
         } else {
             format!("{base}\n{LINUX_FALLBACK_STOP_HINT}")
         }
+    }
+}
+
+/// Routes the Linux notification's Stop action to the presence it belongs to.
+///
+/// The helper closes its notification around every model-facing capture
+/// (`Conceal`) and posts a new one on `Reveal`, so one presence *generation*
+/// (`Show` .. `Hide`) owns several notification ids. An `ActionInvoked` for
+/// an earlier id can still be queued on the bus when `CloseNotification`
+/// returns (verifier finding B3 on 8c614f6c: matching only the current id
+/// dropped that Stop). Every id posted in the active generation therefore
+/// stays live until `Hide`; `Hide` retires them all, so a late action can
+/// never stop a later generation. Pure so it is unit-tested everywhere.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LinuxStopRouter {
+    active: bool,
+    stopping: bool,
+    live: BTreeSet<u32>,
+}
+
+impl LinuxStopRouter {
+    /// Action key of the notification's Stop button.
+    pub const STOP_ACTION: &'static str = "stop";
+
+    /// `Show`: starts a generation, or refreshes the active one (a label
+    /// change keeps its ids live).
+    pub fn show(&mut self) {
+        if !self.active {
+            self.live.clear();
+            self.stopping = false;
+        }
+        self.active = true;
+    }
+
+    /// The server returned `id` for a notification of this generation.
+    pub fn posted(&mut self, id: u32) {
+        if self.active && id != 0 {
+            self.live.insert(id);
+        }
+    }
+
+    /// The daemon acknowledged a Stop (`Stopping`).
+    pub fn stopping(&mut self) {
+        self.stopping = true;
+    }
+
+    /// `Hide`: the generation ends and every id it posted is retired.
+    pub fn hide(&mut self) {
+        self.active = false;
+        self.stopping = false;
+        self.live.clear();
+    }
+
+    /// Whether a generation is showing (notification updates are allowed).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Whether a Stop is already on its way.
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stopping
+    }
+
+    /// An `ActionInvoked(id, key)` signal: `true` exactly once per
+    /// generation when it is the Stop button of one of its notifications,
+    /// including ones already closed for a capture.
+    pub fn on_action(&mut self, id: u32, key: &str) -> bool {
+        if key != Self::STOP_ACTION || !self.active || self.stopping || !self.live.contains(&id) {
+            return false;
+        }
+        self.stopping = true;
+        true
     }
 }
 

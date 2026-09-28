@@ -23539,16 +23539,34 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     };
                     // A capturable indicator (Linux notification popup) is
                     // taken off screen for the model-facing capture.
-                    let _revealed_after_capture = if matches!(
+                    let revealed_after_capture = if matches!(
                         operation.action(),
                         haider_protocol::computer::ComputerAction::Screenshot
                             | haider_protocol::computer::ComputerAction::Inspect { .. }
                     ) {
-                        self.cu_presence.conceal_for_capture().await
+                        match self.cu_presence.conceal_for_capture().await {
+                            Ok(guard) => Some(guard),
+                            Err(message) => {
+                                let error = ComputerError::Backend { message };
+                                broker
+                                    .journal_computer_outcome(
+                                        &intent,
+                                        EffectOutcome::Failed {
+                                            error: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                return Ok(computer_failure_result(&error));
+                            }
+                        }
                     } else {
                         None
                     };
-                    match self.computer.execute(operation.action(), &action_cancel).await {
+                    let execution = self.computer.execute(operation.action(), &action_cancel).await;
+                    // The model-facing pixels exist when execute returns. Restore
+                    // Stop before redaction, bounding, journaling or recording.
+                    drop(revealed_after_capture);
+                    match execution {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
                             let stored = self
                                 .admit_computer_screenshot_region(png, &action_cancel, operation.region())
