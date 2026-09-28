@@ -464,6 +464,21 @@ jobs:
           EXT=tar.xz; [ "$RUNNER_OS" = "Windows" ] && EXT=zip
           NAME=haider-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}-split
           python scripts/release_packaging.py verify-bundle --artifact "dist/$NAME.$EXT" --target "${{ matrix.target }}"
+      # Registry #176: a PE linked against the dynamic MSVC CRT imports
+      # VCRUNTIME140.dll and dies with 0xC0000135 on clean Windows (hosted
+      # runners preinstall the VC++ redistributable, so nothing else sees it).
+      - name: Windows binaries must not need the VC++ redistributable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          NAME=haider-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}-split
+          python scripts/release_packaging.py verify-windows-imports "dist/$NAME.zip"
+      - name: clean launch of the exact Windows release ZIP on Server Core
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Name = "haider-${env:GITHUB_REF_NAME}-${{ matrix.target }}-split.zip"
+          ./scripts/release/check-windows-clean-launch.ps1 -Artifact "dist/$Name"
       - name: package compatibility assets for installed two-member macOS updaters
         if: runner.os == 'macOS'
         shell: bash
@@ -564,6 +579,10 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: bash packaging/installers/macos-build.sh payload installers "$INSTALLER_VERSION" '${{ matrix.target }}'
+      - name: Windows payload must not need the VC++ redistributable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/release_packaging.py verify-windows-imports archives/*.zip payload
       - name: Install Inno Setup
         if: runner.os == 'Windows'
         shell: pwsh
@@ -687,6 +706,8 @@ jobs:
           done
           echo "::error::Android APK workflow was still running after 120 minutes; release blocked"
           exit 1
+      - name: Windows release binaries must not need the VC++ redistributable
+        run: python3 scripts/release_packaging.py verify-windows-imports dist/haider-*-x86_64-pc-windows-msvc-split.zip
       - name: create or update release (prerelease until v0.1.0)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -916,6 +937,12 @@ jobs:
           $Target = 'x86_64-pc-windows-msvc'
           $Zip = "haider-v$Version-$Target-split.zip"
           $ArtifactPath = "artifacts\$Zip"
+          # Registry #176: chocolateyinstall.ps1 runs haider.exe on the
+          # moderation verifier's clean Windows image.
+          python scripts\release_packaging.py verify-windows-imports $ArtifactPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows CRT import gate failed with exit code $LASTEXITCODE"
+          }
           python scripts\release_packaging.py render-chocolatey `
             --source packaging\chocolatey `
             --output dist-choco `
