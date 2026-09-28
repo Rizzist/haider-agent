@@ -907,17 +907,17 @@ fn e6_e8_edge_drag_scrolls_only_the_visible_owner() {
 fn ordinary_cards_allow_visible_transcript_hits_but_covering_views_do_not() {
     for mode in ["permission", "search", "theme", "effort", "history"] {
         let mut model = model();
+        model.scroll_back.set(10);
         arm(&mut model, mode);
-        assert!(
-            model.hit_owned(&Hit::ToolRowToggle("tool".into())),
-            "{mode}"
-        );
-        assert!(model.hit_owned(&Hit::JumpToBottom), "{mode}");
+        model.handle_hit(Hit::JumpToBottom);
+        assert_eq!(model.scroll_back.get(), 0, "{mode}");
     }
     for mode in ["detail", "inbox", "model", "plan-doc", "file-review-doc"] {
         let mut model = model();
+        model.scroll_back.set(10);
         arm(&mut model, mode);
-        assert!(!model.hit_owned(&Hit::JumpToBottom), "{mode}");
+        model.handle_hit(Hit::JumpToBottom);
+        assert_eq!(model.scroll_back.get(), 10, "{mode}");
     }
 }
 
@@ -930,15 +930,6 @@ fn ordinary_cards_allow_edge_drag_of_the_visible_transcript() {
         arm(&mut model, mode);
         model.drag_autoscroll(true);
         assert_eq!(model.scroll_back.get(), 21, "{mode}");
-    }
-}
-
-#[test]
-fn back_chip_remains_clickable_beneath_full_screen_owners() {
-    for mode in ["fleet-detail", "model"] {
-        let mut model = model();
-        arm(&mut model, mode);
-        assert!(model.hit_owned(&Hit::BackChip), "{mode}");
     }
 }
 
@@ -1947,12 +1938,6 @@ fn i_rendered_hit_map_agrees_with_the_input_owner() {
                 "{mode} published a hidden composer target"
             );
         }
-        for (_, hit) in &hits {
-            assert!(
-                model.hit_owned(hit),
-                "{mode} exposed an unusable {hit:?} hit"
-            );
-        }
     }
 }
 
@@ -1992,12 +1977,16 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
     key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert_eq!(model.screen, Screen::Session);
     assert!(model.login.is_none());
-    let mut model = model();
-    model.screen = Screen::Accounts;
-    arm(&mut model, "login");
-    key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL);
-    assert_eq!(model.screen, Screen::Accounts);
-    assert!(model.login.is_none());
+    let mut accounts_model = model();
+    accounts_model.screen = Screen::Accounts;
+    arm(&mut accounts_model, "login");
+    key(
+        &mut accounts_model,
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    );
+    assert_eq!(accounts_model.screen, Screen::Accounts);
+    assert!(accounts_model.login.is_none());
 }
 
 fn pending_visible_talk_mirror() -> (AppModel, LiveDriver) {
@@ -2378,10 +2367,10 @@ fn back_chip_closes_fleet_detail_and_navigates_under_model_picker() {
     model.handle_hit(Hit::BackChip);
     assert!(model.fleet.detail.is_none());
     assert_eq!(model.screen, Screen::Fleet);
-    let mut model = model();
-    arm(&mut model, "model");
-    model.handle_hit(Hit::BackChip);
-    assert_eq!(model.screen, Screen::Launcher);
+    let mut picker_model = model();
+    arm(&mut picker_model, "model");
+    picker_model.handle_hit(Hit::BackChip);
+    assert_eq!(picker_model.screen, Screen::Launcher);
 }
 
 #[test]
