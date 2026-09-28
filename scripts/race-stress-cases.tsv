@@ -1,4 +1,6 @@
 # id	platform	package	suite	test	source
+provider-binding-finish-race	all	haider-provider	lib	binding_latch_waits_for_finish_before_concurrent_render	crates/haider-provider/src/anthropic_tests.rs
+provider-binding-concurrent-failure	all	haider-provider	lib	failed_concurrent_fallback_cannot_erase_confirmed_latch	crates/haider-provider/src/anthropic_tests.rs
 android-completion-waiters	linux	haider-android	lib	concurrent_waiters_share_the_same_failure_receipt	crates/haider-android/src/completion_tests.rs
 store-menu-answer-race	linux	haider-store	test:menu_resolution_tests	n_way_race_commits_exactly_one_answer_and_returns_one_resolution_coordinate	crates/haider-store/tests/menu_resolution_tests.rs
 store-queue-remove-race	linux	haider-store	test:queue_control_tests	two_same_revision_removes_race_to_exactly_one_commit	crates/haider-store/tests/queue_control_tests.rs

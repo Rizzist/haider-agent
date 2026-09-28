@@ -1483,7 +1483,10 @@ impl AnthropicProvider {
         let account = self.account.clone();
         let chunk_idle_timeout = self.transport_config.chunk_idle_timeout;
         let semantic_progress_timeout = self.transport_config.semantic_progress_timeout;
-        let context = crate::SseRequestContext::capture(self.route_gating());
+        let context = AnthropicStreamContext {
+            sse: crate::SseRequestContext::capture(self.route_gating()),
+            pending_binding_route,
+        };
         let producer = tokio::spawn(async move {
             stream_response(
                 response,
@@ -1493,7 +1496,6 @@ impl AnthropicProvider {
                 semantic_progress_timeout,
                 native_computer,
                 context,
-                pending_binding_route,
             )
             .await;
         });
@@ -1983,6 +1985,11 @@ fn model_capabilities(model: &str) -> ModelCapabilities {
     }
 }
 
+struct AnthropicStreamContext {
+    sse: crate::SseRequestContext,
+    pending_binding_route: Option<ThinkingBindingRoute>,
+}
+
 async fn stream_response(
     response: reqwest::Response,
     account: Option<CredentialAlias>,
@@ -1990,8 +1997,7 @@ async fn stream_response(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     native_computer: bool,
-    context: crate::SseRequestContext,
-    pending_binding_route: Option<ThinkingBindingRoute>,
+    context: AnthropicStreamContext,
 ) {
     stream_sse_source_with_native(
         response,
@@ -2001,7 +2007,6 @@ async fn stream_response(
         semantic_progress_timeout,
         native_computer,
         context,
-        pending_binding_route,
     )
     .await;
 }
@@ -2040,8 +2045,10 @@ pub(crate) async fn stream_sse_source<S: SseChunkSource>(
         chunk_idle_timeout,
         semantic_progress_timeout,
         false,
-        crate::SseRequestContext::capture(route_gating),
-        None,
+        AnthropicStreamContext {
+            sse: crate::SseRequestContext::capture(route_gating),
+            pending_binding_route: None,
+        },
     )
     .await;
 }
@@ -2053,14 +2060,17 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     native_computer: bool,
-    context: crate::SseRequestContext,
-    mut pending_binding_route: Option<ThinkingBindingRoute>,
+    context: AnthropicStreamContext,
 ) {
+    let AnthropicStreamContext {
+        sse,
+        mut pending_binding_route,
+    } = context;
     let crate::SseRequestContext {
         route_gating,
         turn_trace,
         idle_deadline,
-    } = context;
+    } = sse;
     let mut decoder = SseDecoder::with_native_computer(account, native_computer);
     let mut progress = crate::ProviderProgressClock::new(
         chunk_idle_timeout,
