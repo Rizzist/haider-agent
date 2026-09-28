@@ -815,7 +815,10 @@ fn e6_e7_e9_wheel_scrolls_visible_transcript_only() {
                 modifiers: KeyModifiers::NONE,
             }),
         );
-        if matches!(mode, "theme" | "effort" | "history" | "permission" | "search") {
+        if matches!(
+            mode,
+            "theme" | "effort" | "history" | "permission" | "search"
+        ) {
             assert_eq!(model.scroll_back.get(), 13, "{mode}");
         } else {
             assert_eq!(model.scroll_back.get(), 10, "{mode}");
@@ -905,7 +908,10 @@ fn ordinary_cards_allow_visible_transcript_hits_but_covering_views_do_not() {
     for mode in ["permission", "search", "theme", "effort", "history"] {
         let mut model = model();
         arm(&mut model, mode);
-        assert!(model.hit_owned(&Hit::ToolRowToggle("tool".into())), "{mode}");
+        assert!(
+            model.hit_owned(&Hit::ToolRowToggle("tool".into())),
+            "{mode}"
+        );
         assert!(model.hit_owned(&Hit::JumpToBottom), "{mode}");
     }
     for mode in ["detail", "inbox", "model", "plan-doc", "file-review-doc"] {
@@ -1942,7 +1948,10 @@ fn i_rendered_hit_map_agrees_with_the_input_owner() {
             );
         }
         for (_, hit) in &hits {
-            assert!(model.hit_owned(hit), "{mode} exposed an unusable {hit:?} hit");
+            assert!(
+                model.hit_owned(hit),
+                "{mode} exposed an unusable {hit:?} hit"
+            );
         }
     }
 }
@@ -1972,9 +1981,12 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
     }
     model.requests.clear();
     key(&mut model, KeyCode::Char('s'), KeyModifiers::CONTROL);
-    assert!(model.requests.iter().any(|request| matches!(request,
-        haider_tui::app::AppRequest::SshProfileSave { .. }
-    )));
+    assert!(
+        model
+            .requests
+            .iter()
+            .any(|request| matches!(request, haider_tui::app::AppRequest::SshProfileSave { .. }))
+    );
     let mut model = model();
     arm(&mut model, "login");
     key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -1984,23 +1996,39 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
 
 fn pending_visible_talk_mirror() -> (AppModel, LiveDriver) {
     let mut model = model();
-    model.daemon_features.insert(haider_rpc::FEATURE_INPUT_MIRROR_V1.into());
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_INPUT_MIRROR_V1.into());
     model.composer.set_text("OLD");
     let mut driver = LiveDriver::new("owner-test");
     let _ = driver.sync_input_mirror(&model);
-    driver.apply(&mut model, LiveReply::SurfaceWatching {
-        caller_owner: Some("local".into()), epoch: 0, session: session(), input: None,
-    });
+    driver.apply(
+        &mut model,
+        LiveReply::SurfaceWatching {
+            caller_owner: Some("local".into()),
+            epoch: 0,
+            session: session(),
+            input: None,
+        },
+    );
     let _ = driver.sync_input_mirror(&model);
-    model.talk.begin(haider_stt::config::TranscriptionEngine::Local);
+    model
+        .talk
+        .begin(haider_stt::config::TranscriptionEngine::Local);
     model.talk.phase = TalkPhase::Listening;
     model.talk.ghost = "GHOSTWORDS".into();
-    driver.apply(&mut model, LiveReply::SurfaceInput {
-        session: session(),
-        input: haider_rpc::SurfaceInputWire {
-            text: "NEW".into(), attachments: vec![], revision: 1, owner: "foreign".into(),
+    driver.apply(
+        &mut model,
+        LiveReply::SurfaceInput {
+            session: session(),
+            input: haider_rpc::SurfaceInputWire {
+                text: "NEW".into(),
+                attachments: vec![],
+                revision: 1,
+                owner: "foreign".into(),
+            },
         },
-    });
+    );
     assert_eq!(model.composer.text(), "OLD");
     (model, driver)
 }
@@ -2019,7 +2047,8 @@ fn refused_mirror_edit_cannot_erase_newer_typing_or_paste() {
         driver.apply_pending_input(&mut model);
         assert_eq!(model.composer.text(), local);
         let published = driver.sync_input_mirror(&model);
-        assert!(published.iter().any(|command| matches!(command,
+        assert!(published.iter().any(|command| matches!(
+            command,
             haider_tui::live::LiveCommand::SurfacePublish { .. }
         )));
     }
@@ -2049,16 +2078,24 @@ fn waiting_mirror_edit_blocks_publish_before_apply_even_if_local_text_changes() 
 #[test]
 fn history_chooser_disappears_when_a_permission_card_takes_input() {
     let mut model = model();
-    model.prompt_history.push_back(haider_tui::session::PromptEntry::local(
-        "HISTORY_UNIQUE_SENTINEL".into(),
-    ));
+    model
+        .prompt_history
+        .push_back(haider_tui::session::PromptEntry::local(
+            "HISTORY_UNIQUE_SENTINEL".into(),
+        ));
     arm(&mut model, "history");
     let paint = |model: &AppModel| {
         let mut terminal = Terminal::new(TestBackend::new(118, 36)).unwrap();
-        terminal.draw(|frame| { let _ = haider_tui::render::render(model, frame); }).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = haider_tui::render::render(model, frame);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer();
-        (0..buffer.area.height).flat_map(|y| (0..buffer.area.width)
-            .map(move |x| buffer[(x, y)].symbol().to_owned())).collect::<Vec<_>>().join("")
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol().to_owned()))
+            .collect::<Vec<_>>()
+            .join("")
     };
     assert!(paint(&model).contains("HISTORY_UNIQUE_SENTINEL"));
     arm(&mut model, "permission");
@@ -2070,23 +2107,50 @@ fn history_chooser_disappears_when_a_permission_card_takes_input() {
 
 #[test]
 fn ctrl_shift_c_copies_a_mouse_selection_made_on_the_current_overlay() {
-    for mode in ["help", "inbox", "monitors", "permission", "search", "ssh-terminal"] {
+    for mode in [
+        "help",
+        "inbox",
+        "monitors",
+        "permission",
+        "search",
+        "ssh-terminal",
+    ] {
         let mut model = model();
         arm(&mut model, mode);
-        dispatch_input(&mut model, &[], Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left), column: 5, row: 5,
-            modifiers: KeyModifiers::NONE,
-        }));
-        dispatch_input(&mut model, &[], Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left), column: 16, row: 5,
-            modifiers: KeyModifiers::NONE,
-        }));
+        dispatch_input(
+            &mut model,
+            &[],
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        dispatch_input(
+            &mut model,
+            &[],
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 16,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
         assert!(model.selection.is_some(), "{mode}");
         model.requests.clear();
-        key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
-        assert!(model.requests.iter().any(|r| matches!(r,
-            haider_tui::app::AppRequest::CopySelection
-        )), "{mode}");
+        key(
+            &mut model,
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(
+            model
+                .requests
+                .iter()
+                .any(|r| matches!(r, haider_tui::app::AppRequest::CopySelection)),
+            "{mode}"
+        );
     }
 }
 
@@ -2119,17 +2183,28 @@ fn i_pairwise_overlay_precedence_paints_the_owner_above_every_lower_owner() {
             let mut model = model();
             arm(&mut model, lower_name);
             arm(&mut model, higher);
-            assert_eq!(model.input_owner(), expected_owner(higher),
-                "{higher} over {lower_name}");
+            assert_eq!(
+                model.input_owner(),
+                expected_owner(higher),
+                "{higher} over {lower_name}"
+            );
             let mut terminal = Terminal::new(TestBackend::new(118, 36)).unwrap();
-            terminal.draw(|frame| { let _ = haider_tui::render::render(&model, frame); }).unwrap();
+            terminal
+                .draw(|frame| {
+                    let _ = haider_tui::render::render(&model, frame);
+                })
+                .unwrap();
             let buffer = terminal.backend().buffer();
             let painted = (0..buffer.area.height)
-                .flat_map(|y| (0..buffer.area.width)
-                    .map(move |x| buffer[(x, y)].symbol().to_owned()))
-                .collect::<Vec<_>>().join("");
-            assert!(painted.contains(marker),
-                "{higher} over {lower_name}: missing painted owner {marker:?}");
+                .flat_map(|y| {
+                    (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol().to_owned())
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(
+                painted.contains(marker),
+                "{higher} over {lower_name}: missing painted owner {marker:?}"
+            );
             if lower_name == "history" && higher == "permission" {
                 assert!(!painted.contains("↑↓ / digits choose"));
             }
@@ -2140,12 +2215,39 @@ fn i_pairwise_overlay_precedence_paints_the_owner_above_every_lower_owner() {
 #[test]
 fn i_owner_by_input_kind_matrix_keeps_parked_drafts_unchanged() {
     const OWNERS: &[&str] = &[
-        "detail", "help", "search", "inbox", "shells", "ssh", "ssh-form",
-        "ssh-terminal", "monitors", "lockdown", "model", "theme", "effort",
-        "history", "permission", "plan-doc", "file-review-doc", "login",
-        "accounts-replace", "talk-setup", "custom-form", "fleet-detail", "fleet",
-        "sessions", "accounts", "providers", "usage", "graph", "tools", "tree",
-        "hooks", "boot", "subagent-question",
+        "detail",
+        "help",
+        "search",
+        "inbox",
+        "shells",
+        "ssh",
+        "ssh-form",
+        "ssh-terminal",
+        "monitors",
+        "lockdown",
+        "model",
+        "theme",
+        "effort",
+        "history",
+        "permission",
+        "plan-doc",
+        "file-review-doc",
+        "login",
+        "accounts-replace",
+        "talk-setup",
+        "custom-form",
+        "fleet-detail",
+        "fleet",
+        "sessions",
+        "accounts",
+        "providers",
+        "usage",
+        "graph",
+        "tools",
+        "tree",
+        "hooks",
+        "boot",
+        "subagent-question",
     ];
     for mode in OWNERS {
         for input in ["control", "paste", "inject", "stale-composer-click"] {
@@ -2158,14 +2260,20 @@ fn i_owner_by_input_kind_matrix_keeps_parked_drafts_unchanged() {
             match input {
                 "control" => key(&mut model, KeyCode::Char('u'), KeyModifiers::CONTROL),
                 "paste" => model.handle(AppEvent::Paste("MATRIX_PASTE".to_owned().into())),
-                "inject" => { LiveDriver::new("matrix").apply(&mut model,
-                    LiveReply::InputInjected {
-                        session: session(),
-                        op: haider_rpc::SurfaceInjectOp::Set { text: "MATRIX_SET".into() },
-                    }); },
-                "stale-composer-click" => model.composer_press(
-                    0, DRAFT, 0, surface, revision, epoch,
-                ),
+                "inject" => {
+                    LiveDriver::new("matrix").apply(
+                        &mut model,
+                        LiveReply::InputInjected {
+                            session: session(),
+                            op: haider_rpc::SurfaceInjectOp::Set {
+                                text: "MATRIX_SET".into(),
+                            },
+                        },
+                    );
+                }
+                "stale-composer-click" => {
+                    model.composer_press(0, DRAFT, 0, surface, revision, epoch)
+                }
                 _ => unreachable!(),
             }
             assert_eq!(model.composer.text(), DRAFT, "{mode} × {input}");
@@ -2176,21 +2284,40 @@ fn i_owner_by_input_kind_matrix_keeps_parked_drafts_unchanged() {
 #[test]
 fn a_mouse_selection_from_a_covered_owner_is_not_copied() {
     let mut model = model();
-    dispatch_input(&mut model, &[], Event::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left), column: 5, row: 5,
-        modifiers: KeyModifiers::NONE,
-    }));
-    dispatch_input(&mut model, &[], Event::Mouse(MouseEvent {
-        kind: MouseEventKind::Drag(MouseButton::Left), column: 16, row: 5,
-        modifiers: KeyModifiers::NONE,
-    }));
+    dispatch_input(
+        &mut model,
+        &[],
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    dispatch_input(
+        &mut model,
+        &[],
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 16,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
     assert!(model.selection.is_some());
     arm(&mut model, "help");
     model.requests.clear();
-    key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
-    assert!(model.requests.iter().all(|request| !matches!(request,
-        haider_tui::app::AppRequest::CopySelection
-    )));
+    key(
+        &mut model,
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert!(
+        model
+            .requests
+            .iter()
+            .all(|request| !matches!(request, haider_tui::app::AppRequest::CopySelection))
+    );
 }
 
 #[test]
@@ -2208,7 +2335,14 @@ fn back_chip_closes_fleet_detail_and_navigates_under_model_picker() {
 
 #[test]
 fn slash_palette_is_not_painted_over_a_non_composer_owner() {
-    for mode in ["search", "theme", "effort", "history", "login", "talk-setup"] {
+    for mode in [
+        "search",
+        "theme",
+        "effort",
+        "history",
+        "login",
+        "talk-setup",
+    ] {
         let mut model = model();
         model.composer.set_text("/model");
         assert!(model.palette_open(), "plain composer control");
@@ -2220,13 +2354,19 @@ fn slash_palette_is_not_painted_over_a_non_composer_owner() {
 #[test]
 fn refused_mirror_edit_does_not_erase_a_newer_attachment() {
     let (mut model, mut driver) = pending_visible_talk_mirror();
-    model.composer.push_attachment(haider_tui::composer::PendingAttachment {
-        upload: 17, label: "new.txt".into(),
-        kind: haider_tui::composer::PendingKind::File {
-            name: "new.txt".into(), lines: 1,
-        },
-        bytes: Some(4), artifact: None, carried: None,
-    });
+    model
+        .composer
+        .push_attachment(haider_tui::composer::PendingAttachment {
+            upload: 17,
+            label: "new.txt".into(),
+            kind: haider_tui::composer::PendingKind::File {
+                name: "new.txt".into(),
+                lines: 1,
+            },
+            bytes: Some(4),
+            artifact: None,
+            carried: None,
+        });
     model.talk.phase = TalkPhase::Idle;
     driver.apply_pending_input(&mut model);
     assert_eq!(model.composer.text(), "OLD");
@@ -2237,10 +2377,15 @@ fn refused_mirror_edit_does_not_erase_a_newer_attachment() {
 fn refused_mirror_edit_does_not_erase_a_newer_injected_edit() {
     let (mut model, mut driver) = pending_visible_talk_mirror();
     model.talk.phase = TalkPhase::Idle;
-    driver.apply(&mut model, LiveReply::InputInjected {
-        session: session(),
-        op: haider_rpc::SurfaceInjectOp::Set { text: "INJECTED".into() },
-    });
+    driver.apply(
+        &mut model,
+        LiveReply::InputInjected {
+            session: session(),
+            op: haider_rpc::SurfaceInjectOp::Set {
+                text: "INJECTED".into(),
+            },
+        },
+    );
     assert_eq!(model.composer.text(), "INJECTED");
     driver.apply_pending_input(&mut model);
     assert_eq!(model.composer.text(), "INJECTED");

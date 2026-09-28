@@ -7715,8 +7715,9 @@ impl AppModel {
                         self.handle_ssh_form_key(key);
                         return;
                     }
-                    InputOwner::Login if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('c' | 'C')) =>
+                    InputOwner::Login
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('c' | 'C')) =>
                     {
                         self.close_login_card();
                         return;
@@ -11121,14 +11122,14 @@ impl AppModel {
         }
         let mut realized = zeroize::Zeroizing::new(text.to_owned());
         realized.push(' ');
-        if self.input_owner().accepts_session_edits()
-            && !self.mirror_waiting_for_owner
-        {
+        if self.input_owner().accepts_session_edits() && !self.mirror_waiting_for_owner {
             self.composer.insert_str(&realized);
             if submit && self.accepts_injected_submit() {
                 self.submit_composer();
             } else if submit {
-                self.flash = Some("· dictation added to your draft — auto-send paused while away".to_owned());
+                self.flash = Some(
+                    "· dictation added to your draft — auto-send paused while away".to_owned(),
+                );
             }
         } else {
             self.pending_dictation = Some(PendingDictation {
@@ -19914,6 +19915,26 @@ impl AppModel {
                 | Hit::QueueRowSteer(_)
                 | Hit::QueueRowToggle(_)
         );
+        // Ordinary cards leave these transcript and panel rows painted.
+        // Keep their clicks without admitting a stale composer or header hit.
+        let transcript = matches!(
+            hit,
+            Hit::RevealPath(_)
+                | Hit::ChipRow(_)
+                | Hit::SubTreeToggle
+                | Hit::TodosToggle
+                | Hit::ToolRowToggle(_)
+                | Hit::ToolFoldToggle(_)
+                | Hit::ToolShowAll(_)
+                | Hit::ToolDetail(_)
+                | Hit::TaskLineToggle
+                | Hit::TaskLineMore
+                | Hit::TodoRow(_)
+                | Hit::StickyJump(_)
+                | Hit::JumpToBottom
+                | Hit::QueueRowSteer(_)
+                | Hit::QueueRowToggle(_)
+        );
         match self.input_owner() {
             InputOwner::Lockdown
             | InputOwner::Help
@@ -19921,7 +19942,7 @@ impl AppModel {
             | InputOwner::SshForm
             | InputOwner::SshTerminal
             | InputOwner::TalkSetup => false,
-            InputOwner::HistoryChooser => session || chrome,
+            InputOwner::HistoryChooser => transcript || chrome,
             InputOwner::AccountsReplace => matches!(hit, Hit::AccountAdd(_)),
             InputOwner::ToolDetail => matches!(hit, Hit::ToolDetailClose),
             InputOwner::Inbox => false,
@@ -19943,10 +19964,17 @@ impl AppModel {
             InputOwner::CustomProviderForm => {
                 matches!(hit, Hit::CustomProviderField { .. } | Hit::AccountAdd(_))
             }
-            InputOwner::SessionMenu => session || matches!(
-                hit,
-                Hit::BackChip | Hit::MenuOption { .. } | Hit::PermissionOpenSettings | Hit::PermissionRetry
-            ),
+            InputOwner::SessionMenu => {
+                transcript
+                    || matches!(
+                        hit,
+                        Hit::BackChip
+                            | Hit::MenuOption { .. }
+                            | Hit::PermissionOpenSettings
+                            | Hit::PermissionRetry
+                            | Hit::InboxBand
+                    )
+            }
             InputOwner::PlanDoc | InputOwner::FileReviewDoc => matches!(
                 hit,
                 Hit::BackChip
@@ -19955,18 +19983,24 @@ impl AppModel {
                     | Hit::PermissionRetry
                     | Hit::InboxBand
             ),
-            InputOwner::SubagentQuestion => session || matches!(
-                hit,
-                Hit::BackChip
-                    | Hit::SessionHome
-                    | Hit::ChipCloseBtn(_)
-                    | Hit::ChipCrumb(_)
-                    | Hit::MenuOption { .. }
-            ),
-            InputOwner::EffortPicker => session || matches!(hit, Hit::EffortOption(_)),
-            InputOwner::ThemePicker => session || matches!(hit, Hit::ThemeOption(_)),
+            InputOwner::SubagentQuestion => {
+                transcript
+                    || matches!(
+                        hit,
+                        Hit::BackChip
+                            | Hit::SessionHome
+                            | Hit::ChipCloseBtn(_)
+                            | Hit::ChipCrumb(_)
+                            | Hit::MenuOption { .. }
+                    )
+            }
+            InputOwner::EffortPicker => transcript || matches!(hit, Hit::EffortOption(_)),
+            InputOwner::ThemePicker => transcript || matches!(hit, Hit::ThemeOption(_)),
             InputOwner::FleetMemberDetail => {
-                matches!(hit, Hit::BackChip | Hit::FleetTranscript(_) | Hit::FleetKill(_))
+                matches!(
+                    hit,
+                    Hit::BackChip | Hit::FleetTranscript(_) | Hit::FleetKill(_)
+                )
             }
             InputOwner::Search => chrome || session,
             InputOwner::Screen(screen) => {

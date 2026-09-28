@@ -1172,7 +1172,7 @@ impl LiveDriver {
             && pending.epoch == self.connection_epoch
             && self.input_mirror.epoch == pending.epoch
             && model.composer.revision() == pending.composer_revision
-            && model.composer.attachments() == pending.local_attachments
+            && model.composer.attachments() == pending.local_attachments.as_slice()
         {
             self.apply_surface_input(model, session, pending.input);
         }
@@ -5875,24 +5875,32 @@ impl LiveDriver {
                 if model.active_session.as_ref() == Some(&session) {
                     match op {
                         haider_rpc::SurfaceInjectOp::Set { text } => {
-                            if model.accepts_injected_edits() { model.composer.set_text(text); }
+                            if model.accepts_injected_edits() {
+                                model.composer.set_text(text);
+                            }
                         }
                         haider_rpc::SurfaceInjectOp::Insert { text } => {
-                            if model.accepts_injected_edits() { model.composer.insert_str(&text); }
+                            if model.accepts_injected_edits() {
+                                model.composer.insert_str(&text);
+                            }
                         }
                         haider_rpc::SurfaceInjectOp::Clear => {
-                            if model.accepts_injected_edits() { model.composer.clear(); }
+                            if model.accepts_injected_edits() {
+                                model.composer.clear();
+                            }
                         }
                         haider_rpc::SurfaceInjectOp::Submit => {
                             // Exactly the Enter path — mid-turn queue modes,
                             // command dispatch, and drafts all keep their
                             // ordinary meaning.
-                            if model.accepts_injected_submit() { model.handle(crate::app::AppEvent::Key(
-                                ratatui::crossterm::event::KeyEvent::new(
-                                    ratatui::crossterm::event::KeyCode::Enter,
-                                    ratatui::crossterm::event::KeyModifiers::NONE,
-                                ),
-                            )); }
+                            if model.accepts_injected_submit() {
+                                model.handle(crate::app::AppEvent::Key(
+                                    ratatui::crossterm::event::KeyEvent::new(
+                                        ratatui::crossterm::event::KeyCode::Enter,
+                                        ratatui::crossterm::event::KeyModifiers::NONE,
+                                    ),
+                                ));
+                            }
                         }
                         // Unknown = a newer daemon's vocabulary — ignored,
                         // never fatal (forward-compat law).
