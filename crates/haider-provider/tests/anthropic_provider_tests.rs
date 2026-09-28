@@ -213,6 +213,7 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
                     call_id: "toolu_sanitized".into(),
                     preview: "sunny".into(),
                     truncated: false,
+                    completion_status: None,
                     images: Vec::new(),
                 }],
             },
