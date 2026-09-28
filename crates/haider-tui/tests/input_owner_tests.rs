@@ -909,14 +909,32 @@ fn ordinary_cards_allow_visible_transcript_hits_but_covering_views_do_not() {
         let mut model = model();
         model.scroll_back.set(10);
         arm(&mut model, mode);
-        model.handle_hit(Hit::JumpToBottom);
+        stale_pointer(
+            &mut model,
+            Hit::JumpToBottom,
+            MouseEventKind::Down(MouseButton::Left),
+        );
+        stale_pointer(
+            &mut model,
+            Hit::JumpToBottom,
+            MouseEventKind::Up(MouseButton::Left),
+        );
         assert_eq!(model.scroll_back.get(), 0, "{mode}");
     }
     for mode in ["detail", "inbox", "model", "plan-doc", "file-review-doc"] {
         let mut model = model();
         model.scroll_back.set(10);
         arm(&mut model, mode);
-        model.handle_hit(Hit::JumpToBottom);
+        stale_pointer(
+            &mut model,
+            Hit::JumpToBottom,
+            MouseEventKind::Down(MouseButton::Left),
+        );
+        stale_pointer(
+            &mut model,
+            Hit::JumpToBottom,
+            MouseEventKind::Up(MouseButton::Left),
+        );
         assert_eq!(model.scroll_back.get(), 10, "{mode}");
     }
 }
@@ -2364,12 +2382,30 @@ fn a_mouse_selection_from_a_covered_owner_is_not_copied() {
 fn back_chip_closes_fleet_detail_and_navigates_under_model_picker() {
     let mut model = model();
     arm(&mut model, "fleet-detail");
-    model.handle_hit(Hit::BackChip);
+    stale_pointer(
+        &mut model,
+        Hit::BackChip,
+        MouseEventKind::Down(MouseButton::Left),
+    );
+    stale_pointer(
+        &mut model,
+        Hit::BackChip,
+        MouseEventKind::Up(MouseButton::Left),
+    );
     assert!(model.fleet.detail.is_none());
     assert_eq!(model.screen, Screen::Fleet);
     let mut picker_model = model();
     arm(&mut picker_model, "model");
-    picker_model.handle_hit(Hit::BackChip);
+    stale_pointer(
+        &mut picker_model,
+        Hit::BackChip,
+        MouseEventKind::Down(MouseButton::Left),
+    );
+    stale_pointer(
+        &mut picker_model,
+        Hit::BackChip,
+        MouseEventKind::Up(MouseButton::Left),
+    );
     assert_eq!(picker_model.screen, Screen::Launcher);
 }
 
