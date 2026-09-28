@@ -2279,6 +2279,51 @@ fn i_owner_by_input_kind_matrix_keeps_parked_drafts_unchanged() {
             assert_eq!(model.composer.text(), DRAFT, "{mode} × {input}");
         }
     }
+    for mode in ["session", "launcher", "subagent", "aura", "loom"] {
+        for input in ["control", "paste", "inject", "composer-click"] {
+            let mut model = model();
+            arm(&mut model, mode);
+            assert!(matches!(model.input_owner(), InputOwner::Composer(_)));
+            let surface = model.surface_key();
+            let revision = model.composer.revision();
+            let epoch = model.geometry_epoch.get();
+            match input {
+                "control" => {
+                    key(&mut model, KeyCode::Char('u'), KeyModifiers::CONTROL);
+                    assert!(model.composer.text().is_empty(), "{mode} × {input}");
+                }
+                "paste" => {
+                    model.handle(AppEvent::Paste("MATRIX_PASTE".to_owned().into()));
+                    assert!(
+                        model.composer.text().contains("MATRIX_PASTE"),
+                        "{mode} × {input}"
+                    );
+                }
+                "inject" => {
+                    LiveDriver::new("matrix").apply(
+                        &mut model,
+                        LiveReply::InputInjected {
+                            session: session(),
+                            op: haider_rpc::SurfaceInjectOp::Set {
+                                text: "MATRIX_SET".into(),
+                            },
+                        },
+                    );
+                    let expected = if mode == "session" {
+                        "MATRIX_SET"
+                    } else {
+                        DRAFT
+                    };
+                    assert_eq!(model.composer.text(), expected, "{mode} × {input}");
+                }
+                "composer-click" => {
+                    model.composer_press(0, DRAFT, 0, surface, revision, epoch);
+                    assert_eq!(model.composer.cursor(), 0, "{mode} × {input}");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
 }
 
 #[test]
