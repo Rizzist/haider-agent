@@ -1205,14 +1205,39 @@ pub fn arg_summary(args: &serde_json::Value) -> String {
     if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
         return computer_action_summary(action, args);
     }
-    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+    if let Some(path) = [
+        "path",
+        "file_path",
+        "file",
+        "cwd",
+        "root",
+        "directory",
+        "workspace",
+    ]
+    .iter()
+    .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
+    {
         return crate::live::workspace_display_path(path);
     }
     if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-        return match args.get("glob").and_then(|v| v.as_str()) {
-            Some(glob) => format!("\"{query}\" {glob}"),
+        return match args
+            .get("glob")
+            .or_else(|| args.get("include"))
+            .and_then(|v| v.as_str())
+        {
+            Some(glob) => format!(
+                "\"{query}\" {}",
+                crate::toolview::project_absolute_pattern(glob)
+            ),
             None => format!("\"{query}\""),
         };
+    }
+    if let Some(glob) = args
+        .get("glob")
+        .or_else(|| args.get("include"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return crate::toolview::project_absolute_pattern(glob);
     }
     String::new()
 }
@@ -1269,7 +1294,10 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
         }
         "fs_search" | "grep" | "ripgrep" | "search" | "file_search" => {
             let mut summary = match (query, glob, path) {
-                (Some(query), Some(glob), _) => format!("\"{query}\" {glob}"),
+                (Some(query), Some(glob), _) => format!(
+                    "\"{query}\" {}",
+                    crate::toolview::project_absolute_pattern(glob)
+                ),
                 (Some(query), None, Some(path)) => format!(
                     "\"{query}\" in {}",
                     crate::live::workspace_display_path(path)
@@ -1284,6 +1312,10 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
             }
             summary
         }
+        "fs_glob" | "glob" => query
+            .or(glob)
+            .map(crate::toolview::project_absolute_pattern)
+            .unwrap_or_else(|| arg_summary(args)),
         "agent_spawn" | "task" | "task_spawn" | "subagent" => {
             let label = text("label").or_else(|| text("name")).or(description);
             let state = text("state").or_else(|| text("status"));

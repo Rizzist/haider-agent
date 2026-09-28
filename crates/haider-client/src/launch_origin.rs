@@ -84,6 +84,41 @@ pub fn is_multiuser_workspace_root(root: &Path) -> bool {
             .is_some_and(|resolved| DisplayPath::parse(&resolved).is_multiuser_ancestor())
 }
 
+/// A display-only workspace label, using the same path components and
+/// Windows spelling rules as home and account projection. Never use this
+/// label for filesystem access. Dot segments can cross a workspace boundary
+/// (or a symlink), so they make the label unavailable even when lexical
+/// normalization would place the final path below the root.
+#[must_use]
+pub fn workspace_relative_display(path: &Path, root: &Path) -> Option<String> {
+    let has_dot_segment = |path: &Path| {
+        path.to_string_lossy()
+            .split(['/', '\\'])
+            .any(|component| matches!(component, "." | ".."))
+    };
+    if has_dot_segment(path) || has_dot_segment(root) {
+        return None;
+    }
+    let parsed_path = DisplayPath::parse(path);
+    let parsed_root = DisplayPath::parse(root);
+    if !parsed_path.absolute || !parsed_root.absolute {
+        return None;
+    }
+    let relative = parsed_path.relative_to(&parsed_root).or_else(|| {
+        // Canonical spellings cover host aliases such as /tmp -> /private/tmp.
+        // A failure to resolve either side keeps the lexical fallback.
+        let path = canonicalize_existing_prefix(path)?;
+        let root = canonicalize_existing_prefix(root)?;
+        DisplayPath::parse(&path).relative_to(&DisplayPath::parse(&root))
+    })?;
+    let label = if relative.is_empty() {
+        ".".to_owned()
+    } else {
+        relative.join("/")
+    };
+    Some(display_path_with_homes(Path::new(&label), &[]))
+}
+
 fn usable_home_on(home: &Path, windows: bool) -> bool {
     let parsed = DisplayPath::parse(home);
     parsed.absolute

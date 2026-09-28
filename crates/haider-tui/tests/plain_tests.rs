@@ -216,6 +216,56 @@ fn plain_tool_paths_use_the_shared_account_projection() {
             "/Users/<user>/private",
         ),
         ("fs_list", json!({"path": "src"}), "src"),
+        (
+            "custom_tool",
+            json!({"cwd": "/Users/bob/repo"}),
+            "/Users/<user>/repo",
+        ),
+        (
+            "custom_tool",
+            json!({"file_path": "/Users/bob/repo/x"}),
+            "/Users/<user>/repo/x",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "glob": "/Users/bob/**"}),
+            "\"x\" /Users/<user>/**",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "include": "/Users/bob/**"}),
+            "\"x\" /Users/<user>/**",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "include": "src/**"}),
+            "\"x\" src/**",
+        ),
+        (
+            "glob",
+            json!({"pattern": "/Users/bob/**"}),
+            "/Users/<user>/**",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "glob": r"C:\Users\bob\**"}),
+            "\"x\" C:/Users/<user>/**",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "include": "../src/**"}),
+            "\"x\" ../src/**",
+        ),
+        (
+            "fs_read",
+            json!({"path": r"C:/w/..\Users\bob\x"}),
+            "C:/Users/<user>/x",
+        ),
+        (
+            "custom_tool",
+            json!({"cwd": r"C:/w/sub\..\..\Users\bob\x"}),
+            "C:/Users/<user>/x",
+        ),
     ] {
         let mut projection = SessionProjection::new();
         projection.apply(&EventPayload::Item(ItemEvent::Started {

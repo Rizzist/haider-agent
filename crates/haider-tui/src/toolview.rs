@@ -154,17 +154,13 @@ impl PathContext {
         if broad_workspace {
             return display;
         }
-        if let Some(rest) = self
-            .workspace
-            .as_deref()
-            .and_then(|root| strip_root(path, root))
-            .filter(|rest| !rest.split('/').any(|component| component == ".."))
-        {
-            return if rest.is_empty() {
-                ".".to_owned()
-            } else {
-                haider_client::launch_origin::display_path_with_homes(Path::new(rest), &[])
-            };
+        if let Some(label) = self.workspace.as_deref().and_then(|root| {
+            haider_client::launch_origin::workspace_relative_display(
+                Path::new(path),
+                Path::new(root),
+            )
+        }) {
+            return label;
         }
         display
     }
@@ -177,18 +173,6 @@ impl PathContext {
         self.hash(&mut hasher);
         hasher.finish()
     }
-}
-
-fn strip_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
-    let root = root.trim_end_matches('/');
-    if root.is_empty() {
-        return None;
-    }
-    let rest = path.strip_prefix(root)?;
-    if rest.is_empty() {
-        return Some("");
-    }
-    rest.strip_prefix('/')
 }
 
 /// One display line from arbitrary text: the first non-blank line with its
@@ -212,6 +196,33 @@ fn arg_text<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
         .filter(|text| !text.is_empty())
+}
+
+/// Keep relative patterns lexical; project absolute patterns through the
+/// shared home/account mask before putting them in a compact tool row.
+#[must_use]
+pub fn project_absolute_pattern(pattern: &str) -> String {
+    if is_absolute_pattern(pattern) {
+        crate::live::workspace_display_path(pattern)
+    } else {
+        pattern.to_owned()
+    }
+}
+
+fn is_absolute_pattern(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    pattern.starts_with('/')
+        || pattern.starts_with(r"\\")
+        || pattern.starts_with(r"\??\")
+        || (bytes.get(1) == Some(&b':') && matches!(bytes.get(2).copied(), Some(b'/' | b'\\')))
+}
+
+fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> String {
+    if is_absolute_pattern(pattern) {
+        paths.shorten(pattern)
+    } else {
+        pattern.to_owned()
+    }
 }
 
 /// The FULL command a shell-ish call ran: `command`/`cmd`, or an `argv`
@@ -255,15 +266,21 @@ pub fn header_args(name: &str, args: &serde_json::Value, paths: &PathContext) ->
                 return fallback();
             };
             let within = path.or_else(|| arg_text(args, &["root"]).map(|p| paths.shorten(p)));
-            let glob = arg_text(args, &["glob", "include"]);
-            let mut text = format!("\"{}\"", one_line(pattern));
+            let glob = arg_text(args, &["glob", "include"])
+                .map(|pattern| project_pattern_in_context(pattern, paths));
+            let pattern = if name.contains("glob") {
+                project_pattern_in_context(pattern, paths)
+            } else {
+                pattern.to_owned()
+            };
+            let mut text = format!("\"{}\"", one_line(&pattern));
             if let Some(within) = within {
                 text.push_str(" in ");
                 text.push_str(&within);
             }
             if let Some(glob) = glob {
                 text.push(' ');
-                text.push_str(glob);
+                text.push_str(&glob);
             }
             text
         }

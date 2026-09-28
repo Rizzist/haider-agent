@@ -200,6 +200,158 @@ fn account_shaped_workspace_keeps_safe_relative_labels() {
     );
 }
 
+#[test]
+fn mixed_windows_separators_cannot_escape_workspace_label() {
+    for (workspace, path) in [
+        ("C:/w", r"C:/w/..\Users\bob\x"),
+        ("C:/w", r"C:/w/sub\..\..\Users\bob\x"),
+        ("C:/Users/alice/dev", r"C:/Users/alice/dev/..\..\bob\x"),
+        (r"C:\w", r"C:\w\..\Users\bob\x"),
+        (r"\\?\C:\w", r"\\?\C:\w\..\Users\bob\x"),
+        (r"\\srv\share\w", r"\\srv\share\w\..\Users\bob\x"),
+    ] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        let expected = if path.starts_with(r"\\srv") {
+            "//srv/share/Users/<user>/x"
+        } else {
+            "C:/Users/<user>/x"
+        };
+        assert_eq!(context.shorten(path), expected, "{workspace}: {path}");
+        assert_eq!(
+            tv::header_args("fs_read", &json!({"path": path}), &context),
+            expected,
+            "header: {path}"
+        );
+    }
+}
+
+#[test]
+fn dot_segments_never_become_workspace_labels() {
+    let context = PathContext {
+        workspace: Some("C:/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for path in [
+        "C:/w/./src/x.rs",
+        r"C:/w/.\src\x.rs",
+        "C:/w/sub/../src/x.rs",
+        r"C:/w/sub\..\src\x.rs",
+    ] {
+        assert_eq!(context.shorten(path), "C:/w/src/x.rs", "{path}");
+    }
+}
+
+#[test]
+fn equivalent_windows_spellings_keep_safe_workspace_labels() {
+    for (workspace, path) in [
+        (r"C:\w", r"C:\w\src\x.rs"),
+        ("C:/w", r"C:\w\src\x.rs"),
+        ("C:/w", "c:/W/src/x.rs"),
+        (r"\\?\C:\w", r"C:\w\src\x.rs"),
+        ("C:/w", r"\\?\C:\w\src\x.rs"),
+        (r"\\srv\share\w", r"\\SRV\SHARE\W\src\x.rs"),
+        (r"\\?\UNC\srv\share\w", r"\\srv\share\w\src\x.rs"),
+    ] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        assert_eq!(context.shorten(path), "src/x.rs", "{workspace}: {path}");
+    }
+    let own_home = PathContext {
+        workspace: Some("C:/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    assert_eq!(own_home.shorten("C:/Users/alice"), "~");
+    assert_eq!(own_home.shorten("/etc/hosts"), "/etc/hosts");
+    assert_eq!(own_home.shorten("src/x.rs"), "src/x.rs");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn canonical_tmp_alias_keeps_the_workspace_label() {
+    let context = PathContext {
+        workspace: Some("/tmp/winpath-973-alias".to_owned()),
+        homes: Vec::new(),
+    };
+    assert_eq!(
+        context.shorten("/private/tmp/winpath-973-alias/src/x.rs"),
+        "src/x.rs"
+    );
+}
+
+#[test]
+fn absolute_search_patterns_use_the_account_projection() {
+    let context = PathContext {
+        workspace: Some("/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for args in [
+        json!({"query": "x", "glob": "/Users/bob/**"}),
+        json!({"query": "x", "include": "/Users/bob/**"}),
+    ] {
+        assert_eq!(
+            tv::header_args("fs_search", &args, &context),
+            "\"x\" /Users/<user>/**"
+        );
+    }
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "glob": "src/**"}),
+            &context
+        ),
+        "\"x\" src/**"
+    );
+    assert_eq!(
+        tv::header_args("glob", &json!({"pattern": "/Users/bob/**"}), &context),
+        "\"/Users/<user>/**\""
+    );
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "include": "C:/Users/alice/**"}),
+            &context
+        ),
+        "\"x\" ~/**"
+    );
+    assert_eq!(
+        tv::header_args("glob", &json!({"pattern": "/w/src/**"}), &context),
+        "\"src/**\""
+    );
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "glob": r"C:\Users\bob\**"}),
+            &context
+        ),
+        "\"x\" C:/Users/<user>/**"
+    );
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "include": r"\\srv\share\Users\bob\**"}),
+            &context
+        ),
+        "\"x\" //srv/share/Users/<user>/**"
+    );
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "include": "../src/**"}),
+            &context
+        ),
+        "\"x\" ../src/**"
+    );
+    assert_eq!(
+        tv::header_args("custom_tool", &json!({"cwd": "/Users/bob/repo"}), &context),
+        "/Users/<user>/repo"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_alias_to_multiuser_root_keeps_the_account_mask() {

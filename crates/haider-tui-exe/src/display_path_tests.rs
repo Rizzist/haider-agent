@@ -39,6 +39,28 @@ fn seeded_display_homes_reach_the_rendered_tool_row() {
                 status: ToolStatus::InProgress,
             },
         }));
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("escape-row"),
+            item: TurnItem::ToolCall {
+                call_id: "escape-row".into(),
+                name: "fs_read".into(),
+                args: serde_json::json!({"path": r"C:/Users/alice/work/..\..\bob\x"}),
+                status: ToolStatus::InProgress,
+            },
+        }));
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("glob-row"),
+            item: TurnItem::ToolCall {
+                call_id: "glob-row".into(),
+                name: "fs_search".into(),
+                args: serde_json::json!({"query": "x", "glob": "C:/Users/alice/**"}),
+                status: ToolStatus::InProgress,
+            },
+        }));
     let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
     terminal
         .draw(|frame| {
@@ -50,6 +72,8 @@ fn seeded_display_homes_reach_the_rendered_tool_row() {
         .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
         .collect::<String>();
     assert!(painted.contains("Read(~/notes.md)"), "{painted}");
+    assert!(painted.contains("Read(C:/Users/<user>/x)"), "{painted}");
+    assert!(painted.contains("Search(\"x\" ~/**)"), "{painted}");
 }
 
 #[test]
