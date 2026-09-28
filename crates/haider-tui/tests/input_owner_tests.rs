@@ -2146,6 +2146,36 @@ fn history_chooser_disappears_when_a_permission_card_takes_input() {
 }
 
 #[test]
+fn context_panel_does_not_overpaint_a_new_input_owner() {
+    let mut base = model();
+    base.token_panel = true;
+    let paint = |model: &AppModel| {
+        let mut terminal = Terminal::new(TestBackend::new(118, 36)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = haider_tui::render::render(model, frame);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol().to_owned()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    assert!(paint(&base).contains("context by model"));
+    for mode in ["permission", "search"] {
+        let mut covered = model();
+        covered.token_panel = true;
+        arm(&mut covered, mode);
+        assert!(matches!(
+            covered.input_owner(),
+            InputOwner::SessionMenu | InputOwner::Search
+        ));
+        assert!(!paint(&covered).contains("context by model"), "{mode}");
+    }
+}
+
+#[test]
 fn ctrl_shift_c_copies_a_mouse_selection_made_on_the_current_overlay() {
     for mode in [
         "help",

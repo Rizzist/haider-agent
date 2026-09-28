@@ -7759,7 +7759,8 @@ fn render_session(
     if subtree_height > 0 {
         render_subtree(model, theme, frame, subtree_area, false, hits);
     }
-    if model.token_panel {
+    if model.token_panel && model.input_owner() == crate::app::InputOwner::Composer(Screen::Session)
+    {
         render_token_panel(model, theme, frame, area, rule_area.y);
     }
 }
