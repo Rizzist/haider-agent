@@ -946,7 +946,18 @@ fn ordinary_cards_allow_edge_drag_of_the_visible_transcript() {
         model.scroll_max.set(100);
         model.scroll_back.set(20);
         arm(&mut model, mode);
-        model.drag_autoscroll(true);
+        model.transcript_view.set(Rect::new(0, 3, 80, 10));
+        model.mouse_down = Some((10, 8));
+        dispatch_input(
+            &mut model,
+            &[],
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 10,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
         assert_eq!(model.scroll_back.get(), 21, "{mode}");
     }
 }
