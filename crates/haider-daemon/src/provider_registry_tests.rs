@@ -1127,7 +1127,7 @@ fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catal
     let empty = registry
         .summary("bench-proxy", &|_| true)
         .expect("empty summary");
-    assert!(empty.models.is_empty());
+    assert_eq!(empty.models, ["deepseek-v4-flash"]);
     assert_eq!(
         empty.inventory_authority,
         haider_rpc::ModelInventoryAuthorityWire::Advisory
@@ -1923,16 +1923,14 @@ fn bedrock_and_vertex_model_details_get_effort_ladders_but_no_speeds() {
 }
 
 /// LAW (LZ2 — the azure discovery-404 fallback): an Azure-origin CUSTOM
-/// profile keeps its manually entered deployments as inventory when
-/// discovery has nothing, and lights Available once its key exists; a
-/// non-azure custom keeps the G4a rule (discovery is the only inventory
-/// truth) — both directions.
+/// profile keeps its manually entered deployments visible when discovery has
+/// nothing. Configured rows do not claim that remote discovery succeeded;
+/// both Azure and other custom origins remain Unavailable until a fetch.
 ///
-/// MUTATION CHECK: drop the azure-origin arm from `seeded_inventory`.
-/// Expected RUNTIME failure: the azure row below reports Unavailable with
-/// an empty model list.
+/// MUTATION CHECK: drop the configured-row fallback from `seeded_inventory`.
+/// Expected runtime failure: the Azure and generic rows below are empty.
 #[test]
-fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
+fn lz2_azure_custom_keeps_manual_deployments_visible_without_discovery() {
     let custom = |provider: &str, origin: &str| ProviderProfileV1 {
         provider_id: provider.to_owned(),
         display_name: provider.to_owned(),
@@ -1961,7 +1959,7 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
     let azure = registry
         .summary("azure", &|provider| provider == "azure")
         .expect("azure summary");
-    assert_eq!(azure.availability, ProviderAvailabilityWire::Available);
+    assert_eq!(azure.availability, ProviderAvailabilityWire::Unavailable);
     assert_eq!(azure.models, ["my-gpt-deployment"]);
     assert_eq!(azure.default_model.as_deref(), Some("my-gpt-deployment"));
 
@@ -1980,9 +1978,9 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
     assert_eq!(
         generic.availability,
         ProviderAvailabilityWire::Unavailable,
-        "non-azure customs keep the G4a discovery-only inventory rule"
+        "configured rows do not establish remote availability"
     );
-    assert!(generic.models.is_empty());
+    assert_eq!(generic.models, ["my-gpt-deployment"]);
     assert_eq!(
         generic.availability_reason.as_deref(),
         Some("provider model inventory is unavailable")

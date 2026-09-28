@@ -1386,24 +1386,24 @@ async fn catalog_sweep_keeps_public_and_live_rows_across_startup_and_account_rem
         root.path().join("store"),
         root.path(),
     );
-    let fixture = AccountFixture::for_provider("haider-code", Vec::new());
+    let fixture = AccountFixture::for_provider("xai", Vec::new());
     let task = ready_with_dependencies(&config, fixture.dependencies()).await;
     let mut client = control_client(&config).await;
-    let stage_a = stage_secret(&mut client, "sweep-a", "synthetic-haider-code-a").await;
+    let stage_a = stage_secret(&mut client, "sweep-a", "synthetic-xai-a").await;
     let a = expect_descriptor(
         request(
             &mut client,
             "login-sweep-a",
-            login_body_for_provider("command-sweep-a", "haider-code", &stage_a, Some("a"), None),
+            login_body_for_provider("command-sweep-a", "xai", &stage_a, Some("a"), None),
         )
         .await,
     );
-    let stage_b = stage_secret(&mut client, "sweep-b", "synthetic-haider-code-b").await;
+    let stage_b = stage_secret(&mut client, "sweep-b", "synthetic-xai-b").await;
     let b = expect_descriptor(
         request(
             &mut client,
             "login-sweep-b",
-            login_body_for_provider("command-sweep-b", "haider-code", &stage_b, Some("b"), None),
+            login_body_for_provider("command-sweep-b", "xai", &stage_b, Some("b"), None),
         )
         .await,
     );
@@ -1411,8 +1411,8 @@ async fn catalog_sweep_keeps_public_and_live_rows_across_startup_and_account_rem
     task.shutdown_handle().request("seed catalog rows");
     let _ = task.join().await;
 
-    let key_a = haider_store::ProviderModelCacheKey::for_account("haider-code", &a);
-    let key_b = haider_store::ProviderModelCacheKey::for_account("haider-code", &b);
+    let key_a = haider_store::ProviderModelCacheKey::for_account("xai", &a);
+    let key_b = haider_store::ProviderModelCacheKey::for_account("xai", &b);
     let public = "haider-code";
     let unread = [
         "openai-oauth",
