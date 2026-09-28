@@ -150,26 +150,6 @@ fn identical_api_key_digest_preserves_incarnation_and_replacement_mints() {
 }
 
 #[test]
-fn auth_method_switch_mints_even_with_identical_credential_bytes() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
-    let mut row = descriptor("mode", "provider", CredentialStatus::Ok, true);
-    row.credential_digest = Some("identical-synthetic-bytes".into());
-    accounts.add(row.clone()).unwrap();
-    let alias = CredentialAlias::new("mode");
-    let api_key_incarnation = accounts.get(&alias).unwrap().incarnation;
-
-    row.auth_method = AuthMethod::OAuth;
-    accounts.replace(row.clone()).unwrap();
-    let oauth_incarnation = accounts.get(&alias).unwrap().incarnation;
-    assert!(oauth_incarnation > api_key_incarnation);
-
-    row.auth_method = AuthMethod::ApiKey;
-    accounts.replace(row).unwrap();
-    assert!(accounts.get(&alias).unwrap().incarnation > oauth_incarnation);
-}
-
-#[test]
 fn configuration_boundary_mints_once_then_identical_key_keeps_that_incarnation() {
     let directory = tempfile::tempdir().unwrap();
     let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();

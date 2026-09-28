@@ -331,6 +331,15 @@ pub struct AccountStore<S> {
 }
 
 impl<S: StoreLike> AccountStore<S> {
+    /// Validates a transient read-only projection used only for credential
+    /// resolution. The owning daemon has already migrated its durable store;
+    /// this view must never try to persist an older synthetic snapshot.
+    pub fn new_read_only(store: S) -> AccountsResult<Self> {
+        let descriptors = store.load()?;
+        validate_snapshot(&descriptors)?;
+        Ok(Self { store, descriptors })
+    }
+
     /// Loads and validates descriptors from `store`.
     pub fn new(store: S) -> AccountsResult<Self> {
         let mut descriptors = store.load()?;

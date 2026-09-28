@@ -3264,6 +3264,10 @@ async fn begin_provider_models_refresh(
             )),
         };
         if source_mismatch {
+            // A source may be in the middle of an atomic replacement. Give
+            // it the same coalescing window as the file watcher before
+            // reconciling; a transient B→A rewrite must not adopt B.
+            tokio::time::sleep(SOURCE_EVENT_COALESCE).await;
             let _ = commands.send(AccountCommand::ReconcileSources).await;
         }
         let _ = commands
@@ -4758,6 +4762,26 @@ fn publish_management_snapshot(
     }
 }
 
+fn publish_management_snapshot_with_inventory(
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    revision: u64,
+) {
+    let descriptors = accounts.list().to_vec();
+    if let Ok(mut view) = snapshot.lock() {
+        *view = descriptors.clone();
+    }
+    if let Some(management) = management {
+        management.publish(
+            revision,
+            descriptors,
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+        );
+    }
+}
+
 async fn publish_next_management_revision(
     store: &SqliteStoreHandle,
     snapshot: &AccountsSnapshot,
@@ -4781,17 +4805,7 @@ async fn publish_next_management_revision_with_inventory(
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Result<u64, HaiderError> {
     let revision = store.advance_management_revision().await?;
-    let descriptors = accounts.list().to_vec();
-    if let Ok(mut view) = snapshot.lock() {
-        *view = descriptors.clone();
-    }
-    if let Some(management) = management {
-        management.publish(
-            revision,
-            descriptors,
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
-        );
-    }
+    publish_management_snapshot_with_inventory(snapshot, management, accounts, providers, revision);
     Ok(revision)
 }
 
@@ -9050,7 +9064,7 @@ async fn finalize_oauth_commit(
             return;
         }
     };
-    publish_management_snapshot(snapshot, management, accounts, revision);
+    publish_management_snapshot_with_inventory(snapshot, management, accounts, providers, revision);
     enqueue_catalog_discovery(&descriptor.provider, providers, pending_catalog_discoveries);
     match response {
         OAuthCommitResponse::Add => respond(route, ResponseBody::AccountAdd { descriptor }),
@@ -10853,7 +10867,7 @@ impl AccountsProviderFactory {
                 false,
             ));
         };
-        let accounts = AccountStore::new(ReadOnlySnapshotStore(descriptors))?;
+        let accounts = AccountStore::new_read_only(ReadOnlySnapshotStore(descriptors))?;
         let active = accounts
             .active_for_provider(provider)
             .cloned()
