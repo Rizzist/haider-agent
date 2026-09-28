@@ -1424,8 +1424,18 @@ pub struct SessionProviderRebindCommand {
     pub max_tokens: u64,
     pub max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1,
     pub clamped: Option<haider_protocol::output_budget::OutputBudgetClampV1>,
+    pub active_output_budget: Option<haider_protocol::session::ActiveRunOutputBudgetV1>,
     pub event_id: EventId,
     pub device_id: DeviceId,
+}
+
+/// Committed selection as of a run's admission boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOutputPairSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: u64,
+    pub source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
 }
 
 /// Stable response stored in the `session.provider.rebind` receipt.
@@ -8525,6 +8535,152 @@ impl Store {
         lookup_session_create_receipt(&connection, command_id, request_digest, request_json)
     }
 
+    /// Original canonical admission for an already established internal child.
+    /// Callers still submit it through the normal strict receipt comparison;
+    /// this only recovers its historical shape before constructing the retry.
+    pub fn child_create_admission(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+    ) -> StoreResult<Option<(String, SessionMetadataV1)>> {
+        let connection = self.connection()?;
+        let row = connection.query_row(
+            "SELECT method, session_id, state, request_json, response_json FROM command_receipts WHERE command_id = ?1",
+            [command_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+                      row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?)),
+        ).optional().map_err(map_sqlite_error)?;
+        match row {
+            None => Ok(None),
+            Some((method, stored_session, state, request_json, response_json))
+                if method == "session.create"
+                    && stored_session.as_deref() == Some(session_id.as_str())
+                    && state == "committed" =>
+            {
+                let response_json = response_json
+                    .ok_or_else(|| corrupt("committed child admission has no response"))?;
+                let created: CreatedSession =
+                    serde_json::from_str(&response_json).map_err(|error| {
+                        corrupt(format!("invalid child admission response: {error}"))
+                    })?;
+                Ok(Some((request_json, created.metadata)))
+            }
+            Some(_) => Err(store_error(
+                ErrorCode::InvalidArgument,
+                "child command id was already used with different semantics",
+                false,
+            )),
+        }
+    }
+
+    /// Original canonical turn request for an established child. A replay
+    /// keeps its accepted generation in the receipt even after a restart;
+    /// a child whose turn was never accepted still uses the current fence.
+    pub fn child_turn_admission(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+    ) -> StoreResult<Option<String>> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT method, session_id, state, request_json FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        match row {
+            None => Ok(None),
+            Some((method, stored_session, state, request_json))
+                if method == "turn.submit"
+                    && stored_session.as_deref() == Some(session_id.as_str())
+                    && state == "committed" =>
+            {
+                Ok(Some(request_json))
+            }
+            Some(_) => Err(store_error(
+                ErrorCode::InvalidArgument,
+                "child turn command id was already used with different semantics",
+                false,
+            )),
+        }
+    }
+
+    /// The pair and budget accepted for a run at a journal boundary. Later
+    /// ordinary selections are next-turn state and cannot rewrite this view.
+    pub fn session_output_pair_at(
+        &self,
+        session_id: &SessionId,
+        through_seq: u64,
+    ) -> StoreResult<Option<SessionOutputPairSnapshot>> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare(
+                "SELECT method, response_json FROM command_receipts
+             WHERE session_id = ?1 AND state = 'committed' AND accepted_seq <= ?2
+               AND method IN ('session.create', 'session.select_model', 'session.provider.rebind')
+             ORDER BY accepted_seq",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = query
+            .query(params![
+                session_id.as_str(),
+                to_sqlite_integer(through_seq)?
+            ])
+            .map_err(map_sqlite_error)?;
+        let mut pair: Option<SessionOutputPairSnapshot> = None;
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let method: String = row.get(0).map_err(map_sqlite_error)?;
+            let json: String = row.get(1).map_err(map_sqlite_error)?;
+            match method.as_str() {
+                "session.create" => {
+                    let created: CreatedSession = serde_json::from_str(&json)
+                        .map_err(|error| corrupt(format!("invalid create receipt: {error}")))?;
+                    let meta = created.metadata;
+                    pair = Some(SessionOutputPairSnapshot {
+                        provider: meta.provider,
+                        model: meta.model,
+                        max_tokens: meta.max_tokens,
+                        source: meta.max_tokens_source,
+                    });
+                }
+                "session.select_model" => {
+                    let selected: SelectedModel = serde_json::from_str(&json)
+                        .map_err(|error| corrupt(format!("invalid selection receipt: {error}")))?;
+                    if let Some(current) = pair.as_mut() {
+                        current.provider = selected.provider;
+                        current.model = selected.model;
+                        if let Some(budget) = selected.output_budget {
+                            current.max_tokens = budget.max_tokens;
+                            current.source = Some(budget.source);
+                        }
+                    }
+                }
+                "session.provider.rebind" => {
+                    let rebound: ReboundSessionProvider = serde_json::from_str(&json)
+                        .map_err(|error| corrupt(format!("invalid rebind receipt: {error}")))?;
+                    if let Some(current) = pair.as_mut() {
+                        current.provider = rebound.provider;
+                        if rebound.max_tokens != 0 {
+                            current.max_tokens = rebound.max_tokens;
+                            current.source = Some(rebound.max_tokens_source);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(pair)
+    }
+
     /// Atomically claims/finalizes a command receipt, inserts typed metadata,
     /// and commits `SessionState::Created` at sequence one.
     pub fn create_session(
@@ -10930,6 +11086,7 @@ impl Store {
             base_url: command.base_url.clone(),
             account: command.account.clone(),
             output_budget: Some(output_budget),
+            active_output_budget: command.active_output_budget.clone(),
         };
         let fact = rebound.to_payload_value().map_err(|error| {
             store_error(

@@ -283,8 +283,9 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             super::rpc::resolve_session_output_limit(haider_provider::MAX_OUTPUT_LIMIT, &custom)
                 .expect("up to the adapter maximum")
                 .max_tokens,
-            haider_provider::MAX_OUTPUT_LIMIT
+            384_000
         );
+        assert_eq!(haider_provider::MAX_OUTPUT_LIMIT, 384_000);
         assert!(matches!(
             super::rpc::resolve_session_output_limit(
                 haider_provider::MAX_OUTPUT_LIMIT + 1,
@@ -293,7 +294,8 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             Err((
                 _,
                 haider_rpc::ErrorData::ModelOutputLimit {
-                    max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+                    requested: 384_001,
+                    max_output_tokens: 384_000,
                     ..
                 }
             ))

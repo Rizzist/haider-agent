@@ -298,3 +298,261 @@ fn provider_rebind_frozen_policy_compares_actual_permission_bits() {
         ProviderLockdownPolicy::Configured
     ));
 }
+
+/// Pause selection after it has computed its inherited/explicit budget. The
+/// concurrent rebind must wait and then compute from the committed snapshot.
+/// Each row is one distinct budget/source race, including budget-only config.
+#[tokio::test]
+async fn pair_and_budget_writers_serialize_all_seven_snapshot_variants() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let cases = [
+        (
+            "declared",
+            "wide",
+            "small",
+            20_000,
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 }),
+            None,
+            8192,
+            SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+        ),
+        (
+            "context",
+            "unbounded",
+            "ctx",
+            150_000,
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 150_000 }),
+            None,
+            100_000,
+            SessionOutputBudgetSourceV1::UserSet { requested: 150_000 },
+        ),
+        (
+            "derived",
+            "wide",
+            "small",
+            30_000,
+            Some(SessionOutputBudgetSourceV1::Derived),
+            None,
+            8192,
+            SessionOutputBudgetSourceV1::Derived,
+        ),
+        (
+            "restore",
+            "small",
+            "wide",
+            8192,
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 }),
+            None,
+            20_000,
+            SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+        ),
+        (
+            "latest-explicit",
+            "wide",
+            "wide",
+            20_000,
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 }),
+            Some(6000),
+            6000,
+            SessionOutputBudgetSourceV1::UserSet { requested: 6000 },
+        ),
+        (
+            "latest-auto",
+            "wide",
+            "wide",
+            20_000,
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 }),
+            Some(0),
+            30_000,
+            SessionOutputBudgetSourceV1::Derived,
+        ),
+        (
+            "derived-to-explicit",
+            "wide",
+            "wide",
+            30_000,
+            Some(SessionOutputBudgetSourceV1::Derived),
+            Some(6000),
+            6000,
+            SessionOutputBudgetSourceV1::UserSet { requested: 6000 },
+        ),
+    ];
+    for (label, old, new, initial_budget, initial_source, explicit, expected, expected_source) in
+        cases
+    {
+        let root = tempfile::tempdir().expect("store root");
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("hub");
+        let session_id = SessionId::new(format!("budget-race-{label}"));
+        hub.create_internal_session(haider_core::SessionCreateCommand {
+            command_id: format!("create-{label}"),
+            request_digest: format!("digest-{label}"),
+            request_json: "{}".into(),
+            session_id: session_id.clone(),
+            cwd: "/tmp".into(),
+            provider: "mock-a".into(),
+            model: old.into(),
+            max_tokens: initial_budget,
+            max_tokens_source: initial_source,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "test".into(),
+            event_id: EventId::new(format!("created-{label}")),
+            device_id: DeviceId::new("race-device"),
+        })
+        .await
+        .expect("session");
+        let profiles = ["mock-a", "mock-b"].into_iter().map(|provider| {
+            serde_json::from_value::<haider_rpc::ProviderSummaryWire>(serde_json::json!({
+                "provider":provider, "api_family":"openai_chat_completions", "availability":"available",
+                "enabled":true, "trust":"full", "inventory":{"state":"static"},
+                "models":["wide","small","ctx","unbounded"], "default_model":"wide",
+                "model_details":[
+                    {"name":"wide","max_output_tokens":30000,"max_output_tokens_source":"declared","context_window":1048576},
+                    {"name":"small","max_output_tokens": if provider == "mock-b" {8192} else {30000},"max_output_tokens_source":"declared","context_window":1048576},
+                    {"name":"ctx","context_window": if provider == "mock-b" {200000} else {1048576}},
+                    {"name":"unbounded","context_window":1048576}
+                ]
+            })).expect("profile")
+        }).collect();
+        hub.install_accounts(crate::accounts::AccountsFacade {
+            login: None,
+            oauth: None,
+            snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
+            management: crate::accounts::ManagementSnapshot::new(1, Vec::new(), profiles),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+            sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts");
+        hub.install_creatable_providers(std::collections::BTreeSet::from([
+            "mock-a".into(),
+            "mock-b".into(),
+        ]))
+        .expect("creatable");
+        let pause = Arc::new(ModelSelectionBudgetPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        hub.inner
+            .model_selection_budget_pauses
+            .lock()
+            .await
+            .insert(session_id.clone(), pause.clone());
+        let sink = Arc::new(RebindCaptureSink::default());
+        let select_connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([
+                    haider_rpc::Capability::View,
+                    haider_rpc::Capability::Control,
+                ]),
+                sink.clone(),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("select connection");
+        let rebind_connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([
+                    haider_rpc::Capability::View,
+                    haider_rpc::Capability::Control,
+                ]),
+                sink.clone(),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("rebind connection");
+        for (connection, suffix) in [
+            (&select_connection, "select"),
+            (&rebind_connection, "rebind"),
+        ] {
+            connection
+                .request(
+                    RequestId::new(format!("attach-{suffix}")),
+                    RequestBody::SessionAttach {
+                        session_id: session_id.clone(),
+                        after_seq: 0,
+                        mode: haider_rpc::AttachMode::Control,
+                        sealed_replay: false,
+                    },
+                )
+                .await
+                .expect("attach");
+        }
+        let selected_session = session_id.clone();
+        let generation = store.worker_generation();
+        let select = tokio::spawn(async move {
+            select_connection
+                .request(
+                    RequestId::new("select"),
+                    RequestBody::SessionSelectModel {
+                        command_id: haider_rpc::CommandId::new("select-command"),
+                        session_id: selected_session,
+                        worker_generation: generation,
+                        model: new.into(),
+                        provider: Some("mock-a".into()),
+                        confirm_new_epoch: true,
+                        max_tokens: explicit,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("selection reached budget seam");
+        let rebound_session = session_id.clone();
+        let mut rebind = tokio::spawn(async move {
+            rebind_connection
+                .request(
+                    RequestId::new("rebind"),
+                    RequestBody::SessionProviderRebind {
+                        command_id: haider_rpc::CommandId::new("rebind-command"),
+                        session_id: rebound_session,
+                        worker_generation: generation,
+                        provider: "mock-b".into(),
+                        base_url: None,
+                        account: None,
+                    },
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut rebind)
+                .await
+                .is_err(),
+            "rebind cannot commit across the selection snapshot"
+        );
+        pause.release.notify_one();
+        select.await.expect("select join").expect("select handled");
+        rebind.await.expect("rebind join").expect("rebind handled");
+        {
+            let responses = sink.0.lock().expect("responses");
+            assert!(
+                responses.iter().any(|frame| matches!(frame,
+                WireFrame::Response { request_id, body: ResponseBody::SessionProviderRebind { .. } }
+                    if request_id.as_str() == "rebind")),
+                "rebind response: {responses:?}"
+            );
+        }
+        let metadata = hub
+            .session_metadata(&session_id)
+            .await
+            .expect("metadata")
+            .expect("typed");
+        assert_eq!(
+            (metadata.provider.as_str(), metadata.model.as_str()),
+            ("mock-b", new),
+            "{label}"
+        );
+        assert_eq!(
+            (metadata.max_tokens, metadata.max_tokens_source),
+            (expected, Some(expected_source)),
+            "{label}"
+        );
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+}

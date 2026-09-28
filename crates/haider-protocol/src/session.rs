@@ -373,8 +373,20 @@ pub struct SessionProviderRebound {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// Budget for the durable queued next-turn pair after this route change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_budget: Option<crate::output_budget::SessionOutputBudgetV1>,
+    /// Budget installed for the already running request when its model is
+    /// different from the queued next-turn model in `output_budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_output_budget: Option<ActiveRunOutputBudgetV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveRunOutputBudgetV1 {
+    pub run_id: crate::ids::RunId,
+    pub model: String,
+    pub budget: crate::output_budget::SessionOutputBudgetV1,
 }
 
 /// Additive replay fact emitted atomically with a committed live-session

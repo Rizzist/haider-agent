@@ -6481,6 +6481,15 @@ impl LiveDriver {
                     model.refresh_context_window();
                     model.dirty = true;
                 }
+                let next_clamp = rebound.output_budget.and_then(|budget| budget.clamped);
+                if let Some(clamp) = next_clamp {
+                    model.apply_output_budget_clamp(&clamp);
+                }
+                if let Some(clamp) = rebound.active_output_budget
+                    .and_then(|active| active.budget.clamped)
+                    && Some(clamp) != next_clamp {
+                    model.apply_output_budget_clamp(&clamp);
+                }
             }
             // Dated-workspace addendum O5/O7: ONE replaceable context slot.
             // Replay folds by revision (the latest wins in place); no

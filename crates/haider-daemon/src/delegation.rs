@@ -462,7 +462,7 @@ impl DelegationHandle {
     /// `AgentSpawn` outcome before [`Self::launch`] crosses that boundary.
     pub(crate) async fn establish(
         &self,
-        coordinates: SpawnCoordinates,
+        mut coordinates: SpawnCoordinates,
         request: SpawnSubagent,
     ) -> Result<EstablishedSpawn, HaiderError> {
         let (public_headless, direct_operator_spawn) =
@@ -496,6 +496,54 @@ impl DelegationHandle {
         let lease = LeaseId::new(format!("lease-child-{identity}"));
         let callsign = callsign_from_identity(&identity);
         let existing_spawn = self.hub.delegation(agent_id.clone()).await?;
+        // A retry uses the child admission that was actually committed. A
+        // catalog edit may re-derive a different effective budget, and older
+        // receipts omit max_tokens_source altogether. Neither is a caller
+        // change. Compare caller intent and the other coordinates below.
+        let original_admission = self
+            .hub
+            .child_create_admission(
+                format!("delegation-session-{identity}"),
+                child_session_id.clone(),
+            )
+            .await?;
+        if existing_spawn.is_some() && original_admission.is_none() {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "established child has no creation admission",
+                false,
+            ));
+        }
+        let original_create = if let Some((original, admitted)) = original_admission {
+            let old: serde_json::Value =
+                serde_json::from_str(&original).map_err(internal_serialization)?;
+            let old_max = old
+                .get("max_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "child creation admission has no output budget",
+                        false,
+                    )
+                })?;
+            if haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                coordinates.metadata.max_tokens_source,
+                coordinates.metadata.max_tokens,
+            ) != haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                admitted.max_tokens_source,
+                admitted.max_tokens,
+            ) {
+                return Err(workflow_rejection(
+                    "changed_child_budget",
+                    "child budget intent differs from its durable admission",
+                ));
+            }
+            coordinates.metadata.max_tokens = old_max;
+            Some((original, old))
+        } else {
+            None
+        };
         let registered_workflow = match request.workflow.as_ref() {
             Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name))
                 if graph_template(name).is_none() =>
@@ -700,6 +748,23 @@ impl DelegationHandle {
                     }),
                 });
         }
+        if let Some(existing) = &existing_spawn {
+            // A display coordinate introduced after the original spawn is
+            // not part of the caller's retry semantics.
+            match existing
+                .manifest
+                .coordinates
+                .as_ref()
+                .and_then(|value| value.get("output_budget"))
+            {
+                Some(budget) => manifest_coordinates["output_budget"] = budget.clone(),
+                None => {
+                    if let Some(fields) = manifest_coordinates.as_object_mut() {
+                        fields.remove("output_budget");
+                    }
+                }
+            }
+        }
         // Display identity is not new retry semantics. Reuse the first
         // durable value (including legacy absence) after a registry edit;
         // grants/CLI scope still undergo the existing semantics check.
@@ -752,9 +817,11 @@ impl DelegationHandle {
             budget_tokens: Some(coordinates.metadata.max_tokens),
             placement: Placement::Local,
             lease,
+            // The durable child already owns its original fence. A daemon
+            // restart advances the worker generation but does not turn the
+            // same child-establishment retry into a new delegation.
             fencing_epoch: existing_spawn
                 .as_ref()
-                .filter(|_| direct_operator_spawn)
                 .map_or(self.hub.worker_generation(), |record| {
                     record.manifest.fencing_epoch
                 }),
@@ -794,7 +861,7 @@ impl DelegationHandle {
         } else {
             haider_protocol::session::SessionInteractionModeV1::Interactive
         };
-        let create_json = serde_json::to_string(&serde_json::json!({
+        let mut create_value = serde_json::json!({
             "cwd": coordinates.metadata.cwd,
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
@@ -809,8 +876,23 @@ impl DelegationHandle {
             "fast": coordinates.metadata.fast,
             "cache_policy": coordinates.metadata.cache_policy,
             "interaction_mode": child_interaction_mode,
-        }))
-        .map_err(internal_serialization)?;
+        });
+        let create_json = if let Some((original, old)) = original_create {
+            if old.get("max_tokens_source").is_none()
+                && let Some(fields) = create_value.as_object_mut()
+            {
+                fields.remove("max_tokens_source");
+            }
+            if create_value != old {
+                return Err(workflow_rejection(
+                    "changed_child_admission",
+                    "child creation coordinates differ from the durable admission",
+                ));
+            }
+            original
+        } else {
+            serde_json::to_string(&create_value).map_err(internal_serialization)?
+        };
         let create_digest = digest_bytes(create_json.as_bytes());
         self.hub
             .create_internal_session_with_interaction_mode(
@@ -995,7 +1077,32 @@ impl DelegationHandle {
                 fields.remove("worker_generation");
             }
         }
-        let turn_json = serde_json::to_string(&turn_value).map_err(internal_serialization)?;
+        let original_turn = self
+            .hub
+            .child_turn_admission(
+                format!("delegation-turn-{identity}"),
+                record.child_session_id.clone(),
+            )
+            .await?;
+        let replaying_turn = original_turn.is_some();
+        let turn_json = if let Some(original) = original_turn {
+            let old: serde_json::Value =
+                serde_json::from_str(&original).map_err(internal_serialization)?;
+            if let Some(generation) = old.get("worker_generation") {
+                turn_value["worker_generation"] = generation.clone();
+            } else if let Some(fields) = turn_value.as_object_mut() {
+                fields.remove("worker_generation");
+            }
+            if turn_value != old {
+                return Err(workflow_rejection(
+                    "changed_child_turn",
+                    "child first-turn coordinates differ from the durable admission",
+                ));
+            }
+            original
+        } else {
+            serde_json::to_string(&turn_value).map_err(internal_serialization)?
+        };
         let mut accepted = self
             .hub
             .accept_internal_turn(TurnAcceptCommand {
@@ -1016,7 +1123,7 @@ impl DelegationHandle {
                 device_id: self.hub.device_id(),
             })
             .await?;
-        if direct_operator_spawn {
+        if direct_operator_spawn || replaying_turn {
             accepted.worker_generation = self.hub.worker_generation();
         }
         Ok(EstablishedSpawn {

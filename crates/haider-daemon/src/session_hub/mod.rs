@@ -161,6 +161,7 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{
     BranchId, CredentialAlias, DeviceId, EventId, GraphId, MenuId, RunId, SessionId,
 };
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind, MenuScope,
     effect_recovery_menu,
@@ -912,6 +913,20 @@ struct LockdownTurnBinding {
     policy: crate::auto_hermetic::ProviderLockdownPolicy,
 }
 
+#[cfg(test)]
+struct ModelSelectionBudgetPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+pub(crate) struct ActiveRunOutputPairSnapshot {
+    pub run_id: RunId,
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: u64,
+    pub source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
+}
+
 struct HubInner {
     provider_rebind_revision: Arc<AtomicU64>,
     store: SqliteStoreHandle,
@@ -988,6 +1003,9 @@ struct HubInner {
     /// blocking daemon-internal workflow_author transitions inside an already
     /// fenced tool call.
     workflow_selection_serials: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    model_selection_budget_pauses:
+        tokio::sync::Mutex<HashMap<SessionId, Arc<ModelSelectionBudgetPause>>>,
     /// Weak root-run budget authorities shared by delegated child workers.
     /// The owning parent turn controls their lifetime; stale entries cannot
     /// keep a completed run or worker lease alive.
@@ -2500,6 +2518,8 @@ impl SessionHub {
             shell_registry_events_cancel,
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            model_selection_budget_pauses: tokio::sync::Mutex::new(HashMap::new()),
             run_budget_coordinators: Mutex::new(HashMap::new()),
             checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
             replay_tasks: Mutex::new(HashMap::new()),
@@ -4257,6 +4277,28 @@ impl SessionHub {
             SessionCreateOutcome::Committed { created, .. }
             | SessionCreateOutcome::IdempotentReplay { created } => Ok(created),
         }
+    }
+
+    pub(crate) async fn child_create_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+    ) -> Result<Option<(String, haider_protocol::session::SessionMetadataV1)>, HaiderError> {
+        self.inner
+            .store
+            .child_create_admission(command_id, session_id)
+            .await
+    }
+
+    pub(crate) async fn child_turn_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+    ) -> Result<Option<String>, HaiderError> {
+        self.inner
+            .store
+            .child_turn_admission(command_id, session_id)
+            .await
     }
 
     /// Narrow daemon-internal turn acceptance used by local delegation. The
@@ -6667,6 +6709,103 @@ impl SessionHub {
         }
     }
 
+    /// Snapshot the currently running request lane at its start, then apply
+    /// only automatic in-run pair switches. Ordinary selections after that
+    /// point belong to the queued next turn.
+    pub(crate) async fn active_run_output_pair(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ActiveRunOutputPairSnapshot>, HaiderError> {
+        let mut cursor = 0;
+        let mut states = HashMap::<RunId, RunState>::new();
+        let mut started = HashMap::<RunId, u64>::new();
+        let mut specs = HashMap::<RunId, haider_protocol::headless::HeadlessRunSpecV1>::new();
+        let mut promoted = HashMap::<RunId, (String, String)>::new();
+        loop {
+            let page = self
+                .inner
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::ProviderRebind,
+                    session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let count = page.len();
+            for event in page {
+                cursor = event.seq;
+                let Some(run_id) = event.run_id.as_ref() else {
+                    continue;
+                };
+                if let Some(
+                    haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(spec),
+                ) = haider_protocol::headless::HeadlessRunEventPayload::from_payload_value(
+                    &event.payload,
+                ) {
+                    specs.insert(run_id.clone(), spec);
+                }
+                if let Ok(EventPayload::RunState(state)) = event.payload.decode_event() {
+                    if !matches!(state, RunState::Queued) {
+                        started.entry(run_id.clone()).or_insert(event.seq);
+                    }
+                    states.insert(run_id.clone(), state);
+                }
+                if let Ok(EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data },
+                    ..
+                })) = event.payload.decode_event()
+                    && kind == "provider_pair_switch_v1"
+                    && let Some(model) = data.get("to_model").and_then(serde_json::Value::as_str)
+                    && let Some(provider) =
+                        data.get("to_provider").and_then(serde_json::Value::as_str)
+                {
+                    promoted.insert(run_id.clone(), (provider.to_owned(), model.to_owned()));
+                }
+            }
+            if count < 256 {
+                break;
+            }
+        }
+        let Some((run_id, start_seq)) = started
+            .into_iter()
+            .filter(|(run_id, _)| states.get(run_id).is_some_and(|state| !state.is_terminal()))
+            .max_by_key(|(_, seq)| *seq)
+        else {
+            return Ok(None);
+        };
+        let Some(snapshot) = self
+            .inner
+            .store
+            .session_output_pair_at(session_id.clone(), start_seq)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut provider = snapshot.provider;
+        let mut model = snapshot.model;
+        let mut max_tokens = snapshot.max_tokens;
+        if let Some(spec) = specs.get(&run_id) {
+            provider.clone_from(&spec.provider);
+            model.clone_from(&spec.model);
+            max_tokens = spec.max_output_tokens;
+        }
+        if let Some((switched_provider, switched_model)) = promoted.remove(&run_id) {
+            provider = switched_provider;
+            model = switched_model;
+        }
+        Ok(Some(ActiveRunOutputPairSnapshot {
+            run_id,
+            provider,
+            model,
+            max_tokens,
+            source: snapshot.source,
+        }))
+    }
+
     /// One per-session total order for native workflow selection and the
     /// durable admission of work that makes an idle session nonterminal.
     pub(crate) async fn lock_workflow_selection(
@@ -6682,6 +6821,21 @@ impl SessionHub {
             )
         };
         serial.lock_owned().await
+    }
+
+    #[cfg(test)]
+    async fn pause_model_selection_after_budget(&self, session_id: &SessionId) {
+        let pause = self
+            .inner
+            .model_selection_budget_pauses
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     pub(crate) async fn lock_checkpoint_mutation(

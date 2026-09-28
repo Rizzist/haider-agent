@@ -47,6 +47,7 @@ fn command(store: &Store) -> SessionProviderRebindCommand {
         max_tokens: 4096,
         max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
         clamped: None,
+        active_output_budget: None,
         event_id: EventId::new("rebound-1"),
         device_id: DeviceId::new("test-device"),
     }
@@ -65,6 +66,18 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
     command.clamped = Some(haider_protocol::output_budget::OutputBudgetClampV1 {
         requested: 20_000,
         max_output_tokens: 8192,
+    });
+    command.active_output_budget = Some(haider_protocol::session::ActiveRunOutputBudgetV1 {
+        run_id: haider_protocol::ids::RunId::new("active-run"),
+        model: "small-active-model".into(),
+        budget: haider_protocol::output_budget::SessionOutputBudgetV1 {
+            max_tokens: 4096,
+            source: command.max_tokens_source,
+            clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                requested: 20_000,
+                max_output_tokens: 4096,
+            }),
+        },
     });
     let mut replayed_metadata = store
         .session_metadata(&command.session_id)
@@ -88,6 +101,11 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
     assert_eq!(envelope.payload["type"], "session_provider_rebound");
     let fact =
         SessionProviderRebound::from_payload_value(&envelope.payload).expect("typed replay fact");
+    assert_eq!(fact.active_output_budget, command.active_output_budget);
+    assert_eq!(
+        fact.output_budget.expect("next-turn budget").max_tokens,
+        8192
+    );
     fact.apply_to_metadata(&mut replayed_metadata);
     assert_eq!(replayed_metadata.model, "test-model");
     assert_eq!(replayed_metadata.provider, "proxy");
@@ -147,6 +165,40 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
             )
             .expect("receipt across generation change"),
         Some(selected)
+    );
+}
+
+#[test]
+fn provider_rebind_keeps_larger_active_derived_budget_separate_from_queued_budget() {
+    let root = tempfile::tempdir().expect("temporary store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "session-a");
+    let mut command = command(&store);
+    command.max_tokens = 8192;
+    command.active_output_budget = Some(haider_protocol::session::ActiveRunOutputBudgetV1 {
+        run_id: haider_protocol::ids::RunId::new("active-large"),
+        model: "wide-model".into(),
+        budget: haider_protocol::output_budget::SessionOutputBudgetV1 {
+            max_tokens: 30_000,
+            source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+            clamped: None,
+        },
+    });
+    let SessionProviderRebindOutcome::Committed { envelope, .. } =
+        store.rebind_session_provider(&command).expect("rebind")
+    else {
+        panic!("commit")
+    };
+    let fact = SessionProviderRebound::from_payload_value(&envelope.payload).expect("fact");
+    assert_eq!(fact.output_budget.expect("queued budget").max_tokens, 8192);
+    assert_eq!(fact.active_output_budget, command.active_output_budget);
+    assert_eq!(
+        store
+            .session_metadata(&command.session_id)
+            .expect("metadata")
+            .expect("typed")
+            .max_tokens,
+        8192
     );
 }
 

@@ -458,8 +458,11 @@ async fn session_create_above_global_ceiling_returns_typed_model_output_limit() 
         root.path().join("runtime"),
     );
     let fake = Arc::new(FakeProvider::new(text_turn("must not dispatch")));
-    let task =
-        ready_with_dependencies(&config, routed_dependencies(&[("fake", fake.clone())])).await;
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[("custom-ceiling", fake.clone())]),
+    )
+    .await;
     let mut client = UdsClient::connect_control(
         &config.endpoint_path(),
         config.frame_limit,
@@ -475,7 +478,7 @@ async fn session_create_above_global_ceiling_returns_typed_model_output_limit() 
         RequestBody::SessionCreate {
             command_id: CommandId::new("create-over-global"),
             cwd: workspace.display().to_string(),
-            provider: "fake".into(),
+            provider: "custom-ceiling".into(),
             model: "unknown-model".into(),
             max_tokens: 384_001,
         },
@@ -488,10 +491,7 @@ async fn session_create_above_global_ceiling_returns_typed_model_output_limit() 
             ResponseBody::Error {
                 data: Some(ErrorData::ModelOutputLimit {
                     requested: 384_001,
-                    // The injected fake row's 30,000 ceiling is tighter than
-                    // the global 384,000 bound; the typed refusal reports
-                    // the effective model ceiling.
-                    max_output_tokens: 30_000,
+                    max_output_tokens: 384_000,
                     ..
                 }),
                 ..

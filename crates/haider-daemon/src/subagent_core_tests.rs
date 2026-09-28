@@ -6146,3 +6146,256 @@ async fn activity_typed_spawn_freezes_display_identity_in_the_replayed_manifest(
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close store");
 }
+// Review-only fixture: exact pre-b444 child receipt JSON omits max_tokens_source.
+#[tokio::test]
+async fn astra_legacy_child_receipt_replay_is_compatible() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent = SessionId::new("astra-legacy-parent");
+    let run = RunId::new("astra-legacy-run");
+    accept_parent_with_interaction_mode(
+        &hub,
+        &parent,
+        &run,
+        "astra-legacy",
+        haider_protocol::session::SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    let mut metadata = hub
+        .session_metadata(&parent)
+        .await
+        .expect("metadata")
+        .expect("parent");
+    metadata.model = "fake-other".into();
+    metadata.max_tokens = 20_000;
+    metadata.max_tokens_source = Some(
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+    );
+    let coordinates = || SpawnCoordinates {
+        parent_session_id: parent.clone(),
+        parent_run_id: run.clone(),
+        parent_branch_id: None,
+        parent_agent_id: None,
+        tool_item_id: haider_protocol::ids::ItemId::new("astra-legacy-tool"),
+        call_id: "astra-legacy-call".into(),
+        metadata: metadata.clone(),
+        agent_type: None,
+        lockdown: false,
+        auto_hermetic: false,
+    };
+    let request=SpawnSubagent::from_tool_args(serde_json::json!({"task":"legacy","prompt":"fixture","provider":"fake","model":"fake-other"})).expect("spawn args");
+    let delegation = DelegationHandle::new(hub.clone());
+    let first = delegation
+        .establish(coordinates(), request.clone())
+        .await
+        .expect("first establishment");
+    let child = first
+        .ticket
+        .manifest
+        .coordinates
+        .as_ref()
+        .expect("coordinates")["child_session_id"]
+        .as_str()
+        .expect("child id")
+        .to_owned();
+    let control = delegation
+        .establish(coordinates(), request.clone())
+        .await
+        .expect("current-format replay control");
+    println!("ASTRA current-format child receipt replay succeeds");
+    drop(control);
+    drop(first);
+    drop(delegation);
+    hub.shutdown().await.expect("shutdown");
+    drop(hub);
+    store.close().await.expect("close");
+    let db = rusqlite::Connection::open(root.path().join("store.sqlite")).expect("fixture db");
+    let (command,json):(String,String)=db.query_row("SELECT command_id, request_json FROM command_receipts WHERE session_id=?1 AND method='session.create'",[&child],|r|Ok((r.get(0)?,r.get(1)?))).expect("child receipt");
+    let mut json: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let removed = json
+        .as_object_mut()
+        .expect("object")
+        .remove("max_tokens_source");
+    assert!(removed.is_some());
+    let old_json = serde_json::to_string(&json).expect("old receipt JSON");
+    let old_digest = blake3::hash(old_json.as_bytes()).to_hex().to_string();
+    db.execute(
+        "UPDATE command_receipts SET request_json=?1,request_digest=?2 WHERE command_id=?3",
+        rusqlite::params![old_json, old_digest, command],
+    )
+    .expect("install old-format receipt");
+    drop(db);
+    let store = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopened hub");
+    let delegation = DelegationHandle::new(hub.clone());
+    let replay = delegation.establish(coordinates(), request).await;
+    println!(
+        "ASTRA old-child receipt same pair/budget/request replay error={:?}",
+        replay.as_ref().err()
+    );
+    let okay = replay.is_ok();
+    drop(replay);
+    drop(delegation);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
+    assert!(
+        okay,
+        "pre-b444 child receipt must replay without semantic change"
+    );
+}
+
+/// Legacy absent source/display fields and a changed destination catalog are
+/// replay coordinates, not a new child request. A changed requested budget is.
+#[tokio::test]
+async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_catalog_edits() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    for variant in ["absent_source", "absent_clamp_display", "changed_catalog"] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let parent = SessionId::new(format!("parent-{variant}"));
+        let run = RunId::new(format!("run-{variant}"));
+        accept_parent_with_interaction_mode(
+            &hub,
+            &parent,
+            &run,
+            variant,
+            haider_protocol::session::SessionInteractionModeV1::Autonomous,
+        )
+        .await;
+        let mut child_metadata = hub
+            .session_metadata(&parent)
+            .await
+            .expect("metadata")
+            .expect("parent");
+        child_metadata.model = "small".into();
+        child_metadata.max_tokens = if variant == "absent_source" {
+            4096
+        } else {
+            8192
+        };
+        child_metadata.max_tokens_source = if variant == "absent_source" {
+            None
+        } else {
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 })
+        };
+        let original_metadata = child_metadata.clone();
+        let request = SpawnSubagent::from_tool_args(serde_json::json!({
+            "task":"replay", "prompt":"same call", "provider":"fake", "model":"small"
+        }))
+        .expect("spawn args");
+        let coordinates = |metadata| SpawnCoordinates {
+            parent_session_id: parent.clone(),
+            parent_run_id: run.clone(),
+            parent_branch_id: None,
+            parent_agent_id: None,
+            tool_item_id: haider_protocol::ids::ItemId::new("tool"),
+            call_id: "same-call".into(),
+            metadata,
+            agent_type: None,
+            lockdown: false,
+            auto_hermetic: false,
+        };
+        let delegation = DelegationHandle::new(hub.clone());
+        let first = delegation
+            .establish(coordinates(child_metadata.clone()), request.clone())
+            .await
+            .expect("first establishment");
+        let child = first
+            .ticket
+            .manifest
+            .coordinates
+            .as_ref()
+            .expect("coordinates")["child_session_id"]
+            .as_str()
+            .expect("child id")
+            .to_owned();
+        drop(first);
+        drop(delegation);
+        hub.shutdown().await.expect("shutdown");
+        drop(hub);
+        store.close().await.expect("close");
+        let db = rusqlite::Connection::open(root.path().join("store.sqlite")).expect("fixture db");
+        if variant == "absent_source" {
+            let (command, request_json): (String, String) = db.query_row(
+                "SELECT command_id, request_json FROM command_receipts WHERE session_id=?1 AND method='session.create'",
+                [&child], |row| Ok((row.get(0)?, row.get(1)?))).expect("receipt");
+            let mut json: serde_json::Value = serde_json::from_str(&request_json).expect("json");
+            json.as_object_mut()
+                .expect("object")
+                .remove("max_tokens_source");
+            let old = serde_json::to_string(&json).expect("canonical");
+            db.execute("UPDATE command_receipts SET request_json=?1, request_digest=?2 WHERE command_id=?3",
+                rusqlite::params![old, blake3::hash(old.as_bytes()).to_hex().to_string(), command])
+                .expect("old-format receipt");
+        }
+        if variant == "absent_clamp_display" {
+            let manifest: String = db
+                .query_row(
+                    "SELECT manifest_json FROM delegations WHERE child_session_id=?1",
+                    [&child],
+                    |row| row.get(0),
+                )
+                .expect("manifest");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&manifest).expect("manifest json");
+            assert!(
+                json["coordinates"]
+                    .as_object_mut()
+                    .expect("coordinates")
+                    .remove("output_budget")
+                    .is_some(),
+                "first spawn has a clamp display"
+            );
+            db.execute(
+                "UPDATE delegations SET manifest_json=?1 WHERE child_session_id=?2",
+                rusqlite::params![serde_json::to_string(&json).expect("manifest"), child],
+            )
+            .expect("legacy absent display");
+        }
+        drop(db);
+        let store = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        if variant == "changed_catalog" {
+            child_metadata.max_tokens = 16_384;
+        }
+        let delegation = DelegationHandle::new(hub.clone());
+        let replay = delegation
+            .establish(coordinates(child_metadata), request.clone())
+            .await
+            .expect("unchanged child request replays");
+        assert_eq!(
+            replay.ticket.manifest.budget_tokens,
+            Some(original_metadata.max_tokens)
+        );
+        if variant == "absent_clamp_display" {
+            assert!(
+                replay
+                    .ticket
+                    .manifest
+                    .coordinates
+                    .as_ref()
+                    .expect("coordinates")
+                    .get("output_budget")
+                    .is_none()
+            );
+        }
+        if variant == "changed_catalog" {
+            let mut changed = original_metadata.clone();
+            changed.max_tokens_source =
+                Some(SessionOutputBudgetSourceV1::UserSet { requested: 10_000 });
+            assert!(
+                delegation
+                    .establish(coordinates(changed), request.clone())
+                    .await
+                    .is_err(),
+                "a changed requested budget must not borrow the old receipt"
+            );
+        }
+        drop(replay);
+        drop(delegation);
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+}

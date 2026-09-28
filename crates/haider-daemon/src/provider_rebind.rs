@@ -6,6 +6,48 @@ mod tests;
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+async fn recorded_active_budget(
+    store: &HubStoreHandle,
+    rebind_id: Option<&str>,
+    model: &str,
+) -> Result<Option<haider_protocol::output_budget::SessionOutputBudgetV1>, HaiderError> {
+    let Some(rebind_id) = rebind_id else {
+        return Ok(None);
+    };
+    let mut cursor = 0;
+    loop {
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::ProviderRebind,
+                store.session_id(),
+                cursor,
+                256,
+            )
+            .await?;
+        if page.is_empty() {
+            return Ok(None);
+        }
+        let count = page.len();
+        for envelope in page {
+            cursor = envelope.seq;
+            if let Some(rebound) =
+                haider_protocol::session::SessionProviderRebound::from_payload_value(
+                    &envelope.payload,
+                )
+                && rebound.rebind_id == rebind_id
+            {
+                return Ok(rebound
+                    .active_output_budget
+                    .filter(|active| active.model == model)
+                    .map(|active| active.budget));
+            }
+        }
+        if count < 256 {
+            return Ok(None);
+        }
+    }
+}
+
 /// A headless spec pins run tuning, while an explicit durable rebind owns the
 /// provider route. Restoring only the spec provider would combine its adapter
 /// with another provider's rebound endpoint and account after recovery.
@@ -51,7 +93,11 @@ pub(super) async fn pin_headless_turn_metadata(
                 )
                 && metadata.provider_rebind_id.as_deref() == Some(rebound.rebind_id.as_str())
             {
-                rebound_budget = Some((envelope.seq, rebound.output_budget));
+                rebound_budget = Some((
+                    envelope.seq,
+                    rebound.output_budget,
+                    rebound.active_output_budget,
+                ));
             }
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
@@ -81,12 +127,13 @@ pub(super) async fn pin_headless_turn_metadata(
             break;
         }
     }
-    let run_rebound =
-        rebound_budget.is_some_and(|(seq, _)| first_run_seq.is_some_and(|first| seq > first));
+    let run_rebound = rebound_budget
+        .as_ref()
+        .is_some_and(|(seq, _, _)| first_run_seq.is_some_and(|first| *seq > first));
     if !run_rebound {
         return Ok(());
     }
-    if let Some((_, Some(budget))) = rebound_budget {
+    if let Some((_, Some(budget), _)) = rebound_budget.as_ref() {
         metadata.max_tokens = budget.max_tokens;
         metadata.max_tokens_source = Some(budget.source);
     } else {
@@ -94,6 +141,14 @@ pub(super) async fn pin_headless_turn_metadata(
         // as the best available pair-specific value for that legacy run.
         metadata.max_tokens = stored_budget.0;
         metadata.max_tokens_source = stored_budget.1;
+    }
+    if let Some((_, _, Some(active))) = rebound_budget.as_ref()
+        && active.run_id == *run_id
+        && active.model == metadata.model
+    {
+        metadata.max_tokens = active.budget.max_tokens;
+        metadata.max_tokens_source = Some(active.budget.source);
+        return Ok(());
     }
     if let Some(view) = store
         .hub()
@@ -274,7 +329,16 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             self.seen_revision.store(revision, Ordering::Release);
             return Ok(None);
         }
-        if let Some(view) = self
+        let recorded_active = recorded_active_budget(
+            &self.store,
+            metadata.provider_rebind_id.as_deref(),
+            current_model,
+        )
+        .await?;
+        if let Some(budget) = recorded_active {
+            metadata.max_tokens = budget.max_tokens;
+            metadata.max_tokens_source = Some(budget.source);
+        } else if let Some(view) = self
             .store
             .hub()
             .accounts()

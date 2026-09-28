@@ -90,6 +90,7 @@ async fn commit_test_rebind(
         max_tokens: 4096,
         max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
         clamped: None,
+        active_output_budget: None,
         event_id: EventId::new(format!("rebound-{session_id}-{ordinal}")),
         device_id: DeviceId::new("rebind-test-device"),
     })
@@ -108,6 +109,30 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
         .expect("hub");
     let session_id = SessionId::new("rebind-live-model");
     create_rebind_test_session(&hub, &session_id).await;
+    hub.install_creatable_providers(std::collections::BTreeSet::from(["fake".to_owned()]))
+        .expect("creatable provider");
+    let profile = serde_json::from_value::<haider_rpc::ProviderSummaryWire>(serde_json::json!({
+        "provider":"fake", "api_family":"openai_responses", "availability":"available",
+        "enabled":true, "trust":"full", "inventory":{"state":"static"},
+        "models":["initial-model","promoted-live-model","pending-next-turn-model"],
+        "model_details":[
+            {"name":"initial-model","max_output_tokens":8192,"max_output_tokens_source":"declared","context_window":1048576},
+            {"name":"promoted-live-model","max_output_tokens":8192,"max_output_tokens_source":"declared","context_window":1048576},
+            {"name":"pending-next-turn-model","max_output_tokens":30000,"max_output_tokens_source":"declared","context_window":1048576}
+        ]
+    })).expect("profile");
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(1, Vec::new(), vec![profile]),
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+        vault: None,
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })
+    .expect("accounts");
     let lease = hub
         .acquire_worker_lease(session_id.clone())
         .await
@@ -156,6 +181,10 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
         .await
         .expect("refresh")
         .expect("rebound target");
+    assert_eq!(
+        target.max_tokens, 8192,
+        "legacy rebind facts still re-derive for the active promoted model"
+    );
     assert_eq!(
         target.account.as_ref().map(|alias| alias.as_str()),
         Some("selected-account")
@@ -507,6 +536,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 requested: 20_000,
                 max_output_tokens: 8192,
             }),
+            active_output_budget: None,
             event_id: EventId::new("recovery-rebound"),
             device_id: device_id.clone(),
         })
@@ -664,4 +694,319 @@ async fn provider_rebind_recovery_rejects_changed_frozen_permissions_and_lockdow
     );
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close");
+}
+#[tokio::test]
+async fn astra_divergent_headless_recovery_reapplies_active_limit() {
+    for (headless, automatic_switch) in [(true, false), (true, true)] {
+        let root = tempfile::tempdir().expect("store root");
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("hub");
+        hub.install_creatable_providers(std::collections::BTreeSet::from([
+            "fake".to_owned(),
+            "fake-b".to_owned(),
+        ]))
+        .expect("creatable");
+        let providers = ["fake", "fake-b"].into_iter().map(|p| serde_json::from_value::<haider_rpc::ProviderSummaryWire>(serde_json::json!({
+            "provider":p,"api_family":"openai_responses","availability":"available","enabled":true,
+            "models":["initial-model","promoted-live-model","pending-next-turn-model"],
+            "model_details":[
+                {"name":"initial-model","max_output_tokens":8192,"max_output_tokens_source":"declared","context_window":1048576},
+                {"name":"promoted-live-model","max_output_tokens":8192,"max_output_tokens_source":"declared","context_window":1048576},
+                {"name":"pending-next-turn-model","max_output_tokens":30000,"max_output_tokens_source":"declared","context_window":1048576}
+            ]
+        })).expect("summary")).collect();
+        hub.install_accounts(crate::accounts::AccountsFacade {
+            login: None,
+            oauth: None,
+            snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
+            management: crate::accounts::ManagementSnapshot::new(1, Vec::new(), providers),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+            vault: None,
+            sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+        })
+        .expect("accounts");
+        let session_id = SessionId::new(format!("rebind-recover-{headless}-{automatic_switch}"));
+        let run_id = RunId::new(format!("active-{session_id}"));
+        let device_id = DeviceId::new("recovery-device");
+        create_rebind_test_session(&hub, &session_id).await;
+        let accepted = hub
+            .accept_internal_turn(haider_core::TurnAcceptCommand {
+                command_id: "accept-recovery".into(),
+                request_digest: "accept-recovery-digest".into(),
+                request_json: "{}".into(),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                run_id: run_id.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: "resume the accepted run".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+                queued_event_id: EventId::new("recovery-queued"),
+                user_event_id: EventId::new("recovery-user"),
+                active_event_id: EventId::new("recovery-active"),
+                device_id: device_id.clone(),
+            })
+            .await
+            .expect("accept durable run");
+        let lease = hub
+            .acquire_worker_lease(session_id.clone())
+            .await
+            .expect("lease");
+        let event_ids = EventIdGenerator::new(format!("recovery-{session_id}"));
+        if headless {
+            let mut envelopes =
+                [
+                    supervisor_raw_envelope(
+                        &lease,
+                        &device_id,
+                        None,
+                        Some(run_id.clone()),
+                        event_ids.next(),
+                        HeadlessRunEventPayload::HeadlessRunConfigured(
+                            rebound_recovery_headless_spec(),
+                        )
+                        .to_payload_value()
+                        .expect("headless payload"),
+                    ),
+                ];
+            // Headless configuration is an admission-owned durable fact,
+            // outside the worker envelope's writable payload family.
+            haider_core::StoreHandle::append(&store, &mut envelopes)
+                .await
+                .expect("headless config");
+        }
+        append_payloads(
+            &lease,
+            &device_id,
+            &run_id,
+            None,
+            &event_ids,
+            vec![EventPayload::RunState(RunState::Thinking)],
+        )
+        .await
+        .expect("run was active before recovery");
+        if automatic_switch {
+            append_payloads(
+                &lease,
+                &device_id,
+                &run_id,
+                None,
+                &event_ids,
+                vec![EventPayload::Item(ItemEvent::Completed {
+                    item_id: haider_protocol::ids::ItemId::new("live-model-switch"),
+                    item: TurnItem::Extension {
+                        kind: "provider_pair_switch_v1".into(),
+                        data: serde_json::json!({
+                            "from_provider": "fake", "from_model": "initial-model",
+                            "to_provider": "fake", "to_model": "promoted-live-model",
+                            "why": "fallback_chain"
+                        }),
+                    },
+                })],
+            )
+            .await
+            .expect("automatic run model fact");
+            let unrelated_run = RunId::new("unrelated-run");
+            let mut historical = [
+                EventPayload::RunState(RunState::Queued),
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: haider_protocol::ids::ItemId::new("unrelated-model-switch"),
+                    item: TurnItem::Extension {
+                        kind: "provider_pair_switch_v1".into(),
+                        data: serde_json::json!({"to_provider": "fake", "to_model": "unrelated-model"}),
+                    },
+                }),
+                EventPayload::RunState(RunState::Done),
+            ].into_iter().map(|payload| supervisor_envelope(
+                &lease, &device_id, None, Some(unrelated_run.clone()), event_ids.next(), payload,
+            ).expect("historical envelope")).collect::<Vec<_>>();
+            haider_core::StoreHandle::append(&store, &mut historical)
+                .await
+                .expect("unrelated completed run history");
+        }
+        if headless {
+            hub.select_session_model(haider_store::SessionSelectModelCommand {
+                command_id: "pending-selection".into(),
+                request_digest: "pending-selection-digest".into(),
+                request_json: "{}".into(),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                provider: "fake".into(),
+                model: "pending-next-turn-model".into(),
+                output_budget: None,
+                expected_pair: None,
+                event_id: EventId::new("pending-model-selected"),
+                device_id: device_id.clone(),
+            })
+            .await
+            .expect("pending ordinary model selection");
+        }
+        hub.rebind_session_provider(haider_store::SessionProviderRebindCommand {
+            command_id: "rebind-recovery".into(),
+            request_digest: "rebind-recovery-digest".into(),
+            request_json: "{}".into(),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "fake-b".into(),
+            base_url: Some("http://127.0.0.1:31702/v1".into()),
+            account: Some("fake-b-account".into()),
+            max_tokens: 20_000,
+            max_tokens_source:
+                haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                    requested: 20_000,
+                },
+            clamped: None,
+            active_output_budget: (!automatic_switch).then(|| {
+                haider_protocol::session::ActiveRunOutputBudgetV1 {
+                    run_id: run_id.clone(),
+                    model: "initial-model".into(),
+                    budget: haider_protocol::output_budget::SessionOutputBudgetV1 {
+                        max_tokens: 8192,
+                        source:
+                            haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                                requested: 20_000,
+                            },
+                        clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                            requested: 20_000,
+                            max_output_tokens: 8192,
+                        }),
+                    },
+                }
+            }),
+            event_id: EventId::new("recovery-rebound"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("durable cross-provider route");
+        let fact = store
+            .read(&session_id, 0, 1024)
+            .await
+            .expect("journal")
+            .into_iter()
+            .filter_map(|event| {
+                haider_protocol::session::SessionProviderRebound::from_payload_value(&event.payload)
+            })
+            .next_back()
+            .expect("rebind fact");
+        if !automatic_switch {
+            let active = fact
+                .active_output_budget
+                .expect("active budget in route transaction");
+            assert_eq!(active.run_id, run_id);
+            assert_eq!(active.budget.max_tokens, 8192);
+            assert_eq!(
+                active.budget.clamped.expect("typed active clamp").requested,
+                20_000
+            );
+        }
+        drop(lease);
+        let provider = Arc::new(haider_provider::FakeProvider::new(vec![
+            haider_provider::FakeStep::EmitText {
+                text: "recovered answer".into(),
+            },
+            haider_provider::FakeStep::Finish {
+                reason: haider_protocol::provider::FinishReason::EndTurn,
+            },
+        ]));
+        let factory = Arc::new(RecordingRebindFactory {
+            provider: Some(provider.clone()),
+            ..RecordingRebindFactory::default()
+        });
+        let manager = WorkerManager::start(
+            hub.clone(),
+            WorkerDependencies {
+                provider_factory: factory.clone(),
+                tool_factory: Arc::new(BrokerToolFactory),
+                delegation: None,
+                web_search: None,
+                diagnostics: None,
+            },
+            false,
+        );
+        hub.install_worker_manager(manager.handle())
+            .expect("install recovered worker");
+        manager
+            .handle()
+            // Resume this same active run at a workflow-continuation handoff.
+            .recover_workflow_continuation(accepted, 1, 1)
+            .await
+            .expect("recover active run");
+        // One fake response has no delay; 10 s is the existing runtime-test
+        // scheduling budget, and the loop performs no network or backoff wait.
+        let settled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(state) = store
+                    .read(&session_id, 0, 1024)
+                    .await
+                    .expect("journal")
+                    .iter()
+                    .filter_map(|event| {
+                        if event.run_id.as_ref() != Some(&run_id) {
+                            return None;
+                        }
+                        match event.payload.decode_event() {
+                            Ok(EventPayload::RunState(state)) if state.is_terminal() => Some(state),
+                            _ => None,
+                        }
+                    })
+                    .next_back()
+                {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(
+            settled.expect("rebound recovery reaches a terminal state"),
+            RunState::Done,
+            "recovery headless={headless} automatic_switch={automatic_switch}"
+        );
+        let calls = factory.calls.lock().expect("factory calls").clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].provider, "fake-b");
+        assert_eq!(
+            calls[0].provider_base_url.as_deref(),
+            Some("http://127.0.0.1:31702/v1")
+        );
+        assert_eq!(calls[0].account_alias.as_deref(), Some("fake-b-account"));
+        assert_eq!(
+            calls[0].provider_rebind_id.as_deref(),
+            Some("rebind-recovery")
+        );
+        let expected_model = if automatic_switch {
+            "promoted-live-model"
+        } else {
+            "initial-model"
+        };
+        assert_eq!(calls[0].model, expected_model);
+        if headless {
+            assert_eq!(calls[0].effort.as_deref(), Some("high"));
+            assert!(calls[0].fast);
+            assert_eq!(calls[0].max_tokens, 8192);
+        }
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, expected_model);
+        println!(
+            "ASTRA divergent headless recovery automatic_switch={automatic_switch} receipt_budget=20000 active_model={} provider_received={}",
+            requests[0].model, requests[0].max_tokens
+        );
+        assert_eq!(requests[0].max_tokens, 8192);
+        assert_eq!(
+            hub.bound_lockdown_run(&session_id, &run_id)
+                .expect("frozen authority"),
+            Some((
+                "fake".into(),
+                crate::auto_hermetic::ProviderLockdownPolicy::Full
+            ))
+        );
+        manager.shutdown().await.expect("manager shutdown");
+        hub.shutdown().await.expect("hub shutdown");
+        store.close().await.expect("store close");
+    }
 }

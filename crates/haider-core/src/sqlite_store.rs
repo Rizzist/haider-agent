@@ -693,6 +693,42 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn child_create_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+    ) -> Result<Option<(String, SessionMetadataV1)>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.child_create_admission(&command_id, &session_id))
+        })
+        .await
+    }
+
+    pub async fn child_turn_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+    ) -> Result<Option<String>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.child_turn_admission(&command_id, &session_id))
+        })
+        .await
+    }
+
+    pub async fn session_output_pair_at(
+        &self,
+        session_id: SessionId,
+        through_seq: u64,
+    ) -> Result<Option<haider_store::SessionOutputPairSnapshot>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.session_output_pair_at(&session_id, through_seq))
+        })
+        .await
+    }
+
     /// Atomically creates session metadata, `Created`, and its command receipt.
     pub async fn create_session(
         &self,

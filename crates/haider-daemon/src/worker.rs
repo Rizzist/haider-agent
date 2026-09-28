@@ -484,7 +484,9 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
-        match self.store.hub().select_session_model(command).await {
+        let hub = self.store.hub();
+        let _selection = hub.lock_workflow_selection(self.store.session_id()).await;
+        match hub.select_session_model(command).await {
             Ok(
                 SessionSelectModelOutcome::Committed { .. }
                 | SessionSelectModelOutcome::IdempotentReplay { .. },

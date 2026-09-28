@@ -12120,6 +12120,12 @@ impl HubConnection {
             Err(error) => return Err(error),
         }
 
+        // All pair and output-budget writers use the same session order.
+        // The inherited budget is computed from metadata below, so hold the
+        // lock through the receipt/fact/metadata commit. Receipt replay above
+        // remains unfenced across generation and registry changes.
+        let _selection = self.hub.lock_workflow_selection(&session_id).await;
+
         let Some(current) = (match self.hub.session_metadata(&session_id).await {
             Ok(metadata) => metadata,
             Err(error) => return self.respond_turn_error(request_id, error),
@@ -12192,6 +12198,10 @@ impl HubConnection {
             },
             None => reapply_session_output_budget(&current, &validated),
         };
+        #[cfg(test)]
+        self.hub
+            .pause_model_selection_after_budget(&session_id)
+            .await;
         if matches!(
             validated.inventory_status,
             haider_rpc::ModelInventoryStatusWire::Unlisted
