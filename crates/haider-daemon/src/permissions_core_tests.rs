@@ -1683,15 +1683,15 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // six bytes when the optional spawn_subagent.request_budget description
     // changed from 154 to 148 bytes; only its description is in this pin.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_640;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_634;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_591;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_585;
     #[cfg(target_os = "windows")]
     // `tool_script` nests the platform-specific `process_exec` schema, so
     // Windows carries the historical 3-byte command-description delta twice.
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_587;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_581;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_585;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_579;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

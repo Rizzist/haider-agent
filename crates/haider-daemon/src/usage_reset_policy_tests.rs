@@ -46,6 +46,7 @@ fn metadata(cwd: &str, read_only: bool) -> SessionMetadataV1 {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
         permission_overrides: Some(SessionPermissionOverridesV1 {
             read_only,
@@ -121,6 +122,7 @@ async fn run_case(case: Case) -> Outcome {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: metadata(&cwd, read_only).permission_overrides,
         effort: None,
         fast: false,

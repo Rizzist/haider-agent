@@ -5829,7 +5829,11 @@ impl LiveDriver {
                             model.composer.clear();
                         }
                         haider_rpc::SurfaceInjectOp::Submit => {
-                            if model.visible_spend_card().is_some() {
+                            if model.visible_spend_card().is_some()
+                                || model.theme_picker.is_some()
+                                || model.effort_picker.is_some()
+                                || model.model_picker.is_some()
+                            {
                                 return Vec::new();
                             }
                             // Exactly the Enter path — mid-turn queue modes,

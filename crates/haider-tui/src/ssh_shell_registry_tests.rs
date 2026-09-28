@@ -147,37 +147,37 @@ fn ssh_profile_overlay_opens_add_edit_test_remove_and_shell_flows() {
     model.apply_ssh_list(vec![profile("prod")]);
     model.ssh_open = true;
 
-    model.handle_key(key(KeyCode::Char('a')), std::time::Instant::now());
+    model.handle_key(key(KeyCode::Char('a')), std::time::Instant::now(), None);
     let add = model.ssh_form.as_ref().expect("add form");
     assert!(add.original.is_none());
     assert_eq!(add.auth, SshFormAuthKind::KeyFile);
 
     model.ssh_form = None;
-    model.handle_key(key(KeyCode::Char('e')), std::time::Instant::now());
+    model.handle_key(key(KeyCode::Char('e')), std::time::Instant::now(), None);
     let edit = model.ssh_form.as_ref().expect("edit form");
     assert_eq!(edit.original.as_deref(), Some("prod"));
     assert_eq!(edit.auth, SshFormAuthKind::Keep);
 
     model.ssh_form = None;
     model.requests.clear();
-    model.handle_key(key(KeyCode::Char('t')), std::time::Instant::now());
+    model.handle_key(key(KeyCode::Char('t')), std::time::Instant::now(), None);
     assert!(matches!(
         model.requests.as_slice(),
         [AppRequest::SshTest { profile }] if profile == "prod"
     ));
 
     model.requests.clear();
-    model.handle_key(key(KeyCode::Char('d')), std::time::Instant::now());
+    model.handle_key(key(KeyCode::Char('d')), std::time::Instant::now(), None);
     assert_eq!(model.ssh_remove_armed.as_deref(), Some("prod"));
     assert!(model.requests.is_empty());
-    model.handle_key(key(KeyCode::Char('d')), std::time::Instant::now());
+    model.handle_key(key(KeyCode::Char('d')), std::time::Instant::now(), None);
     assert!(matches!(
         model.requests.as_slice(),
         [AppRequest::SshRemove { profile }] if profile == "prod"
     ));
 
     model.requests.clear();
-    model.handle_key(key(KeyCode::Enter), std::time::Instant::now());
+    model.handle_key(key(KeyCode::Enter), std::time::Instant::now(), None);
     assert!(matches!(
         model.requests.as_slice(),
         [AppRequest::SshShellOpen { profile, .. }] if profile == "prod"
@@ -205,6 +205,7 @@ fn ssh_form_masks_and_redacts_password_before_staging() {
     model.handle_key(
         KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
         std::time::Instant::now(),
+        None,
     );
     assert!(matches!(
         model.requests.last(),
@@ -230,7 +231,7 @@ fn ssh_form_allows_plain_s_in_cwd_without_submitting() {
     form.focus = 7;
     model.ssh_form = Some(form);
 
-    model.handle_key(key(KeyCode::Char('s')), std::time::Instant::now());
+    model.handle_key(key(KeyCode::Char('s')), std::time::Instant::now(), None);
 
     assert_eq!(model.ssh_form.as_ref().expect("cwd form").cwd, "s");
     assert!(model.requests.is_empty());
@@ -258,7 +259,7 @@ fn ssh_terminal_input_is_redacted_and_ctrl_d_is_typed_eof() {
     terminal.shell_id = Some("shell-pty".into());
     model.ssh_terminal = Some(terminal);
 
-    model.handle_key(key(KeyCode::Char('x')), std::time::Instant::now());
+    model.handle_key(key(KeyCode::Char('x')), std::time::Instant::now(), None);
     assert!(matches!(
         model.requests.last(),
         Some(AppRequest::SshShellInput { id, input })
@@ -269,6 +270,7 @@ fn ssh_terminal_input_is_redacted_and_ctrl_d_is_typed_eof() {
     model.handle_key(
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
         std::time::Instant::now(),
+        None,
     );
     assert!(matches!(
         model.requests.last(),

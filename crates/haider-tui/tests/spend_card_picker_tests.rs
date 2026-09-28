@@ -86,7 +86,9 @@ fn reset_card() -> Menu {
 fn painted(model: &AppModel) -> String {
     let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
     terminal
-        .draw(|frame| haider_tui::render::render(model, frame))
+        .draw(|frame| {
+            haider_tui::render::render(model, frame);
+        })
         .expect("draw");
     let buffer = terminal.backend().buffer();
     (0..buffer.area.height)
@@ -133,7 +135,7 @@ fn seeded_session() -> AppModel {
     model
 }
 
-fn chip_with_card(model: &mut AppModel) {
+fn chip_with_menu(model: &mut AppModel, menu: Menu) {
     // The parent session may have its own ordinary question while the chip
     // view is active. Only the viewed chip's menu participates in ownership.
     let mut parent_question = reset_card();
@@ -163,8 +165,7 @@ fn chip_with_card(model: &mut AppModel) {
         options: vec!["Deny".into(), "Apply one reset".into()],
         resolved: false,
     });
-    chip.transcript
-        .apply(&EventPayload::MenuOpened(reset_card()));
+    chip.transcript.apply(&EventPayload::MenuOpened(menu));
     model.chips.push(chip);
     model.screen = Screen::Subagent;
     model.view_path = vec!["agent-reset".into()];
@@ -174,6 +175,10 @@ fn chip_with_card(model: &mut AppModel) {
             .and_then(ChipModel::question_menu)
             .is_some()
     );
+}
+
+fn chip_with_card(model: &mut AppModel) {
+    chip_with_menu(model, reset_card());
 }
 
 fn open_picker_then_card(picker: Picker, chip: bool) -> AppModel {
@@ -238,6 +243,10 @@ fn assert_picker_owns_each_gesture(picker: Picker, chip: bool) {
         model.outbox.is_empty(),
         "injected Submit answered hidden card"
     );
+    assert!(
+        picker.is_open(&model),
+        "injected Submit must leave picker open"
+    );
 }
 
 #[test]
@@ -284,6 +293,31 @@ fn blocking_question_still_outranks_a_local_picker() {
     let frame = painted(&model);
     assert!(frame.contains("Deny"), "question stays painted:\n{frame}");
     assert!(!frame.contains("○ light"), "picker waits below question");
+    model.handle(key(KeyCode::Down));
+    assert!(model.theme_picker.is_none());
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.outbox[0].answer.option_key.as_deref(), Some("second"));
+}
+
+#[test]
+fn blocking_chip_question_still_outranks_a_local_picker() {
+    let mut model = seeded_session();
+    run_slash(&mut model, "/theme");
+    let mut question = reset_card();
+    question.kind = MenuKind::Question;
+    question.blocking = true;
+    question.options[1].key = "second".into();
+    chip_with_menu(&mut model, question);
+    model.outbox.clear();
+    let frame = painted(&model);
+    assert!(
+        frame.contains("Deny"),
+        "chip question stays painted:\n{frame}"
+    );
+    assert!(
+        !frame.contains("○ light"),
+        "picker waits below chip question"
+    );
     model.handle(key(KeyCode::Down));
     assert!(model.theme_picker.is_none());
     model.handle(key(KeyCode::Enter));
