@@ -37,7 +37,7 @@ impl haider_daemon::ProviderModelDiscoverer for SyntheticCatalog {
             self.release.notified().await;
         }
         match access {
-   Some(v) if v == "synthetic-A" || v.ends_with(".synthetic-A") => Ok(haider_provider::DiscoveredCatalog { models: vec![serde_json::from_value(serde_json::json!({"slug":if delayed {"astra-import-A-late"} else {"astra-import-A-only"},"display_name":"Synthetic A only","supported_efforts":[],"visible":true,"use_responses_lite":true})).unwrap()],etag:Some("A".into()) }),
+   Some(v) if v == "synthetic-A" || v.ends_with(".synthetic-A") => Ok(haider_provider::DiscoveredCatalog { models: vec![serde_json::from_value(serde_json::json!({"slug":if delayed {"astra-import-A-late"} else {"astra-import-A-only"},"display_name":"Synthetic A only","supported_efforts":[],"visible":true,"use_responses_lite":true})).expect("synthetic catalog boundary fixture")],etag:Some("A".into()) }),
    Some(v) if v == "synthetic-B" || v.ends_with(".synthetic-B") => Err(haider_provider::CatalogError::Unavailable { reason:"provider does not serve a model list to this credential (403)".into() }),
    other => panic!("unexpected synthetic fixture token: {other:?}"),
   }
@@ -54,15 +54,15 @@ async fn req(c: &mut UdsClient, id: &str, body: RequestBody) -> ResponseBody {
     .await;
     tokio::time::timeout(support::DEADLINE, async {
         loop {
-            if let WireFrame::Response { request_id, body } = c.receive().await {
-                if request_id.as_str() == id {
-                    return body;
-                }
+            if let WireFrame::Response { request_id, body } = c.receive().await
+                && request_id.as_str() == id
+            {
+                return body;
             }
         }
     })
     .await
-    .unwrap()
+    .expect("synthetic catalog boundary fixture")
 }
 async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_token: bool) {
     if std::env::var_os("HAIDER_CATALOG_BOUNDARY_CHILD").is_none() {
@@ -71,7 +71,8 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
         let fixture = test_root("catalog-import-env-");
         let fixture_path = fixture.path().join("import-source.json");
         let device_path = fixture.path().join("device_id");
-        private_write(&device_path, b"11111111-1111-4111-8111-111111111111").unwrap();
+        private_write(&device_path, b"11111111-1111-4111-8111-111111111111")
+            .expect("synthetic catalog boundary fixture");
         let name = match source {
             "kimi-code" => "kimi_import_must_not_reuse_prior_account_catalog",
             "grok-cli" => "grok_import_must_not_reuse_prior_account_catalog",
@@ -81,15 +82,17 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
             "codex" => "identityless_codex_import_must_not_reuse_prior_account_catalog",
             _ => panic!("unexpected import source"),
         };
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg(name)
-            .arg("--nocapture")
-            .env("HAIDER_CATALOG_BOUNDARY_CHILD", "1")
-            .env(path_var, &fixture_path)
-            .env("HAIDER_KIMI_DEVICE_ID_PATH", &device_path)
-            .output()
-            .unwrap();
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("synthetic catalog boundary fixture"),
+        )
+        .arg("--exact")
+        .arg(name)
+        .arg("--nocapture")
+        .env("HAIDER_CATALOG_BOUNDARY_CHILD", "1")
+        .env(path_var, &fixture_path)
+        .env("HAIDER_KIMI_DEVICE_ID_PATH", &device_path)
+        .output()
+        .expect("synthetic catalog boundary fixture");
         assert!(
             output.status.success(),
             "{provider} child failed: {} {}",
@@ -100,7 +103,9 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
     }
     let root = test_root("hastra-import-");
     let config = DaemonConfig::new("astra-synthetic", root.path().join("store"), root.path());
-    let fixture_path = std::path::PathBuf::from(std::env::var(path_var).unwrap());
+    let fixture_path = std::path::PathBuf::from(
+        std::env::var(path_var).expect("synthetic catalog boundary fixture"),
+    );
     let write = |who: &str| {
         let mut v =
             serde_json::json!({"access_token":format!("synthetic-{who}"),"expires_in":3600});
@@ -115,7 +120,7 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
                 v["tokens"]["id_token"] = serde_json::json!("malformed");
             }
         }
-        private_write(&fixture_path, v.to_string()).unwrap();
+        private_write(&fixture_path, v.to_string()).expect("synthetic catalog boundary fixture");
     };
     let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let arrived = Arc::new(tokio::sync::Notify::new());
@@ -181,7 +186,7 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
     .await;
     tokio::time::timeout(support::DEADLINE, arrived.notified())
         .await
-        .unwrap();
+        .expect("synthetic catalog boundary fixture");
     write("B");
     let b = req(
         &mut c,
@@ -213,21 +218,21 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
     let immediately = providers
         .iter()
         .find(|p| p.provider == provider)
-        .unwrap()
+        .expect("synthetic catalog boundary fixture")
         .models
         .clone();
     release.notify_one();
     let late_reply = tokio::time::timeout(support::DEADLINE, async {
         loop {
-            if let WireFrame::Response { request_id, body } = c.receive().await {
-                if request_id.as_str() == "late-A" {
-                    break body;
-                }
+            if let WireFrame::Response { request_id, body } = c.receive().await
+                && request_id.as_str() == "late-A"
+            {
+                break body;
             }
         }
     })
     .await
-    .unwrap();
+    .expect("synthetic catalog boundary fixture");
     let late_list = req(
         &mut c,
         "list-late",
@@ -242,7 +247,7 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
     let after_late = providers
         .iter()
         .find(|p| p.provider == provider)
-        .unwrap()
+        .expect("synthetic catalog boundary fixture")
         .models
         .clone();
     let refreshed = req(
@@ -267,7 +272,7 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
     let after = providers
         .iter()
         .find(|p| p.provider == provider)
-        .unwrap()
+        .expect("synthetic catalog boundary fixture")
         .models
         .clone();
     let ka = haider_store::ProviderModelCacheKey::for_account(provider, &a);
@@ -299,7 +304,7 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
     let after_restart = providers
         .iter()
         .find(|p| p.provider == provider)
-        .unwrap()
+        .expect("synthetic catalog boundary fixture")
         .models
         .clone();
     println!(
@@ -334,7 +339,7 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
     let after_second_restart = providers
         .iter()
         .find(|p| p.provider == provider)
-        .unwrap()
+        .expect("synthetic catalog boundary fixture")
         .models
         .clone();
     drop(c);
@@ -398,8 +403,9 @@ async fn recovery_case(remove: bool) {
     .await;
     for who in ["A", "B"] {
         let source = root.path().join(who);
-        std::fs::create_dir_all(source.join("credentials")).unwrap();
-        private_write(source.join("credentials/kimi-code.json"),serde_json::json!({"access_token":format!("synthetic-{who}"),"expires_at":4_102_444_800_u64,"scope":"kimi-code","token_type":"Bearer"}).to_string()).unwrap();
+        std::fs::create_dir_all(source.join("credentials"))
+            .expect("synthetic catalog boundary fixture");
+        private_write(source.join("credentials/kimi-code.json"),serde_json::json!({"access_token":format!("synthetic-{who}"),"expires_at":4_102_444_800_u64,"scope":"kimi-code","token_type":"Bearer"}).to_string()).expect("synthetic catalog boundary fixture");
         let r = req(
             &mut c,
             &format!("add-{who}"),
@@ -421,16 +427,19 @@ async fn recovery_case(remove: bool) {
         .request("stage durable recovery fixture");
     let _ = task.join().await;
     let descriptors: Vec<haider_protocol::credential::CredentialDescriptor> =
-        serde_json::from_slice(&std::fs::read(config.store_dir.join("accounts.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(
+            &std::fs::read(config.store_dir.join("accounts.json"))
+                .expect("synthetic catalog boundary fixture"),
+        )
+        .expect("synthetic catalog boundary fixture");
     let a = descriptors
         .iter()
         .find(|d| d.provider == "kimi-oauth" && d.active)
-        .unwrap();
+        .expect("synthetic catalog boundary fixture");
     let b = descriptors
         .iter()
         .find(|d| d.provider == "kimi-oauth" && !d.active)
-        .unwrap();
+        .expect("synthetic catalog boundary fixture");
     let ka = haider_store::ProviderModelCacheKey::for_account("kimi-oauth", a);
     let kb = haider_store::ProviderModelCacheKey::for_account("kimi-oauth", b);
     assert_ne!(
@@ -438,8 +447,9 @@ async fn recovery_case(remove: bool) {
         "different aliases/accounts are positive control for key separation"
     );
     {
-        let store = haider_store::Store::open(&config.store_dir).unwrap();
-        store.put_provider_models(ka.as_str(),&serde_json::json!([{"slug":"astra-recovery-A-only","display_name":"A only","supported_efforts":[],"visible":true}]).to_string(),Some("A"),1).unwrap();
+        let store = haider_store::Store::open(&config.store_dir)
+            .expect("synthetic catalog boundary fixture");
+        store.put_provider_models(ka.as_str(),&serde_json::json!([{"slug":"astra-recovery-A-only","display_name":"A only","supported_efforts":[],"visible":true}]).to_string(),Some("A"),1).expect("synthetic catalog boundary fixture");
         if remove {
             let request =
                 serde_json::json!({"alias":a.alias.as_str(),"expected_revision":null}).to_string();
@@ -456,7 +466,7 @@ async fn recovery_case(remove: bool) {
                     "kimi-oauth",
                     true,
                 )
-                .unwrap();
+                .expect("synthetic catalog boundary fixture");
         } else {
             let request = serde_json::json!({"alias":b.alias.as_str()}).to_string();
             let recovery =
@@ -471,7 +481,7 @@ async fn recovery_case(remove: bool) {
                     Some(&recovery),
                     None,
                 )
-                .unwrap();
+                .expect("synthetic catalog boundary fixture");
         }
     }
     let task = ready_with_dependencies(&config, deps()).await;
@@ -497,16 +507,18 @@ async fn recovery_case(remove: bool) {
     let rows = providers
         .iter()
         .find(|p| p.provider == "kimi-oauth")
-        .unwrap()
+        .expect("synthetic catalog boundary fixture")
         .models
         .clone();
-    let recovered: Vec<haider_protocol::credential::CredentialDescriptor> =
-        serde_json::from_slice(&std::fs::read(config.store_dir.join("accounts.json")).unwrap())
-            .unwrap();
+    let recovered: Vec<haider_protocol::credential::CredentialDescriptor> = serde_json::from_slice(
+        &std::fs::read(config.store_dir.join("accounts.json"))
+            .expect("synthetic catalog boundary fixture"),
+    )
+    .expect("synthetic catalog boundary fixture");
     let active = recovered
         .iter()
         .find(|d| d.provider == "kimi-oauth" && d.active)
-        .unwrap();
+        .expect("synthetic catalog boundary fixture");
     println!(
         "ASTRA_RECOVERY_PROBE {}",
         serde_json::json!({"pending_operation":if remove {"remove_A"} else {"select_B"},"alias_A":a.alias,"alias_B":b.alias,"active_after_recovery":active.alias,"key_A":ka.as_str(),"key_B":kb.as_str(),"models_after_recovery":rows})
@@ -552,7 +564,7 @@ impl haider_daemon::ProviderModelDiscoverer for SyntheticApiBoundary {
             Some("synthetic-api-B") => &["astra-api-B-only", "astra-api-B-private-extra"],
             _ => panic!("unexpected synthetic API fixture"),
         };
-        Ok(haider_provider::DiscoveredCatalog {models:slugs.iter().map(|slug| serde_json::from_value(serde_json::json!({"slug":slug,"display_name":slug,"supported_efforts":[],"visible":true})).unwrap()).collect(),etag:None})
+        Ok(haider_provider::DiscoveredCatalog {models:slugs.iter().map(|slug| serde_json::from_value(serde_json::json!({"slug":slug,"display_name":slug,"supported_efforts":[],"visible":true})).expect("synthetic catalog boundary fixture")).collect(),etag:None})
     }
 }
 #[async_trait::async_trait]
@@ -725,19 +737,26 @@ async fn staged_api_case(provider: &str) {
         .request("astra API provenance probe done");
     let _ = task.join().await;
     let descriptors: Vec<haider_protocol::credential::CredentialDescriptor> =
-        serde_json::from_slice(&std::fs::read(config.store_dir.join("accounts.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(
+            &std::fs::read(config.store_dir.join("accounts.json"))
+                .expect("synthetic catalog boundary fixture"),
+        )
+        .expect("synthetic catalog boundary fixture");
     let active = descriptors
         .iter()
         .find(|d| d.provider == provider && d.active)
-        .unwrap();
+        .expect("synthetic catalog boundary fixture");
     assert_eq!(active.alias, a.alias);
     let key = haider_store::ProviderModelCacheKey::for_account(provider, active);
-    let store = haider_store::Store::open(&config.store_dir).unwrap();
-    let cached = store.provider_models(key.as_str()).unwrap().unwrap();
+    let store =
+        haider_store::Store::open(&config.store_dir).expect("synthetic catalog boundary fixture");
+    let cached = store
+        .provider_models(key.as_str())
+        .expect("synthetic catalog boundary fixture")
+        .expect("synthetic catalog boundary fixture");
     println!(
         "ASTRA_API_PROBE {}",
-        serde_json::json!({"provider":provider,"active_alias":active.alias,"active_account_key":key.as_str(),"models_after_staged_B":rows,"configured_request_models":["astra-api-B-only"],"active_A_cache_rows":serde_json::from_str::<serde_json::Value>(&cached.models_json).unwrap()})
+        serde_json::json!({"provider":provider,"active_alias":active.alias,"active_account_key":key.as_str(),"models_after_staged_B":rows,"configured_request_models":["astra-api-B-only"],"active_A_cache_rows":serde_json::from_str::<serde_json::Value>(&cached.models_json).expect("synthetic catalog boundary fixture")})
     );
     assert!(
         !rows.contains(&"astra-api-B-private-extra".into())
@@ -768,12 +787,15 @@ fn active_boundary_descriptor(
     provider: &str,
 ) -> haider_protocol::credential::CredentialDescriptor {
     let descriptors: Vec<haider_protocol::credential::CredentialDescriptor> =
-        serde_json::from_slice(&std::fs::read(config.store_dir.join("accounts.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(
+            &std::fs::read(config.store_dir.join("accounts.json"))
+                .expect("synthetic catalog boundary fixture"),
+        )
+        .expect("synthetic catalog boundary fixture");
     descriptors
         .into_iter()
         .find(|row| row.provider == provider && row.active)
-        .unwrap()
+        .expect("synthetic catalog boundary fixture")
 }
 
 async fn reconfigure_boundary(
@@ -923,8 +945,14 @@ async fn configuration_boundary_case(repoint: bool) {
     task.shutdown_handle()
         .request("configuration boundary test restart");
     let _ = task.join().await;
-    let store = haider_store::Store::open(&config.store_dir).unwrap();
-    assert!(store.provider_models(old_key.as_str()).unwrap().is_none());
+    let store =
+        haider_store::Store::open(&config.store_dir).expect("synthetic catalog boundary fixture");
+    assert!(
+        store
+            .provider_models(old_key.as_str())
+            .expect("synthetic catalog boundary fixture")
+            .is_none()
+    );
     drop(store);
     let task = ready_with_dependencies(&config, deps()).await;
     let mut c = UdsClient::connect_control(
@@ -986,7 +1014,7 @@ impl haider_daemon::ProviderModelDiscoverer for SourceRaceCatalog {
             }
             _ => panic!("unexpected synthetic source race token"),
         };
-        Ok(haider_provider::DiscoveredCatalog {models:vec![serde_json::from_value(serde_json::json!({"slug":slug,"display_name":slug,"supported_efforts":[],"visible":true,"use_responses_lite":true})).unwrap()],etag:None})
+        Ok(haider_provider::DiscoveredCatalog {models:vec![serde_json::from_value(serde_json::json!({"slug":slug,"display_name":slug,"supported_efforts":[],"visible":true,"use_responses_lite":true})).expect("synthetic catalog boundary fixture")],etag:None})
     }
 }
 #[tokio::test]
@@ -994,23 +1022,27 @@ async fn read_through_credential_must_match_catalog_identity_snapshot() {
     let root = test_root("hastra-source-race-");
     let config = DaemonConfig::new("astra-race", root.path().join("store"), root.path());
     let source = root.path().join("source");
-    std::fs::create_dir_all(source.join("credentials")).unwrap();
+    std::fs::create_dir_all(source.join("credentials"))
+        .expect("synthetic catalog boundary fixture");
     let file = source.join("credentials/kimi-code.json");
     let write = |who: &str, modified: Option<std::time::SystemTime>| {
         let staged = file.with_extension("next");
-        private_write(&staged,serde_json::json!({"access_token":format!("synthetic-{who}"),"expires_at":4_102_444_800_u64,"scope":"kimi-code","token_type":"Bearer"}).to_string()).unwrap();
+        private_write(&staged,serde_json::json!({"access_token":format!("synthetic-{who}"),"expires_at":4_102_444_800_u64,"scope":"kimi-code","token_type":"Bearer"}).to_string()).expect("synthetic catalog boundary fixture");
         if let Some(t) = modified {
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(&staged)
-                .unwrap()
+                .expect("synthetic catalog boundary fixture")
                 .set_times(std::fs::FileTimes::new().set_modified(t))
-                .unwrap();
+                .expect("synthetic catalog boundary fixture");
         }
-        std::fs::rename(staged, &file).unwrap();
+        std::fs::rename(staged, &file).expect("synthetic catalog boundary fixture");
     };
     write("A", None);
-    let a_time = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let a_time = std::fs::metadata(&file)
+        .expect("synthetic catalog boundary fixture")
+        .modified()
+        .expect("synthetic catalog boundary fixture");
     let arrived = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let deps = || DaemonDependencies {
@@ -1048,12 +1080,14 @@ async fn read_through_credential_must_match_catalog_identity_snapshot() {
         "source add: {r:?}"
     );
     let read_descriptor = || -> haider_protocol::credential::CredentialDescriptor {
-        let ds: Vec<haider_protocol::credential::CredentialDescriptor> =
-            serde_json::from_slice(&std::fs::read(config.store_dir.join("accounts.json")).unwrap())
-                .unwrap();
+        let ds: Vec<haider_protocol::credential::CredentialDescriptor> = serde_json::from_slice(
+            &std::fs::read(config.store_dir.join("accounts.json"))
+                .expect("synthetic catalog boundary fixture"),
+        )
+        .expect("synthetic catalog boundary fixture");
         ds.into_iter()
             .find(|d| d.provider == "kimi-oauth" && d.active)
-            .unwrap()
+            .expect("synthetic catalog boundary fixture")
     };
     let a = read_descriptor();
     let key_a = haider_store::ProviderModelCacheKey::for_account("kimi-oauth", &a);
@@ -1092,15 +1126,15 @@ async fn read_through_credential_must_match_catalog_identity_snapshot() {
     release.notify_one();
     let reply = tokio::time::timeout(support::DEADLINE, async {
         loop {
-            if let WireFrame::Response { request_id, body } = c.receive().await {
-                if request_id.as_str() == "race-fetch-B" {
-                    break body;
-                }
+            if let WireFrame::Response { request_id, body } = c.receive().await
+                && request_id.as_str() == "race-fetch-B"
+            {
+                break body;
             }
         }
     })
     .await
-    .unwrap();
+    .expect("synthetic catalog boundary fixture");
     let after = read_descriptor();
     let key_after = haider_store::ProviderModelCacheKey::for_account("kimi-oauth", &after);
     let r = req(
