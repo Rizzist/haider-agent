@@ -60,6 +60,18 @@ const BADGE_MARGIN: f64 = 10.0;
 const BADGE_AVOID_MARGIN: f64 = 28.0;
 const CONCEAL_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
 static DISPLAY_TICKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "native-macos-presence-gate")]
+static BLOCK_GATE_TICKS: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "native-macos-presence-gate")]
+#[path = "overlay_macos_native_gate.rs"]
+mod native_gate;
+
+#[cfg(feature = "native-macos-presence-gate")]
+#[allow(dead_code)] // The harness=false integration executable calls this entry.
+pub(super) fn run_native_gate() {
+    native_gate::run();
+}
 
 /// A real display-link callback, rather than a wall-clock delay, marks the
 /// compositor refresh after the window server reports every panel absent.
@@ -71,6 +83,10 @@ unsafe extern "C-unwind" fn display_tick(
     _: NonNull<CVOptionFlags>,
     _: *mut std::ffi::c_void,
 ) -> i32 {
+    #[cfg(feature = "native-macos-presence-gate")]
+    if BLOCK_GATE_TICKS.load(Ordering::Acquire) {
+        return kCVReturnSuccess;
+    }
     DISPLAY_TICKS.fetch_add(1, Ordering::Release);
     kCVReturnSuccess
 }
@@ -105,6 +121,14 @@ fn panels_absent(numbers: &[u32; 3]) -> Result<bool, String> {
 
 #[allow(deprecated)] // CVDisplayLink supplies the actual display refresh boundary.
 fn verify_panels_absent(numbers: &[u32; 3]) -> Result<(), String> {
+    verify_panels_absent_after_first_list(numbers, || {})
+}
+
+#[allow(deprecated)] // CVDisplayLink supplies the actual display refresh boundary.
+fn verify_panels_absent_after_first_list(
+    numbers: &[u32; 3],
+    after_first_absence: impl FnOnce(),
+) -> Result<(), String> {
     let deadline = Instant::now() + CONCEAL_VERIFY_TIMEOUT;
     let mut raw_link = std::ptr::null_mut();
     // SAFETY: raw_link is writable and remains live for this call.
@@ -125,8 +149,12 @@ fn verify_panels_absent(numbers: &[u32; 3]) -> Result<(), String> {
         return Err("could not start a display refresh link".into());
     }
     let result = (|| {
+        let mut after_first_absence = Some(after_first_absence);
         while Instant::now() < deadline {
             if panels_absent(numbers)? {
+                if let Some(hook) = after_first_absence.take() {
+                    hook();
+                }
                 let first = DISPLAY_TICKS.load(Ordering::Acquire);
                 // Require a full subsequent refresh, then check again so a
                 // panel ordered front in the meantime cannot be acknowledged.
@@ -513,38 +541,7 @@ impl Overlay {
             // that are sharing-none are already absent from captures.
             PresenceCommand::Conceal { seq, .. } => {
                 if evidence_capturable() {
-                    let event = conceal_after_hide(
-                        seq,
-                        self,
-                        |renderer| {
-                            renderer.visibility.conceal();
-                            NSAnimationContext::beginGrouping();
-                            NSAnimationContext::currentContext().setDuration(0.0);
-                            CATransaction::begin();
-                            CATransaction::setDisableActions(true);
-                            renderer.pointer.orderOut(None);
-                            renderer.ring.orderOut(None);
-                            renderer.badge.orderOut(None);
-                            CATransaction::commit();
-                            NSAnimationContext::endGrouping();
-                            CATransaction::flush();
-                        },
-                        |renderer| {
-                            let numbers = [
-                                renderer.pointer.windowNumber(),
-                                renderer.ring.windowNumber(),
-                                renderer.badge.windowNumber(),
-                            ];
-                            let numbers = numbers.map(u32::try_from);
-                            numbers
-                                .into_iter()
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(|_| "invalid presence panel window number".to_owned())
-                                .and_then(|numbers| {
-                                    verify_panels_absent(&[numbers[0], numbers[1], numbers[2]])
-                                })
-                        },
-                    );
+                    let event = self.conceal_capturable(seq, |_| {});
                     emit(&event);
                 } else {
                     emit(&PresenceEvent::Ack { seq });
@@ -559,6 +556,46 @@ impl Overlay {
                 }
             }
         }
+    }
+
+    /// The hook lets the native gate keep a panel on screen after the real
+    /// orderOut. Production supplies an empty hook.
+    fn conceal_capturable(
+        &mut self,
+        seq: u64,
+        after_order_out: impl FnOnce(&mut Self),
+    ) -> PresenceEvent {
+        conceal_after_hide(
+            seq,
+            self,
+            |renderer| {
+                renderer.visibility.conceal();
+                NSAnimationContext::beginGrouping();
+                NSAnimationContext::currentContext().setDuration(0.0);
+                CATransaction::begin();
+                CATransaction::setDisableActions(true);
+                renderer.pointer.orderOut(None);
+                renderer.ring.orderOut(None);
+                renderer.badge.orderOut(None);
+                CATransaction::commit();
+                NSAnimationContext::endGrouping();
+                CATransaction::flush();
+                after_order_out(renderer);
+            },
+            |renderer| {
+                let numbers = [
+                    renderer.pointer.windowNumber(),
+                    renderer.ring.windowNumber(),
+                    renderer.badge.windowNumber(),
+                ];
+                let numbers = numbers.map(u32::try_from);
+                numbers
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "invalid presence panel window number".to_owned())
+                    .and_then(|numbers| verify_panels_absent(&[numbers[0], numbers[1], numbers[2]]))
+            },
+        )
     }
 
     fn pointer_to(&mut self, seq: u64, mark: PresenceMark, point: Option<PresencePoint>) {

@@ -14,6 +14,13 @@ bench = false
 
 [features]
 android-standalone = []
+native-macos-presence-gate = []
+
+[[test]]
+name = "overlay_macos_native_gate"
+path = "tests/overlay_macos_native_gate.rs"
+harness = false
+required-features = ["native-macos-presence-gate"]
 
 [dependencies]
 async-trait.workspace = true

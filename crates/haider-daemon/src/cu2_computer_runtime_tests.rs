@@ -2350,6 +2350,295 @@ impl crate::cu_presence::PresenceRenderer for CapturableOverlay {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ConcealReply {
+    Ack,
+    Failed,
+    Silent,
+    HelperDies,
+    SendFails,
+}
+
+struct RefusingOverlay {
+    log: OrderLog,
+    sink: crate::cu_presence::EventSink,
+    reply: ConcealReply,
+}
+
+impl crate::cu_presence::PresenceRenderer for RefusingOverlay {
+    fn send(&mut self, command: &haider_tools::presence::PresenceCommand) -> bool {
+        use haider_tools::presence::{PresenceCommand, PresenceEvent};
+        match command {
+            PresenceCommand::Conceal { seq, .. } => {
+                self.log.lock().expect("log").push("conceal".into());
+                match self.reply {
+                    ConcealReply::Ack | ConcealReply::Failed => {
+                        let sink = Arc::clone(&self.sink);
+                        let event = if matches!(self.reply, ConcealReply::Ack) {
+                            PresenceEvent::Ack { seq: *seq }
+                        } else {
+                            PresenceEvent::ConcealFailed {
+                                seq: *seq,
+                                message: "window remained visible".into(),
+                            }
+                        };
+                        tokio::spawn(async move { sink(event) });
+                    }
+                    ConcealReply::Silent => {}
+                    ConcealReply::HelperDies => {
+                        #[cfg(unix)]
+                        {
+                            use std::io::Write as _;
+                            use std::process::{Command, Stdio};
+                            let mut child = Command::new("/bin/sh")
+                                .args(["-c", "read line; exit 0"])
+                                .stdin(Stdio::piped())
+                                .spawn()
+                                .expect("spawn disposable helper");
+                            writeln!(child.stdin.take().expect("helper stdin"), "conceal")
+                                .expect("send conceal to helper");
+                            assert!(child.wait().expect("reap helper").success());
+                            self.log.lock().expect("log").push("helper:exited".into());
+                        }
+                    }
+                    ConcealReply::SendFails => return false,
+                }
+            }
+            PresenceCommand::Reveal { .. } => {
+                self.log.lock().expect("log").push("reveal".into());
+                if matches!(self.reply, ConcealReply::HelperDies) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn capturable(&self) -> bool {
+        true
+    }
+
+    fn close(&mut self) {
+        self.log.lock().expect("log").push("renderer:closed".into());
+    }
+}
+
+async fn dispatcher_conceal_result(action: &str, reply: ConcealReply) {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let call_id = format!("conceal-{action}-{reply:?}");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: call_id.clone(),
+            name: "computer".into(),
+            args: if action == "screenshot" {
+                serde_json::json!({"action": "screenshot"})
+            } else {
+                serde_json::json!({"action": "inspect", "x": 3, "y": 4})
+            },
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: call_id.clone(),
+        },
+        FakeStep::EmitText {
+            text: "done".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let log: OrderLog = Arc::new(Mutex::new(Vec::new()));
+    let backend = Arc::new(LoggingBackend {
+        log: Arc::clone(&log),
+    });
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    presence.register_renderer(
+        haider_tools::presence::PresenceSurface::Screen,
+        Arc::new({
+            let log = Arc::clone(&log);
+            move |sink| {
+                Some(Box::new(RefusingOverlay {
+                    log: Arc::clone(&log),
+                    sink,
+                    reply,
+                })
+                    as Box<dyn crate::cu_presence::PresenceRenderer>)
+            }
+        }),
+    );
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new(format!("{call_id}-session"));
+    let run_id = RunId::new(format!("{call_id}-run"));
+    let device_id = DeviceId::new(format!("{call_id}-device"));
+    create_session(&hub, &session_id, &device_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
+    let result = events
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::ToolResult {
+                call_id: id,
+                result,
+            }) if id == call_id => Some(result),
+            _ => None,
+        })
+        .expect("computer tool result");
+    let log = log.lock().expect("log").clone();
+    if matches!(reply, ConcealReply::Ack) {
+        assert_eq!(result.status, ToolResultStatus::Completed);
+        assert_eq!(
+            log.iter().take(3).cloned().collect::<Vec<_>>(),
+            vec![
+                "conceal".to_owned(),
+                format!("capture:{action}"),
+                "reveal".to_owned()
+            ]
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("capture:"))
+                .count(),
+            1
+        );
+    } else {
+        assert_eq!(
+            result.status,
+            ToolResultStatus::Failed,
+            "{action} {reply:?}"
+        );
+        #[cfg(unix)]
+        if matches!(reply, ConcealReply::HelperDies) {
+            assert!(log.contains(&"helper:exited".into()));
+        }
+        let preview: serde_json::Value =
+            serde_json::from_str(&result.preview).expect("typed failure preview");
+        assert_eq!(preview["status"], "failed");
+        assert_eq!(preview["error"]["kind"], "backend");
+        assert_eq!(
+            preview["error"]["message"],
+            "presence panels could not be verified absent from the capture"
+        );
+        assert!(
+            !log.iter().any(|entry| entry.starts_with("capture:")),
+            "backend capture ran on refused conceal: {log:?}"
+        );
+        if matches!(reply, ConcealReply::SendFails) {
+            assert!(log.contains(&"renderer:closed".into()), "{log:?}");
+        } else {
+            assert!(log.contains(&"reveal".into()), "{log:?}");
+        }
+    }
+    assert_eq!(
+        presence.capture_holders(haider_tools::presence::PresenceSurface::Screen),
+        0,
+        "the capture guard must be dropped before settling the tool result"
+    );
+    let effect = events
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Effect(EffectPhase::Intent(intent)))
+                if intent.summary == format!("computer {action}") =>
+            {
+                Some(intent.effect)
+            }
+            _ => None,
+        })
+        .expect("computer effect intent");
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Outcome { effect: id, outcome, .. }))
+            if id == effect && match reply {
+                ConcealReply::Ack => matches!(outcome, EffectOutcome::Ok),
+                _ => matches!(outcome, EffectOutcome::Failed { .. }),
+            }
+    )));
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_screenshot_on_typed_conceal_failure() {
+    dispatcher_conceal_result("screenshot", ConcealReply::Failed).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_inspect_on_typed_conceal_failure() {
+    dispatcher_conceal_result("inspect", ConcealReply::Failed).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_screenshot_on_conceal_deadline() {
+    dispatcher_conceal_result("screenshot", ConcealReply::Silent).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_inspect_on_conceal_deadline() {
+    dispatcher_conceal_result("inspect", ConcealReply::Silent).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_screenshot_after_helper_death() {
+    dispatcher_conceal_result("screenshot", ConcealReply::HelperDies).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_inspect_after_helper_death() {
+    dispatcher_conceal_result("inspect", ConcealReply::HelperDies).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_screenshot_on_conceal_send_failure() {
+    dispatcher_conceal_result("screenshot", ConcealReply::SendFails).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_inspect_on_conceal_send_failure() {
+    dispatcher_conceal_result("inspect", ConcealReply::SendFails).await;
+}
+
+/// Negative controls: a real Ack allows both model-facing captures.
+#[tokio::test]
+async fn dispatcher_captures_screenshot_after_conceal_ack() {
+    dispatcher_conceal_result("screenshot", ConcealReply::Ack).await;
+}
+
+#[tokio::test]
+async fn dispatcher_captures_inspect_after_conceal_ack() {
+    dispatcher_conceal_result("inspect", ConcealReply::Ack).await;
+}
+
 /// Verifier finding (0ddd89a0): nothing tested that the broker dispatcher
 /// itself conceals a capturable indicator around model-facing captures.
 /// MUTATION CHECK: replace `self.cu_presence.conceal_for_capture().await`

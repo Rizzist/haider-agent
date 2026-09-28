@@ -372,3 +372,23 @@ unchanged.
   on-device run is not possible in this tree.
 * The macOS "human view" screenshots were taken with the evidence-only
   capturable switch; in production the overlay is invisible to all capture.
+## Native macOS verification gate
+
+Run this local gate from a logged-in macOS desktop session with a window
+server. It uses real AppKit panels on the executable's main thread and
+requires a display refresh after the window list reports all panels absent:
+
+```sh
+HAIDER_HARNESS_ROOT="$(cd ../.. && pwd)" # from a harness worktree
+CARGO_TARGET_DIR="$PWD/target-presence-gate" \
+  "$HAIDER_HARNESS_ROOT/runtime/build-slot.sh" cu-presence-native -- \
+  cargo test -p haider-tools --features native-macos-presence-gate \
+  --test overlay_macos_native_gate
+```
+
+The executable prints `NATIVE_GATE: PASS` when visible panels are refused
+and an actual `orderOut` is acknowledged. It prints `NATIVE_GATE: SKIP` with
+a reason when no window-server session or primary screen exists; a skip is
+not a passing local gate. Run it 20 times under the lane's concurrent test
+load before accepting a macOS presence change. CI runners without an AppKit
+window-server session cannot supply this gate.
