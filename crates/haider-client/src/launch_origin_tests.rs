@@ -637,7 +637,7 @@ fn firmlink_spellings_keep_own_existing_and_missing_leaf() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn apfs_case_alias_keeps_existing_and_missing_own_paths() {
     let temp = tempfile::tempdir().unwrap();
@@ -773,8 +773,10 @@ fn canonical_path_beneath_symlinked_own_home_stays_home_relative() {
 /// `C:\` vs `\\?\C:\`, or a Windows 8.3 `RUNNER~1` short name), the
 /// canonical comparison must still recognise the own home via the nearest
 /// existing ancestor instead of masking the owner as another user.
-#[test]
-fn missing_leaf_beneath_differently_spelled_own_home_stays_home_relative() {
+///
+/// This exercises real temporary-directory and canonicalization semantics,
+/// so a Windows-home simulation on Unix must skip the Unix entry point.
+fn assert_missing_leaf_beneath_differently_spelled_own_home_stays_home_relative() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().canonicalize().unwrap();
     let leaf = temp
@@ -791,6 +793,18 @@ fn missing_leaf_beneath_differently_spelled_own_home_stays_home_relative() {
         Some("~/Haider/1448-04-07/s-0123456789abcdef")
     );
     assert!(!leaf.exists(), "sanitising must never create the leaf");
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_leaf_beneath_differently_spelled_own_home_stays_home_relative() {
+    assert_missing_leaf_beneath_differently_spelled_own_home_stays_home_relative();
+}
+
+#[cfg(windows)]
+#[test]
+fn missing_leaf_beneath_differently_spelled_own_home_stays_home_relative() {
+    assert_missing_leaf_beneath_differently_spelled_own_home_stays_home_relative();
 }
 
 #[cfg(unix)]
