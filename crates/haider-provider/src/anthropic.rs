@@ -1,6 +1,6 @@
 //! Anthropic Messages API adapter.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -15,6 +15,7 @@ use reqwest::header::{
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 /// Anthropic documents this as a limit on the complete JSON request, not the
 /// decoded PDF. Check the final payload because base64 expansion and prompt
@@ -192,14 +193,40 @@ pub(crate) fn thinking_binding_drop_required(request: &TurnRequest) -> bool {
             .rewrites_earlier_tool_results()
 }
 
-/// Routes (auth mode, URL, model) whose endpoint rejected the thinking
-/// binding opt-in as an unknown field or unsupported beta AND then accepted
-/// the same request without it. Process-wide so a rebuilt adapter for the
-/// same route never repeats the rejected request; see
-/// [`AnthropicProvider::send_request_with_binding_fallback`].
-fn thinking_binding_rejected_routes() -> &'static Mutex<HashSet<String>> {
-    static ROUTES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    ROUTES.get_or_init(|| Mutex::new(HashSet::new()))
+/// A route is recorded only after its policy-free resend decodes a complete
+/// `message_stop` and its Finish is ready to be forwarded. Entries expire so
+/// changing endpoint capabilities are probed again after one hour.
+const THINKING_BINDING_ROUTE_TTL: Duration = Duration::from_secs(60 * 60);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ThinkingBindingRoute {
+    auth_mode: AnthropicAuthMode,
+    api_url: String,
+    model: String,
+    account: Option<CredentialAlias>,
+}
+
+fn thinking_binding_rejected_routes() -> &'static Mutex<HashMap<ThinkingBindingRoute, Instant>> {
+    static ROUTES: OnceLock<Mutex<HashMap<ThinkingBindingRoute, Instant>>> = OnceLock::new();
+    ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn contains_opt_in_token(message: &str) -> bool {
+    [
+        "block_binding",
+        "prefix_mismatch_behavior",
+        ANTHROPIC_THINKING_BINDING_BETA,
+    ]
+    .iter()
+    .any(|token| {
+        message.match_indices(token).any(|(start, _)| {
+            let before = message[..start].chars().next_back();
+            let after = message[start + token.len()..].chars().next();
+            let boundary = |c: Option<char>| {
+                c.is_none_or(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_')
+            };
+            boundary(before) && boundary(after)
+        })
+    })
 }
 
 /// Whether a 400 body is an explicit validation rejection of Haider's
@@ -215,10 +242,55 @@ fn thinking_binding_rejected_routes() -> &'static Mutex<HashSet<String>> {
 /// prefix-binding diagnostic is therefore never an unsupported-opt-in
 /// rejection, and neither is any other invalid request.
 pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
-    let message = serde_json::from_slice::<ErrorEnvelope>(body).map_or_else(
-        |_| String::from_utf8_lossy(body).to_ascii_lowercase(),
-        |envelope| envelope.error.message.to_ascii_lowercase(),
-    );
+    // A body at the read ceiling may have lost a later prefix/signature
+    // exclusion. Fail closed rather than infer a route capability from it.
+    if body.len() >= crate::HTTP_ERROR_BODY_LIMIT {
+        return false;
+    }
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Diagnostic {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        message: Option<String>,
+        param: Option<String>,
+        details: Option<serde_json::Value>,
+    }
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Envelope {
+        error: Option<Diagnostic>,
+        message: Option<String>,
+    }
+    let (message, kind, param, details) = match serde_json::from_slice::<Envelope>(body) {
+        Ok(envelope) => match envelope.error {
+            Some(error) => (
+                error.message.unwrap_or_default(),
+                error.kind.unwrap_or_default(),
+                error.param.unwrap_or_default(),
+                error
+                    .details
+                    .map_or_else(String::new, |value| value.to_string()),
+            ),
+            None => (
+                envelope.message.unwrap_or_default(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+        },
+        Err(_) => (
+            String::from_utf8_lossy(body).into_owned(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
+    };
+    let message = message.to_ascii_lowercase();
+    let kind = kind.to_ascii_lowercase();
+    let kind_words = kind.replace(['_', '-'], " ");
+    let param = param.to_ascii_lowercase();
+    let details = details.to_ascii_lowercase();
     let prefix_or_signature_diagnostic = [
         "signature",
         "bound to a different conversation",
@@ -227,17 +299,17 @@ pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
         "remove the block",
     ]
     .iter()
-    .any(|marker| message.contains(marker));
-    if prefix_or_signature_diagnostic {
+    .any(|marker| message.contains(marker) || kind.contains(marker) || details.contains(marker));
+    if prefix_or_signature_diagnostic || kind.contains("prefix") || kind.contains("signature") {
         return false;
     }
     // Gateways word an unknown-field / unsupported-parameter rejection in
     // many ways (Anthropic, Bedrock, Vertex, OpenAI-compatible proxies). Any
     // such generic wording counts, but ONLY when the message names the
     // opt-in itself: the binding field or the binding-controls beta value.
-    let names_opt_in = message.contains("block_binding")
-        || message.contains("prefix_mismatch_behavior")
-        || message.contains(ANTHROPIC_THINKING_BINDING_BETA);
+    let names_opt_in = [&message, &param, &details]
+        .iter()
+        .any(|part| contains_opt_in_token(part));
     let rejection_wording = [
         "extra inputs are not permitted",
         "extra input is not permitted",
@@ -264,7 +336,9 @@ pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
         "not a valid beta",
     ]
     .iter()
-    .any(|phrase| message.contains(phrase));
+    .any(|phrase| {
+        message.contains(phrase) || kind_words.contains(phrase) || details.contains(phrase)
+    });
     names_opt_in && rejection_wording
 }
 
@@ -422,7 +496,7 @@ pub const fn select_anthropic_cache_ttl(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AnthropicAuthMode {
     ApiKey,
     None,
@@ -1229,14 +1303,31 @@ impl AnthropicProvider {
         })
     }
 
-    fn thinking_binding_route(&self) -> String {
-        format!("{:?}|{}|{}", self.auth_mode, self.api_url, self.model)
+    fn thinking_binding_route(&self) -> ThinkingBindingRoute {
+        // The account alias is an opaque ID, never the credential secret.
+        ThinkingBindingRoute {
+            auth_mode: self.auth_mode,
+            api_url: self.api_url.clone(),
+            model: self.model.clone(),
+            account: self.account.clone(),
+        }
     }
 
     fn thinking_binding_rejected(&self) -> bool {
         thinking_binding_rejected_routes()
             .lock()
-            .is_ok_and(|routes| routes.contains(&self.thinking_binding_route()))
+            .is_ok_and(|mut routes| {
+                let route = self.thinking_binding_route();
+                if routes
+                    .get(&route)
+                    .is_some_and(|published| published.elapsed() < THINKING_BINDING_ROUTE_TTL)
+                {
+                    true
+                } else {
+                    routes.remove(&route);
+                    false
+                }
+            })
     }
 
     async fn send_request(
@@ -1252,14 +1343,14 @@ impl AnthropicProvider {
     /// Sends one turn. When the payload carries the prefix-binding drop
     /// policy and the endpoint answers 400 rejecting exactly that opt-in
     /// (e.g. a gateway or route without thinking-binding controls), the route
-    /// is latched as unsupported for this process and the SAME prepared wire
-    /// is resent once without the policy, restoring the pre-policy request.
-    /// Later requests on the route render without it, so the fallback never
-    /// repeats or loops; any other status or 400 is returned unchanged.
+    /// is classified, the SAME prepared wire is resent once without the
+    /// policy. A successful HTTP status returns a pending route decision;
+    /// only the streaming producer publishes it just before forwarding a
+    /// decoded Finish. Other statuses and incomplete streams never publish.
     async fn send_request_with_binding_fallback(
         &self,
         request: &TurnRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(reqwest::Response, Option<ThinkingBindingRoute>), ProviderError> {
         let mut prepared = self.take_or_render_prepared(request)?;
         if self.thinking_binding_rejected() {
             strip_thinking_binding_drop(&mut prepared.payload);
@@ -1267,12 +1358,15 @@ impl AnthropicProvider {
         if !payload_uses_thinking_binding_drop(&prepared.payload) {
             let built = self.request_body_prepared_for_send(&prepared).await?;
             drop(prepared);
-            return self.execute_prepared_send(built).await;
+            return self
+                .execute_prepared_send(built)
+                .await
+                .map(|response| (response, None));
         }
         let built = self.request_body_prepared_for_send(&prepared).await?;
         let response = self.execute_prepared_send(built).await?;
         if response.status().as_u16() != 400 {
-            return Ok(response);
+            return Ok((response, None));
         }
         let request_id = anthropic_request_id(&response);
         let retry_after = response
@@ -1303,20 +1397,13 @@ impl AnthropicProvider {
         let built = self.request_body_prepared_for_send(&prepared).await?;
         drop(prepared);
         let response = self.execute_prepared_send(built).await?;
-        // Latch only once the route has actually accepted the pre-policy
-        // wire; a failed resend leaves the route's policy untouched.
-        if response.status().is_success() {
-            if let Ok(mut routes) = thinking_binding_rejected_routes().lock() {
-                routes.insert(self.thinking_binding_route());
-            }
-            tracing::warn!(
-                target: "haider.provider",
-                model = %self.model,
-                auth_mode = ?self.auth_mode,
-                "Anthropic route accepted the request without the thinking prefix-binding opt-in; disabling it for this route"
-            );
-        }
-        Ok(response)
+        // Headers alone cannot establish acceptance. Keep this decision
+        // pending until the decoder validates message_stop.
+        let pending = response
+            .status()
+            .is_success()
+            .then(|| self.thinking_binding_route());
+        Ok((response, pending))
     }
 
     async fn execute_prepared_send(
@@ -1374,7 +1461,8 @@ impl AnthropicProvider {
     ) -> Result<ProviderStream, ProviderError> {
         let native_computer = anthropic_computer_tool_version(&request.model).is_some()
             && request.tools.iter().any(|tool| tool.name == "computer");
-        let response = self.send_request_with_binding_fallback(request).await?;
+        let (response, pending_binding_route) =
+            self.send_request_with_binding_fallback(request).await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -1405,6 +1493,7 @@ impl AnthropicProvider {
                 semantic_progress_timeout,
                 native_computer,
                 context,
+                pending_binding_route,
             )
             .await;
         });
@@ -1902,6 +1991,7 @@ async fn stream_response(
     semantic_progress_timeout: Duration,
     native_computer: bool,
     context: crate::SseRequestContext,
+    pending_binding_route: Option<ThinkingBindingRoute>,
 ) {
     stream_sse_source_with_native(
         response,
@@ -1911,6 +2001,7 @@ async fn stream_response(
         semantic_progress_timeout,
         native_computer,
         context,
+        pending_binding_route,
     )
     .await;
 }
@@ -1950,6 +2041,7 @@ pub(crate) async fn stream_sse_source<S: SseChunkSource>(
         semantic_progress_timeout,
         false,
         crate::SseRequestContext::capture(route_gating),
+        None,
     )
     .await;
 }
@@ -1962,6 +2054,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
     semantic_progress_timeout: Duration,
     native_computer: bool,
     context: crate::SseRequestContext,
+    mut pending_binding_route: Option<ThinkingBindingRoute>,
 ) {
     let crate::SseRequestContext {
         route_gating,
@@ -1985,7 +2078,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
                 if let Some(idle) = &idle_deadline {
                     idle.observe_items(&items);
                 }
-                send_items(&sender, items).await;
+                send_items(&sender, items, &mut pending_binding_route).await;
                 return;
             }
             Ok(Some(Err(error))) => {
@@ -2025,7 +2118,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
         if crate::has_semantic_progress(&items) {
             progress.observe_semantic_progress();
         }
-        if !send_items(&sender, items).await || decoder.is_terminal() {
+        if !send_items(&sender, items, &mut pending_binding_route).await || decoder.is_terminal() {
             return;
         }
     }
@@ -2034,9 +2127,32 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
 async fn send_items(
     sender: &mpsc::Sender<ProviderStreamItem>,
     items: Vec<ProviderStreamItem>,
+    pending_binding_route: &mut Option<ThinkingBindingRoute>,
 ) -> bool {
     for item in items {
-        if sender.send(item).await.is_err() {
+        if matches!(&item, Ok(crate::StreamEvent::Finish { .. })) && pending_binding_route.is_some()
+        {
+            // Reserve capacity first: a dropped receiver cannot publish a
+            // capability. Every decoded Finish reason is success here because
+            // the policy-free Messages stream completed, regardless of why
+            // the model stopped (tool use, limit, refusal, etc.).
+            let Ok(permit) = sender.reserve().await else {
+                return false;
+            };
+            if sender.is_closed() {
+                return false;
+            }
+            if let Some(route) = pending_binding_route.take()
+                && let Ok(mut routes) = thinking_binding_rejected_routes().lock()
+            {
+                routes.insert(route, Instant::now());
+                tracing::warn!(
+                    target: "haider.provider",
+                    "Anthropic policy-free fallback completed; binding opt-in disabled for this route for one hour"
+                );
+            }
+            permit.send(item);
+        } else if sender.send(item).await.is_err() {
             return false;
         }
     }

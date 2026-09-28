@@ -3114,9 +3114,26 @@ async fn binding_rejection_falls_back_once_and_latches_the_route() {
         "drop_block",
         "the route is not latched before its first rejection"
     );
-    drain_turn(&provider, elided.clone())
+    let mut first = provider
+        .stream_turn(elided.clone())
         .await
-        .expect("one bounded fallback resend succeeds");
+        .expect("fallback stream");
+    let mut finished = false;
+    while let Some(item) = first.recv().await {
+        if matches!(item.as_ref(), Ok(StreamEvent::Finish { .. })) {
+            assert!(
+                provider
+                    .request_payload(&elided)
+                    .expect("payload")
+                    .get("thinking")
+                    .is_none(),
+                "the latch is visible when Finish reaches the consumer"
+            );
+            finished = true;
+        }
+        item.expect("decoded event");
+    }
+    assert!(finished, "a complete stream is required to latch");
     assert!(
         provider
             .request_payload(&elided)
@@ -3223,6 +3240,821 @@ fn only_binding_opt_in_rejections_trigger_the_fallback() {
     assert!(!crate::anthropic::anthropic_rejects_thinking_binding(
         DOCUMENTED_PREFIX_MISMATCH.as_bytes()
     ));
+}
+
+#[test]
+fn binding_classifier_structured_tokens_and_bounded_controls() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    for body in [
+        serde_json::json!({"error":{"type":"invalid_request_error","message":"Request validation failed","details":[{"field":"thinking.block_binding","message":"Unknown field"}]}}).to_string(),
+        serde_json::json!({"error":{"type":"invalid_request_error","message":"Unknown parameter","param":"thinking.block_binding"}}).to_string(),
+        serde_json::json!({"error":{"type":"unknown_field","message":"Validation failed","param":"thinking.block_binding"}}).to_string(),
+        serde_json::json!({"error":{"type":"unsupported_beta","message":"Validation failed","param":"thinking-binding-controls-2026-08-01"}}).to_string(),
+        r#"{"message":"Unknown field block\u005fbinding"}"#.to_owned(),
+        "Unknown field thinking.block_binding".to_owned(),
+        "Unknown field [block_binding]".to_owned(),
+        "Unknown field 'block_binding'".to_owned(),
+        "Unknown field /block_binding".to_owned(),
+        "Unknown field `block_binding`".to_owned(),
+        "Unknown field\nblock_binding".to_owned(),
+        "Unknown field\tblock_binding".to_owned(),
+        "Unknown field thinking.block_binding.prefix_mismatch_behavior".to_owned(),
+        "UNKNOWN FIELD THINKING.BLOCK_BINDING".to_owned(),
+    ] {
+        assert!(rejects(body.as_bytes()), "positive: {body}");
+    }
+    for body in [
+        serde_json::json!({"error":{"type":"prefix_binding_mismatch","message":"Unsupported conversation prefix; set thinking.block_binding.prefix_mismatch_behavior to drop_block"}}).to_string(),
+        serde_json::json!({"error":{"type":"signature_validation_error","message":"Unknown field block_binding"}}).to_string(),
+        "Unknown field user_block_binding_metadata".to_owned(),
+        "Unknown field my_prefix_mismatch_behavior_extra".to_owned(),
+        "Unknown field xthinking-binding-controls-2026-08-01x".to_owned(),
+        format!("unsupported media type; request has block_binding; {}signature abc", "x".repeat(65536)),
+    ] {
+        assert!(!rejects(body.as_bytes()), "negative: {}", &body[..body.len().min(100)]);
+    }
+    assert!(!rejects(
+        &b"unknown field block_binding".repeat(3000)[..65536]
+    ));
+}
+
+const VALID_BINDING_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+#[tokio::test]
+async fn every_decoded_finish_reason_confirms_binding_fallback() {
+    use tokio::io::AsyncWriteExt;
+    for reason in [
+        "end_turn",
+        "stop_sequence",
+        "tool_use",
+        "max_tokens",
+        "pause_turn",
+        "refusal",
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let sse = VALID_BINDING_SSE.replace("end_turn", reason);
+        let server = tokio::spawn(async move {
+            let mut policies = Vec::new();
+            for ordinal in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let (_, payload) = read_http_request(&mut socket).await;
+                policies.push(payload.pointer("/thinking/block_binding").is_some());
+                let (status, body) = if ordinal == 0 {
+                    (
+                        400,
+                        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}",
+                    )
+                } else {
+                    (200, sse.as_str())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+            policies
+        });
+        let provider = prefix_fake_adapter(reason, &url);
+        let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+        let mut stream = provider
+            .stream_turn(request.clone())
+            .await
+            .expect("fallback");
+        let mut finished = false;
+        while let Some(item) = stream.recv().await {
+            if matches!(item.as_ref(), Ok(StreamEvent::Finish { .. })) {
+                assert!(
+                    provider
+                        .request_payload(&request)
+                        .expect("payload")
+                        .get("thinking")
+                        .is_none(),
+                    "{reason}: published before Finish"
+                );
+                finished = true;
+            }
+            item.expect("decoded event");
+        }
+        assert!(finished, "{reason}");
+        assert_eq!(server.await.expect("server"), vec![true, false]);
+    }
+}
+
+async fn binding_stream_case(case: &str, fallback_status: u16, fallback_body: &str) {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let body = fallback_body.to_owned();
+    let echoed = case == "echo-sse";
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        for ordinal in 0..4 {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("physical request missing")
+                .expect("accept");
+            let (headers, payload) = read_http_request(&mut socket).await;
+            let policy = payload.pointer("/thinking/block_binding").is_some();
+            let beta = headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().contains(THINKING_BINDING_BETA));
+            policies.push((policy, beta));
+            let (status, content) = if ordinal == 1 {
+                (fallback_status, body.as_str())
+            } else if ordinal == 0 {
+                if echoed {
+                    (
+                        400,
+                        "messages.5.content.1.source.media_type: unsupported image type 'image/bmp'. Request body: {\"thinking\":{\"block_binding\":{}}}",
+                    )
+                } else {
+                    (
+                        400,
+                        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}",
+                    )
+                }
+            } else {
+                (
+                    400,
+                    "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}",
+                )
+            };
+            let content_type = if content.starts_with("<html>") {
+                "text/html"
+            } else {
+                "text/event-stream"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{content}",
+                content.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("respond");
+        }
+        policies
+    });
+    let provider = prefix_fake_adapter(case, &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("failed fallback must surface an error");
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "{case}: same adapter"
+    );
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("same adapter retains policy");
+    let rebuilt = prefix_fake_adapter("next-session", &url);
+    assert!(
+        rebuilt
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "{case}: next session"
+    );
+    drain_turn(&rebuilt, request)
+        .await
+        .expect_err("new adapter retains policy");
+    assert_eq!(
+        server.await.expect("server"),
+        vec![(true, true), (false, false), (true, true), (true, true)],
+        "{case}: physical sends"
+    );
+}
+
+#[tokio::test]
+async fn failed_streamed_binding_fallbacks_never_latch() {
+    let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n";
+    let error = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}\n\n";
+    for (case, status, body) in [
+        (
+            "partial-error",
+            200,
+            format!(
+                "{start}event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"partial\"}}}}\n\n{error}"
+            ),
+        ),
+        (
+            "partial-thinking-error",
+            200,
+            format!(
+                "{start}event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"partial\"}}}}\n\n{error}"
+            ),
+        ),
+        (
+            "wrong-shape",
+            200,
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":1}\n\n".to_owned(),
+        ),
+        (
+            "stop-no-reason",
+            200,
+            format!("{start}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"),
+        ),
+        (
+            "partial-eof",
+            200,
+            format!(
+                "{start}event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"partial\"}}}}\n\n"
+            ),
+        ),
+        (
+            "stop-open-block",
+            200,
+            format!(
+                "{start}event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+        ),
+        ("empty", 200, String::new()),
+        ("html", 200, "<html>bad upstream</html>".to_owned()),
+        ("empty202", 202, String::new()),
+        ("empty206", 206, String::new()),
+    ] {
+        binding_stream_case(case, status, &body).await;
+    }
+}
+
+#[tokio::test]
+async fn binding_fallback_sseerror_before_start_never_latches() {
+    binding_stream_case("sseerror", 200, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature\"}}\n\n").await;
+}
+
+#[tokio::test]
+async fn binding_fallback_sseerror_after_start_never_latches() {
+    binding_stream_case("sseafterstart", 200, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature\"}}\n\n").await;
+}
+
+#[tokio::test]
+async fn binding_fallback_malformed_sse_never_latches() {
+    binding_stream_case(
+        "malformed",
+        200,
+        "event: message_start\ndata: {bad json}\n\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn binding_fallback_truncated_sse_never_latches() {
+    binding_stream_case("truncated", 200, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n").await;
+}
+
+#[tokio::test]
+async fn binding_fallback_empty_204_never_latches() {
+    binding_stream_case("empty204", 204, "").await;
+}
+
+#[tokio::test]
+async fn binding_fallback_echoed_error_then_sseerror_never_latches() {
+    binding_stream_case("echo-sse", 200, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature\"}}\n\n").await;
+}
+
+#[tokio::test]
+async fn binding_latch_is_scoped_to_credential_alias() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(binding_rejecting_fake(listener, 4));
+    let first =
+        prefix_fake_adapter("account-a", &url).with_account(CredentialAlias::new("account-a"));
+    let second =
+        prefix_fake_adapter("account-b", &url).with_account(CredentialAlias::new("account-b"));
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    drain_turn(&first, request.clone())
+        .await
+        .expect("first fallback");
+    assert!(
+        first
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none()
+    );
+    assert!(
+        second
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some()
+    );
+    drain_turn(&second, request)
+        .await
+        .expect("second credential reprobes");
+    assert_eq!(
+        server
+            .await
+            .expect("server")
+            .iter()
+            .map(|v| (v.status, v.drop_policy))
+            .collect::<Vec<_>>(),
+        vec![(400, true), (200, false), (400, true), (200, false)]
+    );
+}
+
+#[tokio::test]
+async fn binding_latch_expires_and_reprobes_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(binding_rejecting_fake(listener, 5));
+    let provider = prefix_fake_adapter("ttl", &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    drain_turn(&provider, request.clone())
+        .await
+        .expect("first fallback");
+    drain_turn(&provider, request.clone())
+        .await
+        .expect("cached route");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(3599)).await;
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none(),
+        "route remains cached just before expiry"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "expired route reprobes with the policy"
+    );
+    tokio::time::resume();
+    drain_turn(&provider, request.clone())
+        .await
+        .expect("expired route reprobes");
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none()
+    );
+    assert_eq!(
+        server
+            .await
+            .expect("server")
+            .iter()
+            .map(|v| (v.status, v.drop_policy))
+            .collect::<Vec<_>>(),
+        vec![
+            (400, true),
+            (200, false),
+            (200, false),
+            (400, true),
+            (200, false)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn binding_latch_waits_for_finish_before_concurrent_render() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        let mut held = None;
+        let mut release_rx = Some(release_rx);
+        for ordinal in 0..4 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let (_, payload) = read_http_request(&mut socket).await;
+            policies.push(payload.pointer("/thinking/block_binding").is_some());
+            if ordinal == 1 {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    VALID_BINDING_SSE.len()
+                );
+                socket.write_all(header.as_bytes()).await.expect("headers");
+                let release = release_rx.take().expect("one held response");
+                held = Some(tokio::spawn(async move {
+                    release.await.expect("release");
+                    socket
+                        .write_all(VALID_BINDING_SSE.as_bytes())
+                        .await
+                        .expect("finish body");
+                }));
+            } else {
+                let (status, body) = match ordinal {
+                    0 => (
+                        400,
+                        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}",
+                    ),
+                    2 => (
+                        400,
+                        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}",
+                    ),
+                    _ => (200, VALID_BINDING_SSE),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+        }
+        held.expect("held fallback").await.expect("held task");
+        policies
+    });
+    let provider = prefix_fake_adapter("concurrent", &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    let mut first = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("fallback headers");
+    let second = prefix_fake_adapter("concurrent-second", &url);
+    assert!(
+        second
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "headers alone cannot latch"
+    );
+    drain_turn(&second, request.clone())
+        .await
+        .expect_err("concurrent request still carries policy");
+    release_tx.send(()).expect("release fallback");
+    let mut finished = false;
+    while let Some(item) = first.recv().await {
+        if matches!(item.as_ref(), Ok(StreamEvent::Finish { .. })) {
+            assert!(
+                second
+                    .request_payload(&request)
+                    .expect("payload")
+                    .get("thinking")
+                    .is_none(),
+                "Finish publishes before delivery"
+            );
+            finished = true;
+        }
+        item.expect("first stream");
+    }
+    assert!(finished);
+    drain_turn(&second, request)
+        .await
+        .expect("latched request goes direct");
+    assert_eq!(
+        server.await.expect("server"),
+        vec![true, false, true, false]
+    );
+}
+
+#[tokio::test]
+async fn failed_concurrent_fallback_cannot_erase_confirmed_latch() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let (a_tx, a_rx) = tokio::sync::oneshot::channel::<()>();
+    let (c_tx, c_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        let mut a_release = Some(a_rx);
+        let mut c_release = Some(c_rx);
+        let mut held = Vec::new();
+        for ordinal in 0..5 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let (_, payload) = read_http_request(&mut socket).await;
+            policies.push(payload.pointer("/thinking/block_binding").is_some());
+            if ordinal == 1 || ordinal == 3 {
+                let body = if ordinal == 1 {
+                    VALID_BINDING_SSE
+                } else {
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature\"}}\n\n"
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(headers.as_bytes()).await.expect("headers");
+                let release = if ordinal == 1 {
+                    a_release.take().expect("A release")
+                } else {
+                    c_release.take().expect("C release")
+                };
+                held.push(tokio::spawn(async move {
+                    release.await.expect("release held stream");
+                    socket.write_all(body.as_bytes()).await.expect("body");
+                }));
+            } else {
+                let (status, body) = if ordinal == 4 {
+                    (200, VALID_BINDING_SSE)
+                } else {
+                    (
+                        400,
+                        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+        }
+        for task in held {
+            task.await.expect("held task");
+        }
+        policies
+    });
+    let provider = prefix_fake_adapter("parallel-a", &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    let mut a = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("A pending");
+    let mut c = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("C pending");
+    a_tx.send(()).expect("release A");
+    let mut a_finished = false;
+    while let Some(item) = a.recv().await {
+        if matches!(item.as_ref(), Ok(StreamEvent::Finish { .. })) {
+            a_finished = true;
+        }
+        item.expect("A event");
+    }
+    assert!(a_finished);
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none()
+    );
+    c_tx.send(()).expect("release C");
+    let mut c_failed = false;
+    while let Some(item) = c.recv().await {
+        if item.is_err() {
+            c_failed = true;
+        }
+    }
+    assert!(c_failed);
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none(),
+        "C cannot roll back A"
+    );
+    let second = prefix_fake_adapter("parallel-new-session", &url);
+    drain_turn(&second, request)
+        .await
+        .expect("latch survives failed C");
+    assert_eq!(
+        server.await.expect("server"),
+        vec![true, false, true, false, false]
+    );
+}
+
+#[tokio::test]
+async fn cancelled_binding_fallback_does_not_publish() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        let mut held = None;
+        let mut release_rx = Some(release_rx);
+        for ordinal in 0..4 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let (_, payload) = read_http_request(&mut socket).await;
+            policies.push(payload.pointer("/thinking/block_binding").is_some());
+            if ordinal == 1 {
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    VALID_BINDING_SSE.len()
+                );
+                socket.write_all(headers.as_bytes()).await.expect("headers");
+                let release = release_rx.take().expect("one held response");
+                held = Some(tokio::spawn(async move {
+                    release.await.expect("release");
+                    // The peer has cancelled; a failed write is expected.
+                    let _ = socket.write_all(VALID_BINDING_SSE.as_bytes()).await;
+                }));
+            } else {
+                let body = if ordinal == 0 {
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}"
+                } else {
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}"
+                };
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+        }
+        held.expect("held response").await.expect("held task");
+        policies
+    });
+    let provider = prefix_fake_adapter("cancel", &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    let stream = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("fallback headers");
+    drop(stream); // aborts the owned producer before its pending Finish
+    release_tx.send(()).expect("release");
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some()
+    );
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("same adapter policy");
+    let second = prefix_fake_adapter("cancel-second", &url);
+    drain_turn(&second, request)
+        .await
+        .expect_err("new adapter policy");
+    assert_eq!(server.await.expect("server"), vec![true, false, true, true]);
+}
+
+async fn binding_unfinished_transport_case(case: &str, timed_out: bool, semantic: bool) {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        let mut held = None;
+        let mut heartbeat = None;
+        for ordinal in 0..4 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let (_, payload) = read_http_request(&mut socket).await;
+            policies.push(payload.pointer("/thinking/block_binding").is_some());
+            if ordinal == 1 {
+                let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n";
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{start}",
+                    start.len() + if semantic { 10000 } else { 100 }
+                );
+                socket
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("partial body");
+                if semantic {
+                    heartbeat = Some(tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            if socket.write_all(b": ping\n\n").await.is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                } else if timed_out {
+                    held = Some(socket);
+                }
+                // Otherwise drop with an incomplete Content-Length: real body
+                // transport failure after headers and decoded message_start.
+            } else {
+                let body = if ordinal == 0 {
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}"
+                } else {
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}"
+                };
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+        }
+        drop(held);
+        if let Some(task) = heartbeat {
+            task.abort();
+        }
+        policies
+    });
+    let mut provider = prefix_fake_adapter(case, &url);
+    if timed_out {
+        provider = provider
+            .with_transport_config(AnthropicTransportConfig {
+                retry_policy: AnthropicRetryPolicy::Never,
+                connect_timeout: Duration::from_secs(5),
+                response_open_timeout: Duration::from_secs(30),
+                chunk_idle_timeout: Duration::from_secs(if semantic { 5 } else { 1 }),
+                semantic_progress_timeout: Duration::from_secs(2),
+            })
+            .expect("fixture clocks");
+    }
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    let mut stream = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("fallback headers");
+    if timed_out {
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        if semantic {
+            for _ in 0..15 {
+                tokio::time::advance(Duration::from_millis(200)).await;
+                tokio::task::yield_now().await;
+            }
+        } else {
+            tokio::time::advance(Duration::from_secs(3)).await;
+        }
+    }
+    let mut failure = None;
+    while let Some(item) = stream.recv().await {
+        if let Err(error) = item {
+            failure = Some(error);
+        }
+    }
+    let failure = failure.expect("incomplete transport must fail");
+    if timed_out {
+        tokio::time::resume();
+    }
+    if semantic {
+        assert!(
+            failure.message.contains("no model content"),
+            "{case}: {failure:?}"
+        );
+    } else if timed_out {
+        assert!(failure.message.contains("no data"), "{case}: {failure:?}");
+    }
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some()
+    );
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("same adapter policy");
+    let rebuilt = prefix_fake_adapter("transport-new-session", &url);
+    drain_turn(&rebuilt, request)
+        .await
+        .expect_err("new adapter policy");
+    assert_eq!(server.await.expect("server"), vec![true, false, true, true]);
+}
+
+#[tokio::test]
+async fn binding_fallback_body_reset_never_latches() {
+    binding_unfinished_transport_case("body-reset", false, false).await;
+}
+
+#[tokio::test]
+async fn binding_fallback_chunk_timeout_never_latches() {
+    binding_unfinished_transport_case("chunk-timeout", true, false).await;
+}
+
+#[tokio::test]
+async fn binding_fallback_semantic_timeout_never_latches() {
+    binding_unfinished_transport_case("semantic-timeout", true, true).await;
 }
 
 /// Loopback route answering EVERY request with one fixed 400 body; records
