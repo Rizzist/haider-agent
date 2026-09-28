@@ -6796,6 +6796,13 @@ impl LiveDriver {
                             &selected.model,
                             selected.selection_epoch.or(Some(envelope.seq)),
                         );
+                        if let Some(alias) = selected.cleared_account_pin.as_deref() {
+                            model.note_parked_account_pin_cleared(
+                                session,
+                                alias,
+                                &selected.provider,
+                            );
+                        }
                     }
                 }
                 haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(
@@ -6861,6 +6868,12 @@ impl LiveDriver {
                         "⇄ model → {} · {}",
                         selected.model, selected.provider
                     ));
+                    if let Some(alias) = selected.cleared_account_pin.as_deref() {
+                        model.projection.push_note(format!(
+                            "· account pin {alias} cleared — {} uses its active account",
+                            selected.provider
+                        ));
+                    }
                 }
                 model.dirty = true;
             }

@@ -24,8 +24,8 @@ use haider_protocol::verify::VerifyVerdict;
 use haider_store::{
     BranchCreateCommand, DelegationRecord, DelegationState, EventStore,
     ForkCacheInheritanceCandidate, SessionCreateCommand, SessionForkCommand, SessionForkOutcome,
-    SessionMetaforkCommit, SessionRenameCommand, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    fork_provider_view_prefix_digest,
+    SessionMetaforkCommit, SessionPromptForkCommand, SessionRenameCommand, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, fork_provider_view_prefix_digest,
 };
 use rusqlite::types::ValueRef;
 use std::collections::HashSet;
@@ -350,7 +350,7 @@ fn fork_command(
 }
 
 #[test]
-fn fork_and_metafork_do_not_inherit_an_explicit_account_pin() {
+fn fork_and_metafork_inherit_explicit_account_and_endpoint() {
     let root = tempfile::tempdir().expect("profile");
     let store = Store::open(root.path()).expect("store");
     let source = SessionId::new("pinned-source");
@@ -407,7 +407,7 @@ fn fork_and_metafork_do_not_inherit_an_explicit_account_pin() {
         "unpinned-metafork-command",
         &source,
         "unpinned-metafork-child",
-        node,
+        node.clone(),
         seq,
         Some(SessionMetaforkCommit {
             description: "remove source prompt".into(),
@@ -417,14 +417,37 @@ fn fork_and_metafork_do_not_inherit_an_explicit_account_pin() {
     );
     accept_metafork_review(&mut meta);
     store.fork_session(&meta).expect("metafork");
-    for child in [&ordinary.session_id, &meta.session_id] {
+    let prompt_json = serde_json::json!({"source": source, "prompt_seq": user_seq}).to_string();
+    let prompt = SessionPromptForkCommand {
+        command_id: "pinned-prompt-fork".into(),
+        request_digest: blake3::hash(prompt_json.as_bytes()).to_hex().to_string(),
+        request_json: prompt_json,
+        source_session_id: source.clone(),
+        session_id: SessionId::new("pinned-prompt-fork-child"),
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        prompt_seq: user_seq,
+        name: Some("pinned prompt fork".into()),
+        audit_event_id: EventId::new("pinned-prompt-fork-audit"),
+        device_id: DeviceId::new("session-fork-test-device"),
+    };
+    store
+        .fork_session_from_prompt(&prompt)
+        .expect("prompt fork");
+    for child in [&ordinary.session_id, &meta.session_id, &prompt.session_id] {
         let metadata = store
             .session_metadata(child)
             .expect("child metadata")
             .expect("typed child");
-        assert_eq!(metadata.account_alias, None);
-        assert_eq!(metadata.provider_base_url, None);
-        assert_eq!(metadata.provider_rebind_id, None);
+        assert_eq!(metadata.account_alias.as_deref(), Some("explicit-source"));
+        assert_eq!(
+            metadata.provider_base_url.as_deref(),
+            Some("https://synthetic.invalid")
+        );
+        assert_eq!(
+            metadata.provider_rebind_id.as_deref(),
+            Some("explicit-rebind")
+        );
         assert_eq!(
             metadata.resolved_route_alias.as_deref(),
             Some("historic-account")
@@ -437,6 +460,29 @@ fn fork_and_metafork_do_not_inherit_an_explicit_account_pin() {
     }
     assert_eq!(
         store.session_metadata(&source).expect("parent unchanged"),
+        Some(parent.clone())
+    );
+    // A branch stays in the same session and therefore keeps the explicit
+    // route without any metadata copy or rebind operation.
+    let branch = BranchCreateCommand {
+        command_id: "branch-pinned-source".into(),
+        request_digest: "branch-pinned-source-digest".into(),
+        request_json: r#"{"branch":"pinned"}"#.into(),
+        session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        branch_id: BranchId::new("pinned-branch"),
+        source_branch_id: None,
+        fork_node_id: node,
+        fork_seq: seq,
+        name: Some("pinned branch".into()),
+        event_id: EventId::new("pinned-branch-created"),
+        device_id: DeviceId::new("session-fork-test-device"),
+    };
+    store.create_branch(&branch).expect("branch");
+    assert_eq!(
+        store
+            .session_metadata(&source)
+            .expect("branch keeps session route"),
         Some(parent)
     );
 }

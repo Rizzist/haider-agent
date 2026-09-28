@@ -321,6 +321,7 @@ async fn create_session_with_interaction_mode(
         },
         interaction_mode,
         None,
+        None,
     )
     .await
     .expect("create CU-2 session");

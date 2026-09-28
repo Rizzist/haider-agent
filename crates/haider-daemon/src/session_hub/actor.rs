@@ -466,6 +466,7 @@ pub(super) async fn run_session_actor(
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
                 completed,
             } => {
                 // Same INV-1 shape as ordinary append: the complete metadata +
@@ -477,6 +478,7 @@ pub(super) async fn run_session_actor(
                         interaction_mode,
                         account_alias,
                         workspace_allocation,
+                        inherited_route,
                     )
                     .await;
                 if let Ok(SessionCreateOutcome::Committed { envelope, .. }) = &result {

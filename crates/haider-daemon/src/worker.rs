@@ -372,6 +372,7 @@ struct DaemonProviderPairSwitchCommitter {
     branch_id: Option<BranchId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
+    turn_selection: Arc<Mutex<haider_protocol::session::SessionMetadataV1>>,
 }
 
 struct DaemonProviderRouteCommitter {
@@ -379,7 +380,7 @@ struct DaemonProviderRouteCommitter {
     /// The pair and epoch admitted for this turn, including its initial
     /// resolved route. A later selection must not donate its new epoch to
     /// this older turn's rotation.
-    selection: haider_protocol::session::SessionMetadataV1,
+    selection: Arc<Mutex<haider_protocol::session::SessionMetadataV1>>,
 }
 
 impl std::fmt::Debug for DaemonProviderRouteCommitter {
@@ -399,12 +400,22 @@ impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
         model: &str,
         to: &haider_protocol::ids::CredentialAlias,
     ) -> Result<u64, HaiderError> {
-        if self.selection.provider != provider || self.selection.model != model {
-            return Ok(self.selection.selection_epoch.unwrap_or(0));
+        let selection = self.selection.lock().await.clone();
+        if selection.provider != provider || selection.model != model {
+            return Ok(selection.selection_epoch.unwrap_or(0));
         }
-        self.store
-            .commit_resolved_route(&self.selection, Some(to.as_str()))
-            .await
+        let epoch = self
+            .store
+            .commit_resolved_route(&selection, Some(to.as_str()))
+            .await?;
+        let mut current = self.selection.lock().await;
+        if current.provider == selection.provider
+            && current.model == selection.model
+            && current.selection_epoch == selection.selection_epoch
+        {
+            current.selection_epoch = Some(epoch);
+        }
+        Ok(epoch)
     }
 }
 
@@ -524,7 +535,13 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             Ok(
                 SessionSelectModelOutcome::Committed { selected, .. }
                 | SessionSelectModelOutcome::IdempotentReplay { selected },
-            ) => Ok(selected.selected_seq),
+            ) => {
+                let mut current = self.turn_selection.lock().await;
+                current.provider = selected.provider;
+                current.model = selected.model;
+                current.selection_epoch = Some(selected.selected_seq);
+                Ok(selected.selected_seq)
+            }
             Err(error) => Err(hub_error(error)),
         }
     }
@@ -9505,9 +9522,10 @@ async fn start_turn(
     config.selection_epoch = Some(route_epoch);
     let mut route_selection = metadata.clone();
     route_selection.selection_epoch = Some(route_epoch);
+    let turn_selection = Arc::new(Mutex::new(route_selection));
     config.provider_route_committer = Some(Arc::new(DaemonProviderRouteCommitter {
         store: lease.clone(),
-        selection: route_selection,
+        selection: Arc::clone(&turn_selection),
     }));
     config.turn_trace = turn_trace.clone();
     config.agent_spawn = headless
@@ -9782,6 +9800,7 @@ async fn start_turn(
         branch_id: accepted.branch_id.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
+        turn_selection,
     }));
     config.supervisor_commits_cancelled = true;
     config.prompt_retraction_enabled = true;

@@ -87,6 +87,7 @@ pub enum CommitGroupBatch {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -753,6 +754,7 @@ impl SqliteStoreHandle {
             interaction_mode,
             account_alias,
             None,
+            None,
         )
         .await
     }
@@ -763,6 +765,7 @@ impl SqliteStoreHandle {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
@@ -772,6 +775,7 @@ impl SqliteStoreHandle {
                     interaction_mode,
                     account_alias,
                     workspace_allocation,
+                    inherited_route,
                 )
             })
         })
@@ -2232,11 +2236,13 @@ impl SqliteStoreHandle {
                             interaction_mode,
                             account_alias,
                             workspace_allocation,
+                            inherited_route,
                         } => JournalCommitBatch::CreateSession {
                             command,
                             interaction_mode,
                             account_alias,
                             workspace_allocation,
+                            inherited_route,
                         },
                         CommitGroupBatch::AcceptTurn {
                             command,

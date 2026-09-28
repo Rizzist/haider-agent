@@ -3,10 +3,10 @@
 use haider_protocol::envelope::PromptRender;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
-use haider_protocol::session::SessionProviderRebound;
+use haider_protocol::session::{ModelSelected, SessionProviderRebound};
 use haider_store::{
     SessionCreateCommand, SessionProviderRebindCommand, SessionProviderRebindOutcome,
-    SessionSelectModelCommand, Store,
+    SessionSelectModelCommand, SessionSelectModelOutcome, Store,
 };
 
 fn create(store: &Store, session: &str) {
@@ -90,6 +90,170 @@ fn command(store: &Store) -> SessionProviderRebindCommand {
         event_id: EventId::new("rebound-1"),
         device_id: DeviceId::new("test-device"),
     }
+}
+
+#[test]
+fn cross_provider_pick_clears_pin_and_old_route_with_typed_notice() {
+    let root = tempfile::tempdir().expect("temporary store");
+    let store = Store::open(root.path()).expect("store");
+    create(&store, "session-a");
+    let id = SessionId::new("session-a");
+    let mut first = SessionSelectModelCommand {
+        command_id: "pin-source".into(),
+        request_digest: "pin-source-digest".into(),
+        request_json: r#"{"pin":"bed-a"}"#.into(),
+        session_id: id.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "source".into(),
+        model: "test-model".into(),
+        expected_pair: None,
+        account_alias: Some("bed-a".into()),
+        output_budget: None,
+        event_id: EventId::new("pin-source-event"),
+        device_id: DeviceId::new("test-device"),
+    };
+    store.select_session_model(&first).expect("pin source");
+    let current = store
+        .session_metadata(&id)
+        .expect("metadata")
+        .expect("typed");
+    store
+        .commit_resolved_route(
+            &id,
+            "source",
+            "test-model",
+            current.selection_epoch.unwrap_or(0),
+            Some("old-route"),
+            &DeviceId::new("test-device"),
+        )
+        .expect("served route");
+    first.command_id = "same-provider".into();
+    first.request_digest = "same-provider-digest".into();
+    first.request_json = r#"{"model":"same-provider-model"}"#.into();
+    first.model = "same-provider-model".into();
+    first.account_alias = None;
+    first.event_id = EventId::new("same-provider-event");
+    let SessionSelectModelOutcome::Committed { selected: same, .. } = store
+        .select_session_model(&first)
+        .expect("same-provider selection")
+    else {
+        panic!("same-provider commit");
+    };
+    assert_eq!(same.cleared_account_pin, None);
+    assert_eq!(
+        store
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .account_alias
+            .as_deref(),
+        Some("bed-a")
+    );
+    first.command_id = "cross-provider".into();
+    first.request_digest = "cross-provider-digest".into();
+    first.request_json = r#"{"provider":"target"}"#.into();
+    first.provider = "target".into();
+    first.account_alias = None;
+    first.event_id = EventId::new("cross-provider-event");
+    let SessionSelectModelOutcome::Committed { selected, envelope } = store
+        .select_session_model(&first)
+        .expect("cross-provider selection")
+    else {
+        panic!("committed selection");
+    };
+    assert_eq!(selected.cleared_account_pin.as_deref(), Some("bed-a"));
+    assert_eq!(
+        ModelSelected::from_payload_value(&envelope.payload)
+            .expect("fact")
+            .cleared_account_pin
+            .as_deref(),
+        Some("bed-a")
+    );
+    let metadata = store
+        .session_metadata(&id)
+        .expect("metadata")
+        .expect("typed");
+    assert_eq!(metadata.account_alias, None);
+    assert_eq!(metadata.resolved_route_alias, None);
+    assert!(!metadata.resolved_route_seen);
+    let SessionSelectModelOutcome::IdempotentReplay { selected: replay } =
+        store.select_session_model(&first).expect("retry")
+    else {
+        panic!("receipt replay");
+    };
+    assert_eq!(replay, selected);
+}
+
+#[test]
+fn derived_child_inherits_explicit_route_and_rejects_mismatched_provider() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    create(&store, "parent");
+    let parent = SessionId::new("parent");
+    let connection = rusqlite::Connection::open(store.database_path()).expect("fixture database");
+    connection.execute("UPDATE sessions SET meta_json = json_set(meta_json, '$.account_alias', 'bed-b', '$.provider_base_url', 'https://synthetic.invalid', '$.provider_rebind_id', 'rebind-parent') WHERE id = ?1", [parent.as_str()]).expect("explicit parent fixture");
+    drop(connection);
+    let source = store
+        .session_metadata(&parent)
+        .expect("parent metadata")
+        .expect("typed");
+    let child = SessionCreateCommand {
+        command_id: "create-derived".into(),
+        request_digest: "create-derived-digest".into(),
+        request_json: r#"{"child":"derived"}"#.into(),
+        session_id: SessionId::new("derived"),
+        cwd: "/tmp".into(),
+        provider: "source".into(),
+        model: "test-model".into(),
+        max_tokens: 4096,
+        max_tokens_source: None,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: "test-system".into(),
+        event_id: EventId::new("derived-created"),
+        device_id: DeviceId::new("test-device"),
+    };
+    store
+        .create_session_with_workspace_configuration(
+            &child,
+            Default::default(),
+            None,
+            None,
+            Some(source.clone()),
+        )
+        .expect("derived child");
+    let metadata = store
+        .session_metadata(&child.session_id)
+        .expect("child metadata")
+        .expect("typed");
+    assert_eq!(metadata.account_alias, source.account_alias);
+    assert_eq!(metadata.provider_base_url, source.provider_base_url);
+    assert_eq!(metadata.provider_rebind_id, source.provider_rebind_id);
+    let mut wrong = child.clone();
+    wrong.session_id = SessionId::new("wrong-provider");
+    wrong.command_id = "create-wrong-provider".into();
+    wrong.request_digest = "create-wrong-provider-digest".into();
+    wrong.request_json = r#"{"child":"wrong-provider"}"#.into();
+    wrong.provider = "target".into();
+    assert!(
+        store
+            .create_session_with_workspace_configuration(
+                &wrong,
+                Default::default(),
+                None,
+                None,
+                Some(source)
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .session_metadata(&wrong.session_id)
+            .expect("not created")
+            .is_none()
+    );
 }
 
 #[test]

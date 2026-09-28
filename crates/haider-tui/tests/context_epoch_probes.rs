@@ -716,6 +716,7 @@ fn deliver_model_fact(
         provider: provider.to_owned(),
         model: slug.to_owned(),
         route_only: false,
+        cleared_account_pin: None,
     };
     deliver(
         driver,
@@ -1523,6 +1524,104 @@ fn launcher_create_reply_binds_pair_budget_and_account_before_first_list_refresh
 }
 
 #[test]
+fn cross_provider_pick_shows_new_default_and_pin_notice_at_both_widths() {
+    let (mut model, mut driver) = live_session(true);
+    let session = session_id("cross-provider-label");
+    model.upsert_live_session(&session);
+    model.open_session(&session);
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            launch_origin: None,
+            attachment: attachment_of(&session),
+            session: session.clone(),
+            worker_generation: 7,
+            replay_through_seq: 0,
+        },
+    );
+    model.identity.provider = "bedrock".into();
+    model.identity.model_short = "synthetic-model".into();
+    model.meter_epoch.admit(
+        ("bedrock".into(), "synthetic-model".into()),
+        Some(1),
+        None,
+        None,
+    );
+    let mut old = oauth_descriptor("bedrock");
+    old.alias = CredentialAlias::new("bed-a");
+    let mut current = oauth_descriptor("anthropic-oauth");
+    current.alias = CredentialAlias::new("ant-a");
+    driver.apply(
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![old, current],
+            revision: Some(2),
+            sources: Vec::new(),
+        },
+    );
+    let mut metadata = listed_summary(&session, "bedrock", "synthetic-model", 4096)
+        .metadata
+        .expect("metadata");
+    metadata.selection_epoch = Some(1);
+    metadata.account_alias = Some("bed-b".into());
+    metadata.resolved_route_alias = Some("bed-b".into());
+    metadata.resolved_route_seen = true;
+    model.note_session_account(&session, &metadata);
+    assert_eq!(model.attached_account_label(), "bed-b (pinned)");
+
+    let fact = haider_protocol::session::ModelSelected {
+        selection_epoch: Some(2),
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-5-5".into(),
+        route_only: false,
+        cleared_account_pin: Some("bed-b".into()),
+    };
+    deliver(
+        &mut driver,
+        &mut model,
+        &session,
+        2,
+        fact.to_payload_value().expect("fact"),
+    );
+    model.apply_session_model_selected_at(
+        &session,
+        "anthropic-oauth",
+        "claude-opus-5-5",
+        None,
+        Some(2),
+    );
+    metadata.provider = "anthropic-oauth".into();
+    metadata.model = "claude-opus-5-5".into();
+    metadata.selection_epoch = Some(2);
+    metadata.account_alias = None;
+    metadata.resolved_route_alias = None;
+    metadata.resolved_route_seen = false;
+    model.note_session_account(&session, &metadata);
+    assert_eq!(model.attached_account_label(), "ant-a (default)");
+    assert!(model.projection.entries().iter().any(|entry| matches!(
+        entry,
+        haider_tui::projection::TranscriptEntry::Note { text }
+            if text.contains("account pin bed-b cleared")
+    )));
+    for width in [80, 118] {
+        let header = draw(&model, width, if width == 80 { 24 } else { 36 });
+        let expected = if width == 80 {
+            "@ant-a (default)"
+        } else {
+            "account ant-a (default)"
+        };
+        assert!(
+            header[..3].iter().any(|line| line.contains(expected)),
+            "{width}: {header:?}"
+        );
+        assert!(
+            !header[..3].iter().any(|line| line.contains("bed-b")),
+            "{width}: {header:?}"
+        );
+    }
+}
+
+#[test]
 fn first_served_route_refreshes_the_attached_account_label() {
     let (mut model, mut driver) = two_attached_sessions();
     let session = session_id("s-meter-a");
@@ -1598,6 +1697,7 @@ fn same_pair_route_fact_keeps_budget_and_has_no_model_note() {
             provider: "anthropic-oauth".into(),
             model: "claude-opus-5-5".into(),
             route_only: true,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("route fact"),
@@ -1915,6 +2015,7 @@ fn astra_noop_selection_fact_does_not_hide_current_daemon_truth() {
         provider: "eq-oauth".into(),
         model: "eq-wide".into(),
         route_only: false,
+        cleared_account_pin: None,
     }
     .to_payload_value()
     .expect("no-op fact");
@@ -2107,6 +2208,7 @@ fn astra_a_fact_during_an_inflight_list_gets_a_fresh_budget_read() {
             provider: "eq-oauth".into(),
             model: m.into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("fact")
@@ -2269,6 +2371,7 @@ fn astra_failed_metadata_read_releases_the_refresh_latch() {
             provider: "eq-oauth".into(),
             model: m.into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("fact")
@@ -2326,6 +2429,7 @@ fn newer_selection_dirty_during_a_failed_list_gets_one_followup() {
             provider: "eq-oauth".into(),
             model: "eq-small".into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("fact"),
@@ -3110,6 +3214,7 @@ fn older_daemon_selection_fact_and_metadata_bind_pair_without_claiming_snapshot_
             provider: "eq-oauth".into(),
             model: "eq-mid".into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("legacy fact"),
@@ -3150,6 +3255,7 @@ fn epochless_durable_fact_after_a_selection_reply_still_advances_its_pair() {
             provider: "eq-oauth".into(),
             model: "eq-mid".into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("legacy fact"),
@@ -3416,6 +3522,7 @@ fn cross_session_fact_during_paginated_list_gets_one_dirty_followup() {
             provider: "anthropic-oauth".into(),
             model: "claude-sonnet-4-6".into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("probe fixture"),
@@ -3450,6 +3557,7 @@ fn cross_session_fact_during_paginated_list_gets_one_dirty_followup() {
             provider: "anthropic-oauth".into(),
             model: "claude-sonnet-4-6".into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("probe fixture"),
@@ -3905,6 +4013,7 @@ fn boot_list_in_flight_gets_one_dirty_followup_for_a_new_selection() {
             provider: "eq-oauth".into(),
             model: "eq-small".into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("fact"),

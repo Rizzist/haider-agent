@@ -1104,11 +1104,11 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
-        provider_base_url: None,
-        provider_rebind_id: None,
+        provider_base_url: Some("https://synthetic.invalid".into()),
+        provider_rebind_id: Some("parent-rebind".into()),
         cwd,
         provider: "fake".into(),
-        account_alias: None,
+        account_alias: Some("parent-pin".into()),
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1195,6 +1195,20 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         .await
         .expect("parent delegations");
     assert_eq!(records.len(), 1);
+    let child_metadata = store
+        .session_metadata(&records[0].child_session_id)
+        .await
+        .expect("derived child metadata")
+        .expect("typed child");
+    assert_eq!(child_metadata.account_alias.as_deref(), Some("parent-pin"));
+    assert_eq!(
+        child_metadata.provider_base_url.as_deref(),
+        Some("https://synthetic.invalid")
+    );
+    assert_eq!(
+        child_metadata.provider_rebind_id.as_deref(),
+        Some("parent-rebind")
+    );
     assert_eq!(records[0].parent_branch_id, Some(parent_branch));
     assert_eq!(
         records[0]
@@ -2802,6 +2816,7 @@ async fn accept_parent_with_interaction_mode(
             device_id: DeviceId::new("w6c-test-device"),
         },
         interaction_mode,
+        None,
         None,
     )
     .await

@@ -433,6 +433,15 @@ impl DelegationHandle {
             )
             .map(|(provider, model)| {
                 let mut child = parent.clone();
+                if child.provider != provider {
+                    // A child that explicitly chooses another provider starts
+                    // under that provider's own account and endpoint.
+                    child.account_alias = None;
+                    child.provider_base_url = None;
+                    child.provider_rebind_id = None;
+                    child.resolved_route_alias = None;
+                    child.resolved_route_seen = false;
+                }
                 child.provider = provider;
                 child.model = model;
                 child
@@ -770,6 +779,9 @@ impl DelegationHandle {
             "fast": coordinates.metadata.fast,
             "cache_policy": coordinates.metadata.cache_policy,
             "interaction_mode": child_interaction_mode,
+            "inherited_account_alias": coordinates.metadata.account_alias,
+            "inherited_provider_base_url": coordinates.metadata.provider_base_url,
+            "inherited_provider_rebind_id": coordinates.metadata.provider_rebind_id,
         }))
         .map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
@@ -795,6 +807,7 @@ impl DelegationHandle {
                 },
                 child_interaction_mode,
                 None,
+                Some(coordinates.metadata.clone()),
             )
             .await?;
 

@@ -7,7 +7,9 @@
 mod cli_main;
 
 use cli_main::models::{auth_state, availability_name};
-use cli_main::session_config::{ConfigError, ConfigOptions, parse_options, resolve_model_selector};
+use cli_main::session_config::{
+    ConfigError, ConfigOptions, document, human_text, parse_options, resolve_model_selector,
+};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
 use haider_rpc::{ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire};
@@ -35,6 +37,46 @@ fn provider_summary(provider: &str) -> ProviderSummaryWire {
         default_model: None,
         enabled: true,
         trust: haider_rpc::ProviderTrustWire::Full,
+    }
+}
+
+/// The JSON and human doors must report the durable explicit pin, including
+/// its absence. This links the actual document renderer into the test binary.
+#[test]
+fn config_document_reports_pinned_and_unpinned_accounts() {
+    for alias in [Some("bed-a"), None] {
+        let digest: haider_rpc::SessionObserveDigest = serde_json::from_value(serde_json::json!({
+            "session_id": "account-config",
+            "head_seq": 1,
+            "worker_generation": 7,
+            "metadata": {
+                "cwd": "/tmp/account-config",
+                "provider": "bedrock",
+                "model": "synthetic-model",
+                "account_alias": alias,
+                "max_tokens": 4096,
+                "interaction_mode": "interactive",
+                "fast": false,
+                "cache_policy": {},
+                "created_at_ms": 1
+            },
+            "title": "Account config",
+            "run_state": "idle",
+            "main_head_seq": 1,
+            "updated_at_ms": 2
+        }))
+        .expect("typed observe digest");
+        let rendered = document(digest, &[]).expect("config document");
+        let json = serde_json::to_value(&rendered).expect("config JSON");
+        assert_eq!(
+            json["account_alias"],
+            alias.map_or(serde_json::Value::Null, |value| serde_json::json!(value))
+        );
+        let human = human_text(&rendered);
+        assert!(
+            human.contains(&format!("account: {}\n", alias.unwrap_or("unbound"))),
+            "{human}"
+        );
     }
 }
 

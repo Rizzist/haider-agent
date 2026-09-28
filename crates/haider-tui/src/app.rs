@@ -21213,6 +21213,20 @@ impl AppModel {
         self.dirty = true;
     }
 
+    pub fn note_parked_account_pin_cleared(
+        &mut self,
+        session: &SessionId,
+        alias: &str,
+        provider: &str,
+    ) {
+        if let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) {
+            row.projection.push_note(format!(
+                "· account pin {alias} cleared — {provider} uses its active account"
+            ));
+            self.dirty = true;
+        }
+    }
+
     /// A resolved-account change advances provenance for a parked session
     /// without changing its model or forgetting its committed output budget.
     pub fn note_parked_route_selected_at(

@@ -1546,6 +1546,7 @@ impl AppendCommitter {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let byte_weight = command
             .request_json
@@ -1561,6 +1562,7 @@ impl AppendCommitter {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             },
             byte_weight,
             AppendCommitCompletion::CreateSession(completed),
@@ -1829,6 +1831,7 @@ enum ActorCommand {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
     },
     CreateBranch {
@@ -4229,6 +4232,7 @@ impl SessionHub {
             command,
             haider_protocol::session::SessionInteractionModeV1::Interactive,
             None,
+            None,
         )
         .await
     }
@@ -4238,6 +4242,7 @@ impl SessionHub {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<CreatedSession, HaiderError> {
         if let Some(created) = self
             .inner
@@ -4252,7 +4257,13 @@ impl SessionHub {
             return Ok(created);
         }
         match self
-            .create_session_with_interaction_mode(command, interaction_mode, account_alias, None)
+            .create_session_with_interaction_mode(
+                command,
+                interaction_mode,
+                account_alias,
+                None,
+                inherited_route,
+            )
             .await
             .map_err(hub_error_as_store)?
         {
@@ -4832,6 +4843,7 @@ impl SessionHub {
             haider_protocol::session::SessionInteractionModeV1::Interactive,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4842,6 +4854,7 @@ impl SessionHub {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<SessionCreateOutcome, SessionHubError> {
         if crate::android_policy::enabled() {
             crate::android_workspace::validate(std::path::Path::new(&command.cwd))?;
@@ -4855,6 +4868,7 @@ impl SessionHub {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
                 completed,
             })
             .await

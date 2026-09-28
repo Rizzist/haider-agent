@@ -1290,6 +1290,61 @@ async fn create_fork_ready_source(
     (source, node_id, seq)
 }
 
+#[tokio::test]
+async fn daemon_fork_keeps_the_explicit_account_and_endpoint_route() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let (source, node, seq) = create_fork_ready_source(&hub, &store, "explicit-route-fork").await;
+    let rebind_json =
+        r#"{"provider":"fake","base_url":"https://synthetic.invalid","account":"bed-b"}"#
+            .to_owned();
+    hub.rebind_session_provider(haider_store::SessionProviderRebindCommand {
+        command_id: "explicit-route-parent-rebind".into(),
+        request_digest: blake3::hash(rebind_json.as_bytes()).to_hex().to_string(),
+        request_json: rebind_json,
+        session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "fake".into(),
+        base_url: Some("https://synthetic.invalid".into()),
+        account: Some("bed-b".into()),
+        event_id: EventId::new("explicit-route-parent-rebound"),
+        device_id: DeviceId::new("worker-law-test"),
+    })
+    .await
+    .expect("explicit parent rebind");
+    let parent = store
+        .session_metadata(&source)
+        .await
+        .expect("parent metadata")
+        .expect("typed");
+    let child = SessionId::new("explicit-route-fork-child");
+    hub.fork_session(private_fork_command(
+        &store,
+        "explicit-route",
+        source.clone(),
+        child.clone(),
+        node,
+        seq,
+    ))
+    .await
+    .expect("daemon fork");
+    let copied = store
+        .session_metadata(&child)
+        .await
+        .expect("child metadata")
+        .expect("typed");
+    assert_eq!(copied.account_alias, parent.account_alias);
+    assert_eq!(copied.provider_base_url, parent.provider_base_url);
+    assert_eq!(copied.provider_rebind_id, parent.provider_rebind_id);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 async fn observe_fork_outcome(
     hub: &SessionHub,
     session: &SessionId,
@@ -6128,6 +6183,7 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
         provider: "fake-b".into(),
         model: "model-b".into(),
         route_only: false,
+        cleared_account_pin: None,
     }
     .to_payload_value()
     .expect("fact serializes");

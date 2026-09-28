@@ -950,6 +950,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
             provider: "openai".into(),
             model: "gpt-5.2".into(),
             route_only: false,
+            cleared_account_pin: None,
         }
         .to_payload_value()
         .expect("model selected"),

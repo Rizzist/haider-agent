@@ -736,6 +736,7 @@ fn deliver_model_fact(
         provider: provider.to_owned(),
         model: slug.to_owned(),
         route_only: false,
+        cleared_account_pin: None,
     };
     deliver(
         driver,

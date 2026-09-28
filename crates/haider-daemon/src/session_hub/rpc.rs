@@ -12342,6 +12342,7 @@ impl HubConnection {
                 selected_seq: selected.selected_seq,
                 worker_generation: selected.worker_generation,
                 output_budget: selected.output_budget,
+                cleared_account_pin: selected.cleared_account_pin,
             },
         })
     }
@@ -16914,6 +16915,7 @@ impl HubConnection {
                 interaction_mode,
                 account_alias.map(|alias| alias.as_str().to_owned()),
                 workspace_allocation,
+                None,
             )
             .await
         {

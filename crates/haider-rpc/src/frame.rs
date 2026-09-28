@@ -5329,6 +5329,9 @@ pub enum ResponseBody {
         /// budget exceeded the new model's maximum.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+        /// Previous explicit account pin cleared by a cross-provider pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleared_account_pin: Option<String>,
     },
     /// Durable coordinates of a committed rename (G2): the NORMALIZED title
     /// — never an echo of the request — plus the committed journal sequence

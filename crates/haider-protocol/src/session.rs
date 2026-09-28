@@ -359,6 +359,9 @@ pub struct ModelSelected {
     /// keep their known output budget and omit the model-change note.
     #[serde(default, skip_serializing_if = "is_false")]
     pub route_only: bool,
+    /// Explicit account pin cleared by this cross-provider selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_account_pin: Option<String>,
 }
 
 /// Additive replay fact emitted atomically with a committed live-session

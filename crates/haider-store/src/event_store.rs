@@ -1121,6 +1121,9 @@ pub struct SelectedModel {
     /// Budget committed with this selection; absent in pre-973 receipts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+    /// Explicit pin removed because this selection changed providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_account_pin: Option<String>,
 }
 
 /// Result of the atomic metadata-update/event/receipt transaction.
@@ -2126,6 +2129,7 @@ pub enum JournalCommitBatch {
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -5126,6 +5130,7 @@ impl Store {
                     provider: metadata.provider.clone(),
                     model: metadata.model.clone(),
                     route_only: true,
+                    cleared_account_pin: None,
                 }
                 .to_payload_value()
                 .map_err(|error| store_error(ErrorCode::StoreCorrupt, error.to_string(), false))?,
@@ -8353,12 +8358,14 @@ impl Store {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             } => self
                 .create_session_with_workspace_configuration(
                     command,
                     *interaction_mode,
                     account_alias.clone(),
                     workspace_allocation.clone(),
+                    inherited_route.clone(),
                 )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
@@ -8397,6 +8404,7 @@ impl Store {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             } => self
                 .create_session_in_transaction(
                     transaction,
@@ -8404,6 +8412,7 @@ impl Store {
                     *interaction_mode,
                     account_alias.clone(),
                     workspace_allocation.clone(),
+                    inherited_route.clone(),
                 )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
@@ -8662,18 +8671,21 @@ impl Store {
             interaction_mode,
             account_alias,
             None,
+            None,
         )
     }
 
-    /// Atomic session creation with an optional resolved dated allocation.
-    /// The allocation is metadata only: this transaction performs no
-    /// filesystem materialisation.
+    /// Atomic session creation with an optional resolved dated allocation and
+    /// explicit route inherited by a delegated child. The route's provider
+    /// must match the child's selected provider. The allocation is metadata
+    /// only: this transaction performs no filesystem materialisation.
     pub fn create_session_with_workspace_configuration(
         &self,
         command: &SessionCreateCommand,
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     ) -> StoreResult<SessionCreateOutcome> {
         let mut connection = self.connection()?;
         let transaction = connection
@@ -8685,6 +8697,7 @@ impl Store {
             interaction_mode,
             account_alias,
             workspace_allocation,
+            inherited_route,
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(outcome)
@@ -8697,6 +8710,7 @@ impl Store {
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     ) -> StoreResult<SessionCreateOutcome> {
         validate_command_identity(
             &command.command_id,
@@ -8734,15 +8748,31 @@ impl Store {
             created_at_ms,
         )?;
 
+        if inherited_route
+            .as_ref()
+            .is_some_and(|parent| parent.provider != command.provider)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "inherited route provider differs from child provider",
+                false,
+            ));
+        }
         let metadata = SessionMetadataV1 {
             selection_epoch: Some(0),
             resolved_route_alias: None,
             resolved_route_seen: false,
-            provider_base_url: None,
-            provider_rebind_id: None,
+            provider_base_url: inherited_route
+                .as_ref()
+                .and_then(|parent| parent.provider_base_url.clone()),
+            provider_rebind_id: inherited_route
+                .as_ref()
+                .and_then(|parent| parent.provider_rebind_id.clone()),
             cwd: command.cwd.clone(),
             provider: command.provider.clone(),
-            account_alias,
+            account_alias: inherited_route
+                .as_ref()
+                .map_or(account_alias, |parent| parent.account_alias.clone()),
             model: command.model.clone(),
             max_tokens: command.max_tokens,
             max_tokens_source: command.max_tokens_source,
@@ -9246,13 +9276,9 @@ impl Store {
             decode_session_metadata(command.source_session_id, &source_metadata_json)?
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
-        // The fork copies conversation and model history, not the source's
-        // explicit credential or endpoint choice. Keep the resolved route as
-        // provenance for copied footprints; the child's next turn resolves
-        // its own mutable default and advances the epoch if that route differs.
-        metadata.account_alias = None;
-        metadata.provider_base_url = None;
-        metadata.provider_rebind_id = None;
+        // Explicit account and endpoint choices are part of the copied
+        // session configuration. Unpinned parents still follow the mutable
+        // provider default because their account_alias is already None.
         // A fork inherits prompt history, not the source session's operational
         // savings ledger. Its first model-view reduction starts a fresh total.
         metadata.context_economy = ContextEconomy::default();
@@ -9977,6 +10003,11 @@ impl Store {
                 .checked_add(1)
                 .ok_or_else(|| corrupt("event sequence space is exhausted"))?
         };
+        let cleared_account_pin = if metadata.provider != command.provider {
+            metadata.account_alias.clone()
+        } else {
+            None
+        };
         if metadata.provider != command.provider {
             // Accounts and route overrides belong to their selected
             // provider. A cross-provider model choice cannot carry either
@@ -9984,6 +10015,8 @@ impl Store {
             metadata.account_alias = None;
             metadata.provider_base_url = None;
             metadata.provider_rebind_id = None;
+            metadata.resolved_route_alias = None;
+            metadata.resolved_route_seen = false;
         }
         if let Some(alias) = &command.account_alias {
             metadata.account_alias = Some(alias.clone());
@@ -10033,6 +10066,7 @@ impl Store {
                 provider: command.provider.clone(),
                 model: command.model.clone(),
                 route_only: false,
+                cleared_account_pin: cleared_account_pin.clone(),
             }
             .to_payload_value()
             .map_err(|error| {
@@ -10052,6 +10086,7 @@ impl Store {
             selected_seq: selection_epoch,
             worker_generation: self.worker_generation,
             output_budget: command.output_budget,
+            cleared_account_pin,
         };
         finalize_command_receipt(
             &transaction,

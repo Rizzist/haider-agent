@@ -13,8 +13,9 @@ use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
 };
 use haider_core::{
-    ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitchCause,
-    ProviderPairSwitchTarget, QueueConsumeCommand, QueuePromoteCommand, ResolvedProviderAttempt,
+    EventIdGenerator, ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitch,
+    ProviderPairSwitchCause, ProviderPairSwitchCommitter, ProviderPairSwitchTarget,
+    ProviderRouteCommitter, QueueConsumeCommand, QueuePromoteCommand, ResolvedProviderAttempt,
     SessionCreateCommand, SessionSelectEffortCommand, SessionSelectEffortOutcome,
     SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
@@ -43,6 +44,77 @@ use haider_rpc::{
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
+
+/// A compaction promotion updates the route committer's pair and epoch before
+/// the promoted model's credential rotates in the same turn.
+#[tokio::test]
+async fn rotation_after_compaction_promotion_records_the_promoted_route() {
+    let world = PairSwitchWorld::boot(
+        "promotion-rotation",
+        Arc::new(FakeProvider::new(text_turn("a"))),
+        Arc::new(FakeProvider::new(text_turn("b"))),
+    )
+    .await;
+    let lease = world
+        .hub
+        .acquire_worker_lease(world.session_id.clone())
+        .await
+        .expect("lease");
+    let selection = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed");
+    let shared = Arc::new(tokio::sync::Mutex::new(selection));
+    let route = super::DaemonProviderRouteCommitter {
+        store: lease.clone(),
+        selection: Arc::clone(&shared),
+    };
+    let pair = super::DaemonProviderPairSwitchCommitter {
+        store: lease,
+        branch_id: None,
+        device_id: world.device_id.clone(),
+        event_ids: Arc::new(EventIdGenerator::new("promotion-route-test")),
+        turn_selection: shared,
+    };
+    let promoted_epoch = pair
+        .commit(&ProviderPairSwitch {
+            run_id: RunId::new("promotion-rotation-run"),
+            switch_ordinal: 0,
+            from_provider: "fake-a".into(),
+            from_model: "model-a".into(),
+            to_provider: "fake-b".into(),
+            to_model: "model-b".into(),
+            cause: ProviderPairSwitchCause::CompactionGuard,
+        })
+        .await
+        .expect("promotion commit");
+    let rotated_epoch = route
+        .commit(
+            "fake-b",
+            "model-b",
+            &CredentialAlias::new("promoted-rotated-account"),
+        )
+        .await
+        .expect("rotation commit");
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed");
+    assert_eq!(
+        (metadata.provider.as_str(), metadata.model.as_str()),
+        ("fake-b", "model-b")
+    );
+    assert_eq!(
+        metadata.resolved_route_alias.as_deref(),
+        Some("promoted-rotated-account")
+    );
+    assert!(rotated_epoch >= promoted_epoch);
+    world.shutdown().await;
+}
 
 #[derive(Default)]
 struct GraphSelectionSink(Mutex<Vec<WireFrame>>);
