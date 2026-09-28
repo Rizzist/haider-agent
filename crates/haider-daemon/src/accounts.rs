@@ -2310,9 +2310,11 @@ async fn run_account_actor(
                     vault.as_ref(),
                     &snapshot,
                     management.as_ref(),
-                    &providers,
-                    &mut pending_catalog_discoveries,
-                    &source_registry,
+                    RefreshIdentityCatalogContext {
+                        providers: &providers,
+                        pending: &mut pending_catalog_discoveries,
+                        source_registry: &source_registry,
+                    },
                     *job,
                 )
                 .await;
@@ -4560,17 +4562,26 @@ async fn handle_set_label(
 /// Rebuilds public identity from the credential already inside Haider's
 /// vault. OAuth providers all pass through the provider-owned abstraction;
 /// no token bytes enter the response, receipt, or diagnostic path.
+struct RefreshIdentityCatalogContext<'a> {
+    providers: &'a ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending: &'a mut AutomaticCatalogDiscoveryQueue,
+    source_registry: &'a Arc<StdMutex<CredentialSourceRegistry>>,
+}
+
 async fn handle_refresh_identity(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &dyn Vault,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
-    pending: &mut AutomaticCatalogDiscoveryQueue,
-    source_registry: &Arc<StdMutex<CredentialSourceRegistry>>,
+    catalog: RefreshIdentityCatalogContext<'_>,
     job: RefreshIdentityJob,
 ) {
+    let RefreshIdentityCatalogContext {
+        providers,
+        pending,
+        source_registry,
+    } = catalog;
     let alias = CredentialAlias::new(job.alias.trim());
     let Some(current) = accounts
         .list()

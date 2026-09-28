@@ -54,7 +54,8 @@ fn daemon_descriptor_store_reserves_incarnations_on_disk() {
     let directory = test_store_dir();
     let json = JsonFileStore::new(directory.path());
     let counter = json.path().with_extension("incarnation-counter");
-    let mut accounts = AccountStore::new(DescriptorStore::Json(json)).unwrap();
+    let mut accounts =
+        AccountStore::new(DescriptorStore::Json(json)).expect("open durable account store");
     let mut descriptor = CredentialDescriptor {
         incarnation: 0,
         credential_digest: Some("synthetic-A".into()),
@@ -69,26 +70,31 @@ fn daemon_descriptor_store_reserves_incarnations_on_disk() {
         account_identity: None,
         created_at_ms: None,
     };
-    accounts.add(descriptor.clone()).unwrap();
+    accounts.add(descriptor.clone()).expect("add first account");
     let first = accounts
         .get(&CredentialAlias::new("first"))
-        .unwrap()
+        .expect("first account")
         .incarnation;
     assert_eq!(
-        std::fs::read_to_string(&counter).unwrap().trim(),
+        std::fs::read_to_string(&counter)
+            .expect("read incarnation counter")
+            .trim(),
         first.to_string()
     );
-    accounts.remove(&CredentialAlias::new("first")).unwrap();
+    accounts
+        .remove(&CredentialAlias::new("first"))
+        .expect("remove first account");
     drop(accounts);
     let mut restarted =
-        AccountStore::new(DescriptorStore::Json(JsonFileStore::new(directory.path()))).unwrap();
+        AccountStore::new(DescriptorStore::Json(JsonFileStore::new(directory.path())))
+            .expect("reopen durable account store");
     descriptor.alias = CredentialAlias::new("second");
     descriptor.credential_digest = Some("synthetic-B".into());
-    restarted.add(descriptor).unwrap();
+    restarted.add(descriptor).expect("add second account");
     assert!(
         restarted
             .get(&CredentialAlias::new("second"))
-            .unwrap()
+            .expect("second account")
             .incarnation
             > first
     );
@@ -470,9 +476,11 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
         &vault,
         &snapshot,
         Some(&management),
-        &providers,
-        &mut pending,
-        &source_registry,
+        RefreshIdentityCatalogContext {
+            providers: &providers,
+            pending: &mut pending,
+            source_registry: &source_registry,
+        },
         RefreshIdentityJob {
             alias: alias.as_str().to_owned(),
             route: LoginRoute {
@@ -14814,14 +14822,14 @@ fn kimi_rewrite_with_mtime_mints_incarnation(
     reconcile_credential_sources(&mut registry, &mut accounts).expect("A scan");
     let first = accounts
         .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-        .unwrap()
+        .expect("linked account remains present")
         .incarnation;
     write("synthetic-B", second);
     reconcile_credential_sources(&mut registry, &mut accounts).expect("B scan");
     assert!(
         accounts
             .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-            .unwrap()
+            .expect("linked account remains present")
             .incarnation
             > first
     );
@@ -14869,19 +14877,19 @@ fn vanished_linked_source_reappearing_with_identical_bytes_keeps_a_new_incarnati
     reconcile_credential_sources(&mut registry, &mut accounts).expect("initial scan");
     let original = accounts
         .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-        .unwrap()
+        .expect("linked account remains present")
         .incarnation;
     std::fs::remove_file(&file).expect("remove source file");
     reconcile_credential_sources(&mut registry, &mut accounts).expect("missing scan");
     let vanished = accounts
         .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-        .unwrap()
+        .expect("linked account remains present")
         .incarnation;
     assert!(vanished > original);
     assert!(
         accounts
             .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-            .unwrap()
+            .expect("linked account remains present")
             .credential_digest
             .is_none()
     );
@@ -14889,7 +14897,7 @@ fn vanished_linked_source_reappearing_with_identical_bytes_keeps_a_new_incarnati
     assert_eq!(
         accounts
             .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-            .unwrap()
+            .expect("linked account remains present")
             .incarnation,
         vanished
     );
@@ -14898,7 +14906,7 @@ fn vanished_linked_source_reappearing_with_identical_bytes_keeps_a_new_incarnati
     assert!(
         accounts
             .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-            .unwrap()
+            .expect("linked account remains present")
             .incarnation
             > vanished,
         "re-adoption after a missing source is another unproven intake"
@@ -14919,20 +14927,20 @@ fn malformed_linked_source_invalidates_once_before_a_recovered_intake() {
     reconcile_credential_sources(&mut registry, &mut accounts).expect("initial scan");
     let original = accounts
         .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-        .unwrap()
+        .expect("linked account remains present")
         .incarnation;
     std::fs::write(&file, b"{").expect("partial rewrite");
     reconcile_credential_sources(&mut registry, &mut accounts).expect("invalid scan");
     let invalidated = accounts
         .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-        .unwrap()
+        .expect("linked account remains present")
         .incarnation;
     assert!(invalidated > original);
     reconcile_credential_sources(&mut registry, &mut accounts).expect("repeat invalid scan");
     assert_eq!(
         accounts
             .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-            .unwrap()
+            .expect("linked account remains present")
             .incarnation,
         invalidated
     );
@@ -14940,7 +14948,7 @@ fn malformed_linked_source_invalidates_once_before_a_recovered_intake() {
     reconcile_credential_sources(&mut registry, &mut accounts).expect("recovered scan");
     let recovered = accounts
         .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
-        .unwrap();
+        .expect("linked account remains present");
     assert!(recovered.incarnation > original);
     assert!(recovered.credential_digest.is_some());
 }
@@ -14958,14 +14966,14 @@ fn linked_codex_retained_last_refresh_mints_for_different_account() {
     reconcile_credential_sources(&mut registry, &mut accounts).expect("A scan");
     let first = accounts
         .active_for_provider(OPENAI_OAUTH_PROVIDER_NAME)
-        .unwrap()
+        .expect("linked account remains present")
         .incarnation;
     write_linked_codex_source(&root, "workspace-B", "b@example.test");
     reconcile_credential_sources(&mut registry, &mut accounts).expect("B scan");
     assert!(
         accounts
             .active_for_provider(OPENAI_OAUTH_PROVIDER_NAME)
-            .unwrap()
+            .expect("linked account remains present")
             .incarnation
             > first
     );
