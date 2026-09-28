@@ -2075,7 +2075,7 @@ pub struct HubConnection {
     spend_injection_shadow: Mutex<HashMap<SessionId, (String, u64, bool)>>,
     /// Folded open-menu state at a journal head. Empty Submit injections
     /// read only newly appended events after the first replay.
-    spend_menu_cache: Mutex<HashMap<SessionId, (u64, Vec<(MenuId, bool)>)>>,
+    spend_menu_cache: Mutex<HashMap<SessionId, SpendMenuSnapshot>>,
     /// One required-delivery, cursor-replayable monitor stream. A new
     /// `monitor.watch` replaces the prior registration on this connection.
     monitor_watch: Mutex<Option<MonitorWatchState>>,
@@ -2096,6 +2096,12 @@ pub struct HubConnection {
     /// independently tear down) the caller's live identity.
     identity_lease: Arc<ConnectionIdentityLease>,
     closed: AtomicBool,
+}
+
+#[derive(Clone, Default)]
+struct SpendMenuSnapshot {
+    head: u64,
+    open: Vec<(MenuId, bool)>,
 }
 
 struct MonitorWatchState {

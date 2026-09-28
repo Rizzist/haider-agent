@@ -17828,9 +17828,10 @@ impl HubConnection {
     ) -> Result<bool, SessionHubError> {
         let head = self.hub.inner.store.latest_seq(session_id).await?;
         let cached = lock(&self.spend_menu_cache)?.get(session_id).cloned();
-        let (mut cursor, mut open) = cached
-            .filter(|(cached_head, _)| *cached_head <= head)
+        let cached = cached
+            .filter(|snapshot| snapshot.head <= head)
             .unwrap_or_default();
+        let (mut cursor, mut open) = (cached.head, cached.open);
         loop {
             if cursor >= head {
                 break;
@@ -17889,7 +17890,8 @@ impl HubConnection {
         // A concurrent append invalidates the just-scanned snapshot. Never
         // cache under an earlier head when a new menu may already be open.
         if cursor >= head && self.hub.inner.store.latest_seq(session_id).await? == head {
-            lock(&self.spend_menu_cache)?.insert(session_id.clone(), (head, open));
+            lock(&self.spend_menu_cache)?
+                .insert(session_id.clone(), SpendMenuSnapshot { head, open });
         }
         Ok(spend)
     }
