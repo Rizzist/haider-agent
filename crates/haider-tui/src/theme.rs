@@ -55,6 +55,28 @@ impl Rgb {
         }
     }
 
+    /// WCAG 2.x relative luminance (sRGB).
+    #[must_use]
+    pub fn luminance(self) -> f64 {
+        fn channel(c: u8) -> f64 {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(self.r) + 0.7152 * channel(self.g) + 0.0722 * channel(self.b)
+    }
+
+    /// WCAG contrast ratio between two colours (1.0 ..= 21.0).
+    #[must_use]
+    pub fn contrast(self, other: Rgb) -> f64 {
+        let (a, b) = (self.luminance(), other.luminance());
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
     /// Alpha-blend `self` over `base` with opacity in per-mille (0..=1000):
     /// translucent chrome pre-blended onto a solid ground. Rounds half-up,
     /// matching the real-valued blend to the nearest channel step.

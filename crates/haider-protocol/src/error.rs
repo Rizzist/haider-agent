@@ -7,6 +7,135 @@ const SUBCODE_LIMIT: usize = 64;
 const TITLE_LIMIT: usize = 96;
 const DETAIL_LIMIT: usize = 512;
 const REQUEST_ID_LIMIT: usize = 128;
+const PROVIDER_ERROR_TYPE_LIMIT: usize = 128;
+const PROVIDER_RAW_DETAIL_LIMIT: usize = 2048;
+
+/// Fixed public detail suffix used whenever provider prose matched no known
+/// template (see `haider-provider`'s `error_templates`). Provider prose is
+/// untrusted and may echo account data, so shareable surfaces show the
+/// provider-class default explanation plus this notice instead.
+pub const PROVIDER_DETAIL_WITHHELD: &str = "details withheld";
+
+/// JSON key of [`ErrorPresentation::provider_raw_detail`]. Shareable
+/// projections remove every occurrence with [`strip_local_only_fields`].
+pub const PROVIDER_RAW_DETAIL_FIELD: &str = "provider_raw_detail";
+
+/// Where a consumer of `RunFailed` sends it, for the provider raw-detail
+/// policy (ruling 2). See [`RUN_FAILED_CONSUMERS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFailedSurface {
+    /// Producer or owner-local consumer (journal, TUI, CLI print, owner-UID
+    /// RPC frames): `provider_raw_detail` may be present.
+    OwnerLocal,
+    /// Reads only codes, message or `title`/`detail` (never the raw field),
+    /// including model-/peer-visible projections.
+    PublicFieldsOnly,
+    /// Serializes the presentation to a shareable place; it strips the raw
+    /// field, proven by the named regression test.
+    ShareableStripped(&'static str),
+}
+
+/// Registry of every production file that consumes or produces `RunFailed`
+/// (`EventPayload::RunFailed` or a `"run_failed"` payload tag). A protocol
+/// test scans the workspace and fails when a file is missing here, so a new
+/// surface cannot be added without classifying it; every
+/// `ShareableStripped` entry names an existing regression test.
+pub const RUN_FAILED_CONSUMERS: &[(&str, RunFailedSurface)] = &[
+    (
+        "crates/haider-cli/src/export.rs",
+        RunFailedSurface::ShareableStripped("every_export_format_strips_owner_local_provider_text"),
+    ),
+    (
+        "crates/haider-cli/src/run.rs",
+        RunFailedSurface::ShareableStripped(
+            "owner_local_provider_detail_is_stripped_from_shareable_projections",
+        ),
+    ),
+    (
+        "crates/haider-client/src/headless.rs",
+        RunFailedSurface::ShareableStripped("replay_ledgers_strip_owner_local_provider_detail"),
+    ),
+    (
+        "crates/haider-core/src/actor.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-core/src/task_outcome.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-daemon/src/completion.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-daemon/src/delegation.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-daemon/src/mobile_transport/chat_bridge.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-daemon/src/pipe_native.rs",
+        RunFailedSurface::ShareableStripped(
+            "sidecar_error_rows_never_carry_owner_local_provider_text",
+        ),
+    ),
+    (
+        "crates/haider-daemon/src/runtime.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-daemon/src/session_hub/actor.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-daemon/src/turn_recovery.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-daemon/src/worker.rs",
+        RunFailedSurface::ShareableStripped(
+            "failed_manual_compaction_under_lockdown_journals_templates_only",
+        ),
+    ),
+    (
+        "crates/haider-protocol/src/completion.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-protocol/src/error.rs",
+        RunFailedSurface::ShareableStripped(
+            "provider_raw_detail_is_local_only_and_strippable_everywhere",
+        ),
+    ),
+    (
+        "crates/haider-protocol/src/pipe.rs",
+        RunFailedSurface::ShareableStripped(
+            "sidecar_error_rows_never_carry_owner_local_provider_text",
+        ),
+    ),
+    (
+        "crates/haider-protocol/src/transcript.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-store/src/event_store.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+    (
+        "crates/haider-store/src/usage_ledger.rs",
+        RunFailedSurface::PublicFieldsOnly,
+    ),
+    (
+        "crates/haider-tui/src/projection.rs",
+        RunFailedSurface::OwnerLocal,
+    ),
+];
+
+/// Human label every owner-local renderer (CLI print, TUI) uses for
+/// [`ErrorPresentation::provider_raw_detail`].
+pub const PROVIDER_RAW_DETAIL_LABEL: &str = "Provider detail (local only)";
 
 /// Stable, bounded machine-readable reason carried to every presentation
 /// surface. Values are lowercase ASCII kebab tokens; invalid producer input
@@ -131,6 +260,20 @@ pub struct ErrorPresentation {
     pub loop_limit: Option<crate::loop_guard::LoopLimitV1>,
     pub scope: ErrorScope,
     pub allowed_actions: Vec<ErrorAction>,
+    /// Provider's own error category, when its response supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_error_type: Option<String>,
+    /// OWNER-LOCAL ONLY. The provider's raw error text when it matched no
+    /// known template (credentials already redacted, control and bidi
+    /// characters removed, bounded). It is kept in the owner's local journal
+    /// and shown by owner-local renderers (TUI, CLI print output). Every
+    /// shareable surface — `haider export` (masked or not), headless
+    /// `--output json|jsonl` and the SDK result, masked `session item`,
+    /// recovery menus, model/provider-visible text and lockdown turns —
+    /// removes it ([`Self::strip_local_only`] / [`strip_local_only_fields`])
+    /// and shows `detail` (the provider-class default + "details withheld").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_raw_detail: Option<String>,
 }
 
 impl ErrorPresentation {
@@ -183,6 +326,8 @@ impl ErrorPresentation {
             loop_limit: None,
             scope,
             allowed_actions,
+            provider_error_type: None,
+            provider_raw_detail: None,
         }
     }
 
@@ -198,6 +343,31 @@ impl ErrorPresentation {
             .map(|value| bounded_public_text(value, REQUEST_ID_LIMIT))
             .filter(|value| !value.is_empty());
         self
+    }
+
+    #[must_use]
+    pub fn with_provider_error_type(mut self, error_type: Option<&str>) -> Self {
+        self.provider_error_type = error_type
+            .map(|value| bounded_public_text(value, PROVIDER_ERROR_TYPE_LIMIT).replace('\n', " "))
+            .filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// Attaches the owner-local raw provider text. Control characters become
+    /// spaces and invisible/bidi formatting characters are dropped so the
+    /// text cannot restyle or reorder a terminal line; the result is bounded.
+    #[must_use]
+    pub fn with_provider_raw_detail(mut self, raw: Option<&str>) -> Self {
+        self.provider_raw_detail = raw
+            .map(local_raw_text)
+            .filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// Removes every owner-local-only field before the presentation reaches
+    /// a shareable surface (export, headless/SDK output, menus, lockdown).
+    pub fn strip_local_only(&mut self) {
+        self.provider_raw_detail = None;
     }
 
     #[must_use]
@@ -267,6 +437,10 @@ struct RawErrorPresentation {
     scope: Option<ErrorScope>,
     #[serde(default)]
     allowed_actions: Vec<ErrorAction>,
+    #[serde(default)]
+    provider_error_type: Option<String>,
+    #[serde(default)]
+    provider_raw_detail: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ErrorPresentation {
@@ -287,6 +461,8 @@ impl<'de> Deserialize<'de> for ErrorPresentation {
             .provider_request_id
             .map(|value| bounded_public_text(&value, REQUEST_ID_LIMIT))
             .filter(|value| !value.is_empty());
+        presentation = presentation.with_provider_error_type(raw.provider_error_type.as_deref());
+        presentation = presentation.with_provider_raw_detail(raw.provider_raw_detail.as_deref());
         presentation.retry_after_ms = raw.retry_after_ms;
         presentation.reset_at_ms = raw.reset_at_ms;
         presentation.opened_within_ms = raw.opened_within_ms;
@@ -307,6 +483,66 @@ impl Default for ErrorPresentation {
             ErrorScope::Turn,
             [ErrorAction::None],
         )
+    }
+}
+
+fn local_raw_text(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter(|character| !invisible_format_character(*character))
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    bounded_public_text(cleaned.trim(), PROVIDER_RAW_DETAIL_LIMIT)
+}
+
+const fn invisible_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+/// Removes every [`PROVIDER_RAW_DETAIL_FIELD`] from a JSON value (at any
+/// depth) and returns the first removed text. Shareable projections of raw
+/// journal payloads (headless JSON/JSONL, SDK results, exports) call this so
+/// owner-local provider text never leaves the machine through them.
+pub fn strip_local_only_fields(value: &mut serde_json::Value) -> Option<String> {
+    let mut first = None;
+    strip_local_only_fields_into(value, &mut first);
+    first
+}
+
+fn strip_local_only_fields_into(value: &mut serde_json::Value, first: &mut Option<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if let Some(removed) = fields.remove(PROVIDER_RAW_DETAIL_FIELD)
+                && first.is_none()
+                && let serde_json::Value::String(text) = removed
+            {
+                *first = Some(text);
+            }
+            for child in fields.values_mut() {
+                strip_local_only_fields_into(child, first);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                strip_local_only_fields_into(child, first);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -612,6 +848,129 @@ mod tests {
             serde_json::to_value(ErrorCode::WorkflowUnfinished).expect("serialize code"),
             serde_json::json!("workflow_unfinished")
         );
+    }
+
+    #[test]
+    fn provider_raw_detail_is_local_only_and_strippable_everywhere() {
+        let presentation = ErrorPresentation::new(
+            "permission-denied",
+            "Provider access denied",
+            "The active account is not allowed to make this request. · details withheld",
+            ErrorScope::Account,
+            [ErrorAction::SwitchAccount],
+        )
+        .with_provider_raw_detail(Some("Denied for org quillmere\u{202e}\u{0007}\nretry"));
+        let raw = presentation.provider_raw_detail.clone().expect("raw kept");
+        assert_eq!(raw, "Denied for org quillmere  retry");
+        let mut payload = serde_json::json!({
+            "type": "run_failed",
+            "presentation": presentation,
+            "nested": [{"menu": {"presentation": {"provider_raw_detail": "second"}}}],
+        });
+        let decoded: ErrorPresentation =
+            serde_json::from_value(payload["presentation"].clone()).expect("round trip");
+        assert_eq!(decoded.provider_raw_detail.as_deref(), Some(raw.as_str()));
+        // Every occurrence is removed; one of them is returned.
+        assert!(strip_local_only_fields(&mut payload).is_some());
+        let text = payload.to_string();
+        assert!(
+            !text.contains("quillmere") && !text.contains("second"),
+            "{text}"
+        );
+        let mut stripped = decoded;
+        stripped.strip_local_only();
+        assert!(stripped.provider_raw_detail.is_none());
+        let long = ErrorPresentation::new("x", "t", "d", ErrorScope::Turn, [ErrorAction::None])
+            .with_provider_raw_detail(Some(&"🦀".repeat(4096)));
+        assert!(long.provider_raw_detail.expect("bounded").len() <= PROVIDER_RAW_DETAIL_LIMIT);
+    }
+
+    /// Registry guard: every production source file that references
+    /// `RunFailed` is classified in [`RUN_FAILED_CONSUMERS`], and every
+    /// shareable entry's regression test exists in the workspace.
+    #[test]
+    fn run_failed_consumer_registry_is_complete() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let mut sources = Vec::new();
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read dir").flatten() {
+                let path = entry.path();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if path.is_dir() {
+                    if name != "tests" && name != "target" {
+                        stack.push(path);
+                    }
+                } else if name.ends_with(".rs") {
+                    sources.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        let mut all_text = String::new();
+        for path in &sources {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let relative = path
+                .strip_prefix(&root)
+                .expect("under root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if !name.ends_with("_tests.rs")
+                // `::RunFailed` (not `EventPayload::RunFailed`) also catches
+                // aliased imports such as `Ev::RunFailed`.
+                && (text.contains("::RunFailed") || text.contains("\"run_failed\""))
+            {
+                found.push(relative);
+            }
+            all_text.push_str(&text);
+        }
+        for path in root.join("crates").read_dir().expect("crates").flatten() {
+            let tests = path.path().join("tests");
+            if let Ok(entries) = std::fs::read_dir(tests) {
+                for entry in entries.flatten() {
+                    all_text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+                }
+            }
+        }
+        found.sort();
+        let registered: Vec<String> = RUN_FAILED_CONSUMERS
+            .iter()
+            .map(|(path, _)| (*path).to_owned())
+            .collect();
+        let missing: Vec<_> = found
+            .iter()
+            .filter(|path| !registered.contains(path))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "classify these RunFailed consumers in RUN_FAILED_CONSUMERS: {missing:?}"
+        );
+        let stale: Vec<_> = registered
+            .iter()
+            .filter(|path| !found.contains(path))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "registry entries no longer reference RunFailed: {stale:?}"
+        );
+        for (path, surface) in RUN_FAILED_CONSUMERS {
+            if let RunFailedSurface::ShareableStripped(test) = surface {
+                assert!(
+                    all_text.contains(&format!("fn {test}(")),
+                    "{path}: regression test `{test}` not found"
+                );
+            }
+        }
     }
 
     #[test]

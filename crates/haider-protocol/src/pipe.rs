@@ -1531,12 +1531,17 @@ fn sidecar_projection(
             unresolved_tool: None,
         }),
         EventPayload::RunFailed {
-            presentation: Some(presentation),
+            presentation: Some(mut presentation),
             ..
         } => Some(SidecarProjection {
             row: SidecarRow(SidecarRowKind::Error(ErrorRow {
                 role: "error",
-                presentation,
+                // Pipe rows are read by peers/models and back the unmasked
+                // export: owner-local provider text never enters them.
+                presentation: {
+                    presentation.strip_local_only();
+                    presentation
+                },
                 at_ms,
                 seq,
                 branch_id,
@@ -2137,6 +2142,25 @@ mod tests {
         );
         assert!(lines.iter().all(|line| !line.contains(['\n', '\r'])));
         assert_eq!(escape_pipe_field("a\\|\r\nb"), "|a\\\\\\|\\nb|");
+    }
+
+    #[test]
+    fn sidecar_error_rows_never_carry_owner_local_provider_text() {
+        let event = envelope(
+            9,
+            EventPayload::RunFailed {
+                code: ErrorCode::ProviderError,
+                message: "PermissionDenied: OpenAI HTTP 403 returned a permission error".into(),
+                retryable: false,
+                presentation: Some(
+                    interruption().with_provider_raw_detail(Some("Denied for org quillmere.")),
+                ),
+            },
+        );
+        let row = sidecar_row_line(&event).expect("error row");
+        assert!(!row.contains("quillmere"), "{row}");
+        let line = pipe_body_line(&event).expect("pipe line");
+        assert!(!line.contains("quillmere"), "{line}");
     }
 
     #[test]

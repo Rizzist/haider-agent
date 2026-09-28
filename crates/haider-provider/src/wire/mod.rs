@@ -2028,6 +2028,8 @@ pub(crate) fn api_error(error: WireApiError) -> ProviderError {
         kind,
         format!("Anthropic API returned {}", provider_kind_name(kind)),
     )
+    .with_provider_error_type(Some(&error.kind))
+    .with_provider_detail(&error.message)
 }
 
 pub(crate) const fn provider_kind_name(kind: ProviderErrorKind) -> &'static str {
@@ -2063,9 +2065,7 @@ fn normalize_stop_reason(reason: &str) -> Result<FinishReason, ProviderError> {
             "Anthropic reported model_context_window_exceeded",
         )),
         "refusal" => Ok(FinishReason::Refusal),
-        _ => Err(malformed(format!(
-            "Anthropic returned unknown stop_reason `{reason}`"
-        ))),
+        _ => Err(malformed("Anthropic returned an unknown stop_reason")),
     }
 }
 
@@ -2084,8 +2084,10 @@ pub(crate) fn is_anthropic_context_error(kind: &str, message: &str) -> bool {
         .any(|needle| message.to_ascii_lowercase().contains(needle)))
 }
 
+/// Malformed-frame messages interpolate provider-controlled values (event
+/// names, ids, decoder text), so they are published only via templates.
 fn malformed(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+    ProviderError::new(ProviderErrorKind::MalformedFrame, message).with_untrusted_message()
 }
 
 fn stream_interrupted(message: impl Into<String>) -> ProviderError {

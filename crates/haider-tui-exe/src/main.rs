@@ -530,6 +530,8 @@ async fn tui_command(rest: &[String]) -> ExitCode {
         };
         model.launcher_dir = abbreviated.clone();
         model.session_dir = abbreviated;
+        // Tool rows shorten paths under home to `~/…` (973-tui-toolview).
+        model.home_dir = (!home.is_empty()).then_some(home);
     }
     if !interactive {
         // The plain/CI oracle stays deterministic: no demo-store load, no
@@ -767,6 +769,8 @@ fn apply_cwd(model: &mut AppModel) {
     model.launcher_dir = abbreviated.clone();
     model.session_dir = abbreviated;
     model.cwd = cwd.display().to_string();
+    // Tool rows shorten paths under home to `~/…` (973-tui-toolview).
+    model.home_dir = (!home.is_empty()).then_some(home);
 }
 
 #[cfg(test)]

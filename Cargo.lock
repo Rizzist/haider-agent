@@ -1823,6 +1823,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "unicode-properties",
  "zeroize",
 ]
 
@@ -1957,8 +1958,10 @@ dependencies = [
  "haider-accounts",
  "haider-platform",
  "haider-protocol",
+ "haider-tools",
  "haider-webextract",
  "httpdate",
+ "regex",
  "reqwest",
  "rustls",
  "serde",
@@ -1967,6 +1970,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-width",
+ "url",
 ]
 
 [[package]]
@@ -2063,6 +2067,7 @@ dependencies = [
  "haider-provider",
  "haider-rpc",
  "haider-stt",
+ "haider-tools",
  "image",
  "ratatui",
  "ratatui-image",
