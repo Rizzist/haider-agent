@@ -50,6 +50,220 @@ fn empty_source_snapshot() -> AccountSourcesSnapshot {
 }
 
 #[test]
+fn daemon_descriptor_store_reserves_incarnations_on_disk() {
+    let directory = test_store_dir();
+    let json = JsonFileStore::new(directory.path());
+    let counter = json.path().with_extension("incarnation-counter");
+    let mut accounts = AccountStore::new(DescriptorStore::Json(json)).unwrap();
+    let mut descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: Some("synthetic-A".into()),
+        alias: CredentialAlias::new("first"),
+        provider: "synthetic".into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "first".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    accounts.add(descriptor.clone()).unwrap();
+    let first = accounts
+        .get(&CredentialAlias::new("first"))
+        .unwrap()
+        .incarnation;
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().trim(),
+        first.to_string()
+    );
+    accounts.remove(&CredentialAlias::new("first")).unwrap();
+    drop(accounts);
+    let mut restarted =
+        AccountStore::new(DescriptorStore::Json(JsonFileStore::new(directory.path()))).unwrap();
+    descriptor.alias = CredentialAlias::new("second");
+    descriptor.credential_digest = Some("synthetic-B".into());
+    restarted.add(descriptor).unwrap();
+    assert!(
+        restarted
+            .get(&CredentialAlias::new("second"))
+            .unwrap()
+            .incarnation
+            > first
+    );
+    assert!(counter.exists());
+}
+
+#[test]
+fn poisoned_source_registry_cannot_disable_authenticated_catalog_fence() {
+    let registry = empty_source_registry();
+    let poisoned = Arc::clone(&registry);
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("fixture lock");
+            panic!("intentional registry poison");
+        })
+        .join()
+        .is_err()
+    );
+    let descriptor = CredentialDescriptor {
+        incarnation: 1,
+        credential_digest: Some("synthetic-digest".into()),
+        alias: CredentialAlias::new("linked"),
+        provider: "kimi-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "fixture".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let error = linked_source_for_catalog(&registry, Some(&descriptor))
+        .expect_err("an unavailable source registry cannot make discovery unlinked");
+    assert_eq!(error.code, ErrorCode::CredentialMissing);
+    assert!(
+        linked_source_for_catalog(&registry, None)
+            .expect("public catalog has no linked source")
+            .is_none()
+    );
+}
+
+#[test]
+fn endpoint_boundary_mints_active_and_inactive_aliases_only_for_its_provider() {
+    let mut accounts = memory_accounts();
+    for (alias, provider, active) in [
+        ("active", "custom", true),
+        ("inactive", "custom", false),
+        ("other", "unrelated", true),
+    ] {
+        accounts
+            .add(CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: Some(format!("synthetic-{alias}")),
+                alias: CredentialAlias::new(alias),
+                provider: provider.into(),
+                base_url: None,
+                auth_method: AuthMethod::ApiKey,
+                identity: alias.into(),
+                status: CredentialStatus::Ok,
+                active,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            })
+            .expect("add fixture");
+    }
+    let before = accounts
+        .list()
+        .iter()
+        .map(|row| (row.alias.clone(), row.incarnation))
+        .collect::<std::collections::HashMap<_, _>>();
+    mint_provider_incarnations(&mut accounts, "custom").expect("mint profile boundary");
+    for row in accounts.list() {
+        let prior = before[&row.alias];
+        if row.provider == "custom" {
+            assert!(row.incarnation > prior, "{}", row.alias);
+        } else {
+            assert_eq!(row.incarnation, prior);
+        }
+    }
+}
+
+#[test]
+fn authenticated_catalog_key_changes_with_same_alias_identity_but_survives_relogin() {
+    let mut accounts = memory_accounts();
+    let providers = test_provider_registry();
+    let mut descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+        alias: CredentialAlias::new("reused-source-alias"),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "same display".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(AccountIdentity {
+            email: Some("a@example.invalid".into()),
+            display_name: None,
+            account_id: Some("synthetic-a".into()),
+            plan: None,
+            issuer: Some("synthetic-issuer".into()),
+            captured_at: 1,
+            verified: false,
+        }),
+        created_at_ms: None,
+    };
+    accounts.add(descriptor.clone()).expect("add A");
+    let active_key = |accounts: &AccountStore<Box<dyn StoreLike>>| {
+        active_catalog_cache_key(OPENAI_OAUTH_PROVIDER_NAME, accounts, &providers)
+            .expect("active catalog key")
+    };
+    let a_key = active_key(&accounts);
+    descriptor
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .captured_at = 2;
+    accounts.replace(descriptor.clone()).expect("re-login A");
+    assert_eq!(
+        active_key(&accounts),
+        a_key,
+        "same identity keeps its cache"
+    );
+    providers.replace_discovered_models(
+        OPENAI_OAUTH_PROVIDER_NAME.into(),
+        vec![DiscoveredModel {
+            slug: "a-only".into(),
+            display_name: "A only".into(),
+            context_window: None,
+            max_output_tokens: None,
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            use_responses_lite: Some(true),
+            extensions: None,
+        }],
+        1,
+    );
+    let before = accounts.list().to_vec();
+    descriptor
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .account_id = Some("synthetic-b".into());
+    accounts
+        .replace(descriptor)
+        .expect("import B into same alias");
+    assert_ne!(
+        active_key(&accounts),
+        a_key,
+        "B must not read A's durable row"
+    );
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+    clear_catalogs_after_account_change(&before, &accounts, &providers, &mut pending);
+    let models = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("summary")
+        .models;
+    assert!(
+        !models.contains(&"a-only".to_owned()),
+        "B must not see A's fetched row"
+    );
+    assert_eq!(models.len(), 6, "provider-level static rows remain visible");
+    assert_eq!(
+        pending.next_ready(&HashSet::new()).as_deref(),
+        Some(OPENAI_OAUTH_PROVIDER_NAME)
+    );
+}
+
+#[test]
 fn linked_source_failure_health_states_remain_distinct() {
     use crate::device_discovery::LinkedSourceReadFailure;
 
@@ -104,6 +318,63 @@ pub(super) fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
     }
     let store: Box<dyn StoreLike> = Box::new(Ephemeral(StdMutex::new(Vec::new())));
     AccountStore::new(store).unwrap_or_else(|error| panic!("accounts: {error:?}"))
+}
+
+#[test]
+fn subscription_availability_tracks_active_credential_health() {
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("subscription-health");
+    accounts
+        .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
+            alias: alias.clone(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("add fixture credential");
+    assert!(provider_credential_ready_for_summary(&accounts)(
+        ANTHROPIC_OAUTH_PROVIDER_NAME
+    ));
+    accounts
+        .set_status(&alias, CredentialStatus::Limited { until_ms: u64::MAX })
+        .expect("rate-limit credential");
+    assert!(
+        provider_credential_ready_for_summary(&accounts)(ANTHROPIC_OAUTH_PROVIDER_NAME),
+        "a temporary quota window keeps the subscription selectable"
+    );
+    accounts
+        .set_status(&alias, CredentialStatus::Expired)
+        .expect("expire credential");
+    assert!(!provider_credential_ready_for_summary(&accounts)(
+        ANTHROPIC_OAUTH_PROVIDER_NAME
+    ));
+    accounts
+        .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
+            alias: CredentialAlias::new("offline-descriptor"),
+            provider: BEDROCK_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "offline fixture".into(),
+            status: CredentialStatus::Expired,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("add offline fixture");
+    assert!(provider_credential_ready_for_summary(&accounts)(
+        BEDROCK_PROVIDER_NAME
+    ));
 }
 
 #[test]
@@ -167,6 +438,8 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
     let alias = CredentialAlias::new("refresh-api");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "openai".into(),
             base_url: None,
@@ -176,7 +449,6 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed descriptor");
@@ -234,6 +506,8 @@ async fn startup_backfill_decodes_only_the_vaulted_id_token_without_network() {
     let alias = CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME);
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -243,7 +517,6 @@ async fn startup_backfill_decodes_only_the_vaulted_id_token_without_network() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed descriptor");
@@ -293,6 +566,8 @@ async fn startup_backfill_marks_missing_oauth_secret_as_source_gone() {
     let alias = CredentialAlias::new("legacy-missing-oauth");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -302,7 +577,6 @@ async fn startup_backfill_marks_missing_oauth_secret_as_source_gone() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed descriptor");
@@ -322,6 +596,8 @@ async fn startup_backfill_synthesizes_stable_anthropic_meter_identity() {
     let alias = CredentialAlias::new("legacy-anthropic-oauth");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -331,7 +607,6 @@ async fn startup_backfill_synthesizes_stable_anthropic_meter_identity() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed descriptor");
@@ -425,11 +700,14 @@ pub(super) fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegis
                         slug: slug.to_owned(),
                         display_name: format!("Fixture {slug}"),
                         context_window: None,
+                        max_output_tokens: None,
                         description: Some("provider-owned test fixture".to_owned()),
                         default_effort: None,
                         supported_efforts: Vec::new(),
                         visible: true,
                         priority: None,
+                        use_responses_lite: (provider == OPENAI_OAUTH_PROVIDER_NAME)
+                            .then_some(true),
                         extensions: None,
                     })
                     .collect(),
@@ -450,6 +728,630 @@ pub(super) fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegis
         model_source,
     )
     .expect("provider registry")
+}
+
+#[tokio::test]
+async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut accounts = memory_accounts();
+    let account = |name: &str, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+        alias: CredentialAlias::new(name),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: name.to_owned(),
+        status: CredentialStatus::Ok,
+        active,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    accounts.add(account("account-a", true)).expect("add A");
+    accounts.add(account("account-b", false)).expect("add B");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let providers = test_provider_registry();
+    let row = |slug: &str| DiscoveredModel {
+        slug: slug.to_owned(),
+        display_name: slug.to_owned(),
+        context_window: None,
+        max_output_tokens: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: Some(true),
+        extensions: None,
+    };
+    providers.replace_discovered_models(
+        OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        vec![row("a-only")],
+        1,
+    );
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+    let (sink, mut frames) = channel_sink();
+    for (command_id, alias, previous) in [
+        ("switch-to-b", "account-b", "a-only"),
+        ("switch-back-to-a", "account-a", "b-only"),
+    ] {
+        if alias == "account-a" {
+            providers.replace_discovered_models(
+                OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+                vec![row("b-only")],
+                2,
+            );
+        }
+        handle_set_active(
+            &store,
+            &mut accounts,
+            &snapshot,
+            None,
+            &providers,
+            &mut pending,
+            SetActiveJob {
+                command_id: command_id.to_owned(),
+                alias: alias.to_owned(),
+                route: LoginRoute {
+                    request_id: RequestId::new(command_id),
+                    sink: Arc::clone(&sink),
+                },
+            },
+        )
+        .await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), frames.recv())
+                .await
+                .expect("set-active deadline"),
+            Some(WireFrame::Response {
+                body: ResponseBody::AccountSetActive { .. },
+                ..
+            })
+        ));
+        let summary = providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("summary");
+        assert!(
+            !summary.models.contains(&previous.to_owned()),
+            "{previous} must disappear at the switch boundary"
+        );
+        assert_eq!(summary.models.len(), 6, "only static Lite rows remain");
+        assert!(matches!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::Static
+        ));
+        assert_eq!(
+            pending.next_ready(&HashSet::new()).as_deref(),
+            Some(OPENAI_OAUTH_PROVIDER_NAME)
+        );
+        assert_eq!(
+            active_catalog_cache_key(OPENAI_OAUTH_PROVIDER_NAME, &accounts, &providers),
+            Some(ProviderModelCacheKey::for_account(
+                OPENAI_OAUTH_PROVIDER_NAME,
+                accounts
+                    .get(&CredentialAlias::new(alias))
+                    .expect("active descriptor")
+            ))
+        );
+    }
+    providers.replace_discovered_models(
+        OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        vec![row("a-refetched")],
+        3,
+    );
+    let models = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("A summary after refetch")
+        .models;
+    assert!(models.contains(&"a-refetched".to_owned()));
+    assert_eq!(models.len(), 7);
+}
+
+/// Astra B1: a Kimi Code home source names the credential SOURCE
+/// (`kimi:<source suffix>`), not the account. A different account signing in
+/// at the same source (the credential digest changes)
+/// must start a new catalog: the previous account's live rows are cleared, a
+/// late completion started under A's key is fenced, A's durable row is never
+/// read under B's key after a restart, and this holds whether or not the
+/// sweep manages to delete A's row. An unchanged source re-read keeps its
+/// catalog.
+/// MUTATION CHECK: omit the incarnation from the key; A and B collide.
+#[tokio::test]
+async fn same_source_account_replacement_never_serves_the_previous_accounts_rows() {
+    let kimi = haider_provider::KIMI_OAUTH_PROVIDER_NAME;
+    let row = |slug: &str| DiscoveredModel {
+        slug: slug.into(),
+        display_name: slug.into(),
+        context_window: None,
+        max_output_tokens: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let source_account = |captured_at: u64, credential: &str| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: Some(format!("synthetic-credential-{credential}")),
+        alias: CredentialAlias::new("kimi-code-home"),
+        provider: kimi.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "kimi:0123456789abcdef".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(AccountIdentity {
+            email: None,
+            display_name: Some("Kimi Code subscription".into()),
+            account_id: Some("kimi:0123456789abcdef".into()),
+            plan: None,
+            issuer: Some("https://auth.kimi.com".into()),
+            captured_at,
+            verified: false,
+        }),
+        created_at_ms: None,
+    };
+    let registry = || {
+        ProviderRegistry::new(
+            Box::new(TestProviderStore::default()) as Box<dyn ProviderRegistryStoreLike>,
+            initial_provider_profiles(
+                &std::collections::BTreeSet::from([kimi.to_owned()]),
+                "unused",
+            ),
+            Arc::new(CachedProviderModelSource::default()),
+        )
+        .expect("provider registry")
+    };
+    let has_row = |providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>| {
+        providers
+            .summary(kimi, &|_| true)
+            .expect("kimi summary")
+            .models
+            .contains(&"a-only".to_owned())
+    };
+
+    for prune_succeeds in [true, false] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let providers = registry();
+        let mut accounts = memory_accounts();
+        accounts.add(source_account(1_000, "A")).expect("account A");
+        let key_a = ProviderModelCacheKey::for_account(
+            kimi,
+            accounts
+                .get(&CredentialAlias::new("kimi-code-home"))
+                .expect("A"),
+        );
+        let producer_a = catalog_producer("test-profile", kimi, &accounts, &providers)
+            .expect("A catalog producer");
+        store
+            .put_provider_models(key_a.clone().into(), "[]".into(), Some("a-etag".into()), 1)
+            .await
+            .expect("A's durable catalog");
+        providers.replace_discovered_models(kimi.to_owned(), vec![row("a-only")], 1);
+        let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+
+        // An unchanged source re-read is the same account: nothing moves.
+        let before = accounts.list().to_vec();
+        accounts
+            .replace(source_account(1_000, "A"))
+            .expect("unchanged re-read");
+        finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+        assert!(has_row(&providers), "an unchanged source keeps its catalog");
+        assert!(refresh_completion_is_current(
+            &producer_a,
+            "test-profile",
+            &accounts,
+            &providers
+        ));
+
+        // Account B signs in at the same source: the file is rewritten.
+        if !prune_succeeds {
+            store
+                .clone()
+                .close()
+                .await
+                .expect("close store: the sweep will fail");
+        }
+        let before = accounts.list().to_vec();
+        accounts
+            .replace(source_account(1_000, "B"))
+            .expect("account B at the same source");
+        finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+        let key_b = ProviderModelCacheKey::for_account(
+            kimi,
+            accounts
+                .get(&CredentialAlias::new("kimi-code-home"))
+                .expect("B"),
+        );
+        let producer_b = catalog_producer("test-profile", kimi, &accounts, &providers)
+            .expect("B catalog producer");
+        assert_ne!(
+            key_a, key_b,
+            "a same-source account replacement is a new catalog"
+        );
+        assert!(
+            !has_row(&providers),
+            "A's live rows are gone at the replacement"
+        );
+        assert!(
+            !refresh_completion_is_current(&producer_a, "test-profile", &accounts, &providers),
+            "a flight started under A's key is fenced after the replacement"
+        );
+        assert!(refresh_completion_is_current(
+            &producer_b,
+            "test-profile",
+            &accounts,
+            &providers
+        ));
+
+        // Restart hydration reads B's key only.
+        let reopened = if prune_succeeds {
+            store.clone()
+        } else {
+            open_store(dir.path()).await
+        };
+        assert!(
+            reopened
+                .provider_models(key_b.clone().into())
+                .await
+                .expect("B hydration read")
+                .is_none(),
+            "restart never hydrates A's rows as B's (prune_succeeds={prune_succeeds})"
+        );
+        assert_eq!(
+            reopened
+                .provider_models(key_a.clone().into())
+                .await
+                .expect("A row read")
+                .is_some(),
+            !prune_succeeds,
+            "a successful sweep deletes A's row; a failed one leaves it unreadable"
+        );
+        reopened.close().await.expect("close");
+
+        // A removed alias can later be reused with byte-identical source
+        // content. Its retired producer must still be rejected, including
+        // when the earlier prune failed.
+        accounts
+            .remove(&CredentialAlias::new("kimi-code-home"))
+            .expect("remove B");
+        accounts
+            .add(source_account(1_000, "B"))
+            .expect("re-add same alias and bytes");
+        assert!(!refresh_completion_is_current(
+            &producer_b,
+            "test-profile",
+            &accounts,
+            &providers
+        ));
+    }
+}
+
+/// A login whose provider returns no account coordinate (Kimi, Grok without
+/// an ID token, Anthropic) gets a synthetic identity from its grant: stable
+/// across refresh of that grant, distinct for every new login, and Anthropic
+/// keeps its released spelling.
+#[test]
+fn grant_identity_is_a_per_login_account_boundary() {
+    let grant = |access: &[u8]| haider_accounts::OAuthIdentityV1 {
+        subject_hash: blake3::hash(access).to_hex().to_string(),
+        display_identity: "Kimi Code subscription".into(),
+    };
+    let kimi = haider_provider::KIMI_OAUTH_PROVIDER_NAME;
+    let first =
+        crate::oauth::grant_account_identity(kimi, "https://auth.kimi.com", &grant(b"a"), 1);
+    let again =
+        crate::oauth::grant_account_identity(kimi, "https://auth.kimi.com", &grant(b"a"), 1);
+    let other =
+        crate::oauth::grant_account_identity(kimi, "https://auth.kimi.com", &grant(b"b"), 2);
+    assert_eq!(first, again);
+    assert_ne!(first.account_id, other.account_id);
+    assert!(
+        first
+            .account_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("kimi-oauth:grant-"))
+    );
+    let anthropic = crate::oauth::grant_account_identity(
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        "https://claude.ai",
+        &grant(b"a"),
+        1,
+    );
+    assert!(
+        anthropic
+            .account_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("anthropic:") && !id.contains("grant"))
+    );
+}
+
+#[tokio::test]
+async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let providers = test_provider_registry();
+    let mut accounts = memory_accounts();
+    let descriptor = |alias: &str, identity: &str, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+        alias: CredentialAlias::new(alias),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: identity.into(),
+        status: CredentialStatus::Ok,
+        active,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let row = |slug: &str| DiscoveredModel {
+        slug: slug.into(),
+        display_name: slug.into(),
+        context_window: None,
+        max_output_tokens: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: Some(true),
+        extensions: None,
+    };
+    accounts
+        .add(descriptor("a", "identity-a", true))
+        .expect("A");
+    accounts
+        .add(descriptor("retired", "old", false))
+        .expect("retired");
+    providers.replace_discovered_models(OPENAI_OAUTH_PROVIDER_NAME.into(), vec![row("a-only")], 1);
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+
+    let before = accounts.list().to_vec();
+    accounts
+        .replace(descriptor("retired", "new", false))
+        .expect("replace inactive");
+    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    assert!(
+        providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("active summary")
+            .models
+            .contains(&"a-only".into())
+    );
+
+    let before = accounts.list().to_vec();
+    accounts
+        .replace(descriptor("a", "identity-a", true))
+        .expect("same identity re-login");
+    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    assert!(
+        providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("same identity summary")
+            .models
+            .contains(&"a-only".into())
+    );
+
+    let before = accounts.list().to_vec();
+    accounts
+        .add(descriptor("b", "identity-b", true))
+        .expect("new active B");
+    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    let summary = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("B summary");
+    assert!(!summary.models.contains(&"a-only".into()));
+    assert_eq!(
+        summary.models.len(),
+        6,
+        "only static provider truth remains"
+    );
+    providers.models_unavailable(OPENAI_OAUTH_PROVIDER_NAME, "synthetic 403".into());
+    let failed = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("failed B summary");
+    assert!(
+        !failed.models.contains(&"a-only".into()),
+        "failed B refresh cannot revive A"
+    );
+
+    providers.replace_discovered_models(OPENAI_OAUTH_PROVIDER_NAME.into(), vec![row("b-only")], 2);
+    let old_b_key = ProviderModelCacheKey::for_account(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        accounts
+            .get(&CredentialAlias::new("b"))
+            .expect("B descriptor"),
+    );
+    store
+        .put_provider_models(old_b_key.clone().into(), "[]".into(), None, 2)
+        .await
+        .expect("seed B cache");
+    let before = accounts.list().to_vec();
+    accounts
+        .replace(descriptor("b", "different-identity", true))
+        .expect("reimport other identity");
+    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    assert!(
+        !providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("new identity summary")
+            .models
+            .contains(&"b-only".into())
+    );
+    assert!(
+        store
+            .provider_models(old_b_key.into())
+            .await
+            .expect("old B cache read")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn fresh_anthropic_oauth_add_keeps_claude_selectable_after_models_403() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let providers = test_provider_registry();
+    providers.clear_discovered_models(ANTHROPIC_OAUTH_PROVIDER_NAME);
+    let accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let vault = Arc::new(MemoryVault::new());
+    let discoverer = Arc::new(BlockingModelDiscoverer {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        seen: StdMutex::new(Vec::new()),
+        results: StdMutex::new(std::collections::VecDeque::from([
+            ModelDiscoveryFixture::Return(Err(CatalogError::Unavailable {
+                reason: "synthetic /v1/models (403)".into(),
+            })),
+        ])),
+    });
+    let broker_vault = vault.clone() as Arc<dyn Vault>;
+    let broker_snapshot = Arc::clone(&snapshot);
+    let (mut actor, broker) = start_account_actor_with_services(
+        AccountActorConfig {
+            store: store.clone(),
+            accounts,
+            vault: vault as Arc<dyn Vault>,
+            validator: Arc::new(ProviderCredentialValidator),
+            snapshot: Arc::clone(&snapshot),
+            management: Some(management.clone()),
+            device_discovery: DeviceDiscoverySnapshot::new(false),
+            profile_id: "fresh-anthropic-oauth".into(),
+            default_model: "unused".into(),
+            providers,
+            provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            reserved_aliases: HashSet::new(),
+            refresh_fences: RefreshFenceRegistry::default(),
+            source_registry: empty_source_registry(),
+            source_snapshot: empty_source_snapshot(),
+        },
+        |commands| {
+            CredentialBroker::new(
+                broker_vault,
+                OAuthProviderCatalog::default(),
+                broker_snapshot,
+                commands,
+            )
+        },
+        discoverer.clone() as Arc<dyn ProviderModelDiscoverer>,
+        Arc::new(UnreachableGcloud),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
+    )
+    .expect("fresh subscription actor");
+
+    let bundle = haider_accounts::OAuthTokenBundleV1::new(
+        ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+        "https://claude.ai".into(),
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
+        None,
+        "Bearer".into(),
+        Zeroizing::new(b"synthetic-anthropic-access".to_vec()),
+        None,
+        u64::MAX - 1,
+        Some(u64::MAX),
+        vec!["user:inference".into()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "synthetic-subject".into(),
+            display_identity: "synthetic@example.invalid".into(),
+        },
+        1,
+    )
+    .expect("synthetic OAuth bundle");
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "fresh-anthropic-oauth-add".into(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+            display_alias: "fresh-claude".into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                ANTHROPIC_OAUTH_PROVIDER_NAME,
+                "fresh-claude",
+                bundle,
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("fresh-anthropic-oauth-add"),
+                sink,
+            },
+        })))
+        .await
+        .expect("OAuth add handoff");
+    let added = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+        .await
+        .expect("OAuth add response deadline")
+        .expect("OAuth add response");
+    let WireFrame::Response {
+        body: ResponseBody::AccountAdd { descriptor },
+        ..
+    } = added
+    else {
+        panic!("unexpected OAuth add response: {added:?}");
+    };
+    broker
+        .resolve(&descriptor)
+        .await
+        .unwrap_or_else(|error| panic!("synthetic OAuth credential should resolve: {error:?}"));
+    tokio::time::timeout(Duration::from_secs(10), discoverer.started.notified())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "queued /v1/models request; current summary: {:?}",
+                management.read().expect("management view").providers
+            )
+        });
+    discoverer.release.notify_one();
+    let provider = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let view = management.read().expect("management view");
+            let provider = view
+                .providers
+                .into_iter()
+                .find(|row| row.provider == ANTHROPIC_OAUTH_PROVIDER_NAME)
+                .expect("Anthropic OAuth summary");
+            if matches!(
+                provider.inventory,
+                haider_rpc::ModelInventoryWire::Unavailable { .. }
+            ) {
+                break provider;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed model-list publication");
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(provider.models.contains(&"claude-fable-5-1".into()));
+    assert!(provider.model_details.iter().any(|row| {
+        row.name == "claude-fable-5-1"
+            && row.source == Some(haider_rpc::ModelDetailSourceWire::Static)
+    }));
+    assert!(
+        discoverer
+            .seen
+            .lock()
+            .expect("recorded discovery")
+            .iter()
+            .any(|(source, token, _)| {
+                source.endpoint().ends_with("/v1/models")
+                    && token.as_deref() == Some("synthetic-anthropic-access")
+            })
+    );
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
 }
 
 fn identity_for(profile: &str, command: &str) -> LoginIdentity {
@@ -528,6 +1430,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         .unwrap_or_else(|error| panic!("{error:?}"));
     let snapshot = Arc::new(StdMutex::new(vec![
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: anthropic_alias.clone(),
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -537,10 +1441,11 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: openai_alias.clone(),
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -550,10 +1455,11 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: gemini_alias.clone(),
             provider: GEMINI_PROVIDER_NAME.into(),
             base_url: None,
@@ -563,10 +1469,11 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: compatible_alias.clone(),
             provider: OPENAI_COMPATIBLE_PROVIDER_NAME.into(),
             base_url: Some("http://127.0.0.1:11434".into()),
@@ -576,7 +1483,6 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
     ]));
@@ -595,6 +1501,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         account_alias: None,
         model: model.into(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -675,6 +1582,8 @@ fn selected_session_account_bypasses_mutable_active_account() {
     let selected_alias = CredentialAlias::new("selected-openai");
     let active_alias = CredentialAlias::new("active-openai");
     let selected = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: selected_alias.clone(),
         provider: OPENAI_PROVIDER_NAME.into(),
         base_url: None,
@@ -684,10 +1593,11 @@ fn selected_session_account_bypasses_mutable_active_account() {
         active: false,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let active = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: active_alias,
         identity: "active fixture".into(),
         active: true,
@@ -729,6 +1639,8 @@ pub(super) fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderS
 
 pub(super) fn adapter_cache_descriptor(provider: &str, alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.to_owned(),
         base_url: None,
@@ -738,7 +1650,6 @@ pub(super) fn adapter_cache_descriptor(provider: &str, alias: &str) -> Credentia
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -1020,6 +1931,8 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     let provider = "custom-llama";
     let alias = CredentialAlias::new("custom-llama-key");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: Some("http://203.0.113.7/v1".to_owned()),
@@ -1029,7 +1942,6 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: Some(42),
     };
     let summary = ProviderSummaryWire {
@@ -1042,9 +1954,11 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "llama-fixture".to_owned(),
                 display_name: None,
                 context_window: Some(131_072),
+                max_output_tokens: Some(16_384),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -1052,9 +1966,11 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "llama-other".to_owned(),
                 display_name: None,
                 context_window: Some(65_536),
+                max_output_tokens: Some(16_384),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -1115,6 +2031,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             account_alias: None,
             model: "llama-fixture".to_owned(),
             max_tokens: 64,
+            max_tokens_source: None,
             permission_overrides: None,
             interaction_mode: Default::default(),
             system_prompt_version: None,
@@ -1139,6 +2056,114 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     );
 }
 
+/// Catalogs that declare no window (Anthropic subscription and API, Gemini,
+/// DeepSeek) still give the daemon a compaction threshold: the projection
+/// falls back to the single pinned limits table. Anthropic's 1M windows for
+/// Opus 5.5 and Sonnet 4.6 are the documented default without a beta header
+/// (platform.claude.com/docs/en/build-with-claude/context-windows, checked
+/// 2026-09-25).
+/// MUTATION CHECK: drop the `static_model_limits` fallback in
+/// `model_detail_wire`; every window below becomes None and no automatic
+/// compaction threshold exists for these sessions.
+#[tokio::test]
+async fn undeclared_catalog_windows_still_yield_a_daemon_compaction_threshold() {
+    let windowless = |slug: &str| haider_provider::DiscoveredModel {
+        slug: slug.to_owned(),
+        display_name: slug.to_owned(),
+        context_window: None,
+        max_output_tokens: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let cases = [
+        // A fetched Anthropic subscription row with no window (the remote
+        // metadata replaces the static row) and a static-only row.
+        (
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            "claude-opus-5-5",
+            1_000_000_u64,
+        ),
+        (
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            "claude-sonnet-4-6",
+            1_000_000,
+        ),
+        (ANTHROPIC_PROVIDER_NAME, "claude-sonnet-4-6", 1_000_000),
+        (
+            haider_provider::GEMINI_PROVIDER_NAME,
+            "gemini-3.7-flash",
+            1_048_576,
+        ),
+        (
+            haider_provider::DEEPSEEK_PROVIDER_NAME,
+            "deepseek-v4-flash",
+            1_000_000,
+        ),
+    ];
+    for provider in [
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        ANTHROPIC_PROVIDER_NAME,
+        haider_provider::GEMINI_PROVIDER_NAME,
+        haider_provider::DEEPSEEK_PROVIDER_NAME,
+    ] {
+        let models = cases
+            .iter()
+            // anthropic-oauth sonnet-4-6 stays a static-only row.
+            .filter(|(case_provider, model, _)| {
+                *case_provider == provider
+                    && !(provider == ANTHROPIC_OAUTH_PROVIDER_NAME && *model == "claude-sonnet-4-6")
+            })
+            .map(|(_, model, _)| windowless(model))
+            .collect::<Vec<_>>();
+        model_source.replace(
+            provider.to_owned(),
+            ProviderInventory::Fetched {
+                models,
+                fetched_at_ms: 1,
+            },
+        );
+    }
+    let registry = ProviderRegistry::new(
+        Box::new(TestProviderStore::default()) as Box<dyn ProviderRegistryStoreLike>,
+        initial_provider_profiles(
+            &cases
+                .iter()
+                .map(|(provider, _, _)| (*provider).to_owned())
+                .collect(),
+            "claude-opus-5-5",
+        ),
+        model_source,
+    )
+    .expect("provider registry");
+    let summaries = registry.summaries(&|_| true);
+    let factory = AccountsProviderFactory::new_with_management(
+        Arc::new(StdMutex::new(Vec::new())),
+        ManagementSnapshot::new(0, Vec::new(), summaries),
+        VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    for (provider, model, expected_window) in cases {
+        let window = factory.model_context_window(provider, model);
+        assert_eq!(
+            window,
+            Some(expected_window),
+            "{provider}/{model} must project its pinned window"
+        );
+        let reserved = haider_provider::static_model_limits(provider, model).max_output_tokens;
+        let threshold = haider_core::context_soft_threshold_tokens(expected_window, reserved);
+        assert!(
+            threshold.is_some_and(|tokens| tokens > 0 && tokens < expected_window),
+            "{provider}/{model} has an automatic compaction threshold: {threshold:?}"
+        );
+    }
+}
+
 /// MUTATION CHECK: skip the active-credential proof, accept an equal/smaller
 /// target window, or forget to build the promotion lane. Expected runtime
 /// failure: an unusable target resolves or the valid larger target disappears.
@@ -1156,9 +2181,11 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         models: vec!["model-small".to_owned(), "model-large".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "model-small".to_owned(),
                 display_name: None,
                 context_window: Some(32_000),
+                max_output_tokens: Some(8_192),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -1166,9 +2193,11 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "model-large".to_owned(),
                 display_name: None,
                 context_window: Some(128_000),
+                max_output_tokens: Some(32_768),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -1196,6 +2225,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         account_alias: None,
         model: "model-small".to_owned(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -1233,6 +2263,8 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
     );
 
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: None,
@@ -1242,7 +2274,6 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let vault = Arc::new(MemoryVault::default());
@@ -1297,9 +2328,11 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
         semantic_progress_timeout_ms: None,
         models: vec!["llama3.1:8b".to_owned()],
         model_details: vec![ModelDetailWire {
+            source: None,
             name: "llama3.1:8b".to_owned(),
             display_name: None,
             context_window: None,
+            max_output_tokens: None,
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: Vec::new(),
@@ -1349,6 +2382,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         account_alias: None,
         model: "llama3.1:8b".to_owned(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -1453,6 +2487,8 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         .put(&alias, b"stored-key-sentinel")
         .expect("seed stored key");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: None,
@@ -1462,7 +2498,6 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
@@ -1525,6 +2560,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
                 account_alias: None,
                 model: "llama3.1:8b".to_owned(),
                 max_tokens: 64,
+                max_tokens_source: None,
                 permission_overrides: None,
                 interaction_mode: Default::default(),
                 system_prompt_version: None,
@@ -1702,6 +2738,8 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
     let store = open_store(dir.path()).await;
     let alias = CredentialAlias::new("fenced-oauth");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: "fake-oauth".into(),
         base_url: None,
@@ -1711,7 +2749,6 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let mut accounts = memory_accounts();
@@ -1959,6 +2996,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     let primary_alias = CredentialAlias::new("wedged-primary");
     let alternate_alias = CredentialAlias::new("wedged-backup");
     let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
+        credential_digest: None,
         alias,
         provider: OPENAI_PROVIDER_NAME.into(),
         base_url: None,
@@ -2024,6 +3062,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             account_alias: None,
             model: "gpt-test".into(),
             max_tokens: 64,
+            max_tokens_source: None,
             permission_overrides: None,
             interaction_mode: Default::default(),
             system_prompt_version: None,
@@ -2066,6 +3105,8 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
     let target = CredentialAlias::new("fallback-openai");
     let descriptors = vec![
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: current.clone(),
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -2075,10 +3116,11 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: target.clone(),
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -2088,7 +3130,6 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
     ];
@@ -2135,6 +3176,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         // traversal. Manual model selection must not disable the chain.
         model: "claude-manual-selection".into(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -2269,6 +3311,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
     let refresh_backup_alias = CredentialAlias::new("refresh-usable-backup");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: limited_alias.clone(),
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -2278,12 +3322,13 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("limited descriptor");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alternate_alias.clone(),
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -2293,12 +3338,13 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             active: false,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("alternate descriptor");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: refresh_failed_alias.clone(),
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -2308,12 +3354,13 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("refresh-failed descriptor");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: refresh_backup_alias.clone(),
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -2323,7 +3370,6 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             active: false,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("refresh backup descriptor");
@@ -2373,6 +3419,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             account_alias: None,
             model: "gpt-test".into(),
             max_tokens: 64,
+            max_tokens_source: None,
             permission_overrides: None,
             interaction_mode: Default::default(),
             system_prompt_version: None,
@@ -2458,6 +3505,8 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
     let openai_alias = CredentialAlias::new("openai-oauth-dispatch");
     let anthropic_alias = CredentialAlias::new("anthropic-oauth-dispatch");
     let descriptor = |alias: CredentialAlias, provider: &str| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias,
         provider: provider.into(),
         base_url: None,
@@ -2467,7 +3516,6 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let openai_descriptor = descriptor(openai_alias.clone(), OPENAI_OAUTH_PROVIDER_NAME);
@@ -2590,6 +3638,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         account_alias: None,
         model: model.into(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -2927,11 +3976,13 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
                     slug: "live-model".into(),
                     display_name: "Live Model".into(),
                     context_window: None,
+                    max_output_tokens: None,
                     description: None,
                     default_effort: None,
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: Some("fixture-etag".into()),
@@ -2941,7 +3992,8 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
 
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
-    let accounts = memory_accounts();
+    let mut accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = MemoryVault::new();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
@@ -2950,8 +4002,10 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
+            profile_id: "test-profile",
             store: &store,
-            accounts: &accounts,
+            accounts: &mut accounts,
+            snapshot: &snapshot,
             vault: &vault,
             management: Some(&management),
             providers: &mut providers,
@@ -3043,7 +4097,8 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
 
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
-    let accounts = memory_accounts();
+    let mut accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let discoverer = UnusedDiscovery;
@@ -3051,8 +4106,10 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
+            profile_id: "test-profile",
             store: &store,
-            accounts: &accounts,
+            accounts: &mut accounts,
+            snapshot: &snapshot,
             vault: &vault,
             management: None,
             providers: &mut providers,
@@ -4047,6 +5104,8 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
 
     // Finalize commits the descriptor response; a replay returns it.
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(identity.physical_alias.clone()),
         provider: "anthropic".into(),
         base_url: None,
@@ -4056,7 +5115,6 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     store
@@ -4253,6 +5311,8 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
     let descriptor_d = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(identity_d.physical_alias.clone()),
         provider: "anthropic".into(),
         base_url: None,
@@ -4262,7 +5322,6 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     store
@@ -4817,6 +5876,8 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
         replace_existing: false,
     };
     let descriptor = |alias: &CredentialAlias, identity: &str, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: "anthropic".into(),
         base_url: None,
@@ -4826,7 +5887,6 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
         active,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
 
@@ -4963,6 +6023,8 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
                 "readd-removed".into(),
                 AccountAddReceiptResponse {
                     descriptor: CredentialDescriptor {
+                        incarnation: 0,
+                        credential_digest: None,
                         alias: removed_alias.clone(),
                         provider: "fake-oauth".into(),
                         base_url: None,
@@ -4972,7 +6034,6 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
                         active: true,
                         label: None,
                         account_identity: None,
-                        incarnation: 0,
                         created_at_ms: None,
                     },
                 },
@@ -5061,6 +6122,8 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
     let other_alias = CredentialAlias::new("other-oauth-account");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: other_alias.clone(),
             provider: captured.provider.clone(),
             base_url: None,
@@ -5070,7 +6133,6 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
             active: false,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("add other descriptor");
@@ -5080,6 +6142,11 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
     accounts
         .select(&other_alias)
         .expect("change active selection");
+    let prior_incarnation = accounts.get(&alias).expect("captured account").incarnation;
+    let prior_catalog_key = ProviderModelCacheKey::for_account(
+        &captured.provider,
+        accounts.get(&alias).expect("captured account"),
+    );
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = Arc::new(MemoryVault::new());
     vault
@@ -5122,6 +6189,15 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
     .await
     .expect("benign fields do not fence rotation");
     let current = accounts.get(&alias).expect("descriptor remains");
+    assert_eq!(
+        current.incarnation, prior_incarnation,
+        "token refresh keeps the account incarnation"
+    );
+    assert_eq!(
+        ProviderModelCacheKey::for_account(&captured.provider, current),
+        prior_catalog_key,
+        "token refresh keeps the durable catalog key",
+    );
     assert!(!current.active);
     assert!(matches!(
         current.status,
@@ -5453,6 +6529,8 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
     let primary_alias = CredentialAlias::new("oauth-primary");
     let removed_alias = CredentialAlias::new("oauth-removed");
     let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias,
         provider: "fake-oauth".into(),
         base_url: None,
@@ -5462,7 +6540,6 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         active,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let mut accounts = memory_accounts();
@@ -5866,6 +6943,8 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
     let mut accounts = memory_accounts();
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "anthropic".into(),
             base_url: None,
@@ -5875,7 +6954,6 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
             active: true,
             label: Some("operator label".into()),
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("seed API descriptor");
@@ -6272,6 +7350,7 @@ async fn provider_trust_toggle_is_receipted_persisted_and_journaled_raw() {
             provider: OPENAI_PROVIDER_NAME.into(),
             model: "gpt-test".into(),
             max_tokens: 4_096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -6435,11 +7514,13 @@ fn endpoint_edit_registry(
                     slug: "model-a".to_owned(),
                     display_name: "Model A".to_owned(),
                     context_window: None,
+                    max_output_tokens: None,
                     description: Some("endpoint-edit fixture".to_owned()),
                     default_effort: None,
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
             },
@@ -6517,6 +7598,8 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
     let mut accounts = memory_accounts();
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "custom".to_owned(),
             base_url: Some(old_origin.to_owned()),
@@ -6526,7 +7609,6 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("custom descriptor");
@@ -7095,6 +8177,8 @@ async fn pending_remove_reconciliation_retries_orphan_deletion_before_release() 
     let mut accounts = memory_accounts();
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "anthropic".into(),
             base_url: None,
@@ -7104,7 +8188,6 @@ async fn pending_remove_reconciliation_retries_orphan_deletion_before_release() 
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("descriptor");
@@ -7295,7 +8378,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
         ManagementClaim::Fresh
     ));
 
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut providers)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut providers)
         .await
         .expect("legacy receipt reconciliation");
     assert_eq!(store.management_revision().await.expect("revision"), 2);
@@ -7367,17 +8450,27 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
     };
     let (request_json, request_digest) = command_json(&identity).expect("configure identity");
     let recovery = ProviderConfigureRecovery {
+        catalog_producer: configure_catalog_producer(
+            "test-profile",
+            "recovered-router",
+            Some("https://router.example.invalid/v1"),
+            ProviderAuthRequirementWire::None,
+            &memory_accounts(),
+        ),
+        previous_origin: None,
         input,
         previous_auth_requirement: None,
         discovered_models: Some(vec![haider_provider::DiscoveredModel {
             slug: "recovered-model".into(),
             display_name: "Recovered Model".into(),
             context_window: Some(128_000),
+            max_output_tokens: Some(32_768),
             description: None,
             default_effort: None,
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            use_responses_lite: None,
             extensions: None,
         }]),
         discovered_etag: Some("recovered-etag".into()),
@@ -7399,7 +8492,7 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
         ManagementClaim::Fresh
     ));
 
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut providers)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut providers)
         .await
         .expect("reconcile custom configure");
     let summary = providers
@@ -7416,6 +8509,165 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
     assert_eq!(cached.etag.as_deref(), Some("recovered-etag"));
     assert!(cached.models_json.contains("recovered-model"));
     assert_eq!(store.management_revision().await.expect("revision"), 1);
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn recovered_authenticated_custom_catalog_without_account_has_no_durable_row() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let mut providers = ProviderRegistry::new(provider_store, Vec::new(), model_source)
+        .expect("empty provider registry");
+    let input = ProviderConfigureInput {
+        provider: "auth-router".into(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some("https://router.example.invalid/v1".into()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models: vec!["remote-model".into()],
+        default_model: Some("remote-model".into()),
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        trust: None,
+    };
+    let (request_json, request_digest) = command_json(&ProviderConfigureIdentity {
+        input: input.clone(),
+        expected_revision: 0,
+    })
+    .expect("configure identity");
+    let recovery = ProviderConfigureRecovery {
+        catalog_producer: None,
+        previous_origin: None,
+        input,
+        previous_auth_requirement: None,
+        discovered_models: Some(vec![DiscoveredModel {
+            slug: "remote-model".into(),
+            display_name: "Remote Model".into(),
+            context_window: Some(10_000),
+            max_output_tokens: None,
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            use_responses_lite: None,
+            extensions: None,
+        }]),
+        discovered_etag: Some("synthetic-etag".into()),
+        revision_unchanged: false,
+        revision_unchanged_response: None,
+    };
+    store
+        .management_claim_receipt::<ProviderReceipt>(
+            "recover-auth-router".into(),
+            PROVIDER_CONFIGURE_METHOD.into(),
+            request_digest,
+            request_json,
+            Some(serde_json::to_string(&recovery).expect("recovery JSON")),
+            Some(0),
+        )
+        .await
+        .expect("claim");
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut providers)
+        .await
+        .expect("reconcile");
+    assert!(
+        store
+            .provider_models("auth-router".into())
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert!(
+        providers
+            .summary("auth-router", &|_| false)
+            .expect("summary")
+            .models
+            .contains(&"remote-model".into())
+    );
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn legacy_staged_configure_receipt_restores_only_explicit_models() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let mut providers =
+        ProviderRegistry::new(provider_store, Vec::new(), model_source).expect("provider registry");
+    let requested = ProviderConfigureInput {
+        provider: "legacy-staged-router".into(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some("https://router.example.invalid/v1".into()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models: vec!["explicit-static".into()],
+        default_model: Some("explicit-static".into()),
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        trust: None,
+    };
+    let (request_json, request_digest) = command_json(&ProviderConfigureIdentity {
+        input: requested.clone(),
+        expected_revision: 0,
+    })
+    .expect("request identity");
+    let mut contaminated = requested;
+    contaminated.models = vec!["staged-B-private".into()];
+    contaminated.default_model = Some("staged-B-private".into());
+    let recovery = ProviderConfigureRecovery {
+        input: contaminated,
+        previous_auth_requirement: None,
+        previous_origin: None,
+        discovered_models: Some(vec![DiscoveredModel {
+            slug: "staged-B-private".into(),
+            display_name: "staged B".into(),
+            context_window: None,
+            max_output_tokens: None,
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            use_responses_lite: None,
+            extensions: None,
+        }]),
+        discovered_etag: None,
+        catalog_producer: None,
+        revision_unchanged: false,
+        revision_unchanged_response: None,
+    };
+    store
+        .management_claim_receipt::<ProviderReceipt>(
+            "legacy-staged".into(),
+            PROVIDER_CONFIGURE_METHOD.into(),
+            request_digest,
+            request_json,
+            Some(serde_json::to_string(&recovery).expect("recovery JSON")),
+            Some(0),
+        )
+        .await
+        .expect("claim receipt");
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut providers)
+        .await
+        .expect("recover legacy configure");
+    let summary = providers
+        .summary("legacy-staged-router", &|_| false)
+        .expect("summary");
+    assert!(summary.models.contains(&"explicit-static".into()));
+    assert!(!summary.models.contains(&"staged-B-private".into()));
+    assert!(
+        store
+            .provider_models("legacy-staged-router".into())
+            .await
+            .expect("catalog")
+            .is_none()
+    );
     store.close().await.expect("close");
 }
 
@@ -7507,11 +8759,13 @@ async fn wh3_deepseek_catalog_source_populates_models_and_flips_available() {
                     slug: "deepseek-live-fixture".to_owned(),
                     display_name: "DeepSeek Live Fixture".to_owned(),
                     context_window: None,
+                    max_output_tokens: None,
                     description: None,
                     default_effort: None,
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -7647,11 +8901,13 @@ async fn start_gemini_catalog_test_actor(
                     slug: "gemini-2.5-flash".to_owned(),
                     display_name: "Gemini 2.5 Flash".to_owned(),
                     context_window: Some(1_048_576),
+                    max_output_tokens: Some(65_536),
                     description: None,
                     default_effort: None,
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -7855,6 +9111,43 @@ fn refresh_oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
     .expect("model refresh bundle")
 }
 
+#[test]
+fn oauth_intake_digest_covers_refresh_and_id_token_bytes() {
+    let first = refresh_oauth_bundle();
+    assert_eq!(
+        oauth_credential_digest(&first),
+        oauth_credential_digest(&refresh_oauth_bundle())
+    );
+    let changed_refresh = haider_accounts::OAuthTokenBundleV1::new(
+        OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        "http://127.0.0.1:32111".to_owned(),
+        "model-refresh-audience".to_owned(),
+        Some("model-refresh-resource".to_owned()),
+        "Bearer".to_owned(),
+        Zeroizing::new(b"MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_vec()),
+        Some(Zeroizing::new(b"different-synthetic-refresh".to_vec())),
+        u64::MAX - 1,
+        Some(u64::MAX),
+        vec!["inference".to_owned()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "model-refresh-subject".to_owned(),
+            display_identity: "model refresh fixture".to_owned(),
+        },
+        2,
+    )
+    .expect("changed refresh bundle");
+    assert_ne!(
+        oauth_credential_digest(&first),
+        oauth_credential_digest(&changed_refresh)
+    );
+    let changed_id =
+        refresh_oauth_bundle().with_id_token(Zeroizing::new(b"synthetic-id-token".to_vec()));
+    assert_ne!(
+        oauth_credential_digest(&first),
+        oauth_credential_digest(&changed_id)
+    );
+}
+
 /// MUTATION CHECK (W5g-5b): drop the custom-profile arm from
 /// `catalog_source`. Expected runtime failure: the first refresh answers
 /// unavailable instead of publishing `custom-key-model` in its summary.
@@ -7935,6 +9228,8 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
 
     let alias = CredentialAlias::new("custom-refresh-key");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: key_provider.to_owned(),
         base_url: Some("http://203.0.113.7/descriptor-decoy".to_owned()),
@@ -7944,11 +9239,12 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let gemini_alias = CredentialAlias::new("gemini-refresh-key");
     let gemini_descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: gemini_alias.clone(),
         provider: GEMINI_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -7958,7 +9254,6 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let mut accounts = memory_accounts();
@@ -7984,11 +9279,13 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     slug: "custom-key-model".to_owned(),
                     display_name: "custom-key-model".to_owned(),
                     context_window: None,
+                    max_output_tokens: None,
                     description: None,
                     default_effort: None,
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -7998,11 +9295,13 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     slug: "gemini-2.5-flash".to_owned(),
                     display_name: "Gemini 2.5 Flash".to_owned(),
                     context_window: Some(1_048_576),
+                    max_output_tokens: Some(65_536),
                     description: None,
                     default_effort: None,
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: Some(r#"W/"gemini-catalog""#.to_owned()),
@@ -8012,11 +9311,13 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     slug: "custom-public-model".to_owned(),
                     display_name: "custom-public-model".to_owned(),
                     context_window: None,
+                    max_output_tokens: None,
                     description: None,
                     default_effort: None,
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -8174,6 +9475,34 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
     store.close().await.expect("close");
 }
 
+#[test]
+fn old_codex_cache_forces_full_refresh_before_etag_reuse() {
+    let legacy = haider_core::CachedModels {
+        models_json: r#"[{"slug":"old-row","display_name":"Old Row","context_window":null,"description":null,"default_effort":null,"supported_efforts":[],"visible":true,"priority":null}]"#.into(),
+        etag: Some("fixture-etag".into()),
+        fetched_at_ms: 1,
+    };
+    assert_eq!(
+        catalog_refresh_etag(OPENAI_OAUTH_PROVIDER_NAME, Some(&legacy)),
+        None
+    );
+    assert_eq!(
+        catalog_refresh_etag(ANTHROPIC_OAUTH_PROVIDER_NAME, Some(&legacy)).as_deref(),
+        Some("fixture-etag")
+    );
+    let current = haider_core::CachedModels {
+        models_json: legacy.models_json.replace(
+            "\"priority\":null",
+            "\"priority\":null,\"use_responses_lite\":true",
+        ),
+        ..legacy
+    };
+    assert_eq!(
+        catalog_refresh_etag(OPENAI_OAUTH_PROVIDER_NAME, Some(&current)).as_deref(),
+        Some("fixture-etag")
+    );
+}
+
 /// Refresh HTTP is handed to an owned task, broker resolution exposes only
 /// the OAuth access token, and the actor alone publishes the durable result.
 ///
@@ -8213,6 +9542,8 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     let store = open_store(dir.path()).await;
     let alias = CredentialAlias::new("model-refresh-active");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -8222,9 +9553,9 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
+    let cache_key = ProviderModelCacheKey::for_account(OPENAI_OAUTH_PROVIDER_NAME, &descriptor);
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
@@ -8248,11 +9579,13 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
                     slug: "frontier-refresh".to_owned(),
                     display_name: "Provider Refresh Fixture".to_owned(),
                     context_window: None,
+                    max_output_tokens: None,
                     description: Some("provider-owned refresh provenance".to_owned()),
                     default_effort: Some("medium".to_owned()),
                     supported_efforts: vec!["low".to_owned(), "medium".to_owned()],
                     visible: true,
                     priority: Some(7),
+                    use_responses_lite: Some(true),
                     extensions: None,
                 }],
                 etag: Some(r#"W/"refresh-etag""#.to_owned()),
@@ -8345,9 +9678,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             body: ResponseBody::ProviderModelsRefresh { provider, revision },
         } => {
             assert_eq!(request_id.as_str(), "refresh-models");
-            assert_eq!(revision, 1);
-            assert_eq!(provider.models, vec!["frontier-refresh"]);
-            assert_eq!(provider.default_model, None);
+            assert_eq!(revision, 2);
+            assert!(provider.models.contains(&"frontier-refresh".to_owned()));
+            assert!(provider.models.contains(&"gpt-6-astra".to_owned()));
+            assert_eq!(provider.default_model.as_deref(), Some("gpt-6-astra"));
         }
         other => panic!("unexpected refresh response: {other:?}"),
     }
@@ -8363,7 +9697,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         "discovery receives the broker-extracted access token, never the encoded bundle"
     );
     let cached = store
-        .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+        .provider_models(cache_key.clone().into())
         .await
         .expect("cache read")
         .expect("cache row");
@@ -8372,13 +9706,14 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     assert_eq!(cached_models[0].slug, "frontier-refresh");
     assert_eq!(cached.etag.as_deref(), Some(r#"W/"refresh-etag""#));
     let view = management.read().expect("management view");
-    assert_eq!(view.revision, 1);
+    assert_eq!(view.revision, 2);
     let summary = view
         .providers
         .iter()
         .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
         .expect("refreshed provider");
-    assert_eq!(summary.models, vec!["frontier-refresh"]);
+    assert!(summary.models.contains(&"frontier-refresh".to_owned()));
+    assert!(summary.models.contains(&"gpt-6-astra".to_owned()));
     assert_eq!(
         summary.inventory.fetched_at_ms(),
         Some(cached.fetched_at_ms)
@@ -8408,12 +9743,12 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     assert!(matches!(
         frame,
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 1, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 2, .. },
             ..
         }
     ));
     let touched = store
-        .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+        .provider_models(cache_key.clone().into())
         .await
         .expect("touched cache read")
         .expect("touched cache row");
@@ -8434,7 +9769,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         Some(touched.fetched_at_ms),
         "304 refresh must republish the cache timestamp without a revision bump"
     );
-    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    assert_eq!(store.management_revision().await.expect("revision"), 2);
     let seen = discoverer.seen.lock().expect("seen lock").clone();
     assert_eq!(
         seen.get(1).and_then(|(_, _, etag)| etag.as_deref()),
@@ -8484,13 +9819,13 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     }
     assert_eq!(
         store
-            .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+            .provider_models(cache_key.clone().into())
             .await
             .expect("cache after unavailable")
             .expect("cache remains"),
         before_unavailable
     );
-    assert_eq!(store.management_revision().await.expect("revision"), 2);
+    assert_eq!(store.management_revision().await.expect("revision"), 3);
     let failed_view = management.read().expect("failure snapshot");
     let failed_provider = failed_view
         .providers
@@ -8556,7 +9891,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("post-panic response deadline")
             .expect("post-panic response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 4, .. },
             ..
         }
     ));
@@ -8593,7 +9928,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("draining response deadline")
             .expect("draining response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 4, .. },
             ..
         }
     ));
@@ -9274,6 +10609,8 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
         ))
     ));
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME),
         provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -9283,7 +10620,6 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let bundle = haider_accounts::OAuthTokenBundleV1::new(
@@ -9382,6 +10718,16 @@ async fn marked_expired_import_commits_a_fresher_source_and_resolves_it() {
         receipt.command_id.starts_with("oauth-heal-") && receipt.state == "committed"
     }));
     assert!(snapshot.lock().expect("snapshot")[0].status == CredentialStatus::Ok);
+    let healed = snapshot.lock().expect("snapshot")[0].clone();
+    assert!(
+        healed.incarnation > descriptor.incarnation,
+        "an identity-poor import healed from different source bytes needs a new incarnation"
+    );
+    assert_ne!(
+        ProviderModelCacheKey::for_account(&descriptor.provider, &healed),
+        ProviderModelCacheKey::for_account(&descriptor.provider, &descriptor),
+        "the healed account must not read the previous account catalog"
+    );
 
     assert!(broker.shutdown().await);
     actor.shutdown().await;
@@ -9786,6 +11132,8 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     let vault = Arc::new(MemoryVault::new());
     let mut accounts = memory_accounts();
     let expired = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME),
         provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -9795,7 +11143,6 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     accounts.add(expired.clone()).expect("seed expired account");
@@ -9804,7 +11151,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     let management = ManagementSnapshot::new(
         0,
         accounts.list().to_vec(),
-        providers.summaries(&provider_has_credential(&accounts)),
+        providers.summaries(&provider_credential_ready_for_summary(&accounts)),
     );
     let native = Arc::new(StubAccountClaudeNative::with_bytes(
         CLAUDE_READ_THROUGH_FIXTURE,
@@ -9881,6 +11228,8 @@ async fn oauth_import_repairs_an_expired_default_alias_in_place() {
     let mut accounts = memory_accounts();
     let alias = CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME);
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias,
         provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -9890,7 +11239,6 @@ async fn oauth_import_repairs_an_expired_default_alias_in_place() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     accounts
@@ -10563,6 +11911,111 @@ async fn reimport_over_a_retired_secret_restores_the_account() {
     store.close().await.expect("close");
 }
 
+/// Provider removal runs the catalog sweep: rows no reader uses (an orphan
+/// `account-v2:` key left by a removed custom-provider account, the
+/// unreleased `account:<len>:` form, a legacy bare key for an account-scoped
+/// catalog) are deleted, while the public Haider Code catalog under its bare
+/// key survives.
+/// MUTATION CHECK: drop `prune_catalog_cache` from `handle_provider_remove`
+/// (the orphan rows survive), or classify by the profile's inference auth
+/// (the public `haider-code` row is deleted).
+#[tokio::test]
+async fn provider_removal_prunes_unread_catalog_rows_and_keeps_public_catalogs() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let unread = [
+        "account-v2:1111111111111111111111111111111111111111111111111111111111111111",
+        "account:12:openai-oauth:legacy",
+        OPENAI_OAUTH_PROVIDER_NAME,
+    ];
+    for key in unread
+        .into_iter()
+        .chain([haider_provider::HAIDER_CODE_PROVIDER_NAME, "custom-lab"])
+    {
+        store
+            .put_provider_models(key.to_owned(), "[]".to_owned(), None, 1)
+            .await
+            .expect("seed catalog row");
+    }
+    let mut profiles = initial_provider_profiles(
+        &std::collections::BTreeSet::from([
+            OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            haider_provider::HAIDER_CODE_PROVIDER_NAME.to_owned(),
+        ]),
+        "unused",
+    );
+    profiles.push(removable_provider_profile("custom-lab"));
+    let provider_store: Box<dyn ProviderRegistryStoreLike> =
+        Box::new(JsonProviderRegistryStore::new(dir.path()));
+    let providers = ProviderRegistry::new(
+        provider_store,
+        profiles,
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("provider registry");
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
+        profile_id: "provider-remove-prune".into(),
+        default_model: "unused".into(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
+    });
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RemoveProvider(Box::new(
+            ProviderRemoveJob {
+                command_id: "remove-custom-prune".to_owned(),
+                provider: "custom-lab".to_owned(),
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("remove-custom-prune"),
+                    sink,
+                },
+            },
+        )))
+        .await
+        .expect("send remove");
+    assert!(matches!(
+        frames.recv().await.expect("remove response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderRemove { .. },
+            ..
+        }
+    ));
+    for key in unread.into_iter().chain(["custom-lab"]) {
+        assert!(
+            store
+                .provider_models(key.to_owned())
+                .await
+                .expect("cache read")
+                .is_none(),
+            "provider removal prunes unread row {key}"
+        );
+    }
+    assert!(
+        store
+            .provider_models(haider_provider::HAIDER_CODE_PROVIDER_NAME.to_owned())
+            .await
+            .expect("cache read")
+            .is_some(),
+        "the public Haider Code catalog is never pruned"
+    );
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 fn removable_provider_profile(provider: &str) -> ProviderProfileV1 {
     ProviderProfileV1 {
         provider_id: provider.to_owned(),
@@ -10636,11 +12089,13 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
         slug: "custom-model".to_owned(),
         display_name: "Custom Model".to_owned(),
         context_window: Some(64_000),
+        max_output_tokens: Some(16_384),
         description: None,
         default_effort: None,
         supported_efforts: Vec::new(),
         visible: true,
         priority: None,
+        use_responses_lite: None,
         extensions: None,
     };
     store
@@ -10822,7 +12277,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
     )
     .expect("restart loads stale projection");
     assert!(restarted.get("custom-lab").is_some());
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut restarted)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut restarted)
         .await
         .expect("removal receipt reconciles restart");
     assert!(restarted.get("custom-lab").is_none());
@@ -10859,6 +12314,8 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
     for (alias, active) in [("zeta-key", true), ("alpha-key", false)] {
         accounts
             .add(CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: None,
                 alias: CredentialAlias::new(alias),
                 provider: "custom-in-use".to_owned(),
                 base_url: None,
@@ -10868,7 +12325,6 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
                 active,
                 label: None,
                 account_identity: None,
-                incarnation: 0,
                 created_at_ms: None,
             })
             .expect("blocking descriptor");
@@ -11687,6 +13143,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
         account_alias: None,
         model: "claude-opus-5".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         system_prompt_version: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
@@ -11797,9 +13254,11 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
         models: vec!["gpt-5.5".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "gpt-5.5".to_owned(),
                 display_name: None,
                 context_window: Some(400_000),
+                max_output_tokens: Some(128_000),
                 supported_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
                 default_effort: Some("medium".to_owned()),
                 supported_speeds: Vec::new(),
@@ -11807,9 +13266,11 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "gpt-5.6-sol".to_owned(),
                 display_name: None,
                 context_window: Some(400_000),
+                max_output_tokens: Some(128_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -11906,6 +13367,7 @@ fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session:
         account_alias: None,
         model: model.to_owned(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -11938,6 +13400,8 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
             .put(&alias, b"ENTERPRISE_BEARER_SENTINEL_1f2e")
             .unwrap_or_else(|error| panic!("seed key: {error:?}"));
         let descriptor = CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: provider.to_owned(),
             base_url: None,
@@ -11947,7 +13411,6 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         };
         let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
@@ -12007,6 +13470,7 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
 struct ScriptedGcloud {
     responses: StdMutex<std::collections::VecDeque<Result<Vec<u8>, String>>>,
     calls: std::sync::atomic::AtomicUsize,
+    account_id: StdMutex<Option<String>>,
 }
 
 impl ScriptedGcloud {
@@ -12025,9 +13489,17 @@ impl ScriptedGcloud {
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn set_account_id(&self, account_id: &str) {
+        *self.account_id.lock().expect("account id") = Some(account_id.into());
+    }
 }
 
 impl crate::gcloud::GcloudAccessTokenSource for ScriptedGcloud {
+    fn active_account_id(&self) -> Result<Option<String>, HaiderError> {
+        Ok(self.account_id.lock().expect("account id").clone())
+    }
+
     fn print_access_token(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, HaiderError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self
@@ -12076,6 +13548,8 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
     .expect("install scripted source before sharing");
 
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: "vertex".to_owned(),
         base_url: None,
@@ -12085,7 +13559,6 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let refreshed = broker
@@ -12121,6 +13594,8 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
     // Every OTHER ApiKey descriptor keeps the classic refusal — and never
     // touches the shell-out source.
     let plain = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("vertex-key"),
         provider: "vertex".to_owned(),
         base_url: None,
@@ -12130,7 +13605,6 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let refused = broker
@@ -12418,7 +13892,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     let management = ManagementSnapshot::new(
         0,
         Vec::new(),
-        providers.summaries(&provider_has_credential(&accounts)),
+        providers.summaries(&provider_credential_ready_for_summary(&accounts)),
     );
     let before = management
         .read()
@@ -12436,6 +13910,8 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     let gcloud = Arc::new(ScriptedGcloud::default());
     gcloud.push_token(b"GCLOUD_IMPORT_TOKEN_31ab");
     gcloud.push_token(b"GCLOUD_REIMPORT_TOKEN_42cd");
+    gcloud.push_token(b"GCLOUD_OTHER_ACCOUNT_TOKEN_53de");
+    gcloud.set_account_id("synthetic-account@example.invalid");
     let (sink, mut frames) = channel_sink();
     let mut catalog_discoveries = AutomaticCatalogDiscoveryQueue::new(false);
     let job = |command_id: &str, request_id: &str| DeviceImportJob {
@@ -12464,6 +13940,14 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     .await;
     assert!(catalog_discoveries.is_empty());
     let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
+    let first_cache_key = ProviderModelCacheKey::for_account(
+        "vertex",
+        accounts.get(&alias).expect("first vertex account"),
+    );
+    store
+        .put_provider_models(first_cache_key.clone().into(), "[]".into(), None, 1)
+        .await
+        .expect("seed vertex cache");
     match frames.try_recv().expect("import response") {
         WireFrame::Response {
             body: ResponseBody::AccountImportDevice { descriptor, .. },
@@ -12535,6 +14019,59 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
             .filter(|descriptor| descriptor.provider == "vertex")
             .count(),
         1
+    );
+    assert_eq!(
+        ProviderModelCacheKey::for_account(
+            "vertex",
+            accounts.get(&alias).expect("reimported vertex")
+        ),
+        first_cache_key,
+        "a rotating access token from the same gcloud account keeps the catalog"
+    );
+    assert!(
+        store
+            .provider_models(first_cache_key.clone().into())
+            .await
+            .expect("same account cache read")
+            .is_some()
+    );
+    gcloud.set_account_id("other-account@example.invalid");
+    handle_device_import(
+        &store,
+        &mut accounts,
+        Arc::clone(&vault),
+        &snapshot,
+        Some(&management),
+        &providers,
+        &mut catalog_discoveries,
+        &HashSet::new(),
+        &RefreshFenceRegistry::default(),
+        gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
+        job("gcloud-import-3", "req-3"),
+    )
+    .await;
+    assert!(matches!(
+        frames.try_recv(),
+        Ok(WireFrame::Response {
+            body: ResponseBody::AccountImportDevice { .. },
+            ..
+        })
+    ));
+    assert_ne!(
+        ProviderModelCacheKey::for_account(
+            "vertex",
+            accounts.get(&alias).expect("other vertex account")
+        ),
+        first_cache_key,
+        "changing the gcloud account must re-key its catalog"
+    );
+    assert!(
+        store
+            .provider_models(first_cache_key.into())
+            .await
+            .expect("replaced cache read")
+            .is_none()
     );
     store.close().await.expect("close store");
 }
@@ -12617,6 +14154,8 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
     }
     let snapshot = Arc::new(StdMutex::new(vec![
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: anthropic_alias,
             provider: ANTHROPIC_PROVIDER_NAME.into(),
             base_url: None,
@@ -12626,10 +14165,11 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
         CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: openai_alias,
             provider: OPENAI_PROVIDER_NAME.into(),
             base_url: None,
@@ -12639,7 +14179,6 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
     ]));
@@ -12659,6 +14198,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         account_alias: None,
         model: "web-test".into(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -12791,6 +14331,8 @@ async fn each_turn_resolves_the_currently_active_account() {
     let first = CredentialAlias::new("switch-first");
     let second = CredentialAlias::new("switch-second");
     let descriptor = |alias: &CredentialAlias, active: bool| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: Some("http://127.0.0.1:11434/v1".to_owned()),
@@ -12800,7 +14342,6 @@ async fn each_turn_resolves_the_currently_active_account() {
         active,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
 
@@ -12824,9 +14365,11 @@ async fn each_turn_resolves_the_currently_active_account() {
         semantic_progress_timeout_ms: None,
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![ModelDetailWire {
+            source: None,
             name: "llama-fixture".to_owned(),
             display_name: None,
             context_window: Some(131_072),
+            max_output_tokens: Some(16_384),
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: Vec::new(),
@@ -12861,6 +14404,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         account_alias: None,
         model: "llama-fixture".to_owned(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -13219,6 +14763,187 @@ fn write_linked_kimi_source(root: &std::path::Path, access_token: &str, file_nam
     .expect("write Kimi source");
 }
 
+fn kimi_rewrite_with_mtime_mints_incarnation(
+    first: std::time::SystemTime,
+    second: std::time::SystemTime,
+) {
+    let profile = test_store_dir();
+    let root = profile.path().join("kimi-source");
+    let file = root.join("credentials/kimi-code.json");
+    let write = |access: &str, modified: std::time::SystemTime| {
+        write_linked_kimi_source(&root, access, "kimi-code.json");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .expect("open source")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("set source mtime");
+    };
+    write("synthetic-A", first);
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::KimiCodeHome, &root, None)
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("A scan");
+    let first = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    write("synthetic-B", second);
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("B scan");
+    assert!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation
+            > first
+    );
+}
+
+#[test]
+fn linked_kimi_equal_mtime_rewrite_mints_incarnation() {
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    kimi_rewrite_with_mtime_mints_incarnation(time, time);
+}
+
+#[test]
+fn linked_kimi_zero_mtime_rewrite_mints_incarnation() {
+    kimi_rewrite_with_mtime_mints_incarnation(std::time::UNIX_EPOCH, std::time::UNIX_EPOCH);
+}
+
+#[test]
+#[cfg(unix)]
+fn linked_kimi_unrepresentable_mtime_rewrite_mints_incarnation() {
+    let time = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+    kimi_rewrite_with_mtime_mints_incarnation(time, time);
+}
+
+#[test]
+fn linked_kimi_nanosecond_mtime_collision_mints_incarnation() {
+    let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    kimi_rewrite_with_mtime_mints_incarnation(
+        base + std::time::Duration::from_nanos(100),
+        base + std::time::Duration::from_nanos(200),
+    );
+}
+
+#[test]
+fn vanished_linked_source_reappearing_with_identical_bytes_keeps_a_new_incarnation() {
+    let profile = test_store_dir();
+    let root = profile.path().join("kimi-source");
+    let file = root.join("credentials/kimi-code.json");
+    write_linked_kimi_source(&root, "synthetic-A", "kimi-code.json");
+    let bytes = std::fs::read(&file).expect("read original credential bytes");
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::KimiCodeHome, &root, None)
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("initial scan");
+    let original = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    std::fs::remove_file(&file).expect("remove source file");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("missing scan");
+    let vanished = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    assert!(vanished > original);
+    assert!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .credential_digest
+            .is_none()
+    );
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("repeat missing scan");
+    assert_eq!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation,
+        vanished
+    );
+    std::fs::write(&file, bytes).expect("restore same credential bytes");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("return scan");
+    assert_eq!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation,
+        vanished
+    );
+}
+
+#[test]
+fn malformed_linked_source_invalidates_once_before_a_recovered_intake() {
+    let profile = test_store_dir();
+    let root = profile.path().join("kimi-source");
+    let file = root.join("credentials/kimi-code.json");
+    write_linked_kimi_source(&root, "synthetic-A", "kimi-code.json");
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::KimiCodeHome, &root, None)
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("initial scan");
+    let original = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    std::fs::write(&file, b"{").expect("partial rewrite");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("invalid scan");
+    let invalidated = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    assert!(invalidated > original);
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("repeat invalid scan");
+    assert_eq!(
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation,
+        invalidated
+    );
+    write_linked_kimi_source(&root, "synthetic-B", "kimi-code.json");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("recovered scan");
+    let recovered = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .unwrap();
+    assert!(recovered.incarnation > original);
+    assert!(recovered.credential_digest.is_some());
+}
+
+#[test]
+fn linked_codex_retained_last_refresh_mints_for_different_account() {
+    let profile = test_store_dir();
+    let root = profile.path().join("codex-source");
+    write_linked_codex_source(&root, "workspace-A", "a@example.test");
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::CodexHome, &root, None)
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("A scan");
+    let first = accounts
+        .active_for_provider(OPENAI_OAUTH_PROVIDER_NAME)
+        .unwrap()
+        .incarnation;
+    write_linked_codex_source(&root, "workspace-B", "b@example.test");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("B scan");
+    assert!(
+        accounts
+            .active_for_provider(OPENAI_OAUTH_PROVIDER_NAME)
+            .unwrap()
+            .incarnation
+            > first
+    );
+}
+
 /// The operator vocabulary for `haider account source add`. Every durable
 /// kind name plus its short alias resolves; anything else is refused.
 #[test]
@@ -13479,6 +15204,8 @@ fn linked_and_native_grok_accounts_coexist_without_sharing_alias_or_credential()
     let mut accounts = memory_accounts();
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: native_alias.clone(),
             provider: GROK_OAUTH_PROVIDER_NAME.to_owned(),
             base_url: None,
@@ -13488,7 +15215,6 @@ fn linked_and_native_grok_accounts_coexist_without_sharing_alias_or_credential()
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("native descriptor");
@@ -13720,6 +15446,8 @@ impl Vault for VaultTouchCounter {
 
 fn antigravity_descriptor(alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: GOOGLE_ANTIGRAVITY_PROVIDER_NAME.into(),
         base_url: None,
@@ -13729,7 +15457,6 @@ fn antigravity_descriptor(alias: &str) -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -13767,6 +15494,7 @@ fn antigravity_metadata(model: &str) -> haider_protocol::session::SessionMetadat
         account_alias: None,
         model: model.into(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -13984,6 +15712,8 @@ fn account_selection_pins_one_google_alias_and_refuses_another_providers_alias()
     let work = antigravity_descriptor("google-antigravity-work");
     let personal = antigravity_descriptor("google-antigravity-personal");
     let gemini_key = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("gemini-api-key"),
         provider: GEMINI_PROVIDER_NAME.into(),
         base_url: None,
@@ -13993,7 +15723,6 @@ fn account_selection_pins_one_google_alias_and_refuses_another_providers_alias()
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let snapshot = Arc::new(StdMutex::new(vec![
@@ -14139,6 +15868,7 @@ fn the_api_key_gemini_request_shape_is_unchanged_by_the_supervised_agent() {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider
         .request_payload(&request)
@@ -14177,6 +15907,8 @@ async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_va
 
     let supervised = antigravity_descriptor("google-antigravity-attempt");
     let gemini = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: gemini_alias,
         provider: GEMINI_PROVIDER_NAME.into(),
         base_url: None,
@@ -14186,7 +15918,6 @@ async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_va
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let management = ManagementSnapshot::new(
@@ -14288,11 +16019,13 @@ fn customprov_model_rows(ids: &[&str]) -> Vec<haider_provider::DiscoveredModel> 
             slug: (*slug).to_owned(),
             display_name: (*slug).to_owned(),
             context_window: None,
+            max_output_tokens: None,
             description: None,
             default_effort: None,
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            use_responses_lite: None,
             extensions: None,
         })
         .collect()
@@ -14443,14 +16176,15 @@ impl ProviderModelDiscoverer for CustomprovNoSecondDiscovery {
     }
 }
 
-/// The complete chosen picker list survives create in the durable cache and
-/// modelcat's list_models projection. An edit can also choose a manual id
+/// The complete chosen picker list survives create as provider configuration
+/// and in modelcat's list_models projection. An edit can also choose a manual id
 /// after a failed probe even when the old endpoint's cached list disagrees.
 #[tokio::test]
 async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_without_reprobe() {
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
-    let accounts = memory_accounts();
+    let mut accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = MemoryVault::new();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
@@ -14462,8 +16196,10 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
         let (sink, mut frames) = channel_sink();
         handle_provider_configure(
             ProviderConfigureContext {
+                profile_id: "test-profile",
                 store: &store,
-                accounts: &accounts,
+                accounts: &mut accounts,
+                snapshot: &snapshot,
                 vault: &vault,
                 management: Some(&management),
                 providers: &mut providers,
@@ -14514,19 +16250,13 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
             }
             other => panic!("unexpected confirm reply: {other:?}"),
         }
-        let cached = store
-            .provider_models("customprov-confirm".into())
-            .await
-            .expect("cache read")
-            .expect("confirmed cache");
-        let cached: Vec<haider_provider::DiscoveredModel> =
-            serde_json::from_str(&cached.models_json).expect("cached model rows");
-        assert_eq!(
-            cached
-                .iter()
-                .map(|model| model.slug.as_str())
-                .collect::<Vec<_>>(),
-            ids
+        assert!(
+            store
+                .provider_models("customprov-confirm".into())
+                .await
+                .expect("cache read")
+                .is_none(),
+            "explicit configured models must not become fetched inventory"
         );
         let view = management.read().expect("published management");
         let catalog = crate::model_select::ModelSelectionAuthority::new(None, view.providers)
@@ -14553,6 +16283,8 @@ async fn customprov_probe_rejects_claimed_origin_before_resolving_or_sending_key
     let alias = CredentialAlias::new("customprov-repoint-key");
     accounts
         .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: "custom-a".into(),
             base_url: None,
@@ -14562,7 +16294,6 @@ async fn customprov_probe_rejects_claimed_origin_before_resolving_or_sending_key
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         })
         .expect("existing custom account");
@@ -14628,6 +16359,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
     let mut accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
@@ -14635,8 +16367,10 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
+            profile_id: "test-profile",
             store: &store,
-            accounts: &accounts,
+            accounts: &mut accounts,
+            snapshot: &snapshot,
             vault: &vault,
             management: Some(&management),
             providers: &mut providers,
@@ -14754,6 +16488,7 @@ async fn create_provider_trust_test_session(
             provider: OPENAI_PROVIDER_NAME.into(),
             model: "gpt-test".into(),
             max_tokens: 4_096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -14857,7 +16592,7 @@ async fn provider_trust_multiple_sessions_is_atomic_replayable_and_restored_afte
         reopened.get(OPENAI_PROVIDER_NAME).expect("provider").trust,
         ProviderTrustWire::Full
     );
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut reopened)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut reopened)
         .await
         .expect("restore committed trust");
     assert_eq!(
@@ -14933,7 +16668,7 @@ async fn provider_trust_second_session_append_failure_rolls_back_events_receipt_
     store.close().await.expect("close");
     let store = open_store(dir.path()).await;
     let mut reopened = test_provider_registry();
-    reconcile_provider_receipts(&store, &memory_accounts(), &mut reopened)
+    reconcile_provider_receipts(&store, "test-profile", &memory_accounts(), &mut reopened)
         .await
         .expect("restart after failed operation");
     assert_eq!(
@@ -14974,11 +16709,13 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
                     slug: "deepseek-v4-flash".into(),
                     display_name: "deepseek-v4-flash".into(),
                     context_window: None,
+                    max_output_tokens: None,
                     description: None,
                     default_effort: None,
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -15029,7 +16766,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             .summary(HAIDER_CODE_PROVIDER_NAME, &|_| false)
             .expect("public")
             .inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
+        haider_rpc::ModelInventoryWire::Static
     );
     let (sink, mut frames) = channel_sink();
     begin_provider_models_refresh(
@@ -15060,6 +16797,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         .expect("completion");
     let AccountCommand::ProviderModelsRefreshCompleted {
         provider,
+        cache_key,
         cached,
         result,
         completed,
@@ -15076,6 +16814,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             completed: &completed,
         },
         provider,
+        cache_key,
         cached,
         result,
     )
@@ -15113,6 +16852,8 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         let mut invalid_accounts = memory_accounts();
         invalid_accounts
             .add(CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: None,
                 alias: CredentialAlias::new("catalog-test-account"),
                 provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
                 base_url: None,
@@ -15122,7 +16863,6 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
                 active: true,
                 label: None,
                 account_identity: None,
-                incarnation: 0,
                 created_at_ms: None,
             })
             .expect("test descriptor without secret");

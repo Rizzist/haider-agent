@@ -315,7 +315,7 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
     assert_eq!(carrier.call_id, "write-1");
     assert_eq!(carrier.name, "fs_write");
     assert_eq!(carrier.arguments["path"], "result.txt");
-    assert_eq!(carrier.arguments["password"], "[REDACTED:secret_value]");
+    assert_eq!(carrier.arguments["password"], "[REDACTED:password]");
     assert_eq!(carrier.arguments["token"], "[REDACTED:api_key]");
     assert!(!carrier_envelope.render.ui);
     assert_eq!(carrier_envelope.render.prompt, PromptRender::Omit);
@@ -556,7 +556,7 @@ async fn tool_script_carrier_card_and_dispatch_preserve_redacted_raw_source() {
         "whitespace, order, and duplicate keys stay byte-faithful"
     );
     assert!(!redacted_source.contains("short-secret"));
-    assert!(redacted_source.contains("[REDACTED:secret_value]"));
+    assert!(redacted_source.contains("[REDACTED:password]"));
     let card_args = dispatcher
         .seen_card_args
         .lock()

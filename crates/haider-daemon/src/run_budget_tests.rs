@@ -896,6 +896,7 @@ async fn run_provider_budget_case_inner(
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     if usage_reset_auto_allow.is_some() {
         let account = haider_protocol::credential::CredentialDescriptor {
+            credential_digest: None,
             alias: haider_protocol::ids::CredentialAlias::new("synthetic-openai"),
             provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -982,6 +983,7 @@ async fn run_provider_budget_case_inner(
         model: model.to_owned(),
         max_tokens: max_output_tokens,
         permission_overrides,
+        max_tokens_source: None,
         effort: None,
         fast: false,
         cache_policy: Default::default(),
@@ -1934,6 +1936,7 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
         provider: "openai".into(),
         model: "gpt-5.6-sol".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -2236,6 +2239,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

@@ -106,6 +106,11 @@ pub struct CheckpointRecorded {
     pub post_digest: String,
     /// Zero is a producer placeholder stamped from `committed_at_ms`.
     pub recorded_at_ms: u64,
+    /// Some captured path or content would be redacted in an agent view. The
+    /// exact digests above stay in the owner-local journal; public
+    /// projections (headless run output, masked export) must withhold them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted_content: bool,
 }
 
 /// Opaque newest-first list cursor. It is the last emitted journal sequence;

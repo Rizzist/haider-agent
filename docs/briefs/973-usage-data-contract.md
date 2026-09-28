@@ -49,7 +49,10 @@ a keyless answer is rejected as `invalid_frame` with no durable Deny event.
 The TUI answers a spending card only from a deliberate local gesture while the
 card is visible. Composer text, attachments, paste, newline chords, and remote
 input do not answer it. Enter selects Deny by default; a fresh local Down can
-select Apply. An attachment alone is composer content and submits as a message
+select Apply. A local theme, effort, or model picker stays above a pending
+spending card. Every card gesture must find that card visible when the event
+begins, even if an overlay closes during dispatch. An attachment alone is
+composer content and submits as a message
 without answering the card. The menu is session-scoped and
 `blocking: false`; the initiating RPC/tool immediately returns
 `approval_pending` and the run continues.

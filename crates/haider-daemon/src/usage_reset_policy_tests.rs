@@ -84,6 +84,7 @@ async fn run_case(case: Case) -> Outcome {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
         Arc::new(std::sync::Mutex::new(vec![CredentialDescriptor {
+            credential_digest: None,
             alias: CredentialAlias::new(ACCOUNT),
             provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.into(),
             base_url: None,

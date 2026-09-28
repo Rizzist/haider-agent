@@ -11,7 +11,8 @@
 //!   lexicographically first 500 paths and reports overflow honestly.
 //! - File freshness is session-scoped and advances only with a durably
 //!   journaled terminal outcome. File `fs_read`, `fs_write`, and `fs_edit`
-//!   attach the exact BLAKE3 digest to that outcome. Existing-file writes and
+//!   attach a BLAKE3 digest to that outcome (a process-secret keyed digest
+//!   for a redacted read). Existing-file writes and
 //!   edits compare it against the locked current snapshot, returning typed
 //!   unread or stale refusals before any replacement is prepared.
 //! - Mutations record their post-mutation digest in the
@@ -647,7 +648,7 @@ impl EffectOperation for FsRead {
     }
 
     fn summary(&self) -> String {
-        format!("read {}", self.path.display())
+        format!("read {}", crate::redact::model_visible_path(&self.path))
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -778,7 +779,11 @@ impl EffectOperation for FsSearch {
     }
 
     fn summary(&self) -> String {
-        format!("search {} for {:?}", self.root.display(), self.query)
+        format!(
+            "search {} for {:?}",
+            crate::redact::model_visible_path(&self.root),
+            self.query
+        )
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -846,7 +851,11 @@ impl EffectOperation for FsGlob {
     }
 
     fn summary(&self) -> String {
-        format!("glob {} for {:?}", self.root.display(), self.pattern)
+        format!(
+            "glob {} for {:?}",
+            crate::redact::model_visible_path(&self.root),
+            self.pattern
+        )
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -930,7 +939,7 @@ impl EffectOperation for FsEdit {
     }
 
     fn summary(&self) -> String {
-        format!("edit {}", self.path.display())
+        format!("edit {}", crate::redact::model_visible_path(&self.path))
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -1007,7 +1016,7 @@ impl EffectOperation for FsWrite {
     }
 
     fn summary(&self) -> String {
-        format!("write {}", self.path.display())
+        format!("write {}", crate::redact::model_visible_path(&self.path))
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -1104,7 +1113,12 @@ pub(crate) fn build_permission_file_review(
     }
 }
 
-fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(String, usize)> {
+/// Applies anchored replacements. In a file with redacted spans (as `fs_read`
+/// renders it for the model) anchors match visible text only: every verdict,
+/// count and message is a function of the redacted rendering, so an edit —
+/// including an identity edit — cannot test a guess about redacted bytes.
+/// Shared by the unix and Windows edit paths and the Ask file-review recipe.
+fn apply_edit_changes(operation: &FsEdit, edited: String) -> ToolResult<(String, usize)> {
     if operation.edits.is_empty() {
         return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
     }
@@ -1113,6 +1127,15 @@ fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(Str
             "fs_edit old anchors cannot be empty",
         ));
     }
+    let redaction = crate::redact::explicit_read_redacted_spans(&operation.path, &edited);
+    if redaction.spans.is_empty() {
+        apply_plain_edit_changes(operation, edited)
+    } else {
+        apply_redacted_edit_changes(operation, edited, redaction)
+    }
+}
+
+fn apply_plain_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(String, usize)> {
     let mut replacements = 0usize;
     for edit in &operation.edits {
         let matches = edited.match_indices(&edit.old).count();
@@ -1142,6 +1165,105 @@ fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(Str
     Ok((edited, replacements))
 }
 
+/// Matches of `anchor` inside the visible stretches between redacted `spans`.
+/// Each stretch is searched on its own, so a match never crosses a span and
+/// counts and positions depend only on visible text.
+fn visible_anchor_matches(
+    text: &str,
+    anchor: &str,
+    spans: &[crate::redact::RawRedaction],
+) -> Vec<usize> {
+    let mut matches = Vec::new();
+    let mut cursor = 0usize;
+    let tail = text.len()..text.len();
+    for span in spans
+        .iter()
+        .map(|span| &span.raw)
+        .chain(std::iter::once(&tail))
+    {
+        if let Some(visible) = text.get(cursor..span.start) {
+            matches.extend(
+                visible
+                    .match_indices(anchor)
+                    .map(|(index, _)| cursor + index),
+            );
+        }
+        cursor = cursor.max(span.end);
+    }
+    matches
+}
+
+fn apply_redacted_edit_changes(
+    operation: &FsEdit,
+    mut text: String,
+    redaction: crate::redact::ExplicitReadSpans,
+) -> ToolResult<(String, usize)> {
+    if redaction.whole_file {
+        return Err(ToolError::AnchorInRedactedContent {
+            path: operation.path.clone(),
+            whole_file: true,
+        });
+    }
+    let mut spans = redaction.spans;
+    let mut replacements = 0usize;
+    for edit in &operation.edits {
+        let matches = visible_anchor_matches(&text, &edit.old, &spans);
+        // A visible match that ends where a span starts (or starts where one
+        // ends) touches redacted content: refuse it, like an anchor with no
+        // visible match at all (which may name redacted bytes). Both
+        // decisions read only visible text and span positions.
+        let touches = matches.iter().any(|&at| {
+            let end = at + edit.old.len();
+            spans
+                .iter()
+                .any(|span| span.raw.start == end || span.raw.end == at)
+        });
+        if matches.is_empty() || touches {
+            return Err(ToolError::AnchorInRedactedContent {
+                path: operation.path.clone(),
+                whole_file: false,
+            });
+        }
+        if !edit.replace_all && matches.len() != 1 {
+            return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
+                path: operation.path.clone(),
+                matches: matches.len(),
+                replace_all: false,
+                nearest_candidate: None,
+            }));
+        }
+        let mut next = String::with_capacity(
+            text.len()
+                .saturating_add(matches.len().saturating_mul(edit.new.len())),
+        );
+        let mut cursor = 0usize;
+        for &at in &matches {
+            next.push_str(&text[cursor..at]);
+            next.push_str(&edit.new);
+            cursor = at + edit.old.len();
+        }
+        next.push_str(&text[cursor..]);
+        // Matches never overlap a span; a later span moves by the length
+        // change of every replacement before it. Spans are not re-detected:
+        // the redacted bytes keep their original extent for later edits.
+        for span in &mut spans {
+            let before = matches
+                .iter()
+                .take_while(|at| **at < span.raw.start)
+                .count();
+            let shift = |offset: usize| {
+                offset
+                    .saturating_add(before.saturating_mul(edit.new.len()))
+                    .saturating_sub(before.saturating_mul(edit.old.len()))
+            };
+            span.raw = shift(span.raw.start)..shift(span.raw.end);
+        }
+        text = next;
+        replacements = replacements.saturating_add(matches.len());
+    }
+    Ok((text, replacements))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod edit_change_tests {
@@ -1166,6 +1288,207 @@ mod edit_change_tests {
                 message: "fs_edit old anchors cannot be empty".into(),
             }
         );
+    }
+
+    // Synthetic secrets only. `RIGHT` is the redacted value in every fixture;
+    // `WRONG` is a guess of the same shape.
+    const RIGHT: &str = "violet-sunrise";
+    const WRONG: &str = "amber-moonset1";
+
+    /// What the model sees for one edit: the typed verdict and its rendered
+    /// message (success text includes the replacement count).
+    fn model_view(path: &str, text: &str, edit: FsEditChange) -> String {
+        let operation = FsEdit::many(path, vec![edit]);
+        match apply_edit_changes(&operation, text.to_owned()) {
+            Ok((_, replacements)) => format!("ok ({replacements} replacements)"),
+            Err(error) => format!("{error:?} | {error}"),
+        }
+    }
+
+    fn change(old: &str, new: &str, replace_all: bool) -> FsEditChange {
+        FsEditChange {
+            old: old.into(),
+            new: new.into(),
+            replace_all,
+        }
+    }
+
+    /// Every guess shape, as a (right, wrong) pair of anchors and news.
+    fn guess_pairs() -> Vec<(FsEditChange, FsEditChange)> {
+        let mut pairs = Vec::new();
+        for replace_all in [false, true] {
+            for (right, wrong) in [
+                (format!("password={RIGHT}"), format!("password={WRONG}")),
+                (RIGHT.to_owned(), WRONG.to_owned()),
+                (
+                    format!("password={}", &RIGHT[..8]),
+                    format!("password={}", &WRONG[..8]),
+                ),
+                (RIGHT[..3].to_owned(), WRONG[..3].to_owned()),
+                (format!("password={RIGHT}\n"), format!("password={WRONG}\n")),
+                (format!("{RIGHT}\nb=2"), format!("{WRONG}\nb=2")),
+            ] {
+                // Identity edit (old == new) and a real replacement.
+                pairs.push((
+                    change(&right, &right, replace_all),
+                    change(&wrong, &wrong, replace_all),
+                ));
+                pairs.push((
+                    change(&right, "password=changed", replace_all),
+                    change(&wrong, "password=changed", replace_all),
+                ));
+            }
+        }
+        pairs
+    }
+
+    fn assert_guesses_indistinguishable(path: &str, text: &str) {
+        for (right, wrong) in guess_pairs() {
+            let right_view = model_view(path, text, right.clone());
+            let wrong_view = model_view(path, text, wrong.clone());
+            assert_eq!(
+                right_view, wrong_view,
+                "{path}: a correct guess {:?} must look exactly like a wrong one {:?}",
+                right.old, wrong.old
+            );
+            assert!(
+                right_view.contains("AnchorInRedactedContent"),
+                "{path}: {right_view}"
+            );
+            assert!(!right_view.contains(&RIGHT[..6]), "{right_view}");
+        }
+    }
+
+    #[test]
+    fn edit_guesses_on_a_repeated_secret_are_indistinguishable() {
+        let text = format!("a=1\npassword={RIGHT}\nb=2\npassword={RIGHT}\n");
+        assert_guesses_indistinguishable("settings.conf", &text);
+    }
+
+    #[test]
+    fn edit_guesses_on_a_unique_secret_are_indistinguishable() {
+        let text = format!("a=1\npassword={RIGHT}\nb=2\n");
+        assert_guesses_indistinguishable("settings.conf", &text);
+        // A PEM body line is one redacted span too.
+        let pem =
+            format!("-----BEGIN\x20PRIVATE KEY-----\n{RIGHT}\n-----END PRIVATE KEY-----\na=1\n");
+        for (right, wrong) in [(RIGHT, WRONG), (&RIGHT[..4], &WRONG[..4])] {
+            assert_eq!(
+                model_view("key.pem", &pem, change(right, right, false)),
+                model_view("key.pem", &pem, change(wrong, wrong, false))
+            );
+        }
+    }
+
+    #[test]
+    fn anchors_touching_a_redacted_span_get_one_typed_refusal() {
+        let text = format!("a=1\npassword={RIGHT}\nb=2\n");
+        for anchor in [
+            "password=",
+            "=",
+            "\nb=2",
+            "password=[REDACTED:password]",
+            "[REDACTED:password]",
+        ] {
+            let error =
+                apply_edit_changes(&FsEdit::new("settings.conf", anchor, anchor), text.clone())
+                    .expect_err("touching anchor refused");
+            assert!(
+                matches!(
+                    error,
+                    ToolError::AnchorInRedactedContent {
+                        whole_file: false,
+                        ..
+                    }
+                ),
+                "{anchor:?}: {error:?}"
+            );
+            assert!(!error.to_string().contains(RIGHT));
+        }
+    }
+
+    #[test]
+    fn edits_in_visible_text_still_apply_and_keep_the_secret() {
+        let text = format!("color=violet\npassword={RIGHT}\nb=2\npassword={RIGHT}\n");
+        // `violet` also occurs inside the redacted value; only the visible
+        // occurrence counts and changes.
+        let (edited, replacements) = apply_edit_changes(
+            &FsEdit::new("settings.conf", "violet", "blue").replace_all(true),
+            text.clone(),
+        )
+        .expect("visible replace_all");
+        assert_eq!(replacements, 1);
+        assert_eq!(
+            edited,
+            format!("color=blue\npassword={RIGHT}\nb=2\npassword={RIGHT}\n")
+        );
+        // Sequential edits shift the recorded spans with the visible text.
+        let (edited, replacements) = apply_edit_changes(
+            &FsEdit::many(
+                "settings.conf",
+                vec![
+                    change("color=violet", "color=a-much-longer-value", false),
+                    change("b=2", "b=3", false),
+                    change("b=3", "b", false),
+                ],
+            ),
+            text.clone(),
+        )
+        .expect("sequential visible edits");
+        assert_eq!(replacements, 3);
+        assert_eq!(
+            edited,
+            format!("color=a-much-longer-value\npassword={RIGHT}\nb\npassword={RIGHT}\n")
+        );
+        // An anchor that would reach a shifted span is still refused.
+        let error = apply_edit_changes(
+            &FsEdit::many(
+                "settings.conf",
+                vec![
+                    change("color=violet", "c", false),
+                    change("\nb=2", "x", false),
+                ],
+            ),
+            text,
+        )
+        .expect_err("shifted span still touches");
+        assert!(matches!(error, ToolError::AnchorInRedactedContent { .. }));
+    }
+
+    #[test]
+    fn visible_match_counts_ignore_redacted_occurrences() {
+        // `x` occurs twice in the visible text; the secret's own characters
+        // never add to the count or the replacement total.
+        let text = format!("x=1\nx=2\npassword={RIGHT}xx\n");
+        let error = apply_edit_changes(&FsEdit::new("a.conf", "x=", "y="), text)
+            .expect_err("ambiguous visible anchor");
+        let ToolError::EditAnchor(mismatch) = error else {
+            panic!("expected an ordinary count");
+        };
+        assert_eq!(mismatch.matches, 2);
+    }
+
+    #[test]
+    fn wholly_redacted_files_refuse_every_anchor_alike() {
+        let text = format!("A=1\nSECRET={RIGHT}\n");
+        let views = ["A=1", "SECRET", RIGHT, WRONG]
+            .map(|anchor| model_view(".env", &text, change(anchor, anchor, false)));
+        assert!(views.iter().all(|view| view == &views[0]), "{views:?}");
+        assert!(views[0].contains("whole_file: true"), "{}", views[0]);
+    }
+
+    #[test]
+    fn files_without_redactions_keep_raw_anchor_semantics() {
+        let text = "let marker = \"[REDACTED:secret]\";\nsame same\n".to_owned();
+        let (edited, _) = apply_edit_changes(
+            &FsEdit::new("src/redact.rs", "[REDACTED:secret]", "[REDACTED:kind]"),
+            text.clone(),
+        )
+        .expect("literal marker in a plain file");
+        assert!(edited.contains("[REDACTED:kind]"));
+        let error = apply_edit_changes(&FsEdit::new("src/redact.rs", "same", "x"), text)
+            .expect_err("ambiguous");
+        assert!(matches!(error, ToolError::EditAnchor(ref m) if m.matches == 2));
     }
 }
 
@@ -1236,10 +1559,10 @@ impl EffectOperation for FsPath {
             Some(destination) => format!(
                 "{} {} to {}",
                 self.operation_name(),
-                self.source.display(),
-                destination.display()
+                crate::redact::model_visible_path(&self.source),
+                crate::redact::model_visible_path(destination)
             ),
-            None => format!("delete {}", self.source.display()),
+            None => format!("delete {}", crate::redact::model_visible_path(&self.source)),
         }
     }
 
@@ -1326,6 +1649,22 @@ impl EffectBroker {
                 let sensitive_path = crate::redact::is_sensitive_path(&operation.path)
                     || (crate::redact::is_token_config_path(&operation.path)
                         && crate::redact::token_config_contains_secret(read.contents.as_bytes()));
+                let redacted_file = read.digest.is_some()
+                    && (sensitive_path
+                        || crate::redact::ExplicitReadPaths::new(&operation.path)
+                            .redact(&operation.path, &read.contents)
+                            .replacements
+                            > 0);
+                let freshness_digest = read.digest.as_ref().and_then(|digest| {
+                    if redacted_file {
+                        private_freshness_digest(
+                            read.contents.as_bytes(),
+                            self.freshness_profile_scope(),
+                        )
+                    } else {
+                        Some(digest.clone())
+                    }
+                });
                 let result = bounded_read(
                     read.contents,
                     &operation,
@@ -1336,7 +1675,7 @@ impl EffectBroker {
                 )
                 .await;
                 let freshness = result.as_ref().ok().and_then(|_| {
-                    read.digest.map(|digest| FileFreshness {
+                    freshness_digest.map(|digest| FileFreshness {
                         path: freshness_path,
                         digest,
                     })
@@ -2518,7 +2857,13 @@ fn list_directory_fd(directory: OwnedFd, display_path: &Path) -> ToolResult<Dire
 fn directory_listing(entries: Vec<(String, bool)>, entries_seen: usize) -> DirectoryListing {
     let raw = entries
         .iter()
-        .map(|(name, _)| name.clone())
+        .map(|(name, _)| {
+            if crate::redact::model_path_masked(Path::new(name.trim_end_matches('/'))) {
+                crate::redact::SENSITIVE_PATH_MARKER.to_owned()
+            } else {
+                name.clone()
+            }
+        })
         .collect::<Vec<_>>();
     let collapsed_entries = directory_preview(&entries).1;
     DirectoryListing {
@@ -2553,8 +2898,8 @@ fn directory_preview(entries: &[(String, bool)]) -> (String, usize) {
     let mut collapsed = 0usize;
     for (name, directory) in entries {
         let path = Path::new(name.trim_end_matches('/'));
-        if crate::redact::is_sensitive_path(path) || crate::redact::is_token_config_path(path) {
-            preview.push("[REDACTED:sensitive_path]".to_owned());
+        if crate::redact::model_path_masked(path) {
+            preview.push(crate::redact::SENSITIVE_PATH_MARKER.to_owned());
             collapsed = collapsed.saturating_add(1);
             continue;
         }
@@ -2648,7 +2993,7 @@ fn search_files_at(
                 else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                if path_filters.matches(&match_path) {
+                if path_filters.matches(&model_match_path(path, match_path)) {
                     ensure_search_collector(
                         &mut matches,
                         max_preview_bytes,
@@ -2675,7 +3020,7 @@ fn search_files_at(
                 let path_under_root =
                     path_under_search_root(workspace_root, relative, workspace_path)?;
                 let match_path = portable_relative_path(path_under_root)?;
-                if !path_filters.matches(&match_path) {
+                if !path_filters.matches(&model_match_path(workspace_path, match_path)) {
                     return Ok(ControlFlow::Continue(()));
                 }
                 if crate::redact::is_sensitive_path(workspace_path) {
@@ -2776,7 +3121,7 @@ struct SearchOutput {
     match_count: usize,
     max_matches: usize,
     total_bytes: usize,
-    original_sha256: String,
+    presented_sha256: String,
     complete: tempfile::NamedTempFile,
     footprint: Option<ReadFootprint>,
     structured: Vec<FsSearchMatch>,
@@ -2785,13 +3130,15 @@ struct SearchOutput {
     skipped_sensitive: usize,
     files_scanned: usize,
     bytes_scanned: usize,
+    safe_bytes_scanned: usize,
+    redaction_applied: bool,
 }
 
 struct SearchCollector {
     preview: String,
     match_count: usize,
     total_bytes: usize,
-    original_hasher: Sha256,
+    presented_hasher: Sha256,
     max_preview_bytes: usize,
     max_matches: usize,
     preview_saturated: bool,
@@ -2803,6 +3150,8 @@ struct SearchCollector {
     skipped_sensitive: usize,
     files_scanned: usize,
     bytes_scanned: usize,
+    safe_bytes_scanned: usize,
+    redaction_applied: bool,
 }
 
 fn ensure_search_collector(
@@ -2840,7 +3189,7 @@ impl SearchCollector {
             preview: String::new(),
             match_count: 0,
             total_bytes: 0,
-            original_hasher: Sha256::new(),
+            presented_hasher: Sha256::new(),
             max_preview_bytes,
             max_matches,
             preview_saturated: false,
@@ -2852,18 +3201,20 @@ impl SearchCollector {
             skipped_sensitive: 0,
             files_scanned: 0,
             bytes_scanned: 0,
+            safe_bytes_scanned: 0,
+            redaction_applied: false,
         })
     }
 
     fn push_line(
         &mut self,
-        raw_line: &str,
+        spool_line: &str,
         preview_line: &str,
         mut structured: Vec<FsSearchMatch>,
     ) -> ToolResult<Vec<usize>> {
         let projected_bytes = self
             .total_bytes
-            .saturating_add(raw_line.len())
+            .saturating_add(spool_line.len())
             .saturating_add(1);
         if projected_bytes
             .saturating_add(self.structured_bytes)
@@ -2874,11 +3225,11 @@ impl SearchCollector {
             return Ok(Vec::new());
         }
         self.complete
-            .write_all(raw_line.as_bytes())
+            .write_all(spool_line.as_bytes())
             .and_then(|()| self.complete.write_all(b"\n"))
             .map_err(|error| ToolError::io("write search result spool", "<search>", error))?;
-        self.original_hasher.update(raw_line.as_bytes());
-        self.original_hasher.update(b"\n");
+        self.presented_hasher.update(spool_line.as_bytes());
+        self.presented_hasher.update(b"\n");
         self.total_bytes = projected_bytes;
         let first_match_index = self.match_count;
         self.match_count = self.match_count.saturating_add(structured.len());
@@ -2947,6 +3298,11 @@ impl SearchCollector {
         self.bytes_scanned = self.bytes_scanned.saturating_add(bytes);
     }
 
+    fn observe_safe_line(&mut self, bytes: usize, redacted: bool) {
+        self.safe_bytes_scanned = self.safe_bytes_scanned.saturating_add(bytes);
+        self.redaction_applied |= redacted;
+    }
+
     fn file_scanned(&mut self) {
         self.files_scanned = self.files_scanned.saturating_add(1);
     }
@@ -2986,7 +3342,7 @@ impl SearchCollector {
             match_count: self.match_count,
             max_matches: self.max_matches,
             total_bytes: self.total_bytes,
-            original_sha256: format!("{:x}", self.original_hasher.finalize()),
+            presented_sha256: format!("{:x}", self.presented_hasher.finalize()),
             complete: self.complete,
             footprint,
             structured: self.structured,
@@ -2995,6 +3351,8 @@ impl SearchCollector {
             skipped_sensitive: self.skipped_sensitive,
             files_scanned: self.files_scanned,
             bytes_scanned: self.bytes_scanned,
+            safe_bytes_scanned: self.safe_bytes_scanned,
+            redaction_applied: self.redaction_applied,
         }
     }
 }
@@ -3320,6 +3678,22 @@ fn portable_relative_path(path: &Path) -> ToolResult<String> {
     Ok(path_argument(path)?.replace('\\', "/"))
 }
 
+/// The path a glob filter tests: the same masking as every model-visible
+/// listing. A masked name matches only as the marker, so an include or
+/// exclude pattern can select only what the model can already see and never
+/// tests a guess about a masked name.
+fn model_match_path(workspace_path: &Path, candidate: String) -> String {
+    let workspace_masked = match portable_relative_path(workspace_path) {
+        Ok(portable) => crate::redact::model_path_masked(Path::new(&portable)),
+        Err(_) => true,
+    };
+    if workspace_masked || crate::redact::model_path_masked(Path::new(&candidate)) {
+        crate::redact::SENSITIVE_PATH_MARKER.to_owned()
+    } else {
+        candidate
+    }
+}
+
 fn portable_hidden_accounting_path(
     workspace_root: &Path,
     search_root: &Path,
@@ -3479,6 +3853,9 @@ fn collect_streamed_file_matches(
     let mut buffer = Vec::new();
     let mut line_number = 0usize;
     let mut redaction = crate::redact::RedactionState::default();
+    // Once a multi-line secret has been hidden, later physical line numbers
+    // would count its lines; withhold them for the rest of this file.
+    let mut line_coordinates_withheld = false;
     loop {
         if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
             matches.truncate(ToolTruncationReason::TimeBudget);
@@ -3520,8 +3897,7 @@ fn collect_streamed_file_matches(
         // Feed physical line endings to the quote consumer before removing
         // them from search's single-line presentation and match coordinates.
         let redacted = crate::redact::redact_line_with_state(full_line, &mut redaction);
-        let line = full_line.strip_suffix('\n').unwrap_or(full_line);
-        let line = line.strip_suffix('\r').unwrap_or(line);
+        matches.observe_safe_line(redacted.text.len(), redacted.replacements > 0);
         let safe_line = redacted.text.strip_suffix('\n').unwrap_or(&redacted.text);
         let safe_line = safe_line.strip_suffix('\r').unwrap_or(safe_line);
         let structured_line = utf8_prefix(safe_line, SEARCH_STRUCTURED_LINE_BYTES).to_owned();
@@ -3541,7 +3917,7 @@ fn collect_streamed_file_matches(
             .saturating_sub(matches.match_count)
             .saturating_add(1);
         let columns = compiled.columns(
-            line,
+            safe_line,
             operation,
             remaining_matches,
             line_number,
@@ -3552,21 +3928,33 @@ fn collect_streamed_file_matches(
             break;
         }
         if !columns.is_empty() {
-            let display = portable_relative_path(display_path)?;
-            let raw_legacy = format!("{display}:{line_number}:{line}");
-            let preview_legacy = format!("{display}:{line_number}:{safe_line}");
+            let display = model_visible_search_path(display_path)?;
+            // Zero (structured) and `?` (preview) withhold the coordinate.
+            let public_line = if line_coordinates_withheld {
+                0
+            } else {
+                line_number
+            };
+            let line_label = if line_coordinates_withheld {
+                "?".to_owned()
+            } else {
+                line_number.to_string()
+            };
+            // Match text, columns, and the spool all use the redacted line.
+            let preview_legacy = format!("{display}:{line_label}:{safe_line}");
+            let spool_line = &preview_legacy;
             let structured = columns
                 .into_iter()
                 .map(|column| FsSearchMatch {
                     path: display.clone(),
-                    line: line_number,
+                    line: public_line,
                     column,
                     text: structured_line.clone(),
                     context_before: before.iter().cloned().collect(),
                     context_after: Vec::new(),
                 })
                 .collect();
-            let indices = matches.push_line(&raw_legacy, &preview_legacy, structured)?;
+            let indices = matches.push_line(spool_line, &preview_legacy, structured)?;
             if operation.context.after > 0 {
                 pending.extend(indices.into_iter().map(|match_index| PendingContext {
                     match_index,
@@ -3574,6 +3962,7 @@ fn collect_streamed_file_matches(
                 }));
             }
         }
+        line_coordinates_withheld |= redaction.spans_lines();
         before.push_back(structured_line);
         while before.len() > operation.context.before {
             before.pop_front();
@@ -3767,7 +4156,7 @@ fn glob_files_at(
                     else {
                         return Ok(ControlFlow::Continue(()));
                     };
-                    if pattern.is_match(&candidate) {
+                    if pattern.is_match(model_match_path(path, candidate)) {
                         skipped_sensitive = skipped_sensitive.saturating_add(1);
                     }
                     return Ok(ControlFlow::Continue(()));
@@ -3777,7 +4166,7 @@ fn glob_files_at(
             files_scanned = files_scanned.saturating_add(1);
             let path_under_root = path_under_search_root(workspace_root, relative, workspace_path)?;
             let candidate = portable_relative_path(path_under_root)?;
-            if !pattern.is_match(&candidate) {
+            if !pattern.is_match(model_match_path(workspace_path, candidate)) {
                 return Ok(ControlFlow::Continue(()));
             }
             if crate::redact::is_sensitive_path(workspace_path) {
@@ -3787,7 +4176,7 @@ fn glob_files_at(
             let display_path = workspace_root.join(workspace_path);
             let file = open_search_file(&workspace_dir, workspace_path, &display_path)?;
             drop(file);
-            paths.push(portable_relative_path(workspace_path)?);
+            paths.push(model_visible_search_path(workspace_path)?);
             Ok(ControlFlow::Continue(()))
         },
     )?;
@@ -4301,6 +4690,16 @@ struct AppliedMutation {
 }
 
 impl AppliedMutation {
+    /// Classify the mutation before any result is published. A redacted
+    /// class keeps exact digests and byte counts owner-local; agent-visible
+    /// results and public projections withhold them.
+    fn classify_redaction(mut self, post_content: Option<&[u8]>) -> Self {
+        self.checkpoint.redacted_content |=
+            crate::checkpoint::capture_paths_redacted(&self.checkpoint.paths)
+                || post_content.is_some_and(crate::redact::content_redaction_affected);
+        self
+    }
+
     /// The receipt and change ledger already own the ordered relative and
     /// absolute paths. Attach metadata before either is moved into its durable
     /// finalizer; never reread a mutable path to infer the completed effect.
@@ -4370,7 +4769,7 @@ impl MutationWorkerOutcome {
                 checkpoint,
             } => (
                 Ok(result),
-                Some(workspace_mutation(effect, post_digest)),
+                Some(workspace_mutation(effect, post_digest, &checkpoint)),
                 Some(checkpoint),
             ),
             Self::ApplyFailed(error) => (Err(error), None, None),
@@ -4381,7 +4780,7 @@ impl MutationWorkerOutcome {
                 checkpoint,
             } => (
                 Err(error),
-                Some(workspace_mutation(effect, post_digest)),
+                Some(workspace_mutation(effect, post_digest, &checkpoint)),
                 Some(checkpoint),
             ),
         }
@@ -4403,7 +4802,7 @@ impl MutationWorkerOutcome {
                 post_digest,
                 checkpoint,
             } => {
-                let mutation = workspace_mutation(effect, post_digest.clone());
+                let mutation = workspace_mutation(effect, post_digest.clone(), &checkpoint);
                 (
                     Ok(result),
                     Some(FileFreshness {
@@ -4421,7 +4820,7 @@ impl MutationWorkerOutcome {
                 post_digest,
                 checkpoint,
             } => {
-                let mutation = workspace_mutation(effect, post_digest.clone());
+                let mutation = workspace_mutation(effect, post_digest.clone(), &checkpoint);
                 (
                     Err(error),
                     Some(FileFreshness {
@@ -4439,12 +4838,14 @@ impl MutationWorkerOutcome {
 fn workspace_mutation(
     effect_id: haider_protocol::ids::EffectId,
     mutation_digest: String,
+    checkpoint: &CheckpointCapture,
 ) -> WorkspaceMutation {
     WorkspaceMutation {
         effect_id,
         mutation_digest,
         workspace_revision: None,
         subject_digest: None,
+        redacted_content: checkpoint.redacted_content,
     }
 }
 
@@ -4562,7 +4963,7 @@ fn install_checkpoint_state_in(
             let (current_bytes, _) = file_snapshot(&parent, &mut file, &display_path)
                 .map_err(checkpoint_install_error)?
                 .parts();
-            let current_digest = mutation_digest(&current_bytes);
+            let current_digest = freshness_digest_for_expected(&current_bytes, expected_digest);
             match expected_digest {
                 Some(expected) if current_digest == expected => {}
                 _ => {
@@ -4732,7 +5133,7 @@ pub(crate) fn install_checkpoint_state(
                 .map_err(checkpoint_install_error)?;
             let snapshot = windows_stable_snapshot(&mut file, &display_path)
                 .map_err(checkpoint_install_error)?;
-            let current_digest = mutation_digest(&snapshot.bytes);
+            let current_digest = freshness_digest_for_expected(&snapshot.bytes, expected_digest);
             match expected_digest {
                 Some(expected) if expected == current_digest => {}
                 _ => {
@@ -4966,7 +5367,7 @@ fn apply_windows_write(
         Ok(_) => {
             let mut file = open_windows_locked_file(&target, &operation.path)?;
             let source = windows_stable_snapshot(&mut file, &operation.path)?;
-            let current_digest = mutation_digest(&source.bytes);
+            let current_digest = freshness_digest_for_expected(&source.bytes, expected_digest);
             let Some(expected_digest) = expected_digest else {
                 return Err(ToolError::UnreadFile {
                     path: operation.path.clone(),
@@ -5077,8 +5478,10 @@ fn apply_windows_write(
                 truncated_reason: None,
             }],
             post_digest,
+            redacted_content: false,
         },
     }
+    .classify_redaction(Some(bytes))
     .with_file_effects(bytes.len() as u64, false))
 }
 
@@ -5095,7 +5498,7 @@ fn apply_windows_edit(
         windows_mutation_target(workspace_root, relative, &operation.path, false)?;
     let mut source_file = open_windows_locked_file(&target, &operation.path)?;
     let source = windows_stable_snapshot(&mut source_file, &operation.path)?;
-    let current_digest = mutation_digest(&source.bytes);
+    let current_digest = freshness_digest_for_expected(&source.bytes, expected_digest);
     let Some(expected_digest) = expected_digest else {
         return Err(ToolError::UnreadFile {
             path: operation.path.clone(),
@@ -5183,8 +5586,10 @@ fn apply_windows_edit(
                 truncated_reason: None,
             }],
             post_digest,
+            redacted_content: false,
         },
     }
+    .classify_redaction(Some(bytes))
     .with_file_effects(bytes.len() as u64, false))
 }
 
@@ -5806,6 +6211,8 @@ fn apply_windows_path(
         post_digest: None,
         ..source_preimage.clone()
     }];
+    // Copy hashes copied bytes into `structural`; classify them in the same pass.
+    let mut copied_redacted = false;
     let mut structural = Vec::new();
     structural.extend_from_slice(operation.operation_name().as_bytes());
     structural.push(0);
@@ -5831,7 +6238,10 @@ fn apply_windows_path(
             }
             remove_windows_entry_from_handle(&source, &operation.source, source_entry)?;
             (
-                mutation_result(format!("deleted {}", operation.source.display())),
+                mutation_result(format!(
+                    "deleted {}",
+                    crate::redact::model_visible_path(&operation.source)
+                )),
                 vec![operation.source.clone()],
             )
         }
@@ -5951,8 +6361,8 @@ fn apply_windows_path(
                     (
                         mutation_result(format!(
                             "moved {} to {}",
-                            operation.source.display(),
-                            destination.display()
+                            crate::redact::model_visible_path(&operation.source),
+                            crate::redact::model_visible_path(destination)
                         )),
                         vec![operation.source.clone(), destination.clone()],
                     )
@@ -5960,14 +6370,20 @@ fn apply_windows_path(
                 FsPathOperation::Copy => {
                     let staging = create_windows_path_staging(&destination_parent, destination)?;
                     let staged_entry = staging.path.join("entry");
-                    let staged_entry_guard = match copy_windows_entry_from_handle(
+                    let mut copy_evidence = CopyEvidence {
+                        structural: &mut structural,
+                        redacted: false,
+                    };
+                    let copied = copy_windows_entry_from_handle(
                         &source,
                         &staged_entry,
                         &operation.source,
                         destination,
-                        &mut structural,
+                        &mut copy_evidence,
                         source_entry,
-                    ) {
+                    );
+                    copied_redacted = copy_evidence.redacted;
+                    let staged_entry_guard = match copied {
                         Ok(entry) => entry,
                         Err(error) => {
                             cleanup_windows_path_staging(staging, destination);
@@ -5986,8 +6402,8 @@ fn apply_windows_path(
                     (
                         mutation_result(format!(
                             "copied {} to {}",
-                            operation.source.display(),
-                            destination.display()
+                            crate::redact::model_visible_path(&operation.source),
+                            crate::redact::model_visible_path(destination)
                         )),
                         vec![destination.clone()],
                     )
@@ -6009,8 +6425,10 @@ fn apply_windows_path(
             kind: checkpoint_kind,
             paths: checkpoint_paths,
             post_digest,
+            redacted_content: copied_redacted,
         },
     }
+    .classify_redaction(None)
     .with_file_effects(effect_bytes, move_destination_existed))
 }
 
@@ -6178,7 +6596,7 @@ fn copy_windows_entry(
     destination: &Path,
     source_display: &Path,
     destination_display: &Path,
-    structural: &mut Vec<u8>,
+    evidence: &mut CopyEvidence<'_>,
 ) -> ToolResult<WindowsPathEntry> {
     let source_entry = open_windows_path_entry(source, source_display, false)?;
     copy_windows_entry_from_handle(
@@ -6186,7 +6604,7 @@ fn copy_windows_entry(
         destination,
         source_display,
         destination_display,
-        structural,
+        evidence,
         source_entry,
     )
 }
@@ -6199,10 +6617,12 @@ fn copy_windows_entry_from_handle(
     destination: &Path,
     source_display: &Path,
     destination_display: &Path,
-    structural: &mut Vec<u8>,
+    evidence: &mut CopyEvidence<'_>,
     mut source_entry: WindowsPathEntry,
 ) -> ToolResult<WindowsPathEntry> {
     let source_identity = source_entry.identity;
+    evidence.redacted |=
+        copied_name_masked(source_display) || copied_name_masked(destination_display);
     if source_identity.directory {
         fs::create_dir(destination).map_err(|error| {
             ToolError::io(
@@ -6217,8 +6637,10 @@ fn copy_windows_entry_from_handle(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| ToolError::io("list copy source", source_display, error))?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
-        structural.extend_from_slice(b"\0directory\0");
-        structural.extend_from_slice(destination.as_os_str().as_encoded_bytes());
+        evidence.structural.extend_from_slice(b"\0directory\0");
+        evidence
+            .structural
+            .extend_from_slice(destination.as_os_str().as_encoded_bytes());
         for entry in entries {
             let name = entry.file_name();
             let _ = copy_windows_entry(
@@ -6226,7 +6648,7 @@ fn copy_windows_entry_from_handle(
                 &destination.join(&name),
                 &source_display.join(&name),
                 &destination_display.join(&name),
-                structural,
+                evidence,
             )?;
         }
         destination_guard
@@ -6302,10 +6724,13 @@ fn copy_windows_entry_from_handle(
                     error,
                 )
             })?;
-        structural.extend_from_slice(b"\0file\0");
-        structural.extend_from_slice(destination.as_os_str().as_encoded_bytes());
-        structural.push(0);
-        structural.extend_from_slice(&snapshot.bytes);
+        evidence.structural.extend_from_slice(b"\0file\0");
+        evidence
+            .structural
+            .extend_from_slice(destination.as_os_str().as_encoded_bytes());
+        evidence.structural.push(0);
+        evidence.structural.extend_from_slice(&snapshot.bytes);
+        evidence.redacted |= crate::redact::content_redaction_affected(&snapshot.bytes);
         let destination_guard =
             windows_path_entry_from_file(destination_file, destination_display)?;
         let final_identity = haider_platform::windows_file_identity(&source_entry.handle)
@@ -6572,7 +6997,7 @@ fn apply_write_at(
             let (mut source, metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
             let (source_bytes, _source_basis) =
                 file_snapshot(&parent, &mut source, &operation.path)?.parts();
-            let current_digest = mutation_digest(&source_bytes);
+            let current_digest = freshness_digest_for_expected(&source_bytes, expected_digest);
             let Some(expected_digest) = expected_digest else {
                 return Err(ToolError::UnreadFile {
                     path: operation.path.clone(),
@@ -6686,8 +7111,10 @@ fn apply_write_at(
                 truncated_reason: None,
             }],
             post_digest,
+            redacted_content: false,
         },
     }
+    .classify_redaction(Some(bytes))
     .with_file_effects(bytes.len() as u64, false))
 }
 
@@ -6796,7 +7223,7 @@ fn apply_edit_at_with_commit_hooks(
     let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
     let (source_bytes, _source_basis) =
         file_snapshot(&parent, &mut source, &operation.path)?.parts();
-    let current_digest = mutation_digest(&source_bytes);
+    let current_digest = freshness_digest_for_expected(&source_bytes, expected_digest);
     let Some(expected_digest) = expected_digest else {
         return Err(ToolError::UnreadFile {
             path: operation.path.clone(),
@@ -6901,8 +7328,10 @@ fn apply_edit_at_with_commit_hooks(
                 truncated_reason: None,
             }],
             post_digest,
+            redacted_content: false,
         },
     }
+    .classify_redaction(Some(bytes))
     .with_file_effects(bytes.len() as u64, false))
 }
 
@@ -7044,6 +7473,8 @@ fn apply_path_at_with_commit_hook(
         ..source_preimage.clone()
     }];
 
+    // Copy hashes copied bytes into `structural`; classify them in the same pass.
+    let mut copied_redacted = false;
     let mut structural = Vec::new();
     structural.extend_from_slice(operation.operation_name().as_bytes());
     structural.push(0);
@@ -7067,7 +7498,10 @@ fn apply_path_at_with_commit_hook(
             )?;
             remove_entry_at(&commit_source_parent, &source_leaf, &operation.source)?;
             (
-                mutation_result(format!("deleted {}", operation.source.display())),
+                mutation_result(format!(
+                    "deleted {}",
+                    crate::redact::model_visible_path(&operation.source)
+                )),
                 vec![operation.source.clone()],
             )
         }
@@ -7217,8 +7651,8 @@ fn apply_path_at_with_commit_hook(
                     (
                         mutation_result(format!(
                             "moved {} to {}",
-                            operation.source.display(),
-                            destination.display()
+                            crate::redact::model_visible_path(&operation.source),
+                            crate::redact::model_visible_path(destination)
                         )),
                         vec![operation.source.clone(), destination.clone()],
                     )
@@ -7252,15 +7686,21 @@ fn apply_path_at_with_commit_hook(
                     let (staging_name, staging_directory) =
                         create_path_staging_directory(&copy_destination_parent, destination)?;
                     let staging_leaf = OsStr::new("entry");
-                    if let Err(error) = copy_entry_at(
+                    let mut copy_evidence = CopyEvidence {
+                        structural: &mut structural,
+                        redacted: false,
+                    };
+                    let copied = copy_entry_at(
                         &copy_source_parent,
                         &source_leaf,
                         &staging_directory,
                         staging_leaf,
                         &operation.source,
                         destination,
-                        &mut structural,
-                    ) {
+                        &mut copy_evidence,
+                    );
+                    copied_redacted = copy_evidence.redacted;
+                    if let Err(error) = copied {
                         remove_path_staging(&copy_destination_parent, &staging_name, destination);
                         return Err(error);
                     }
@@ -7336,8 +7776,8 @@ fn apply_path_at_with_commit_hook(
                     (
                         mutation_result(format!(
                             "copied {} to {}",
-                            operation.source.display(),
-                            destination.display()
+                            crate::redact::model_visible_path(&operation.source),
+                            crate::redact::model_visible_path(destination)
                         )),
                         vec![destination.clone()],
                     )
@@ -7360,8 +7800,10 @@ fn apply_path_at_with_commit_hook(
             kind: checkpoint_kind,
             paths: checkpoint_paths,
             post_digest,
+            redacted_content: copied_redacted,
         },
     }
+    .classify_redaction(None)
     .with_file_effects(effect_bytes, move_destination_existed))
 }
 
@@ -7569,10 +8011,11 @@ fn copy_entry_at(
     destination_leaf: &OsStr,
     source_path: &Path,
     destination_path: &Path,
-    structural: &mut Vec<u8>,
+    evidence: &mut CopyEvidence<'_>,
 ) -> ToolResult<()> {
     require_public_android_path(source_path)?;
     require_public_android_path(destination_path)?;
+    evidence.redacted |= copied_name_masked(source_path) || copied_name_masked(destination_path);
     let metadata = rustix::fs::statat(source_parent, source_leaf, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| anchored_io_error("inspect copy source", source_path, error))?;
     match FileType::from_raw_mode(metadata.st_mode) {
@@ -7606,10 +8049,13 @@ fn copy_entry_at(
                     rustix::fs::unlinkat(destination_parent, destination_leaf, AtFlags::empty());
                 return Err(error);
             }
-            structural.extend_from_slice(b"\0file\0");
-            structural.extend_from_slice(destination_leaf.as_encoded_bytes());
-            structural.push(0);
-            structural.extend_from_slice(&bytes);
+            evidence.structural.extend_from_slice(b"\0file\0");
+            evidence
+                .structural
+                .extend_from_slice(destination_leaf.as_encoded_bytes());
+            evidence.structural.push(0);
+            evidence.structural.extend_from_slice(&bytes);
+            evidence.redacted |= crate::redact::content_redaction_affected(&bytes);
             Ok(())
         }
         FileType::Directory => {
@@ -7644,8 +8090,10 @@ fn copy_entry_at(
                 }
             }
             names.sort();
-            structural.extend_from_slice(b"\0directory\0");
-            structural.extend_from_slice(destination_leaf.as_encoded_bytes());
+            evidence.structural.extend_from_slice(b"\0directory\0");
+            evidence
+                .structural
+                .extend_from_slice(destination_leaf.as_encoded_bytes());
             for name in names {
                 copy_entry_at(
                     &source_directory,
@@ -7654,7 +8102,7 @@ fn copy_entry_at(
                     &name,
                     &source_path.join(&name),
                     &destination_path.join(&name),
-                    structural,
+                    evidence,
                 )?;
             }
             rustix::fs::fsync(&destination_directory).map_err(|error| {
@@ -8384,6 +8832,11 @@ where
     };
     let redacted = crate::redact::redact_text_bounded(&presented, bounds.max_preview_bytes);
     let presentation_reduced = presented.as_ref() != contents || redacted.replacements > 0;
+    let safe_source = if sensitive_path || redacted.replacements > 0 {
+        crate::redact::redact_text(&presented).text.into_bytes()
+    } else {
+        contents.as_bytes().to_vec()
+    };
     let contents_len = contents.len();
     let truncated = semantic_truncated
         || presentation_reduced
@@ -8393,10 +8846,10 @@ where
         || contents_len > bounds.max_preview_bytes
         || redacted.full_len > bounds.max_preview_bytes;
     let truncation =
-        truncated.then(|| ToolTruncation::from_bytes(contents.as_bytes(), redacted.text.len()));
+        truncated.then(|| ToolTruncation::from_bytes(&safe_source, redacted.text.len()));
     drop(presented);
     let artifact = if artifact_required {
-        Some(cas.put_owned(contents.into_bytes()).await?)
+        Some(cas.put_owned(safe_source).await?)
     } else {
         None
     };
@@ -8446,7 +8899,7 @@ where
         truncated: true,
         original_bytes: output.total_bytes as u64,
         payload_bytes: output.preview.len() as u64,
-        sha256: output.original_sha256,
+        sha256: output.presented_sha256,
     };
     let artifact = if truncated {
         Some(cas.put_file(output.complete.path()).await?)
@@ -8464,7 +8917,11 @@ where
             binary_files_skipped: output.binary_files_skipped,
             skipped_sensitive: output.skipped_sensitive,
             files_scanned: output.files_scanned,
-            bytes_scanned: output.bytes_scanned,
+            bytes_scanned: if output.redaction_applied {
+                output.safe_bytes_scanned
+            } else {
+                output.bytes_scanned
+            },
         }),
         artifact,
         images: Vec::new(),
@@ -8595,11 +9052,72 @@ fn relative_path_argument(path: &Path) -> ToolResult<&str> {
     path_argument(path)
 }
 
+/// Search and glob report portable workspace-relative paths; one masking rule
+/// covers every listing so an assignment-bearing name never reaches the agent.
+fn model_visible_search_path(path: &Path) -> ToolResult<String> {
+    let portable = portable_relative_path(path)?;
+    Ok(if crate::redact::model_path_masked(Path::new(&portable)) {
+        crate::redact::SENSITIVE_PATH_MARKER.to_owned()
+    } else {
+        portable
+    })
+}
+
+/// Structural copy evidence and its agent-visible redaction class, gathered
+/// in the same pass over the copied bytes and names.
+struct CopyEvidence<'a> {
+    structural: &'a mut Vec<u8>,
+    redacted: bool,
+}
+
+/// Copy display paths may be absolute; classify only the copied entry's own
+/// name. Workspace-relative mutation paths are classified by the checkpoint.
+fn copied_name_masked(display_path: &Path) -> bool {
+    display_path
+        .file_name()
+        .is_some_and(|name| crate::redact::model_path_masked(Path::new(name)))
+}
+
 /// Single digest seam for authored content and structural mutation evidence.
 /// A later workspace-revision producer can consume this value without
 /// duplicating digest logic across mutation tools.
 fn mutation_digest(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+/// Redacted reads need byte-exact stale checks without publishing a guessable
+/// hash of their original content. The process-local master is never written
+/// to a journal or wire result. Production scopes derivation to the profile
+/// installation ID. A daemon restart changes the master and therefore refuses
+/// an old redacted freshness claim until the file is read again.
+fn private_freshness_digest(bytes: &[u8], profile_scope: &str) -> Option<String> {
+    static MASTER: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+    let master = MASTER.get_or_init(|| {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).ok().map(|()| key)
+    });
+    let master = master.as_ref()?;
+    let mut material = Vec::with_capacity(master.len() + profile_scope.len());
+    material.extend_from_slice(master);
+    material.extend_from_slice(profile_scope.as_bytes());
+    let key = blake3::derive_key("haider redacted file freshness v1", &material);
+    Some(format!(
+        "blake3k:{profile_scope}:{}",
+        blake3::keyed_hash(&key, bytes).to_hex()
+    ))
+}
+
+fn freshness_digest_for_expected(bytes: &[u8], expected: Option<&str>) -> String {
+    if let Some(profile_scope) = expected
+        .and_then(|digest| digest.strip_prefix("blake3k:"))
+        .and_then(|digest| digest.rsplit_once(':'))
+        .map(|(scope, _)| scope)
+    {
+        private_freshness_digest(bytes, profile_scope)
+            .unwrap_or_else(|| "blake3k:unavailable".to_owned())
+    } else {
+        mutation_digest(bytes)
+    }
 }
 
 #[cfg(unix)]
@@ -9024,9 +9542,15 @@ mod w4a13_tests;
 
 #[cfg(all(test, unix))]
 #[allow(clippy::expect_used)]
+#[path = "filesystem/tests/redaction_provenance.rs"]
+mod redaction_provenance_tests;
+
+#[cfg(all(test, unix))]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
     use std::os::unix::fs::{MetadataExt, symlink};
 
     #[test]

@@ -44,6 +44,8 @@ impl AccountClient for FakeAccountClient {
 
 fn descriptor(alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: "anthropic".into(),
         base_url: None,
@@ -53,7 +55,6 @@ fn descriptor(alias: &str) -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     }
 }

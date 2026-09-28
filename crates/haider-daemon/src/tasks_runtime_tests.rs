@@ -62,6 +62,7 @@ fn task_metadata(cwd: &str) -> SessionMetadataV1 {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
         permission_overrides: overrides(),
         interaction_mode: Default::default(),
@@ -86,6 +87,7 @@ async fn create_task_session(hub: &SessionHub, name: &str, cwd: &str) -> Session
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: overrides(),
         effort: None,
         fast: false,
@@ -1890,10 +1892,19 @@ async fn activity_real_interleaved_pipes_cannot_split_pem_redaction() {
         "background":true
     })).await;
     let task = TaskId::new(receipt["task_id"].as_str().expect("task"));
+    let safe_pem_bytes = u64::try_from(
+        "diagnostic\n".len()
+            + haider_tools::redact_output_text("-----BEGIN\x20PRIVATE KEY-----\nAA==\n").len(),
+    )
+    .expect("small safe capture length");
     for (expected_bytes, expected_line, release) in [
         (11, None, "stream-stderr"),
         (22, Some("diagnostic"), "stream-stdout"),
-        (44, Some("[REDACTED:private_key]"), "stream-finish"),
+        (
+            safe_pem_bytes,
+            Some("[REDACTED:private_key]"),
+            "stream-finish",
+        ),
     ] {
         timeout(Duration::from_secs(10), async {
             loop {
@@ -2123,6 +2134,52 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     .await;
     assert_eq!(alias_page["task_id"], "cap:capture-call");
     assert!(full.starts_with(alias_page["chunk"].as_str().expect("alias chunk")));
+    // One unbounded turn can issue more captures than the 256-entry cache.
+    // Each process signal and result is journaled before paging the first.
+    for index in 0..260 {
+        let call_id = format!("evict-{index}");
+        let outcome = dispatcher
+            .execute(
+                &run,
+                &ItemId::new(format!("evict-item-{index}")),
+                &call_id,
+                "process_exec",
+                serde_json::json!({"command": format!("printf capture-{index}")}),
+                &CancelToken::new(),
+            )
+            .await
+            .expect("extra capture");
+        let ToolDispatchResult::Completed(bounded) = outcome else {
+            panic!("extra process must complete");
+        };
+        let mut facts = [crate::tasks::test_task_fact_envelope(
+            &hub,
+            &session,
+            &run,
+            &format!("evict-result-{index}"),
+            serde_json::to_value(EventPayload::ToolResult {
+                call_id,
+                result: bounded,
+            })
+            .expect("result event"),
+        )];
+        hub.append(&mut facts).await.expect("persist extra capture");
+    }
+    assert!(hub.task_registry().capture(&session, &handle).is_none());
+    assert!(
+        hub.task_registry()
+            .capture(&session, "cap:capture-call")
+            .is_none()
+    );
+    let evicted_page = dispatch(
+        &dispatcher,
+        &run,
+        "evicted-page",
+        "task_output",
+        serde_json::json!({"task_id": handle, "cursor": 0}),
+    )
+    .await;
+    assert!(full.starts_with(evicted_page["chunk"].as_str().expect("evicted chunk")));
     let facade = TaskFacade::new(hub.clone());
     let restored = facade
         .restore_foreground_capture(&session, &handle)
@@ -2173,6 +2230,19 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     dispatcher.close().await.expect("close dispatcher");
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close store");
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("reopen store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("restart hub");
+    let restarted = TaskFacade::new(hub.clone())
+        .foreground_capture_page(&session, &handle, Some(0))
+        .await
+        .expect("capture survives restart");
+    let restarted: serde_json::Value =
+        serde_json::from_str(&restarted.preview).expect("restart page JSON");
+    assert!(full.starts_with(restarted["chunk"].as_str().expect("restart chunk")));
+    hub.shutdown().await.expect("restart shutdown");
+    store.close().await.expect("restart store close");
 }
 
 fn redaction_repair_fixture() -> &'static str {
@@ -2210,8 +2280,8 @@ fn assert_repair_carriers_present(text: &str) {
         assert!(text.contains(carrier), "carrier {carrier} lost");
     }
     for authority in [
-        "https://owner:[REDACTED:secret_value]@",
-        "postgres://owner:[REDACTED:secret_value]@",
+        "https://owner:[REDACTED:password]@",
+        "postgres://owner:[REDACTED:password]@",
     ] {
         assert!(
             text.contains(authority),

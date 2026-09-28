@@ -293,3 +293,92 @@ fn text_cas_preserves_provider_resume_opaque_text_and_mixed_reply_fields() {
         assert!(replayed.payload.provider_opaque_data().is_some());
     }
 }
+
+/// MUTATION CHECK: drop the segment-rebuild comparison in `history_prefix`.
+/// The tampered segment rows then still pass the ledger-derived cursor
+/// digest, so `encode` compacts a record that `decode` can never hydrate.
+#[test]
+fn history_compaction_requires_segment_rows_that_rebuild_the_ledger() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::cache::{
+        ProviderViewBlobV1, ProviderViewBoundaryV1, ProviderViewLedgerV1,
+    };
+    use haider_protocol::item::ItemEvent;
+
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = SessionId::new("text-cas-history-guard");
+    store
+        .connection()
+        .expect("connection")
+        .execute(
+            "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, 1, '{}')",
+            [session_id.as_str()],
+        )
+        .expect("insert session");
+    let system = ProviderViewBlobV1::new(b"guard-system".to_vec());
+    let tools = ProviderViewBlobV1::new(b"guard-tools".to_vec());
+    let history = ["one", "two", "three", "four"]
+        .map(|text| ProviderViewBlobV1::new(text.as_bytes().to_vec()));
+    let ledger = ProviderViewLedgerV1 {
+        provider: "openai".into(),
+        model: "gpt-test".into(),
+        max_tokens: 4_096,
+        dialect: "responses".into(),
+        serialization_version: "haider.provider-view.json.v2".into(),
+        header_epoch: "header".into(),
+        cache_epoch: "cache".into(),
+        compaction_epoch: "root".into(),
+        reasoning_retention: "append_only_provider_opaque_v1:test".into(),
+        account_scope: None,
+        stable_history_end: 1,
+        current_user_start: 1,
+        latest_compaction_summary_end: None,
+        trim_sentinel: "root".into(),
+        boundaries: vec![ProviderViewBoundaryV1 {
+            section: "history".into(),
+            message_end: Some(1),
+        }],
+        system_block: system.block.clone(),
+        tool_schema_block: tools.block.clone(),
+        history_blocks: history.iter().map(|blob| blob.block.clone()).collect(),
+        storage: None,
+    };
+    let mut blobs = vec![system, tools];
+    blobs.extend(history);
+    let stored = store
+        .persist_provider_view(&session_id, ledger, blobs)
+        .expect("persist provider view");
+    let item = ProviderViewAttemptV1 {
+        ordinal: 1,
+        view: stored,
+    }
+    .extension_item()
+    .expect("attempt item");
+    let event = envelope(
+        serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new("guard-item"),
+            item,
+        }))
+        .expect("attempt payload"),
+    );
+    let connection = store.connection().expect("connection");
+    let compact = encode(&connection, &event)
+        .expect("encode intact history")
+        .expect("an intact four-block ledger is compacted");
+    assert_eq!(decode(&connection, &compact).expect("hydrate"), event);
+
+    connection
+        .execute(
+            "UPDATE provider_view_history_blocks SET byte_len = byte_len + 1
+             WHERE block_ordinal = 3",
+            [],
+        )
+        .expect("model segment rows that no longer rebuild the ledger");
+    assert!(
+        encode(&connection, &event)
+            .expect("encode after drift")
+            .is_none(),
+        "a ledger its segment rows cannot rebuild must stay self-contained"
+    );
+}

@@ -605,9 +605,22 @@ impl UsageReportService {
         let Some(tokens) = &self.tokens else {
             return Err(MeterUnavailable::new("credential_broker_unavailable"));
         };
-        let token = tokens.bearer(&descriptor).await?;
-        // Token resolution can await refresh. Re-read the descriptor after
-        // that await and check the same snapshot used for the request header.
+        // Select the descriptor again before resolving the bearer. An import
+        // may replace its vault entry before publishing the new descriptor;
+        // resolving from the freshest descriptor narrows that handoff.
+        let current = self
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| &descriptor.alias == account_alias)
+            .ok_or_else(|| MeterUnavailable::new(crate::usage_reset::ACCOUNT_CHANGED_REASON))?;
+        if self.binding_for_descriptor(&current).as_ref() != Some(binding) {
+            return Err(MeterUnavailable::new(
+                crate::usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        }
+        let token = tokens.bearer(&current).await?;
+        // Token resolution can await refresh. Re-read after that await too:
+        // the same bound account must still supply the request header.
         let current = self
             .descriptors()
             .into_iter()

@@ -995,6 +995,7 @@ mod reducer_filter_tests {
                 mutation_digest: "mutation-digest".into(),
                 workspace_revision: Some(WorkspaceRevision::new("workspace-revision:11")),
                 subject_digest: Some("mutation-subject".into()),
+                redacted_content: false,
             }),
         };
         let signal_artifact = ArtifactRef::new(format!("blake3:{}", "a".repeat(64)));

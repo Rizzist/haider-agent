@@ -92,6 +92,225 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     }
 }
 
+#[test]
+fn session_output_limit_validation_is_exact_and_typed() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = crate::model_select::ValidatedModelSelection {
+        provider: "anthropic-oauth".into(),
+        model: "claude-fable-5-1".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+        context_window: Some(1_000_000),
+        max_output_tokens: 128_000,
+        explicit_max_output_tokens: 128_000,
+    };
+
+    let derived = super::rpc::resolve_session_output_limit(0, &selection).expect("derived default");
+    assert_eq!(derived.max_tokens, 30_000);
+    assert_eq!(derived.source, SessionOutputBudgetSourceV1::Derived);
+    // A SOURCED 8,192 row (e.g. Gemini 2.0): the explicit ceiling is exact.
+    let smaller = crate::model_select::ValidatedModelSelection {
+        max_output_tokens: 8_192,
+        explicit_max_output_tokens: 8_192,
+        ..selection.clone()
+    };
+    assert_eq!(
+        super::rpc::resolve_session_output_limit(0, &smaller)
+            .expect("model-bounded default")
+            .max_tokens,
+        8_192
+    );
+    assert!(
+        matches!(
+            super::rpc::resolve_session_output_limit(30_000, &smaller),
+            Err((
+                _,
+                haider_rpc::ErrorData::ModelOutputLimit {
+                    requested: 30_000,
+                    max_output_tokens: 8_192,
+                    ..
+                }
+            ))
+        ),
+        "an explicit request above the model maximum receives a typed refusal"
+    );
+    let exact = super::rpc::resolve_session_output_limit(128_000, &selection)
+        .expect("exact explicit limit");
+    assert_eq!(exact.max_tokens, 128_000);
+    assert_eq!(
+        exact.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 128_000 }
+    );
+    let (message, data) = super::rpc::resolve_session_output_limit(128_001, &selection)
+        .expect_err("over-limit refusal");
+    assert!(message.contains("claude-fable-5-1"));
+    assert!(message.contains("128000"));
+    assert!(matches!(
+        data,
+        haider_rpc::ErrorData::ModelOutputLimit {
+            requested: 128_001,
+            max_output_tokens: 128_000,
+            context_window: Some(1_000_000),
+            ..
+        }
+    ));
+}
+
+/// D1: a model switch re-applies the STORED budget. Derived (recorded, or a
+/// legacy client default) re-derives; user-set (recorded, or a legacy
+/// non-default value) clamps with a typed notice and never refuses.
+#[test]
+fn model_switch_reapplies_derived_and_user_set_budgets() {
+    use haider_protocol::output_budget::{OutputBudgetClampV1, SessionOutputBudgetSourceV1};
+    let gpt_4o = crate::model_select::ValidatedModelSelection {
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+        context_window: Some(128_000),
+        max_output_tokens: 16_384,
+        explicit_max_output_tokens: 16_384,
+    };
+    let custom = crate::model_select::ValidatedModelSelection {
+        provider: "custom973".into(),
+        model: "custom-unknown".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Unlisted,
+        context_window: None,
+        max_output_tokens: 8_192,
+        explicit_max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+    };
+    let metadata = |max_tokens, source| {
+        let mut metadata: haider_protocol::session::SessionMetadataV1 =
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/workspace",
+                "provider": "anthropic-oauth",
+                "model": "claude-fable-5-1",
+                "max_tokens": max_tokens,
+                "created_at_ms": 1_u64,
+            }))
+            .expect("metadata fixture");
+        metadata.max_tokens_source = source;
+        metadata
+    };
+
+    for current in [
+        metadata(30_000, Some(SessionOutputBudgetSourceV1::Derived)),
+        metadata(30_000, None),
+        metadata(4_096, None),
+    ] {
+        let budget = super::rpc::reapply_session_output_budget(&current, &gpt_4o);
+        assert_eq!(budget.max_tokens, 16_384);
+        assert_eq!(budget.source, SessionOutputBudgetSourceV1::Derived);
+        assert_eq!(budget.clamped, None);
+        assert_eq!(
+            super::rpc::reapply_session_output_budget(&current, &custom).max_tokens,
+            8_192
+        );
+    }
+
+    let user = metadata(
+        30_000,
+        Some(SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }),
+    );
+    let budget = super::rpc::reapply_session_output_budget(&user, &gpt_4o);
+    assert_eq!(budget.max_tokens, 16_384);
+    assert_eq!(
+        budget.clamped,
+        Some(OutputBudgetClampV1 {
+            requested: 30_000,
+            max_output_tokens: 16_384
+        })
+    );
+    let legacy_override = metadata(12_000, None);
+    let budget = super::rpc::reapply_session_output_budget(&legacy_override, &gpt_4o);
+    assert_eq!(budget.max_tokens, 12_000);
+    assert_eq!(
+        budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 12_000 },
+        "a legacy non-default value is the user's own"
+    );
+    assert_eq!(budget.clamped, None);
+    let legacy_large = metadata(20_000, None);
+    let budget = super::rpc::reapply_session_output_budget(&legacy_large, &gpt_4o);
+    assert_eq!(budget.max_tokens, 16_384);
+    assert!(budget.clamped.is_some());
+    // S1: an unverified 8,192 guess does not clamp the user's own budget.
+    let budget = super::rpc::reapply_session_output_budget(&legacy_large, &custom);
+    assert_eq!(budget.max_tokens, 20_000);
+    assert_eq!(budget.clamped, None);
+}
+
+/// S1: when the row maximum is only the unverified 8,192 fallback, an
+/// explicit budget up to `MAX_OUTPUT_LIMIT` (strictly below a known context
+/// window) is admitted; the derived default still follows the guess.
+#[test]
+fn unverified_fallback_rows_admit_larger_explicit_budgets() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = |provider: &str, model: &str, context_window: Option<u64>| {
+        let max_output_tokens =
+            haider_provider::model_output_limit(provider, model, None, context_window);
+        crate::model_select::ValidatedModelSelection {
+            provider: provider.into(),
+            model: model.into(),
+            inventory_status: haider_rpc::ModelInventoryStatusWire::Unlisted,
+            context_window,
+            max_output_tokens,
+            explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
+                provider,
+                model,
+                max_output_tokens,
+                context_window,
+            ),
+        }
+    };
+    for custom in [
+        selection("custom973", "custom-unknown", None),
+        selection("anthropic", "claude-sonnet-4-20250514", None),
+        selection("gemini", "gemini-9-unlisted", None),
+        selection("openai", "gpt-unknown", None),
+    ] {
+        assert_eq!(
+            custom.max_output_tokens,
+            haider_provider::UNKNOWN_OUTPUT_LIMIT
+        );
+        let derived = super::rpc::resolve_session_output_limit(0, &custom).expect("derived");
+        assert_eq!(derived.max_tokens, haider_provider::UNKNOWN_OUTPUT_LIMIT);
+        let explicit = super::rpc::resolve_session_output_limit(30_000, &custom)
+            .expect("explicit budget above the unverified guess");
+        assert_eq!(explicit.max_tokens, 30_000);
+        assert_eq!(
+            explicit.source,
+            SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }
+        );
+        assert_eq!(
+            super::rpc::resolve_session_output_limit(haider_provider::MAX_OUTPUT_LIMIT, &custom)
+                .expect("up to the adapter maximum")
+                .max_tokens,
+            haider_provider::MAX_OUTPUT_LIMIT
+        );
+        assert!(matches!(
+            super::rpc::resolve_session_output_limit(
+                haider_provider::MAX_OUTPUT_LIMIT + 1,
+                &custom
+            ),
+            Err((
+                _,
+                haider_rpc::ErrorData::ModelOutputLimit {
+                    max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+                    ..
+                }
+            ))
+        ));
+    }
+    // A known context window still bounds the explicit ceiling strictly below it.
+    let windowed = selection("custom973", "custom-unknown", Some(64_000));
+    assert_eq!(windowed.explicit_max_output_tokens, 32_000);
+    assert!(super::rpc::resolve_session_output_limit(32_000, &windowed).is_ok());
+    assert!(super::rpc::resolve_session_output_limit(32_001, &windowed).is_err());
+    // A sourced row keeps its exact maximum.
+    let sourced = selection("anthropic", "claude-sonnet-4-5", Some(200_000));
+    assert_eq!(sourced.explicit_max_output_tokens, 64_000);
+    assert!(super::rpc::resolve_session_output_limit(64_001, &sourced).is_err());
+}
+
 /// The attachment replay preflight must keep immutable-blob validation out of
 /// an idempotent retry while still entering the fused acceptance transaction
 /// that repairs a legacy first-turn receipt with no title.
@@ -358,6 +577,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -659,6 +879,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -783,6 +1004,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -2145,6 +2367,8 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let selected_alias = haider_protocol::ids::CredentialAlias::new("selected-fake");
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: selected_alias.clone(),
         provider: "fake".into(),
         base_url: None,
@@ -2154,13 +2378,14 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         active: false,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let mut provider = provider_summary("fake");
     provider.models = vec!["fake-v1".into()];
     provider.default_model = Some("fake-v1".into());
     let active_other = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("active-other"),
         provider: "other".into(),
         active: true,
@@ -3461,6 +3686,7 @@ async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
     let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
     let snapshot = Arc::new(std::sync::Mutex::new(vec![
         haider_protocol::credential::CredentialDescriptor {
+            credential_digest: None,
             alias: account.clone(),
             provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.into(),
             base_url: None,
@@ -3859,6 +4085,7 @@ fn reset_test_descriptor(
     account: haider_protocol::ids::CredentialAlias,
 ) -> haider_protocol::credential::CredentialDescriptor {
     haider_protocol::credential::CredentialDescriptor {
+        credential_digest: None,
         alias: account,
         provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.into(),
         base_url: None,
@@ -4564,6 +4791,152 @@ async fn usage_reset_default_card_answer_never_consumes_and_explicit_approve_con
     store.close().await.expect("store closes");
 }
 
+/// Swapping the descriptor under the same display alias after the menu opens
+/// must fail at the hub answer boundary, before any provider task is queued.
+#[tokio::test]
+async fn usage_reset_answer_rejects_descriptor_swap_under_the_same_alias() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("reset-descriptor-swap");
+    hub.create_internal_session(create_command(&session, "reset-descriptor-swap"))
+        .await
+        .expect("session created");
+    let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
+    let descriptors = Arc::new(Mutex::new(vec![reset_test_descriptor(account.clone())]));
+    let http = Arc::new(SlowResetHttp::default());
+    hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+        descriptors.clone(),
+        Some(Arc::new(ResetTestTokens)),
+        http.clone(),
+    )))
+    .expect("usage service installs");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("swap-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attached");
+    let (menu_id, request_seq, generation) =
+        open_reset_approval(&connection, &sink, &session, &account, "swap-command").await;
+    {
+        let mut rows = descriptors.lock().expect("descriptors");
+        rows[0].incarnation += 1;
+        rows[0]
+            .account_identity
+            .as_mut()
+            .expect("identity")
+            .account_id = Some("different-workspace".into());
+    }
+    connection
+        .menu_answer(
+            Some(haider_rpc::RequestId::new("swap-answer")),
+            haider_rpc::CommandId::new("swap-answer-command"),
+            session.clone(),
+            menu_id,
+            request_seq,
+            generation,
+            crate::usage_reset::APPROVE_OPTION_KEY.into(),
+            1,
+            None,
+        )
+        .await
+        .expect("answer resolves to a typed failure");
+    let events = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = store.read(&session, 0, 128).await.expect("journal");
+            if events.iter().any(|event| {
+                matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { ref kind, ref data },
+                        ..
+                    })) if kind == haider_protocol::usage::USAGE_RESET_APPLY_RESULT_EXTENSION
+                        && data["reason"] == crate::usage_reset::ACCOUNT_CHANGED_REASON
+                )
+            }) {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("account change settles");
+    assert!(events.iter().all(|event| !matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
+    )));
+    assert_eq!(http.posts.load(Ordering::SeqCst), 0);
+
+    // A service disappearing after a second card was opened is a subsystem
+    // failure, not evidence that its bound account changed.
+    let (menu_id, request_seq, generation) = open_reset_approval(
+        &connection,
+        &sink,
+        &session,
+        &account,
+        "service-missing-command",
+    )
+    .await;
+    *hub.inner.usage_report.lock().expect("usage service lock") = None;
+    connection
+        .menu_answer(
+            Some(haider_rpc::RequestId::new("service-missing-answer")),
+            haider_rpc::CommandId::new("service-missing-answer-command"),
+            session.clone(),
+            menu_id,
+            request_seq,
+            generation,
+            crate::usage_reset::APPROVE_OPTION_KEY.into(),
+            1,
+            None,
+        )
+        .await
+        .expect("missing service resolves to a typed failure");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = store.read(&session, 0, 256).await.expect("journal");
+            if events.iter().any(|event| {
+                matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { ref kind, ref data },
+                        ..
+                    })) if kind == haider_protocol::usage::USAGE_RESET_APPLY_RESULT_EXTENSION
+                        && data["reason"] == "usage_subsystem_unavailable"
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("missing service settles with its own reason");
+    assert_eq!(http.posts.load(Ordering::SeqCst), 0);
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// Raises the drain fence synchronously when the reset authorization batch
 /// (answer + `Authorized` + `Dispatched`) persists, i.e. after the durable
 /// dispatch claim and before the provider task can be registered.
@@ -5250,6 +5623,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -6614,6 +6988,7 @@ pub(super) fn create_command(session_id: &SessionId, suffix: &str) -> SessionCre
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4_096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

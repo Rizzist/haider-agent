@@ -965,3 +965,35 @@ fn replayed_pending_card_in_fresh_model_paints_and_answers_deny() {
     resumed.handle(key(KeyCode::Enter));
     assert_eq!(answered_keys(&resumed), vec![Some("deny".to_owned())]);
 }
+
+#[test]
+fn live_reply_retires_hidden_apply_navigation_before_the_next_key() {
+    let mut model = session_with_card_no_history();
+    let card = model.projection.open_menu().expect("card").clone();
+    model.handle(key(KeyCode::Down));
+    assert_eq!(model.menu_display_selection(&card), 1);
+    let mut driver = LiveDriver::new("synthetic-reply");
+
+    // A background overlay change and a daemon reply can both occur between
+    // keyboard events. The reply epilogue must retire ownership right away.
+    model.help_open = true;
+    driver.apply(
+        &mut model,
+        LiveReply::Draining {
+            reason: "synthetic".into(),
+        },
+    );
+    model.help_open = false;
+    assert_eq!(model.menu_display_selection(&card), 0);
+
+    // A reply that leaves the card painted keeps a deliberate selection.
+    model.handle(key(KeyCode::Down));
+    assert_eq!(model.menu_display_selection(&card), 1);
+    driver.apply(
+        &mut model,
+        LiveReply::Draining {
+            reason: "synthetic".into(),
+        },
+    );
+    assert_eq!(model.menu_display_selection(&card), 1);
+}

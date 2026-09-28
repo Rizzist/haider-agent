@@ -1467,6 +1467,8 @@ fn golden_credentials() {
     golden(
         "credential_descriptor_oauth",
         &CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("personal-max"),
             provider: "anthropic".into(),
             base_url: None,
@@ -1476,13 +1478,14 @@ fn golden_credentials() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
     );
     golden(
         "credential_descriptor_keychain_locked",
         &CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("claude-code"),
             provider: "anthropic-oauth".into(),
             base_url: None,
@@ -1494,7 +1497,6 @@ fn golden_credentials() {
             active: true,
             label: None,
             account_identity: None,
-            incarnation: 0,
             created_at_ms: None,
         },
     );

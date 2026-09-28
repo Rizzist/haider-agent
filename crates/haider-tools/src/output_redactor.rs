@@ -6,6 +6,7 @@ pub struct OutputRedactor {
     pending: Vec<u8>,
     state: crate::redact::RedactionState,
     discarding_line: bool,
+    redactions_applied: bool,
 }
 
 impl OutputRedactor {
@@ -29,6 +30,7 @@ impl OutputRedactor {
                     let _ = self.finish_bytes();
                     self.state.discard_oversized_line();
                     self.discarding_line = true;
+                    self.redactions_applied = true;
                     output.extend_from_slice(b"[REDACTED:oversized_output_line]\n");
                 } else {
                     self.pending.extend_from_slice(segment);
@@ -74,17 +76,34 @@ impl OutputRedactor {
             &format!("{classified}{newline}"),
             &mut self.state,
         );
+        // A stripped terminal control can carry a hidden credential too. Its
+        // removal is a redaction for provenance even if visible text needed
+        // no marker.
+        self.redactions_applied |= redacted.replacements > 0 || plain != text;
         if redacted.replacements == 0 && plain == text {
             bytes
         } else {
             crate::shell::strip_ansi(&redacted.text).into_bytes()
         }
     }
+
+    pub fn redactions_applied(&self) -> bool {
+        self.redactions_applied
+    }
 }
 
 /// Matches the journal's per-stream, complete-line redaction. Interleaving
 /// stderr inside a stdout token must not break classification of that token.
 pub fn redact_process_output(chunks: &[crate::ProcessOutputChunk]) -> crate::ToolResult<String> {
+    redact_process_output_with_redaction(chunks).map(|(text, _)| text)
+}
+
+/// Complete safe text plus whether a secret/oversized line was actually
+/// replaced. Stripped terminal controls count because their hidden payload
+/// may contain a credential; lossy UTF-8 alone does not.
+pub fn redact_process_output_with_redaction(
+    chunks: &[crate::ProcessOutputChunk],
+) -> crate::ToolResult<(String, bool)> {
     use base64::Engine as _;
     let mut redactors = [OutputRedactor::default(), OutputRedactor::default()];
     let mut output = String::new();
@@ -98,7 +117,10 @@ pub fn redact_process_output(chunks: &[crate::ProcessOutputChunk]) -> crate::Too
     for redactor in &mut redactors {
         output.push_str(&redactor.finish());
     }
-    Ok(output)
+    Ok((
+        output,
+        redactors.iter().any(OutputRedactor::redactions_applied),
+    ))
 }
 
 #[cfg(test)]

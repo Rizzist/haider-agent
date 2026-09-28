@@ -362,15 +362,19 @@ impl HubConnection {
     ) -> Result<(), SessionHubError> {
         let approved = usage_reset::answered_option_key(answer.option_key.as_deref())
             == usage_reset::APPROVE_OPTION_KEY;
-        let account_changed = match (binding, self.hub.usage_report_service()?) {
-            (Some(binding), Some(service)) => !service.reset_binding_matches(account, binding),
-            _ => true,
+        let failure_reason = match (binding, self.hub.usage_report_service()?) {
+            (None, _) => Some(usage_reset::ACCOUNT_CHANGED_REASON),
+            (Some(_), None) => Some("usage_subsystem_unavailable"),
+            (Some(binding), Some(service)) if !service.reset_binding_matches(account, binding) => {
+                Some(usage_reset::ACCOUNT_CHANGED_REASON)
+            }
+            (Some(_), Some(_)) => None,
         };
         let effect = usage_reset::effect_id(approval_id);
         let scope = ResetEventScope::after(answered);
-        let final_verdict = if account_changed {
+        let final_verdict = if let Some(reason) = failure_reason {
             AuthorizationVerdict::Deny {
-                reason: usage_reset::ACCOUNT_CHANGED_REASON.into(),
+                reason: reason.into(),
             }
         } else if approved {
             AuthorizationVerdict::Allow
@@ -387,7 +391,7 @@ impl HubConnection {
             }),
             PromptRender::Omit,
         )];
-        if approved && !account_changed {
+        if approved && failure_reason.is_none() {
             authorization.push((
                 "dispatched",
                 EventPayload::Effect(EffectPhase::Dispatched {
@@ -401,9 +405,8 @@ impl HubConnection {
                 .usage_reset_envelopes(&scope, approval_id, "authorization", authorization)?;
         self.hub.append(&mut authorization).await?;
 
-        if account_changed {
-            let result =
-                usage_reset::failed(approval_id, account, usage_reset::ACCOUNT_CHANGED_REASON);
+        if let Some(reason) = failure_reason {
+            let result = usage_reset::failed(approval_id, account, reason);
             let delivered = self
                 .hub
                 .notify_usage_reset_result(&answered.session_id, approval_id, &result)

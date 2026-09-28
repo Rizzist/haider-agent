@@ -187,6 +187,7 @@ pub(crate) async fn draft_from_prose(
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     let mut prepared = resolved.provider.prepare_turn(&request);
     if let (Some(prepared), Some(trace)) = (prepared.as_mut(), correlation.turn_trace.as_ref()) {

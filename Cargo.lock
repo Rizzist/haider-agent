@@ -1822,6 +1822,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "zeroize",
 ]
 
@@ -1951,6 +1952,8 @@ dependencies = [
  "async-trait",
  "base64",
  "blake3",
+ "bytes",
+ "futures-util",
  "haider-accounts",
  "haider-platform",
  "haider-protocol",
@@ -2025,11 +2028,16 @@ dependencies = [
  "base64",
  "blake3",
  "futures-util",
+ "getrandom 0.3.4",
  "globset",
  "haider-platform",
  "haider-protocol",
  "ignore",
  "image",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-graphics",
+ "objc2-foundation",
  "regex",
  "regex-syntax",
  "rustix 1.1.4",
@@ -3158,6 +3166,7 @@ checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.1",
  "objc2",
+ "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
 ]

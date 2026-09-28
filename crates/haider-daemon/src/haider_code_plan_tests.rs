@@ -22,6 +22,8 @@ use super::haider_code_plan::{
 
 fn descriptor(alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: "haider-code".into(),
         base_url: None,
@@ -31,7 +33,6 @@ fn descriptor(alias: &str) -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     }
 }
@@ -707,6 +708,7 @@ async fn real_session_hub_interest_requires_an_attached_haider_code_session() {
             provider: provider.into(),
             model: "test-model".into(),
             max_tokens: 4_096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,

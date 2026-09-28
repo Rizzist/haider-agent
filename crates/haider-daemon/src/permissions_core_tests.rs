@@ -302,6 +302,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -464,6 +465,7 @@ fn autonomous_effect_defaults_keep_sensitive_reset_human_only() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: SessionInteractionModeV1::Autonomous,
         system_prompt_version: None,
@@ -598,6 +600,7 @@ fn auto_allow_promotes_ordinary_asks_but_not_sensitive_reset() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -1086,6 +1089,7 @@ fn create_durable_session(store: &Store, session_id: &SessionId) {
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -1675,7 +1679,9 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // 972-ax-testrun, the frozen typed `tool_script` DAG schema, and the
     // platform-invariant 1,237 bytes of the usage-reset manifest. The
     // default instruct-pipe pack is unchanged: the large orchestration schema
-    // remains discovery-only until explicitly promoted.
+    // remains discovery-only until explicitly promoted. The full pack lost
+    // six bytes when the optional spawn_subagent.request_budget description
+    // changed from 154 to 148 bytes; only its description is in this pin.
     #[cfg(target_os = "linux")]
     const EXPECTED_FULL_PREFIX_BYTES: usize = 44_640;
     #[cfg(target_os = "macos")]

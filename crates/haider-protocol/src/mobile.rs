@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Registered name of the capability-gated `mobile` tool. The daemon routes
+/// exactly this name to the mobile backend, so it is the tool's typed identity.
+pub const MOBILE_TOOL_NAME: &str = "mobile";
+
 /// One point in the mobile screenshot coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

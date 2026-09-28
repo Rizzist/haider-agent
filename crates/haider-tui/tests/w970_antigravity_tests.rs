@@ -49,6 +49,8 @@ fn accounts_model() -> AppModel {
 
 fn descriptor(alias: &str, provider: &str, identity: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.into(),
         base_url: None,
@@ -58,7 +60,6 @@ fn descriptor(alias: &str, provider: &str, identity: &str) -> CredentialDescript
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     }
 }

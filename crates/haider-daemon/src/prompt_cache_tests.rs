@@ -180,6 +180,8 @@ async fn run_fixture(cache_on: bool) -> Vec<serde_json::Value> {
     // Exercise the actual usage.report service over the same SQLite journal;
     // an API-key descriptor has no remote subscription meter to poll.
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: account.clone(),
         provider: "anthropic".into(),
         base_url: None,
@@ -189,7 +191,6 @@ async fn run_fixture(cache_on: bool) -> Vec<serde_json::Value> {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let report = UsageReportService::new(

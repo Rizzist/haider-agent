@@ -10,6 +10,7 @@ use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, MenuId, RunId, S
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::FinishReason;
+use haider_protocol::request_budget::RequestBudgetV1;
 use haider_protocol::session::SessionInteractionModeV1;
 use haider_protocol::state::RunState;
 use haider_protocol::tool::ToolResultStatus;
@@ -645,8 +646,10 @@ async fn provider_request_ceiling_preserves_a_typed_budget_continuation() {
         11,
     )
     .with_started_at_ms(1_700_000_000_000);
-    config.max_provider_requests_per_turn = 1;
-    config.provider_request_tranche = 1;
+    config.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 1,
+    });
     let store = Arc::new(MemoryStore::new());
     let provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitRequestInput {

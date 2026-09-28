@@ -15,7 +15,7 @@ use haider_protocol::cache::{
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{ArtifactRef, SessionId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
@@ -28,6 +28,9 @@ mod provider_view_store_tests;
 pub(crate) const PROVIDER_VIEW_HOT_BLOCK_CAP_BYTES: usize = 64 * 1024;
 pub(crate) const PROVIDER_VIEW_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const PROVIDER_VIEW_SWEEP_REQUEST_BATCH: usize = 128;
+/// Queued hashes reclaimed per maintenance step; a larger queue is continued
+/// by later steps.
+const PROVIDER_VIEW_GC_BATCH: usize = 256;
 const PROVIDER_VIEW_SWEEP_PERSIST_INTERVAL: u64 = 64;
 const PROVIDER_VIEW_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -40,6 +43,474 @@ pub(crate) struct ProviderViewStore {
 pub(crate) struct PreparedProviderView {
     ledger: ProviderViewLedgerV1,
     expected: HashSet<ProviderViewBlockRefV1>,
+}
+
+/// Domain separator for [`history_digest`]. Persisted in request cursors and
+/// compact journal records, so changing it invalidates existing profiles.
+const HISTORY_DIGEST_DOMAIN: &[u8] = b"haider.provider-view.history-prefix.v1\0";
+
+/// Digest of an ordered history ledger (hash and length of every block). It
+/// binds a request cursor or compact journal record to its exact ledger.
+pub(crate) fn history_digest(blocks: &[ProviderViewBlockRefV1]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(HISTORY_DIGEST_DOMAIN);
+    for block in blocks {
+        hasher.update(block.content_hash.as_bytes());
+        hasher.update(&block.byte_len.to_be_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Read one immutable history prefix. Segment rows are never removed: journal
+/// attempt facts can still be decoded after the seven-day CAS/index expiry.
+pub(crate) fn history_segment_prefix(
+    connection: &Connection,
+    session_id: &SessionId,
+    segment_id: i64,
+    count: usize,
+) -> StoreResult<Vec<ProviderViewBlockRefV1>> {
+    let owner: Option<String> = connection
+        .query_row(
+            "SELECT session_id FROM provider_view_history_segments WHERE id = ?1",
+            [segment_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_read_error)?;
+    if owner.as_deref() != Some(session_id.as_str()) {
+        return Err(corrupt(
+            "provider-view history segment belongs to another session",
+        ));
+    }
+    let mut statement = connection
+        .prepare_cached(
+            "WITH RECURSIVE chain(segment_id, cutoff) AS (
+                 SELECT ?1, ?2
+                 UNION ALL
+                 SELECT s.parent_segment_id, MIN(chain.cutoff, s.parent_block_count)
+                 FROM chain JOIN provider_view_history_segments s ON s.id = chain.segment_id
+                 WHERE s.parent_segment_id IS NOT NULL
+             )
+             SELECT s.session_id, b.block_ordinal, b.content_hash, b.byte_len
+             FROM chain
+             JOIN provider_view_history_segments s ON s.id = chain.segment_id
+             LEFT JOIN provider_view_history_blocks b
+               ON b.segment_id = s.id
+              AND b.block_ordinal >= s.parent_block_count
+              AND b.block_ordinal < chain.cutoff
+             ORDER BY b.block_ordinal",
+        )
+        .map_err(sqlite_read_error)?;
+    let rows = statement
+        .query_map(
+            params![
+                segment_id,
+                i64::try_from(count)
+                    .map_err(|_| corrupt("history prefix exceeds SQLite integer space"))?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .map_err(sqlite_read_error)?;
+    let mut blocks = Vec::with_capacity(count);
+    for row in rows {
+        let (owner, ordinal, content_hash, byte_len) = row.map_err(sqlite_read_error)?;
+        if owner != session_id.as_str() {
+            return Err(corrupt(
+                "provider-view history segment belongs to another session",
+            ));
+        }
+        let Some(ordinal) = ordinal else { continue };
+        let (Some(content_hash), Some(byte_len)) = (content_hash, byte_len) else {
+            return Err(corrupt("provider-view history segment row is incomplete"));
+        };
+        if ordinal != i64::try_from(blocks.len()).unwrap_or(i64::MAX) {
+            return Err(corrupt(
+                "provider-view history segment has a missing ordinal",
+            ));
+        }
+        blocks.push(ProviderViewBlockRefV1 {
+            content_hash,
+            byte_len: u64::try_from(byte_len)
+                .map_err(|_| corrupt("provider-view history block length is negative"))?,
+        });
+    }
+    if blocks.len() != count {
+        return Err(corrupt(
+            "provider-view history segment is shorter than its request",
+        ));
+    }
+    Ok(blocks)
+}
+
+/// Where one request's history ledger lives in the trunk/leaf segment tree.
+///
+/// Invariants (schema v32):
+/// - Segment rows and block rows are immutable once a later row refers to
+///   them. A trunk only grows past its current end; a leaf never grows.
+/// - A segment's own blocks occupy ordinals `parent_block_count..`; ordinals
+///   below `parent_block_count` are read from the parent, cut at that count.
+///   Parents always have smaller ids, so every chain is finite.
+/// - Each request owns one leaf whose parent cutoff equals its trunk's length
+///   when the leaf was created (`prefix_len`). Later trunk growth is therefore
+///   invisible to older leaves, which keeps journal replay deterministic.
+/// - A new request reuses its predecessor's trunk only while that leaf's
+///   cutoff still equals the trunk's length. If the trunk has grown since
+///   (the newer requests that grew it have expired), the new request branches
+///   at `min(common prefix, leaf cutoff)`, because the grown blocks were never
+///   compared with the surviving predecessor.
+/// - A trunk holds only blocks that two consecutive requests agreed on, so a
+///   request writes O(changed tail) rows, never its whole history again.
+struct HistoryPlacement {
+    trunk_id: i64,
+    /// Trunk length before this request; `trunk_end..prefix_len` is appended.
+    trunk_end: usize,
+    leaf_id: i64,
+    /// Blocks shared with the trunk; `prefix_len..` is stored in the leaf.
+    prefix_len: usize,
+}
+
+/// Chooses or creates this request's trunk and inserts its new leaf segment.
+/// The caller inserts the block rows from the returned ranges. Each request
+/// gets a short immutable leaf. Its parent trunk contains blocks confirmed
+/// stable by the next request and only grows by the newly confirmed delta.
+/// When an earlier stable block changes, a new trunk branches from the common
+/// prefix (or starts empty), leaving the old trunk and its leaves untouched.
+fn place_history_segments(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    history_blocks: &[ProviderViewBlockRefV1],
+) -> StoreResult<HistoryPlacement> {
+    let previous: Option<(Option<i64>, Option<i64>)> = transaction
+        .query_row(
+            "SELECT h.segment_id, h.block_count
+             FROM provider_view_requests r
+             LEFT JOIN provider_view_request_history h
+               ON h.session_id = r.session_id
+              AND h.request_ordinal = r.request_ordinal
+             WHERE r.session_id = ?1
+             ORDER BY r.request_ordinal DESC LIMIT 1",
+            [session_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_read_error)?;
+    let (trunk_id, trunk_end, prefix_len) = match previous {
+        Some((Some(leaf_id), Some(count))) => {
+            let count = usize::try_from(count)
+                .map_err(|_| corrupt("provider-view history count is negative"))?;
+            let earlier = history_segment_prefix(transaction, session_id, leaf_id, count)?;
+            let common = earlier
+                .iter()
+                .zip(history_blocks)
+                .take_while(|(left, right)| left == right)
+                .count();
+            let (trunk_id, leaf_cutoff): (Option<i64>, i64) = transaction
+                .query_row(
+                    "SELECT parent_segment_id, parent_block_count
+                     FROM provider_view_history_segments WHERE id = ?1",
+                    [leaf_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(sqlite_read_error)?;
+            let trunk_id =
+                trunk_id.ok_or_else(|| corrupt("provider-view history leaf has no trunk"))?;
+            let leaf_cutoff = usize::try_from(leaf_cutoff)
+                .map_err(|_| corrupt("provider-view history leaf cutoff is negative"))?;
+            let (parent_count, local_end): (i64, i64) = transaction
+                .query_row(
+                    "SELECT s.parent_block_count, COALESCE(MAX(b.block_ordinal) + 1, 0)
+                     FROM provider_view_history_segments s
+                     LEFT JOIN provider_view_history_blocks b ON b.segment_id = s.id
+                     WHERE s.id = ?1 GROUP BY s.id",
+                    [trunk_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(sqlite_read_error)?;
+            let trunk_end = usize::try_from(parent_count.max(local_end))
+                .map_err(|_| corrupt("provider-view trunk length is negative"))?;
+            if leaf_cutoff > trunk_end {
+                return Err(corrupt("provider-view history leaf extends past its trunk"));
+            }
+            // The previous leaf only vouches for its trunk up to its own
+            // cutoff. When the trunk grew after that leaf was created (a newer
+            // request has since expired out of order), the blocks between the
+            // cutoff and `trunk_end` were never compared with this ledger.
+            if leaf_cutoff == trunk_end && common >= trunk_end {
+                (trunk_id, trunk_end, common)
+            } else {
+                let branch = common.min(leaf_cutoff);
+                let new_trunk = if branch == 0 {
+                    transaction
+                        .execute(
+                            "INSERT INTO provider_view_history_segments(session_id)
+                             VALUES (?1)",
+                            [session_id.as_str()],
+                        )
+                        .map_err(sqlite_write_error)?;
+                    transaction.last_insert_rowid()
+                } else {
+                    transaction
+                        .execute(
+                            "INSERT INTO provider_view_history_segments(
+                                session_id, parent_segment_id, parent_block_count
+                             ) VALUES (?1, ?2, ?3)",
+                            params![
+                                session_id.as_str(),
+                                trunk_id,
+                                i64::try_from(branch).map_err(|_| invalid(
+                                    "provider-view history prefix exceeds SQLite integer space"
+                                ))?,
+                            ],
+                        )
+                        .map_err(sqlite_write_error)?;
+                    transaction.last_insert_rowid()
+                };
+                // `branch..common` was confirmed by the previous request and
+                // becomes the new trunk's first own blocks.
+                (new_trunk, branch, common)
+            }
+        }
+        _ => {
+            transaction
+                .execute(
+                    "INSERT INTO provider_view_history_segments(session_id) VALUES (?1)",
+                    [session_id.as_str()],
+                )
+                .map_err(sqlite_write_error)?;
+            (transaction.last_insert_rowid(), 0, 0)
+        }
+    };
+    transaction
+        .execute(
+            "INSERT INTO provider_view_history_segments(
+                session_id, parent_segment_id, parent_block_count
+             ) VALUES (?1, ?2, ?3)",
+            params![
+                session_id.as_str(),
+                trunk_id,
+                i64::try_from(prefix_len).map_err(|_| invalid(
+                    "provider-view history prefix exceeds SQLite integer space"
+                ))?,
+            ],
+        )
+        .map_err(sqlite_write_error)?;
+    Ok(HistoryPlacement {
+        trunk_id,
+        trunk_end,
+        leaf_id: transaction.last_insert_rowid(),
+        prefix_len,
+    })
+}
+
+/// Never lets a request expire before its session's latest surviving request.
+/// Expiry is wall-clock based, so a clock step backwards would otherwise
+/// expire newer requests first and leave an older one as the session's
+/// latest. Clamping keeps each session's expiry order equal to its request
+/// order; [`place_history_segments`] still tolerates profiles written before
+/// this clamp.
+fn monotonic_expiry(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    expires_at_ms: u64,
+) -> StoreResult<u64> {
+    let latest: Option<i64> = transaction
+        .query_row(
+            "SELECT expires_at_ms FROM provider_view_requests
+             WHERE session_id = ?1 ORDER BY request_ordinal DESC LIMIT 1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_read_error)?;
+    let Some(latest) = latest else {
+        return Ok(expires_at_ms);
+    };
+    let latest = u64::try_from(latest).map_err(|_| corrupt("provider-view expiry is negative"))?;
+    Ok(expires_at_ms.max(latest))
+}
+
+/// Inserts `blocks` into `segment_id` at ordinals starting from `start`.
+fn insert_history_blocks(
+    transaction: &rusqlite::Transaction<'_>,
+    segment_id: i64,
+    start: usize,
+    blocks: &[ProviderViewBlockRefV1],
+) -> StoreResult<()> {
+    for (offset, block) in blocks.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO provider_view_history_blocks(
+                    segment_id, block_ordinal, content_hash, byte_len
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    segment_id,
+                    i64::try_from(start + offset).map_err(|_| invalid(
+                        "provider-view history ordinal exceeds SQLite integer space"
+                    ))?,
+                    &block.content_hash,
+                    to_sqlite_integer(block.byte_len)?,
+                ],
+            )
+            .map_err(sqlite_write_error)?;
+    }
+    Ok(())
+}
+
+/// Outcome of one bounded maintenance step.
+struct MaintenanceStep {
+    expired: usize,
+    /// More expired requests or queued hashes remain for a later step.
+    more_work: bool,
+}
+
+/// Own block-ordinal range `start..end` of each reachable segment that at
+/// least one of `leaves` (leaf segment id, visible block count) reads.
+///
+/// Parents always have smaller ids, so visiting segments in descending id
+/// order sees every child before its parent. Each segment is visited once
+/// with its maximal reach, which keeps the cost linear in reachable segments
+/// even when many leaves share one trunk.
+fn segment_coverage(
+    connection: &Connection,
+    leaves: Vec<(i64, i64)>,
+) -> StoreResult<HashMap<i64, (usize, usize)>> {
+    let mut pending = BTreeMap::<i64, usize>::new();
+    for (segment_id, count) in leaves {
+        let count = usize::try_from(count)
+            .map_err(|_| corrupt("provider-view history count is negative"))?;
+        if count > 0 {
+            let reach = pending.entry(segment_id).or_default();
+            *reach = (*reach).max(count);
+        }
+    }
+    let mut parent = connection
+        .prepare_cached(
+            "SELECT parent_segment_id, parent_block_count
+             FROM provider_view_history_segments WHERE id = ?1",
+        )
+        .map_err(sqlite_read_error)?;
+    let mut coverage = HashMap::with_capacity(pending.len());
+    while let Some((segment_id, end)) = pending.pop_last() {
+        let (parent_id, start): (Option<i64>, i64) = parent
+            .query_row([segment_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+            .map_err(sqlite_read_error)?
+            .ok_or_else(|| corrupt("provider-view history segment is missing"))?;
+        let start = usize::try_from(start)
+            .map_err(|_| corrupt("provider-view history cutoff is negative"))?;
+        if end > start {
+            coverage.insert(segment_id, (start, end));
+        }
+        if let Some(parent_id) = parent_id {
+            if parent_id >= segment_id {
+                return Err(corrupt("provider-view history segment parent is not older"));
+            }
+            let inherited = end.min(start);
+            if inherited > 0 {
+                let reach = pending.entry(parent_id).or_default();
+                *reach = (*reach).max(inherited);
+            }
+        }
+    }
+    Ok(coverage)
+}
+
+/// Per-step cache of which history rows surviving requests still read.
+#[derive(Default)]
+struct LiveHistory {
+    sessions: HashMap<String, HashMap<i64, (usize, usize)>>,
+}
+
+impl LiveHistory {
+    /// Whether any surviving request still references `hash`, either through
+    /// a directly indexed block or through a covered history segment row.
+    fn contains(&mut self, connection: &Connection, hash: &str) -> StoreResult<bool> {
+        let indexed: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_view_blocks WHERE content_hash = ?1)",
+                [hash],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_read_error)?;
+        if indexed {
+            return Ok(true);
+        }
+        let rows = {
+            let mut statement = connection
+                .prepare_cached(
+                    "SELECT s.session_id, b.segment_id, b.block_ordinal
+                     FROM provider_view_history_blocks b
+                     JOIN provider_view_history_segments s ON s.id = b.segment_id
+                     WHERE b.content_hash = ?1",
+                )
+                .map_err(sqlite_read_error)?;
+            statement
+                .query_map([hash], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(sqlite_read_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_error)?
+        };
+        for (session_id, segment_id, ordinal) in rows {
+            let ordinal = usize::try_from(ordinal)
+                .map_err(|_| corrupt("provider-view history ordinal is negative"))?;
+            if !self.sessions.contains_key(&session_id) {
+                let coverage = live_session_coverage(connection, &session_id)?;
+                self.sessions.insert(session_id.clone(), coverage);
+            }
+            if self
+                .sessions
+                .get(&session_id)
+                .and_then(|coverage| coverage.get(&segment_id))
+                .is_some_and(|&(start, end)| (start..end).contains(&ordinal))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// History coverage of one session's surviving requests. Segments never
+/// cross sessions, so other sessions cannot reach these rows.
+fn live_session_coverage(
+    connection: &Connection,
+    session_id: &str,
+) -> StoreResult<HashMap<i64, (usize, usize)>> {
+    let leaves = {
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT h.segment_id, h.block_count
+                 FROM provider_view_request_history h
+                 JOIN provider_view_requests r
+                   ON r.session_id = h.session_id
+                  AND r.request_ordinal = h.request_ordinal
+                 WHERE h.session_id = ?1",
+            )
+            .map_err(sqlite_read_error)?;
+        statement
+            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(sqlite_read_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_read_error)?
+    };
+    segment_coverage(connection, leaves)
+}
+
+fn sqlite_count(value: usize) -> StoreResult<i64> {
+    i64::try_from(value).map_err(|_| corrupt("provider-view count exceeds SQLite integer space"))
 }
 
 /// Monotonic provider-view maintenance watermark. The count bound prevents a
@@ -177,7 +648,22 @@ impl ProviderViewStore {
             mut ledger,
             expected,
         } = prepared;
-        self.queue_gc(transaction, &expected)?;
+        let expires_at_ms = monotonic_expiry(transaction, session_id, expires_at_ms)?;
+        let HistoryPlacement {
+            trunk_id,
+            trunk_end,
+            leaf_id: segment_id,
+            prefix_len,
+        } = place_history_segments(transaction, session_id, &ledger.history_blocks)?;
+        let newly_stable = &ledger.history_blocks[trunk_end..prefix_len];
+        let suffix = &ledger.history_blocks[prefix_len..];
+        let mut gc_candidates = HashSet::from([
+            ledger.system_block.clone(),
+            ledger.tool_schema_block.clone(),
+        ]);
+        gc_candidates.extend(newly_stable.iter().chain(suffix).cloned());
+        debug_assert!(gc_candidates.is_subset(&expected));
+        self.queue_gc(transaction, &gc_candidates)?;
         transaction
             .execute(
                 "INSERT OR IGNORE INTO provider_view_session_cursors(
@@ -221,6 +707,22 @@ impl ProviderViewStore {
                 ],
             )
             .map_err(sqlite_write_error)?;
+        transaction
+            .execute(
+                "INSERT INTO provider_view_request_history(
+                    session_id, request_ordinal, segment_id, block_count, history_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session_id.as_str(),
+                    request_ordinal,
+                    segment_id,
+                    i64::try_from(ledger.history_blocks.len()).map_err(|_| invalid(
+                        "provider-view history exceeds SQLite integer space"
+                    ))?,
+                    history_digest(&ledger.history_blocks),
+                ],
+            )
+            .map_err(sqlite_write_error)?;
         insert_block(
             transaction,
             &ledger,
@@ -241,23 +743,13 @@ impl ProviderViewStore {
             &ledger.tool_schema_block,
             expires_at_ms,
         )?;
-        for (ordinal, block) in ledger.history_blocks.iter().enumerate() {
-            insert_block(
-                transaction,
-                &ledger,
-                session_id,
-                request_ordinal,
-                "history",
-                ordinal,
-                block,
-                expires_at_ms,
-            )?;
-        }
+        insert_history_blocks(transaction, trunk_id, trunk_end, newly_stable)?;
+        insert_history_blocks(transaction, segment_id, prefix_len, suffix)?;
         {
             let mut delete_gc = transaction
                 .prepare_cached("DELETE FROM provider_view_gc WHERE content_hash = ?1")
                 .map_err(sqlite_write_error)?;
-            for block in &expected {
+            for block in &gc_candidates {
                 delete_gc
                     .execute([&block.content_hash])
                     .map_err(sqlite_write_error)?;
@@ -284,9 +776,13 @@ impl ProviderViewStore {
         let request_ordinal = to_sqlite_integer(storage.request_ordinal)?;
         let request = connection
             .query_row(
-                "SELECT provider, model, cache_epoch, expires_at_ms
-                 FROM provider_view_requests
-                 WHERE session_id = ?1 AND request_ordinal = ?2",
+                "SELECT r.provider, r.model, r.cache_epoch, r.expires_at_ms,
+                        h.segment_id, h.block_count, h.history_digest
+                 FROM provider_view_requests r
+                 LEFT JOIN provider_view_request_history h
+                   ON h.session_id = r.session_id
+                  AND h.request_ordinal = r.request_ordinal
+                 WHERE r.session_id = ?1 AND r.request_ordinal = ?2",
                 params![storage.session_id.as_str(), request_ordinal],
                 |row| {
                     Ok((
@@ -294,6 +790,9 @@ impl ProviderViewStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
@@ -322,7 +821,7 @@ impl ProviderViewStore {
                      block_ordinal",
             )
             .map_err(sqlite_read_error)?;
-        let stored = statement
+        let mut stored = statement
             .query_map(
                 params![storage.session_id.as_str(), request_ordinal],
                 |row| {
@@ -342,6 +841,32 @@ impl ProviderViewStore {
             .map_err(sqlite_read_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sqlite_read_error)?;
+        if let (Some(segment_id), Some(count)) = (request.4, request.5) {
+            let count = usize::try_from(count)
+                .map_err(|_| corrupt("provider-view history count is negative"))?;
+            if count != ledger.history_blocks.len()
+                || request.6.as_deref() != Some(history_digest(&ledger.history_blocks).as_str())
+            {
+                return Err(corrupt(
+                    "provider-view history digest differs from its index",
+                ));
+            }
+            for (ordinal, block) in
+                history_segment_prefix(connection, &storage.session_id, segment_id, count)?
+                    .into_iter()
+                    .enumerate()
+            {
+                stored.push(StoredBlock {
+                    section: "history".to_owned(),
+                    ordinal: i64::try_from(ordinal)
+                        .map_err(|_| corrupt("provider-view history ordinal overflow"))?,
+                    block,
+                    expires_at_ms,
+                });
+            }
+        } else if request.4.is_some() || request.5.is_some() || request.6.is_some() {
+            return Err(corrupt("provider-view history cursor is incomplete"));
+        }
         let expected = indexed_blocks(ledger);
         if stored.len() != expected.len()
             || stored.iter().zip(&expected).any(|(stored, expected)| {
@@ -429,20 +954,32 @@ impl ProviderViewStore {
         Ok(bytes)
     }
 
+    /// Runs bounded maintenance steps until no expired request and no queued
+    /// GC hash remains. Store open and the explicit sweep API use this; the
+    /// persist path runs at most one step per call through
+    /// [`Self::sweep_expired_if_due`].
     pub(crate) fn sweep_expired(
         &self,
         connection: &mut Connection,
         through_ms: u64,
     ) -> StoreResult<usize> {
         let mut schedule = self.sweep_schedule()?;
-        let removed = self.sweep_expired_rows(connection, through_ms)?;
+        let mut removed = 0_usize;
+        loop {
+            let step = self.maintenance_step(connection, through_ms)?;
+            removed = removed.saturating_add(step.expired);
+            if !step.more_work {
+                break;
+            }
+        }
         schedule.sweep_completed(Instant::now());
         Ok(removed)
     }
 
-    /// Runs expiry maintenance before a provider-view persist only when its
-    /// monotonic time/count watermark is due. A failed sweep stays due so the
-    /// next persist retries instead of silently postponing reclamation.
+    /// Runs one bounded maintenance step before a provider-view persist only
+    /// when its monotonic time/count watermark is due. A failed or unfinished
+    /// sweep stays due, so later persists continue it one step at a time
+    /// instead of one turn paying for the whole backlog.
     pub(crate) fn sweep_expired_if_due(
         &self,
         connection: &mut Connection,
@@ -461,102 +998,172 @@ impl ProviderViewStore {
         if !schedule.note_persist_and_is_due(monotonic_now) {
             return Ok(None);
         }
-        let removed = self.sweep_expired_rows(connection, through_ms)?;
-        schedule.sweep_completed(monotonic_now);
-        Ok(Some(removed))
+        let step = self.maintenance_step(connection, through_ms)?;
+        if !step.more_work {
+            schedule.sweep_completed(monotonic_now);
+        }
+        Ok(Some(step.expired))
     }
 
-    fn sweep_expired_rows(
+    /// Expires at most [`PROVIDER_VIEW_SWEEP_REQUEST_BATCH`] requests and then
+    /// reclaims at most [`PROVIDER_VIEW_GC_BATCH`] queued hashes.
+    ///
+    /// Liveness is decided per hash from the few rows that carry it (both
+    /// hash columns are indexed) and the live coverage of only the sessions
+    /// owning those rows, computed once per step. The cost is therefore
+    /// linear in the touched sessions' live segments and rows, never
+    /// proportional to every live request times its history.
+    fn maintenance_step(
         &self,
         connection: &mut Connection,
         through_ms: u64,
-    ) -> StoreResult<usize> {
+    ) -> StoreResult<MaintenanceStep> {
         let through_ms = to_sqlite_integer(through_ms)?;
-        let batch_size = i64::try_from(PROVIDER_VIEW_SWEEP_REQUEST_BATCH)
-            .map_err(|_| corrupt("provider-view sweep batch exceeds SQLite integer space"))?;
-        let mut removed = 0_usize;
-        loop {
+        let mut live = LiveHistory::default();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_write_error)?;
+        let expired = {
+            let mut statement = transaction
+                .prepare_cached(
+                    "SELECT session_id, request_ordinal FROM provider_view_requests
+                     WHERE expires_at_ms <= ?1
+                     ORDER BY expires_at_ms, session_id, request_ordinal
+                     LIMIT ?2",
+                )
+                .map_err(sqlite_read_error)?;
+            statement
+                .query_map(
+                    params![through_ms, sqlite_count(PROVIDER_VIEW_SWEEP_REQUEST_BATCH)?],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(sqlite_read_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_error)?
+        };
+        let mut candidates = HashSet::new();
+        let mut expired_leaves = Vec::new();
+        for (session_id, request_ordinal) in &expired {
+            // System/tool blocks and pre-segment (v24) history rows.
+            let mut blocks = transaction
+                .prepare_cached(
+                    "SELECT content_hash FROM provider_view_blocks
+                     WHERE session_id = ?1 AND request_ordinal = ?2",
+                )
+                .map_err(sqlite_read_error)?;
+            for hash in blocks
+                .query_map(params![session_id, request_ordinal], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(sqlite_read_error)?
+            {
+                candidates.insert(hash.map_err(sqlite_read_error)?);
+            }
+            let leaf: Option<(i64, i64)> = transaction
+                .query_row(
+                    "SELECT segment_id, block_count FROM provider_view_request_history
+                     WHERE session_id = ?1 AND request_ordinal = ?2",
+                    params![session_id, request_ordinal],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sqlite_read_error)?;
+            expired_leaves.extend(leaf);
+        }
+        for (segment_id, (start, end)) in segment_coverage(&transaction, expired_leaves)? {
+            let mut blocks = transaction
+                .prepare_cached(
+                    "SELECT content_hash FROM provider_view_history_blocks
+                     WHERE segment_id = ?1 AND block_ordinal >= ?2 AND block_ordinal < ?3",
+                )
+                .map_err(sqlite_read_error)?;
+            for hash in blocks
+                .query_map(
+                    params![segment_id, sqlite_count(start)?, sqlite_count(end)?],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(sqlite_read_error)?
+            {
+                candidates.insert(hash.map_err(sqlite_read_error)?);
+            }
+        }
+        for (session_id, request_ordinal) in &expired {
+            transaction
+                .execute(
+                    "DELETE FROM provider_view_requests
+                     WHERE session_id = ?1 AND request_ordinal = ?2",
+                    params![session_id, request_ordinal],
+                )
+                .map_err(sqlite_write_error)?;
+        }
+        // Only hashes that no surviving request reaches enter the durable
+        // queue, so an expiry writes O(reclaimed) queue rows.
+        for hash in &candidates {
+            if !live.contains(&transaction, hash)? {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO provider_view_gc(content_hash, queued_at_ms)
+                         VALUES (?1, ?2)",
+                        params![hash, through_ms],
+                    )
+                    .map_err(sqlite_write_error)?;
+            }
+        }
+        transaction.commit().map_err(sqlite_write_error)?;
+
+        // The caller holds the only connection, so the liveness computed
+        // above still describes the committed state. Queued hashes are
+        // re-checked because older binaries queued them unconditionally.
+        let mut queued = {
+            let mut statement = connection
+                .prepare_cached(
+                    "SELECT content_hash FROM provider_view_gc
+                     ORDER BY content_hash LIMIT ?1",
+                )
+                .map_err(sqlite_read_error)?;
+            statement
+                .query_map([sqlite_count(PROVIDER_VIEW_GC_BATCH + 1)?], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(sqlite_read_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_read_error)?
+        };
+        let more_queued = queued.len() > PROVIDER_VIEW_GC_BATCH;
+        queued.truncate(PROVIDER_VIEW_GC_BATCH);
+        for hash in &queued {
+            if !live.contains(connection, hash)? {
+                self.cas.remove(&ArtifactRef::new(hash.clone()))?;
+                self.hot_blocks
+                    .lock()
+                    .map_err(|_| corrupt("provider-view hot-block cache lock is poisoned"))?
+                    .remove(hash);
+            }
+        }
+        if !queued.is_empty() {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_write_error)?;
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO provider_view_gc(content_hash, queued_at_ms)
-                     SELECT DISTINCT b.content_hash, ?1
-                     FROM provider_view_blocks b
-                     JOIN (
-                         SELECT session_id, request_ordinal
-                         FROM provider_view_requests
-                         WHERE expires_at_ms <= ?1
-                         ORDER BY expires_at_ms, session_id, request_ordinal
-                         LIMIT ?2
-                     ) expired
-                       ON expired.session_id = b.session_id
-                      AND expired.request_ordinal = b.request_ordinal",
-                    params![through_ms, batch_size],
-                )
-                .map_err(sqlite_write_error)?;
-            let batch_removed = transaction
-                .execute(
-                    "DELETE FROM provider_view_requests
-                     WHERE rowid IN (
-                         SELECT rowid FROM provider_view_requests
-                         WHERE expires_at_ms <= ?1
-                         ORDER BY expires_at_ms, session_id, request_ordinal
-                         LIMIT ?2
-                     )",
-                    params![through_ms, batch_size],
-                )
-                .map_err(sqlite_write_error)?;
-            transaction.commit().map_err(sqlite_write_error)?;
-            removed = removed.saturating_add(batch_removed);
-            if batch_removed < PROVIDER_VIEW_SWEEP_REQUEST_BATCH {
-                break;
+            {
+                let mut dequeue = transaction
+                    .prepare_cached("DELETE FROM provider_view_gc WHERE content_hash = ?1")
+                    .map_err(sqlite_write_error)?;
+                for hash in &queued {
+                    dequeue.execute([hash]).map_err(sqlite_write_error)?;
+                }
             }
+            transaction.commit().map_err(sqlite_write_error)?;
         }
-        self.drain_gc(connection)?;
-        Ok(removed)
+        Ok(MaintenanceStep {
+            expired: expired.len(),
+            more_work: expired.len() == PROVIDER_VIEW_SWEEP_REQUEST_BATCH || more_queued,
+        })
     }
 
     fn sweep_schedule(&self) -> StoreResult<std::sync::MutexGuard<'_, ProviderViewSweepSchedule>> {
         self.sweep_schedule
             .lock()
             .map_err(|_| corrupt("provider-view sweep schedule lock is poisoned"))
-    }
-
-    fn drain_gc(&self, connection: &Connection) -> StoreResult<()> {
-        while let Some(hash) = connection
-            .query_row(
-                "SELECT content_hash FROM provider_view_gc
-                 ORDER BY content_hash LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(sqlite_read_error)?
-        {
-            let references: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM provider_view_blocks WHERE content_hash = ?1",
-                    [&hash],
-                    |row| row.get(0),
-                )
-                .map_err(sqlite_read_error)?;
-            if references == 0 {
-                self.cas.remove(&ArtifactRef::new(hash.clone()))?;
-                self.hot_blocks
-                    .lock()
-                    .map_err(|_| corrupt("provider-view hot-block cache lock is poisoned"))?
-                    .remove(&hash);
-            }
-            connection
-                .execute(
-                    "DELETE FROM provider_view_gc WHERE content_hash = ?1",
-                    [&hash],
-                )
-                .map_err(sqlite_write_error)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn resident_bytes(&self) -> StoreResult<usize> {
@@ -596,7 +1203,45 @@ impl ProviderViewStore {
             )
             .optional()
             .map_err(sqlite_read_error)?;
-        found.ok_or_else(|| corrupt("provider-view block is not indexed for this request"))
+        if found.is_some() {
+            return Ok(());
+        }
+        if !ledger.history_blocks.contains(block) {
+            return Err(corrupt(
+                "provider-view block is not indexed for this request",
+            ));
+        }
+        let history_cursor: Option<(i64, String)> = connection
+            .query_row(
+                "SELECT h.block_count, h.history_digest
+                 FROM provider_view_requests r
+                 JOIN provider_view_request_history h
+                   ON h.session_id = r.session_id
+                  AND h.request_ordinal = r.request_ordinal
+                 WHERE r.provider = ?1 AND r.model = ?2 AND r.cache_epoch = ?3
+                   AND r.session_id = ?4 AND r.request_ordinal = ?5",
+                params![
+                    &ledger.provider,
+                    &ledger.model,
+                    &ledger.cache_epoch,
+                    storage.session_id.as_str(),
+                    to_sqlite_integer(storage.request_ordinal)?,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_read_error)?;
+        match history_cursor {
+            Some((count, digest))
+                if usize::try_from(count).ok() == Some(ledger.history_blocks.len())
+                    && digest == history_digest(&ledger.history_blocks) =>
+            {
+                Ok(())
+            }
+            _ => Err(corrupt(
+                "provider-view block is not indexed for this request",
+            )),
+        }
     }
 
     fn verify_cas_block(&self, block: &ProviderViewBlockRefV1) -> StoreResult<()> {

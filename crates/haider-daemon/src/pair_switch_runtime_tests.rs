@@ -254,6 +254,7 @@ impl PairSwitchWorld {
             provider: "fake-a".into(),
             model: "model-a".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -461,6 +462,7 @@ impl PairSwitchWorld {
             provider: "fake-b".into(),
             model: "model-b".into(),
             expected_pair: None,
+            output_budget: None,
             event_id: EventId::new(format!("{command_id}-event")),
             device_id: self.device_id.clone(),
         }
@@ -1763,6 +1765,7 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
         provider: "fake-a".into(),
         model: "model-a".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

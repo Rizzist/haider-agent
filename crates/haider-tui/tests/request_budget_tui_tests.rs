@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 #[test]
-fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces() {
+fn budget_status_hides_per_request_progress_and_renders_only_actionable_bounds() {
     for (phase, used) in [
         (RequestBudgetPhaseV1::Progress, 31),
         (RequestBudgetPhaseV1::SoftBound, 32),
@@ -36,6 +36,25 @@ fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces(
                 agent_id: None,
             },
         };
+        if phase == RequestBudgetPhaseV1::Progress {
+            let mut bare = haider_tui::projection::SessionProjection::new();
+            assert_eq!(haider_tui::plain::status_line(&bare, 0), "IDLE · 0 tok");
+            bare.apply(&EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("budget-golden"),
+                item: status.to_extension_item().expect("status item"),
+            }));
+            assert_eq!(
+                format!("{}\n", haider_tui::plain::status_line(&bare, 0)),
+                include_str!("fixtures/request_budget_status.golden")
+            );
+            bare.apply(&EventPayload::RunState(
+                haider_protocol::state::RunState::Done,
+            ));
+            bare.apply(&EventPayload::RunState(
+                haider_protocol::state::RunState::Thinking,
+            ));
+            assert!(!haider_tui::plain::status_line(&bare, 0).contains("request cap"));
+        }
         model
             .projection
             .apply(&EventPayload::Item(ItemEvent::Completed {
@@ -47,8 +66,14 @@ fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces(
             }));
         let expected = format!("requests {used} / tranche 32 / hard cap 64");
         let plain = render_plain(&model.projection, 0, None);
-        assert!(plain.contains(&expected), "plain: {plain}");
-        if phase != RequestBudgetPhaseV1::Progress {
+        assert!(
+            plain.contains("request cap 64 (tranche 32)"),
+            "plain status: {plain}"
+        );
+        if phase == RequestBudgetPhaseV1::Progress {
+            assert!(!plain.contains(&expected), "plain: {plain}");
+        } else {
+            assert!(plain.contains(&expected), "plain: {plain}");
             assert!(plain.contains("resume budget-run"));
         }
         let mut terminal = Terminal::new(TestBackend::new(180, 40)).expect("terminal");
@@ -66,6 +91,59 @@ fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains(&expected), "styled: {rendered}");
+        assert!(
+            rendered.contains("request cap 64 (tranche 32)"),
+            "styled status: {rendered}"
+        );
+        if phase == RequestBudgetPhaseV1::Progress {
+            assert!(!rendered.contains(&expected), "styled: {rendered}");
+        } else {
+            assert!(rendered.contains(&expected), "styled: {rendered}");
+        }
     }
+}
+
+#[test]
+fn loop_suspected_steer_renders_as_a_visible_transcript_line() {
+    let note = haider_protocol::loop_guard::LoopSuspectedV1 {
+        run_id: RunId::new("loop-run"),
+        repeated_calls: 30,
+        stop_after: 30,
+        tool: Some("fs_read".into()),
+        guard: haider_protocol::loop_guard::LoopGuardKindV1::RepeatedToolCalls,
+    };
+    let mut model = AppModel::new();
+    for payload in demo_script() {
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("loop-suspected"),
+            item: note.to_extension_item().expect("steer item"),
+        }));
+    let plain = render_plain(&model.projection, 0, None);
+    assert!(
+        plain.contains(&format!("{}\n", note.summary())),
+        "plain: {plain}"
+    );
+    let mut terminal = Terminal::new(TestBackend::new(180, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            render(&model, frame);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let rendered = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("loop suspected — 30 consecutive tool calls"),
+        "styled: {rendered}"
+    );
 }

@@ -75,6 +75,8 @@ fn provider() -> ProviderSummaryWire {
 
 fn descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("router"),
         provider: "router".into(),
         base_url: None,
@@ -84,7 +86,6 @@ fn descriptor() -> CredentialDescriptor {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     }
 }

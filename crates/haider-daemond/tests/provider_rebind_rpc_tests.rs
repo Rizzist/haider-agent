@@ -475,6 +475,8 @@ async fn provider_rebind_selects_named_account_and_rejects_provider_mismatch() {
         ("other-account", "different-proxy", true),
     ]
     .map(|(alias, provider, active)| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.into(),
         base_url: None,
@@ -484,7 +486,6 @@ async fn provider_rebind_selects_named_account_and_rejects_provider_mismatch() {
         active,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     });
     std::fs::write(

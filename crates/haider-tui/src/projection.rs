@@ -330,6 +330,9 @@ fn is_foldable_tool_item(item: &TurnItem) -> bool {
 /// Session display state, reduced from the envelope stream.
 #[derive(Debug, Default)]
 pub struct SessionProjection {
+    /// The selected turn's explicit request policy, learned from its durable
+    /// progress/checkpoint item. Cleared on the next turn opening.
+    request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
     /// Monotonic view-cache invalidation token. The durable/display reducer
     /// remains the authority; render caches only use this to avoid comparing
     /// an unchanged transcript on every animation frame.
@@ -361,6 +364,11 @@ pub struct SessionProjection {
     /// control banner reads this ingest-time index in O(1); it must never
     /// scan transcript history on the frame path.
     screen_control_items: std::collections::HashSet<ItemId>,
+    /// Session-scoped computer-use presence for the header chip: raised by
+    /// the first `computer`/`mobile` screen action of the current run,
+    /// refreshed by every later one, and retired at run end or after
+    /// `CU_PRESENCE_IDLE_SECS` without one (mirroring the daemon's overlay).
+    cu_presence: Option<(CuPresenceSurface, std::time::Instant)>,
     /// Unique append authorities for live assistant/reasoning rows. Completed
     /// transcript items retain only their shared reply range.
     reply_writers: std::collections::HashMap<ItemId, haider_protocol::reply::ReplyArenaWriter>,
@@ -444,6 +452,41 @@ pub struct SessionProjection {
     duplicate_items: u64,
 }
 
+/// What a live computer-use session is controlling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuPresenceSurface {
+    Screen,
+    Phone,
+}
+
+impl CuPresenceSurface {
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Screen => "screen",
+            Self::Phone => "phone",
+        }
+    }
+}
+
+/// The presence surface a tool call operates, if any. Every `computer`
+/// action counts (the daemon overlay appears for observation too); SMS reads
+/// and app listing do not operate the phone's screen.
+fn cu_presence_surface(item: &TurnItem) -> Option<CuPresenceSurface> {
+    let TurnItem::ToolCall { name, args, .. } = item else {
+        return None;
+    };
+    match name.as_str() {
+        "computer" => Some(CuPresenceSurface::Screen),
+        "mobile" => (!matches!(
+            args.get("action").and_then(|value| value.as_str()),
+            Some("sms_read") | Some("list_apps") | None
+        ))
+        .then_some(CuPresenceSurface::Phone),
+        _ => None,
+    }
+}
+
 fn is_screen_control_item(item: &TurnItem) -> bool {
     let TurnItem::ToolCall {
         name, status, args, ..
@@ -465,6 +508,12 @@ fn is_screen_control_item(item: &TurnItem) -> bool {
 }
 
 impl SessionProjection {
+    /// The active or most recently completed turn's explicitly pinned cap.
+    #[must_use]
+    pub fn request_budget(&self) -> Option<haider_protocol::request_budget::RequestBudgetV1> {
+        self.request_budget
+    }
+
     /// Apply hidden provenance to an already-visible command block. The
     /// marker is committed after the started item, so no pending side table
     /// is needed; a missing target fails closed as model-origin display.
@@ -729,6 +778,7 @@ impl SessionProjection {
             }
             EventPayload::RunState(run) => {
                 if run.is_terminal() {
+                    self.cu_presence = None;
                     self.flush_pending_effect_failures();
                     self.effect_tool_owners.clear();
                     // The OS-permission grant card is TURN-SCOPED: it exists
@@ -747,6 +797,7 @@ impl SessionProjection {
                 // (Streaming → RunningTool → Streaming) must NOT reset it.
                 let was_idle = self.run.as_ref().is_none_or(RunState::is_terminal);
                 if was_idle && !run.is_terminal() {
+                    self.request_budget = None;
                     self.streamed_output_chars = 0;
                     // escretract: the SAME opening edge closes the previous
                     // turn's retraction window. The boundary is per-run daemon
@@ -1481,6 +1532,9 @@ impl SessionProjection {
                     if is_screen_control_item(item) {
                         self.screen_control_items.insert(item_id.clone());
                     }
+                    if let Some(surface) = cu_presence_surface(item) {
+                        self.cu_presence = Some((surface, std::time::Instant::now()));
+                    }
                     if let Some(text) = item_reply_text(item) {
                         let mut writer = haider_protocol::reply::ReplyArenaWriter::new();
                         let _ = writer.append_shared(text);
@@ -1501,6 +1555,13 @@ impl SessionProjection {
                 if self.finished_items.contains(item_id) {
                     self.duplicate_items += 1;
                     return;
+                }
+                if let Some(status) =
+                    haider_protocol::request_budget::RequestBudgetStatusV1::from_extension_item(
+                        item,
+                    )
+                {
+                    self.request_budget = Some(status.budget);
                 }
                 if let TurnItem::Plan { items } = item {
                     let all_done = items.iter().all(|todo| todo.state == TodoState::Completed);
@@ -2193,7 +2254,7 @@ impl SessionProjection {
                 (window > 0).then(|| {
                     format!(
                         "· context at {}% — compacting · planned cache epoch transition; next turn history cold (summary retained · originals stay in /tree)",
-                        footprint.used_tokens.saturating_mul(100) / window
+                        crate::context_meter::percent_of(footprint.used_tokens, window)
                     )
                 })
             })
@@ -2233,6 +2294,22 @@ impl SessionProjection {
     #[must_use]
     pub fn screen_control_active(&self) -> bool {
         !self.screen_control_items.is_empty()
+    }
+
+    /// The session-header presence chip: what the current run is
+    /// controlling, while it has used `computer`/`mobile` within the shared
+    /// idle window. Esc (the existing turn cancel) is its Stop.
+    #[must_use]
+    pub fn cu_presence(&self) -> Option<CuPresenceSurface> {
+        self.cu_presence_at(std::time::Instant::now())
+    }
+
+    #[must_use]
+    pub fn cu_presence_at(&self, now: std::time::Instant) -> Option<CuPresenceSurface> {
+        let idle = std::time::Duration::from_secs(haider_protocol::computer::CU_PRESENCE_IDLE_SECS);
+        self.cu_presence
+            .filter(|(_, last)| now.saturating_duration_since(*last) < idle)
+            .map(|(surface, _)| surface)
     }
 
     /// View-cache invalidation token; no semantic state is derived from it.

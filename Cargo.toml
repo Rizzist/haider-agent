@@ -74,6 +74,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 unicode-segmentation = "1"
+unicode-normalization = "0.1"
 unicode-width = "0.2"
 url = "2"
 x11rb = { version = "0.13.2", default-features = false, features = ["xtest"] }

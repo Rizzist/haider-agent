@@ -142,6 +142,7 @@ impl TestWorker {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens,
+            max_tokens_source: None,
             permission_overrides: Some(SessionPermissionOverridesV1 {
                 read_only: false,
                 allow_writes: false,
@@ -313,6 +314,7 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         system_prompt_version: Some(SystemPromptBuilder::VERSION.into()),
         permission_overrides: None,
         interaction_mode: Default::default(),
@@ -1070,6 +1072,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,

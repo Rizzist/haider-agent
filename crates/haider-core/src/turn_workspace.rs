@@ -3,7 +3,9 @@
 //! Each capture reads every included regular-file byte. File buffers are bounded,
 //! but the retained path/digest map necessarily grows with the complete tree.
 //! Capture runs outside the async executor; it neither adds a deadline nor treats
-//! unreadable or concurrently changing entries as evidence of an untouched tree.
+//! unreadable, concurrently changing, or secret-bearing entries as evidence
+//! of an untouched tree. A secret-bearing tree yields a generic unavailable
+//! receipt so its raw path/content identities never enter a durable extension.
 
 use std::collections::BTreeMap;
 use std::fs::{self, Metadata};
@@ -11,6 +13,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_tools::{OutputRedactor, workspace_receipt_path_sensitive};
 use serde::{Deserialize, Serialize};
 
 const RECEIPT_DOMAIN: &[u8] = b"haider.turn-workspace-tree.v1";
@@ -138,7 +141,7 @@ fn capture_tree_observed(
             ));
         }
         entries.insert(
-            path_key(&relative)?,
+            receipt_path_key(&relative)?,
             entry_digest(EntryKind::Directory, &before, &[]),
         );
         let children = fs::read_dir(&path)
@@ -148,6 +151,7 @@ fn capture_tree_observed(
             let child =
                 child.map_err(|error| receipt_error(&path, "read directory entry", error))?;
             let child_relative = relative.join(child.file_name());
+            let child_key = receipt_path_key(&child_relative)?;
             let child_path = root.join(&child_relative);
             let child_metadata = metadata(&child_path)?;
             // Git's administrative directory or linked-worktree file is not
@@ -161,9 +165,15 @@ fn capture_tree_observed(
             if child_metadata.file_type().is_symlink() {
                 let target = fs::read_link(&child_path)
                     .map_err(|error| receipt_error(&child_path, "read symlink target", error))?;
+                let mut detector = OutputRedactor::default();
+                let _ = detector.push_bytes(target.as_os_str().as_encoded_bytes());
+                let _ = detector.finish_bytes();
+                if detector.redactions_applied() {
+                    return Err(redacted_receipt_error());
+                }
                 ensure_stable(&child_path, &child_metadata, &metadata(&child_path)?)?;
                 entries.insert(
-                    path_key(&child_relative)?,
+                    child_key,
                     entry_digest(
                         EntryKind::Symlink,
                         &child_metadata,
@@ -184,6 +194,7 @@ fn capture_tree_observed(
                     .map_err(|error| receipt_error(&child_path, "inspect open file", error))?;
                 ensure_stable(&child_path, &child_metadata, &opened)?;
                 let mut content = blake3::Hasher::new();
+                let mut detector = OutputRedactor::default();
                 let mut buffer = [0_u8; CONTENT_BUFFER_BYTES];
                 let mut remaining = opened.len();
                 // Read exactly the observed length. A writer cannot make this
@@ -198,7 +209,12 @@ fn capture_tree_observed(
                         .map_err(|error| receipt_error(&child_path, "read complete file", error))?;
                     chunk_read();
                     content.update(&buffer[..chunk]);
+                    let _ = detector.push_bytes(&buffer[..chunk]);
                     remaining -= chunk as u64;
+                }
+                let _ = detector.finish_bytes();
+                if detector.redactions_applied() {
+                    return Err(redacted_receipt_error());
                 }
                 let after = file
                     .metadata()
@@ -206,7 +222,7 @@ fn capture_tree_observed(
                 ensure_stable(&child_path, &opened, &after)?;
                 ensure_stable(&child_path, &opened, &metadata(&child_path)?)?;
                 entries.insert(
-                    path_key(&child_relative)?,
+                    child_key,
                     entry_digest(EntryKind::File, &opened, content.finalize().as_bytes()),
                 );
             } else {
@@ -236,7 +252,22 @@ fn path_key(relative: &Path) -> Result<String, HaiderError> {
                 path.to_owned()
             }
         })
-        .ok_or_else(|| receipt_error(relative, "encode relative path", "path is not valid UTF-8"))
+        .ok_or_else(redacted_receipt_error)
+}
+
+fn receipt_path_key(relative: &Path) -> Result<String, HaiderError> {
+    if workspace_receipt_path_sensitive(relative) {
+        return Err(redacted_receipt_error());
+    }
+    path_key(relative)
+}
+
+fn redacted_receipt_error() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        "workspace tree receipt unavailable: redacted material",
+        false,
+    )
 }
 
 fn metadata(path: &Path) -> Result<Metadata, HaiderError> {

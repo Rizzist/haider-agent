@@ -251,6 +251,12 @@ pub struct SessionMetadataV1 {
     pub model: String,
     /// Maximum output tokens for each provider request.
     pub max_tokens: u64,
+    /// Whether `max_tokens` was derived from the selected model or set by the
+    /// user. `None` for metadata written before 973; readers classify it with
+    /// [`crate::output_budget::SessionOutputBudgetSourceV1::classify`].
+    /// Absence stays off the wire so legacy metadata bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_source: Option<crate::output_budget::SessionOutputBudgetSourceV1>,
     /// Version of the deterministic daemon-owned system policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_version: Option<String>,

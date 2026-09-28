@@ -256,6 +256,7 @@ impl WebWorld {
             provider: pair.into(),
             model: model.into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: Some(SessionPermissionOverridesV1 {
                 read_only: false,
                 allow_writes: false,
@@ -303,6 +304,7 @@ impl WebWorld {
                 provider: provider.to_owned(),
                 model: model.to_owned(),
                 expected_pair: None,
+                output_budget: None,
                 event_id: EventId::new(format!("{command_id}-event")),
                 device_id: self.device_id.clone(),
             })

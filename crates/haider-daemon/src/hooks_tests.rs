@@ -959,6 +959,7 @@ impl EngineFixture {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: settings.permission_overrides,
             effort: None,
             fast: false,
@@ -2335,6 +2336,7 @@ async fn durable_ask_bytes_without_hooks(workspace: &Path, menu: Menu) -> Vec<u8
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -2592,6 +2594,8 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
     // makes a fresh live lookup say Full, but cannot rewrite the adapter the
     // worker already selected.
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("late-fake-key"),
         provider: "fake".to_owned(),
         base_url: None,
@@ -2601,7 +2605,6 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let provider = ProviderSummaryWire {
@@ -2774,6 +2777,7 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -2963,6 +2967,7 @@ async fn recovery_replays_exactly_the_unacknowledged_rows() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -3104,6 +3109,7 @@ async fn run_scoped_hook_trust_is_reduced_before_recovery_dispatch() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

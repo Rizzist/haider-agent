@@ -784,6 +784,7 @@ impl DelegationHandle {
                     provider: coordinates.metadata.provider.clone(),
                     model: coordinates.metadata.model.clone(),
                     max_tokens: coordinates.metadata.max_tokens,
+                    max_tokens_source: coordinates.metadata.max_tokens_source,
                     permission_overrides: child_overrides,
                     effort: coordinates.metadata.effort.clone(),
                     fast: coordinates.metadata.fast,

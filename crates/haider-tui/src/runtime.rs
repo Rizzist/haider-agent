@@ -2190,6 +2190,8 @@ impl DemoDriver {
                     return;
                 };
                 let descriptor = haider_protocol::credential::CredentialDescriptor {
+                    incarnation: 0,
+                    credential_digest: None,
                     alias: haider_protocol::ids::CredentialAlias::new(row.alias),
                     provider: row.provider,
                     base_url: row.base_url,
@@ -2199,7 +2201,6 @@ impl DemoDriver {
                     active: true,
                     label: None,
                     account_identity: None,
-                    incarnation: 0,
                     created_at_ms: None,
                 };
                 let revision = model.accounts.revision.map_or(1, |current| current + 1);
@@ -3674,6 +3675,7 @@ pub fn live_pass(
     commands.extend(driver.busy_retries_due());
     // The OAuth poll sweep (W5e-1): same clock as the login deadline.
     commands.extend(driver.oauth_poll());
+    let reply_arrived = reply.is_some();
     if let Some(reply) = reply {
         commands.extend(driver.apply(model, reply));
     }
@@ -3700,6 +3702,7 @@ pub fn live_pass(
     model.demo_requests.clear();
     commands.extend(driver.sync_selection(model));
     commands.extend(driver.drain_answers(model));
+    driver.sync_workspace_presence(model, reply_arrived);
     LivePass { commands, shell }
 }
 

@@ -1132,15 +1132,9 @@ fn gemini_stream_endpoint(model: &str) -> Result<String, ProviderError> {
 }
 
 fn gemini_context_limit(model: &str) -> u64 {
-    if model.starts_with("gemini-3")
-        || model.starts_with("gemini-2.5")
-        || model.starts_with("gemini-2.0")
-        || model.starts_with("gemini-1.5")
-    {
-        1_048_576
-    } else {
-        128_000
-    }
+    crate::static_model_limits(GEMINI_PROVIDER_NAME, model)
+        .context_window
+        .unwrap_or(128_000)
 }
 
 fn next_synthesized_call_index(request: &TurnRequest) -> Result<u64, ProviderError> {

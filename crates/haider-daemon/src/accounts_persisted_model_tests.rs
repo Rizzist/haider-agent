@@ -63,6 +63,8 @@ fn factory(
 ) {
     let alias = CredentialAlias::new("upgrade-fixture");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: summary.provider.clone(),
         base_url: None,
@@ -72,7 +74,6 @@ fn factory(
         active: true,
         label: None,
         account_identity: None,
-        incarnation: 0,
         created_at_ms: None,
     };
     let vault = Arc::new(MemoryVault::default());
@@ -101,6 +102,7 @@ async fn exercise_admitted_turn(result: &Result<crate::worker::ResolvedTurnProvi
                 tools: Vec::new(),
                 attachments: Vec::new(),
                 cache_metadata: None,
+                tool_result_image_projection: Default::default(),
             })
             .await
             .expect("record physical provider round");

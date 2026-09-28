@@ -294,6 +294,21 @@ async fn custom_anthropic_discovery_uses_standard_keyed_models_get() {
     assert_eq!(catalog.models[0].slug, "claude-local");
 }
 
+#[tokio::test]
+async fn recording_models_server_returns_403_for_the_models_get() {
+    let (origin, fixture) =
+        one_shot_catalog("403 Forbidden", br#"{"error":"model listing forbidden"}"#).await;
+    let result = discover_models(
+        CatalogSource::AnthropicCompatible { origin },
+        Some("fixture-only-secret"),
+        None,
+    )
+    .await;
+    let request = fixture.await.expect("recorded request");
+    assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+    assert!(matches!(result, Err(CatalogError::Unavailable { reason }) if reason.contains("403")));
+}
+
 /// The daemon maps these three discovery errors to the public Q probe
 /// taxonomy; pin the transport/parser source classifications at the mocked
 /// `/v1/models` boundary.

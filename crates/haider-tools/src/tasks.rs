@@ -406,7 +406,6 @@ pub struct TaskOutputBuffer {
     tail: VecDeque<u8>,
     tail_cap: usize,
     total: u64,
-    captured: u64,
     progress_stdout: TaskProgressLine,
     progress_stderr: TaskProgressLine,
     progress_stream: Option<OutputStream>,
@@ -487,7 +486,6 @@ impl TaskOutputBuffer {
             tail: VecDeque::new(),
             tail_cap,
             total: 0,
-            captured: 0,
             progress_stdout: TaskProgressLine::default(),
             progress_stderr: TaskProgressLine::default(),
             progress_stream: None,
@@ -507,13 +505,11 @@ impl TaskOutputBuffer {
 
     pub fn append(&mut self, bytes: &[u8]) {
         self.track_progress(OutputStream::Stdout, bytes);
-        self.captured = self.captured.saturating_add(bytes.len() as u64);
         self.commit(bytes);
     }
 
     fn append_stream(&mut self, stream: OutputStream, bytes: &[u8]) {
         self.track_progress(stream, bytes);
-        self.captured = self.captured.saturating_add(bytes.len() as u64);
         // Classify before the retained-head or completion-tail bounds can
         // split a credential. Unfinished lines remain replaceable live views.
         let index = usize::from(stream == OutputStream::Stderr);
@@ -555,12 +551,12 @@ impl TaskOutputBuffer {
         self.total
     }
 
-    /// Raw bytes seen so far, including unfinished lines the redactor still
-    /// holds back from commitment. Live-activity progress counts these;
-    /// durable completion facts and paging use [`Self::total_bytes`].
+    /// Bytes in the current safe rendering, including unfinished lines after
+    /// the same redactor used by live paging. Never expose the raw stream size
+    /// to task observation after a credential has been masked.
     #[must_use]
     pub fn captured_bytes(&self) -> u64 {
-        self.captured
+        self.live_snapshot().total_bytes()
     }
 
     /// Last complete, redacted output line, bounded to 256 UTF-8 bytes.
@@ -981,6 +977,7 @@ async fn supervise_background_with_exit_observation(
                 mutation_digest,
                 workspace_revision: None,
                 subject_digest: None,
+                redacted_content: false,
             });
     BackgroundExitStatus {
         exit_code: exit_status
