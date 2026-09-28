@@ -1984,28 +1984,28 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
             haider_tui::app::AppRequest::SshShellInput { input, .. } if input.as_slice() == [byte]
         )), "Ctrl+{code} did not reach the remote shell");
     }
-    let mut model = model();
-    arm(&mut model, "ssh-form");
+    let mut form_model = model();
+    arm(&mut form_model, "ssh-form");
     {
-        let form = model.ssh_form.as_mut().unwrap();
+        let form = form_model.ssh_form.as_mut().unwrap();
         form.name = "prod".into();
         form.host = "prod.test".into();
         form.user = "deploy".into();
         form.credential = "/keys/prod".into();
     }
-    model.requests.clear();
-    key(&mut model, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    form_model.requests.clear();
+    key(&mut form_model, KeyCode::Char('s'), KeyModifiers::CONTROL);
     assert!(
-        model
+        form_model
             .requests
             .iter()
             .any(|request| matches!(request, haider_tui::app::AppRequest::SshProfileSave { .. }))
     );
-    let mut model = model();
-    arm(&mut model, "login");
-    key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL);
-    assert_eq!(model.screen, Screen::Session);
-    assert!(model.login.is_none());
+    let mut login_model = model();
+    arm(&mut login_model, "login");
+    key(&mut login_model, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(login_model.screen, Screen::Session);
+    assert!(login_model.login.is_none());
     let mut accounts_model = model();
     accounts_model.screen = Screen::Accounts;
     arm(&mut accounts_model, "login");
@@ -2454,7 +2454,7 @@ fn back_chip_closes_fleet_detail_and_navigates_under_model_picker() {
     );
     assert!(model.fleet.detail.is_none());
     assert_eq!(model.screen, Screen::Fleet);
-    let mut picker_model = model();
+    let mut picker_model = self::model();
     arm(&mut picker_model, "model");
     stale_pointer(
         &mut picker_model,
