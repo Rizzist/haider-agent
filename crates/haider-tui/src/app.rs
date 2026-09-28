@@ -283,6 +283,31 @@ pub enum InputOwner {
     Composer(Screen),
 }
 
+impl InputOwner {
+    /// Owners with a visible draft field. A shared answer-line card joins
+    /// here without changing every input route independently.
+    const fn accepts_composer_edits(self) -> bool {
+        matches!(self, Self::Composer(_))
+    }
+
+    const fn accepts_session_edits(self) -> bool {
+        matches!(self, Self::Composer(Screen::Session))
+    }
+
+    const fn scrolls_transcript(self) -> bool {
+        matches!(
+            self,
+            Self::Composer(Screen::Session | Screen::Subagent)
+                | Self::SessionMenu
+                | Self::Search
+                | Self::ThemePicker
+                | Self::EffortPicker
+                | Self::HistoryChooser
+                | Self::SubagentQuestion
+        )
+    }
+}
+
 #[derive(Debug)]
 struct PendingDictation {
     session: SessionId,
@@ -5889,6 +5914,8 @@ pub struct AppModel {
     /// after release (the highlight survives the auto-copy), cleared by the
     /// next click or keypress. Screen-space — see [`crate::select`].
     pub selection: Option<crate::select::Selection>,
+    /// Owner of the frame where a screen-space mouse selection began.
+    pub(crate) selection_owner: Option<InputOwner>,
     /// A left button went down here and has not resolved yet: the potential
     /// selection anchor AND the pending click. On Up with no meaningful
     /// movement the click dispatches from THESE coordinates; a drag that
@@ -6218,6 +6245,7 @@ impl Default for AppModel {
             sticky_suppressed: std::cell::Cell::new(false),
             hovered: None,
             selection: None,
+            selection_owner: None,
             mouse_down: None,
             composer_drag: false,
             should_quit: false,
@@ -6966,7 +6994,8 @@ impl AppModel {
     /// `\n`, tui.js:235).
     #[must_use]
     pub fn palette_open(&self) -> bool {
-        if !self.composer.text().starts_with('/')
+        if !self.composer_owns_input()
+            || !self.composer.text().starts_with('/')
             || self.composer.text().contains('\n')
             || self.palette_dismissed
             || self.help_open
@@ -7626,6 +7655,45 @@ impl AppModel {
                 // moving on. Cleared BEFORE dispatch so the very key that
                 // raises a new one (⌃V) still shows it.
                 self.composer_notice = None;
+                // Clipboard paste is the one shortcut interpreted before
+                // text-field dispatch. Its result still re-enters the
+                // owner's zeroizing Paste route.
+                if matches!(key.code, KeyCode::Char('v' | 'V'))
+                    && (key.modifiers == KeyModifiers::CONTROL
+                        || key.modifiers == KeyModifiers::SUPER
+                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                        || key.modifiers == (KeyModifiers::SUPER | KeyModifiers::SHIFT))
+                    && self.screen != Screen::Loom
+                {
+                    self.request_clipboard_paste();
+                    return;
+                }
+                if matches!(key.code, KeyCode::Char('c' | 'C'))
+                    && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                    && self.selection_is_visible()
+                {
+                    self.requests.push(AppRequest::CopySelection);
+                    return;
+                }
+                // Text-field owners see their chords before globals. The
+                // terminal forwards control bytes to its remote PTY.
+                match self.input_owner() {
+                    InputOwner::SshTerminal => {
+                        self.handle_ssh_terminal_key(key);
+                        return;
+                    }
+                    InputOwner::SshForm => {
+                        self.handle_ssh_form_key(key);
+                        return;
+                    }
+                    InputOwner::Login if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c' | 'C')) =>
+                    {
+                        self.close_login_card();
+                        return;
+                    }
+                    _ => {}
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('t' | 'T') => {
@@ -7652,25 +7720,10 @@ impl AppModel {
                         _ => {}
                     }
                 }
-                // If the terminal forwards its paste chord, fetch the OS
-                // clipboard before a modal can ignore it or type a literal
-                // 'v'. Text re-enters the existing zeroizing Paste route,
-                // including masked fields. Loom retains Ctrl+V validation.
-                if matches!(key.code, KeyCode::Char('v' | 'V'))
-                    && (key.modifiers == KeyModifiers::CONTROL
-                        || key.modifiers == KeyModifiers::SUPER
-                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-                        || key.modifiers == (KeyModifiers::SUPER | KeyModifiers::SHIFT))
-                    && self.screen != Screen::Loom
-                {
-                    self.request_clipboard_paste();
-                    return;
-                }
                 // Chords without an owner-specific text action never fall
                 // through to the parked composer or to a covered chooser.
                 if key.modifiers == KeyModifiers::CONTROL
                     && !self.composer_owns_input()
-                    && self.input_owner() != InputOwner::SshTerminal
                     && !(self.input_owner() == InputOwner::ToolDetail
                         && key.code == KeyCode::Char('o'))
                 {
@@ -7738,14 +7791,7 @@ impl AppModel {
                 {
                     // A screen-space selection from a covered frame is not
                     // an invitation to copy what the modal painted over it.
-                    if self.selection.is_some()
-                        && matches!(
-                            self.input_owner(),
-                            InputOwner::Composer(_)
-                                | InputOwner::Screen(_)
-                                | InputOwner::ToolDetail
-                        )
-                    {
+                    if self.selection.is_some() && self.selection_is_visible() {
                         self.requests.push(AppRequest::CopySelection);
                     } else if self.composer_owns_input() {
                         self.selection_key(&key);
@@ -7834,7 +7880,7 @@ impl AppModel {
                         }
                         return;
                     }
-                    InputOwner::Composer(_) => {}
+                    owner if owner.accepts_composer_edits() => {}
                     owner => {
                         self.flash = Some(if owner == InputOwner::ToolDetail {
                             "· paste ignored — the detail view is read-only (esc to return)"
@@ -7890,7 +7936,7 @@ impl AppModel {
             AppEvent::SurfaceInputReplace { text } => {
                 // The Loom editor is a dedicated local surface. A volatile
                 // session-input mirror must never replace its bytes.
-                if !self.accepts_injected_input() {
+                if !self.accepts_injected_edits() {
                     return;
                 }
                 self.composer.set_text(text);
@@ -8673,14 +8719,6 @@ impl AppModel {
     }
 
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
-        if self.input_owner() == InputOwner::SshTerminal {
-            self.handle_ssh_terminal_key(key);
-            return;
-        }
-        if self.input_owner() == InputOwner::SshForm {
-            self.handle_ssh_form_key(key);
-            return;
-        }
         if self.input_owner() == InputOwner::Lockdown {
             self.lockdown_overlay = false;
             self.dirty = true;
@@ -10019,15 +10057,35 @@ impl AppModel {
         }
     }
 
-    /// Embedding input is accepted only by the plain Session answer line.
+    /// Whether the visible Session answer line accepts an external edit.
+    /// A future card that shares the answer line extends this predicate.
     #[must_use]
-    pub fn accepts_injected_input(&self) -> bool {
+    pub fn accepts_injected_edits(&self) -> bool {
+        self.input_owner().accepts_session_edits() && !self.talk.engaged()
+    }
+
+    /// Whether an external Submit may use the visible Enter target.
+    #[must_use]
+    pub fn accepts_injected_submit(&self) -> bool {
         self.input_owner() == InputOwner::Composer(Screen::Session) && !self.talk.engaged()
+    }
+
+    /// Selection belongs to the currently painted surface, including an
+    /// overlay selection made after that surface opened.
+    fn selection_is_visible(&self) -> bool {
+        self.selection.is_some()
+            && match self.selection_owner {
+                Some(owner) => owner == self.input_owner(),
+                None => matches!(
+                    self.input_owner(),
+                    InputOwner::Composer(_) | InputOwner::Screen(_) | InputOwner::ToolDetail
+                ),
+            }
     }
 
     /// Whether the current owner can accept a composer image or selection.
     fn clipboard_composer_visible(&self) -> bool {
-        matches!(self.input_owner(), InputOwner::Composer(_))
+        self.input_owner().accepts_composer_edits()
             && !self
                 .loom_authoring
                 .as_ref()
@@ -10036,7 +10094,7 @@ impl AppModel {
 
     /// The only authority for editing and selecting the visible composer.
     fn composer_owns_input(&self) -> bool {
-        matches!(self.input_owner(), InputOwner::Composer(_))
+        self.input_owner().accepts_composer_edits()
     }
 
     /// The composer-edit epilogue every text-changing key shares (the sim
@@ -11034,12 +11092,14 @@ impl AppModel {
         }
         let mut realized = zeroize::Zeroizing::new(text.to_owned());
         realized.push(' ');
-        if self.input_owner() == InputOwner::Composer(Screen::Session)
+        if self.input_owner().accepts_session_edits()
             && !self.mirror_waiting_for_owner
         {
             self.composer.insert_str(&realized);
-            if submit {
+            if submit && self.accepts_injected_submit() {
                 self.submit_composer();
+            } else if submit {
+                self.flash = Some("· dictation added to your draft — auto-send paused while away".to_owned());
             }
         } else {
             self.pending_dictation = Some(PendingDictation {
@@ -11059,7 +11119,7 @@ impl AppModel {
         let Some(pending) = self.pending_dictation.take() else {
             return;
         };
-        if self.input_owner() != InputOwner::Composer(Screen::Session) {
+        if !self.input_owner().accepts_session_edits() {
             self.pending_dictation = Some(pending);
             return;
         }
@@ -16615,10 +16675,9 @@ impl AppModel {
 
     /// Only advertise Enter when this surface will hand it to the pager.
     pub(crate) fn task_pager_enter_available(&self) -> bool {
-        matches!(
-            self.input_owner(),
-            InputOwner::Composer(Screen::Session | Screen::Subagent)
-        ) && self.projection.permission_card().is_none()
+        (self.accepts_injected_submit()
+            || self.input_owner() == InputOwner::Composer(Screen::Subagent))
+            && self.projection.permission_card().is_none()
             && self.composer.is_empty()
             && self.composer.attachments().is_empty()
             && self.focused_tool_row().is_none()
@@ -19780,8 +19839,8 @@ impl AppModel {
             | InputOwner::SshList
             | InputOwner::SshForm
             | InputOwner::SshTerminal
-            | InputOwner::TalkSetup
-            | InputOwner::HistoryChooser => false,
+            | InputOwner::TalkSetup => false,
+            InputOwner::HistoryChooser => session || chrome,
             InputOwner::AccountsReplace => matches!(hit, Hit::AccountAdd(_)),
             InputOwner::ToolDetail => matches!(hit, Hit::ToolDetailClose),
             InputOwner::Inbox => false,
@@ -19796,14 +19855,18 @@ impl AppModel {
                     | Hit::MonitorEdit(_)
                     | Hit::MonitorCopyId(_)
             ),
-            InputOwner::ModelPicker => matches!(hit, Hit::ModelPickerRow { .. }),
+            InputOwner::ModelPicker => matches!(hit, Hit::BackChip | Hit::ModelPickerRow { .. }),
             InputOwner::Login => {
                 self.screen == Screen::Accounts && matches!(hit, Hit::AccountAdd(_))
             }
             InputOwner::CustomProviderForm => {
                 matches!(hit, Hit::CustomProviderField { .. } | Hit::AccountAdd(_))
             }
-            InputOwner::SessionMenu | InputOwner::PlanDoc | InputOwner::FileReviewDoc => matches!(
+            InputOwner::SessionMenu => session || matches!(
+                hit,
+                Hit::BackChip | Hit::MenuOption { .. } | Hit::PermissionOpenSettings | Hit::PermissionRetry
+            ),
+            InputOwner::PlanDoc | InputOwner::FileReviewDoc => matches!(
                 hit,
                 Hit::BackChip
                     | Hit::MenuOption { .. }
@@ -19811,7 +19874,7 @@ impl AppModel {
                     | Hit::PermissionRetry
                     | Hit::InboxBand
             ),
-            InputOwner::SubagentQuestion => matches!(
+            InputOwner::SubagentQuestion => session || matches!(
                 hit,
                 Hit::BackChip
                     | Hit::SessionHome
@@ -19819,10 +19882,10 @@ impl AppModel {
                     | Hit::ChipCrumb(_)
                     | Hit::MenuOption { .. }
             ),
-            InputOwner::EffortPicker => matches!(hit, Hit::EffortOption(_)),
-            InputOwner::ThemePicker => matches!(hit, Hit::ThemeOption(_)),
+            InputOwner::EffortPicker => session || matches!(hit, Hit::EffortOption(_)),
+            InputOwner::ThemePicker => session || matches!(hit, Hit::ThemeOption(_)),
             InputOwner::FleetMemberDetail => {
-                matches!(hit, Hit::FleetTranscript(_) | Hit::FleetKill(_))
+                matches!(hit, Hit::BackChip | Hit::FleetTranscript(_) | Hit::FleetKill(_))
             }
             InputOwner::Search => chrome || session,
             InputOwner::Screen(screen) => {
@@ -20070,6 +20133,9 @@ impl AppModel {
             }
             Hit::BackChip if self.screen == Screen::Session => {
                 self.back_to_launcher();
+            }
+            Hit::BackChip if self.input_owner() == InputOwner::FleetMemberDetail => {
+                self.handle_fleet_key(KeyCode::Esc);
             }
             // ◉ talk (sim `speak`, tui.js:2044-2049): the mic RENDERS on the
             // launcher, but pressing it there does nothing — `speak` returns
@@ -20436,7 +20502,7 @@ impl AppModel {
                 self.dirty = true;
                 return;
             }
-            InputOwner::Screen(_) | InputOwner::Composer(_) => {}
+            owner if owner.scrolls_transcript() || matches!(owner, InputOwner::Screen(_)) => {}
             // Accounts cards are pinned above a still-visible roster. The
             // wheel belongs to that screen's scroll state, as before.
             InputOwner::Login if self.screen == Screen::Accounts => {}
@@ -20560,7 +20626,7 @@ impl AppModel {
                 self.dirty = true;
                 return;
             }
-            InputOwner::Composer(_) => {}
+            owner if owner.scrolls_transcript() => {}
             _ => return,
         }
         if !matches!(self.screen, Screen::Session | Screen::Subagent) {

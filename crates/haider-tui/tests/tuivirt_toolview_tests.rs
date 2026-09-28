@@ -1586,7 +1586,7 @@ fn a_parked_draft_survives_editing_chords_under_the_detail_view() {
     let mut model = detail_over_draft();
     let cursor = model.composer.cursor();
     assert!(
-        !model.accepts_injected_input(),
+        !model.accepts_injected_edits(),
         "an embedding client's injected op / mirror cannot reach the covered draft"
     );
     for chord in ['u', 'w', 'k', 'a', 'e', 'f', 'g', 'v'] {

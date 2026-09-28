@@ -983,7 +983,7 @@ impl LiveDriver {
         // A covered composer must never re-publish its parked bytes. A
         // retained foreign edit is applied by the mutable-model seam before
         // this comparison, so OLD cannot overwrite NEW on the first frame.
-        if !model.accepts_injected_input()
+        if !model.accepts_injected_edits()
             || self
                 .input_mirror
                 .sessions
@@ -1120,13 +1120,15 @@ impl LiveDriver {
         if floor.is_some_and(|floor| input.revision <= floor) {
             return;
         }
-        if !model.accepts_injected_input() {
+        if !model.accepts_injected_edits() {
             if state.pending.as_ref().is_none_or(|pending| {
                 pending.input.owner != input.owner || input.revision > pending.input.revision
             }) {
                 state.pending = Some(PendingForeignInput {
                     input,
                     epoch: self.connection_epoch,
+                    composer_revision: model.composer.revision(),
+                    local_attachments: model.composer.attachments().to_vec(),
                 });
             }
             model.mirror_waiting_for_owner = true;
@@ -1150,10 +1152,11 @@ impl LiveDriver {
         model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
     }
 
-    /// Deliver a refused replacement only once its Session composer is the
-    /// visible owner again. Reconnects and closed sessions drop the slot.
+    /// Deliver a refused replacement only when the visible Session input
+    /// accepts edits and its local content still matches the refusal point.
+    /// Reconnects and closed sessions also drop the slot.
     pub fn apply_pending_input(&mut self, model: &mut AppModel) {
-        if !model.accepts_injected_input() {
+        if !model.accepts_injected_edits() {
             return;
         }
         let Some(session) = model.active_session.clone() else {
@@ -1168,6 +1171,8 @@ impl LiveDriver {
         if let Some(pending) = pending
             && pending.epoch == self.connection_epoch
             && self.input_mirror.epoch == pending.epoch
+            && model.composer.revision() == pending.composer_revision
+            && model.composer.attachments() == pending.local_attachments
         {
             self.apply_surface_input(model, session, pending.input);
         }
@@ -2168,6 +2173,9 @@ struct InputMirrorSession {
 struct PendingForeignInput {
     input: haider_rpc::SurfaceInputWire,
     epoch: u64,
+    /// A later local edit supersedes this refused replacement.
+    composer_revision: u64,
+    local_attachments: Vec<crate::composer::PendingAttachment>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -5756,36 +5764,31 @@ impl LiveDriver {
                 commands
             }
             LiveReply::InputInjected { session, op } => {
-                // Apply only when this composer is genuinely the session's
-                // live input surface: the session is active and a session
-                // surface is on screen. Anything else ignores the op — the
-                // absence of a republish tells the injector it did not land.
-                // rev933c/d finding 4: an injected op lands only when the
-                // PLAIN session composer is the live Enter target — the
-                // single predicate that mirrors key-dispatch precedence
-                // (no login/talk-setup/engaged-talk card, no menu, no help,
-                // not the child-messaging subagent view). A synthesized
-                // Submit can therefore never activate a card row.
-                if model.active_session.as_ref() == Some(&session) && model.accepts_injected_input()
-                {
+                // Judge edits and Submit separately against the current
+                // owner at delivery. A shared answer-line card may accept
+                // Set/Insert/Clear while still refusing a synthetic Enter.
+                // Covered owners never receive a queued injected edit.
+                if model.active_session.as_ref() == Some(&session) {
                     match op {
                         haider_rpc::SurfaceInjectOp::Set { text } => {
-                            model.composer.set_text(text);
+                            if model.accepts_injected_edits() { model.composer.set_text(text); }
                         }
                         haider_rpc::SurfaceInjectOp::Insert { text } => {
-                            model.composer.insert_str(&text);
+                            if model.accepts_injected_edits() { model.composer.insert_str(&text); }
                         }
-                        haider_rpc::SurfaceInjectOp::Clear => model.composer.clear(),
+                        haider_rpc::SurfaceInjectOp::Clear => {
+                            if model.accepts_injected_edits() { model.composer.clear(); }
+                        }
                         haider_rpc::SurfaceInjectOp::Submit => {
                             // Exactly the Enter path — mid-turn queue modes,
                             // command dispatch, and drafts all keep their
                             // ordinary meaning.
-                            model.handle(crate::app::AppEvent::Key(
+                            if model.accepts_injected_submit() { model.handle(crate::app::AppEvent::Key(
                                 ratatui::crossterm::event::KeyEvent::new(
                                     ratatui::crossterm::event::KeyCode::Enter,
                                     ratatui::crossterm::event::KeyModifiers::NONE,
                                 ),
-                            ));
+                            )); }
                         }
                         // Unknown = a newer daemon's vocabulary — ignored,
                         // never fatal (forward-compat law).

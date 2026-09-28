@@ -1143,6 +1143,7 @@ pub fn dispatch_input(
                 // arms `mouse_down`, so the transcript path stays silent.
                 MouseEventKind::Down(MouseButton::Left) => {
                     if model.selection.take().is_some() {
+                        model.selection_owner = None;
                         model.dirty = true;
                     }
                     if let Some((
@@ -1201,6 +1202,7 @@ pub fn dispatch_input(
                                     head,
                                     dragging: true,
                                 });
+                                model.selection_owner = Some(model.input_owner());
                                 model.dirty = true;
                             }
                             _ => {}

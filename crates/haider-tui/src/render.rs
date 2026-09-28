@@ -1893,7 +1893,7 @@ fn render_launcher(
     // The BIG centered mark and the shahada belong to the boot splash
     // alone now — people open many terminals; the settled launcher scans
     // like a working surface, not a poster.
-    let showing_backtrack = model.backtrack.is_some();
+    let showing_backtrack = model.input_owner() == crate::app::InputOwner::HistoryChooser;
     let palette = if showing_backtrack {
         backtrack_block(model, theme, area.width)
     } else if model.palette_open() {
@@ -6346,7 +6346,7 @@ fn render_session(
         u16::try_from(model.msg_queue.len() + 1).unwrap_or(4)
     };
     let mut subtree_height = subtree_needed(model, false);
-    let showing_backtrack = model.backtrack.is_some();
+    let showing_backtrack = model.input_owner() == crate::app::InputOwner::HistoryChooser;
     let palette = if showing_backtrack {
         backtrack_block(model, theme, area.width)
     } else if model.palette_open() {
