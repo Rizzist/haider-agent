@@ -245,6 +245,40 @@ fn dot_segments_never_become_workspace_labels() {
 }
 
 #[test]
+fn windows_dot_and_space_segments_never_become_workspace_labels() {
+    use std::path::Path;
+
+    let context = PathContext {
+        workspace: Some("C:/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for path in [
+        "C:/w/.. /Users/bob/x",
+        "C:/w/sub/.. /.. /Users/bob/x",
+        "C:/w/.. . /Users/bob/x",
+        "C:/w/. /Users/bob/x",
+        "C:/w/.../Users/bob/x",
+        r"\\?\C:\w\.. \Users\bob\x",
+    ] {
+        assert_eq!(
+            haider_client::launch_origin::workspace_relative_display(
+                Path::new(path),
+                Path::new("C:/w")
+            ),
+            None,
+            "{path}"
+        );
+        let label = context.shorten(path);
+        assert!(label.contains("<user>"), "{path}: {label}");
+        assert!(!label.contains("bob"), "{path}: {label}");
+        assert!(!label.starts_with(".."), "{path}: {label}");
+    }
+    // Ordinary leading-dot names still label a file below the workspace.
+    assert_eq!(context.shorten("C:/w/..file/x"), "..file/x");
+    assert_eq!(context.shorten("C:/w/.config/x"), ".config/x");
+}
+
+#[test]
 fn equivalent_windows_spellings_keep_safe_workspace_labels() {
     for (workspace, path) in [
         (r"C:\w", r"C:\w\src\x.rs"),

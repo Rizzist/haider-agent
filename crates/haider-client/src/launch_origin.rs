@@ -91,16 +91,24 @@ pub fn is_multiuser_workspace_root(root: &Path) -> bool {
 /// normalization would place the final path below the root.
 #[must_use]
 pub fn workspace_relative_display(path: &Path, root: &Path) -> Option<String> {
+    let parsed_path = DisplayPath::parse(path);
+    let parsed_root = DisplayPath::parse(root);
+    let windows = parsed_path.windows || parsed_root.windows;
     let has_dot_segment = |path: &Path| {
-        path.to_string_lossy()
-            .split(['/', '\\'])
-            .any(|component| matches!(component, "." | ".."))
+        path.to_string_lossy().split(['/', '\\']).any(|component| {
+            matches!(component, "." | "..")
+                    // Win32 normally strips trailing ASCII spaces and dots
+                    // from components. A dot-only spelling can therefore be
+                    // an alias for a current/parent segment. Verbatim paths
+                    // get the same conservative display rule.
+                    || windows
+                        && component.contains('.')
+                        && component.chars().all(|ch| ch == '.' || ch == ' ')
+        })
     };
     if has_dot_segment(path) || has_dot_segment(root) {
         return None;
     }
-    let parsed_path = DisplayPath::parse(path);
-    let parsed_root = DisplayPath::parse(root);
     if !parsed_path.absolute || !parsed_root.absolute {
         return None;
     }
