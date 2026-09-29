@@ -288,6 +288,18 @@ fn windows_dot_and_space_segments_never_become_workspace_labels() {
     assert_eq!(context.shorten("C:/w/.config/x"), ".config/x");
 }
 
+#[cfg(windows)]
+#[test]
+fn relative_windows_dot_and_space_names_remain_lexical() {
+    let context = PathContext {
+        workspace: Some("C:/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for path in [".../notes", ".. /notes", ". /notes"] {
+        assert_eq!(context.shorten(path), path);
+    }
+}
+
 #[test]
 fn equivalent_windows_spellings_keep_safe_workspace_labels() {
     for (workspace, path) in [

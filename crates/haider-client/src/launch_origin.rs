@@ -662,7 +662,7 @@ impl DisplayPath {
             // spaces. A component made only of them may therefore act as a
             // current or parent segment. Treat verbatim spellings the same
             // way for conservative display masking; this is never used for IO.
-            let dot_count = (windows && part.chars().all(|ch| ch == '.' || ch == ' '))
+            let dot_count = (absolute && windows && part.chars().all(|ch| ch == '.' || ch == ' '))
                 .then(|| part.bytes().filter(|byte| *byte == b'.').count());
             if part == "." || dot_count.is_some_and(|count| count <= 1) {
                 continue;
