@@ -67,6 +67,35 @@ fn first_action_shows_the_surface_once_and_every_action_moves_the_pointer() {
 }
 
 #[test]
+fn pointer_sequence_wraps_below_the_reserved_conceal_range() {
+    let mut machine = PresenceMachine::<String> {
+        next_seq: CONCEAL_ACK_SEQ_START - 1,
+        ..Default::default()
+    };
+    let now = Instant::now();
+    let (last, _) = machine
+        .begin_action(
+            key("seq"),
+            PresenceSurface::Screen,
+            PresenceMark::Move,
+            None,
+            now,
+        )
+        .expect("last pointer sequence");
+    let (first, _) = machine
+        .begin_action(
+            key("seq"),
+            PresenceSurface::Screen,
+            PresenceMark::Move,
+            None,
+            now,
+        )
+        .expect("wrapped pointer sequence");
+    assert_eq!(last, CONCEAL_ACK_SEQ_START - 1);
+    assert_eq!(first, 1);
+}
+
+#[test]
 fn run_end_and_cancel_hide_only_after_the_last_lease_on_that_surface() {
     let mut machine = PresenceMachine::<String>::default();
     let now = Instant::now();
@@ -365,6 +394,14 @@ fn wire_vocabulary_round_trips_and_rejects_unknown_fields() {
             .is_err()
     );
     assert_eq!(encode_event(&PresenceEvent::Stop), r#"{"event":"stop"}"#);
+    let failure = PresenceEvent::ConcealFailed {
+        seq: CONCEAL_ACK_SEQ_START,
+        message: "window still visible".into(),
+    };
+    assert_eq!(
+        serde_json::from_str::<PresenceEvent>(&encode_event(&failure)).expect("failure roundtrip"),
+        failure
+    );
     let ready: PresenceEvent =
         serde_json::from_str(r#"{"event":"ready","platform":"macos","capture_excluded":true}"#)
             .expect("ready");
@@ -489,4 +526,82 @@ fn linux_notification_plan_offers_stop_only_when_the_server_draws_actions() {
             "never name a button that is not drawn"
         );
     }
+}
+
+/// Verifier finding B3 (8c614f6c): the Linux helper matched `ActionInvoked`
+/// only against the current notification id and reset it on close, so a
+/// Stop the human pressed on notification N — still queued on the bus when
+/// the capture's `CloseNotification` returned — was dropped. This replays
+/// the helper loop's exact order: Show/Notify(N), Conceal/Close(N), the
+/// queued ActionInvoked(N), then Reveal/Notify(M).
+/// MUTATION CHECK: retire ids on close (or match only the latest id).
+/// Expected runtime failure: the queued Stop for N is not routed.
+#[test]
+fn linux_stop_queued_before_the_capture_close_still_stops_the_run() {
+    const N: u32 = 41;
+    const M: u32 = 42;
+    let mut router = LinuxStopRouter::default();
+    router.show();
+    router.posted(N);
+    // Conceal: CloseNotification(N) completes; router untouched by close.
+    // The ActionInvoked(N, "stop") signal was already queued.
+    assert!(
+        router.on_action(N, "stop"),
+        "queued Stop for the closed popup"
+    );
+    assert!(router.is_stopping());
+    // A second click (or the re-posted M) cannot stop twice.
+    router.posted(M);
+    assert!(!router.on_action(M, "stop"));
+    assert!(!router.on_action(N, "stop"));
+
+    // Same order, but the Stop arrives after Reveal posted M.
+    let mut router = LinuxStopRouter::default();
+    router.show();
+    router.posted(N);
+    router.posted(M);
+    assert!(!router.on_action(N, "default"), "only the Stop key stops");
+    assert!(router.on_action(N, "stop"));
+}
+
+/// B3, the other half: ids from an ended presence generation never stop a
+/// later one, even if the server reuses nothing and the stale signal is
+/// delivered late.
+/// MUTATION CHECK: keep ids across Hide. Expected runtime failure: the
+/// stale Stop after Hide/Show is routed.
+#[test]
+fn linux_stale_stop_never_reaches_a_later_generation() {
+    let mut router = LinuxStopRouter::default();
+    // Nothing shown: no generation to stop.
+    assert!(!router.on_action(7, "stop"));
+    router.show();
+    router.posted(7);
+    router.hide();
+    assert!(!router.on_action(7, "stop"), "late Stop after Hide");
+    router.show();
+    router.posted(9);
+    assert!(
+        !router.on_action(7, "stop"),
+        "stale id cannot stop generation 2"
+    );
+    // A label refresh (Show while active) keeps the generation's ids.
+    router.show();
+    router.posted(10);
+    assert!(router.on_action(9, "stop"));
+    // A label refresh cannot re-arm Stop in the same generation.
+    router.stopping();
+    router.show();
+    assert!(router.is_stopping());
+    assert!(!router.on_action(10, "stop"));
+    // Only Hide followed by Show starts a new generation.
+    router.hide();
+    router.show();
+    router.posted(11);
+    assert!(!router.is_stopping());
+    assert!(router.on_action(11, "stop"));
+    // A failed Notify (id 0) never becomes live.
+    let mut router = LinuxStopRouter::default();
+    router.show();
+    router.posted(0);
+    assert!(!router.on_action(0, "stop"));
 }
