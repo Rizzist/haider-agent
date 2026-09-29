@@ -3696,6 +3696,7 @@ async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
             active: true,
             label: None,
             account_identity: Some(haider_protocol::credential::AccountIdentity {
+                subject_hash: Some("synthetic-principal".into()),
                 email: Some("synthetic@example.test".into()),
                 display_name: None,
                 account_id: Some("synthetic-account".into()),
@@ -4095,6 +4096,7 @@ fn reset_test_descriptor(
         active: true,
         label: None,
         account_identity: Some(haider_protocol::credential::AccountIdentity {
+            subject_hash: Some("synthetic-principal".into()),
             email: None,
             display_name: None,
             account_id: Some("synthetic-account".into()),

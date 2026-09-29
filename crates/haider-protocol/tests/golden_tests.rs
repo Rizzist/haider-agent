@@ -2517,6 +2517,7 @@ fn deferred_approval_menu_is_explicitly_nonblocking_and_account_scoped() {
                 provider: "openai-oauth".into(),
                 account_id: "synthetic-workspace".into(),
                 incarnation: 7,
+                subject_hash: Some("synthetic-subject".into()),
             }),
         },
         title: "Apply a usage reset credit?".into(),

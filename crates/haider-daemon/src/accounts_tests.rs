@@ -194,6 +194,7 @@ fn authenticated_catalog_key_changes_with_same_alias_identity_but_survives_relog
         active: true,
         label: None,
         account_identity: Some(AccountIdentity {
+            subject_hash: None,
             email: Some("a@example.invalid".into()),
             display_name: None,
             account_id: Some("synthetic-a".into()),
@@ -412,6 +413,7 @@ fn confirmed_device_import_is_bound_to_the_reviewed_source_snapshot() {
 #[test]
 fn provider_normalized_subscription_identity_suppresses_repeat_adoption() {
     let candidate = AccountIdentity {
+        subject_hash: None,
         email: None,
         display_name: Some("Claude Pro subscription".into()),
         account_id: None,
@@ -900,6 +902,7 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
         active: true,
         label: None,
         account_identity: Some(AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: Some("Kimi Code subscription".into()),
             account_id: Some("kimi:0123456789abcdef".into()),

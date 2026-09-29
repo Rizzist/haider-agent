@@ -67,6 +67,7 @@ fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> Credentia
 fn openai_descriptor(alias: &str, account_id: &str) -> CredentialDescriptor {
     let mut descriptor = descriptor("openai-oauth", alias, AuthMethod::OAuth);
     descriptor.account_identity = Some(AccountIdentity {
+        subject_hash: Some(format!("synthetic-subject-{alias}")),
         email: Some(format!("{alias}@example.invalid")),
         display_name: None,
         account_id: Some(account_id.to_owned()),
@@ -964,7 +965,7 @@ impl MeterTokenSource for PausingTokens {
 
 #[tokio::test]
 async fn bound_reset_rechecks_replacement_or_removal_after_token_resolution() {
-    for change in ["incarnation", "account_id", "remove"] {
+    for change in ["incarnation", "account_id", "subject_hash", "remove"] {
         let descriptors = snapshot(vec![openai_descriptor("work-chatgpt", "workspace-a")]);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
@@ -992,6 +993,12 @@ async fn bound_reset_rechecks_replacement_or_removal_after_token_resolution() {
                 } else {
                     if change == "account_id" {
                         rows[0] = openai_descriptor("work-chatgpt", "workspace-b");
+                    } else if change == "subject_hash" {
+                        rows[0]
+                            .account_identity
+                            .as_mut()
+                            .expect("identity")
+                            .subject_hash = Some("another-member-of-the-same-workspace".into());
                     } else {
                         rows[0].incarnation = binding.incarnation + 1;
                     }
@@ -1006,6 +1013,53 @@ async fn bound_reset_rechecks_replacement_or_removal_after_token_resolution() {
         assert_eq!(result.expect_err("stale binding").reason, "account_changed");
         assert_eq!(http.posts(), 0, "change={change}");
     }
+}
+
+#[tokio::test]
+async fn reset_binding_requires_subject_and_survives_same_account_refresh() {
+    let alias = CredentialAlias::new("work-chatgpt");
+    let mut row = openai_descriptor(alias.as_str(), "workspace-a");
+    let descriptors = snapshot(vec![row.clone()]);
+    let http = Arc::new(ApplyHttp::replying(
+        200,
+        br#"{"code":"reset","windows_reset":1}"#,
+    ));
+    let service = super::UsageReportService::with_clock(
+        Arc::clone(&descriptors),
+        Some(Arc::new(StubTokens {
+            bytes: b"synthetic-token".to_vec(),
+        })),
+        Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+        Box::new(|| 9_000_000),
+    );
+    let binding = service.reset_binding(&alias).expect("bound principal");
+    row.account_identity.as_mut().expect("identity").captured_at += 1;
+    row.credential_digest = Some("rotated-synthetic-refresh".into());
+    *descriptors.lock().expect("snapshot") = vec![row];
+    service
+        .apply_bound_reset(&alias, "same-member", &binding)
+        .await
+        .expect("same principal refresh");
+    assert_eq!(http.posts(), 1);
+
+    descriptors.lock().expect("snapshot")[0]
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .subject_hash = None;
+    assert!(
+        service.reset_binding(&alias).is_none(),
+        "legacy unbound record cannot mint a reset approval"
+    );
+    assert_eq!(
+        service
+            .apply_bound_reset(&alias, "legacy", &binding)
+            .await
+            .expect_err("unbound record")
+            .reason,
+        "account_changed"
+    );
+    assert_eq!(http.posts(), 1);
 }
 
 #[tokio::test]
@@ -2487,6 +2541,7 @@ async fn linked_grok_source_row_reports_its_tier_from_the_live_meter() {
     let mut linked = descriptor("grok-oauth", "grok-2f8c1d0a4b6e", AuthMethod::OAuth);
     linked.identity = "pilot@example.test".into();
     linked.account_identity = Some(AccountIdentity {
+        subject_hash: None,
         email: Some("pilot@example.test".into()),
         display_name: None,
         account_id: Some("xai:user-linked".into()),

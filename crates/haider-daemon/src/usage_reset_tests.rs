@@ -102,6 +102,7 @@ fn bound_reset_intent_and_menu_pin_account_id_and_incarnation() {
         provider: "openai-oauth".into(),
         account_id: "workspace-a".into(),
         incarnation: 7,
+        subject_hash: Some("synthetic-subject".into()),
     };
     let menu = bound_approval_menu("approval-a", &alias, Some(&binding));
     assert!(matches!(menu.kind, MenuKind::DeferredApproval {

@@ -297,6 +297,7 @@ impl OAuthTokenBundleV1 {
             let identity = match reader.byte()? {
                 0 => None,
                 1 => Some(AccountIdentity {
+                    subject_hash: None,
                     email: reader.optional_public_string()?,
                     display_name: reader.optional_public_string()?,
                     account_id: reader.optional_public_string()?,
@@ -348,7 +349,10 @@ impl OAuthTokenBundleV1 {
         bundle.refresh_after_unix_ms = refresh_after_unix_ms;
         bundle.refresh_rejected_until_unix_ms = refresh_rejected_until_unix_ms;
         bundle.import_source_access_fingerprint = import_source_access_fingerprint;
-        bundle.account_identity = account_identity;
+        bundle.account_identity = account_identity.map(|mut identity| {
+            identity.subject_hash = Some(bundle.identity.subject_hash.clone());
+            identity
+        });
         bundle.id_token = id_token;
         Ok(bundle)
     }
@@ -385,7 +389,10 @@ impl OAuthTokenBundleV1 {
 
     #[must_use]
     pub fn with_account_identity(mut self, identity: AccountIdentity) -> Self {
-        self.account_identity = Some(identity);
+        self.account_identity = Some(AccountIdentity {
+            subject_hash: Some(self.identity.subject_hash.clone()),
+            ..identity
+        });
         self
     }
 
@@ -609,6 +616,7 @@ mod tests {
     fn token_bundle_round_trip_is_versioned_and_access_only_handle() {
         let bundle = bundle()
             .with_account_identity(AccountIdentity {
+                subject_hash: None,
                 email: Some("owner@example.invalid".into()),
                 display_name: None,
                 account_id: Some("acct-964".into()),

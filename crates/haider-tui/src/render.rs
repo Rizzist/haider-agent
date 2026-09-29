@@ -4,7 +4,7 @@
 //! Visual authority: the `/tui` sim — typography, chips, and row shapes are
 //! copied from it deliberately.
 
-use crate::app::{AppModel, Hit, LauncherRow, LoomPane, Screen, update_version_label};
+use crate::app::{AppModel, Hit, InputOwner, LauncherRow, LoomPane, Screen, update_version_label};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_INTRO_TEXT, PALETTE_MAX_ROWS, help_catalog_lines};
 use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
@@ -1426,6 +1426,25 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             && rect.x.saturating_add(rect.width) <= area.x.saturating_add(area.width)
             && rect.y.saturating_add(rect.height) <= area.y.saturating_add(area.height)
     });
+    let mut owner = model.input_owner();
+    if let InputOwner::Menu(id) = &owner
+        && !hits
+            .iter()
+            .any(|(_, hit)| matches!(hit, Hit::MenuOption { menu, .. } if menu == id))
+    {
+        owner = InputOwner::Surface(model.screen);
+    }
+    let menu = matches!(&owner, InputOwner::Menu(_))
+        .then(|| model.select_menu().cloned())
+        .flatten();
+    if *model.presented_input_owner.borrow() != owner || *model.presented_menu.borrow() != menu {
+        model
+            .presented_input_epoch
+            .set(model.presented_input_epoch.get().wrapping_add(1));
+    }
+    *model.presented_input_owner.borrow_mut() = owner;
+    *model.presented_menu.borrow_mut() = menu;
+    model.presented_input_seen.set(true);
     hits
 }
 

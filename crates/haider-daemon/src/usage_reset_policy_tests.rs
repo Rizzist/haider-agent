@@ -95,6 +95,7 @@ async fn run_case(case: Case) -> Outcome {
             active: true,
             label: None,
             account_identity: Some(haider_protocol::credential::AccountIdentity {
+                subject_hash: Some("synthetic-principal".into()),
                 email: Some("synthetic@example.test".into()),
                 display_name: None,
                 account_id: Some("synthetic-account".into()),

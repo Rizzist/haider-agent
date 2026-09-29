@@ -6,11 +6,18 @@ use serde::{Deserialize, Serialize};
 
 /// Informational, secret-free account facts captured at credential intake.
 ///
-/// These fields are never authentication authority. In particular,
-/// `verified = false` is the only honest value for claims decoded from a JWT
-/// without checking its signature against the issuer.
+/// These fields cannot authenticate on their own. The saved OAuth bundle
+/// must match the subject digest and account coordinate before a token is
+/// handed to a reset action. `verified = false` is the only honest value for
+/// claims decoded from a JWT without checking its signature against the issuer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountIdentity {
+    /// Stable, non-secret OAuth principal digest. It binds a saved token
+    /// bundle to the account record through a vault-before-record update.
+    /// Older records omit it and cannot authorize a usage reset until the
+    /// account is re-established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +116,8 @@ pub struct UsageResetAccountBinding {
     pub provider: String,
     pub account_id: String,
     pub incarnation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

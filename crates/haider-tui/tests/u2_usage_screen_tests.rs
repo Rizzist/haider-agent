@@ -29,6 +29,7 @@ use haider_tui::render::render;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 
@@ -184,6 +185,57 @@ fn usage_model() -> AppModel {
     assert_eq!(model.screen, Screen::Usage, "the screen opens");
     model.usage.apply_report(report());
     model
+}
+
+#[test]
+fn a_pressed_usage_tab_cannot_select_a_reordered_account() {
+    let mut model = usage_model();
+    let (_, first) = draw(&model, 120, 30);
+    let rect = first
+        .iter()
+        .find_map(|(rect, hit)| {
+            matches!(hit, Hit::UsageAccountTab { provider, index: 0 } if provider.as_str() == "anthropic-oauth")
+                .then_some(*rect)
+        })
+        .expect("first account tab");
+    let (x, y) = (rect.x + 1, rect.y);
+    let mouse = |kind| {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    haider_tui::runtime::dispatch_input(
+        &mut model,
+        &first,
+        mouse(MouseEventKind::Down(MouseButton::Left)),
+    );
+    let mut changed = report();
+    changed.accounts.swap(0, 1);
+    model.usage.apply_report(changed);
+    let (_, second) = draw(&model, 120, 30);
+    haider_tui::runtime::dispatch_input(
+        &mut model,
+        &second,
+        mouse(MouseEventKind::Up(MouseButton::Left)),
+    );
+    assert!(
+        model.usage.tabs.is_empty(),
+        "press must retain the original alias"
+    );
+    haider_tui::runtime::dispatch_input(
+        &mut model,
+        &second,
+        mouse(MouseEventKind::Down(MouseButton::Left)),
+    );
+    haider_tui::runtime::dispatch_input(
+        &mut model,
+        &second,
+        mouse(MouseEventKind::Up(MouseButton::Left)),
+    );
+    assert_eq!(model.usage.tabs.get("anthropic-oauth"), Some(&0));
 }
 
 fn live_gated_model() -> AppModel {

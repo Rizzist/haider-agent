@@ -123,6 +123,7 @@ impl OAuthIdentitySource for OpenAiOAuthIdentitySource {
             chatgpt_account_id,
         } = claims.openai_auth.unwrap_or_default();
         Ok(Some(AccountIdentity {
+            subject_hash: None,
             email: nonempty(claims.email),
             display_name: nonempty(claims.name),
             account_id: nonempty(chatgpt_account_id)
@@ -144,6 +145,7 @@ impl OAuthIdentitySource for GrokOAuthIdentitySource {
             return Ok(None);
         };
         Ok(Some(AccountIdentity {
+            subject_hash: None,
             email: nonempty(claims.email),
             display_name: nonempty(claims.name),
             account_id: nonempty(claims.sub),

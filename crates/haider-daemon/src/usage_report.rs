@@ -700,11 +700,16 @@ impl UsageReportService {
             .as_ref()
             .and_then(|identity| identity.account_id.as_deref())
             .and_then(openai_workspace_account_id)?;
+        let subject_hash = descriptor
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.subject_hash.as_ref())?;
         (descriptor.incarnation != 0 && supports_reset_apply(descriptor)).then(|| {
             UsageResetAccountBinding {
                 provider: descriptor.provider.clone(),
                 account_id: account_id.to_owned(),
                 incarnation: descriptor.incarnation,
+                subject_hash: Some(subject_hash.clone()),
             }
         })
     }

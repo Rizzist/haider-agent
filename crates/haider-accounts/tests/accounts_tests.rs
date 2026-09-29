@@ -176,6 +176,7 @@ fn oauth_incarnation_fixture(
     row.auth_method = AuthMethod::OAuth;
     row.identity = "same display".into();
     row.account_identity = Some(AccountIdentity {
+        subject_hash: None,
         email: email.map(str::to_owned),
         display_name: Some("same display".into()),
         account_id: Some(account_id.into()),
@@ -455,6 +456,7 @@ fn new_accounts_are_timestamped_while_legacy_rows_stay_unknown() {
         .backfill_identity(
             &CredentialAlias::new("legacy"),
             AccountIdentity {
+                subject_hash: None,
                 email: Some("owner@example.test".into()),
                 display_name: None,
                 account_id: None,
@@ -1009,6 +1011,7 @@ fn replacement_keeps_only_a_proven_same_account_incarnation() {
     let mut row = descriptor("synthetic-a", "openai-oauth", CredentialStatus::Ok, true);
     row.auth_method = AuthMethod::OAuth;
     row.account_identity = Some(AccountIdentity {
+        subject_hash: None,
         email: Some("a@example.test".into()),
         display_name: None,
         account_id: Some("workspace-a".into()),
@@ -1039,6 +1042,7 @@ fn verified_workspace_without_user_or_email_does_not_prove_continuity() {
     let mut row = descriptor("workspace-only", "openai-oauth", CredentialStatus::Ok, true);
     row.auth_method = AuthMethod::OAuth;
     row.account_identity = Some(AccountIdentity {
+        subject_hash: None,
         email: None,
         display_name: None,
         account_id: Some("shared-workspace".into()),

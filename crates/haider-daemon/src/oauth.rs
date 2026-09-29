@@ -2189,10 +2189,18 @@ fn codex_import_bundle(
     let subject = identity_claims
         .sub
         .and_then(nonempty)
-        .or_else(|| account_id.clone())
-        .unwrap_or_else(|| "imported".to_owned());
+        // A workspace id is shared by its members. When the imported ID
+        // token has no user subject, the grant itself supplies the stable
+        // principal for this login; refresh carries this identity forward.
+        .unwrap_or_else(|| {
+            format!(
+                "grant:{}",
+                blake3::hash(auth.tokens.refresh_token.0.as_slice()).to_hex()
+            )
+        });
     let account_identity = account_identity.or_else(|| {
         (email.is_some() || account_id.is_some()).then(|| AccountIdentity {
+            subject_hash: None,
             email,
             display_name: None,
             account_id,
@@ -6402,6 +6410,23 @@ impl CredentialBroker {
                             && current.base_url == expected.base_url
                             && current.auth_method == expected.auth_method
                             && current.identity == expected.identity
+                            && current.incarnation == expected.incarnation
+                            && current
+                                .account_identity
+                                .as_ref()
+                                .and_then(|identity| identity.subject_hash.as_deref())
+                                == expected
+                                    .account_identity
+                                    .as_ref()
+                                    .and_then(|identity| identity.subject_hash.as_deref())
+                            && current
+                                .account_identity
+                                .as_ref()
+                                .and_then(|identity| identity.account_id.as_deref())
+                                == expected
+                                    .account_identity
+                                    .as_ref()
+                                    .and_then(|identity| identity.account_id.as_deref())
                     })
                     .map_or(SnapshotOAuthState::Replaced, |current| {
                         if matches!(
@@ -6547,6 +6572,7 @@ pub(crate) fn grant_account_identity(
         format!("{provider}:grant-{stable_suffix}")
     };
     AccountIdentity {
+        subject_hash: None,
         email: None,
         display_name: Some(identity.display_identity.clone()),
         account_id: Some(account_id),
@@ -6563,6 +6589,24 @@ fn validate_bundle_against(
     bundle: &OAuthTokenBundleV1,
 ) -> Result<(), HaiderError> {
     if bundle.provider_id != descriptor.provider
+        || bundle.identity.display_identity != descriptor.identity
+        || descriptor
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.subject_hash.as_deref())
+            .is_some_and(|subject| subject != bundle.identity.subject_hash)
+        || descriptor
+            .account_identity
+            .as_ref()
+            .filter(|identity| identity.subject_hash.is_some())
+            .and_then(|identity| identity.account_id.as_deref())
+            .is_some_and(|account| {
+                bundle
+                    .account_identity
+                    .as_ref()
+                    .and_then(|identity| identity.account_id.as_deref())
+                    != Some(account)
+            })
         || bundle.issuer != registration.issuer
         || bundle.audience != registration.audience
         || bundle.resource != registration.resource

@@ -1122,10 +1122,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         // Offline catalogs are authoritative without a network request.
         // An empty remote result never falls back to configured rows.
         let offline_catalog = never_fetched && offline_inventory(profile);
-        // Azure's offline deployments are servable with a credential; the
-        // advisory configured fallback must not downgrade that inventory.
-        let configured_catalog =
-            !offline_catalog && configured_catalog_fallback(profile, &inventory);
+        let configured_catalog = configured_catalog_fallback(profile, &inventory);
         let rows = if offline_catalog || configured_catalog {
             configured_rows(profile)
         } else {

@@ -1838,8 +1838,9 @@ impl ChipModel {
     /// The chip's question card, per the sim's `chipMenu` gate
     /// (tui.js:2360-2364): open only while the chip is `input_required`/
     /// `error` AND holds an UNRESOLVED question. A closed chip has its
-    /// question force-resolved, so its view shows the composer again even
-    /// though the protocol Menu in its projection is still open.
+    /// question force-resolved, so its view shows the composer again. Live
+    /// child menus need no demo-only `ChipQuestion` mirror: the chip's own
+    /// projection retains every unresolved decision.
     #[must_use]
     pub fn question_menu(&self) -> Option<&Menu> {
         if self.closed
@@ -1847,7 +1848,6 @@ impl ChipModel {
                 self.state,
                 ChipDisplayState::InputRequired | ChipDisplayState::Error
             )
-            || self.question.as_ref().is_none_or(|q| q.resolved)
         {
             return None;
         }
@@ -4370,6 +4370,35 @@ impl VoiceState {
     }
 }
 
+/// Keyboard focus of the frame the terminal actually showed. Rechecking the
+/// full owner prevents queued keys from crossing picker, search, history,
+/// composer, menu, and session transitions before another frame is painted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputOwner {
+    Menu(haider_protocol::ids::MenuId),
+    ModelPicker(u64),
+    ThemePicker(u64),
+    EffortPicker(u64),
+    Search,
+    History,
+    Help,
+    Inbox,
+    Lockdown,
+    ToolDetail,
+    CustomProvider,
+    SshForm,
+    Talk,
+    Palette,
+    MentionCompletion,
+    Shells,
+    Ssh,
+    Monitors,
+    Login,
+    TalkSetup,
+    Composer(Screen),
+    Surface(Screen),
+}
+
 /// A clickable region's action (hit-testing: render reports regions, the
 /// runtime maps clicks back through [`AppModel::handle_hit`]).
 ///
@@ -4435,9 +4464,8 @@ pub enum Hit {
     },
     /// Persistent provider-lockdown status segment.
     LockdownStatus,
-    /// One `/usage` account tab chip (U2). VALUE-CARRYING: the provider +
-    /// the index WITHIN its group, so a stale hit map can never select a
-    /// different account.
+    /// One `/usage` account tab chip (U2). The press also snapshots its
+    /// account alias; a refreshed report may reorder this provider's rows.
     UsageAccountTab {
         provider: String,
         index: usize,
@@ -5835,6 +5863,12 @@ pub struct AppModel {
     /// frame) has replaced is unrepresentable — the geometry twin of the
     /// text-revision guard.
     pub geometry_epoch: std::cell::Cell<u64>,
+    /// Menu identity of the last frame actually rendered. Terminal input
+    /// cannot acquire a menu merely because a later reducer event opened it.
+    pub presented_input_owner: std::cell::RefCell<InputOwner>,
+    pub presented_input_seen: std::cell::Cell<bool>,
+    pub presented_input_epoch: std::cell::Cell<u64>,
+    pub presented_menu: std::cell::RefCell<Option<Menu>>,
     /// 971 F2 — the LAST frame's shared bottom-band geometry: the composer
     /// rows a surface drew (`None` when the surface draws no composer) and
     /// the status line under them. Written by `render` under the same
@@ -5886,6 +5920,12 @@ pub struct AppModel {
     /// movement the click dispatches from THESE coordinates; a drag that
     /// selected suppresses it (owner item 9's disambiguation law).
     pub mouse_down: Option<(u16, u16)>,
+    /// Exact painted target and surface that began the current click. A
+    /// release may not reinterpret the press cell through a newer hit map.
+    pub mouse_press_target: Option<(Hit, UiGeneration, Screen, InputOwner, u64, Option<String>)>,
+    /// Reopening a local picker mints a new input owner even if its rows are
+    /// identical to the picker that was closed during a mouse press.
+    pub picker_epoch: u64,
     /// TUI5 item 5 — a left button went down INSIDE the composer text: the
     /// drag (if any) is a COMPOSER selection, never the transcript's
     /// screen-space drag (region disambiguation by drag START). Transient
@@ -6204,6 +6244,10 @@ impl Default for AppModel {
             transcript_view: std::cell::Cell::new(ratatui::layout::Rect::default()),
             status_width: std::cell::Cell::new(0),
             geometry_epoch: std::cell::Cell::new(0),
+            presented_input_owner: std::cell::RefCell::new(InputOwner::Surface(Screen::Boot)),
+            presented_input_seen: std::cell::Cell::new(false),
+            presented_input_epoch: std::cell::Cell::new(0),
+            presented_menu: std::cell::RefCell::new(None),
             composer_rect: std::cell::Cell::new(None),
             status_rect: std::cell::Cell::new(None),
             band_rect: std::cell::Cell::new(None),
@@ -6213,6 +6257,8 @@ impl Default for AppModel {
             hovered: None,
             selection: None,
             mouse_down: None,
+            mouse_press_target: None,
+            picker_epoch: 0,
             composer_drag: false,
             should_quit: false,
             dirty: true,
@@ -8957,6 +9003,7 @@ impl AppModel {
             if self.non_spend_menu_owns_picker() {
                 self.model_picker = None;
                 self.dirty = true;
+                return;
             } else {
                 self.handle_model_picker_key(key.code);
                 return;
@@ -8974,6 +9021,7 @@ impl AppModel {
             }
             self.effort_picker = None;
             self.dirty = true;
+            return;
         }
         // The `/theme` picker owns the keys while it is showing. A daemon
         // non-spend menu or navigation away from its surfaces outranks it.
@@ -8992,6 +9040,7 @@ impl AppModel {
                 self.theme = picker.prior.resolve(self.detected_system);
                 self.dirty = true;
             }
+            return;
         }
         // Subagent view (§2.10): esc ALWAYS walks back to the session (the
         // parent is not blocked); the chip's question menu replaces the
@@ -15493,6 +15542,12 @@ impl AppModel {
                 via: AnswerVia::Tui,
             },
         });
+        if is_deferred_approval(menu)
+            && let Some(agent) = self.view_path.last().cloned()
+            && let Some(chip) = find_chip_mut(&mut self.chips, &agent)
+        {
+            chip.transcript.retire_local_answer(&menu.id);
+        }
         self.menu_selection = 0;
     }
 
@@ -17790,11 +17845,93 @@ impl AppModel {
     /// card arrives — and its Enter — stays a composer message.
     #[must_use]
     pub fn select_menu(&self) -> Option<&Menu> {
-        self.projection.open_menu().filter(|menu| {
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        menu.filter(|menu| {
             !menu.options.is_empty()
                 && (!is_deferred_approval(menu)
                     || self.visible_spend_card().as_ref() == Some(&menu.id))
         })
+    }
+
+    pub(crate) fn input_owner(&self) -> InputOwner {
+        if self.lockdown_overlay {
+            return InputOwner::Lockdown;
+        }
+        if self.tool_detail.is_some() {
+            return InputOwner::ToolDetail;
+        }
+        if self.custom_add.is_some() {
+            return InputOwner::CustomProvider;
+        }
+        if self.ssh_form.is_some() {
+            return InputOwner::SshForm;
+        }
+        if self.talk.engaged() {
+            return InputOwner::Talk;
+        }
+        if self.help_open {
+            return InputOwner::Help;
+        }
+        if self.inbox_open {
+            return InputOwner::Inbox;
+        }
+        if self.transcript_search.is_some() {
+            return InputOwner::Search;
+        }
+        if self.shells_open {
+            return InputOwner::Shells;
+        }
+        if self.ssh_open || self.ssh_terminal.is_some() {
+            return InputOwner::Ssh;
+        }
+        if self.monitors_open {
+            return InputOwner::Monitors;
+        }
+        if self.login.is_some() {
+            return InputOwner::Login;
+        }
+        if self.talk_setup.is_some() {
+            return InputOwner::TalkSetup;
+        }
+        if self.model_picker.is_some() {
+            return InputOwner::ModelPicker(self.picker_epoch);
+        }
+        if let Some(menu) = self
+            .select_menu()
+            .filter(|menu| !is_deferred_approval(menu))
+        {
+            return InputOwner::Menu(menu.id.clone());
+        }
+        if self.effort_picker.is_some() {
+            return InputOwner::EffortPicker(self.picker_epoch);
+        }
+        if self.theme_picker.is_some() {
+            return InputOwner::ThemePicker(self.picker_epoch);
+        }
+        if self.backtrack.is_some() {
+            return InputOwner::History;
+        }
+        if let Some(menu) = self.select_menu() {
+            return InputOwner::Menu(menu.id.clone());
+        }
+        if self.mention_completion.is_some() {
+            return InputOwner::MentionCompletion;
+        }
+        if self.palette_open() {
+            return InputOwner::Palette;
+        }
+        if matches!(
+            self.screen,
+            Screen::Launcher | Screen::Session | Screen::Subagent | Screen::Aura | Screen::Loom
+        ) {
+            InputOwner::Composer(self.screen)
+        } else {
+            InputOwner::Surface(self.screen)
+        }
     }
 
     fn submit_menu_answer(&mut self) {
@@ -17836,11 +17973,16 @@ impl AppModel {
             value: None,
             via: AnswerVia::Tui,
         };
+        let retire = is_deferred_approval(menu).then(|| menu.id.clone());
         self.outbox.push(OutboundAnswer {
             origin: self.ui_generation(),
             branch: self.branch_state.active().cloned(),
             answer,
         });
+        if let Some(menu_id) = retire {
+            self.projection.retire_local_answer(&menu_id);
+            self.retire_spend_card_navigation();
+        }
         self.menu_selection = 0;
     }
 
@@ -19729,7 +19871,7 @@ impl AppModel {
             .find(|entry| entry.ui_gen == generation)
     }
 
-    fn menu_hit_is_live(&self, id: &haider_protocol::ids::MenuId, index: usize) -> bool {
+    pub(crate) fn menu_hit_is_live(&self, id: &haider_protocol::ids::MenuId, index: usize) -> bool {
         let menu = match self.screen {
             Screen::Session => self.projection.open_menu(),
             Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
@@ -19740,6 +19882,46 @@ impl AppModel {
                 && index < menu.options.len()
                 && (!is_deferred_approval(menu) || self.visible_spend_card().as_ref() == Some(id))
         })
+    }
+
+    /// Index-bearing hits also keep the option value painted at press. A
+    /// same-id menu update or changed effort ladder cannot retarget a click.
+    pub(crate) fn mouse_hit_semantics(&self, hit: &Hit) -> Option<String> {
+        match hit {
+            Hit::MenuOption { menu, index } => {
+                let current = match self.screen {
+                    Screen::Session => self.projection.open_menu(),
+                    Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+                    _ => None,
+                }?;
+                (current.id == *menu)
+                    .then_some(current.options.get(*index)?)
+                    .map(|option| format!("{option:?}"))
+            }
+            Hit::EffortOption(index) => self
+                .effort_picker_rows()
+                .get(*index)
+                .map(|row| format!("{:?}", row.effort)),
+            Hit::PermissionRetry | Hit::PermissionOpenSettings => self
+                .projection
+                .permission_card()
+                .map(|card| format!("{}:{:?}", card.request_id, card.permission)),
+            Hit::UsageAccountTab { provider, index } => {
+                let group = self
+                    .usage
+                    .groups()
+                    .into_iter()
+                    .find(|group| group.provider == *provider)?;
+                let slot = *group.accounts.get(*index)?;
+                self.usage
+                    .report
+                    .as_ref()?
+                    .accounts
+                    .get(slot)
+                    .map(|account| account.alias.as_str().to_owned())
+            }
+            _ => None,
+        }
     }
 
     /// A left-click resolved through the frame's hit map. The map may be
@@ -19899,9 +20081,8 @@ impl AppModel {
             Hit::ProviderAccounts if self.screen == Screen::Providers => {
                 self.enter_accounts();
             }
-            // U2: a click on an account tab chip selects exactly the
-            // account the rect was rendered for (value-carrying) and moves
-            // the cursor to its group.
+            // U2: the runtime checks the pressed alias before this index is
+            // interpreted against the current report.
             Hit::UsageAccountTab { provider, index } if self.screen == Screen::Usage => {
                 let groups = self.usage.groups();
                 let Some(position) = groups.iter().position(|group| group.provider == provider)
@@ -20575,6 +20756,7 @@ impl AppModel {
     /// Pushes a registry refresh so the roster is as fresh as the daemon
     /// serves; rows render from the snapshot in hand meanwhile.
     pub fn open_model_picker(&mut self, query: String) {
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
         self.model_picker = Some(ModelPicker {
             query,
             ..ModelPicker::default()
@@ -21326,6 +21508,7 @@ impl AppModel {
             return;
         }
         let Some(requested) = requested else {
+            self.picker_epoch = self.picker_epoch.wrapping_add(1);
             self.effort_picker = Some(EffortPicker::default());
             return;
         };
@@ -21612,6 +21795,7 @@ impl AppModel {
             .iter()
             .position(|choice| *choice == self.theme_choice)
             .unwrap_or(0);
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
         self.theme_picker = Some(ThemePicker {
             selection,
             prior: self.theme_choice,
