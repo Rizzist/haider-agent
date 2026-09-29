@@ -9003,7 +9003,6 @@ impl AppModel {
             if self.non_spend_menu_owns_picker() {
                 self.model_picker = None;
                 self.dirty = true;
-                return;
             } else {
                 self.handle_model_picker_key(key.code);
                 return;
@@ -9013,21 +9012,23 @@ impl AppModel {
         // the same input-replacement law as `/theme`; a non-spend daemon menu
         // outranks it, while a deferred spend card waits below it.
         if self.effort_picker.is_some() {
-            if !self.non_spend_menu_owns_picker()
-                && matches!(self.screen, Screen::Session | Screen::Subagent)
-            {
+            let forward_to_menu = self.non_spend_menu_owns_picker();
+            if !forward_to_menu && matches!(self.screen, Screen::Session | Screen::Subagent) {
                 self.handle_effort_picker_key(key.code);
                 return;
             }
             self.effort_picker = None;
             self.dirty = true;
-            return;
+            if !forward_to_menu {
+                return;
+            }
         }
         // The `/theme` picker owns the keys while it is showing. A daemon
         // non-spend menu or navigation away from its surfaces outranks it.
         // A deferred spend card waits below the picker until it closes.
         if self.theme_picker.is_some() {
-            if !self.non_spend_menu_owns_picker()
+            let forward_to_menu = self.non_spend_menu_owns_picker();
+            if !forward_to_menu
                 && matches!(
                     self.screen,
                     Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
@@ -9040,7 +9041,9 @@ impl AppModel {
                 self.theme = picker.prior.resolve(self.detected_system);
                 self.dirty = true;
             }
-            return;
+            if !forward_to_menu {
+                return;
+            }
         }
         // Subagent view (§2.10): esc ALWAYS walks back to the session (the
         // parent is not blocked); the chip's question menu replaces the
@@ -17897,14 +17900,14 @@ impl AppModel {
         if self.talk_setup.is_some() {
             return InputOwner::TalkSetup;
         }
-        if self.model_picker.is_some() {
-            return InputOwner::ModelPicker(self.picker_epoch);
-        }
         if let Some(menu) = self
             .select_menu()
             .filter(|menu| !is_deferred_approval(menu))
         {
             return InputOwner::Menu(menu.id.clone());
+        }
+        if self.model_picker.is_some() {
+            return InputOwner::ModelPicker(self.picker_epoch);
         }
         if self.effort_picker.is_some() {
             return InputOwner::EffortPicker(self.picker_epoch);
@@ -20105,11 +20108,15 @@ impl AppModel {
             Hit::PaletteRow(item) if self.palette_open() => self.activate_palette_item(item),
             // A `/theme` picker row: click commits (the hover already
             // previewed it). A stale hit after the picker closed drops.
-            Hit::ThemeOption(index) if self.theme_picker.is_some() => {
+            Hit::ThemeOption(index)
+                if self.theme_picker.is_some() && !self.non_spend_menu_owns_picker() =>
+            {
                 self.commit_theme_row(index);
             }
             // G3: an `/effort` row click commits exactly that row.
-            Hit::EffortOption(index) if self.effort_picker.is_some() => {
+            Hit::EffortOption(index)
+                if self.effort_picker.is_some() && !self.non_spend_menu_owns_picker() =>
+            {
                 self.commit_effort_row(index);
             }
             // F2a: a picker row click selects exactly the pair the rect
@@ -20119,7 +20126,7 @@ impl AppModel {
                 provider,
                 model,
                 api_group,
-            } if self.model_picker.is_some() => {
+            } if self.model_picker.is_some() && !self.non_spend_menu_owns_picker() => {
                 let in_provider_stage = self
                     .model_picker
                     .as_ref()

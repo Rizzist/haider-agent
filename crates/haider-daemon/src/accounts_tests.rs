@@ -10117,6 +10117,9 @@ fn set_import_bundle_expiry(
         bundle.generation,
     )
     .expect("aged bundle");
+    if let Some(identity) = bundle.account_identity.clone() {
+        aged = aged.with_account_identity(identity);
+    }
     if let Some(fingerprint) = bundle.import_source_access_fingerprint() {
         aged = aged.with_import_source_access_fingerprint(fingerprint);
     }

@@ -6589,7 +6589,6 @@ fn validate_bundle_against(
     bundle: &OAuthTokenBundleV1,
 ) -> Result<(), HaiderError> {
     if bundle.provider_id != descriptor.provider
-        || bundle.identity.display_identity != descriptor.identity
         || descriptor
             .account_identity
             .as_ref()

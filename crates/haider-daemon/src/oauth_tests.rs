@@ -1858,7 +1858,11 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
     );
     assert_eq!(
         bundle.identity.subject_hash,
-        blake3::hash(b"fake-account-id-1").to_hex().to_string()
+        blake3::hash(
+            format!("grant:{}", blake3::hash(b"fake-refresh-token-1").to_hex()).as_bytes()
+        )
+        .to_hex()
+        .to_string()
     );
     let account_identity = bundle
         .account_identity

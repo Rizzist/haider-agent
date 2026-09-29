@@ -1363,12 +1363,13 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     // rect; a surface that draws none leaves it cleared.
     model.composer_rect.set(None);
     model.status_rect.set((status_height > 0).then_some(status));
-    // F2a: the full-screen /model picker COVERS the body while open —
-    // it owns the keys, so it owns the pixels and the hit map too.
+    // F2a: the full-screen /model picker covers the body only while it owns
+    // input. A blocking daemon menu outranks it and must own the painted
+    // pixels and hit map as well as the keys.
     if model.ssh_terminal.is_some() {
         render_ssh_terminal(model, theme, frame, body);
         hits.clear();
-    } else if model.model_picker.is_some() {
+    } else if model.model_picker.is_some() && !model.non_spend_menu_owns_picker() {
         render_model_picker(model, theme, frame, body, &mut hits);
     } else {
         match model.screen {

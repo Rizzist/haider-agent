@@ -7,7 +7,7 @@ use haider_protocol::effect::EffectClass;
 use haider_protocol::ids::{CredentialAlias, MenuId, SessionId};
 use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_rpc::SurfaceInjectOp;
-use haider_tui::app::{AppEvent, AppModel, ChipModel, ChipQuestion, RuntimeMode, Screen};
+use haider_tui::app::{AppEvent, AppModel, ChipModel, ChipQuestion, Hit, RuntimeMode, Screen};
 use haider_tui::live::{LiveDriver, LiveReply};
 use haider_tui::mock::{seed_account_rows, seed_provider_summaries};
 use haider_tui::script::{ChipDisplayState, ChipSeed};
@@ -46,6 +46,25 @@ impl Picker {
             Self::Theme => "theme — how haider dresses this terminal",
             Self::Effort => "effort — reasoning depth for this pair",
             Self::Model => "OAuth subscriptions + one API choice per model",
+        }
+    }
+
+    fn stale_hit(self, model: &AppModel) -> Hit {
+        match self {
+            Self::Theme => Hit::ThemeOption(0),
+            Self::Effort => Hit::EffortOption(0),
+            Self::Model => {
+                let row = model
+                    .model_picker_rows()
+                    .into_iter()
+                    .find(|row| row.auth == "oauth" && row.selectable)
+                    .expect("selectable OAuth model row");
+                Hit::ModelPickerRow {
+                    provider: row.provider,
+                    model: row.model,
+                    api_group: false,
+                }
+            }
         }
     }
 }
@@ -281,45 +300,77 @@ fn chip_model_picker_owns_spend_card_gestures() {
 
 #[test]
 fn blocking_question_still_outranks_a_local_picker() {
-    let mut model = seeded_session();
-    run_slash(&mut model, "/theme");
-    let mut question = reset_card();
-    question.kind = MenuKind::Question;
-    question.blocking = true;
-    question.options[1].key = "second".into();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
-        question,
-    ))));
-    let frame = painted(&model);
-    assert!(frame.contains("Deny"), "question stays painted:\n{frame}");
-    assert!(!frame.contains("○ light"), "picker waits below question");
-    model.handle(key(KeyCode::Down));
-    assert!(model.theme_picker.is_none());
-    model.handle(key(KeyCode::Enter));
-    assert_eq!(model.outbox[0].answer.option_key.as_deref(), Some("second"));
+    for picker in [Picker::Theme, Picker::Effort, Picker::Model] {
+        let mut model = seeded_session();
+        run_slash(&mut model, picker.slash());
+        let mut question = reset_card();
+        question.kind = MenuKind::Question;
+        question.blocking = true;
+        question.options[1].key = "second".into();
+        model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+            question,
+        ))));
+        let frame = painted(&model);
+        assert!(frame.contains("Deny"), "question stays painted:\n{frame}");
+        assert!(
+            !frame.contains(picker.painted_marker()),
+            "{picker:?} waits below question"
+        );
+        let stale_hit = picker.stale_hit(&model);
+        model.handle_hit(stale_hit);
+        assert!(picker.is_open(&model), "{picker:?} stale hit must drop");
+        assert!(
+            model.outbox.is_empty(),
+            "{picker:?} stale hit must not answer"
+        );
+        model.handle(key(KeyCode::Down));
+        assert!(!picker.is_open(&model));
+        model.handle(key(KeyCode::Enter));
+        assert_eq!(
+            model.outbox[0].answer.option_key.as_deref(),
+            Some("second"),
+            "{picker:?} must forward Down to the painted question"
+        );
+    }
 }
 
 #[test]
 fn blocking_chip_question_still_outranks_a_local_picker() {
-    let mut model = seeded_session();
-    run_slash(&mut model, "/theme");
-    let mut question = reset_card();
-    question.kind = MenuKind::Question;
-    question.blocking = true;
-    question.options[1].key = "second".into();
-    chip_with_menu(&mut model, question);
-    model.outbox.clear();
-    let frame = painted(&model);
-    assert!(
-        frame.contains("Deny"),
-        "chip question stays painted:\n{frame}"
-    );
-    assert!(
-        !frame.contains("○ light"),
-        "picker waits below chip question"
-    );
-    model.handle(key(KeyCode::Down));
-    assert!(model.theme_picker.is_none());
-    model.handle(key(KeyCode::Enter));
-    assert_eq!(model.outbox[0].answer.option_key.as_deref(), Some("second"));
+    for picker in [Picker::Theme, Picker::Effort, Picker::Model] {
+        let mut model = seeded_session();
+        run_slash(&mut model, picker.slash());
+        let mut question = reset_card();
+        question.kind = MenuKind::Question;
+        question.blocking = true;
+        question.options[1].key = "second".into();
+        chip_with_menu(&mut model, question);
+        model.outbox.clear();
+        let frame = painted(&model);
+        assert!(
+            frame.contains("Deny"),
+            "chip question stays painted:\n{frame}"
+        );
+        assert!(
+            !frame.contains(picker.painted_marker()),
+            "{picker:?} waits below chip question"
+        );
+        let stale_hit = picker.stale_hit(&model);
+        model.handle_hit(stale_hit);
+        assert!(
+            picker.is_open(&model),
+            "{picker:?} stale chip hit must drop"
+        );
+        assert!(
+            model.outbox.is_empty(),
+            "{picker:?} stale hit must not answer"
+        );
+        model.handle(key(KeyCode::Down));
+        assert!(!picker.is_open(&model));
+        model.handle(key(KeyCode::Enter));
+        assert_eq!(
+            model.outbox[0].answer.option_key.as_deref(),
+            Some("second"),
+            "{picker:?} must forward Down to the painted chip question"
+        );
+    }
 }
