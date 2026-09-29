@@ -102,7 +102,7 @@ pub fn workspace_relative_display(path: &Path, root: &Path) -> Option<String> {
                     // an alias for a current/parent segment. Verbatim paths
                     // get the same conservative display rule.
                     || windows
-                        && component.contains('.')
+                        && !component.is_empty()
                         && component.chars().all(|ch| ch == '.' || ch == ' ')
         })
     };
@@ -657,11 +657,17 @@ impl DisplayPath {
         let mut parts: Vec<String> = Vec::new();
         let mut had_parent = false;
         let mut unresolved_parent = false;
-        for part in tail
-            .split('/')
-            .filter(|part| !part.is_empty() && *part != ".")
-        {
-            if part == ".." {
+        for part in tail.split('/').filter(|part| !part.is_empty()) {
+            // Win32's ordinary path form removes trailing ASCII dots and
+            // spaces. A component made only of them may therefore act as a
+            // current or parent segment. Treat verbatim spellings the same
+            // way for conservative display masking; this is never used for IO.
+            let dot_count = (windows && part.chars().all(|ch| ch == '.' || ch == ' '))
+                .then(|| part.bytes().filter(|byte| *byte == b'.').count());
+            if part == "." || dot_count.is_some_and(|count| count <= 1) {
+                continue;
+            }
+            if part == ".." || dot_count.is_some_and(|count| count >= 2) {
                 had_parent = true;
                 if !absolute {
                     parts.push("..".to_owned());
@@ -678,7 +684,10 @@ impl DisplayPath {
         }
         // A trailing parent may depend on a missing or symlinked last
         // component. Decline it rather than treating that as the home.
-        if absolute && tail.trim_end_matches('/').ends_with("/..") {
+        let last = tail.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        let trailing_dot_count = (windows && last.chars().all(|ch| ch == '.' || ch == ' '))
+            .then(|| last.bytes().filter(|byte| *byte == b'.').count());
+        if absolute && (last == ".." || trailing_dot_count.is_some_and(|count| count >= 2)) {
             unresolved_parent = true;
         }
         Self {

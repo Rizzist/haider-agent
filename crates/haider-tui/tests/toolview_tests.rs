@@ -256,7 +256,6 @@ fn windows_dot_and_space_segments_never_become_workspace_labels() {
         "C:/w/.. /Users/bob/x",
         "C:/w/sub/.. /.. /Users/bob/x",
         "C:/w/.. . /Users/bob/x",
-        "C:/w/. /Users/bob/x",
         "C:/w/.../Users/bob/x",
         r"\\?\C:\w\.. \Users\bob\x",
     ] {
@@ -272,6 +271,17 @@ fn windows_dot_and_space_segments_never_become_workspace_labels() {
         assert!(label.contains("<user>"), "{path}: {label}");
         assert!(!label.contains("bob"), "{path}: {label}");
         assert!(!label.starts_with(".."), "{path}: {label}");
+    }
+    for path in ["C:/w/. /Users/bob/x", "C:/w/ /Users/bob/x"] {
+        assert_eq!(
+            haider_client::launch_origin::workspace_relative_display(
+                Path::new(path),
+                Path::new("C:/w")
+            ),
+            None,
+            "{path}"
+        );
+        assert_eq!(context.shorten(path), "C:/w/Users/bob/x", "{path}");
     }
     // Ordinary leading-dot names still label a file below the workspace.
     assert_eq!(context.shorten("C:/w/..file/x"), "..file/x");
