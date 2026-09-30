@@ -3,7 +3,7 @@
 //! (research rec 3/6). Alternate screen for v0.1 (rec 1); native-scrollback
 //! insertion is explicitly deferred (rec 19).
 
-use crate::app::{AppEvent, AppModel, AppRequest, DemoRequest};
+use crate::app::{AppEvent, AppModel, AppRequest, DemoRequest, PresentedInput};
 use crate::identity::UiGeneration;
 use crate::mock::demo_script;
 use crate::render::render;
@@ -28,8 +28,47 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{event, execute};
 use std::io::{IsTerminal, Stdout, Write, stderr, stdin, stdout};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+struct QueuedInput {
+    event: Event,
+    presented: Option<(PresentedInput, u64)>,
+}
+
+type PresentedFrame = Mutex<Option<((PresentedInput, u64), Instant)>>;
+
+fn input_stamp(frame: &PresentedFrame, received_at: Instant) -> Option<(PresentedInput, u64)> {
+    frame
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|(owner, painted_at)| (*painted_at <= received_at).then(|| owner.clone()))
+}
+
+fn dispatch_queued_input(
+    model: &mut AppModel,
+    hits: &[(ratatui::layout::Rect, crate::app::Hit)],
+    input: QueuedInput,
+) -> bool {
+    if matches!(
+        &input.event,
+        Event::Key(_) | Event::Paste(_) | Event::Mouse(_)
+    ) && (input.presented.is_none() || input.presented != model.painted_stamp())
+    {
+        if matches!(&input.event, Event::Mouse(_)) {
+            model.clear_mouse_press();
+        }
+        return false;
+    }
+    dispatch_input(model, hits, input.event);
+    true
+}
+
+fn owner_needs_presentation(model: &AppModel) -> bool {
+    model.painted_input().as_ref() != Some(&model.presented_input())
+}
 
 const SYSTEM_THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(20);
 
@@ -736,12 +775,22 @@ pub async fn run_demo(
 
     // Input pump: crossterm's blocking read on a dedicated thread, forwarded
     // into the async loop (no event-stream feature needed).
-    let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
+    let presented = Arc::new(Mutex::new(None::<((PresentedInput, u64), Instant)>));
+    let input_presentation = Arc::clone(&presented);
+    let (input_tx, mut input_rx) = mpsc::channel::<QueuedInput>(64);
     std::thread::spawn(move || {
         loop {
             match event::read() {
                 Ok(item) => {
-                    if input_tx.blocking_send(item).is_err() {
+                    let received_at = Instant::now();
+                    let shown = input_stamp(&input_presentation, received_at);
+                    if input_tx
+                        .blocking_send(QueuedInput {
+                            event: item,
+                            presented: shown,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -797,18 +846,24 @@ pub async fn run_demo(
     while !model.should_quit {
         tokio::select! {
             input = input_rx.recv() => match input {
-                Some(event) => {
-                    match &event {
+                Some(input) => {
+                    let event = &input.event;
+                    let next_pointer = match event {
                         // The pre-resize map describes a frame that no
                         // longer exists — a queued Moved must not re-arm a
                         // hover from dead geometry (W5g-7).
-                        Event::Resize(..) => hit_map.clear(),
-                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => {
-                            pointer = Some((mouse.column, mouse.row));
+                        Event::Resize(..) => {
+                            hit_map.clear();
+                            None
                         }
-                        _ => {}
+                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => Some((mouse.column, mouse.row)),
+                        _ => None,
+                    };
+                    if dispatch_queued_input(&mut model, &hit_map, input)
+                        && let Some(cell) = next_pointer
+                    {
+                        pointer = Some(cell);
                     }
-                    dispatch_input(&mut model, &hit_map, event);
                 }
                 None => break,
             },
@@ -839,7 +894,7 @@ pub async fn run_demo(
             // it and the overdue tick fires immediately, keeping the 30fps
             // coalescing behavior.
             _ = frame_tick.tick(), if model.dirty => {
-                present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
+                present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
                 // Demo persistence (TUI4c-13b): a drawn frame means state
                 // changed — save here, coalesced to the frame cadence
                 // (hash-skipped when nothing persisted moved). This is the
@@ -848,6 +903,10 @@ pub async fn run_demo(
                     store.save(&model);
                 }
             }
+        }
+        model.retire_stale_press();
+        if owner_needs_presentation(&model) {
+            present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
         }
         // Reducer-requested side effects.
         let requests: Vec<AppRequest> = model.requests.drain(..).collect();
@@ -1080,6 +1139,19 @@ pub fn dispatch_input(
     hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
     event: Event,
 ) {
+    model.retire_stale_press();
+    // The completed render records its owner separately from logical state.
+    // A queued key or mouse report cannot migrate to a newly opened owner.
+    if matches!(&event, Event::Key(_) | Event::Paste(_) | Event::Mouse(_))
+        && model
+            .painted_input()
+            .is_some_and(|owner| owner != model.presented_input())
+    {
+        if matches!(&event, Event::Mouse(_)) {
+            model.clear_mouse_press();
+        }
+        return;
+    }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             model.handle(AppEvent::Key(key));
@@ -1101,6 +1173,7 @@ pub fn dispatch_input(
             model
                 .composer
                 .set_wrap_budget(crate::render::composer_text_budget(cols));
+            model.clear_mouse_press();
             model.handle_terminal_resize(cols, rows);
         }
         Event::Mouse(mouse) => {
@@ -1109,11 +1182,7 @@ pub fn dispatch_input(
             // scroll, paste, or move hover in the app. This is not a way to
             // replay an already delivered report into the terminal.
             if terminal_owned_mouse(&mouse) {
-                model.mouse_down = None;
-                model.composer_drag = false;
-                if let Some(selection) = &mut model.selection {
-                    selection.dragging = false;
-                }
+                model.clear_mouse_press();
                 return;
             }
             let hit_at = |column: u16, row: u16| {
@@ -1131,7 +1200,10 @@ pub fn dispatch_input(
                 // A terminal-owned right-click sends paste input instead
                 // of this report. Under capture, service a delivered right
                 // press ourselves; release/drag never paste a second time.
-                MouseEventKind::Down(MouseButton::Right) => model.request_clipboard_paste(),
+                MouseEventKind::Down(MouseButton::Right) => {
+                    model.clear_mouse_press();
+                    model.request_clipboard_paste();
+                }
                 // Owner item 9: Down is only a POTENTIAL anchor — the click
                 // dispatches on Up, because only Up knows whether the press
                 // was a click or a drag-selection. A previous selection's
@@ -1142,10 +1214,11 @@ pub fn dispatch_input(
                 // disambiguation by drag START). The composer press never
                 // arms `mouse_down`, so the transcript path stays silent.
                 MouseEventKind::Down(MouseButton::Left) => {
+                    model.clear_mouse_press();
                     if model.selection.take().is_some() {
-                        model.selection_owner = None;
                         model.dirty = true;
                     }
+                    model.selection_owner = Some(model.input_owner());
                     if let Some((
                         rect,
                         crate::app::Hit::ComposerText {
@@ -1168,7 +1241,15 @@ pub fn dispatch_input(
                         model.custom_provider_field_press(attempt, field, character);
                         return;
                     }
+                    // The target is resolved now, while this frame owns
+                    // input. Release may only confirm this same target.
                     model.mouse_down = Some((mouse.column, mouse.row));
+                    model.mouse_press_owner = Some(model.presented_input());
+                    model.mouse_press_epoch = Some(model.painted_epoch.get());
+                    if let Some((rect, hit)) = hit_rect_at(hit_map, mouse.column, mouse.row) {
+                        model.mouse_press_rect = Some(rect);
+                        model.mouse_press_hit = Some(hit);
+                    }
                 }
                 // Movement with the button held: meaningful movement (a
                 // different cell than the anchor) enters selection mode
@@ -1202,7 +1283,7 @@ pub fn dispatch_input(
                                     head,
                                     dragging: true,
                                 });
-                                model.selection_owner = Some(model.input_owner());
+                                // Selection ownership was captured at press.
                                 model.dirty = true;
                             }
                             _ => {}
@@ -1243,6 +1324,10 @@ pub fn dispatch_input(
                         return;
                     }
                     let down = model.mouse_down.take();
+                    let press_owner = model.mouse_press_owner.take();
+                    let press_hit = model.mouse_press_hit.take();
+                    let press_rect = model.mouse_press_rect.take();
+                    let press_epoch = model.mouse_press_epoch.take();
                     if let Some(selection) = &mut model.selection
                         && down.is_some()
                     {
@@ -1250,7 +1335,12 @@ pub fn dispatch_input(
                         model.requests.push(crate::app::AppRequest::CopySelection);
                         model.dirty = true;
                     } else if let Some((column, row)) = down
-                        && let Some(action) = hit_at(column, row)
+                        && press_owner.as_ref() == Some(&model.presented_input())
+                        && press_epoch == Some(model.painted_epoch.get())
+                        && let Some(action) = press_hit
+                        && let Some(rect) = press_rect
+                        && hit_rect_at(hit_map, column, row).as_ref()
+                            == Some(&(rect, action.clone()))
                     {
                         model.handle_hit(action);
                     }
@@ -1272,7 +1362,10 @@ pub fn dispatch_input(
         // ANY focus event also flips the "focus is reported" latch, so the
         // fire-anyway fallback only holds on emulators that never report it.
         Event::FocusGained => model.set_focus(true),
-        Event::FocusLost => model.set_focus(false),
+        Event::FocusLost => {
+            model.clear_mouse_press();
+            model.set_focus(false);
+        }
         _ => {}
     }
 }
@@ -3063,8 +3156,14 @@ fn present_frame(
     model: &mut AppModel,
     hit_map: &mut Vec<(ratatui::layout::Rect, crate::app::Hit)>,
     pointer: Option<(u16, u16)>,
+    presented: &Arc<PresentedFrame>,
 ) -> std::io::Result<()> {
+    model.retire_stale_press();
     *hit_map = draw(terminal, model)?;
+    *presented
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        model.painted_stamp().map(|stamp| (stamp, Instant::now()));
     model.dirty = false;
     // W5g-7: hover survives a redraw only while the pointer still resolves
     // to it; this applies identically to cadence and semantic-edge frames.
@@ -3096,7 +3195,12 @@ pub fn rendered_selection_text(
     let backend = ratatui::backend::TestBackend::new(size.width, size.height);
     // TestBackend construction is infallible (uninhabited error type).
     let Ok(mut scratch) = Terminal::new(backend);
-    if scratch.draw(|frame| drop(render(model, frame))).is_err() {
+    let prior_presentation = model.painted_input();
+    let prior_epoch = model.painted_epoch.get();
+    let drawn = scratch.draw(|frame| drop(render(model, frame)));
+    *model.painted_input.borrow_mut() = prior_presentation;
+    model.painted_epoch.set(prior_epoch);
+    if drawn.is_err() {
         return String::new();
     }
     crate::select::selection_text(scratch.backend().buffer(), selection)
@@ -3874,12 +3978,22 @@ pub async fn run_live(
     // Truecolor capability (see run_demo) — pinned once for render's shimmer.
     model.truecolor = truecolor_capable(&|name| std::env::var(name).ok());
 
-    let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
+    let presented = Arc::new(Mutex::new(None::<((PresentedInput, u64), Instant)>));
+    let input_presentation = Arc::clone(&presented);
+    let (input_tx, mut input_rx) = mpsc::channel::<QueuedInput>(64);
     std::thread::spawn(move || {
         loop {
             match event::read() {
                 Ok(item) => {
-                    if input_tx.blocking_send(item).is_err() {
+                    let received_at = Instant::now();
+                    let shown = input_stamp(&input_presentation, received_at);
+                    if input_tx
+                        .blocking_send(QueuedInput {
+                            event: item,
+                            presented: shown,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -3968,17 +4082,19 @@ pub async fn run_live(
         let mut immediate_presentation = ImmediatePresentation::default();
         tokio::select! {
             input = input_rx.recv() => match input {
-                Some(event) => {
-                    match &event {
+                Some(input) => {
+                    let event = &input.event;
+                    let next_pointer = match event {
                         // The pre-resize map describes a frame that no
                         // longer exists — a queued Moved must not re-arm a
                         // hover from dead geometry (W5g-7).
-                        Event::Resize(..) => hit_map.clear(),
-                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => {
-                            pointer = Some((mouse.column, mouse.row));
+                        Event::Resize(..) => {
+                            hit_map.clear();
+                            None
                         }
-                        _ => {}
-                    }
+                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => Some((mouse.column, mouse.row)),
+                        _ => None,
+                    };
                     // rev933b finding 3: while the update transaction holds
                     // a dead link, a keystroke would type into a void and a
                     // submit would be silently lost across the restart.
@@ -3994,7 +4110,11 @@ pub async fn run_live(
                         || quit_key
                         || !matches!(event, Event::Key(_) | Event::Paste(_))
                     {
-                        dispatch_input(&mut model, &hit_map, event);
+                        if dispatch_queued_input(&mut model, &hit_map, input)
+                            && let Some(cell) = next_pointer
+                        {
+                            pointer = Some(cell);
+                        }
                     } else {
                         model.flash =
                             Some("· updating — input held until the restart".to_owned());
@@ -4099,10 +4219,11 @@ pub async fn run_live(
             }
             () = wait_until(deadline) => {}
             _ = frame_tick.tick(), if model.dirty => {
-                present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
+                present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
             }
         }
         let pass = live_pass(&mut driver, &mut model, inbound, std::time::Instant::now());
+        model.retire_stale_press();
         // A catch-up tail gap (or any other driver-side continuity failure)
         // returns a Detach in this same pass. Retire its presentation cursor
         // before any later frame from that dead route can accelerate a draw.
@@ -4111,8 +4232,8 @@ pub async fn run_live(
         // perceived latency edges. They move the pending cadence draw here;
         // all continuing deltas and animation still ride the guarded 33 ms
         // tick, and a clean model still draws nothing.
-        if immediate_presentation.required() && model.dirty {
-            present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
+        if owner_needs_presentation(&model) || (model.dirty && immediate_presentation.required()) {
+            present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
         }
         pending.extend(pass.commands);
         // Exhaustive over the CLOSED shell vocabulary — adding a variant

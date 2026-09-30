@@ -283,6 +283,15 @@ pub enum InputOwner {
     Composer(Screen),
 }
 
+/// The input surface shown by a completed frame. The instance distinguishes
+/// two cards with the same owner (including a replaced permission menu).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentedInput {
+    pub owner: InputOwner,
+    pub surface: UiGeneration,
+    pub instance: Option<String>,
+}
+
 impl InputOwner {
     /// Owners with a visible draft field. A shared answer-line card joins
     /// here without changing every input route independently.
@@ -4500,12 +4509,12 @@ pub enum Hit {
     },
     /// Persistent provider-lockdown status segment.
     LockdownStatus,
-    /// One `/usage` account tab chip (U2). VALUE-CARRYING: the provider +
-    /// the index WITHIN its group, so a stale hit map can never select a
-    /// different account.
+    /// One `/usage` account tab chip (U2). The alias fences the group index
+    /// against a refreshed report reordering its accounts during a press.
     UsageAccountTab {
         provider: String,
         index: usize,
+        alias: haider_protocol::ids::CredentialAlias,
     },
     /// One `/usage` scope-strip label. Value-carrying so a stale hit map
     /// can only select the scope that occupied the clicked cell.
@@ -5954,6 +5963,12 @@ pub struct AppModel {
     /// movement the click dispatches from THESE coordinates; a drag that
     /// selected suppresses it (owner item 9's disambiguation law).
     pub mouse_down: Option<(u16, u16)>,
+    pub(crate) mouse_press_owner: Option<PresentedInput>,
+    pub(crate) mouse_press_hit: Option<Hit>,
+    pub(crate) mouse_press_rect: Option<ratatui::layout::Rect>,
+    pub(crate) mouse_press_epoch: Option<u64>,
+    pub(crate) painted_input: std::cell::RefCell<Option<PresentedInput>>,
+    pub(crate) painted_epoch: std::cell::Cell<u64>,
     /// TUI5 item 5 — a left button went down INSIDE the composer text: the
     /// drag (if any) is a COMPOSER selection, never the transcript's
     /// screen-space drag (region disambiguation by drag START). Transient
@@ -6284,6 +6299,12 @@ impl Default for AppModel {
             selection: None,
             selection_owner: None,
             mouse_down: None,
+            mouse_press_owner: None,
+            mouse_press_hit: None,
+            mouse_press_rect: None,
+            mouse_press_epoch: None,
+            painted_input: std::cell::RefCell::new(None),
+            painted_epoch: std::cell::Cell::new(0),
             composer_drag: false,
             should_quit: false,
             dirty: true,
@@ -7663,10 +7684,15 @@ impl AppModel {
 
     /// Deterministic clock seam for rapid Esc backtracking laws.
     pub fn handle_at(&mut self, event: AppEvent, now: std::time::Instant) {
-        let previous_owner = self.input_owner();
+        let previous_owner = self.presented_input();
+        let focus_move = matches!(
+            &event,
+            AppEvent::Key(key)
+                if matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right)
+        );
         self.handle_at_inner(event, now);
-        if self.input_owner() != previous_owner {
-            self.composer_drag = false;
+        if focus_move || self.presented_input() != previous_owner {
+            self.clear_mouse_press();
         }
         self.deliver_pending_dictation();
     }
@@ -7699,9 +7725,12 @@ impl AppModel {
                 }
                 if matches!(key.code, KeyCode::Char('c' | 'C'))
                     && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-                    && self.selection_is_visible()
                 {
-                    self.requests.push(AppRequest::CopySelection);
+                    if self.selection_is_visible() {
+                        self.requests.push(AppRequest::CopySelection);
+                    } else if self.composer_owns_input() {
+                        self.selection_key(&key);
+                    }
                     return;
                 }
                 // Text-field owners see their chords before globals. The
@@ -7715,14 +7744,24 @@ impl AppModel {
                         self.handle_ssh_form_key(key);
                         return;
                     }
-                    InputOwner::TalkSetup if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    InputOwner::TalkSetup
+                        if key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
+                    {
                         self.talk_setup_key(&key);
                         return;
                     }
                     InputOwner::CustomProviderForm
-                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        if key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
                     {
-                        self.handle_custom_card_key(key.code);
+                        if key.modifiers == KeyModifiers::CONTROL
+                            && matches!(key.code, KeyCode::Char('c' | 'C'))
+                        {
+                            self.cancel_custom_add();
+                        }
                         return;
                     }
                     InputOwner::Login
@@ -10097,6 +10136,256 @@ impl AppModel {
         }
     }
 
+    /// Stable identity for the topmost input target, independent of cadence
+    /// redraws and geometry epochs.
+    #[must_use]
+    pub fn presented_input(&self) -> PresentedInput {
+        let owner = self.input_owner();
+        let instance = match owner {
+            InputOwner::SessionMenu => Some(format!(
+                "{}:{}:{}",
+                self.projection
+                    .open_menu()
+                    .map(|menu| menu.id.to_string())
+                    .unwrap_or_default(),
+                self.projection
+                    .permission_card()
+                    .map(|card| card.request_id.as_str())
+                    .unwrap_or_default(),
+                self.menu_selection
+            )),
+            InputOwner::PlanDoc | InputOwner::FileReviewDoc => self
+                .projection
+                .open_menu()
+                .map(|menu| format!("{}:{}", menu.id, self.menu_selection)),
+            InputOwner::Composer(Screen::Session) => self
+                .projection
+                .open_menu()
+                .filter(|menu| menu.options.is_empty())
+                .map(|menu| format!("answer:{}", menu.id)),
+            InputOwner::SubagentQuestion => self.viewed_chip().map(|chip| {
+                format!(
+                    "{}:{}:{}",
+                    chip.agent,
+                    chip.question_menu()
+                        .map(|menu| menu.id.to_string())
+                        .unwrap_or_default(),
+                    self.menu_selection
+                )
+            }),
+            InputOwner::CustomProviderForm => self.custom_add.as_ref().map(|card| {
+                format!(
+                    "{}:{:?}:{:?}",
+                    card.attempt,
+                    card.focus,
+                    std::mem::discriminant(&card.phase)
+                )
+            }),
+            InputOwner::Login => self.login.as_ref().map(|card| {
+                format!(
+                    "{}:{:?}:{:?}",
+                    card.attempt,
+                    card.focus,
+                    std::mem::discriminant(&card.stage)
+                )
+            }),
+            InputOwner::TalkSetup => self
+                .talk_setup
+                .as_ref()
+                .map(|card| format!("{:?}:{:?}:{}", card.stage, card.key_stage, card.selection)),
+            InputOwner::SshForm => self
+                .ssh_form
+                .as_ref()
+                .map(|form| format!("{:?}:{}", form.original, form.focus)),
+            InputOwner::ToolDetail => self.tool_detail.as_ref().map(|view| view.item_id.clone()),
+            InputOwner::FleetMemberDetail => self.fleet.detail.as_ref().map(ToString::to_string),
+            InputOwner::Inbox => Some(format!(
+                "{}:{:?}:{}",
+                self.inbox_cursor,
+                self.inbox_rows()
+                    .get(self.inbox_cursor)
+                    .map(|row| &row.target),
+                self.projection
+                    .open_menu()
+                    .map(|menu| menu.id.to_string())
+                    .unwrap_or_default()
+            )),
+            InputOwner::SshList => Some(format!(
+                "{}:{}",
+                self.ssh_cursor,
+                self.ssh_profiles
+                    .get(self.ssh_cursor)
+                    .map(|profile| profile.name.as_str())
+                    .unwrap_or_default()
+            )),
+            InputOwner::Shells => Some(format!(
+                "{}:{}",
+                self.shells_cursor,
+                self.shells
+                    .get(self.shells_cursor)
+                    .map(|shell| shell.id.as_str())
+                    .unwrap_or_default()
+            )),
+            InputOwner::Monitors => Some(format!(
+                "{}:{}",
+                self.monitors_cursor,
+                self.monitors
+                    .get(self.monitors_cursor)
+                    .map(|monitor| monitor.monitor_id.as_str())
+                    .unwrap_or_default()
+            )),
+            InputOwner::ModelPicker => self.model_picker.as_ref().map(|picker| {
+                let row = self.model_picker_rows().get(picker.selection).cloned();
+                format!(
+                    "{}:{}:{:?}",
+                    picker.provider_stage.is_some(),
+                    picker.selection,
+                    row.map(|row| (row.provider, row.model))
+                )
+            }),
+            InputOwner::AccountsReplace => self
+                .accounts
+                .pending_replace
+                .map(|kind| format!("{kind:?}")),
+            InputOwner::ThemePicker => self
+                .theme_picker
+                .as_ref()
+                .map(|picker| picker.selection.to_string()),
+            InputOwner::EffortPicker => self.effort_picker.as_ref().map(|picker| {
+                format!(
+                    "{}:{:?}",
+                    picker.selection,
+                    self.effort_picker_rows()
+                        .get(picker.selection)
+                        .map(|row| &row.effort)
+                )
+            }),
+            InputOwner::HistoryChooser => self.backtrack.as_ref().map(|chooser| {
+                format!(
+                    "{}:{:?}",
+                    chooser.selection,
+                    self.prompt_history
+                        .get(chooser.selection)
+                        .and_then(|prompt| prompt.seq)
+                )
+            }),
+            InputOwner::SshTerminal => self
+                .ssh_terminal
+                .as_ref()
+                .map(|terminal| format!("{}:{:?}", terminal.profile, terminal.shell_id)),
+            InputOwner::Screen(Screen::Usage) => self.usage.report.as_ref().map(|report| {
+                let groups = self.usage.groups();
+                let alias = groups
+                    .get(self.usage.cursor)
+                    .and_then(|group| group.accounts.get(self.usage.selected_tab(group)))
+                    .and_then(|slot| report.accounts.get(*slot))
+                    .map(|account| account.alias.to_string())
+                    .unwrap_or_default();
+                format!("{}:{:?}:{alias}", report.generated_at_ms, self.usage.scope)
+            }),
+            InputOwner::Screen(Screen::Sessions) => Some(format!(
+                "{}:{}",
+                self.session_browser_sel,
+                self.session_browser_rows()
+                    .get(self.session_browser_sel)
+                    .map(|row| row.id.to_string())
+                    .unwrap_or_default()
+            )),
+            InputOwner::Screen(Screen::Accounts) => Some(format!(
+                "{}:{:?}:{:?}",
+                self.accounts.cursor,
+                self.accounts
+                    .rows
+                    .get(self.accounts.cursor)
+                    .map(|row| &row.alias),
+                self.accounts.pending_remove
+            )),
+            InputOwner::Screen(Screen::Providers) => Some(format!(
+                "{}:{:?}:{:?}",
+                self.providers.cursor,
+                self.providers
+                    .providers
+                    .get(self.providers.cursor)
+                    .map(|row| &row.provider),
+                self.providers.pending_remove
+            )),
+            InputOwner::Screen(Screen::Hooks) => Some(format!(
+                "{}:{:?}:{:?}",
+                self.hooks.cursor,
+                self.hooks
+                    .rows
+                    .as_ref()
+                    .and_then(|rows| rows.get(self.hooks.cursor))
+                    .map(|row| &row.digest),
+                self.hooks
+                    .confirm
+                    .as_ref()
+                    .map(|confirm| (&confirm.digest, confirm.grant))
+            )),
+            InputOwner::Screen(Screen::Fleet) => Some(format!(
+                "{}:{:?}:{:?}",
+                self.fleet.sel,
+                self.fleet_selected_agent().map(|(agent, _, _)| agent),
+                self.fleet.kill_armed
+            )),
+            _ => None,
+        };
+        PresentedInput {
+            owner,
+            surface: self.ui_generation(),
+            instance,
+        }
+    }
+
+    /// The input owner of the last completed render, which may differ from
+    /// the logical owner while a new card awaits presentation.
+    #[must_use]
+    pub fn painted_input(&self) -> Option<PresentedInput> {
+        self.painted_input.borrow().clone()
+    }
+
+    #[must_use]
+    pub(crate) fn painted_stamp(&self) -> Option<(PresentedInput, u64)> {
+        self.painted_input()
+            .map(|owner| (owner, self.painted_epoch.get()))
+    }
+
+    pub(crate) fn clear_mouse_press(&mut self) {
+        self.mouse_down = None;
+        self.mouse_press_owner = None;
+        self.mouse_press_hit = None;
+        self.mouse_press_rect = None;
+        self.mouse_press_epoch = None;
+        self.composer_drag = false;
+        if let Some(selection) = &mut self.selection {
+            selection.dragging = false;
+        }
+    }
+
+    pub(crate) fn retire_stale_press(&mut self) {
+        if self
+            .mouse_press_owner
+            .as_ref()
+            .is_some_and(|owner| owner != &self.presented_input())
+            || self
+                .mouse_press_epoch
+                .is_some_and(|epoch| epoch != self.painted_epoch.get())
+            || (self.composer_drag && !self.composer_owns_input())
+        {
+            self.clear_mouse_press();
+        }
+    }
+
+    pub(crate) fn record_painted_input(&self) {
+        let next = self.presented_input();
+        let mut painted = self.painted_input.borrow_mut();
+        if painted.as_ref() != Some(&next) {
+            self.painted_epoch
+                .set(self.painted_epoch.get().wrapping_add(1));
+        }
+        *painted = Some(next);
+    }
+
     /// Whether the visible Session answer line accepts an external edit.
     /// A future card that shares the answer line extends this predicate.
     #[must_use]
@@ -11657,6 +11946,18 @@ impl AppModel {
     /// Keyboard while the setup card owns the band.
     pub fn talk_setup_key(&mut self, key: &KeyEvent) {
         use crate::talk::{KeyStage, SetupStage};
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            if key.modifiers == KeyModifiers::CONTROL
+                && matches!(key.code, KeyCode::Char('c' | 'C'))
+            {
+                self.talk_setup = None;
+                self.flash = Some("· /talk setup closed".to_owned());
+            }
+            return;
+        }
         enum Action {
             None,
             Activate,
@@ -17632,6 +17933,9 @@ impl AppModel {
             terminal.shell_id = Some(shell.id);
             self.flash = Some("· remote terminal connected · ⌃] close".into());
             self.dirty = true;
+        } else {
+            // The user closed the connecting pane before the open reply.
+            self.requests.push(AppRequest::ShellClose { id: shell.id });
         }
     }
 
@@ -17668,6 +17972,22 @@ impl AppModel {
     }
 
     fn handle_ssh_terminal_key(&mut self, key: KeyEvent) {
+        let close = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(
+                key.code,
+                KeyCode::Char(']' | '5') | KeyCode::Char('\u{001d}')
+            );
+        if close
+            && self
+                .ssh_terminal
+                .as_ref()
+                .is_some_and(|pane| pane.shell_id.is_none())
+        {
+            self.ssh_terminal = None;
+            self.flash = Some("· remote terminal connection cancelled".into());
+            self.dirty = true;
+            return;
+        }
         let Some(id) = self
             .ssh_terminal
             .as_ref()
@@ -17675,7 +17995,7 @@ impl AppModel {
         else {
             return;
         };
-        if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if close {
             self.requests.push(AppRequest::ShellClose { id });
             self.flash = Some("· closing remote terminal…".into());
             return;
@@ -20176,13 +20496,22 @@ impl AppModel {
             // U2: a click on an account tab chip selects exactly the
             // account the rect was rendered for (value-carrying) and moves
             // the cursor to its group.
-            Hit::UsageAccountTab { provider, index } if self.screen == Screen::Usage => {
+            Hit::UsageAccountTab {
+                provider,
+                index,
+                alias,
+            } if self.screen == Screen::Usage => {
                 let groups = self.usage.groups();
                 let Some(position) = groups.iter().position(|group| group.provider == provider)
                 else {
                     return;
                 };
-                if index < groups[position].accounts.len() {
+                if groups[position]
+                    .accounts
+                    .get(index)
+                    .and_then(|slot| self.usage.report.as_ref()?.accounts.get(*slot))
+                    .is_some_and(|account| account.alias == alias)
+                {
                     self.usage.cursor = position;
                     self.usage.tabs.insert(provider, index);
                     self.dirty = true;

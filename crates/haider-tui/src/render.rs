@@ -1288,8 +1288,9 @@ fn image_reveal_hits(
 /// Workspace version shown on boot/launcher (single source: the crate).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Render the whole frame for the current screen. Returns the frame's
-/// clickable regions (hit map) for the runtime's mouse dispatch.
+/// Render the whole frame for the current screen. Returns only clickable
+/// regions. The model also records the painted input owner, just as it
+/// records render geometry for subsequent input dispatch.
 pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     // TUI6.1 fix 1: every frame advances the geometry epoch and stamps
     // its composer hits with the NEW value — only hits from the LATEST
@@ -1437,6 +1438,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             && rect.x.saturating_add(rect.width) <= area.x.saturating_add(area.width)
             && rect.y.saturating_add(rect.height) <= area.y.saturating_add(area.height)
     });
+    model.record_painted_input();
     hits
 }
 
@@ -5593,6 +5595,7 @@ fn render_usage(
                     Hit::UsageAccountTab {
                         provider: group.provider.clone(),
                         index: position,
+                        alias: entry.alias.clone(),
                     },
                 ));
                 spans.push(Span::styled(

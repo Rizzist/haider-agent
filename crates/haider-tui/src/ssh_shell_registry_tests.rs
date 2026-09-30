@@ -294,6 +294,29 @@ fn opening_ssh_terminal_swallows_paste_until_the_channel_id_arrives() {
 }
 
 #[test]
+fn ctrl_bracket_closes_a_connecting_terminal_and_retires_its_late_shell() {
+    let mut model = live_session();
+    model.ssh_terminal = Some(SshTerminalPane::opening(
+        "prod".into(),
+        model.ssh_terminal_size,
+    ));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('5'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(model.ssh_terminal.is_none());
+    model.apply_ssh_shell_opened(shell(
+        "late-shell",
+        haider_rpc::ShellKindWire::Ssh {
+            profile: "prod".into(),
+        },
+    ));
+    assert!(
+        matches!(model.requests.last(), Some(AppRequest::ShellClose { id }) if id == "late-shell")
+    );
+}
+
+#[test]
 fn ssh_terminal_splits_large_paste_at_the_wire_input_bound() {
     let mut model = live_session();
     let mut terminal = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);

@@ -2017,17 +2017,51 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
     assert_eq!(accounts_model.screen, Screen::Accounts);
     assert!(accounts_model.login.is_none());
     for mode in ["talk-setup", "custom-form"] {
-        for code in ['c', 't'] {
+        for code in ['c', 't', 'u'] {
             let mut card_model = model();
             arm(&mut card_model, mode);
             let theme = card_model.theme_choice;
             let screen = card_model.screen;
+            let before = card_model.custom_add.as_ref().map(|card| {
+                (
+                    card.name.clone(),
+                    card.origin.clone(),
+                    card.masked_key_len(),
+                )
+            });
+            let talk_before = card_model
+                .talk_setup
+                .as_ref()
+                .map(|card| card.language.clone());
             key(&mut card_model, KeyCode::Char(code), KeyModifiers::CONTROL);
-            assert_eq!(
-                card_model.input_owner(),
-                expected_owner(mode),
-                "{mode} Ctrl+{code}"
-            );
+            if code == 'c' {
+                assert_ne!(
+                    card_model.input_owner(),
+                    expected_owner(mode),
+                    "{mode} Ctrl+C closes"
+                );
+            } else {
+                assert_eq!(
+                    card_model.input_owner(),
+                    expected_owner(mode),
+                    "{mode} Ctrl+{code}"
+                );
+                assert_eq!(
+                    card_model.custom_add.as_ref().map(|card| (
+                        card.name.clone(),
+                        card.origin.clone(),
+                        card.masked_key_len()
+                    )),
+                    before
+                );
+                assert_eq!(
+                    card_model
+                        .talk_setup
+                        .as_ref()
+                        .map(|card| card.language.clone()),
+                    talk_before
+                );
+            }
             assert_eq!(card_model.screen, screen, "{mode} Ctrl+{code}");
             assert_eq!(card_model.theme_choice, theme, "{mode} Ctrl+{code}");
         }
@@ -2259,9 +2293,10 @@ fn i_pairwise_overlay_precedence_paints_the_owner_above_every_lower_owner() {
                 "{higher} over {lower_name}"
             );
             let mut terminal = Terminal::new(TestBackend::new(118, 36)).unwrap();
+            let mut hits = Vec::new();
             terminal
                 .draw(|frame| {
-                    let _ = haider_tui::render::render(&model, frame);
+                    hits = haider_tui::render::render(&model, frame);
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();
@@ -2275,9 +2310,35 @@ fn i_pairwise_overlay_precedence_paints_the_owner_above_every_lower_owner() {
                 painted.contains(marker),
                 "{higher} over {lower_name}: missing painted owner {marker:?}"
             );
-            if lower_name == "history" && higher == "permission" {
-                assert!(!painted.contains("↑↓ / digits choose"));
-            }
+            // Several owners (including the shell list and lockdown) paint
+            // only part of the frame. A lower surface may remain visible;
+            // the owner marker and the input assertions below establish the
+            // actual paint/input precedence for every pair.
+            let draft = model.composer.text().to_owned();
+            dispatch_input(
+                &mut model,
+                &hits,
+                Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            );
+            let expected_after_key = if higher == "lockdown" {
+                expected_owner(lower_name)
+            } else {
+                expected_owner(higher)
+            };
+            assert_eq!(
+                model.input_owner(),
+                expected_after_key,
+                "{higher} over {lower_name}: key reached an unexpected owner"
+            );
+            assert_eq!(
+                model.composer.text(),
+                draft,
+                "{higher} over {lower_name}: key reached lower composer"
+            );
+            assert!(
+                model.outbox.is_empty(),
+                "{higher} over {lower_name}: key answered lower card"
+            );
         }
     }
 }

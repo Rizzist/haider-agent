@@ -8,6 +8,102 @@ use haider_protocol::ids::{DeviceId, EventId, ItemId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_rpc::AttachmentId;
 
+#[test]
+fn input_stamp_uses_the_frame_completed_before_event_ingress() {
+    let owner = AppModel::new().presented_input();
+    let before = Instant::now();
+    let paint_done = before + Duration::from_millis(10);
+    let state = Mutex::new(Some(((owner.clone(), 7), paint_done)));
+    assert_eq!(input_stamp(&state, before), None);
+    assert_eq!(input_stamp(&state, paint_done), Some((owner, 7)));
+}
+
+#[test]
+fn queued_input_requires_a_painted_owner_and_retires_stale_mouse_press() {
+    let mut model = AppModel::new();
+    let boot = model.presented_input();
+    assert!(!dispatch_queued_input(
+        &mut model,
+        &[],
+        QueuedInput {
+            event: Event::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )),
+            presented: None,
+        },
+    ));
+    model.screen = crate::app::Screen::Session;
+    model.record_painted_input();
+    model.mouse_down = Some((1, 1));
+    assert!(!dispatch_queued_input(
+        &mut model,
+        &[],
+        QueuedInput {
+            event: Event::Mouse(ratatui::crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            presented: Some((boot, 0)),
+        },
+    ));
+    assert!(model.mouse_down.is_none());
+}
+
+#[test]
+fn owner_change_requests_a_frame_without_waiting_for_the_cadence_tick() {
+    let mut model = AppModel::new();
+    let initial_screen = model.screen;
+    model.record_painted_input();
+    assert!(!owner_needs_presentation(&model));
+    model.screen = if initial_screen == crate::app::Screen::Session {
+        crate::app::Screen::Launcher
+    } else {
+        crate::app::Screen::Session
+    };
+    assert!(owner_needs_presentation(&model));
+    model.record_painted_input();
+    assert!(!owner_needs_presentation(&model));
+}
+
+#[test]
+fn paint_generation_changes_on_owner_transition_but_not_a_same_owner_redraw() {
+    let mut model = AppModel::new();
+    let initial_screen = model.screen;
+    model.record_painted_input();
+    let boot = model.painted_stamp().expect("boot painted");
+    model.record_painted_input();
+    assert_eq!(model.painted_stamp(), Some(boot.clone()));
+    model.screen = if initial_screen == crate::app::Screen::Session {
+        crate::app::Screen::Launcher
+    } else {
+        crate::app::Screen::Session
+    };
+    model.record_painted_input();
+    assert_ne!(
+        model.painted_stamp().expect("other owner painted").1,
+        boot.1
+    );
+    model.screen = initial_screen;
+    model.record_painted_input();
+    let reopened = model.painted_stamp().expect("original owner repainted");
+    assert_eq!(reopened.0, boot.0);
+    assert_ne!(reopened.1, boot.1);
+    assert!(!dispatch_queued_input(
+        &mut model,
+        &[],
+        QueuedInput {
+            event: Event::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )),
+            presented: Some(boot),
+        },
+    ));
+}
+
 fn payload_envelope(
     session: &SessionId,
     run: &RunId,
