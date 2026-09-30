@@ -397,6 +397,9 @@ pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
 /// display identity plus its resolved model/provider pair. Every field is
 /// absence-preserving; clients must not infer coordinates when it is absent.
 pub const FEATURE_SESSION_FLEET_IDENTITY_V1: &str = "session_fleet_identity_v1";
+/// Activity fields and provider-transport effects are sent only to clients
+/// that explicitly request this token in Hello and receive it in Welcome.
+pub const FEATURE_SESSION_ACTIVITY_V1: &str = "session_activity_v1";
 /// Daemon implements the reconnectable, per-child-cursor descendant stream.
 pub const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
@@ -799,6 +802,10 @@ pub struct Hello {
     /// never invents a capability the client did not ask for.
     #[serde(default)]
     pub capabilities_requested: CapabilitySet,
+    /// Optional additive feature opt-ins. Old daemons ignore this field;
+    /// unlike an unknown Capability enum value it cannot reject the Hello.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub features_requested: BTreeSet<String>,
     /// Largest encoded body this client can receive.
     ///
     /// The daemon must not send a frame larger than the smaller of this value

@@ -42,6 +42,8 @@ pub struct WorkspaceMutation {
 pub enum EffectClass {
     /// Daemon/provider transport bookkeeping; never agent activity.
     ProviderTransport,
+    /// Operator checkpoint restore (undo, redo, rollback), not agent editing.
+    CheckpointRestore,
     FsRead,
     FsWrite,
     ProcessExec,

@@ -481,7 +481,7 @@ fn checkpoint_effect_envelopes(
     let payloads = vec![
         EventPayload::Effect(EffectPhase::Intent(EffectIntent {
             effect: effect_id.clone(),
-            class: EffectClass::FsWrite,
+            class: EffectClass::CheckpointRestore,
             summary: format!("{} workspace checkpoint", checkpoint.origin.as_str()),
             args_digest,
             workspace_revision: None,
@@ -3678,6 +3678,7 @@ async fn effect_probe_observation(
         // new authority class cannot inherit probe semantics accidentally.
         EffectClass::ProcessExec
         | EffectClass::ProviderTransport
+        | EffectClass::CheckpointRestore
         | EffectClass::RemoteExecution
         | EffectClass::GitOp
         | EffectClass::PeerMessage

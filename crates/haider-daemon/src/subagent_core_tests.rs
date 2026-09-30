@@ -3402,6 +3402,7 @@ impl UdsControlClient {
                     Capability::View,
                     Capability::Control,
                 ]),
+                features_requested: Default::default(),
                 max_receive_frame: u32::try_from(haider_rpc::DEFAULT_FRAME_LIMIT)
                     .expect("test frame limit fits u32"),
                 encodings: Vec::new(),

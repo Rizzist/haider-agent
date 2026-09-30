@@ -62,7 +62,7 @@ use haider_rpc::{
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_REQUEST_BUDGET_V1,
     FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1, FEATURE_RESIDENT_SESSION_BINDING_V1,
     FEATURE_RESIDENT_TURN_SUBMIT_V1, FEATURE_RUN_BUDGET_V1, FEATURE_RUN_RETRY_V1,
-    FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_DESCENDANT_STREAM_V1,
+    FEATURE_SESSION_ACTIVITY_V1, FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_DESCENDANT_STREAM_V1,
     FEATURE_SESSION_FLEET_IDENTITY_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1,
     FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_PROMPT_FORK_V1,
@@ -928,24 +928,47 @@ struct ConnectionFrameSink {
     outbound_limit: usize,
     encoding: WireEncoding,
     fleet_identity: bool,
+    activity: bool,
 }
 
 impl ConnectionFrameSink {
     fn encode(&self, frame: &WireFrame) -> Result<OutboundBytes, DaemonError> {
-        if self.fleet_identity {
+        if self.fleet_identity && self.activity {
             return encode_outbound_parts(frame, self.outbound_limit, self.encoding);
         }
 
         let mut legacy_frame = frame.clone();
-        omit_fleet_identity(&mut legacy_frame);
+        omit_activity(&mut legacy_frame);
+        if !self.fleet_identity {
+            omit_fleet_identity(&mut legacy_frame);
+        }
         encode_outbound_parts(&legacy_frame, self.outbound_limit, self.encoding)
     }
 }
 
-/// Preserve the pre-X1 payload for a peer whose tight Welcome could not
-/// advertise `session_fleet_identity_v1`. Callsigns predate this token; only
-/// the two newly gated fields are omitted.
+/// Remove only the X1 model/provider identity. The separate activity pass
+/// handles the newer token even when a peer already has fleet identity.
 fn omit_fleet_identity(frame: &mut WireFrame) {
+    match frame {
+        WireFrame::Response {
+            body: ResponseBody::SessionFleet { snapshot },
+            ..
+        } => omit_fleet_node_identity(&mut snapshot.roots),
+        WireFrame::Response {
+            body: ResponseBody::SessionDescendantsAttach { baseline, .. },
+            ..
+        } => omit_descendant_node_identity(&mut baseline.roots),
+        WireFrame::SessionDescendantStream {
+            event: haider_rpc::SessionDescendantStreamEventWire::Delta { child, .. },
+            ..
+        } => omit_descendant_node_identity(std::slice::from_mut(child)),
+        _ => {}
+    }
+}
+
+/// Strip activity independently of fleet identity. Released clients already
+/// understand identity but have no activity opt-in or ProviderTransport enum.
+fn omit_activity(frame: &mut WireFrame) {
     match frame {
         WireFrame::Event { envelope, .. }
         | WireFrame::SessionDescendantStream {
@@ -963,17 +986,8 @@ fn omit_fleet_identity(frame: &mut WireFrame) {
         WireFrame::Response {
             body: ResponseBody::SessionFleet { snapshot },
             ..
-        } => omit_fleet_node_identity(&mut snapshot.roots),
-        WireFrame::Response {
-            body: ResponseBody::SessionDescendantsAttach { baseline, .. },
-            ..
-        } => omit_descendant_node_identity(&mut baseline.roots),
-        WireFrame::SessionDescendantStream {
-            event: haider_rpc::SessionDescendantStreamEventWire::Delta { child, .. },
-            ..
-        } => omit_descendant_node_identity(std::slice::from_mut(child)),
-        // 973-activity-icons: `AgentMetricsSnapshot.activity` postdates X1
-        // as well; every frame that carries agent metrics drops it.
+        } => omit_fleet_node_activity(&mut snapshot.roots),
+        // Every frame that carries agent metrics drops activity.
         WireFrame::Response {
             body: ResponseBody::SessionList { sessions, .. },
             ..
@@ -1034,25 +1048,38 @@ fn omit_event_activity(envelope: &mut haider_protocol::envelope::RawEnvelope) {
             if payload.get("phase").and_then(serde_json::Value::as_str) == Some("intent") =>
         {
             // Recovery used a Network effect before this lane. Keep the
-            // historical bytes for a peer without the fleet capability.
+            // historical bytes for peers without the activity capability.
             if let Some(class) = payload
                 .get_mut("class")
                 .and_then(serde_json::Value::as_object_mut)
-                && class.get("class").and_then(serde_json::Value::as_str)
-                    == Some("provider_transport")
             {
-                *class = [
-                    (
-                        "class".to_owned(),
-                        serde_json::Value::String("network".into()),
-                    ),
-                    (
-                        "host".to_owned(),
-                        serde_json::Value::String("provider-request".into()),
-                    ),
-                ]
-                .into_iter()
-                .collect();
+                let class_name = class
+                    .get("class")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                match class_name.as_deref() {
+                    Some("provider_transport") => {
+                        *class = [
+                            (
+                                "class".to_owned(),
+                                serde_json::Value::String("network".into()),
+                            ),
+                            (
+                                "host".to_owned(),
+                                serde_json::Value::String("provider-request".into()),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect();
+                    }
+                    Some("checkpoint_restore") => {
+                        class.insert(
+                            "class".to_owned(),
+                            serde_json::Value::String("fs_write".into()),
+                        );
+                    }
+                    _ => {}
+                }
             }
         }
         _ => {}
@@ -1069,12 +1096,16 @@ fn omit_fleet_node_identity(nodes: &mut [haider_rpc::FleetNodeWire]) {
     for node in nodes {
         node.model = None;
         node.provider = None;
-        // 973-activity-icons fields postdate X1 too: a tight legacy peer
-        // keeps its exact pre-X1 payload.
+        omit_fleet_node_identity(&mut node.children);
+    }
+}
+
+fn omit_fleet_node_activity(nodes: &mut [haider_rpc::FleetNodeWire]) {
+    for node in nodes {
         node.activity = None;
         node.activities.clear();
         omit_metrics_activity(node.metrics.as_mut());
-        omit_fleet_node_identity(&mut node.children);
+        omit_fleet_node_activity(&mut node.children);
     }
 }
 
@@ -1221,7 +1252,7 @@ impl FrameSink for ConnectionFrameSink {
         envelope: &haider_protocol::envelope::RawEnvelope,
     ) -> Result<PreparedFrame, FrameSendError> {
         let mut legacy_envelope;
-        let envelope = if self.fleet_identity {
+        let envelope = if self.activity && self.fleet_identity {
             envelope
         } else {
             legacy_envelope = envelope.clone();
@@ -2047,6 +2078,7 @@ async fn handle_frame(
                 outbound_limit: *outbound_limit,
                 encoding: *encoding,
                 fleet_identity: granted.features.contains(FEATURE_SESSION_FLEET_IDENTITY_V1),
+                activity: granted.features.contains(FEATURE_SESSION_ACTIVITY_V1),
             });
             *hub_connection = Some(
                 context
@@ -2283,9 +2315,13 @@ fn negotiate_hello(
     let encoded_welcome = if lifecycle_phase == LifecyclePhase::Ready
         && negotiated.capabilities_granted == server_range.capabilities
         && negotiated.encoding.is_none()
+        && !hello
+            .features_requested
+            .contains(FEATURE_SESSION_ACTIVITY_V1)
     {
         cached_standard_welcome(context, negotiated.protocol, frame_limit, outbound_limit)?
     } else {
+        let features = welcome_features_for(&hello);
         let welcome = Welcome {
             protocol: negotiated.protocol,
             instance_id: context.instance_id.clone(),
@@ -2295,7 +2331,7 @@ fn negotiate_hello(
             daemon_version: env!("CARGO_PKG_VERSION").into(),
             lifecycle_phase,
             capabilities_granted: negotiated.capabilities_granted.clone(),
-            features: welcome_features(),
+            features,
             user_command_withheld: false,
             encoding: negotiated.encoding.clone(),
         };
@@ -2402,6 +2438,17 @@ fn cached_standard_welcome(
             message: format!("outbound frame rejected by peer limit: {error}"),
         }),
     }
+}
+
+fn welcome_features_for(hello: &Hello) -> BTreeSet<String> {
+    let mut features = welcome_features();
+    if hello
+        .features_requested
+        .contains(FEATURE_SESSION_ACTIVITY_V1)
+    {
+        features.insert(FEATURE_SESSION_ACTIVITY_V1.to_owned());
+    }
+    features
 }
 
 fn welcome_features() -> BTreeSet<String> {
@@ -2551,6 +2598,8 @@ fn encode_welcome_for_peer(
                     features: welcome.features,
                 });
             }
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(FEATURE_SESSION_ACTIVITY_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(haider_rpc::FEATURE_AGENT_CLI_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })

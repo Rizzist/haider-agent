@@ -211,7 +211,7 @@ impl ActivityKind {
     #[must_use]
     pub fn for_effect(class: &EffectClass) -> Option<Self> {
         Some(match class {
-            EffectClass::ProviderTransport => return None,
+            EffectClass::ProviderTransport | EffectClass::CheckpointRestore => return None,
             EffectClass::GuiAct | EffectClass::ScreenObserve | EffectClass::ScreenControl => {
                 Self::Computer
             }
@@ -237,7 +237,9 @@ impl ActivityKind {
     pub fn for_item(item: &TurnItem) -> Option<Self> {
         match item {
             TurnItem::ToolCall { activity, .. } => *activity,
-            TurnItem::CommandExecution { .. } => Some(Self::Run),
+            // CommandExecution is an operator shell command, including replay
+            // of old journals. Agent process tools have typed ToolCall rows.
+            TurnItem::CommandExecution { .. } => None,
             TurnItem::FileChange { .. } => Some(Self::Edit),
             TurnItem::ChildSpawn { .. } => Some(Self::Orchestrate),
             _ => None,
@@ -382,6 +384,16 @@ pub struct ActivityTracker {
     latest: Option<(ActivityKind, u64)>,
     /// The run reached a terminal state (cleared by a later non-terminal run).
     terminal: bool,
+    /// Pre-973 checkpoint commands wrote an FsWrite effect before the typed
+    /// CheckpointRecorded fact in the same transaction. Keep one bounded
+    /// pre-effect state so replay can remove only that operator action.
+    legacy_checkpoint: Option<(
+        String,
+        String,
+        Option<u64>,
+        Option<(ActivityKind, u64)>,
+        bool,
+    )>,
 }
 
 impl ActivityTracker {
@@ -465,7 +477,13 @@ impl ActivityTracker {
                 }
             }
             EffectPhase::Authorized { effect, verdict } => {
-                if matches!(verdict, AuthorizationVerdict::Deny { .. }) {
+                if matches!(
+                    verdict,
+                    AuthorizationVerdict::Deny { .. }
+                        | AuthorizationVerdict::PreAuthorized {
+                            source: crate::effect::AuthorizationSource::UserTyped
+                        }
+                ) {
                     self.pending.retain(|(held, _)| held != effect.as_str());
                 }
             }
@@ -528,8 +546,62 @@ impl ActivityTracker {
             .payload
             .get("type")
             .and_then(serde_json::Value::as_str);
+        if kind == Some("checkpoint_recorded") {
+            if let Ok(EventPayload::CheckpointRecorded(checkpoint)) =
+                envelope.payload.decode_event()
+                && matches!(
+                    checkpoint.origin,
+                    crate::checkpoint::CheckpointOrigin::Undo
+                        | crate::checkpoint::CheckpointOrigin::Redo
+                        | crate::checkpoint::CheckpointOrigin::RollbackTurn
+                )
+                && self
+                    .legacy_checkpoint
+                    .as_ref()
+                    .is_some_and(|(run, effect, _, _, _)| {
+                        envelope
+                            .run_id
+                            .as_ref()
+                            .is_some_and(|id| id.as_str() == run)
+                            && checkpoint.effect_id.as_str() == effect
+                    })
+                && let Some((_, _, edit_touch, latest, terminal)) = self.legacy_checkpoint.take()
+            {
+                self.last_touch[usize::from(ActivityKind::Edit.rank())] = edit_touch;
+                self.latest = latest;
+                self.terminal = terminal;
+            }
+            return;
+        }
         if !matches!(kind, Some("item" | "run_state" | "effect")) {
             return;
+        }
+        if kind == Some("effect")
+            && envelope.agent_id.is_none()
+            && envelope
+                .payload
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                == Some("intent")
+            && envelope
+                .payload
+                .get("class")
+                .and_then(|class| class.get("class"))
+                .and_then(serde_json::Value::as_str)
+                == Some("fs_write")
+            && let Some(run) = envelope.run_id.as_ref()
+            && let Some(effect) = envelope
+                .payload
+                .get("effect")
+                .and_then(serde_json::Value::as_str)
+        {
+            self.legacy_checkpoint = Some((
+                run.as_str().to_owned(),
+                effect.to_owned(),
+                self.last_touch[usize::from(ActivityKind::Edit.rank())],
+                self.latest,
+                self.terminal,
+            ));
         }
         if kind == Some("item") {
             let item_kind = envelope

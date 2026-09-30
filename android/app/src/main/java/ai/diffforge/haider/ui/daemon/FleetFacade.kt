@@ -437,7 +437,8 @@ object FleetRpcAdapter {
         // not a daemon claim — it stays unknown with no raw word.
         state = FleetStateView.of(node.stringOrNull("state")),
         metrics = node.optJSONObject("metrics")?.let(::parseMetrics),
-        // 973-activity-icons: both fields are skipped when empty/absent.
+        // Without a granted session_activity_v1 token the daemon omits these
+        // fields. Absence stays null/empty, so older daemons render no icon.
         activity = FleetActivity.of(node.stringOrNull("activity")),
         activities = node.optJSONArray("activities")?.let { array ->
             (0 until array.length()).mapNotNull { FleetActivity.of(array.optString(it, "")) }

@@ -149,6 +149,7 @@ pub fn transcript() -> Vec<WireFrame> {
             client_instance_id: "client-instance-1".into(),
             client_kind: ClientKind::Gui,
             capabilities_requested: capabilities([Capability::View, Capability::Control]),
+            features_requested: Default::default(),
             max_receive_frame: TEST_FRAME_LIMIT as u32,
             encodings: Vec::new(),
         }),

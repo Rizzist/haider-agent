@@ -25,6 +25,35 @@ use support::{ExpectedItem, read_json, reanchor_events};
 const FIXTURE_DIR: &str = "tests/fixtures/anthropic";
 
 #[test]
+fn anthropic_server_tool_activity_uses_exact_closed_web_names() {
+    use haider_protocol::activity::ActivityKind;
+    for (name, expected) in [
+        ("web_search", Some(ActivityKind::Web)),
+        ("web_fetch", Some(ActivityKind::Web)),
+        ("code_execution", None),
+        ("computer", None),
+        ("bash", None),
+        ("text_editor", None),
+        ("unknown", None),
+        ("Web_Search", None),
+        (" web_search", None),
+        ("web_fetch ", None),
+        ("", None),
+    ] {
+        let name_json = serde_json::to_string(name).expect("name JSON");
+        let sse = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"content\":[],\"usage\":{{\"input_tokens\":1}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"server_tool_use\",\"id\":\"srv-1\",\"name\":{name_json},\"input\":{{}}}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let events = replay_anthropic_sse(sse.as_bytes());
+        let actual = events.into_iter().find_map(|event| match event {
+            Ok(StreamEvent::ServerToolUse { activity, .. }) => Some(activity),
+            _ => None,
+        });
+        assert_eq!(actual, Some(expected), "server tool {name:?}");
+    }
+}
+
+#[test]
 fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {
     let directory = fixture_directory();
     let manifest_bytes = fs::read(directory.join("manifest.json")).expect("manifest bytes");

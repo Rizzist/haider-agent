@@ -20998,6 +20998,54 @@ async fn recover_orchestration_child(
     }
 }
 
+fn live_activity_for_route(
+    name: &str,
+    lockdown_allowed: Option<&[String]>,
+    has_web_search: bool,
+) -> Option<haider_protocol::activity::ActivityKind> {
+    if lockdown_allowed.is_some_and(|allowed| !allowed.iter().any(|tool| tool == name)) {
+        return None;
+    }
+    if name == "web_search" && !has_web_search {
+        return None;
+    }
+    match registered_tool_route(name)? {
+        RegisteredToolRoute::WebSearch => Some(haider_protocol::activity::ActivityKind::Web),
+        RegisteredToolRoute::SessionTranscript
+        | RegisteredToolRoute::ListModels
+        | RegisteredToolRoute::PeerList => Some(haider_protocol::activity::ActivityKind::Read),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn live_activity_respects_lockdown_and_backend_availability() {
+    use haider_protocol::activity::ActivityKind;
+    let allowed = vec!["web_search".to_owned(), "peer_list".to_owned()];
+    let denied = vec!["peer_list".to_owned()];
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&denied), true),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), false),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), true),
+        Some(ActivityKind::Web)
+    );
+    assert_eq!(
+        live_activity_for_route("peer_list", Some(&allowed), false),
+        Some(ActivityKind::Read)
+    );
+    assert_eq!(
+        live_activity_for_route("unknown", Some(&allowed), true),
+        None
+    );
+}
+
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
     fn activity_for_route(&self, name: &str) -> Option<haider_protocol::activity::ActivityKind> {
@@ -21007,23 +21055,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
         &self,
         name: &str,
     ) -> Option<haider_protocol::activity::ActivityKind> {
-        if self
-            .lockdown
-            .as_ref()
-            .is_some_and(|lockdown| !lockdown.tools_allowed.iter().any(|allowed| allowed == name))
-        {
-            return None;
-        }
-        if name == "web_search" && self.web_search.is_none() {
-            return None;
-        }
-        match registered_tool_route(name)? {
-            RegisteredToolRoute::WebSearch => Some(haider_protocol::activity::ActivityKind::Web),
-            RegisteredToolRoute::SessionTranscript
-            | RegisteredToolRoute::ListModels
-            | RegisteredToolRoute::PeerList => Some(haider_protocol::activity::ActivityKind::Read),
-            _ => None,
-        }
+        live_activity_for_route(
+            name,
+            self.lockdown
+                .as_ref()
+                .map(|lockdown| lockdown.tools_allowed.as_slice()),
+            self.web_search.is_some(),
+        )
     }
     fn platform_tool_supported(&self, name: &str) -> bool {
         !crate::android_policy::enabled() || registered_tool_route(name).is_some()

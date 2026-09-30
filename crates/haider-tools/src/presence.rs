@@ -443,7 +443,14 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         } else if self.labels.get(&surface) == Some(&label) {
             self.pending_labels.remove(&surface);
         } else {
-            self.pending_labels.insert(surface, (label, now));
+            if self
+                .pending_labels
+                .get(&surface)
+                .map(|(pending, _)| pending)
+                != Some(&label)
+            {
+                self.pending_labels.insert(surface, (label, now));
+            }
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1).max(1);

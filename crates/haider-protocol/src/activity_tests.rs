@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::*;
-use crate::effect::{AuthorizationVerdict, EffectIntent, EffectOutcome};
+use crate::effect::{AuthorizationSource, AuthorizationVerdict, EffectIntent, EffectOutcome};
 use crate::ids::EffectId;
 use crate::ids::{AgentId, ItemId};
 use crate::item::ToolStatus;
@@ -613,6 +613,290 @@ fn gate_v4_provider_transport_recovery_has_no_agent_activity() {
     }
     assert_eq!(tracker.current(5_000, false), None);
     assert!(tracker.used().is_empty());
+}
+
+#[test]
+fn operator_shell_is_never_agent_activity_even_after_replay() {
+    use crate::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use crate::ids::{DeviceId, EventId, SessionId};
+    let item = TurnItem::CommandExecution {
+        call_id: "user-shell".into(),
+        command: "cargo test".into(),
+        status: ToolStatus::Completed,
+        exit_code: Some(0),
+    };
+    let event = EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("user-shell"),
+        item,
+    });
+    let mut tracker = ActivityTracker::new();
+    tracker.observe(&event, 1_000);
+    assert!(tracker.used().is_empty());
+    assert_eq!(tracker.current(1_000, false), None);
+    // Both child targeting modes have the same old journal item shape:
+    // the shell can be addressed through the child session or its agent id.
+    for agent_id in [None, Some(AgentId::new("child-agent"))] {
+        let raw = EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("old-shell"),
+            seq: 1,
+            session_id: SessionId::new("child-session"),
+            branch_id: None,
+            run_id: None,
+            agent_id,
+            device_id: DeviceId::new("device"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1_000,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(&event).expect("old item").into(),
+        };
+        let mut replay = ActivityTracker::new();
+        replay.observe_raw(&raw);
+        assert!(replay.used().is_empty());
+        assert_eq!(replay.current(1_000, false), None);
+    }
+    for (index, name) in ["process_exec", "test_run", "tool_script"]
+        .into_iter()
+        .enumerate()
+    {
+        let agent = TurnItem::ToolCall {
+            call_id: format!("agent-{name}"),
+            name: name.into(),
+            args: serde_json::Value::Null,
+            status: ToolStatus::Completed,
+            activity: Some(ActivityKind::Run),
+        };
+        tracker.observe(
+            &EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!("agent-{name}")),
+                item: agent,
+            }),
+            1_001 + index as u64,
+        );
+    }
+    assert_eq!(tracker.used(), vec![ActivityKind::Run]);
+}
+
+#[test]
+fn user_typed_process_effect_never_opens_activity_live_or_on_replay() {
+    use crate::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use crate::ids::{DeviceId, EventId, RunId, SessionId};
+    let phases = [
+        intent("shell", "process_exec"),
+        authorized(
+            "shell",
+            AuthorizationVerdict::PreAuthorized {
+                source: AuthorizationSource::UserTyped,
+            },
+        ),
+        dispatched("shell"),
+        EventPayload::Effect(EffectPhase::Outcome {
+            effect: EffectId::new("effect-shell"),
+            outcome: EffectOutcome::Ok,
+            freshness: None,
+            workspace_mutation: None,
+        }),
+    ];
+    for agent_id in [None, Some(AgentId::new("child-agent"))] {
+        let mut live = ActivityTracker::new();
+        let mut replay = ActivityTracker::new();
+        for (index, phase) in phases.iter().enumerate() {
+            let at_ms = 1_000 + index as u64;
+            live.observe(phase, at_ms);
+            let raw = EventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: EventId::new(format!("old-shell-effect-{index}")),
+                seq: index as u64 + 1,
+                session_id: SessionId::new("child-session"),
+                branch_id: None,
+                run_id: Some(RunId::new("shell-run")),
+                agent_id: agent_id.clone(),
+                device_id: DeviceId::new("device"),
+                authority_epoch: 0,
+                worker_generation: 1,
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: at_ms,
+                render: RenderTargets {
+                    ui: false,
+                    durable: true,
+                    prompt: PromptRender::Omit,
+                },
+                payload: serde_json::to_value(phase)
+                    .expect("old journal phase")
+                    .into(),
+            };
+            replay.observe_raw(&raw);
+            assert_eq!(live.current(at_ms, false), None);
+            assert_eq!(replay.current(at_ms, false), None);
+            assert!(live.used().is_empty());
+            assert!(replay.used().is_empty());
+        }
+    }
+    let mut agent_tool = ActivityTracker::new();
+    start(&mut agent_tool, "agent", "process_exec", 2_000);
+    assert_eq!(agent_tool.current(2_000, false), Some(ActivityKind::Run));
+    finish(&mut agent_tool, "agent", "process_exec", 2_001);
+    assert_eq!(agent_tool.used(), vec![ActivityKind::Run]);
+}
+
+#[test]
+fn operator_checkpoint_effects_do_not_count_as_agent_edits() {
+    for class in [EffectClass::CheckpointRestore, EffectClass::FsWrite] {
+        let mut tracker = ActivityTracker::new();
+        let effect = EffectId::new("operator-restore");
+        tracker.observe(
+            &EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect.clone(),
+                class: class.clone(),
+                summary: "workspace checkpoint".into(),
+                args_digest: "digest".into(),
+                workspace_revision: None,
+            })),
+            1_000,
+        );
+        tracker.observe(
+            &EventPayload::Effect(EffectPhase::Authorized {
+                effect: effect.clone(),
+                verdict: AuthorizationVerdict::Allow,
+            }),
+            1_000,
+        );
+        tracker.observe(
+            &EventPayload::Effect(EffectPhase::Dispatched {
+                effect: effect.clone(),
+            }),
+            1_000,
+        );
+        if class == EffectClass::CheckpointRestore {
+            assert!(tracker.used().is_empty());
+            assert_eq!(tracker.current(1_000, false), None);
+        } else {
+            assert_eq!(
+                tracker.current(1_000, false),
+                Some(ActivityKind::Edit),
+                "agent FsWrite remains edit"
+            );
+        }
+    }
+    for name in ["fs_write", "fs_edit", "fs_path"] {
+        let mut tracker = ActivityTracker::new();
+        tracker.observe(
+            &EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!("agent-{name}")),
+                item: TurnItem::ToolCall {
+                    call_id: format!("agent-{name}"),
+                    name: name.into(),
+                    args: serde_json::Value::Null,
+                    status: ToolStatus::Completed,
+                    activity: Some(ActivityKind::Edit),
+                },
+            }),
+            2_000,
+        );
+        assert_eq!(
+            tracker.current(2_000, false),
+            Some(ActivityKind::Edit),
+            "{name}"
+        );
+        assert_eq!(tracker.used(), vec![ActivityKind::Edit], "{name}");
+    }
+}
+
+#[test]
+fn old_checkpoint_journals_replay_without_operator_edit_history() {
+    use crate::checkpoint::{CheckpointKind, CheckpointOrigin, CheckpointRecorded};
+    use crate::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use crate::ids::{CheckpointId, DeviceId, EventId, RunId, SessionId};
+    for origin in [
+        CheckpointOrigin::Undo,
+        CheckpointOrigin::Redo,
+        CheckpointOrigin::RollbackTurn,
+        CheckpointOrigin::Tool,
+    ] {
+        let run = RunId::new("old-operator-run");
+        let effect = EffectId::new("old-operator-effect");
+        let envelope = |seq: u64, payload: EventPayload| EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!("old-checkpoint-{seq}")),
+            seq,
+            session_id: SessionId::new("child"),
+            branch_id: None,
+            run_id: Some(run.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("device"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1_000 + seq,
+            render: RenderTargets {
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).expect("payload").into(),
+        };
+        let mut tracker = ActivityTracker::new();
+        for (seq, payload) in [
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect.clone(),
+                class: EffectClass::FsWrite,
+                summary: "old checkpoint".into(),
+                args_digest: "digest".into(),
+                workspace_revision: None,
+            })),
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect: effect.clone(),
+                verdict: AuthorizationVerdict::Allow,
+            }),
+            EventPayload::Effect(EffectPhase::Dispatched {
+                effect: effect.clone(),
+            }),
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: effect.clone(),
+                outcome: EffectOutcome::Ok,
+                freshness: None,
+                workspace_mutation: None,
+            }),
+            EventPayload::CheckpointRecorded(CheckpointRecorded {
+                checkpoint_id: CheckpointId::new("old-checkpoint"),
+                session_id: SessionId::new("child"),
+                branch_id: None,
+                run_id: run.clone(),
+                effect_id: effect.clone(),
+                call_id: "operator".into(),
+                seq: 5,
+                workspace_revision: None,
+                kind: CheckpointKind::Write,
+                origin,
+                source_checkpoint_id: None,
+                paths: Vec::new(),
+                post_digest: "digest".into(),
+                recorded_at_ms: 1_005,
+                redacted_content: false,
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tracker.observe_raw(&envelope(seq as u64 + 1, payload));
+        }
+        if origin == CheckpointOrigin::Tool {
+            assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
+            assert_eq!(tracker.current(1_005, false), Some(ActivityKind::Edit));
+        } else {
+            assert!(tracker.used().is_empty(), "{origin:?}");
+            assert_eq!(tracker.current(1_005, false), None, "{origin:?}");
+        }
+    }
 }
 
 #[test]

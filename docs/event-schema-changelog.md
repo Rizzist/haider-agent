@@ -29,7 +29,7 @@ additive, absence-preserving fields: `activity` (one of `computer`, `mobile`,
 DOING at `generated_at_ms`, distinct from its `state` — and `activities`, every
 activity used so far in priority order. Both are derived by
 `haider_protocol::activity::ActivityTracker` from typed journal facts only
-(`ToolCall.activity`, `CommandExecution`, `FileChange`, `ChildSpawn`,
+(`ToolCall.activity`, `FileChange`, `ChildSpawn`,
 `RunState`), never from free text. Priority (highest first) is the order
 above. Timing: an open call is active until it completes; a finished call
 stays hot for 8 s (hot kinds compete on priority); a quiet agent then shows
@@ -49,8 +49,8 @@ icon at the accepted dispatch boundary; only successful completion enters
 history. Legacy peers receive the original state event without those keys.
 Provider admission recovery uses `provider_transport`, which never counts as
 agent activity. This is an additive event shape change, and a
-peer that did not negotiate `session_fleet_identity_v1` receives the exact
-pre-field payload on fleet, metrics and Event frames. Clients render emoji (`🖥️ 📱 🌐 🔌 ✏️ ⚙️ 🔍 🧭`, VS16 where
+peer that did not negotiate `session_activity_v1` receives the exact
+pre-activity payload on fleet, metrics and Event frames. Clients render emoji (`🖥️ 📱 🌐 🔌 ✏️ ⚙️ 🔍 🧭`, VS16 where
 the base defaults to text presentation, two columns each) or the text
 fallbacks `[screen] [phone] [web] [remote] [edit] [run] [read] [orch]`;
 `HAIDER_ACTIVITY_ICONS=emoji|text|off`, the TUI `/icons` setting, `NO_COLOR`
@@ -58,7 +58,7 @@ and limited `TERM` values select the form. `AgentMetricsSnapshot` (session
 summaries, observe digests and fleet node metrics) gains an additive
 `activity` object — the time-independent tracker state (`open`, `touched`,
 `latest`, `terminal`) clients evaluate on their own clock; it is likewise
-withheld from peers without `session_fleet_identity_v1`. Only work that
+withheld from peers without `session_activity_v1`. Only work that
 really ran counts: live activity opens on a `Dispatched` effect (by its
 typed `EffectClass`) or an accepted typed effectless route and closes at
 its outcome/settlement; a completed `ToolCall`
@@ -803,3 +803,28 @@ forward-compatibility behavior.
   terminal discriminator remains `cancellation`; no new terminal kind is added.
   All these fields are durable and replay byte-for-byte; `schema_version`
   remains 1. Unknown supplemental payloads retain the raw-envelope law.
+
+### v0.0.973 — client-requested session activity
+
+`session_activity_v1` is an explicit client opt-in. New clients add the optional
+`Hello.features_requested` string list; released daemons ignore that unknown
+field and complete the existing handshake. A new daemon grants the token in
+`Welcome.features` only when it was requested and the Welcome fits the peer's
+receive ceiling. It withholds this newest token before the older fallback
+tokens. The token name ties the activity state and effect class to the session
+wire surface; it is separate from `session_fleet_identity_v1`, which predates
+activity.
+
+Peers without fleet identity keep the pre-identity fleet shape. Peers with
+fleet identity but without activity keep model/provider identity, while all
+activity fields in events, history, observation, lists, roster and recursive
+fleet are omitted. The internal `provider_transport` effect is presented as
+the historical `network { host: "provider-request" }` shape to both older peer
+classes. Operator checkpoint undo/redo/rollback now journal the typed
+`checkpoint_restore` effect class; to older peers it is presented as the
+historical `fs_write` class. Neither operator shell `CommandExecution` nor a
+checkpoint restore counts as agent activity. Old user-shell journals are
+excluded by the typed item kind and the typed `user_typed` authorization
+source on their `process_exec` effect; old checkpoint journals are excluded after
+their typed `checkpoint_recorded` fact identifies the transaction during
+replay. Agent-authored typed tool calls and effects retain their activity.

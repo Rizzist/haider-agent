@@ -1530,7 +1530,7 @@ impl SessionFolder {
             .max(envelope.committed_at_ms);
         if matches!(
             envelope.payload.get("type").and_then(|kind| kind.as_str()),
-            Some("item" | "run_state" | "effect")
+            Some("item" | "run_state" | "effect" | "checkpoint_recorded")
         ) {
             self.activity
                 .entry(envelope_agent.clone())
