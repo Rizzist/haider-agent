@@ -362,77 +362,99 @@ async fn observe_monitor(world: &MonitorWorld, report: MonitorReport) {
 /// session. A later replay must stay settled after the guard drops.
 #[tokio::test]
 async fn fenced_monitor_wake_dismisses_pending_and_admitting_obligations() {
-    use haider_protocol::completion::CompletionEvent;
     for admitting in [false, true] {
-        let label = if admitting {
-            "fenced-admitting"
-        } else {
-            "fenced-pending"
-        };
-        let world = MonitorWorld::new(label).await;
-        let mut report = test_report(label, "stop wake", MonitorReportStatus::Matched);
-        report.session_id = world.session.clone();
-        observe_monitor(&world, report.clone()).await;
-        let id = format!("monitor:{label}");
-        if admitting {
-            let journal = crate::completion::load(&world.hub, &world.session)
-                .await
-                .unwrap();
-            crate::completion::append(
-                &world.hub,
-                &journal.projection.pending[&id],
-                CompletionEvent::CompletionAttempt {
-                    obligation_id: id.clone(),
-                    attempt: 1,
-                    worker_generation: world.hub.worker_generation(),
-                },
-            )
-            .await
-            .unwrap();
-        }
-        let before = crate::completion::load(&world.hub, &world.session)
-            .await
-            .unwrap();
-        assert_eq!(
-            before.projection.pending[&id].status,
-            if admitting {
-                CompletionStatus::Admitting
-            } else {
-                CompletionStatus::Pending
-            }
-        );
-        let fence = world
-            .hub
-            .inner_monitor()
-            .stop_fences()
-            .fence(&world.session);
-        let receipt = world.hub.wake_monitor_report(report.clone()).await.unwrap();
-        assert!(receipt.durable);
-        assert!(!receipt.handed_off);
-        assert_eq!(receipt.disposition, "follow_up_pending");
-        let journal = crate::completion::load(&world.hub, &world.session)
-            .await
-            .unwrap();
-        assert!(journal.projection.is_settled(&id));
-        assert_eq!(journal.events.iter().filter(|event| matches!(event,
-            CompletionEvent::CompletionDismissed { obligation_id, .. } if obligation_id == &id
-        )).count(), 1);
-        assert!(
-            !journal.events.iter().any(|event| matches!(event,
-                CompletionEvent::CompletionAdmitted { obligation_id, .. } if obligation_id == &id
-            )),
-            "dismissal must not admit a monitor run"
-        );
-        drop(fence);
-        world.hub.inner_monitor().completion_cache().await.clear();
-        let replay = world.hub.wake_monitor_report(report).await.unwrap();
-        assert!(replay.durable);
-        assert!(!replay.handed_off);
-        let journal = crate::completion::load(&world.hub, &world.session)
-            .await
-            .unwrap();
-        assert!(journal.projection.is_settled(&id));
+        assert_fenced_monitor_obligation_dismissal(admitting).await;
     }
+}
+
+#[tokio::test]
+async fn fenced_monitor_wake_dismisses_pending_obligation() {
+    assert_fenced_monitor_obligation_dismissal(false).await;
+}
+
+#[tokio::test]
+async fn fenced_monitor_wake_dismisses_admitting_obligation() {
+    assert_fenced_monitor_obligation_dismissal(true).await;
+}
+
+async fn assert_fenced_monitor_obligation_dismissal(admitting: bool) {
+    use haider_protocol::completion::CompletionEvent;
+    let label = if admitting {
+        "fenced-admitting"
+    } else {
+        "fenced-pending"
+    };
+    let world = MonitorWorld::new(label).await;
+    let mut report = test_report(label, "stop wake", MonitorReportStatus::Matched);
+    report.session_id = world.session.clone();
+    observe_monitor(&world, report.clone()).await;
+    let id = format!("monitor:{label}");
+    if admitting {
+        let journal = crate::completion::load(&world.hub, &world.session)
+            .await
+            .unwrap();
+        crate::completion::append(
+            &world.hub,
+            &journal.projection.pending[&id],
+            CompletionEvent::CompletionAttempt {
+                obligation_id: id.clone(),
+                attempt: 1,
+                worker_generation: world.hub.worker_generation(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let before = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.projection.pending[&id].status,
+        if admitting {
+            CompletionStatus::Admitting
+        } else {
+            CompletionStatus::Pending
+        }
+    );
+    let fence = world
+        .hub
+        .inner_monitor()
+        .stop_fences()
+        .fence(&world.session);
+    let receipt = world.hub.wake_monitor_report(report.clone()).await.unwrap();
+    assert!(receipt.durable);
+    assert!(!receipt.handed_off);
+    assert_eq!(receipt.disposition, "follow_up_pending");
+    let journal = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    assert!(journal.projection.is_settled(&id));
+    assert_eq!(
+        journal
+            .events
+            .iter()
+            .filter(|event| matches!(event,
+                CompletionEvent::CompletionDismissed { obligation_id, .. } if obligation_id == &id
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        !journal.events.iter().any(|event| matches!(event,
+            CompletionEvent::CompletionAdmitted { obligation_id, .. } if obligation_id == &id
+        )),
+        "dismissal must not admit a monitor run"
+    );
+    drop(fence);
+    world.hub.inner_monitor().completion_cache().await.clear();
+    let replay = world.hub.wake_monitor_report(report.clone()).await.unwrap();
+    assert!(replay.durable);
+    assert!(!replay.handed_off);
+    let journal = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    assert!(journal.projection.is_settled(&id));
+    assert_dismissed_monitor_survives_store_reopen(world, report).await;
 }
 
 #[tokio::test]
@@ -449,7 +471,7 @@ async fn fenced_monitor_wake_without_obligation_is_retained_without_admission() 
         .inner_monitor()
         .stop_fences()
         .fence(&world.session);
-    let receipt = world.hub.wake_monitor_report(report).await.unwrap();
+    let receipt = world.hub.wake_monitor_report(report.clone()).await.unwrap();
     assert!(receipt.durable);
     assert!(!receipt.handed_off);
     assert_eq!(receipt.disposition, "follow_up_pending");
@@ -462,6 +484,83 @@ async fn fenced_monitor_wake_without_obligation_is_retained_without_admission() 
             .is_empty()
     );
     drop(fence);
+    world.hub.inner_monitor().completion_cache().await.clear();
+    let replay = world.hub.wake_monitor_report(report.clone()).await.unwrap();
+    assert!(replay.durable);
+    assert!(!replay.handed_off);
+    assert_eq!(replay.disposition, "follow_up_pending");
+    let journal = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    assert!(
+        journal
+            .projection
+            .is_settled("monitor:fenced-fallback-report")
+    );
+    let events = world.store.read(&world.session, 0, 256).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.payload.get("type").and_then(|v| v.as_str())
+                == Some("monitor_report_pending"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.payload.get("type").and_then(|v| v.as_str())
+                == Some("monitor_report_delivered"))
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| event.payload.decode_event().is_ok_and(|payload| matches!(payload,
+        EventPayload::UserMessage { text, mode, .. } if mode == DeliveryMode::Subturn && text.contains("monitor_event")
+    ))), "dismissed direct report must never admit a wake");
+    assert_dismissed_monitor_survives_store_reopen(world, report).await;
+}
+
+async fn assert_dismissed_monitor_survives_store_reopen(
+    world: MonitorWorld,
+    report: MonitorReport,
+) {
+    let MonitorWorld {
+        hub,
+        store,
+        lease,
+        _root: root,
+        ..
+    } = world;
+    hub.inner_monitor().shutdown().await.unwrap();
+    drop(lease);
+    drop(hub);
+    store.close().await.unwrap();
+    let store = SqliteStoreHandle::open(root.path()).await.unwrap();
+    let hub = SessionHub::new(
+        store.clone(),
+        crate::session_hub::SessionHubConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        !hub.inner_monitor()
+            .stop_fences()
+            .session_fenced(&report.session_id)
+    );
+    let id = format!("monitor:{}", report.report_id);
+    let receipt = hub.wake_monitor_report(report.clone()).await.unwrap();
+    assert!(receipt.durable);
+    assert!(!receipt.handed_off);
+    assert_eq!(receipt.disposition, "follow_up_pending");
+    let journal = crate::completion::load(&hub, &report.session_id)
+        .await
+        .unwrap();
+    assert!(journal.projection.is_settled(&id));
+    assert!(!journal.events.iter().any(|event| matches!(event,
+        haider_protocol::completion::CompletionEvent::CompletionAdmitted { obligation_id, .. } if obligation_id == &id
+    )));
+    hub.inner_monitor().shutdown().await.unwrap();
+    drop(hub);
+    store.close().await.unwrap();
 }
 
 #[tokio::test]

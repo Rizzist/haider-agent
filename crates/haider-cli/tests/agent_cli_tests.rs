@@ -2574,6 +2574,28 @@ fn stop_refuses_monitors_registered_during_the_stop_for_every_scope() {
     }
 }
 
+// Independent entry points keep one scope's mutation failure from preventing
+// execution of the remaining scope variants in the test binary.
+#[test]
+fn stop_refuses_monitors_registered_during_named_cancel() {
+    monitor_registration_race("named");
+}
+
+#[test]
+fn stop_refuses_monitors_registered_during_cancel_all() {
+    monitor_registration_race("all");
+}
+
+#[test]
+fn stop_refuses_monitors_registered_during_run_stop() {
+    monitor_registration_race("run");
+}
+
+#[test]
+fn stop_refuses_monitors_registered_during_stop_subagents() {
+    monitor_registration_race("subagents");
+}
+
 #[test]
 fn main_only_stop_leaves_child_monitor_registration_open() {
     monitor_registration_race("main");

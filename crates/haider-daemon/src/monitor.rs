@@ -7057,6 +7057,73 @@ impl SessionHub {
         crate::completion::wake_monitor(self, report).await
     }
 
+    /// Retain a direct transport report dismissed during a stop. The caller
+    /// holds the completion lock; source, dismissal and outbox settlement
+    /// commit together so replay cannot turn a discarded report into work.
+    pub(crate) async fn dismiss_unobserved_monitor_report(
+        &self,
+        report: &MonitorReport,
+    ) -> Result<(), MonitorError> {
+        use haider_protocol::completion::{CompletionEvent, CompletionProjection};
+
+        let retained_at_ms = now_ms();
+        let identity = stable_digest(&[
+            report.session_id.as_str(),
+            &report.monitor_id,
+            &report.report_id,
+            "stop-dismissed-direct-report",
+        ]);
+        let fact = |suffix: &str, event: MonitorJournalEvent| {
+            Ok::<_, MonitorError>(monitor_envelope(
+                &report.session_id,
+                None,
+                report.branch_id.as_ref(),
+                report.agent_id.as_ref(),
+                &format!("monitor-direct-{suffix}-{}", &identity[..24]),
+                self.device_id(),
+                self.worker_generation(),
+                event.to_value()?,
+            ))
+        };
+        let observed = fact(
+            "observed",
+            MonitorJournalEvent::MonitorReportPending {
+                pending: PendingMonitorReport {
+                    report: report.clone(),
+                    terminal_reason: None,
+                    queue_order: 0,
+                    queued_at_ms: retained_at_ms,
+                },
+            },
+        )?;
+        let mut projection = CompletionProjection::default();
+        projection.apply(&observed);
+        let id = format!("monitor:{}", report.report_id);
+        let obligation = projection.pending.get(&id).ok_or_else(|| {
+            MonitorError::Store("direct monitor observation has no obligation".into())
+        })?;
+        let dismissed = crate::completion::envelope(
+            self,
+            obligation,
+            &CompletionEvent::CompletionDismissed {
+                obligation_id: id,
+                attempt: 0,
+            },
+        )
+        .map_err(monitor_store_error)?;
+        let delivered = fact(
+            "settled",
+            MonitorJournalEvent::MonitorReportDelivered {
+                report_id: report.report_id.clone(),
+                delivered_at_ms: retained_at_ms,
+            },
+        )?;
+        self.append(&mut [observed, dismissed, delivered])
+            .await
+            .map_err(monitor_store_error)?;
+        Ok(())
+    }
+
     pub(crate) async fn admit_monitor_report(
         &self,
         report: MonitorReport,

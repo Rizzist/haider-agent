@@ -262,6 +262,22 @@ async fn exact_named_cancel_retry_keeps_fence_and_does_not_register_again() {
         replay, original,
         "an exact retry replays its committed receipt"
     );
+    let journal = harness
+        .store
+        .read(&child.child_session_id, 0, 256)
+        .await
+        .expect("child monitor journal");
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|event| {
+                event.payload.get("type").and_then(|value| value.as_str())
+                    == Some("monitor_registered")
+            })
+            .count(),
+        1,
+        "retry must not register a monitor even if another drain could hide it"
+    );
     harness.manager.shutdown().await.expect("manager shutdown");
     harness.hub.shutdown().await.expect("hub shutdown");
     harness.store.close().await.expect("store close");

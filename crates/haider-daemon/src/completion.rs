@@ -220,7 +220,11 @@ pub(crate) async fn wake_monitor(
     let Some(obligation) = journal.projection.pending.get(&id) else {
         // Direct transport seam callers predate the outbox. Settled reports
         // must never reach this fallback; their durable source proves ownership.
-        if stopping || journal.projection.is_settled(&id) {
+        if journal.projection.is_settled(&id) {
+            return Ok(retained_receipt());
+        }
+        if stopping {
+            hub.dismiss_unobserved_monitor_report(&report).await?;
             return Ok(retained_receipt());
         }
         return hub.admit_monitor_report(report, None).await;
