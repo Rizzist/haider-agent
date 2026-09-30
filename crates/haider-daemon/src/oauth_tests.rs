@@ -7116,6 +7116,59 @@ async fn all_sanctioned_live_issued_bundles_still_resolve_remote() {
 }
 
 #[tokio::test]
+async fn all_sanctioned_live_issued_bundles_still_refresh_remote() {
+    for provider in [
+        haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        haider_provider::GROK_OAUTH_PROVIDER_NAME,
+    ] {
+        // Only the issuer has the live shape. The minting registration's
+        // token endpoint stays on this synthetic loopback server.
+        let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+        let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+        registration.provider_id = provider.to_owned();
+        registration.issuer = live_issuer(provider).expect("live issuer").to_owned();
+        let mut descriptor = oauth_descriptor_for_test();
+        descriptor.provider = provider.to_owned();
+        let mut bundle = oauth_bundle_for_test(&server, now_ms().expect("clock") - 1);
+        bundle.provider_id = provider.to_owned();
+        bundle.issuer = registration.issuer.clone();
+        let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+        vault
+            .put(&descriptor.alias, &bundle.encode().expect("encode"))
+            .expect("seed live-shaped bundle");
+        let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+        let broker = CredentialBroker::new(
+            Arc::clone(&vault),
+            OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+            Arc::clone(&snapshot),
+            start_status_actor(&snapshot, Arc::clone(&vault)),
+        )
+        .expect("broker");
+
+        let resolved = broker
+            .resolve_remote(&descriptor)
+            .await
+            .expect("expired live-issued bundle refreshes before remote use");
+        assert_eq!(resolved.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+        let retried = broker
+            .refresh_after_auth_failure_remote(&descriptor, None)
+            .await
+            .expect("live-issued bundle refreshes after a remote auth failure");
+        assert_eq!(retried.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+        assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 2);
+        let stored = vault
+            .resolve(&descriptor.alias)
+            .and_then(|secret| OAuthTokenBundleV1::decode(secret.expose_secret()))
+            .expect("durable refreshed bundle");
+        assert_eq!(stored.issuer, live_issuer(provider).expect("live issuer"));
+        assert_eq!(stored.generation, 3);
+        assert!(broker.shutdown().await);
+    }
+}
+
+#[tokio::test]
 async fn remote_resolution_fails_closed_on_missing_and_undecodable_vault_bundles() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let mut registration = server.registration(Arc::new(FakeIdentityVerifier));

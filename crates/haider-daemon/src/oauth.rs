@@ -5966,8 +5966,8 @@ impl CredentialBroker {
         }
     }
 
-    /// [`Self::refresh_after_auth_failure`] for a token headed back to the
-    /// provider's real endpoint (the inference retry): live-issued only.
+    /// Refreshes a rejected token for a retry to the provider's real
+    /// endpoint, enforcing the live issuer on the returned access token.
     pub(crate) async fn refresh_after_auth_failure_remote(
         &self,
         descriptor: &CredentialDescriptor,
