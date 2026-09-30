@@ -2724,6 +2724,28 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .expect("child metadata present");
     assert_eq!(child_metadata.provider, "fake");
     assert_eq!(child_metadata.model, "fake-model");
+    let child_pair = store
+        .session_output_pair_at(
+            delegation.child_session_id.clone(),
+            child_events.last().expect("child journal").seq,
+        )
+        .await
+        .expect("child pair snapshot")
+        .expect("typed delegated creation receipt");
+    assert_eq!(
+        (
+            child_pair.provider.as_str(),
+            child_pair.model.as_str(),
+            child_pair.max_tokens,
+            child_pair.source
+        ),
+        (
+            child_metadata.provider.as_str(),
+            child_metadata.model.as_str(),
+            child_metadata.max_tokens,
+            child_metadata.max_tokens_source
+        )
+    );
     let overrides = child_metadata
         .permission_overrides
         .expect("child overrides present");

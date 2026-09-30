@@ -97,6 +97,7 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
     assert_eq!(selected.max_tokens, 8192);
     assert_eq!(selected.max_tokens_source, command.max_tokens_source);
     assert_eq!(selected.clamped, command.clamped);
+    assert_eq!(selected.active_output_budget, command.active_output_budget);
     assert!(matches!(envelope.render.prompt, PromptRender::Omit));
     assert_eq!(envelope.payload["type"], "session_provider_rebound");
     let fact =

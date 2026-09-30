@@ -15,6 +15,7 @@ use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EventId, ItemId, LeaseId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
 use haider_protocol::session_fork::{
     ForkContextEpoch, SessionForkMode, SessionForked, SessionMetaforkProposal,
     SessionMetaforkRemoval, SessionMetaforkReviewManifest,
@@ -24,11 +25,108 @@ use haider_protocol::verify::VerifyVerdict;
 use haider_store::{
     BranchCreateCommand, DelegationRecord, DelegationState, EventStore,
     ForkCacheInheritanceCandidate, SessionCreateCommand, SessionForkCommand, SessionForkOutcome,
-    SessionMetaforkCommit, SessionRenameCommand, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    fork_provider_view_prefix_digest,
+    SessionMetaforkCommit, SessionRenameCommand, SessionSelectModelCommand, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, fork_provider_view_prefix_digest,
 };
 use rusqlite::types::ValueRef;
 use std::collections::HashSet;
+
+#[test]
+fn every_session_origin_seeds_the_run_budget_snapshot() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("budget-origin-parent");
+    create_session(&store, &source);
+    let budget_source = SessionOutputBudgetSourceV1::UserSet { requested: 20_000 };
+    store
+        .select_session_model(&SessionSelectModelCommand {
+            command_id: "budget-origin-select".into(),
+            request_digest: "budget-origin-select-digest".into(),
+            request_json: "{}".into(),
+            session_id: source.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            expected_pair: None,
+            output_budget: Some(SessionOutputBudgetV1 {
+                max_tokens: 20_000,
+                source: budget_source,
+                clamped: None,
+            }),
+            event_id: EventId::new("budget-origin-selected"),
+            device_id: DeviceId::new("budget-origin-device"),
+        })
+        .expect("set source budget");
+    let (_, node, seq, user_seq) = source_turn(&store, &source, "budget origin prompt");
+    let source_pair = store
+        .session_output_pair_at(&source, seq)
+        .expect("source pair")
+        .expect("typed create pair");
+    assert_eq!(
+        (source_pair.max_tokens, source_pair.source),
+        (20_000, Some(budget_source))
+    );
+    let node_command = fork_command(
+        &store,
+        "budget-node-fork",
+        &source,
+        "budget-node-child",
+        node.clone(),
+        seq,
+        None,
+    );
+    let SessionForkOutcome::Committed {
+        created: node_child,
+        ..
+    } = store.fork_session(&node_command).expect("node fork")
+    else {
+        panic!("new node fork")
+    };
+    let mut metafork_command = fork_command(
+        &store,
+        "budget-metafork",
+        &source,
+        "budget-meta-child",
+        node,
+        seq,
+        Some(SessionMetaforkCommit {
+            description: "omit source prompt".into(),
+            model_proposal: SessionMetaforkProposal {
+                removals: vec![SessionMetaforkRemoval {
+                    from_seq: user_seq,
+                    through_seq: user_seq,
+                    reason: "omit prompt".into(),
+                    preview: None,
+                    reviewed_events: Vec::new(),
+                }],
+            },
+            accepted_proposal_digest: String::new(),
+        }),
+    );
+    accept_metafork_review(&mut metafork_command);
+    let SessionForkOutcome::Committed {
+        created: meta_child,
+        ..
+    } = store.fork_session(&metafork_command).expect("metafork")
+    else {
+        panic!("new metafork")
+    };
+    for child in [node_child, meta_child] {
+        let pair = store
+            .session_output_pair_at(&child.session_id, child.created_seq)
+            .expect("snapshot")
+            .expect("typed fork origin");
+        assert_eq!(
+            (
+                pair.provider.as_str(),
+                pair.model.as_str(),
+                pair.max_tokens,
+                pair.source
+            ),
+            ("fake", "fake-model", 20_000, Some(budget_source))
+        );
+    }
+}
 
 fn create_session(store: &Store, session_id: &SessionId) {
     store

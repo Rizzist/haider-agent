@@ -1455,6 +1455,8 @@ pub struct ReboundSessionProvider {
     pub max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clamped: Option<haider_protocol::output_budget::OutputBudgetClampV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_output_budget: Option<haider_protocol::session::ActiveRunOutputBudgetV1>,
 }
 
 /// Atomic metadata/event/receipt outcome for one session provider rebind.
@@ -8626,7 +8628,8 @@ impl Store {
             .prepare(
                 "SELECT method, response_json FROM command_receipts
              WHERE session_id = ?1 AND state = 'committed' AND accepted_seq <= ?2
-               AND method IN ('session.create', 'session.select_model', 'session.provider.rebind')
+               AND method IN ('session.create', 'session.fork', 'session.metafork',
+                              'session.select_model', 'session.provider.rebind')
              ORDER BY accepted_seq",
             )
             .map_err(map_sqlite_error)?;
@@ -8644,6 +8647,17 @@ impl Store {
                 "session.create" => {
                     let created: CreatedSession = serde_json::from_str(&json)
                         .map_err(|error| corrupt(format!("invalid create receipt: {error}")))?;
+                    let meta = created.metadata;
+                    pair = Some(SessionOutputPairSnapshot {
+                        provider: meta.provider,
+                        model: meta.model,
+                        max_tokens: meta.max_tokens,
+                        source: meta.max_tokens_source,
+                    });
+                }
+                "session.fork" | "session.metafork" => {
+                    let created: CreatedSessionFork = serde_json::from_str(&json)
+                        .map_err(|error| corrupt(format!("invalid fork receipt: {error}")))?;
                     let meta = created.metadata;
                     pair = Some(SessionOutputPairSnapshot {
                         provider: meta.provider,
@@ -11122,6 +11136,7 @@ impl Store {
                 max_tokens: output_budget.max_tokens,
                 max_tokens_source: output_budget.source,
                 clamped: output_budget.clamped,
+                active_output_budget: command.active_output_budget.clone(),
             },
         )?;
         Ok(match outcome {

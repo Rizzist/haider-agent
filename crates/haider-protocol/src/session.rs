@@ -376,8 +376,8 @@ pub struct SessionProviderRebound {
     /// Budget for the durable queued next-turn pair after this route change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_budget: Option<crate::output_budget::SessionOutputBudgetV1>,
-    /// Budget installed for the already running request when its model is
-    /// different from the queued next-turn model in `output_budget`.
+    /// Budget installed for the active run after this rebind, even when its
+    /// model matches the queued next-turn model in `output_budget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_output_budget: Option<ActiveRunOutputBudgetV1>,
 }

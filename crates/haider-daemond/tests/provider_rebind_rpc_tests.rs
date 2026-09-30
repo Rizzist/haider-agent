@@ -939,7 +939,7 @@ async fn provider_rebind_routes_next_request_preserves_inflight_and_replays() {
         response, repeated,
         "lost-response retry returns the original receipt"
     );
-    let selected_seq = match response {
+    let (selected_seq, active_response) = match response {
         ResponseBody::SessionProviderRebind {
             session_id,
             provider,
@@ -948,13 +948,17 @@ async fn provider_rebind_routes_next_request_preserves_inflight_and_replays() {
             selected_seq,
             worker_generation,
             output_budget: _,
+            active_output_budget,
         } => {
             assert_eq!(session_id, session);
             assert_eq!(provider, PROVIDER);
             assert_eq!(base_url.as_deref(), Some(b.origin.as_str()));
             assert!(account.is_none());
             assert_eq!(worker_generation, generation);
-            selected_seq
+            (
+                selected_seq,
+                active_output_budget.expect("socket response has computed active budget"),
+            )
         }
         other => panic!("rebind: {other:?}"),
     };
@@ -1043,6 +1047,18 @@ async fn provider_rebind_routes_next_request_preserves_inflight_and_replays() {
     )
     .expect("typed rebind fact");
     assert_eq!(fact.base_url.as_deref(), Some(b.origin.as_str()));
+    let active_fact = fact
+        .active_output_budget
+        .expect("socket fact has computed active budget");
+    assert_eq!(active_fact, active_response);
+    assert_eq!(active_fact.run_id, run);
+    assert_eq!(active_fact.model, MODEL);
+    assert_eq!(active_fact.budget.max_tokens, 4096);
+    assert_eq!(
+        active_fact.budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 4096 }
+    );
+    assert_eq!(active_fact.budget.clamped, None);
     drop(client);
     task.shutdown_handle().request("rebind replay test restart");
     task.join().await.expect("first daemon stops");

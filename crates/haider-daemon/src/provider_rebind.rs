@@ -51,7 +51,7 @@ async fn recorded_active_budget(
 /// A headless spec pins run tuning, while an explicit durable rebind owns the
 /// provider route. Restoring only the spec provider would combine its adapter
 /// with another provider's rebound endpoint and account after recovery.
-pub(super) async fn pin_headless_turn_metadata(
+pub(crate) async fn pin_headless_turn_metadata(
     metadata: &mut SessionMetadataV1,
     spec: &HeadlessRunSpecV1,
     store: &HubStoreHandle,
@@ -253,7 +253,7 @@ pub(super) fn rebound_active_turn_lockdown_snapshot(
     active_lockdown_turn_snapshot(hub, session_id, run_id, provider, policy)
 }
 
-pub(super) struct DaemonProviderRebindResolver {
+pub(crate) struct DaemonProviderRebindResolver {
     store: HubStoreHandle,
     factory: Arc<dyn ProviderFactory>,
     metadata: std::sync::Mutex<SessionMetadataV1>,
@@ -269,7 +269,7 @@ impl std::fmt::Debug for DaemonProviderRebindResolver {
 }
 
 impl DaemonProviderRebindResolver {
-    pub(super) fn new(
+    pub(crate) fn new(
         store: HubStoreHandle,
         factory: Arc<dyn ProviderFactory>,
         metadata: SessionMetadataV1,

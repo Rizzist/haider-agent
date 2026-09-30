@@ -50,8 +50,7 @@ impl HubConnection {
             Ok(None) => {}
             Err(error) => return self.respond_turn_error(request_id, error),
         }
-        let _selection = self.hub.lock_workflow_selection(&session_id).await;
-        let Some(current) = (match self.hub.session_metadata(&session_id).await {
+        let Some(_) = (match self.hub.session_metadata(&session_id).await {
             Ok(value) => value,
             Err(error) => return self.respond_turn_error(request_id, error),
         }) else {
@@ -115,12 +114,32 @@ impl HubConnection {
                 );
             }
         }
+        // Custom endpoint validation probes its inventory over the network.
+        // It depends only on the requested route; validate before fencing the
+        // mutable session pair, then compute both budgets under the fence.
         let base_url = match base_url {
             None => None,
-            Some(url) => match validate_rebind_endpoint(&provider, &url).await {
-                Ok(url) => Some(url),
-                Err(error) => return self.respond_turn_error(request_id, error),
-            },
+            Some(url) => {
+                #[cfg(test)]
+                self.hub.pause_selection_network(&session_id).await;
+                match validate_rebind_endpoint(&provider, &url).await {
+                    Ok(url) => Some(url),
+                    Err(error) => return self.respond_turn_error(request_id, error),
+                }
+            }
+        };
+        let _selection = self.hub.lock_workflow_selection(&session_id).await;
+        let Some(current) = (match self.hub.session_metadata(&session_id).await {
+            Ok(value) => value,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }) else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "provider rebind requires a session with typed metadata",
+                false,
+                None,
+            );
         };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
@@ -228,6 +247,7 @@ impl HubConnection {
                         clamped: selected.clamped,
                     },
                 ),
+                active_output_budget: selected.active_output_budget,
             },
         })
     }

@@ -305,6 +305,11 @@ version from journal replay; an already admitted request retains its captured
 adapter. Legacy metadata omits the additive `provider_base_url` and
 `provider_rebind_id` fields. Raw readers preserve this additive kind without
 changing schema version 1.
+The optional `output_budget` describes the queued next-turn pair after a
+rebind. When a run is active, optional `active_output_budget` records its run
+ID, model, resolved budget source and any clamp against the destination
+provider. The same active record appears in the rebind receipt and RPC
+response. Older readers ignore it; older records decode with the field absent.
 
 ### v0.0.970 — recoverable invalid tool calls
 

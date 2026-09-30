@@ -2247,6 +2247,7 @@ pub fn provider_rebind_transcript() -> Vec<WireFrame> {
                 selected_seq: 17,
                 worker_generation: 3,
                 output_budget: None,
+                active_output_budget: None,
             },
         },
     ]

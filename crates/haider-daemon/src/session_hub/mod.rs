@@ -1006,6 +1006,9 @@ struct HubInner {
     #[cfg(test)]
     model_selection_budget_pauses:
         tokio::sync::Mutex<HashMap<SessionId, Arc<ModelSelectionBudgetPause>>>,
+    #[cfg(test)]
+    selection_network_pauses:
+        tokio::sync::Mutex<HashMap<SessionId, Arc<ModelSelectionBudgetPause>>>,
     /// Weak root-run budget authorities shared by delegated child workers.
     /// The owning parent turn controls their lifetime; stale entries cannot
     /// keep a completed run or worker lease alive.
@@ -2520,6 +2523,8 @@ impl SessionHub {
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             model_selection_budget_pauses: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            selection_network_pauses: tokio::sync::Mutex::new(HashMap::new()),
             run_budget_coordinators: Mutex::new(HashMap::new()),
             checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
             replay_tasks: Mutex::new(HashMap::new()),
@@ -6709,15 +6714,16 @@ impl SessionHub {
         }
     }
 
-    /// Snapshot the currently running request lane at its start, then apply
+    /// Snapshot the currently running request lane at admission, then apply
     /// only automatic in-run pair switches. Ordinary selections after that
-    /// point belong to the queued next turn.
+    /// point belong to the queued next turn, including during worker startup.
     pub(crate) async fn active_run_output_pair(
         &self,
         session_id: &SessionId,
     ) -> Result<Option<ActiveRunOutputPairSnapshot>, HaiderError> {
         let mut cursor = 0;
         let mut states = HashMap::<RunId, RunState>::new();
+        let mut admitted = HashMap::<RunId, u64>::new();
         let mut started = HashMap::<RunId, u64>::new();
         let mut specs = HashMap::<RunId, haider_protocol::headless::HeadlessRunSpecV1>::new();
         let mut promoted = HashMap::<RunId, (String, String)>::new();
@@ -6749,6 +6755,9 @@ impl SessionHub {
                     specs.insert(run_id.clone(), spec);
                 }
                 if let Ok(EventPayload::RunState(state)) = event.payload.decode_event() {
+                    if matches!(state, RunState::Queued) {
+                        admitted.entry(run_id.clone()).or_insert(event.seq);
+                    }
                     if !matches!(state, RunState::Queued) {
                         started.entry(run_id.clone()).or_insert(event.seq);
                     }
@@ -6770,13 +6779,16 @@ impl SessionHub {
                 break;
             }
         }
-        let Some((run_id, start_seq)) = started
+        let Some((run_id, active_start_seq)) = started
             .into_iter()
             .filter(|(run_id, _)| states.get(run_id).is_some_and(|state| !state.is_terminal()))
             .max_by_key(|(_, seq)| *seq)
         else {
             return Ok(None);
         };
+        // A selection after acceptance is queued for the next turn even if
+        // worker startup has not yet emitted its first running state.
+        let start_seq = admitted.get(&run_id).copied().unwrap_or(active_start_seq);
         let Some(snapshot) = self
             .inner
             .store
@@ -6828,6 +6840,21 @@ impl SessionHub {
         let pause = self
             .inner
             .model_selection_budget_pauses
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_selection_network(&self, session_id: &SessionId) {
+        let pause = self
+            .inner
+            .selection_network_pauses
             .lock()
             .await
             .get(session_id)

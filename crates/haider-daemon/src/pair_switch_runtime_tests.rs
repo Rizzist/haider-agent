@@ -71,7 +71,14 @@ fn graph_response(sink: &GraphSelectionSink, request_id: &str) -> Option<haider_
 struct RoutingProviderFactory {
     providers: HashMap<String, Arc<FakeProvider>>,
     cache_reconciliations: Arc<Mutex<Vec<(SessionId, String)>>>,
+    cache_reconciliation_pause: Arc<Mutex<Option<Arc<CacheReconciliationPause>>>>,
     fallback_enabled: bool,
+}
+
+#[derive(Default)]
+struct CacheReconciliationPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[derive(Debug)]
@@ -157,6 +164,15 @@ impl ProviderFactory for RoutingProviderFactory {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((session_id.clone(), provider.to_owned()));
+        let pause = self
+            .cache_reconciliation_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
 }
 
@@ -167,6 +183,7 @@ struct PairSwitchWorld {
     session_id: SessionId,
     device_id: DeviceId,
     cache_reconciliations: Arc<Mutex<Vec<(SessionId, String)>>>,
+    cache_reconciliation_pause: Arc<Mutex<Option<Arc<CacheReconciliationPause>>>>,
 }
 
 impl PairSwitchWorld {
@@ -215,6 +232,7 @@ impl PairSwitchWorld {
         hub.install_creatable_providers(BTreeSet::from(["fake-a".to_owned(), "fake-b".to_owned()]))
             .expect("install creatable providers");
         let cache_reconciliations = Arc::new(Mutex::new(Vec::new()));
+        let cache_reconciliation_pause = Arc::new(Mutex::new(None));
         let manager = WorkerManager::start(
             hub.clone(),
             WorkerDependencies {
@@ -225,6 +243,7 @@ impl PairSwitchWorld {
                         ("fake-b".to_owned(), fake_b),
                     ]),
                     cache_reconciliations: Arc::clone(&cache_reconciliations),
+                    cache_reconciliation_pause: Arc::clone(&cache_reconciliation_pause),
                     fallback_enabled,
                 }),
                 // Pair-switch scripts explicitly include delegation; retain
@@ -272,6 +291,7 @@ impl PairSwitchWorld {
             session_id,
             device_id,
             cache_reconciliations,
+            cache_reconciliation_pause,
         }
     }
 
@@ -632,6 +652,276 @@ async fn selected_child_pair_reapplies_parent_budget_and_plain_child_inherits_it
         assert_eq!(inherited.max_tokens, parent_tokens);
         assert_eq!(inherited.max_tokens_source, Some(source));
     }
+    world.shutdown().await;
+}
+
+/// A selection made while the parent request is running queues the next
+/// turn. The child spawned by that request keeps its admitted budget.
+#[tokio::test]
+async fn running_parent_spawns_child_with_active_budget_after_queued_selection() {
+    for startup_selection in [false, true] {
+        assert_running_parent_child_budget(startup_selection).await;
+    }
+}
+
+async fn assert_running_parent_child_budget(startup_selection: bool) {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    let fake_a = Arc::new(FakeProvider::new(if startup_selection {
+        Vec::new()
+    } else {
+        vec![
+            FakeStep::Delay { ms: 1_500 },
+            FakeStep::EmitToolCall {
+                call_id: "active-budget-spawn".into(),
+                name: "spawn_subagent".into(),
+                args: serde_json::json!({"task":"inherit active budget","prompt":"report"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::EmitText {
+                text: "child report".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "active-budget-spawn".into(),
+            },
+            FakeStep::EmitText {
+                text: "parent finished".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ]
+    }));
+    let fake_b = Arc::new(FakeProvider::new(if startup_selection {
+        vec![
+            FakeStep::EmitText {
+                text: "child report".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ]
+    } else {
+        Vec::new()
+    }));
+    let profiles = [("fake-a", "model-a"), ("fake-b", "model-b")]
+        .into_iter()
+        .map(|(provider, model)| {
+            let mut profile = model_summary(provider, &[model]);
+            profile.model_details = vec![
+                serde_json::from_value(serde_json::json!({
+                    "name":model, "context_window":1_048_576,
+                    "max_output_tokens":30_000, "max_output_tokens_source":"declared"
+                }))
+                .expect("child budget catalog row"),
+            ];
+            profile
+        })
+        .collect();
+    let world = PairSwitchWorld::boot_with_catalog(
+        "active-child-budget",
+        fake_a.clone(),
+        fake_b.clone(),
+        profiles,
+    )
+    .await;
+    let mut active = world.select_command("active-parent-budget");
+    active.provider = "fake-a".into();
+    active.model = "model-a".into();
+    active.request_json = serde_json::json!({
+        "session_id": world.session_id,
+        "worker_generation": world.store.worker_generation(),
+        "model": "model-a",
+        "provider": "fake-a",
+        "max_tokens": 20_000,
+    })
+    .to_string();
+    active.request_digest = blake3::hash(active.request_json.as_bytes())
+        .to_hex()
+        .to_string();
+    active.output_budget = Some(SessionOutputBudgetV1 {
+        max_tokens: 20_000,
+        source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+        clamped: None,
+    });
+    world
+        .hub
+        .select_session_model(active)
+        .await
+        .expect("pin parent budget");
+    let mut deferred = None;
+    let (run_id, disposition) = if startup_selection {
+        let run_id = RunId::new("active-parent-run");
+        let accepted = world
+            .hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: "active-parent-accept".into(),
+                request_digest: "active-parent-accept-digest".into(),
+                request_json: "{}".into(),
+                session_id: world.session_id.clone(),
+                worker_generation: world.store.worker_generation(),
+                run_id: run_id.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: "delegate".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+                queued_event_id: EventId::new("active-parent-queued"),
+                user_event_id: EventId::new("active-parent-user"),
+                active_event_id: EventId::new("active-parent-active"),
+                device_id: world.device_id.clone(),
+            })
+            .await
+            .expect("accept before queued selection");
+        let mut configured = world
+            .store
+            .read(&world.session_id, 0, 32)
+            .await
+            .expect("admission journal")
+            .into_iter()
+            .find(|event| {
+                event.run_id.as_ref() == Some(&run_id)
+                    && matches!(
+                        event.payload.decode_event(),
+                        Ok(EventPayload::RunState(RunState::Queued))
+                    )
+            })
+            .expect("queued admission");
+        let spec: haider_protocol::headless::HeadlessRunSpecV1 =
+            serde_json::from_value(serde_json::json!({
+                "provider":"fake-a", "model":"model-a", "max_output_tokens":20_000,
+                "fast":false, "permission_overrides":{}, "budget":{},
+                "agent_spawn":{"task":"inherit active budget", "prompt":"report", "provider":"fake-b", "model":"model-b"}
+            }))
+            .expect("accepted headless spec");
+        configured.seq = 0;
+        configured.event_id = EventId::new("active-parent-configured");
+        configured.payload =
+            haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(spec)
+                .to_payload_value()
+                .expect("headless config payload")
+                .into();
+        StoreHandle::append(&world.store, &mut [configured])
+            .await
+            .expect("durable headless spec before worker pickup");
+        let disposition = accepted.disposition;
+        deferred = Some(accepted);
+        (run_id, disposition)
+    } else {
+        world
+            .submit_turn("active-parent", "delegate", DeliveryMode::Steer)
+            .await
+    };
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    if !startup_selection {
+        timeout(Duration::from_secs(10), async {
+            while fake_a.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("active provider request");
+    }
+    let mut queued = world.select_command("queued-next-budget");
+    queued.request_json = serde_json::json!({
+        "session_id": world.session_id,
+        "worker_generation": world.store.worker_generation(),
+        "model": "model-b",
+        "provider": "fake-b",
+        "max_tokens": 6_000,
+    })
+    .to_string();
+    queued.request_digest = blake3::hash(queued.request_json.as_bytes())
+        .to_hex()
+        .to_string();
+    queued.output_budget = Some(SessionOutputBudgetV1 {
+        max_tokens: 6_000,
+        source: SessionOutputBudgetSourceV1::UserSet { requested: 6_000 },
+        clamped: None,
+    });
+    let SessionSelectModelOutcome::Committed { selected, .. } = world
+        .hub
+        .select_session_model(queued)
+        .await
+        .expect("queue next turn budget")
+    else {
+        panic!("queued selection must commit");
+    };
+    if let Some(accepted) = deferred {
+        world
+            .manager
+            .handle()
+            .submit(accepted)
+            .await
+            .expect("worker pickup after queued selection");
+    }
+    world.await_done(&run_id).await;
+    let events = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("parent journal");
+    let (spawn_seq, manifest) = events
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::AgentSpawned(manifest)) => Some((event.seq, manifest)),
+            _ => None,
+        })
+        .expect("child spawn");
+    assert!(
+        selected.selected_seq < spawn_seq,
+        "the queued budget must commit before the active run spawns its child"
+    );
+    let child_id = manifest
+        .coordinates
+        .as_ref()
+        .and_then(|coordinates| coordinates.get("child_session_id"))
+        .and_then(serde_json::Value::as_str)
+        .expect("child session id");
+    let child = world
+        .store
+        .session_metadata(&SessionId::new(child_id))
+        .await
+        .expect("child metadata")
+        .expect("typed child");
+    assert_eq!(child.max_tokens, 20_000);
+    assert_eq!(
+        child.max_tokens_source,
+        Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 })
+    );
+    if startup_selection {
+        assert_eq!(
+            (child.provider.as_str(), child.model.as_str()),
+            ("fake-b", "model-b")
+        );
+        timeout(Duration::from_secs(10), async {
+            while fake_b.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawned child provider request");
+        assert_eq!(fake_b.requests()[0].max_tokens, 20_000);
+    } else {
+        assert_eq!(
+            (child.provider.as_str(), child.model.as_str()),
+            ("fake-a", "model-a")
+        );
+    }
+    assert_eq!(
+        world
+            .store
+            .session_metadata(&world.session_id)
+            .await
+            .expect("parent metadata")
+            .expect("typed parent")
+            .max_tokens,
+        6_000
+    );
     world.shutdown().await;
 }
 
@@ -1563,7 +1853,33 @@ async fn manual_compaction_and_graph_switch_cannot_cross_the_idle_boundary() {
             .expect("graph switch routes");
         graph_response(&sink, "compact-graph-switch").expect("graph switch response")
     };
-    let (accepted, switched) = tokio::join!(compact, switch);
+    // Cache reconciliation may delete a provider cache over the network.
+    // Pause that actual factory await after durable compaction admission;
+    // graph selection must be able to take the fence and report Busy.
+    let (accepted, switched) = {
+        let pause = Arc::new(CacheReconciliationPause::default());
+        *world
+            .cache_reconciliation_pause
+            .lock()
+            .expect("cache reconciliation pause") = Some(Arc::clone(&pause));
+        let race = async { tokio::join!(compact, switch) };
+        tokio::pin!(race);
+        tokio::select! {
+            reached = timeout(Duration::from_secs(10), pause.reached.notified()) => {
+                reached.expect("compaction cache reconciliation paused");
+            }
+            result = &mut race => panic!("compaction completed before cache pause: {result:?}"),
+        }
+        let selection = timeout(
+            Duration::from_secs(10),
+            world.hub.lock_workflow_selection(&world.session_id),
+        )
+        .await
+        .expect("selection fence available during compaction cache network work");
+        drop(selection);
+        pause.release.notify_one();
+        race.await
+    };
     let accepted = accepted.expect("manual compaction remains admissible");
     match switched {
         ResponseBody::Error { code, .. } => {
@@ -2002,6 +2318,7 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
                     ("fake-b".to_owned(), fake_b),
                 ]),
                 cache_reconciliations: Arc::new(Mutex::new(Vec::new())),
+                cache_reconciliation_pause: Arc::new(Mutex::new(None)),
                 fallback_enabled: false,
             }),
             tool_factory: Arc::new(BrokerToolFactory),
@@ -2701,4 +3018,65 @@ async fn automatic_switch_cas_refuses_when_the_pair_moved_underneath_it() {
             .expect("fresh CAS applies"),
         SessionSelectModelOutcome::Committed { .. }
     ));
+}
+
+/// The automatic writer participates in the same session order as RPC
+/// selection, even when its expected pair has not changed yet.
+#[tokio::test]
+async fn automatic_pair_switch_waits_for_session_selection_fence() {
+    use haider_core::ProviderPairSwitchCommitter as _;
+    let world = PairSwitchWorld::boot(
+        "automatic-lock",
+        Arc::new(FakeProvider::new(Vec::new())),
+        Arc::new(FakeProvider::new(Vec::new())),
+    )
+    .await;
+    let lease = world
+        .hub
+        .acquire_worker_lease(world.session_id.clone())
+        .await
+        .expect("lease");
+    let committer = super::DaemonProviderPairSwitchCommitter {
+        store: lease,
+        branch_id: None,
+        device_id: world.device_id.clone(),
+        event_ids: Arc::new(haider_core::EventIdGenerator::new("automatic-lock-events")),
+    };
+    let held = world.hub.lock_workflow_selection(&world.session_id).await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut commit = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        committer
+            .commit(&haider_core::ProviderPairSwitch {
+                run_id: RunId::new("automatic-lock-run"),
+                switch_ordinal: 1,
+                from_provider: "fake-a".into(),
+                from_model: "model-a".into(),
+                to_provider: "fake-b".into(),
+                to_model: "model-b".into(),
+                cause: ProviderPairSwitchCause::FallbackChain,
+            })
+            .await
+    });
+    started_rx.await.expect("automatic writer scheduled");
+    assert!(
+        timeout(Duration::from_secs(1), &mut commit).await.is_err(),
+        "automatic writer must wait for the session selection fence"
+    );
+    drop(held);
+    commit
+        .await
+        .expect("committer task")
+        .expect("committed after release");
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed");
+    assert_eq!(
+        (metadata.provider.as_str(), metadata.model.as_str()),
+        ("fake-b", "model-b")
+    );
+    world.shutdown().await;
 }

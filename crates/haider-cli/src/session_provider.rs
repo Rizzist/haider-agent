@@ -156,9 +156,20 @@ async fn execute(
             selected_seq,
             worker_generation,
             output_budget,
+            active_output_budget,
         } if returned == session_id => {
             if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
                 eprintln!("haider session provider rebind: {}", clamp.notice());
+            }
+            if let Some(active) = active_output_budget.as_ref()
+                && let Some(clamp) = active.budget.clamped
+            {
+                eprintln!(
+                    "haider session provider rebind: active run {} ({}): {}",
+                    active.run_id,
+                    active.model,
+                    clamp.notice()
+                );
             }
             let mut result = serde_json::json!({
                 "schema": "haider.session_provider_rebind.v1", "session_id": returned,
@@ -167,6 +178,9 @@ async fn execute(
             });
             if let Some(budget) = output_budget {
                 result["output_budget"] = serde_json::json!(budget);
+            }
+            if let Some(active) = active_output_budget {
+                result["active_output_budget"] = serde_json::json!(active);
             }
             Ok(result)
         }

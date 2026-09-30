@@ -4200,6 +4200,7 @@ fn session_provider_rebind_output_budget_is_additive_and_golden() {
         decoded,
         ResponseBody::SessionProviderRebind {
             output_budget: None,
+            active_output_budget: None,
             ..
         }
     ));
@@ -4218,11 +4219,25 @@ fn session_provider_rebind_output_budget_is_additive_and_golden() {
                 max_output_tokens: 8_192,
             }),
         }),
+        active_output_budget: Some(
+            haider_rpc::haider_protocol::session::ActiveRunOutputBudgetV1 {
+                run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+                model: "active-small".into(),
+                budget: SessionOutputBudgetV1 {
+                    max_tokens: 8_192,
+                    source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+                    clamped: Some(OutputBudgetClampV1 {
+                        requested: 20_000,
+                        max_output_tokens: 8_192,
+                    }),
+                },
+            },
+        ),
     };
     let encoded = serde_json::to_string(&body).expect("encode new response");
     assert_eq!(
         encoded,
-        r#"{"method":"session.provider.rebind","session_id":"session-1","provider":"haider-code","base_url":null,"account":null,"selected_seq":43,"worker_generation":7,"output_budget":{"max_tokens":8192,"source":{"kind":"user_set","requested":20000},"clamped":{"requested":20000,"max_output_tokens":8192}}}"#
+        r#"{"method":"session.provider.rebind","session_id":"session-1","provider":"haider-code","base_url":null,"account":null,"selected_seq":43,"worker_generation":7,"output_budget":{"max_tokens":8192,"source":{"kind":"user_set","requested":20000},"clamped":{"requested":20000,"max_output_tokens":8192}},"active_output_budget":{"run_id":"run-1","model":"active-small","budget":{"max_tokens":8192,"source":{"kind":"user_set","requested":20000},"clamped":{"requested":20000,"max_output_tokens":8192}}}}"#
     );
     assert_eq!(
         serde_json::from_str::<ResponseBody>(&encoded).expect("decode new response"),

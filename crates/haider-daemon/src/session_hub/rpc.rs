@@ -10518,6 +10518,7 @@ impl HubConnection {
         summaries: &mut Vec<ProviderSummaryWire>,
         provider: &str,
         model: &str,
+        session_id: Option<&SessionId>,
     ) -> Result<(), InventoryRefreshError> {
         let cached_serves_model = summaries
             .iter()
@@ -10539,6 +10540,12 @@ impl HubConnection {
         if !needs_refresh {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(session_id) = session_id {
+            self.hub.pause_selection_network(session_id).await;
+        }
+        #[cfg(not(test))]
+        let _ = session_id;
         let facade = self
             .hub
             .accounts()
@@ -12120,53 +12127,92 @@ impl HubConnection {
             Err(error) => return Err(error),
         }
 
-        // All pair and output-budget writers use the same session order.
-        // The inherited budget is computed from metadata below, so hold the
-        // lock through the receipt/fact/metadata commit. Receipt replay above
-        // remains unfenced across generation and registry changes.
-        let _selection = self.hub.lock_workflow_selection(&session_id).await;
-
-        let Some(current) = (match self.hub.session_metadata(&session_id).await {
-            Ok(metadata) => metadata,
-            Err(error) => return self.respond_turn_error(request_id, error),
-        }) else {
-            return self.respond_error(
-                request_id,
-                ERROR_CODE_NOT_FOUND,
-                "model selection requires a live session with typed metadata",
-                false,
-                None,
-            );
-        };
-        let (mut summaries, descriptors) = self
-            .hub
-            .accounts()?
-            .and_then(|facade| facade.management.read())
-            .map_or_else(
-                || (Vec::new(), Vec::new()),
-                |view| (view.providers, view.descriptors),
-            );
-        let selected_provider = provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|provider| !provider.is_empty())
-            .unwrap_or(&current.provider);
-        match self
-            .refresh_inventory_if_needed(&mut summaries, selected_provider, model.trim())
-            .await
-        {
-            Ok(()) => {}
-            Err(InventoryRefreshError::Hub(error)) => return Err(error),
-            Err(InventoryRefreshError::Provider(error)) => {
+        // Inventory refresh can perform network I/O. Read a speculative pair,
+        // fetch outside the per-session lock, then validate the same pair
+        // under the lock through the durable commit. If another writer moved
+        // it while fetching, discard the snapshot and retry.
+        let (_selection, current, summaries, descriptors) = loop {
+            let Some(before) = (match self.hub.session_metadata(&session_id).await {
+                Ok(metadata) => metadata,
+                Err(error) => return self.respond_turn_error(request_id, error),
+            }) else {
                 return self.respond_error(
                     request_id,
-                    &error.code,
-                    &error.message,
-                    error.retryable,
-                    error.data,
+                    ERROR_CODE_NOT_FOUND,
+                    "model selection requires a live session with typed metadata",
+                    false,
+                    None,
                 );
+            };
+            let (mut summaries, descriptors) = self
+                .hub
+                .accounts()?
+                .and_then(|facade| facade.management.read())
+                .map_or_else(
+                    || (Vec::new(), Vec::new()),
+                    |view| (view.providers, view.descriptors),
+                );
+            let selected_provider = provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider| !provider.is_empty())
+                .unwrap_or(&before.provider);
+            let refresh = self
+                .refresh_inventory_if_needed(
+                    &mut summaries,
+                    selected_provider,
+                    model.trim(),
+                    Some(&session_id),
+                )
+                .await;
+            let selection = self.hub.lock_workflow_selection(&session_id).await;
+            let Some(current) = (match self.hub.session_metadata(&session_id).await {
+                Ok(metadata) => metadata,
+                Err(error) => return self.respond_turn_error(request_id, error),
+            }) else {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_NOT_FOUND,
+                    "model selection requires a live session with typed metadata",
+                    false,
+                    None,
+                );
+            };
+            if (
+                before.provider.as_str(),
+                before.model.as_str(),
+                before.max_tokens,
+                before.max_tokens_source,
+                before.provider_base_url.as_deref(),
+                before.provider_rebind_id.as_deref(),
+                before.account_alias.as_deref(),
+            ) != (
+                current.provider.as_str(),
+                current.model.as_str(),
+                current.max_tokens,
+                current.max_tokens_source,
+                current.provider_base_url.as_deref(),
+                current.provider_rebind_id.as_deref(),
+                current.account_alias.as_deref(),
+            ) {
+                drop(selection);
+                continue;
             }
-        }
+            match refresh {
+                Ok(()) => {}
+                Err(InventoryRefreshError::Hub(error)) => return Err(error),
+                Err(InventoryRefreshError::Provider(error)) => {
+                    return self.respond_error(
+                        request_id,
+                        &error.code,
+                        &error.message,
+                        error.retryable,
+                        error.data,
+                    );
+                }
+            }
+            break (selection, current, summaries, descriptors);
+        };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             summaries,
@@ -16800,7 +16846,7 @@ impl HubConnection {
             .and_then(|facade| facade.management.read())
             .map_or_else(Vec::new, |view| view.providers);
         match self
-            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim())
+            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim(), None)
             .await
         {
             Ok(()) => {}

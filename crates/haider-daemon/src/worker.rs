@@ -7204,7 +7204,7 @@ async fn find_compaction_receipt(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn perform_manual_compaction(
+pub(crate) async fn perform_manual_compaction(
     dependencies: &WorkerDependencies,
     metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,
@@ -7278,21 +7278,6 @@ async fn perform_manual_compaction(
             false,
         ));
     }
-    // A fresh compaction becomes a nonterminal session at the Compacting
-    // append below. Share the native graph-selection lane from the idle check
-    // through that append so graph.pin/switch cannot commit from a stale idle
-    // observation. Receipt recovery already owns a durable run and therefore
-    // needs no new admission fence.
-    let workflow_selection = if existing.is_none() {
-        Some(
-            lease
-                .hub()
-                .lock_workflow_selection(lease.session_id())
-                .await,
-        )
-    } else {
-        None
-    };
     let durable_run_heads = durable_runs(lease).await?;
     if existing.is_none()
         && durable_run_heads
@@ -7338,10 +7323,59 @@ async fn perform_manual_compaction(
     }) {
         web_degrade.anthropic_web_tools = true;
     }
-    let resolved = dependencies
-        .provider_factory
-        .resolve_for_turn_with_web(metadata, web_degrade)
-        .await;
+    // Provider resolution can refresh authentication over the network.
+    // Resolve first, then fence fresh admission and verify that the metadata
+    // used by the factory still describes the current session. Recovery
+    // already owns a durable run and needs no new admission fence.
+    let mut candidate_metadata = metadata.clone();
+    let (workflow_selection, pinned_metadata, resolved) = loop {
+        #[cfg(test)]
+        lease
+            .hub()
+            .pause_selection_network(lease.session_id())
+            .await;
+        let resolved = dependencies
+            .provider_factory
+            .resolve_for_turn_with_web(&candidate_metadata, web_degrade)
+            .await;
+        let selection = if existing.is_none() {
+            Some(
+                lease
+                    .hub()
+                    .lock_workflow_selection(lease.session_id())
+                    .await,
+            )
+        } else {
+            None
+        };
+        if existing.is_none() {
+            let current = lease.session_metadata().await?.ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::SessionNotFound,
+                    "manual compaction requires typed session metadata",
+                    false,
+                )
+            })?;
+            if current != candidate_metadata {
+                candidate_metadata = current;
+                drop(selection);
+                continue;
+            }
+            if durable_runs(lease)
+                .await?
+                .iter()
+                .any(|(_, state, _, _, _)| !state.is_terminal())
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::Busy,
+                    "manual context compaction is idle-only",
+                    true,
+                ));
+            }
+        }
+        break (selection, candidate_metadata, resolved);
+    };
+    let metadata = &pinned_metadata;
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -7644,6 +7678,7 @@ async fn perform_manual_compaction(
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     });
+    drop(workflow_selection);
     haider_provider::scope_auxiliary_provider_request_recorder(
         provider_request_attempt_recorder,
         dependencies
@@ -7659,7 +7694,6 @@ async fn perform_manual_compaction(
         ));
     }
     let retained_messages = messages.split_off(covered_message_count);
-    drop(workflow_selection);
     let cache_expected_later_reads = u32::from(!post_compaction_tools.is_empty()) * 2;
     let cache_cohort = reduce_turn_setup_journal(
         lease,
@@ -21984,9 +22018,21 @@ impl ToolDispatcher for BrokerToolDispatcher {
             // F1: resolve the child's pair BEFORE any durable spawn work. A
             // typed selection refusal is a completed tool result — the model
             // retries with an explicit pair — never a turn failure.
+            let mut active_parent = self.metadata.clone();
+            if let Some(active) = self
+                .output
+                .store
+                .hub()
+                .active_run_output_pair(&self.session_id)
+                .await?
+                .filter(|active| active.run_id == *run_id)
+            {
+                active_parent.max_tokens = active.max_tokens;
+                active_parent.max_tokens_source = active.source;
+            }
             let child_metadata = match self
                 .delegation
-                .resolve_child_metadata(&self.metadata, &request)?
+                .resolve_child_metadata(&active_parent, &request)?
             {
                 Ok(metadata) => metadata,
                 Err(refusal) => {
@@ -26998,7 +27044,7 @@ fn computer_error(error: ComputerError) -> HaiderError {
 }
 
 #[path = "provider_rebind.rs"]
-mod provider_rebind;
+pub(crate) mod provider_rebind;
 
 #[cfg(all(test, feature = "android-standalone"))]
 #[path = "android_inventory_tests.rs"]

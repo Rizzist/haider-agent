@@ -870,6 +870,19 @@ fn retry_reuses_child_cas_refs_stay_deduplicated_and_running_parent_cannot_chang
     else {
         panic!("fresh prompt fork must commit");
     };
+    let pair = store
+        .session_output_pair_at(&created.session_id, created.created_seq)
+        .expect("prompt-fork snapshot")
+        .expect("typed prompt-fork origin");
+    assert_eq!(
+        (pair.provider.as_str(), pair.model.as_str(), pair.max_tokens),
+        (
+            created.metadata.provider.as_str(),
+            created.metadata.model.as_str(),
+            created.metadata.max_tokens
+        )
+    );
+    assert_eq!(pair.source, created.metadata.max_tokens_source);
     assert_eq!(
         store.journal_replay(&source).expect("parent after fork"),
         parent_at_cut,
