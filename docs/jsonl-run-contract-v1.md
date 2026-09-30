@@ -441,9 +441,9 @@ omit both displays and the JSON field.
 
 ### Loop guards (`loop_limit`, v0.0.973)
 
-Three turn-local loop guards stop genuinely stuck loops. None counts
-productive work, and none is a request-count cap. They share one fingerprint
-set per turn.
+Three turn-local loop guards stop repeated work. None is a request-count cap;
+the action-level guard also bounds identical calls whose results keep changing.
+They share one fingerprint set per turn.
 
 Fresh call IDs, request ordinals, usage updates, transport attempts, opaque
 replay state, and the automatic `max_tokens` nudge are never progress.
@@ -454,8 +454,10 @@ patterns:
 
 - **All content:** Unicode NFKC, a Latin fold of look-alike Cyrillic/Greek
   letters, and collapsed whitespace.
-- **Tool results and assistant text:** every digit run is masked, so latency,
-  clock times, HTTP dates, epochs, counters, and numeric nonces never look new.
+- **Tool results and assistant text:** every decimal digit run is masked, in
+  any script (Unicode category `Nd` after NFKC: ASCII, Arabic-Indic `١٢٣`,
+  Persian `۱۲۳`, Devanagari, ...), so latency, clock times, HTTP dates, epochs,
+  counters, and numeric nonces never look new.
   Digits directly after a letter or `_` are kept (`chunk5`, `mod12`, `v0`),
   because they name something. Letters are never masked, so a new git SHA, UUID
   or encoded token is a new result.
@@ -463,6 +465,13 @@ patterns:
   line's `,`/`;`/`:`-separated items are sorted, then the lines are sorted. A
   reordered list is therefore a repeat, while an added or removed line is
   new.
+- **Successful screen observations** (typed `computer`/`mobile` screenshot
+  with an image, accessibility tree, or inspect, see below) are the exception:
+  their result keeps its digits and line order. Paging through a list whose rows differ
+  only by numbers (prices, IDs, dates) is a new result for both the screen
+  comparison and the result-level guard; a byte-identical tree still repeats.
+  Failed, rejected, conflicting, cancelled, unknown, or status-less receipts
+  and navigation results use the ordinary digit mask.
 - **Assistant text:** case is folded.
 - **Assistant text and argument strings:** a run of one repeated punctuation
   character is capped at three.
@@ -505,10 +514,13 @@ The three guards:
      registered `computer` or `mobile` tool whose arguments parse through
      that tool's typed operation parser is a screen step when it is a
      screenshot, accessibility tree or inspect (observation) or a swipe,
-     scroll, tap/left-click or key (navigation). An observation whose result
+     scroll, tap/left-click or key (navigation). A completed observation with
+     a reading whose result
      (image content address or UI tree) differs from the previous identical
      observation is not counted, and navigation is not counted while the
-     latest observation was such a change. Exempt steps neither count nor
+     latest successful observation was such a change. Navigation starts counted
+     until that first changed observation. Failed receipts count normally,
+     even when they carry changing image references. Exempt steps neither count nor
      reset the streak. Once an observation repeats the previous identical
      one, screen steps count again. The result-level guard still counts
      every screen step, so identical screenshots (stuck at the end of a list)
@@ -560,13 +572,14 @@ Accepted residuals:
   when the repeats also repeat results) keeps resetting the streaks.
 - **Letter-only result noise** on an identical call is a new result, so the
   result-level guard does not count it; the action guard bounds it at 200.
-- **Changing screens.** Computer-use/mobile-use paging whose screenshots keep
-  changing is never stopped by a call guard, including a stuck app whose
-  screen changes only in pixels (a clock or animation). Other tools mixed into
-  such a loop are still counted.
-- **Digit-only result changes** on an identical call (`Completed files: N`,
-  `stage N done`) are no new result, indistinguishable from a clock: such a loop
-  stops after eight no-progress continuations or 60 repeated tool calls.
+- **Changing screens.** Computer-use/mobile-use paging whose successful
+  screenshots or UI-tree/inspect readings keep changing is never stopped by a
+  call guard, including a stuck app whose screen changes only in a clock,
+  counter or animation. Other tools mixed into such a loop are still counted.
+- **Digit-only result changes** on an identical non-screen call
+  (`Completed files: N`, `stage N done`) are no new result, indistinguishable
+  from a clock: such a loop stops after eight no-progress continuations or 60
+  repeated tool calls.
 - **Repeated identical work that is productive** (for example 200 identical
   `git commit -am step` calls in one turn) is stopped by the action guard.
 - The in-memory streaks restart after daemon recovery.
