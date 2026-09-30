@@ -6934,7 +6934,7 @@ async fn v2_non_live_issued_tokens_only_ever_reach_loopback() {
     test_only.provider = "fake-oauth".to_owned();
     assert_eq!(
         ensure_live_issuer_for_remote(&test_only, &bundle)
-            .unwrap_err()
+            .expect_err("an unknown issuer cannot authorize a remote destination")
             .code,
         ErrorCode::Unauthorized
     );

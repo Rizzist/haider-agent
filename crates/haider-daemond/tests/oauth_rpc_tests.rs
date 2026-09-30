@@ -1,7 +1,8 @@
 //! W5b OAuth acceptance over the real production UDS and real loopback TCP.
 //!
-//! The only enabled provider is an injected, public-client fake. No live
-//! provider metadata or endpoint is used by this suite.
+//! Providers and credentials are synthetic, with loopback authorization and
+//! token endpoints. Shutdown barriers use a live issuer label so that remote
+//! credential resolution reaches the controlled refresh persistence boundary.
 
 #![allow(clippy::expect_used)]
 
@@ -234,22 +235,24 @@ impl Vault for BlockingRotationVault {
 }
 
 struct OAuthTurnBuilder {
+    provider: &'static str,
     fake: Arc<FakeProvider>,
     builds: AtomicU64,
 }
 
 impl AccountProviderBuilder for OAuthTurnBuilder {
     fn providers(&self) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::from(["fake-oauth".to_owned()])
+        std::collections::BTreeSet::from([self.provider.to_owned()])
     }
 
     fn build(
         &self,
-        _provider: &str,
+        provider: &str,
         credential: haider_accounts::SecretHandle,
         _model: &str,
         _alias: &haider_protocol::ids::CredentialAlias,
     ) -> Result<Arc<dyn Provider>, haider_protocol::error::HaiderError> {
+        assert_eq!(provider, self.provider);
         assert_eq!(
             credential.expose_secret(),
             ROTATED_ACCESS.as_bytes(),
@@ -269,6 +272,8 @@ struct SeenAuthorization {
 }
 
 struct FakeServer {
+    provider: &'static str,
+    issuer: String,
     address: SocketAddr,
     seen: Arc<Mutex<Option<SeenAuthorization>>>,
     verifier: Arc<Mutex<Option<String>>>,
@@ -285,10 +290,17 @@ impl Drop for FakeServer {
 
 impl FakeServer {
     async fn start() -> Self {
+        Self::start_with_registration("fake-oauth", None).await
+    }
+
+    async fn start_with_registration(provider: &'static str, issuer: Option<&str>) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("fake bind");
         let address = listener.local_addr().expect("fake address");
+        let issuer = issuer
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("http://{address}"));
         let seen = Arc::new(Mutex::new(None));
         let verifier = Arc::new(Mutex::new(None));
         let fail_next_token = Arc::new(AtomicBool::new(false));
@@ -297,6 +309,7 @@ impl FakeServer {
         let verifier_for_task = Arc::clone(&verifier);
         let fail_next_for_task = Arc::clone(&fail_next_token);
         let refresh_calls_for_task = Arc::clone(&refresh_calls);
+        let issuer_for_task = issuer.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -306,10 +319,11 @@ impl FakeServer {
                 let verifier = Arc::clone(&verifier_for_task);
                 let fail_next_token = Arc::clone(&fail_next_for_task);
                 let refresh_calls = Arc::clone(&refresh_calls_for_task);
+                let issuer = issuer_for_task.clone();
                 tokio::spawn(async move {
                     serve(
                         stream,
-                        address,
+                        issuer,
                         seen,
                         verifier,
                         fail_next_token,
@@ -320,6 +334,8 @@ impl FakeServer {
             }
         });
         Self {
+            provider,
+            issuer,
             address,
             seen,
             verifier,
@@ -335,8 +351,8 @@ impl FakeServer {
 
     fn catalog(&self) -> OAuthProviderCatalog {
         OAuthProviderCatalog::with_test_registrations([OAuthProviderRegistration::new(
-            "fake-oauth",
-            format!("http://{}", self.address),
+            self.provider,
+            self.issuer.clone(),
             format!("http://{}/authorize", self.address),
             format!("http://{}/token", self.address),
             "haider-public-fake",
@@ -353,7 +369,7 @@ impl FakeServer {
 
 async fn serve(
     mut stream: TcpStream,
-    address: SocketAddr,
+    issuer: String,
     seen: Arc<Mutex<Option<SeenAuthorization>>>,
     captured_verifier: Arc<Mutex<Option<String>>>,
     fail_next_token: Arc<AtomicBool>,
@@ -456,12 +472,22 @@ async fn serve(
     );
     let identity = serde_json::json!({
         "marker": ID_MARKER,
-        "issuer": format!("http://{address}"),
+        "issuer": issuer,
+        "iss": issuer,
         "audience": "fake-resource",
         "nonce": authorization.nonce,
         "subject": "fake-subject",
-        "display": "person@example.invalid"
+        "sub": "fake-subject",
+        "display": "person@example.invalid",
+        "email": "person@example.invalid"
     });
+    // This is an unsigned fixture JWT, accepted only by FakeVerifier below.
+    // The production informational OpenAI parser still sees the real shape.
+    let id_token = format!(
+        "{}.{}.fixture-signature",
+        URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(identity.to_string()),
+    );
     let token = serde_json::json!({
         "access_token": ACCESS,
         "refresh_token": REFRESH,
@@ -469,7 +495,7 @@ async fn serve(
         "expires_in": 3600,
         "refresh_expires_in": 7200,
         "scope": SCOPES,
-        "id_token": identity.to_string()
+        "id_token": id_token
     })
     .to_string();
     write_response(&mut stream, 200, None, token.as_bytes()).await;
@@ -539,7 +565,14 @@ impl OAuthIdentityVerifier for FakeVerifier {
         id_token: &[u8],
         expected: OAuthIdentityExpectation<'_>,
     ) -> Result<OAuthIdentityV1, OAuthPublicError> {
-        let claims: serde_json::Value = serde_json::from_slice(id_token)
+        let malformed = || OAuthPublicError::new("id_token_malformed", false);
+        let token = std::str::from_utf8(id_token).map_err(|_| malformed())?;
+        let parts = token.split('.').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err(malformed());
+        }
+        let payload = URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| malformed())?;
+        let claims: serde_json::Value = serde_json::from_slice(&payload)
             .map_err(|_| OAuthPublicError::new("id_token_malformed", false))?;
         if claims.get("marker").and_then(serde_json::Value::as_str) != Some(ID_MARKER)
             || claims.get("issuer").and_then(serde_json::Value::as_str) != Some(expected.issuer)
@@ -638,6 +671,7 @@ fn dependencies(server: &FakeServer, vault: Arc<MemoryVault>) -> DaemonDependenc
 
 async fn start_flow(
     client: &mut UdsClient,
+    provider: &str,
     request_id: &str,
     attempt_id: &str,
     desired_alias: &str,
@@ -646,7 +680,7 @@ async fn start_flow(
         client,
         request_id,
         RequestBody::AccountOAuthStart {
-            provider: "fake-oauth".into(),
+            provider: provider.into(),
             desired_alias: desired_alias.into(),
             attempt_id: attempt_id.into(),
         },
@@ -741,8 +775,14 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     ));
 
     let mut owner = control(&config, "owner-1").await;
-    let (flow_id, authorization_url) =
-        start_flow(&mut owner, "oauth-start", "attempt-1", "work-oauth").await;
+    let (flow_id, authorization_url) = start_flow(
+        &mut owner,
+        server.provider,
+        "oauth-start",
+        "attempt-1",
+        "work-oauth",
+    )
+    .await;
     let formatted_start = format!("{authorization_url:?}");
     for sentinel in [CODE, ACCESS, REFRESH, ID_MARKER, RAW_ERROR] {
         assert!(!formatted_start.contains(sentinel));
@@ -895,6 +935,7 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     server.fail_next_token();
     let (failed_flow, failed_authorization_url) = start_flow(
         &mut owner,
+        server.provider,
         "oauth-fail-start",
         "attempt-fail",
         "failed-oauth",
@@ -945,6 +986,7 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     // and wipes the unclaimed flow; no later connection can drive it.
     let (_, disconnected_url) = start_flow(
         &mut owner,
+        server.provider,
         "disconnect-start",
         "disconnect-attempt",
         "discarded",
@@ -1085,9 +1127,50 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     config.discovery_disabled = true; // hermetic: direct spawns bypass support::ready
     config.drain_timeout = Duration::from_millis(100);
     config.inject_worker_manager_shutdown_error = inject_worker_shutdown_error;
-    let server = FakeServer::start().await;
+    // The turn factory resolves for a remote destination even though this
+    // injected provider never sends HTTP. Use a sanctioned issuer label so
+    // its guard permits refresh; authorization and token traffic stay local.
+    // discovery_disabled also suppresses automatic remote catalog refresh.
+    let server = FakeServer::start_with_registration(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        Some("https://auth.openai.com"),
+    )
+    .await;
+    // Remote providers require a fetched catalog for turn admission. Seed a
+    // synthetic model rather than fetching the live OpenAI catalog.
+    {
+        let store = haider_store::Store::open(&config.store_dir).expect("seed barrier catalog");
+        // A stale catalog triggers an explicit refresh during session.create,
+        // even with automatic discovery disabled. Keep this fixture fresh.
+        let fetched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("catalog clock")
+            .as_millis()
+            .try_into()
+            .expect("catalog millisecond clock");
+        let models = vec![haider_provider::DiscoveredModel {
+            slug: "fake-model".into(),
+            display_name: "Fake barrier model".into(),
+            context_window: Some(4096),
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            extensions: None,
+        }];
+        store
+            .put_provider_models(
+                server.provider,
+                &serde_json::to_string(&models).expect("serialize barrier catalog"),
+                None,
+                fetched_at,
+            )
+            .expect("write barrier catalog");
+    }
     let vault = Arc::new(BlockingRotationVault::new());
     let builder = Arc::new(OAuthTurnBuilder {
+        provider: server.provider,
         fake: Arc::new(FakeProvider::new(vec![FakeStep::Finish {
             reason: haider_protocol::provider::FinishReason::EndTurn,
         }])),
@@ -1115,6 +1198,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     let mut client = control(&config, "barrier-owner").await;
     let (flow_id, authorization_url) = start_flow(
         &mut client,
+        server.provider,
         "barrier-oauth-start",
         "barrier-attempt",
         "work",
@@ -1135,7 +1219,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         "barrier-account-add",
         RequestBody::AccountAdd {
             command_id: CommandId::new("barrier-account-command"),
-            provider: "fake-oauth".into(),
+            provider: server.provider.into(),
             alias: "work".into(),
             auth_method: AccountAddMethod::OAuth,
             flow_id,
@@ -1155,6 +1239,8 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         ))
         .expect("initial bundle");
     let initial = OAuthTokenBundleV1::decode(stored.expose_secret()).expect("decode initial");
+    assert_eq!(initial.provider_id, server.provider);
+    assert_eq!(initial.issuer, server.issuer);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -1192,7 +1278,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         RequestBody::SessionCreate {
             command_id: CommandId::new("barrier-session-command"),
             cwd: workspace.to_string_lossy().into_owned(),
-            provider: "fake-oauth".into(),
+            provider: server.provider.into(),
             model: "fake-model".into(),
             max_tokens: 64,
         },
@@ -1354,7 +1440,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         RequestBody::SessionCreate {
             command_id: CommandId::new("barrier-successor-session-command"),
             cwd: workspace.to_string_lossy().into_owned(),
-            provider: "fake-oauth".into(),
+            provider: server.provider.into(),
             model: "fake-model".into(),
             max_tokens: 64,
         },
