@@ -473,21 +473,11 @@ async fn serve(
     let identity = serde_json::json!({
         "marker": ID_MARKER,
         "issuer": issuer,
-        "iss": issuer,
         "audience": "fake-resource",
         "nonce": authorization.nonce,
         "subject": "fake-subject",
-        "sub": "fake-subject",
-        "display": "person@example.invalid",
-        "email": "person@example.invalid"
+        "display": "person@example.invalid"
     });
-    // This is an unsigned fixture JWT, accepted only by FakeVerifier below.
-    // The production informational OpenAI parser still sees the real shape.
-    let id_token = format!(
-        "{}.{}.fixture-signature",
-        URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#),
-        URL_SAFE_NO_PAD.encode(identity.to_string()),
-    );
     let token = serde_json::json!({
         "access_token": ACCESS,
         "refresh_token": REFRESH,
@@ -495,7 +485,7 @@ async fn serve(
         "expires_in": 3600,
         "refresh_expires_in": 7200,
         "scope": SCOPES,
-        "id_token": id_token
+        "id_token": identity.to_string()
     })
     .to_string();
     write_response(&mut stream, 200, None, token.as_bytes()).await;
@@ -565,14 +555,7 @@ impl OAuthIdentityVerifier for FakeVerifier {
         id_token: &[u8],
         expected: OAuthIdentityExpectation<'_>,
     ) -> Result<OAuthIdentityV1, OAuthPublicError> {
-        let malformed = || OAuthPublicError::new("id_token_malformed", false);
-        let token = std::str::from_utf8(id_token).map_err(|_| malformed())?;
-        let parts = token.split('.').collect::<Vec<_>>();
-        if parts.len() != 3 {
-            return Err(malformed());
-        }
-        let payload = URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| malformed())?;
-        let claims: serde_json::Value = serde_json::from_slice(&payload)
+        let claims: serde_json::Value = serde_json::from_slice(id_token)
             .map_err(|_| OAuthPublicError::new("id_token_malformed", false))?;
         if claims.get("marker").and_then(serde_json::Value::as_str) != Some(ID_MARKER)
             || claims.get("issuer").and_then(serde_json::Value::as_str) != Some(expected.issuer)
@@ -1130,14 +1113,16 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     // The turn factory resolves for a remote destination even though this
     // injected provider never sends HTTP. Use a sanctioned issuer label so
     // its guard permits refresh; authorization and token traffic stay local.
+    // Kimi has no token-derived AccountIdentity, preserving the legacy row
+    // shape whose startup backfill must detect a missing vault entry.
     // discovery_disabled also suppresses automatic remote catalog refresh.
     let server = FakeServer::start_with_registration(
-        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
-        Some("https://auth.openai.com"),
+        haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        Some("https://auth.kimi.com"),
     )
     .await;
     // Remote providers require a fetched catalog for turn admission. Seed a
-    // synthetic model rather than fetching the live OpenAI catalog.
+    // synthetic model rather than fetching the live provider catalog.
     {
         let store = haider_store::Store::open(&config.store_dir).expect("seed barrier catalog");
         // A stale catalog triggers an explicit refresh during session.create,
@@ -1232,6 +1217,10 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         ResponseBody::AccountAdd { descriptor } => descriptor,
         other => panic!("unexpected account.add response: {other:?}"),
     };
+    assert!(
+        descriptor.account_identity.is_none(),
+        "the shutdown fixture retains the legacy identity-free row shape"
+    );
     let stored = vault
         .resolve(&haider_daemon::scoped_vault_alias(
             profile_id,
@@ -1429,7 +1418,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
                         }
                     )
             }),
-            "successor migrates the durable descriptor to typed source-gone"
+            "successor migrates the durable descriptor to typed source-gone: {descriptors:?}"
         ),
         other => panic!("unexpected account.list response: {other:?}"),
     }
