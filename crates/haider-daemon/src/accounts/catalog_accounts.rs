@@ -170,6 +170,7 @@ pub(super) async fn discover_models_with_account(
     let resolved = match &destination {
         CatalogDestination::InProcess => broker.resolve_in_process(descriptor).await,
         CatalogDestination::Remote => broker.resolve_remote(descriptor).await,
+        #[cfg(debug_assertions)]
         CatalogDestination::Loopback(url) => broker.resolve_to_loopback(descriptor, url).await,
     };
     match resolved {

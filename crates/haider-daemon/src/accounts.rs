@@ -1579,6 +1579,7 @@ pub(crate) enum CatalogDestination {
     /// The provider's real network endpoint.
     Remote,
     /// A numeric-loopback stand-in (the debug fake-OAuth data plane).
+    #[cfg(debug_assertions)]
     Loopback(url::Url),
 }
 
