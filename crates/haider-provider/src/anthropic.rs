@@ -210,6 +210,9 @@ fn thinking_binding_rejected_routes() -> &'static Mutex<HashMap<ThinkingBindingR
     ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Keep the established ASCII word-token contract: hyphens (including `-v2`)
+// separate tokens, as do dots/brackets. ASCII letters, digits and underscores
+// extend a word. Gateway prose is not an exact schema-path parser.
 fn contains_opt_in_token(message: &str) -> bool {
     [
         "block_binding",
@@ -229,117 +232,344 @@ fn contains_opt_in_token(message: &str) -> bool {
     })
 }
 
-/// Whether a 400 body is an explicit validation rejection of Haider's
-/// prefix-binding opt-in itself: `block_binding` / `prefix_mismatch_behavior`
-/// as an unknown or forbidden field, or the binding-controls beta as an
-/// unknown or unsupported `anthropic-beta` value. Merely NAMING those settings
-/// is not enough: Anthropic's documented prefix-mismatch error ("Invalid
-/// `signature` in `thinking` block. The block is bound to a different
-/// conversation. Remove the block, or set
-/// `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". That
-/// setting requires the `thinking-binding-controls-2026-08-01` value ...")
-/// recommends exactly these settings as its remedy. Any signature or
-/// prefix-binding diagnostic is therefore never an unsupported-opt-in
-/// rejection, and neither is any other invalid request.
-pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
-    // A body at the read ceiling may have lost a later prefix/signature
-    // exclusion. Fail closed rather than infer a route capability from it.
-    if body.len() >= crate::HTTP_ERROR_BODY_LIMIT {
-        return false;
+// Preserve repeated diagnostic keys instead of Value's last-key-wins behavior.
+// Repeated values form a flat group, so a bounded flat body cannot create a
+// deeply nested synthetic tree while retaining every diagnostic occurrence.
+struct BindingDiagnosticValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for BindingDiagnosticValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DiagnosticVisitor;
+        impl<'de> serde::de::Visitor<'de> for DiagnosticVisitor {
+            type Value = BindingDiagnosticValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON diagnostic body")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<BindingDiagnosticValue>()? {
+                    values.push(value.0);
+                }
+                Ok(BindingDiagnosticValue(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                let mut repeated = std::collections::HashSet::new();
+                while let Some((key, value)) = map.next_entry::<String, BindingDiagnosticValue>()? {
+                    match fields.entry(key) {
+                        serde_json::map::Entry::Vacant(entry) => {
+                            entry.insert(value.0);
+                        }
+                        serde_json::map::Entry::Occupied(mut entry) => {
+                            if repeated.insert(entry.key().clone()) {
+                                let previous =
+                                    std::mem::replace(entry.get_mut(), serde_json::Value::Null);
+                                *entry.get_mut() =
+                                    serde_json::Value::Array(vec![previous, value.0]);
+                            } else if let serde_json::Value::Array(values) = entry.get_mut() {
+                                values.push(value.0);
+                            } else {
+                                return Err(serde::de::Error::custom(
+                                    "invalid diagnostic value group",
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(BindingDiagnosticValue(serde_json::Value::Object(fields)))
+            }
+        }
+        deserializer.deserialize_any(DiagnosticVisitor)
     }
-    #[derive(Default, Deserialize)]
-    #[serde(default)]
-    struct Diagnostic {
-        #[serde(rename = "type")]
-        kind: Option<String>,
-        message: Option<String>,
-        param: Option<String>,
-        details: Option<serde_json::Value>,
+}
+
+/// Collect only diagnostic fields, including the common gateway alternatives.
+/// Request/input echoes are not diagnostics, even inside `details`.
+#[derive(Default)]
+struct BindingDiagnostic {
+    text: String,
+    exclusion_text: String,
+    has_message: bool,
+    has_unparsed_fields: bool,
+    prefix_or_signature: bool,
+}
+
+impl BindingDiagnostic {
+    fn collect(&mut self, value: &serde_json::Value, message: bool, all_fields: bool) {
+        match value {
+            serde_json::Value::String(text) => {
+                self.has_message |= message && !text.trim().is_empty();
+                self.text.push('\n');
+                let text = text.to_ascii_lowercase();
+                // Preserve the primary message's conservative signature guard.
+                // Details retain their context and use the specific phrases below.
+                self.prefix_or_signature |= message && !all_fields && text.contains("signature");
+                self.text.push_str(&text);
+                if message {
+                    self.exclusion_text.push('\n');
+                    self.exclusion_text.push_str(&text);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.collect(value, message, all_fields);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    if binding_diagnostic_echo_field(key) {
+                        continue;
+                    }
+                    match key.as_str() {
+                        "type" | "__type" => {
+                            self.collect_kind(value, message && !all_fields);
+                        }
+                        "message" | "Message" | "msg" | "error" => {
+                            self.collect(value, true, all_fields)
+                        }
+                        "detail" | "details" | "errors" => self.collect(value, true, true),
+                        "param" | "field" | "path" | "loc" => self.collect(value, false, true),
+                        _ if all_fields => {
+                            // Some validators encode a field name as the key.
+                            self.collect(&serde_json::Value::String(key.clone()), false, false);
+                            self.collect(value, true, true);
+                        }
+                        _ => {
+                            // The key itself may carry a diagnostic, even when
+                            // its value is a number, boolean or null.
+                            self.has_unparsed_fields = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    #[derive(Default, Deserialize)]
-    #[serde(default)]
-    struct Envelope {
-        error: Option<Diagnostic>,
-        message: Option<String>,
+    fn collect_kind(&mut self, value: &serde_json::Value, primary: bool) {
+        match value {
+            serde_json::Value::String(kind) => {
+                let kind = kind.to_ascii_lowercase();
+                self.prefix_or_signature |= binding_kind_excludes_rejection(&kind, primary);
+                // Keep literal opt-in tokens as well as normalized error-code wording.
+                self.collect(&serde_json::Value::String(kind.clone()), false, false);
+                self.collect(
+                    &serde_json::Value::String(kind.replace(['_', '-'], " ")),
+                    false,
+                    false,
+                );
+            }
+            serde_json::Value::Array(values) => {
+                self.has_unparsed_fields = true;
+                for value in values {
+                    self.collect_kind(value, primary);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                self.has_unparsed_fields = true;
+                for (key, value) in fields {
+                    if !binding_diagnostic_echo_field(key) {
+                        self.collect_kind(&serde_json::Value::String(key.clone()), primary);
+                        self.collect_kind(value, primary);
+                    }
+                }
+            }
+            _ => self.has_unparsed_fields |= !value.is_null(),
+        }
     }
-    let (message, kind, param, details) = match serde_json::from_slice::<Envelope>(body) {
-        Ok(envelope) => match envelope.error {
-            Some(error) => (
-                error.message.unwrap_or_default(),
-                error.kind.unwrap_or_default(),
-                error.param.unwrap_or_default(),
-                error
-                    .details
-                    .map_or_else(String::new, |value| value.to_string()),
-            ),
-            None => (
-                envelope.message.unwrap_or_default(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
-        },
-        Err(_) => (
-            String::from_utf8_lossy(body).into_owned(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ),
-    };
-    let message = message.to_ascii_lowercase();
-    let kind = kind.to_ascii_lowercase();
-    let kind_words = kind.replace(['_', '-'], " ");
-    let param = param.to_ascii_lowercase();
-    let details = details.to_ascii_lowercase();
-    let prefix_or_signature_diagnostic = [
-        "signature",
+}
+
+fn binding_kind_excludes_rejection(kind: &str, primary_kind: bool) -> bool {
+    // Type aliases can be snake case, camel case or qualified SDK names.
+    // A type naming the optional policy field is not a prefix diagnostic.
+    let compact: String = kind.chars().filter(char::is_ascii_alphanumeric).collect();
+    if primary_kind
+        && (compact.contains("signature")
+            || compact.contains("prefix") && !compact.contains("prefixmismatchbehavior"))
+    {
+        return true;
+    }
+    compact.contains("prefixbindingmismatch")
+        || compact.contains("prefixmismatch") && !compact.contains("prefixmismatchbehavior")
+        || [
+            "signaturevalidation",
+            "invalidsignature",
+            "signatureinvalid",
+            "signaturemismatch",
+            "signatureverification",
+            "signatureerror",
+        ]
+        .iter()
+        .any(|marker| compact.contains(marker))
+}
+
+fn binding_diagnostic_echo_field(key: &str) -> bool {
+    ["request", "input", "signature"]
+        .iter()
+        .any(|field| key.eq_ignore_ascii_case(field))
+}
+
+fn strip_binding_diagnostic_echoes(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.retain(|key, _| !binding_diagnostic_echo_field(key));
+            for value in fields.values_mut() {
+                strip_binding_diagnostic_echoes(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                strip_binding_diagnostic_echoes(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn binding_diagnostic_excludes_rejection(text: &str) -> bool {
+    // A signature word/key inside details or an echoed signature must not
+    // invalidate an independent field rejection. Exclude the actual diagnostic
+    // phrases, including Anthropic's remedy for a signed-prefix mismatch.
+    [
+        "invalid signature",
+        "invalid `signature`",
+        "signature mismatch",
+        "signature verification failed",
+        "signature is invalid",
         "bound to a different conversation",
         "prefix_binding_mismatch",
         "prefix mismatch",
         "remove the block",
     ]
     .iter()
-    .any(|marker| message.contains(marker) || kind.contains(marker) || details.contains(marker));
-    if prefix_or_signature_diagnostic || kind.contains("prefix") || kind.contains("signature") {
+    .any(|phrase| text.contains(phrase))
+}
+
+fn binding_diagnostic_rejects(text: &str) -> bool {
+    contains_opt_in_token(text)
+        && [
+            "extra inputs are not permitted",
+            "extra input is not permitted",
+            "extraneous key",
+            "is not permitted",
+            "not permitted",
+            "unknown name",
+            "cannot find field",
+            "unrecognized request argument",
+            "unrecognized field",
+            "unrecognized",
+            "not recognized",
+            "unknown parameter",
+            "unknown field",
+            "unknown beta",
+            "unexpected field",
+            "unexpected keyword",
+            "unexpected value",
+            "additional properties are not allowed",
+            "not allowed",
+            "unsupported",
+            "not supported",
+            "invalid beta",
+            "not a valid beta",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
+}
+
+/// Whether a 400 explicitly rejects the binding field or beta opt-in.
+/// Diagnostic containers are decoded rather than silently discarded by a
+/// permissive envelope. Incomplete/unknown envelopes also use the bounded raw
+/// body, while a complete typed inner error protects against unrelated outer echoes.
+/// Signed-prefix errors recommending the setting as a remedy never qualify.
+pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
+    // A body at the read ceiling may have lost a later diagnostic exclusion.
+    if body.len() >= crate::HTTP_ERROR_BODY_LIMIT {
         return false;
     }
-    // Gateways word an unknown-field / unsupported-parameter rejection in
-    // many ways (Anthropic, Bedrock, Vertex, OpenAI-compatible proxies). Any
-    // such generic wording counts, but ONLY when the message names the
-    // opt-in itself: the binding field or the binding-controls beta value.
-    let names_opt_in = [&message, &param, &details]
-        .iter()
-        .any(|part| contains_opt_in_token(part));
-    let rejection_wording = [
-        "extra inputs are not permitted",
-        "extra input is not permitted",
-        "extraneous key",
-        "is not permitted",
-        "not permitted",
-        "unknown name",
-        "cannot find field",
-        "unrecognized request argument",
-        "unrecognized field",
-        "unrecognized",
-        "not recognized",
-        "unknown parameter",
-        "unknown field",
-        "unknown beta",
-        "unexpected field",
-        "unexpected keyword",
-        "unexpected value",
-        "additional properties are not allowed",
-        "not allowed",
-        "unsupported",
-        "not supported",
-        "invalid beta",
-        "not a valid beta",
-    ]
-    .iter()
-    .any(|phrase| {
-        message.contains(phrase) || kind_words.contains(phrase) || details.contains(phrase)
-    });
-    names_opt_in && rejection_wording
+    let mut diagnostic = BindingDiagnostic::default();
+    let mut inner_message = false;
+    let mut raw_exclusion = None;
+    if let Ok(BindingDiagnosticValue(mut value)) = serde_json::from_slice(body) {
+        if let Some(fields) = value.as_object_mut() {
+            // Preserve the prior complete wire envelope's message authority.
+            // Missing/null/non-string typed fields must not hide the outer message.
+            inner_message = fields.get("error").is_some_and(|error| {
+                ["type", "message"]
+                    .iter()
+                    .all(|key| error.get(key).is_some_and(serde_json::Value::is_string))
+            });
+            if inner_message {
+                // Preserve the established inner-message authority, including
+                // explicit empty strings. Alternative/empty wrapper fields do
+                // not by themselves establish complete diagnostic coverage.
+                diagnostic.has_message = true;
+                for key in ["message", "Message", "msg"] {
+                    fields.remove(key);
+                }
+            }
+        }
+        diagnostic.collect(&value, true, false);
+        // Raw compatibility matching still sees the entire body. Its veto
+        // must retain diagnostic provenance so an echoed signature/remedy
+        // cannot suppress an independent field rejection.
+        strip_binding_diagnostic_echoes(&mut value);
+        raw_exclusion = Some(value.to_string().to_ascii_lowercase());
+    }
+    if !diagnostic.has_message || diagnostic.has_unparsed_fields && !inner_message {
+        // Serde accepting a JSON object does not prove diagnostic coverage:
+        // empty and partly populated envelopes still need the legacy fallback.
+        diagnostic.text.push(' ');
+        let raw = String::from_utf8_lossy(body).to_ascii_lowercase();
+        if raw_exclusion.is_none() && raw.contains("signature") {
+            return false;
+        }
+        diagnostic
+            .text
+            .push_str(raw_exclusion.as_deref().unwrap_or(&raw));
+        diagnostic.exclusion_text.push('\n');
+        diagnostic
+            .exclusion_text
+            .push_str(raw_exclusion.as_deref().unwrap_or(&raw));
+    }
+    !diagnostic.prefix_or_signature
+        && !binding_diagnostic_excludes_rejection(&diagnostic.exclusion_text)
+        && binding_diagnostic_rejects(&diagnostic.text)
 }
 
 /// Removes the binding opt-in from a rendered payload. The beta header is

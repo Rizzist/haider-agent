@@ -3278,6 +3278,221 @@ fn binding_classifier_structured_tokens_and_bounded_controls() {
     ));
 }
 
+#[test]
+fn binding_classifier_preserves_alternative_diagnostic_containers() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    for body in [
+        r#"{"detail":[{"type":"extra_forbidden","loc":["body","thinking","block_binding"],"msg":"Extra inputs are not permitted","input":{}}]}"#,
+        r#"{"__type":"ValidationException","Message":"extraneous key [block_binding] is not permitted"}"#,
+        r#"{"errors":[{"message":"Unknown field block_binding"}]}"#,
+        r#"{"errors":[{"message":"Unknown field","param":"thinking.block_binding"}]}"#,
+        r#"{"error":{"type":"invalid_request_error"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"invalid_request_error","message":null},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"details":{"field":"thinking.block_binding","msg":"Request validation failed"}},"message":"Unknown field"}"#,
+        r#"{"detail":"Unknown field block_binding"}"#,
+        r#"{"detail":{"message":"Unknown field block_binding"}}"#,
+        r#"{"message":"Validation failed","detail":{"block_binding":"Extra inputs are not permitted"}}"#,
+        r#"{"message":"Validation failed","details":{"diagnostic":"Unknown field block_binding"}}"#,
+        r#"{"details":[{"message":"Unknown field block_binding"}]}"#,
+        r#"{"msg":"Unknown field block_binding"}"#,
+        r#"{"error":{"Message":"Unknown field block_binding"}}"#,
+        r#"{"error":{"msg":"Unknown field block_binding"}}"#,
+        r#"{"error":{"errors":[{"message":"Unknown field block_binding"}]}}"#,
+        r#"{"error":{"type":"invalid_request_error","param":"thinking.block_binding","msg":"Unknown field"}}"#,
+        r#"{"error":{"type":"invalid_request_error","details":{"field":"thinking.block_binding"},"msg":"Unknown field"}}"#,
+        r#"{"error":{"type":"invalid_request_error","details":{"field":"thinking.block_binding"},"Message":"Unknown field"}}"#,
+        r#"{"message":"Request validation failed","detail":[{"loc":["body","thinking","block_binding"],"msg":"Extra inputs are not permitted"}]}"#,
+        r#"{"message":"Request validation failed","errors":[{"param":"thinking.block_binding","msg":"Unknown field"}]}"#,
+        r#"{"message":"Request validation failed","Message":"Unknown field block_binding"}"#,
+        r#"{"error":{"message":"Request validation failed","errors":[{"message":"Unknown field block_binding"}]}}"#,
+        r#"{"error":"Unknown field block_binding"}"#,
+        r#"{"error":[{"message":"Unknown field block_binding"}]}"#,
+        r#"{"error":null,"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"unsupported_prefix_mismatch_behavior","message":"Unknown field prefix_mismatch_behavior"}}"#,
+        r#"{"error":{"type":"unknown_prefix_mismatch_behavior","message":"Unknown field thinking.block_binding.prefix_mismatch_behavior"}}"#,
+        r#"{"detail":{"details":[{"errors":[{"msg":"UNKNOWN FIELD","loc":["thinking","BLOCK_BINDING"]}]}]}}"#,
+        r#"{"msg":"Unknown field block\u005fbinding"}"#,
+        r#"{"__type":"Unknown field block_binding","Message":"Validation failed"}"#,
+        r#"{"message":"Unknown field block_binding","message":"Validation failed"}"#,
+        r#"{"message":"Unknown field block_binding","mes\u0073age":"Validation failed"}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"Unknown field block_binding","message":"Validation failed"}}"#,
+        r#"{"error":{"type":"Unknown field block_binding","type":"invalid_request_error","message":"Validation failed"}}"#,
+        r#"{"error":{"msg":"Unknown field block_binding"},"error":{"msg":"Validation failed"}}"#,
+        r#"{"detail":[{"msg":"Unknown field block_binding"}],"detail":[{"msg":"Validation failed"}]}"#,
+        r#"{"details":"Unknown field block_binding","details":"Validation failed"}"#,
+        r#"{"errors":[{"msg":"Unknown field block_binding"}],"errors":[{"msg":"Validation failed"}]}"#,
+    ] {
+        assert!(rejects(body.as_bytes()), "diagnostic container: {body}");
+    }
+    // Structured locations may name the rejected field in a map key.
+    for key in ["param", "field", "path", "loc"] {
+        let body = serde_json::json!({"error":{
+            "type":"invalid_request_error", "message":"Unknown field",
+            key:{"thinking.block_binding":null}
+        }});
+        assert!(
+            rejects(body.to_string().as_bytes()),
+            "mapped location: {body}"
+        );
+    }
+    // Container shapes compose at the top level and inside an error envelope.
+    for key in ["detail", "details", "errors"] {
+        for value in [
+            serde_json::json!("Unknown field block_binding"),
+            serde_json::json!({"param":"thinking.block_binding","msg":"Unknown field"}),
+            serde_json::json!([{"field":"thinking.block_binding","Message":"Unknown field"}]),
+        ] {
+            let diagnostic = serde_json::json!({"message":"Request validation failed", key:value});
+            for body in [diagnostic.clone(), serde_json::json!({"error":diagnostic})] {
+                assert!(
+                    rejects(body.to_string().as_bytes()),
+                    "composed container: {body}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn binding_classifier_falls_back_on_empty_and_partial_envelopes() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    for body in [
+        r#"{"gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"message":"","gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"message":"Request validation failed","gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"error":{"param":"thinking.block_binding"},"message":"Request validation failed","reason":"Unknown field"}"#,
+        r#"{"message":"   ","gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"detail":"","gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"error":{"msg":""},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"message":""},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":null,"message":"Request validation failed"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":400,"message":"Request validation failed"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":{"msg":"Unknown field block_binding"},"message":"Request validation failed"}}"#,
+        r#"{"error":{"Message":"Request validation failed"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"param":"thinking.block_binding","reason":"Unknown field"}}"#,
+        r#"{"error":{"type":"invalid_request_error","reason":"Unknown field block_binding"}}"#,
+        "gateway: Unknown field block_binding",
+        r#"{"error": { malformed: "Unknown field block_binding"}"#,
+    ] {
+        assert!(rejects(body.as_bytes()), "bounded raw fallback: {body}");
+    }
+    // Unknown keys themselves are diagnostic text, irrespective of value type.
+    for value in [
+        serde_json::json!(400),
+        serde_json::json!(false),
+        serde_json::Value::Null,
+    ] {
+        let body =
+            serde_json::json!({"message":"Validation failed", "Unknown field block_binding":value});
+        assert!(
+            rejects(body.to_string().as_bytes()),
+            "diagnostic key: {body}"
+        );
+    }
+    // Flat duplicate keys stay flat and preserve the first diagnostic.
+    let mut repeated = String::from("{\"message\":\"Unknown field block_binding\"");
+    for _ in 0..2_500 {
+        repeated.push_str(",\"message\":\"ok\"");
+    }
+    repeated.push('}');
+    assert!(repeated.len() < crate::HTTP_ERROR_BODY_LIMIT);
+    assert!(rejects(repeated.as_bytes()));
+    assert!(rejects(b"\xff Unknown field block_binding"));
+    for body in [b"{}".as_slice(), b"null", b"[]", b"", b"{", b"{\xff}"] {
+        assert!(!rejects(body), "empty/non-diagnostic: {body:?}");
+    }
+    for length in [65_535, 65_536, 65_537] {
+        let mut body = b"Unknown field block_binding ".to_vec();
+        body.resize(length, b'x');
+        assert_eq!(rejects(&body), length < 65_536, "length {length}");
+    }
+}
+
+#[test]
+fn binding_classifier_scopes_signature_and_echo_exclusions() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    for body in [
+        r#"{"error":{"message":"Unknown field block_binding","details":{"request":{"signature":"synthetic"}}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":"signature synthetic"}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"message":"signature synthetic"}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"request":{"signature":"Invalid signature; remove the block"}}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"signature":"Invalid signature"}}}"#,
+        r#"{"request_id":"synthetic","error":{"message":"Unknown field block_binding","details":{"request":{"signature":"Invalid signature; remove the block"}}}}"#,
+        r#"{"message":"Request validation failed","reason":"Unknown field block_binding","details":{"Request":{"Signature":"Invalid signature; remove the block"}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"type":"signature_metadata"}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":[{"field":"signature","message":"metadata"}]}}"#,
+        r#"{"error":{"message":"Unknown field block_binding"},"request":{"signature":"synthetic"}}"#,
+    ] {
+        assert!(
+            rejects(body.as_bytes()),
+            "signature echo cannot veto: {body}"
+        );
+    }
+    for body in [
+        r#"{"error":{"message":"unsupported media type"},"request":{"block_binding":{}}}"#,
+        r#"{"error":{"message":"unsupported media type","details":{"input":{"block_binding":{}}}}}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"unsupported media type"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"invalid_request_error","message":""},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"   "},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"prefix_binding_mismatch"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"signature_validation_error","msg":"Unknown field block_binding"}}"#,
+        r#"{"error":{"type":"PrefixBindingMismatch","message":"Unsupported conversation prefix; set thinking.block_binding.prefix_mismatch_behavior to drop_block"}}"#,
+        r#"{"error":{"type":"prefix-binding-mismatch","message":"Unknown field block_binding"}}"#,
+        r#"{"__type":"vendor#InvalidSignatureException","Message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"SignatureError","message":"Unknown field block_binding"}}"#,
+        r#"{"error":{"type":"signature_invalid","message":"Unknown field block_binding"}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"type":"signature_invalid"}}}"#,
+        r#"{"error":{"type":"prefix_error","message":"Unsupported conversation prefix; set thinking.block_binding.prefix_mismatch_behavior to drop_block"}}"#,
+        r#"{"detail":{"msg":"Invalid signature; remove the block or set thinking.block_binding.prefix_mismatch_behavior"}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"message":"Invalid signature in thinking block; remove the block"}}}"#,
+        r#"{"detail":{"msg":"Unsupported image type","loc":["body","image"]}}"#,
+        r#"{"message":"Request validation failed","reason":"Invalid signature; remove the block or set thinking.block_binding.prefix_mismatch_behavior"}"#,
+        r#"{"errors":[{"msg":"max_tokens must be positive","param":"max_tokens"}]}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"unsupported content block. Request: {\"thinking\":{\"block_binding\":{}},\"messages\":[{\"content\":[{\"type\":\"thinking\",\"signature\":\"abc\"}]}]}"}}"#,
+        r#"unsupported content block. Request: {"thinking":{"block_binding":{}},"messages":[{"content":[{"type":"thinking","signature":"abc"}]}]}"#,
+        r#"{"signature":"Unknown field block_binding"}"#,
+        r#"{"request":{"message":"Unknown field block_binding"}}"#,
+        r#"{"message":"Validation failed","details":{"input":"Unknown field block_binding"}}"#,
+        r#"{"message":"Unknown","details":{"msg":"field","param":"thinking.block_binding"}}"#,
+        r#"{"error":{"type":"prefix_binding_mismatch","type":"invalid_request_error","message":"Unknown field block_binding"}}"#,
+        r#"{"error":{"type":"signature_validation_error","type":"invalid_request_error","message":"Unknown field block_binding"}}"#,
+    ] {
+        assert!(
+            !rejects(body.as_bytes()),
+            "negative diagnostic control: {body}"
+        );
+    }
+}
+
+#[test]
+fn binding_classifier_hyphens_follow_the_ascii_token_contract() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    // Deliberately retain the established contract: a hyphen is a boundary,
+    // so gateway prose mentioning block_binding-v2 still names the token.
+    for token in [
+        "block_binding-v2",
+        "my-block_binding",
+        "block_bindingé",
+        "préblock_binding",
+        "thinking-binding-controls-2026-08-01-preview",
+    ] {
+        assert!(
+            rejects(format!("Unknown field {token}").as_bytes()),
+            "{token}"
+        );
+    }
+    for token in [
+        "block_bindings",
+        "user_block_binding_metadata",
+        "prefix_mismatch_behaviors",
+    ] {
+        assert!(
+            !rejects(format!("Unknown field {token}").as_bytes()),
+            "{token}"
+        );
+    }
+}
+
 const VALID_BINDING_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
 event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
 event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
