@@ -930,7 +930,7 @@ pub(crate) struct ActiveRunOutputPairSnapshot {
 }
 
 impl ActiveRunOutputPairSnapshot {
-    pub(crate) fn restore_route(&self, metadata: &mut SessionMetadataV1) {
+    pub(crate) fn restore_route(&self, metadata: &mut haider_protocol::session::SessionMetadataV1) {
         if let Some(rebound) = &self.rebound_route {
             metadata.provider_base_url.clone_from(&rebound.base_url);
             metadata.account_alias.clone_from(&rebound.account);
