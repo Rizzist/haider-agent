@@ -920,11 +920,34 @@ struct ModelSelectionBudgetPause {
 }
 
 pub(crate) struct ActiveRunOutputPairSnapshot {
+    pub durably_pinned: bool,
     pub run_id: RunId,
     pub provider: String,
     pub model: String,
     pub max_tokens: u64,
     pub source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
+    rebound_route: Option<Box<haider_protocol::session::SessionProviderRebound>>,
+}
+
+impl ActiveRunOutputPairSnapshot {
+    pub(crate) fn restore_route(&self, metadata: &mut SessionMetadataV1) {
+        if let Some(rebound) = &self.rebound_route {
+            metadata.provider_base_url.clone_from(&rebound.base_url);
+            metadata.account_alias.clone_from(&rebound.account);
+            metadata.provider_rebind_id = Some(rebound.rebind_id.clone());
+        } else if metadata.provider != self.provider {
+            metadata.provider_base_url = None;
+        }
+    }
+}
+
+enum RunOutputPairChange {
+    Switch {
+        run_id: RunId,
+        provider: String,
+        model: String,
+    },
+    Rebind(Box<haider_protocol::session::SessionProviderRebound>),
 }
 
 struct HubInner {
@@ -6714,19 +6737,40 @@ impl SessionHub {
         }
     }
 
-    /// Snapshot the currently running request lane at admission, then apply
-    /// only automatic in-run pair switches. Ordinary selections after that
-    /// point belong to the queued next turn, including during worker startup.
+    /// Reads the pair fixed for this run, with its subsequent automatic
+    /// switches and explicit rebinds. Ordinary selections never alter it.
+    pub(crate) async fn run_output_pair(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<Option<ActiveRunOutputPairSnapshot>, HaiderError> {
+        self.read_run_output_pair(session_id, Some(run_id)).await
+    }
+
     pub(crate) async fn active_run_output_pair(
         &self,
         session_id: &SessionId,
     ) -> Result<Option<ActiveRunOutputPairSnapshot>, HaiderError> {
+        self.read_run_output_pair(session_id, None).await
+    }
+
+    async fn read_run_output_pair(
+        &self,
+        session_id: &SessionId,
+        requested_run: Option<&RunId>,
+    ) -> Result<Option<ActiveRunOutputPairSnapshot>, HaiderError> {
+        use haider_protocol::session::RunOutputPairPinnedV1;
         let mut cursor = 0;
         let mut states = HashMap::<RunId, RunState>::new();
         let mut admitted = HashMap::<RunId, u64>::new();
         let mut started = HashMap::<RunId, u64>::new();
-        let mut specs = HashMap::<RunId, haider_protocol::headless::HeadlessRunSpecV1>::new();
-        let mut promoted = HashMap::<RunId, (String, String)>::new();
+        let mut specs = HashMap::new();
+        let mut pairs = HashMap::<RunId, ActiveRunOutputPairSnapshot>::new();
+        let mut pinned_at = HashMap::<RunId, u64>::new();
+        let mut terminal_at = HashMap::<RunId, u64>::new();
+        // Keep pair-changing facts in order so legacy runs can be seeded
+        // before the same reduction used by newly pinned runs.
+        let mut changes = Vec::new();
         loop {
             let page = self
                 .inner
@@ -6738,12 +6782,16 @@ impl SessionHub {
                     256,
                 )
                 .await?;
-            if page.is_empty() {
-                break;
-            }
             let count = page.len();
             for event in page {
                 cursor = event.seq;
+                if let Some(rebound) =
+                    haider_protocol::session::SessionProviderRebound::from_payload_value(
+                        &event.payload,
+                    )
+                {
+                    changes.push((event.seq, RunOutputPairChange::Rebind(Box::new(rebound))));
+                }
                 let Some(run_id) = event.run_id.as_ref() else {
                     continue;
                 };
@@ -6757,9 +6805,11 @@ impl SessionHub {
                 if let Ok(EventPayload::RunState(state)) = event.payload.decode_event() {
                     if matches!(state, RunState::Queued) {
                         admitted.entry(run_id.clone()).or_insert(event.seq);
-                    }
-                    if !matches!(state, RunState::Queued) {
+                    } else {
                         started.entry(run_id.clone()).or_insert(event.seq);
+                    }
+                    if state.is_terminal() {
+                        terminal_at.insert(run_id.clone(), event.seq);
                     }
                     states.insert(run_id.clone(), state);
                 }
@@ -6767,55 +6817,185 @@ impl SessionHub {
                     item: TurnItem::Extension { kind, data },
                     ..
                 })) = event.payload.decode_event()
-                    && kind == "provider_pair_switch_v1"
-                    && let Some(model) = data.get("to_model").and_then(serde_json::Value::as_str)
-                    && let Some(provider) =
-                        data.get("to_provider").and_then(serde_json::Value::as_str)
                 {
-                    promoted.insert(run_id.clone(), (provider.to_owned(), model.to_owned()));
+                    if kind == RunOutputPairPinnedV1::KIND {
+                        let pin: RunOutputPairPinnedV1 =
+                            serde_json::from_value(data).map_err(|error| {
+                                HaiderError::new(
+                                    ErrorCode::StoreCorrupt,
+                                    format!("invalid run output pair: {error}"),
+                                    false,
+                                )
+                            })?;
+                        pinned_at.entry(run_id.clone()).or_insert(event.seq);
+                        pairs
+                            .entry(run_id.clone())
+                            .or_insert(ActiveRunOutputPairSnapshot {
+                                durably_pinned: true,
+                                run_id: run_id.clone(),
+                                provider: pin.provider,
+                                model: pin.model,
+                                max_tokens: pin.max_tokens,
+                                source: Some(pin.source),
+                                rebound_route: None,
+                            });
+                    } else if kind == "run_worker_pickup_v1" {
+                        started.entry(run_id.clone()).or_insert(event.seq);
+                    } else if kind == "provider_pair_switch_v1"
+                        && let Some(model) =
+                            data.get("to_model").and_then(serde_json::Value::as_str)
+                        && let Some(provider) =
+                            data.get("to_provider").and_then(serde_json::Value::as_str)
+                    {
+                        changes.push((
+                            event.seq,
+                            RunOutputPairChange::Switch {
+                                run_id: run_id.clone(),
+                                provider: provider.to_owned(),
+                                model: model.to_owned(),
+                            },
+                        ));
+                    }
                 }
             }
             if count < 256 {
                 break;
             }
         }
-        let Some((run_id, active_start_seq)) = started
-            .into_iter()
-            .filter(|(run_id, _)| states.get(run_id).is_some_and(|state| !state.is_terminal()))
+        let active = started
+            .iter()
+            .filter(|(run_id, _)| {
+                states
+                    .get(*run_id)
+                    .is_some_and(|state| !state.is_terminal())
+            })
             .max_by_key(|(_, seq)| *seq)
-        else {
+            .map(|(run_id, _)| run_id);
+        let Some(target) = requested_run.or(active) else {
             return Ok(None);
         };
-        // A selection after acceptance is queued for the next turn even if
-        // worker startup has not yet emitted its first running state.
-        let start_seq = admitted.get(&run_id).copied().unwrap_or(active_start_seq);
-        let Some(snapshot) = self
-            .inner
-            .store
-            .session_output_pair_at(session_id.clone(), start_seq)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let mut provider = snapshot.provider;
-        let mut model = snapshot.model;
-        let mut max_tokens = snapshot.max_tokens;
-        if let Some(spec) = specs.get(&run_id) {
-            provider.clone_from(&spec.provider);
-            model.clone_from(&spec.model);
-            max_tokens = spec.max_output_tokens;
+        pairs.retain(|run_id, _| run_id == target);
+        // Compatibility with journals written before the durable pin existed.
+        // Only headless specs use admission; native legacy runs use start.
+        let mut legacy_boundaries = started.clone();
+        for run_id in specs.keys() {
+            if let Some(seq) = admitted.get(run_id) {
+                legacy_boundaries.entry(run_id.clone()).or_insert(*seq);
+            }
         }
-        if let Some((switched_provider, switched_model)) = promoted.remove(&run_id) {
-            provider = switched_provider;
-            model = switched_model;
+        legacy_boundaries.retain(|run_id, _| run_id == target);
+        for (run_id, start_seq) in &legacy_boundaries {
+            if pairs.contains_key(run_id) {
+                continue;
+            }
+            let spec = specs.get(run_id);
+            let seq = if spec.is_some() {
+                admitted.get(run_id).copied().unwrap_or(*start_seq)
+            } else {
+                *start_seq
+            };
+            if let Some(snapshot) = self
+                .inner
+                .store
+                .session_output_pair_at(session_id.clone(), seq)
+                .await?
+            {
+                pinned_at.insert(run_id.clone(), seq);
+                pairs.insert(
+                    run_id.clone(),
+                    ActiveRunOutputPairSnapshot {
+                        durably_pinned: false,
+                        run_id: run_id.clone(),
+                        provider: spec.map_or(snapshot.provider, |spec| spec.provider.clone()),
+                        model: spec.map_or(snapshot.model, |spec| spec.model.clone()),
+                        max_tokens: spec.map_or(snapshot.max_tokens, |spec| spec.max_output_tokens),
+                        source: snapshot.source,
+                        rebound_route: None,
+                    },
+                );
+            }
         }
-        Ok(Some(ActiveRunOutputPairSnapshot {
-            run_id,
-            provider,
-            model,
-            max_tokens,
-            source: snapshot.source,
-        }))
+        for (seq, change) in changes {
+            match change {
+                RunOutputPairChange::Switch {
+                    run_id,
+                    provider,
+                    model,
+                } => {
+                    if let Some(pair) = pairs.get_mut(&run_id) {
+                        if pair.provider != provider {
+                            pair.rebound_route = None;
+                        }
+                        pair.provider = provider;
+                        pair.model = model;
+                    }
+                }
+                RunOutputPairChange::Rebind(rebound) => {
+                    for (run_id, pair) in &mut pairs {
+                        if pinned_at.get(run_id).is_none_or(|pin| *pin >= seq)
+                            || terminal_at.get(run_id).is_some_and(|end| *end < seq)
+                        {
+                            continue;
+                        }
+                        pair.provider.clone_from(&rebound.provider);
+                        pair.rebound_route = Some(rebound.clone());
+                        if let Some(active) = rebound
+                            .active_output_budget
+                            .as_ref()
+                            .filter(|active| active.run_id == *run_id && active.model == pair.model)
+                        {
+                            pair.max_tokens = active.budget.max_tokens;
+                            pair.source = Some(active.budget.source);
+                        } else if pair.durably_pinned {
+                            // Queued headless specs are already pinned even though
+                            // they have no active record in this rebind receipt.
+                            if let Some(view) = self
+                                .accounts()
+                                .map_err(|error| {
+                                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                                })?
+                                .and_then(|accounts| accounts.management.read())
+                            {
+                                let authority = crate::model_select::ModelSelectionAuthority::new(
+                                    self.creatable_providers().map_err(|error| {
+                                        HaiderError::new(
+                                            ErrorCode::Internal,
+                                            error.to_string(),
+                                            false,
+                                        )
+                                    })?,
+                                    view.providers,
+                                );
+                                let selection = authority
+                                    .validate_selection_with_status(
+                                        &pair.provider,
+                                        Some(&pair.provider),
+                                        &pair.model,
+                                    )
+                                    .map_err(|refusal| {
+                                        HaiderError::new(
+                                            ErrorCode::InvalidArgument,
+                                            format!(
+                                                "recovered provider rebind rejected the active model: {}",
+                                                refusal.message()
+                                            ),
+                                            false,
+                                        )
+                                    })?;
+                                let budget = haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(pair.source, pair.max_tokens)
+                                    .apply(selection.max_output_tokens, selection.explicit_max_output_tokens);
+                                pair.max_tokens = budget.max_tokens;
+                                pair.source = Some(budget.source);
+                            }
+                        } else if let Some(budget) = rebound.output_budget {
+                            pair.max_tokens = budget.max_tokens;
+                            pair.source = Some(budget.source);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(pairs.remove(target))
     }
 
     /// One per-session total order for native workflow selection and the

@@ -290,7 +290,11 @@ async fn assert_active_budget_from_origin(origin: &str) {
     hub.accept_internal_turn(haider_core::TurnAcceptCommand {
         command_id: "active-budget-accept".into(),
         request_digest: "active-budget-accept-digest".into(),
-        request_json: "{}".into(),
+        request_json: serde_json::json!({"headless": {
+            "provider":"mock-a", "model":"small", "max_output_tokens":20000,
+            "fast":false, "permission_overrides":{}, "budget":{}
+        }})
+        .to_string(),
         session_id: session_id.clone(),
         worker_generation: store.worker_generation(),
         run_id: run_id.clone(),
@@ -405,6 +409,7 @@ async fn assert_active_budget_from_origin(origin: &str) {
         .expect("typed");
     let resolver = crate::worker::provider_rebind::DaemonProviderRebindResolver::new(
         lease.clone(),
+        run_id.clone(),
         Arc::new(ActiveBudgetFactory),
         before_rebind,
         crate::worker::WebCapabilityDegrade::default(),

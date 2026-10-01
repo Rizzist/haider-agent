@@ -6,48 +6,6 @@ mod tests;
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-async fn recorded_active_budget(
-    store: &HubStoreHandle,
-    rebind_id: Option<&str>,
-    model: &str,
-) -> Result<Option<haider_protocol::output_budget::SessionOutputBudgetV1>, HaiderError> {
-    let Some(rebind_id) = rebind_id else {
-        return Ok(None);
-    };
-    let mut cursor = 0;
-    loop {
-        let page = store
-            .read_for(
-                haider_platform::phase_trace::StoreReadCaller::ProviderRebind,
-                store.session_id(),
-                cursor,
-                256,
-            )
-            .await?;
-        if page.is_empty() {
-            return Ok(None);
-        }
-        let count = page.len();
-        for envelope in page {
-            cursor = envelope.seq;
-            if let Some(rebound) =
-                haider_protocol::session::SessionProviderRebound::from_payload_value(
-                    &envelope.payload,
-                )
-                && rebound.rebind_id == rebind_id
-            {
-                return Ok(rebound
-                    .active_output_budget
-                    .filter(|active| active.model == model)
-                    .map(|active| active.budget));
-            }
-        }
-        if count < 256 {
-            return Ok(None);
-        }
-    }
-}
-
 /// A headless spec pins run tuning, while an explicit durable rebind owns the
 /// provider route. Restoring only the spec provider would combine its adapter
 /// with another provider's rebound endpoint and account after recovery.
@@ -57,6 +15,21 @@ pub(crate) async fn pin_headless_turn_metadata(
     store: &HubStoreHandle,
     run_id: &RunId,
 ) -> Result<(), HaiderError> {
+    if let Some(pair) = store
+        .hub()
+        .run_output_pair(store.session_id(), run_id)
+        .await?
+        .filter(|pair| pair.durably_pinned)
+    {
+        pair.restore_route(metadata);
+        metadata.provider = pair.provider;
+        metadata.model = pair.model;
+        metadata.max_tokens = pair.max_tokens;
+        metadata.max_tokens_source = pair.source;
+        metadata.effort.clone_from(&spec.effort);
+        metadata.fast = spec.fast;
+        return Ok(());
+    }
     let stored_budget = (metadata.max_tokens, metadata.max_tokens_source);
     metadata.model.clone_from(&spec.model);
     metadata.max_tokens = spec.max_output_tokens;
@@ -255,6 +228,7 @@ pub(super) fn rebound_active_turn_lockdown_snapshot(
 
 pub(crate) struct DaemonProviderRebindResolver {
     store: HubStoreHandle,
+    run_id: RunId,
     factory: Arc<dyn ProviderFactory>,
     metadata: std::sync::Mutex<SessionMetadataV1>,
     web_degrade: WebCapabilityDegrade,
@@ -271,12 +245,14 @@ impl std::fmt::Debug for DaemonProviderRebindResolver {
 impl DaemonProviderRebindResolver {
     pub(crate) fn new(
         store: HubStoreHandle,
+        run_id: RunId,
         factory: Arc<dyn ProviderFactory>,
         metadata: SessionMetadataV1,
         web_degrade: WebCapabilityDegrade,
     ) -> Self {
         Self {
             store,
+            run_id,
             factory,
             metadata: std::sync::Mutex::new(metadata),
             web_degrade,
@@ -329,12 +305,24 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             self.seen_revision.store(revision, Ordering::Release);
             return Ok(None);
         }
-        let recorded_active = recorded_active_budget(
-            &self.store,
-            metadata.provider_rebind_id.as_deref(),
-            current_model,
-        )
-        .await?;
+        let recorded_active = self
+            .store
+            .hub()
+            .run_output_pair(self.store.session_id(), &self.run_id)
+            .await?
+            .filter(|pair| pair.model == current_model)
+            .map(|pair| {
+                pair.restore_route(&mut metadata);
+                metadata.provider = pair.provider;
+                haider_protocol::output_budget::SessionOutputBudgetV1 {
+                    max_tokens: pair.max_tokens,
+                    source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                        pair.source,
+                        pair.max_tokens,
+                    ),
+                    clamped: None,
+                }
+            });
         if let Some(budget) = recorded_active {
             metadata.max_tokens = budget.max_tokens;
             metadata.max_tokens_source = Some(budget.source);

@@ -161,15 +161,8 @@ async fn execute(
             if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
                 eprintln!("haider session provider rebind: {}", clamp.notice());
             }
-            if let Some(active) = active_output_budget.as_ref()
-                && let Some(clamp) = active.budget.clamped
-            {
-                eprintln!(
-                    "haider session provider rebind: active run {} ({}): {}",
-                    active.run_id,
-                    active.model,
-                    clamp.notice()
-                );
+            if let Some(notice) = active_rebind_notice(active_output_budget.as_ref()) {
+                eprintln!("{notice}");
             }
             let mut result = serde_json::json!({
                 "schema": "haider.session_provider_rebind.v1", "session_id": returned,
@@ -189,40 +182,19 @@ async fn execute(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|s| (*s).to_owned()).collect()
-    }
-    #[test]
-    fn provider_rebind_cli_requires_explicit_target_and_rejects_ambiguous_flags() {
-        for invalid in [
-            vec![],
-            vec!["--session", "a"],
-            vec!["--provider", "p"],
-            vec!["--session", "a", "--provider", "p", "--account"],
-            vec!["--session", "a", "--provider", "p", "--session", "b"],
-        ] {
-            assert!(parse(&args(&invalid)).is_err(), "{invalid:?}");
-        }
-        assert_eq!(
-            parse(&args(&[
-                "--session",
-                "a",
-                "--provider",
-                "proxy",
-                "--base-url",
-                "http://127.0.0.1:8000",
-                "--account",
-                "bench"
-            ])),
-            Ok(Options {
-                session: "a".into(),
-                provider: "proxy".into(),
-                base_url: Some("http://127.0.0.1:8000".into()),
-                account: Some("bench".into())
-            })
-        );
-    }
+fn active_rebind_notice(
+    active: Option<&haider_protocol::session::ActiveRunOutputBudgetV1>,
+) -> Option<String> {
+    let active = active?;
+    let clamp = active.budget.clamped?;
+    Some(format!(
+        "haider session provider rebind: active run {} ({}): {}",
+        active.run_id,
+        active.model,
+        clamp.notice()
+    ))
 }
+
+#[cfg(test)]
+#[path = "session_provider_tests.rs"]
+mod tests;

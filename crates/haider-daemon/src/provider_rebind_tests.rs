@@ -145,6 +145,7 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
     let factory = Arc::new(RecordingRebindFactory::default());
     let resolver = DaemonProviderRebindResolver::new(
         lease.clone(),
+        RunId::new("rebind-test-run"),
         factory.clone(),
         initial,
         WebCapabilityDegrade::default(),
@@ -241,6 +242,7 @@ async fn provider_rebind_new_identity_rebuilds_same_route_using_current_model() 
     let factory = Arc::new(RecordingRebindFactory::default());
     let resolver = DaemonProviderRebindResolver::new(
         lease.clone(),
+        RunId::new("rebind-test-run"),
         factory.clone(),
         initial,
         WebCapabilityDegrade::default(),
@@ -293,6 +295,7 @@ async fn provider_rebind_rejects_keyless_adapter_resolved_after_full_policy_rece
     let factory = Arc::new(RecordingRebindFactory::default());
     let resolver = DaemonProviderRebindResolver::new(
         lease.clone(),
+        RunId::new("rebind-test-run"),
         factory.clone(),
         initial,
         WebCapabilityDegrade::default(),
@@ -396,15 +399,48 @@ async fn headless_recovery_keeps_accepted_budget_when_rebind_predates_run() {
 /// Any of those changes prevents the resumed turn from sending this request.
 #[tokio::test]
 async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_model_and_authority() {
-    for (headless, automatic_switch) in [(false, false), (true, false), (true, true)] {
+    for (headless, automatic_switch, native_pickup) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+        (false, true, true),
+    ] {
         let root = tempfile::tempdir().expect("store root");
         let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
             .await
             .expect("hub");
-        let session_id = SessionId::new(format!("rebind-recover-{headless}-{automatic_switch}"));
+        let session_id = SessionId::new(format!(
+            "rebind-recover-{headless}-{automatic_switch}-{native_pickup}"
+        ));
         let run_id = RunId::new(format!("active-{session_id}"));
         let device_id = DeviceId::new("recovery-device");
         create_rebind_test_session(&hub, &session_id).await;
+        let select_native =
+            |id: &str, model: &str, budget| haider_store::SessionSelectModelCommand {
+                command_id: id.into(),
+                request_digest: format!("{id}-digest"),
+                request_json: "{}".into(),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                provider: "fake".into(),
+                model: model.into(),
+                expected_pair: None,
+                output_budget: Some(haider_protocol::output_budget::SessionOutputBudgetV1 {
+                    max_tokens: budget,
+                    source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                        requested: budget,
+                    },
+                    clamped: None,
+                }),
+                event_id: EventId::new(format!("{id}-event")),
+                device_id: device_id.clone(),
+            };
+        if native_pickup {
+            hub.select_session_model(select_native("native-admission", "initial-model", 20000))
+                .await
+                .expect("admission budget");
+        }
         let accepted = hub
             .accept_internal_turn(haider_core::TurnAcceptCommand {
                 command_id: "accept-recovery".into(),
@@ -452,6 +488,45 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 .await
                 .expect("headless config");
         }
+        if native_pickup {
+            let model = if automatic_switch {
+                "promoted-live-model"
+            } else {
+                "initial-model"
+            };
+            hub.select_session_model(select_native("native-pickup", model, 6000))
+                .await
+                .expect("selection before pickup");
+            append_payloads(
+                &lease,
+                &device_id,
+                &run_id,
+                None,
+                &event_ids,
+                vec![
+                    haider_protocol::session::RunOutputPairPinnedV1 {
+                        provider: "fake".into(),
+                        model: model.into(),
+                        max_tokens: 6000,
+                        source:
+                            haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                                requested: 6000,
+                            },
+                    }
+                    .to_event(&run_id)
+                    .expect("durable pickup pin"),
+                ],
+            )
+            .await
+            .expect("pin before crash");
+            hub.select_session_model(select_native(
+                "native-next-turn",
+                "pending-next-turn-model",
+                20000,
+            ))
+            .await
+            .expect("next-turn selection");
+        }
         append_payloads(
             &lease,
             &device_id,
@@ -462,7 +537,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
         )
         .await
         .expect("run was active before recovery");
-        if automatic_switch {
+        if automatic_switch && !native_pickup {
             append_payloads(
                 &lease,
                 &device_id,
@@ -536,7 +611,25 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 requested: 20_000,
                 max_output_tokens: 8192,
             }),
-            active_output_budget: None,
+            active_output_budget: native_pickup.then(|| {
+                haider_protocol::session::ActiveRunOutputBudgetV1 {
+                    run_id: run_id.clone(),
+                    model: if automatic_switch {
+                        "promoted-live-model"
+                    } else {
+                        "initial-model"
+                    }
+                    .into(),
+                    budget: haider_protocol::output_budget::SessionOutputBudgetV1 {
+                        max_tokens: 6000,
+                        source:
+                            haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                                requested: 6000,
+                            },
+                        clamped: None,
+                    },
+                }
+            }),
             event_id: EventId::new("recovery-rebound"),
             device_id: device_id.clone(),
         })
@@ -631,7 +724,20 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
         let requests = provider.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].model, expected_model);
-        assert_eq!(requests[0].max_tokens, 8192);
+        assert_eq!(
+            requests[0].max_tokens,
+            if native_pickup { 6000 } else { 8192 }
+        );
+        if native_pickup {
+            assert_eq!(
+                calls[0].max_tokens_source,
+                Some(
+                    haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                        requested: 6000
+                    }
+                )
+            );
+        }
         assert_eq!(
             hub.bound_lockdown_run(&session_id, &run_id)
                 .expect("frozen authority"),

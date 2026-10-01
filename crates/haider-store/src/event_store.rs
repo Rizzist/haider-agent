@@ -1429,7 +1429,7 @@ pub struct SessionProviderRebindCommand {
     pub device_id: DeviceId,
 }
 
-/// Committed selection as of a run's admission boundary.
+/// Committed session selection at a journal boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOutputPairSnapshot {
     pub provider: String,
@@ -8616,8 +8616,8 @@ impl Store {
         }
     }
 
-    /// The pair and budget accepted for a run at a journal boundary. Later
-    /// ordinary selections are next-turn state and cannot rewrite this view.
+    /// Committed session pair and budget through a journal boundary. New
+    /// runs use their durable pin; this view reconstructs pre-pin journals.
     pub fn session_output_pair_at(
         &self,
         session_id: &SessionId,
@@ -12237,6 +12237,30 @@ impl Store {
             )?);
         }
         if let Some(spec) = headless_spec {
+            if !same_run_delivery {
+                let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                    provider: spec.provider.clone(),
+                    model: spec.model.clone(),
+                    max_tokens: spec.max_output_tokens,
+                    source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                        metadata.max_tokens_source,
+                        spec.max_output_tokens,
+                    ),
+                };
+                let mut pinned = unstamped_command_envelope(
+                    EventId::new(format!("output-pair-{}", command.queued_event_id)),
+                    &command.session_id,
+                    command.branch_id.clone(),
+                    Some(command.run_id.clone()),
+                    command.device_id.clone(),
+                    self.worker_generation,
+                    pin.to_event(&command.run_id)
+                        .map_err(|error| corrupt(format!("invalid run output pair: {error}")))?,
+                    PromptRender::Omit,
+                )?;
+                pinned.render.ui = false;
+                envelopes.push(pinned);
+            }
             let payload =
                 haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(spec)
                     .to_payload_value()

@@ -2,6 +2,35 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The immutable output pair fixed for a logical run. Headless admission and
+/// native worker pickup write this same fact before any provider resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOutputPairPinnedV1 {
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: u64,
+    pub source: crate::output_budget::SessionOutputBudgetSourceV1,
+}
+
+impl RunOutputPairPinnedV1 {
+    pub const KIND: &str = "run_output_pair_pinned_v1";
+
+    pub fn to_event(
+        &self,
+        run_id: &crate::ids::RunId,
+    ) -> Result<crate::EventPayload, serde_json::Error> {
+        Ok(crate::EventPayload::Item(
+            crate::item::ItemEvent::Completed {
+                item_id: crate::ids::ItemId::new(format!("output-pair-{run_id}")),
+                item: crate::item::TurnItem::Extension {
+                    kind: Self::KIND.into(),
+                    data: serde_json::to_value(self)?,
+                },
+            },
+        ))
+    }
+}
+
 /// Whether a session may stop for a human interaction.
 ///
 /// The default is deliberately interactive so legacy metadata and every UI

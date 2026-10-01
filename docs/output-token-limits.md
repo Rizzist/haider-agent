@@ -70,6 +70,14 @@ one; an explicit value above the selected model's explicit ceiling is refused,
 like `session.create`. The automatic provider pair-switch path has no validated
 model row and keeps the stored budget; the provider retry below covers it.
 
+Each run records its pinned provider, model, budget and source in a durable
+`run_output_pair_pinned_v1` fact. Headless runs pin the spec at admission;
+native turns pin the current selection under the selection lock at worker
+pickup. A selection committed while a native turn is still queued therefore
+applies to that turn. Selections after pickup apply to the next turn.
+Provider rebind, child inheritance and recovery read this same run record,
+including subsequent automatic pair switches and explicit rebind facts.
+
 ## Provider-stated maxima
 
 If a provider rejects a request because `max_tokens` exceeds the model's

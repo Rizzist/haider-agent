@@ -21,6 +21,15 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.973 — durable run output pair
+
+Additive, UI-hidden and prompt-omitted extension `run_output_pair_pinned_v1` records
+`provider`, `model`, `max_tokens` and `source` once per run. Headless admission
+pins its spec; native worker pickup pins the selection under the selection
+fence. The equally hidden `run_worker_pickup_v1` marks pickup before provider resolution, so a
+rebind during startup can see the active run. Rebind, recovery and delegated
+children reduce the pin together with later pair-switch and rebind facts.
+
 ### v0.0.973 — provider-request budgets become opt-in
 
 Omitting `RunBudgetV1.request_budget` or a delegated child's request policy now

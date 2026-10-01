@@ -4959,50 +4959,44 @@ async fn run_supervisor(
                         }
                     }
                 }
-                // R6 extension (F1): the pair is re-read per logical turn, so
-                // a committed `session.select_model` reaches the NEXT turn
-                // without a worker restart. A failed read fails the turn
-                // honestly instead of silently pinning the spawn snapshot.
-                let turn_result = match fresh_turn_metadata(&lease).await {
-                    Ok(fresh) => {
-                        let startup_budget = wait_for_startup_headless_budget(
-                            lease.clone(),
-                            run_id.clone(),
-                            branch_id.clone(),
-                        );
-                        let start = haider_platform::phase_trace::measure_active(
-                            haider_platform::phase_trace::Phase::TurnSetup,
-                            start_turn(
-                                &dependencies,
-                                &fresh,
-                                &lease,
-                                &device_id,
-                                Arc::clone(&event_ids),
-                                pending,
-                            ),
-                        );
-                        tokio::pin!(startup_budget);
-                        tokio::pin!(start);
-                        tokio::select! {
-                            biased;
-                            result = &mut start => result,
-                            expiry = &mut startup_budget => match expiry {
-                                Ok(expiry) => {
-                                    match persist_headless_budget_expiry(
-                                        &lease,
-                                        &device_id,
-                                        &event_ids,
-                                        &expiry,
-                                    ).await {
-                                        Ok(()) => Err(budget_exhausted_error(&expiry.exhausted)),
-                                        Err(error) => Err(error),
-                                    }
+                // start_turn reads and pins the pair under the selection
+                // fence at pickup; setup failures fail the turn honestly.
+                let turn_result = {
+                    let startup_budget = wait_for_startup_headless_budget(
+                        lease.clone(),
+                        run_id.clone(),
+                        branch_id.clone(),
+                    );
+                    let start = haider_platform::phase_trace::measure_active(
+                        haider_platform::phase_trace::Phase::TurnSetup,
+                        start_turn(
+                            &dependencies,
+                            &lease,
+                            &device_id,
+                            Arc::clone(&event_ids),
+                            pending,
+                        ),
+                    );
+                    tokio::pin!(startup_budget);
+                    tokio::pin!(start);
+                    tokio::select! {
+                        biased;
+                        result = &mut start => result,
+                        expiry = &mut startup_budget => match expiry {
+                            Ok(expiry) => {
+                                match persist_headless_budget_expiry(
+                                    &lease,
+                                    &device_id,
+                                    &event_ids,
+                                    &expiry,
+                                ).await {
+                                    Ok(()) => Err(budget_exhausted_error(&expiry.exhausted)),
+                                    Err(error) => Err(error),
                                 }
-                                Err(error) => Err(error),
-                            },
-                        }
+                            }
+                            Err(error) => Err(error),
+                        },
                     }
-                    Err(error) => Err(error),
                 };
                 match turn_result {
                     Ok(turn) => {
@@ -8526,13 +8520,10 @@ fn strip_foreign_provider_opaque_projection(
     projection.latest_compaction_summary_end = summary_before.map(remap);
 }
 
-/// Re-reads THIS session's metadata for one logical turn (F1). The store is
-/// the one truth for the current model selection: a committed
-/// `session.select_model` between turns is picked up here, which is what
-/// makes the receipt's promise — "the next turn resolves the new pair" —
-/// structural rather than aspirational. `None` (row vanished mid-life) and
-/// read failures fail the turn honestly; the spawn-time snapshot is never a
-/// silent fallback.
+/// Reads the current session selection for a logical turn or control action.
+/// Native start_turn reads under the selection fence and durably pins the
+/// pair at pickup. Missing metadata and read failures fail honestly; the
+/// supervisor's spawn-time snapshot is never a silent fallback.
 async fn fresh_turn_metadata(lease: &HubStoreHandle) -> Result<SessionMetadataV1, HaiderError> {
     lease.session_metadata().await?.ok_or_else(|| {
         HaiderError::new(
@@ -8639,7 +8630,6 @@ fn request_budget_with_test_override(
 /// is the failure mode this ordering exists to prevent.
 async fn start_turn(
     dependencies: &WorkerDependencies,
-    metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,
     device_id: &DeviceId,
     event_ids: Arc<EventIdGenerator>,
@@ -8684,7 +8674,86 @@ async fn start_turn(
         .turn_start_journal_projection(&accepted.run_id)
         .await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
-    let mut pinned_metadata = metadata.clone();
+    // The selection fence fixes the native pair at pickup and makes the
+    // durable pin visible to rebind before provider resolution can suspend.
+    // Recovery reuses that pin rather than the mutable next-turn selection.
+    let mut pinned_metadata = {
+        let _selection = lease
+            .hub()
+            .lock_workflow_selection(lease.session_id())
+            .await;
+        let mut fresh = fresh_turn_metadata(lease).await?;
+        if let Some(pair) = lease
+            .hub()
+            .run_output_pair(lease.session_id(), &accepted.run_id)
+            .await?
+            .filter(|pair| pair.durably_pinned)
+        {
+            pair.restore_route(&mut fresh);
+            fresh.provider = pair.provider;
+            fresh.model = pair.model;
+            fresh.max_tokens = pair.max_tokens;
+            fresh.max_tokens_source = pair.source;
+        } else {
+            if let Some(context) = headless.as_ref() {
+                if let Some(legacy) = lease
+                    .hub()
+                    .run_output_pair(lease.session_id(), &accepted.run_id)
+                    .await?
+                {
+                    fresh.max_tokens_source = legacy.source;
+                }
+                provider_rebind::pin_headless_turn_metadata(
+                    &mut fresh,
+                    &context.spec,
+                    lease,
+                    &accepted.run_id,
+                )
+                .await?;
+            }
+            let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                provider: fresh.provider.clone(),
+                model: fresh.model.clone(),
+                max_tokens: fresh.max_tokens,
+                source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                    fresh.max_tokens_source,
+                    fresh.max_tokens,
+                ),
+            };
+            fresh.max_tokens_source = Some(pin.source);
+            append_payloads(
+                lease,
+                device_id,
+                &accepted.run_id,
+                accepted.branch_id.as_ref(),
+                &event_ids,
+                vec![pin.to_event(&accepted.run_id).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?],
+            )
+            .await?;
+        }
+        append_payloads(
+            lease,
+            device_id,
+            &accepted.run_id,
+            accepted.branch_id.as_ref(),
+            &event_ids,
+            vec![EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!(
+                    "run-worker-pickup-{}-{}",
+                    accepted.run_id,
+                    event_ids.next()
+                )),
+                item: TurnItem::Extension {
+                    kind: "run_worker_pickup_v1".into(),
+                    data: serde_json::json!({}),
+                },
+            })],
+        )
+        .await?;
+        fresh
+    };
     pinned_metadata.context_economy = refresh_context_economy_from_journal(
         lease,
         &pinned_metadata.context_economy,
@@ -9752,6 +9821,7 @@ async fn start_turn(
     config.provider_rebind_resolver = Some(Arc::new(
         provider_rebind::DaemonProviderRebindResolver::new(
             lease.clone(),
+            accepted.run_id.clone(),
             Arc::clone(&dependencies.provider_factory),
             metadata.clone(),
             web_degrade,
@@ -12790,14 +12860,21 @@ async fn append_payloads(
     for payload in payloads {
         let payload_run_id =
             (!matches!(payload, EventPayload::SessionState(_))).then(|| run_id.clone());
-        envelopes.push(supervisor_envelope(
+        let bookkeeping = matches!(&payload,
+            EventPayload::Item(ItemEvent::Completed { item: TurnItem::Extension { kind, .. }, .. })
+            if kind == haider_protocol::session::RunOutputPairPinnedV1::KIND || kind == "run_worker_pickup_v1");
+        let mut envelope = supervisor_envelope(
             store,
             device_id,
             branch_id.cloned(),
             payload_run_id,
             event_ids.next(),
             payload,
-        )?);
+        )?;
+        if bookkeeping {
+            envelope.render.ui = false;
+        }
+        envelopes.push(envelope);
     }
     haider_core::StoreHandle::append(store, &mut envelopes).await?;
     #[cfg(windows)]
@@ -22023,10 +22100,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .output
                 .store
                 .hub()
-                .active_run_output_pair(&self.session_id)
+                .run_output_pair(&self.session_id, run_id)
                 .await?
-                .filter(|active| active.run_id == *run_id)
             {
+                active.restore_route(&mut active_parent);
+                active_parent.provider = active.provider;
+                active_parent.model = active.model;
                 active_parent.max_tokens = active.max_tokens;
                 active_parent.max_tokens_source = active.source;
             }

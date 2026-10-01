@@ -655,7 +655,406 @@ async fn selected_child_pair_reapplies_parent_budget_and_plain_child_inherits_it
     world.shutdown().await;
 }
 
-/// A selection made while the parent request is running queues the next
+/// Native admission leaves the pair unfixed until pickup. A queued selection
+/// must survive a later rebind, ordinary next-turn selection and child spawn.
+#[tokio::test]
+async fn native_queued_pickup_rebind_and_child_use_one_durable_pair() {
+    for model_change in [false, true] {
+        for provider_change in [false, true] {
+            assert_native_pickup_pair(model_change, provider_change, false, 6000).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_pickup_pin_is_visible_before_the_first_provider_request() {
+    for model_change in [false, true] {
+        for provider_change in [false, true] {
+            assert_native_pickup_pair(model_change, provider_change, true, 6000).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn running_child_inherits_the_rebound_active_clamp() {
+    assert_native_pickup_pair(false, false, false, 20000).await;
+}
+
+async fn assert_native_pickup_pair(
+    model_change: bool,
+    provider_change: bool,
+    pause_startup: bool,
+    pickup_budget: u64,
+) {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    let spawn = vec![
+        FakeStep::Delay { ms: 1500 },
+        FakeStep::EmitToolCall {
+            call_id: "native-child".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"inherit pickup pair", "prompt":"report"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ];
+    let first_request_on_b = pause_startup || provider_change;
+    let fake_a = Arc::new(FakeProvider::new(if first_request_on_b {
+        Vec::new()
+    } else {
+        spawn.clone()
+    }));
+    let mut rebound = if first_request_on_b {
+        spawn
+    } else {
+        Vec::new()
+    };
+    rebound.extend([
+        FakeStep::EmitText {
+            text: "child report".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "native-child".into(),
+        },
+        FakeStep::EmitText {
+            text: "parent done".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let fake_b = Arc::new(FakeProvider::new(rebound));
+    let profiles = ["fake-a", "fake-b"]
+        .into_iter()
+        .map(|provider| {
+            let mut profile = model_summary(provider, &["model-a", "model-b"]);
+            profile.model_details = [
+                ("model-a", if provider == "fake-a" { 30000 } else { 8192 }),
+                ("model-b", 30000),
+            ]
+            .into_iter()
+            .map(|(model, max)| {
+                serde_json::from_value(serde_json::json!({"name":model, "context_window":1048576,
+                "max_output_tokens":max, "max_output_tokens_source":"declared"}))
+                .expect("catalog row")
+            })
+            .collect();
+            profile
+        })
+        .collect();
+    let world = PairSwitchWorld::boot("native-pickup", fake_a.clone(), fake_b.clone()).await;
+    let descriptors = ["fake-a", "fake-b"]
+        .into_iter()
+        .map(
+            |provider| haider_protocol::credential::CredentialDescriptor {
+                alias: CredentialAlias::new(format!("{provider}-account")),
+                provider: provider.into(),
+                base_url: None,
+                auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+                identity: "synthetic recording fake".into(),
+                status: haider_protocol::credential::CredentialStatus::Ok,
+                active: true,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            },
+        )
+        .collect::<Vec<_>>();
+    world
+        .hub
+        .install_accounts(crate::accounts::AccountsFacade {
+            login: None,
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(descriptors.clone())),
+            management: crate::accounts::ManagementSnapshot::new(1, descriptors, profiles),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+            vault: None,
+            sources: Arc::new(Mutex::new(Vec::new())),
+        })
+        .expect("synthetic Full recording adapters");
+    let select = |id: &str, provider: &str, model: &str, max_tokens| {
+        let mut command = world.select_command(id);
+        command.provider = provider.into();
+        command.model = model.into();
+        command.request_json = serde_json::json!({
+            "session_id": world.session_id, "worker_generation": world.store.worker_generation(),
+            "provider": provider, "model": model, "max_tokens": max_tokens,
+        })
+        .to_string();
+        command.request_digest = blake3::hash(command.request_json.as_bytes())
+            .to_hex()
+            .to_string();
+        command.output_budget = Some(SessionOutputBudgetV1 {
+            max_tokens,
+            source: SessionOutputBudgetSourceV1::UserSet {
+                requested: max_tokens,
+            },
+            clamped: None,
+        });
+        command
+    };
+    world
+        .hub
+        .select_session_model(select("admission", "fake-a", "model-a", 20000))
+        .await
+        .expect("admission budget");
+    world
+        .hub
+        .rebind_session_provider(haider_store::SessionProviderRebindCommand {
+            command_id: "pickup-route".into(),
+            request_digest: "pickup-route-digest".into(),
+            request_json: "{}".into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            provider: "fake-a".into(),
+            base_url: Some("http://127.0.0.1:31701/v1".into()),
+            account: Some("fake-a-account".into()),
+            max_tokens: 20000,
+            max_tokens_source: SessionOutputBudgetSourceV1::UserSet { requested: 20000 },
+            clamped: None,
+            active_output_budget: None,
+            event_id: EventId::new("pickup-route-event"),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("synthetic pickup endpoint and account");
+    let run_id = RunId::new("native-pickup-run");
+    let accepted = world
+        .hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "native-admit".into(),
+            request_digest: "native-admit-digest".into(),
+            request_json: "{}".into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            run_id: run_id.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "delegate".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("native-queued"),
+            user_event_id: EventId::new("native-user"),
+            active_event_id: EventId::new("native-active"),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("admission before pickup");
+    let model = if model_change { "model-b" } else { "model-a" };
+    let pickup_provider = if provider_change { "fake-b" } else { "fake-a" };
+    world
+        .hub
+        .select_session_model(select("pickup", pickup_provider, model, pickup_budget))
+        .await
+        .expect("selection while queued");
+    let pause = pause_startup.then(|| Arc::new(CacheReconciliationPause::default()));
+    *world.cache_reconciliation_pause.lock().expect("pause slot") = pause.clone();
+    world
+        .manager
+        .handle()
+        .submit(accepted)
+        .await
+        .expect("pickup");
+    if let Some(pause) = pause.as_ref() {
+        timeout(Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("pickup before first request");
+        assert!(fake_a.requests().is_empty());
+        assert!(fake_b.requests().is_empty());
+    } else {
+        let first = if provider_change { &fake_b } else { &fake_a };
+        timeout(Duration::from_secs(10), async {
+            while first.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first request");
+        assert_eq!(
+            (
+                first.requests()[0].model.as_str(),
+                first.requests()[0].max_tokens
+            ),
+            (model, pickup_budget)
+        );
+    }
+    let pin = world
+        .hub
+        .active_run_output_pair(&world.session_id)
+        .await
+        .expect("active pair")
+        .expect("picked up run");
+    assert_eq!(
+        (pin.provider.as_str(), pin.model.as_str(), pin.max_tokens),
+        (pickup_provider, model, pickup_budget)
+    );
+    // This ordinary selection belongs to the next turn, including in the
+    // pickup-to-first-request gap. It must not replace the new durable pin.
+    world
+        .hub
+        .select_session_model(select("next-turn", "fake-a", "model-a", 20000))
+        .await
+        .expect("next-turn budget");
+    let rebound_budget = pickup_budget.min(if model_change { 30000 } else { 8192 });
+    let expected_source = SessionOutputBudgetSourceV1::UserSet {
+        requested: pickup_budget,
+    };
+    let expected_clamp = (rebound_budget < pickup_budget).then_some(
+        haider_protocol::output_budget::OutputBudgetClampV1 {
+            requested: pickup_budget,
+            max_output_tokens: rebound_budget,
+        },
+    );
+    let sink = Arc::new(GraphSelectionSink::default());
+    let connection = world
+        .hub
+        .open_connection(
+            BTreeSet::from([Capability::View, Capability::Control]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("native-attach"),
+            RequestBody::SessionAttach {
+                session_id: world.session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attach");
+    let request = RequestBody::SessionProviderRebind {
+        command_id: CommandId::new("native-rebind-command"),
+        session_id: world.session_id.clone(),
+        worker_generation: world.store.worker_generation(),
+        provider: "fake-b".into(),
+        base_url: None,
+        account: None,
+    };
+    connection
+        .request(RequestId::new("native-rebind"), request.clone())
+        .await
+        .expect("rebind");
+    let response = graph_response(&sink, "native-rebind").expect("response");
+    let ResponseBody::SessionProviderRebind {
+        active_output_budget: Some(active),
+        ..
+    } = &response
+    else {
+        panic!("rebind: {response:?}");
+    };
+    assert_eq!(
+        (
+            active.model.as_str(),
+            active.budget.max_tokens,
+            active.budget.source,
+            active.budget.clamped
+        ),
+        (model, rebound_budget, expected_source, expected_clamp)
+    );
+    connection
+        .request(RequestId::new("native-replay"), request)
+        .await
+        .expect("receipt replay");
+    assert_eq!(
+        graph_response(&sink, "native-replay"),
+        Some(response.clone())
+    );
+    world
+        .hub
+        .select_session_model(select("after-rebind", "fake-a", "model-a", 20000))
+        .await
+        .expect("later selection remains for the next turn");
+    if let Some(pause) = pause {
+        *world
+            .cache_reconciliation_pause
+            .lock()
+            .expect("clear startup pause") = None;
+        pause.release.notify_one();
+    }
+    world.await_done(&run_id).await;
+    let events = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("journal");
+    for event in &events {
+        if matches!(event.payload.decode_event(), Ok(EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { kind, .. }, ..
+        })) if kind == haider_protocol::session::RunOutputPairPinnedV1::KIND || kind == "run_worker_pickup_v1")
+        {
+            assert!(!event.render.ui);
+            assert_eq!(event.render.prompt, PromptRender::Omit);
+        }
+    }
+    let fact = events
+        .iter()
+        .filter_map(|event| {
+            haider_protocol::session::SessionProviderRebound::from_payload_value(&event.payload)
+        })
+        .next_back()
+        .expect("rebind fact");
+    assert_eq!(fact.active_output_budget.as_ref(), Some(active));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.payload.decode_event(),
+        Ok(EventPayload::Item(ItemEvent::Completed { item:TurnItem::Extension { kind, .. }, .. }))
+        if kind == haider_protocol::session::RunOutputPairPinnedV1::KIND))
+            .count(),
+        1
+    );
+    let child = events
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::AgentSpawned(manifest)) => manifest.coordinates.and_then(|c| {
+                c.get("child_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(SessionId::new)
+            }),
+            _ => None,
+        })
+        .expect("spawned child");
+    let child = world
+        .hub
+        .session_metadata(&child)
+        .await
+        .expect("child metadata")
+        .expect("typed child");
+    assert_eq!(
+        (
+            child.provider.as_str(),
+            child.model.as_str(),
+            child.max_tokens,
+            child.max_tokens_source
+        ),
+        ("fake-b", model, rebound_budget, Some(expected_source))
+    );
+    // Child creation establishes its own route binding while inheriting the
+    // run's pinned pair. A parent rebind identity must not leak into it.
+    assert_eq!(child.provider_base_url, None);
+    assert_eq!(child.account_alias, None);
+    assert_eq!(child.provider_rebind_id, None);
+    let requests = fake_b.requests();
+    assert_eq!(requests.len(), if first_request_on_b { 3 } else { 2 });
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.max_tokens == rebound_budget && request.model == model)
+    );
+    drop(connection);
+    world.shutdown().await;
+}
+
+/// A selection made while the headless parent is running queues the next
 /// turn. The child spawned by that request keeps its admitted budget.
 #[tokio::test]
 async fn running_parent_spawns_child_with_active_budget_after_queued_selection() {
