@@ -47,6 +47,7 @@ async fn create_rebind_test_session(hub: &SessionHub, session_id: &SessionId) {
         session_id: session_id.clone(),
         cwd: "/tmp".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "initial-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -138,6 +139,7 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
             session_id: session_id.clone(),
             worker_generation: store.worker_generation(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: model.into(),
             expected_pair,
             output_budget: None,
@@ -395,7 +397,9 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                         data: serde_json::json!({
                             "from_provider": "fake", "from_model": "initial-model",
                             "to_provider": "fake", "to_model": "promoted-live-model",
-                            "why": "fallback_chain"
+                            "why": "fallback_chain",
+                            "model_catalog_key": "synthetic-live-producer",
+                            "output_budget": haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived.apply(333, 333)
                         }),
                     },
                 })],
@@ -428,6 +432,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 session_id: session_id.clone(),
                 worker_generation: store.worker_generation(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "pending-next-turn-model".into(),
                 output_budget: None,
                 expected_pair: None,
@@ -535,7 +540,14 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
         if headless {
             assert_eq!(calls[0].effort.as_deref(), Some("high"));
             assert!(calls[0].fast);
-            assert_eq!(calls[0].max_tokens, 513);
+            assert_eq!(
+                calls[0].max_tokens,
+                if automatic_switch { 333 } else { 513 }
+            );
+            assert_eq!(
+                calls[0].model_catalog_key.as_deref(),
+                automatic_switch.then_some("synthetic-live-producer")
+            );
         }
         let requests = provider.requests();
         assert_eq!(requests.len(), 1);
@@ -601,5 +613,42 @@ async fn provider_rebind_recovery_rejects_changed_frozen_permissions_and_lockdow
         "ordinary recovery cannot invent an unjournaled route change"
     );
     hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn recovered_headless_model_retains_its_catalog_owner_instead_of_pending_selection_owner() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), crate::SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("scoped-headless-pin");
+    create_rebind_test_session(&hub, &session).await;
+    let mut metadata = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata")
+        .expect("session");
+    metadata.model = "pending-b-model".into();
+    metadata.model_catalog_key = Some("synthetic-B-producer".into());
+    let mut spec = rebound_recovery_headless_spec();
+    spec.model_catalog_key = Some("synthetic-A-producer".into());
+    let handle = hub.acquire_worker_lease(session).await.expect("lease");
+    pin_headless_turn_metadata(
+        &mut metadata,
+        &spec,
+        &handle,
+        &RunId::new("scoped-headless-run"),
+    )
+    .await
+    .expect("pin");
+    assert_eq!(metadata.model, spec.model);
+    assert_eq!(
+        metadata.model_catalog_key, spec.model_catalog_key,
+        "A's model cannot borrow B's current metadata owner"
+    );
+    hub.shutdown().await.expect("shutdown");
+    drop(handle);
     store.close().await.expect("close");
 }

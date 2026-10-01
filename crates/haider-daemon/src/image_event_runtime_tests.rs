@@ -32,6 +32,7 @@ async fn image_output_context_commits_self_contained_omitted_prompt_extension() 
             .display()
             .to_string(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

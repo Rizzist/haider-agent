@@ -319,6 +319,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -768,6 +769,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -1183,6 +1185,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

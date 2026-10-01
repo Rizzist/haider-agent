@@ -37,6 +37,9 @@ fn enterprise_summary(
     default_model: &str,
 ) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::AnthropicMessages,
         endpoint: endpoint.map(str::to_owned),
@@ -137,8 +140,12 @@ fn azure_card_derives_the_v1_base_and_chains_the_key_card() {
                     *family,
                     haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
                 );
-                assert!(models.is_empty(), "azure rides the single-model shape");
-                assert!(default_model.is_none());
+                assert_eq!(
+                    models,
+                    &["my-gpt-deployment"],
+                    "the user-configured deployment remains durable"
+                );
+                assert_eq!(default_model.as_deref(), Some("my-gpt-deployment"));
                 assert!(!keyless);
                 Some(command_id.clone())
             }

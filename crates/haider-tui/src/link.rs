@@ -1005,12 +1005,15 @@ pub fn request_body_for_features(
             provider,
             model,
             max_tokens,
+            expected_catalog_key,
             ..
         } => RequestBody::SessionCreateWithPermissionOverrides {
             command_id,
             cwd,
             provider,
+            resolve_model: model.is_empty(),
             model,
+            expected_catalog_key,
             max_tokens,
             // OWNER DIRECTIVE: the interactive surface runs in full AUTO-ALLOW
             // mode (the Codex --full-auto analogue) — writes, exec, web fetch,
@@ -1035,7 +1038,6 @@ pub fn request_body_for_features(
             ssh_scope: None,
             account_alias: None,
             resolve_provider: false,
-            resolve_model: false,
             effort: None,
             fast: None,
         },
@@ -1666,11 +1668,13 @@ pub fn request_body_for_features(
             model,
             provider,
             confirm_new_epoch,
+            expected_catalog_key,
         } => RequestBody::SessionSelectModel {
             command_id,
             session_id: session,
             worker_generation,
             model,
+            expected_catalog_key,
             provider: Some(provider),
             confirm_new_epoch,
             max_tokens: None,
@@ -1912,6 +1916,8 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 worker_generation,
                 cwd: metadata.cwd,
                 model: metadata.model,
+                provider: metadata.provider,
+                model_catalog_key: metadata.model_catalog_key,
             }]
         }),
         // The branch-pinned response shape carries the same driver facts as
@@ -2423,6 +2429,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             model,
             worker_generation,
             output_budget,
+            model_catalog_key,
             ..
         } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::ModelSelected {
@@ -2432,6 +2439,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 model,
                 worker_generation,
                 output_budget,
+                model_catalog_key,
             }]
         }),
         // G2: the NORMALIZED committed title — the reply reports daemon

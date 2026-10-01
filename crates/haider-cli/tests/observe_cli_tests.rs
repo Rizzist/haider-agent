@@ -95,6 +95,7 @@ fn digest(
             cwd: format!("/tmp/{id}"),
             provider: "openai".into(),
             account_alias: None,
+            model_catalog_key: None,
             model: "gpt-observe".into(),
             max_tokens: 4096,
             max_tokens_source: None,

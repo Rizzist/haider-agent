@@ -949,6 +949,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
         7_000,
         ModelSelected {
             provider: "openai".into(),
+            model_catalog_key: None,
             model: "gpt-5.2".into(),
         }
         .to_payload_value()

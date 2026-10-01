@@ -2437,6 +2437,7 @@ mod error_wave3_tests {
                 session_id: session_id.clone(),
                 cwd: root.path().to_string_lossy().into_owned(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-v1".into(),
                 max_tokens: 1_024,
                 max_tokens_source: None,

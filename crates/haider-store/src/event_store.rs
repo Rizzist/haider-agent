@@ -789,6 +789,7 @@ pub struct SessionCreateCommand {
     pub cwd: String,
     pub provider: String,
     pub model: String,
+    pub model_catalog_key: Option<String>,
     pub max_tokens: u64,
     /// Whether `max_tokens` was derived or user-set; `None` leaves legacy
     /// classification to readers (`SessionOutputBudgetSourceV1::classify`).
@@ -1093,6 +1094,7 @@ pub struct SessionSelectModelCommand {
     pub worker_generation: u64,
     pub provider: String,
     pub model: String,
+    pub model_catalog_key: Option<String>,
     /// rev933b finding 7: an AUTOMATIC mid-turn switch is only valid
     /// against the pair it observed (compare-and-swap). `Some` refuses the
     /// commit with RevisionConflict when the durable pair moved underneath
@@ -1113,6 +1115,8 @@ pub struct SelectedModel {
     pub session_id: SessionId,
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
     pub selected_seq: u64,
     pub worker_generation: u64,
     /// Budget committed with this selection; absent in pre-973 receipts.
@@ -8641,6 +8645,7 @@ impl Store {
             provider: command.provider.clone(),
             account_alias,
             model: command.model.clone(),
+            model_catalog_key: command.model_catalog_key.clone(),
             max_tokens: command.max_tokens,
             max_tokens_source: command.max_tokens_source,
             system_prompt_version: Some(command.system_prompt_version.clone()),
@@ -9858,6 +9863,7 @@ impl Store {
         }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
+        metadata.model_catalog_key = command.model_catalog_key.clone();
         if let Some(budget) = command.output_budget {
             metadata.max_tokens = budget.max_tokens;
             metadata.max_tokens_source = Some(budget.source);
@@ -9898,6 +9904,7 @@ impl Store {
             ModelSelected {
                 provider: command.provider.clone(),
                 model: command.model.clone(),
+                model_catalog_key: command.model_catalog_key.clone(),
             }
             .to_payload_value()
             .map_err(|error| {
@@ -9914,6 +9921,7 @@ impl Store {
             session_id: command.session_id.clone(),
             provider: command.provider.clone(),
             model: command.model.clone(),
+            model_catalog_key: command.model_catalog_key.clone(),
             selected_seq: envelopes[0].seq,
             worker_generation: self.worker_generation,
             output_budget: command.output_budget,

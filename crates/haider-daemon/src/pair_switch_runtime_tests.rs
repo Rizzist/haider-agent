@@ -101,6 +101,8 @@ impl ProviderAttemptResolver for RuntimeFallbackResolver {
             account: CredentialAlias::new("fake-b-account"),
             account_incarnation: Some(2),
             provider_name: "fake-b".into(),
+            model_catalog_key: None,
+            output_budget: None,
             model: "model-b".into(),
             context_window: None,
             cached_input_is_subset: true,
@@ -252,6 +254,7 @@ impl PairSwitchWorld {
             session_id: session_id.clone(),
             cwd,
             provider: "fake-a".into(),
+            model_catalog_key: None,
             model: "model-a".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -460,6 +463,7 @@ impl PairSwitchWorld {
             session_id: self.session_id.clone(),
             worker_generation,
             provider: "fake-b".into(),
+            model_catalog_key: None,
             model: "model-b".into(),
             expected_pair: None,
             output_budget: None,
@@ -530,6 +534,9 @@ fn text_turn(text: &str) -> Vec<FakeStep> {
 
 fn model_summary(provider: &str, models: &[&str]) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
@@ -1763,6 +1770,7 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
         session_id: session_id.clone(),
         cwd,
         provider: "fake-a".into(),
+        model_catalog_key: None,
         model: "model-a".into(),
         max_tokens: 4096,
         max_tokens_source: None,

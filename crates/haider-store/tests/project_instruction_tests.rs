@@ -21,6 +21,7 @@ fn accepted_store() -> (tempfile::TempDir, Store, SessionId, RunId) {
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

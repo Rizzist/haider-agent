@@ -1265,6 +1265,7 @@ async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId,
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: provider.into(),
+            model_catalog_key: None,
             model: "test-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -4643,6 +4644,7 @@ fn model_selected_envelope(
     let mut envelope = envelope(session_id, event_id, worker_generation);
     *envelope.payload = ModelSelected {
         provider: provider.into(),
+        model_catalog_key: None,
         model: model.into(),
     }
     .to_payload_value()

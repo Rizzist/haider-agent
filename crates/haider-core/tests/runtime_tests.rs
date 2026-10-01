@@ -1902,7 +1902,8 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     continued_messages.push(Message::user_text(
         "Continue exactly where you stopped. Do not repeat completed content.",
     ));
-    let promoted_window = estimated_input_tokens(&bounded, &continued_messages).saturating_add(1);
+    let promoted_window =
+        estimated_input_tokens(&bounded, &continued_messages).saturating_add(5000);
     assert!(promoted_window > window);
     bounded.context_window = Some(window);
     bounded.context_compaction_v1 = true;
@@ -1925,6 +1926,10 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
         account: CredentialAlias::new("fake-a-primary"),
         account_incarnation: Some(1),
         provider_name: "fake-a".into(),
+        model_catalog_key: None,
+        output_budget: Some(
+            haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived.apply(5000, 5000),
+        ),
         model: "model-large".into(),
         context_window: Some(promoted_window),
         cached_input_is_subset: true,
@@ -1955,11 +1960,23 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].model, "model-large");
     assert_eq!(requests[1].model, "model-large");
+    assert_eq!(
+        requests[0].max_tokens, 5000,
+        "promotion reapplies target defaults"
+    );
+    assert_eq!(requests[1].max_tokens, 5000);
     let switches = committer
         .switches
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(switches.len(), 1);
+    assert_eq!(
+        switches[0]
+            .output_budget
+            .expect("captured budget")
+            .max_tokens,
+        5000
+    );
     assert_eq!(switches[0].from_provider, "fake-a");
     assert_eq!(switches[0].from_model, "model-small");
     assert_eq!(switches[0].to_provider, "fake-a");
@@ -1997,6 +2014,8 @@ async fn compaction_promotion_refuses_a_model_without_a_larger_known_window() {
         account: CredentialAlias::new("fake-a-primary"),
         account_incarnation: Some(1),
         provider_name: "fake-a".into(),
+        model_catalog_key: None,
+        output_budget: None,
         model: "model-not-larger".into(),
         context_window: Some(window),
         cached_input_is_subset: true,

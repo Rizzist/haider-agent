@@ -72,6 +72,9 @@ const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"powershell-wait"}"#;
 
 fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::Unknown,
         endpoint: None,
@@ -575,6 +578,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -739,6 +743,7 @@ async fn recoverable_workflow_continuation_blocks_daemon_idle_ttl_retirement() {
         continuation_of: None,
         cwd: "workflow-idle-ttl-workspace".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "workflow-idle-ttl-model".into(),
         max_output_tokens: 64,
         effort: None,
@@ -877,6 +882,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1002,6 +1008,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -2437,6 +2444,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
                     .to_string_lossy()
                     .into_owned(),
                 provider: String::new(),
+                expected_catalog_key: None,
                 model: String::new(),
                 max_tokens: 4_096,
                 permission_overrides: None,
@@ -2525,6 +2533,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
         command_id: haider_rpc::CommandId::new(command_id),
         cwd: cwd.clone(),
         provider: "fake".into(),
+        expected_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4_096,
         permission_overrides: None,
@@ -4178,6 +4187,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -5543,6 +5553,7 @@ pub(super) fn create_command(session_id: &SessionId, suffix: &str) -> SessionCre
         session_id: session_id.clone(),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4_096,
         max_tokens_source: None,
@@ -5825,6 +5836,7 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
     fact.run_id = None;
     *fact.payload = haider_protocol::session::ModelSelected {
         provider: "fake-b".into(),
+        model_catalog_key: None,
         model: "model-b".into(),
     }
     .to_payload_value()

@@ -15,7 +15,7 @@ use haider_daemon::{
     ValidationError, ValidationFailureKind, VaultProvision,
 };
 use haider_protocol::credential::CredentialDescriptor;
-use haider_protocol::error::HaiderError;
+use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_rpc::{
     ClientKind, CommandId, DEFAULT_FRAME_LIMIT, ERROR_CODE_PERMISSION_DENIED,
@@ -137,6 +137,18 @@ impl SharedDescriptors {
 }
 
 impl StoreLike for SharedDescriptors {
+    fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        COUNTER
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| current.max(floor).checked_add(1),
+            )
+            .map(|previous| previous.max(floor) + 1)
+            .map_err(|_| HaiderError::new(ErrorCode::Internal, "test incarnation exhausted", false))
+    }
+
     fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
         Ok(self.dump())
     }

@@ -14,8 +14,59 @@ fn old_metadata() -> haider_protocol::session::SessionMetadataV1 {
     .expect("actual installed 0.0.971 session metadata")
 }
 
+#[test]
+fn automatic_selection_rederives_fetched_settings_and_preserves_explicit_budget() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1::{Derived, UserSet};
+    let mut profile = summary(ModelInventoryWire::Fetched { fetched_at_ms: 1 });
+    profile.catalog = ProviderCatalogKindWire::Authenticated;
+    profile.configured_models = profile.models.clone();
+    profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "synthetic-target-B".into(),
+        account_alias: Some("work".into()),
+        account_incarnation: Some(2),
+    });
+    profile.model_details = vec![haider_rpc::ModelDetailWire {
+        source: Some(haider_rpc::ModelDetailSourceWire::Remote),
+        name: profile.models[0].clone(),
+        display_name: None,
+        context_window: Some(100_000),
+        max_output_tokens: Some(500),
+        supported_efforts: Vec::new(),
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    }];
+    for (source, expected, owner) in [
+        (Derived, 500, Some("synthetic-target-B")),
+        (UserSet { requested: 1000 }, 500, Some("synthetic-target-B")),
+        (UserSet { requested: 100 }, 100, None),
+    ] {
+        let mut metadata = old_metadata();
+        metadata.max_tokens = 111;
+        metadata.max_tokens_source = Some(source);
+        metadata.model_catalog_key = Some("synthetic-source-A".into());
+        let (key, budget) = AccountsProviderFactory::automatic_model_selection(
+            &profile,
+            &profile.models[0],
+            &metadata,
+        )
+        .expect("target selection");
+        assert_eq!(budget.max_tokens, expected);
+        assert_eq!(budget.source, source, "the requested source remains intact");
+        assert_eq!(
+            key.as_deref(),
+            owner,
+            "A's effective default is not B's state"
+        );
+    }
+}
+
 fn summary(inventory: ModelInventoryWire) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: HAIDER_CODE_PROVIDER_NAME.into(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some(HAIDER_CODE_BASE_URL.into()),
@@ -272,4 +323,160 @@ async fn persisted_remote_model_cannot_use_empty_catalog_or_implicit_alias() {
         assert_eq!(provider.requests().len(), 0);
         assert_reselection(&result.err().expect("explicit reselection required"));
     }
+}
+
+/// A session default is derived data even on an advisory custom provider.
+/// Same-alias replacement must refuse it before constructing/sending a turn.
+#[tokio::test]
+async fn catalog_derived_session_selection_keeps_its_original_incarnation() {
+    let mut profile = summary(ModelInventoryWire::Fetched { fetched_at_ms: 1 });
+    profile.provider = "custom-fixture".into();
+    profile.catalog = ProviderCatalogKindWire::Custom;
+    profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    profile.models = vec!["Go".into()];
+    profile.default_model = Some("Go".into());
+    profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "pending".into(),
+        account_alias: Some("upgrade-fixture".into()),
+        account_incarnation: Some(0),
+    });
+    let (factory, provider, alias) = factory(profile.clone());
+    let mut descriptor = factory.snapshot.lock().expect("snapshot")[0].clone();
+    let original_key = AccountsProviderFactory::descriptor_catalog_key(&profile, Some(&descriptor))
+        .expect("private producer");
+    profile.catalog_scope.as_mut().expect("scope").key = original_key.clone();
+    factory.management.as_ref().expect("management").publish(
+        2,
+        vec![descriptor.clone()],
+        vec![profile.clone()],
+    );
+    let mut metadata = old_metadata();
+    metadata.provider = profile.provider.clone();
+    metadata.model_catalog_key = Some(original_key.clone());
+    metadata.account_alias = Some(alias.as_str().into());
+    // Ordinary refresh/token rotation of the same incarnation is continuous.
+    let admitted = factory.resolve_for_turn(&metadata).await;
+    exercise_admitted_turn(&admitted).await;
+    assert!(admitted.is_ok());
+    assert_eq!(provider.requests().len(), 1);
+
+    descriptor.incarnation = 1;
+    *factory.snapshot.lock().expect("snapshot") = vec![descriptor.clone()];
+    let replacement_key =
+        AccountsProviderFactory::descriptor_catalog_key(&profile, Some(&descriptor))
+            .expect("replacement producer");
+    profile.catalog_scope.as_mut().expect("scope").key = replacement_key.clone();
+    profile
+        .catalog_scope
+        .as_mut()
+        .expect("scope")
+        .account_incarnation = Some(1);
+    factory.management.as_ref().expect("management").publish(
+        3,
+        vec![descriptor.clone()],
+        vec![profile.clone()],
+    );
+    haider_protocol::session::SessionProviderRebound {
+        rebind_id: "synthetic-rebind".into(),
+        provider: profile.provider.clone(),
+        base_url: None,
+        account: Some(alias.as_str().into()),
+    }
+    .apply_to_metadata(&mut metadata);
+    assert_eq!(
+        metadata.model_catalog_key.as_deref(),
+        Some(original_key.as_str()),
+        "a route edit cannot erase the producer of derived model settings"
+    );
+    let retired = factory.resolve_for_turn(&metadata).await;
+    exercise_admitted_turn(&retired).await;
+    let error = retired.err().expect("retired derived selection");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        error.details.expect("reselection")["requires_model_reselection"],
+        true
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "no physical request using A's default under B"
+    );
+
+    metadata.model_catalog_key = Some(replacement_key);
+    let reselected = factory.resolve_for_turn(&metadata).await;
+    exercise_admitted_turn(&reselected).await;
+    assert!(reselected.is_ok());
+    assert_eq!(provider.requests().len(), 2);
+    // A repoint changes the producer even when the account coordinate stays.
+    profile.endpoint = Some("http://127.0.0.1:23456/v1".into());
+    factory
+        .management
+        .as_ref()
+        .expect("management")
+        .publish(4, vec![descriptor], vec![profile]);
+    let repointed = factory.resolve_for_turn(&metadata).await;
+    assert!(repointed.is_err());
+    assert_eq!(provider.requests().len(), 2);
+    // Explicit unlisted configuration remains advisory passthrough.
+    metadata.model_catalog_key = None;
+    metadata.model = "manually-entered-unlisted-model".into();
+    let manual = factory.resolve_for_turn(&metadata).await;
+    exercise_admitted_turn(&manual).await;
+    assert!(manual.is_ok());
+    assert_eq!(provider.requests().len(), 3);
+}
+
+#[test]
+fn automatic_routing_owner_includes_anonymous_endpoint_context() {
+    let mut profile = summary(ModelInventoryWire::Fetched { fetched_at_ms: 1 });
+    profile.provider = "custom-fixture".into();
+    profile.catalog = ProviderCatalogKindWire::Custom;
+    profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    profile.auth_methods.clear();
+    profile.models = vec!["same-model-name".into()];
+    profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "pending".into(),
+        account_alias: None,
+        account_incarnation: None,
+    });
+    profile.catalog_scope.as_mut().expect("scope").key =
+        AccountsProviderFactory::descriptor_catalog_key(&profile, None)
+            .expect("anonymous producer");
+    let (factory, _, _) = factory(profile.clone());
+    let factory = factory.with_resilience(AccountsResilienceConfig {
+        fallback_chain: vec![ProviderTargetV1 {
+            provider: profile.provider.clone(),
+            model: Some("same-model-name".into()),
+        }],
+        promotion_targets: HashMap::new(),
+    });
+    assert!(factory.resilience_model_is_current(&profile, "same-model-name"));
+    profile.endpoint = Some("http://127.0.0.1:23457/v1".into());
+    profile.catalog_scope.as_mut().expect("scope").key =
+        AccountsProviderFactory::descriptor_catalog_key(&profile, None)
+            .expect("new origin producer");
+    factory.management.as_ref().expect("management").publish(
+        2,
+        factory.snapshot.lock().expect("snapshot").clone(),
+        vec![profile.clone()],
+    );
+    assert!(
+        !factory.resilience_model_is_current(&profile, "same-model-name"),
+        "the old automatic choice is retired even when B lists the same spelling"
+    );
+    // Explicit configured deployments are independent of remote ownership.
+    let detail = haider_rpc::ModelDetailWire {
+        source: Some(haider_rpc::ModelDetailSourceWire::Configured),
+        name: "same-model-name".into(),
+        display_name: None,
+        context_window: None,
+        max_output_tokens: None,
+        supported_efforts: Vec::new(),
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    };
+    profile.model_details = vec![detail];
+    assert!(factory.resilience_model_is_current(&profile, "same-model-name"));
 }

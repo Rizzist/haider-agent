@@ -300,9 +300,13 @@ pub(crate) fn linked_credential_path(
 }
 
 fn kimi_slot_path(root: &Path) -> Result<PathBuf, LinkedSourceReadFailure> {
-    let Ok(entries) = std::fs::read_dir(root.join("credentials")) else {
-        return Err(LinkedSourceReadFailure::RequiresOriginClient);
-    };
+    let entries = std::fs::read_dir(root.join("credentials")).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LinkedSourceReadFailure::RequiresOriginClient
+        } else {
+            LinkedSourceReadFailure::Unreadable
+        }
+    })?;
     let mut candidates = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())

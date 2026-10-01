@@ -448,7 +448,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             }));
             return Err(error);
         }
-        let request_json = serde_json::json!({
+        let mut request_coordinates = serde_json::json!({
             "automatic": true,
             "session_id": self.store.session_id(),
             "run_id": switch.run_id,
@@ -459,13 +459,37 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             "provider": switch.to_provider,
             "model": switch.to_model,
             "cause": switch.cause.as_str(),
-        })
-        .to_string();
+        });
+        if let Some(key) = &switch.model_catalog_key {
+            request_coordinates["model_catalog_key"] = serde_json::json!(key);
+        }
+        if let Some(budget) = switch.output_budget {
+            request_coordinates["output_budget"] = serde_json::json!(budget);
+        }
+        let request_json = request_coordinates.to_string();
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
         let command_id = format!(
             "automatic-pair-switch-{}",
             request_digest.get(..24).unwrap_or(&request_digest)
         );
+        if let Some(key) = &switch.model_catalog_key {
+            let summaries = self
+                .store
+                .hub()
+                .accounts()
+                .map_err(hub_error)?
+                .and_then(|facade| facade.management.read())
+                .map_or_else(Vec::new, |view| view.providers);
+            if !crate::model_select::ModelSelectionAuthority::new(None, summaries)
+                .catalog_key_is_current(&switch.to_provider, key)
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::RevisionConflict,
+                    "automatic model selection belongs to a retired catalog",
+                    false,
+                ));
+            }
+        }
         let command = SessionSelectModelCommand {
             command_id,
             request_digest,
@@ -473,14 +497,14 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             session_id: self.store.session_id().clone(),
             worker_generation: self.store.worker_generation(),
             provider: switch.to_provider.clone(),
+            model_catalog_key: switch.model_catalog_key.clone(),
             model: switch.to_model.clone(),
             // rev933b finding 7: the automatic switch observed this exact
             // pair; a concurrent explicit selection moves it and must win.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
-            // No validated model row exists on this path: keep the stored
-            // budget. An oversized budget on the fallback model is recovered
-            // by the provider's one-shot `max_tokens too large` retry.
-            output_budget: None,
+            // Production resolution reapplies the stored source to the target
+            // row. Injected legacy lanes without inventory preserve the budget.
+            output_budget: switch.output_budget,
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
@@ -13768,6 +13792,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -13884,6 +13909,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -13996,6 +14022,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

@@ -1056,6 +1056,7 @@ fn tui_session_create_carries_automode_overrides() {
         cwd: allocation.leaf.clone(),
         workspace_allocation: Some(allocation.clone()),
         provider: "fake".into(),
+        expected_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         first_text: "hi".into(),

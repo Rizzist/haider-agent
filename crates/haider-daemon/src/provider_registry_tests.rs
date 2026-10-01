@@ -141,6 +141,10 @@ fn fresh_subscription_and_failed_catalog_keep_static_rows_selectable() {
         .iter()
         .find(|row| row.name == "claude-fable-5-1")
         .expect("overridden");
+    assert!(
+        merged.static_models.contains(&"claude-fable-5-1".into()),
+        "release ownership is independent of fetched metadata precedence"
+    );
     assert_eq!(overridden.context_window, Some(123_456));
     assert_eq!(
         overridden.source,
@@ -486,6 +490,7 @@ fn enabled_profile_with_unknown_api_family_is_never_available() {
             configured_models: vec!["future-model".to_owned()],
             default_model: Some("future-model".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         }])
@@ -1046,6 +1051,7 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
             configured_models: vec!["literal-guess".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         }])
@@ -1097,6 +1103,7 @@ fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catal
         configured_models: vec!["deepseek-v4-flash".to_owned()],
         default_model: Some("deepseek-v4-flash".to_owned()),
         promotion_model: None,
+        catalog_selection_key: None,
         provenance: ProviderProvenance::Custom,
         trust: haider_rpc::ProviderTrustWire::Full,
     };
@@ -1156,6 +1163,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
             configured_models: Vec::new(),
             default_model: Some("frontier-a".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         }])
@@ -1944,6 +1952,7 @@ fn lz2_azure_custom_keeps_manual_deployments_visible_without_discovery() {
         configured_models: vec!["my-gpt-deployment".to_owned()],
         default_model: Some("my-gpt-deployment".to_owned()),
         promotion_model: None,
+        catalog_selection_key: None,
         provenance: ProviderProvenance::Custom,
         trust: haider_rpc::ProviderTrustWire::Full,
     };
@@ -1983,7 +1992,7 @@ fn lz2_azure_custom_keeps_manual_deployments_visible_without_discovery() {
     assert_eq!(generic.models, ["my-gpt-deployment"]);
     assert_eq!(
         generic.availability_reason.as_deref(),
-        Some("provider model inventory is unavailable")
+        Some("model list not fetched — fetch models before selecting")
     );
 }
 
@@ -2194,4 +2203,358 @@ fn upgrade_removes_persisted_public_seed_without_creating_aliases() {
             .inventory,
         haider_rpc::ModelInventoryWire::Static
     );
+}
+
+#[test]
+fn configured_deployments_are_selectable_only_after_success_or_unsupported_discovery() {
+    let mut registry = seeded_registry("openai");
+    registry
+        .configure(ProviderConfigureInput {
+            provider: "azure-test".into(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("https://fixture.openai.azure.com/openai/v1".into()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["my-deployment".into()],
+            default_model: Some("my-deployment".into()),
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+        })
+        .expect("configured deployment");
+    assert!(
+        registry
+            .validate_default_model("azure-test", "my-deployment")
+            .is_err()
+    );
+    for (reason, unsupported) in [
+        ("server returned 404 for /models", true),
+        ("server returned 405 for /models", true),
+        ("model listing is explicitly not supported", true),
+        ("server returned 503 for /models", false),
+        ("model catalog discovery timed out", false),
+        ("model catalog authentication failed", false),
+    ] {
+        if unsupported {
+            registry.models_unsupported("azure-test", reason.into());
+        } else {
+            registry.models_unavailable("azure-test", reason.into());
+        }
+        let summary = registry.summary("azure-test", &|_| true).expect("summary");
+        assert_eq!(summary.models, ["my-deployment"]);
+        let authority =
+            crate::model_select::ModelSelectionAuthority::new(None, vec![summary.clone()]);
+        assert_eq!(
+            authority
+                .validate_selection_with_status("azure-test", None, "my-deployment")
+                .is_ok(),
+            unsupported,
+            "session and picker selection must agree: {reason}"
+        );
+        assert_eq!(
+            summary.availability == ProviderAvailabilityWire::Available,
+            unsupported,
+            "{reason}"
+        );
+        assert_eq!(
+            registry
+                .validate_default_model("azure-test", "my-deployment")
+                .is_ok(),
+            unsupported,
+            "selection agrees with summary"
+        );
+        assert!(
+            summary
+                .availability_reason
+                .as_deref()
+                .expect("specific reason")
+                .contains(reason)
+        );
+        if unsupported {
+            assert!(
+                summary
+                    .availability_reason
+                    .as_deref()
+                    .expect("label")
+                    .contains("configured (unverified)")
+            );
+            assert_eq!(
+                registry
+                    .summary("azure-test", &|_| false)
+                    .expect("keyless")
+                    .availability,
+                ProviderAvailabilityWire::Unavailable
+            );
+        }
+    }
+    registry.replace_discovered_models(
+        "azure-test".into(),
+        vec![offline_model("azure-test", "my-deployment")],
+        u64::MAX,
+    );
+    let fetched = registry.summary("azure-test", &|_| true).expect("fetched");
+    assert_eq!(fetched.availability, ProviderAvailabilityWire::Available);
+    assert!(
+        registry
+            .validate_default_model("azure-test", "my-deployment")
+            .is_ok()
+    );
+    registry.models_unavailable("azure-test", "server returned 503 for /models".into());
+    let failed = registry
+        .summary("azure-test", &|_| true)
+        .expect("failed after success");
+    assert_eq!(failed.availability, ProviderAvailabilityWire::Unavailable);
+    assert!(
+        failed
+            .availability_reason
+            .as_deref()
+            .expect("reason")
+            .contains("503")
+    );
+    assert!(
+        registry
+            .validate_default_model("azure-test", "my-deployment")
+            .is_err()
+    );
+    assert!(
+        crate::model_select::ModelSelectionAuthority::new(None, vec![failed])
+            .validate_selection_with_status("azure-test", None, "my-deployment")
+            .is_err()
+    );
+}
+
+#[test]
+fn fetched_default_is_scoped_durably_and_configured_deployment_is_a_negative_control() {
+    let dir = tempfile::tempdir().expect("profile");
+    let store = JsonProviderRegistryStore::new(dir.path());
+    let mut registry =
+        ProviderRegistry::new(store, Vec::new(), model_source([])).expect("registry");
+    registry
+        .configure(ProviderConfigureInput {
+            provider: "work".into(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("https://fixture.example.test/v1".into()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["configured-deployment".into()],
+            default_model: Some("configured-deployment".into()),
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+        })
+        .expect("provider");
+    registry
+        .reconcile_catalog_scope("work", Some("incarnation-A".into()))
+        .expect("A scope");
+    registry.replace_discovered_models(
+        "work".into(),
+        vec![offline_model("work", "a-private")],
+        u64::MAX,
+    );
+    registry
+        .set_default_model("work", "a-private")
+        .expect("fetched selection");
+    registry
+        .configure(ProviderConfigureInput {
+            provider: "work".into(),
+            api_family: None,
+            origin: None,
+            auth_requirement: None,
+            enabled: true,
+            models: Vec::new(),
+            default_model: None,
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+        })
+        .expect("configuration-only update");
+    let profile = registry.get("work").expect("same-incarnation profile");
+    assert_eq!(profile.default_model.as_deref(), Some("a-private"));
+    assert_eq!(profile.configured_models, ["configured-deployment"]);
+    drop(registry);
+    let mut registry = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        Vec::new(),
+        model_source([]),
+    )
+    .expect("restart");
+    registry
+        .reconcile_catalog_scope("work", Some("incarnation-A".into()))
+        .expect("same scope");
+    assert_eq!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .as_deref(),
+        Some("a-private"),
+        "same incarnation retains its selected default"
+    );
+    registry
+        .reconcile_catalog_scope("work", Some("incarnation-B".into()))
+        .expect("replacement");
+    assert!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .is_none()
+    );
+    registry.replace_discovered_models(
+        "work".into(),
+        vec![offline_model("work", "b-current")],
+        u64::MAX,
+    );
+    assert_eq!(
+        registry
+            .summary("work", &|_| true)
+            .expect("B summary")
+            .default_model
+            .as_deref(),
+        Some("b-current")
+    );
+    registry.models_unsupported("work", "not supported".into());
+    registry
+        .set_default_model("work", "configured-deployment")
+        .expect("explicit config");
+    registry
+        .reconcile_catalog_scope("work", Some("incarnation-C".into()))
+        .expect("new account");
+    assert_eq!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .as_deref(),
+        Some("configured-deployment")
+    );
+    drop(registry);
+    let registry = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        Vec::new(),
+        model_source([]),
+    )
+    .expect("restart after replacement");
+    assert_ne!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .as_deref(),
+        Some("a-private")
+    );
+}
+
+#[test]
+fn retired_catalog_failover_models_are_removed_from_the_durable_document() {
+    let dir = tempfile::tempdir().expect("profile");
+    let path = dir.path().join("providers.json");
+    let mut profile = builtin_or_unknown("work", "unused");
+    profile.provenance = ProviderProvenance::Custom;
+    profile.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+    profile.auth_requirement = ProviderAuthRequirementWire::ApiKey;
+    profile.enabled = true;
+    profile.base_url = Some("https://fixture.example.test".into());
+    profile.catalog_selection_key = Some("A".into());
+    profile.configured_models = vec!["explicit-deployment".into()];
+    profile.default_model = Some("a-private".into());
+    profile.promotion_model = Some("a-private-large".into());
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&ProviderRegistryDocumentV1 {
+            providers: vec![profile],
+            fallback_chain: vec!["work/a-private".into()],
+        })
+        .expect("document"),
+    )
+    .expect("seed");
+    let mut registry = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        vec![],
+        model_source([]),
+    )
+    .expect("registry");
+    registry
+        .reconcile_catalog_scope("work", Some("B".into()))
+        .expect("retire A");
+    let document: ProviderRegistryDocumentV1 =
+        serde_json::from_slice(&std::fs::read(path).expect("read")).expect("document");
+    assert_eq!(document.fallback_chain, ["work"]);
+    assert!(document.providers[0].default_model.is_none());
+    assert!(document.providers[0].promotion_model.is_none());
+    assert_eq!(registry.fallback_chain()[0].model, None);
+    assert_eq!(
+        document.providers[0].configured_models,
+        ["explicit-deployment"]
+    );
+}
+
+#[test]
+fn discovery_recovery_does_not_promote_fetched_slugs_into_configured_deployments() {
+    for retired in [false, true] {
+        let mut registry = seeded_registry("openai");
+        let input = ProviderConfigureInput {
+            provider: "recovery-work".into(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("https://synthetic.example.test/v1".into()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["a-private".into()],
+            default_model: Some("a-private".into()),
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+        };
+        registry
+            .configure(input.clone())
+            .expect("partially saved legacy discovery");
+        if retired {
+            registry
+                .reconcile_catalog_scope("recovery-work", Some("B".into()))
+                .expect("account changed before recovery");
+        }
+        let mut original = input;
+        original.models.clear();
+        if retired {
+            original.default_model = None;
+        }
+        let fetched = if retired {
+            Vec::new()
+        } else {
+            vec!["a-private".into()]
+        };
+        registry
+            .reconcile_discovered_configure(original, &fetched, retired)
+            .expect("recovery");
+        assert!(
+            registry
+                .get("recovery-work")
+                .expect("profile")
+                .configured_models
+                .is_empty()
+        );
+        if retired {
+            assert!(
+                registry
+                    .get("recovery-work")
+                    .expect("profile")
+                    .default_model
+                    .is_none()
+            );
+        }
+        registry
+            .reconcile_catalog_scope("recovery-work", Some("B".into()))
+            .expect("replacement");
+        assert!(
+            registry
+                .get("recovery-work")
+                .expect("profile")
+                .default_model
+                .is_none()
+        );
+    }
 }

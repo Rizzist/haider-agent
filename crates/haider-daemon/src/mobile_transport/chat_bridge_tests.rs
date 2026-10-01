@@ -16,6 +16,7 @@ fn mobile_chat_creation_derives_the_selected_models_output_budget() {
     );
     assert!(
         matches!(request, RequestBody::SessionCreateWithPermissionOverrides {
+        expected_catalog_key: None,
         max_tokens: 0, provider, model, ..
     } if provider == "gemini" && model == "gemini-2.0-flash")
     );

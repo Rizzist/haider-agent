@@ -558,6 +558,7 @@ async fn create_dated_and_attach(
             command_id: CommandId::new(format!("{request_stem}-command")),
             cwd: allocation.leaf.clone(),
             provider: "fake".into(),
+            expected_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             permission_overrides: Some(SessionPermissionOverridesV1 {
@@ -7523,6 +7524,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         command_id: CommandId::new("override-command"),
         cwd: workspace.to_string_lossy().into_owned(),
         provider: "fake".into(),
+        expected_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4096,
         permission_overrides: overrides,

@@ -1509,9 +1509,28 @@ impl ModelInventoryWire {
     }
 }
 
+/// Opaque catalog producer coordinate. It contains no credential material.
+/// The key also scopes anonymous catalogs to their endpoint/auth context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCatalogScopeWire {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_incarnation: Option<u64>,
+}
+
 /// One provider's read-only management projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSummaryWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_scope: Option<ProviderCatalogScopeWire>,
+    /// Explicit deployment IDs, independent of fetched metadata for those IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_models: Vec<String>,
+    /// Release-owned IDs remain permanent when remote details replace them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_models: Vec<String>,
     pub provider: String,
     pub api_family: ProviderApiFamilyWire,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1557,6 +1576,97 @@ pub struct ProviderSummaryWire {
 }
 
 impl ProviderSummaryWire {
+    /// Private discovery belongs to the published route, including anonymous
+    /// endpoints. An explicit model name does not transfer its metadata.
+    #[must_use]
+    pub fn catalog_matches_session_route(
+        &self,
+        base_url: Option<&str>,
+        account: Option<&str>,
+    ) -> bool {
+        self.catalog_scope.as_ref().is_none_or(|scope| {
+            base_url.is_none_or(|url| self.endpoint.as_deref() == Some(url))
+                && account
+                    .zip(scope.account_alias.as_deref())
+                    .is_none_or(|(selected, published)| selected == published)
+        })
+    }
+
+    /// Retire discovery while preserving configuration and release-owned IDs.
+    pub fn retire_fetched_catalog(&mut self) {
+        for detail in &mut self.model_details {
+            if detail.source == Some(ModelDetailSourceWire::Remote)
+                && (self.configured_models.contains(&detail.name)
+                    || self.static_models.contains(&detail.name))
+            {
+                // Keep the explicit declaration, discard every fetched field.
+                detail.source = Some(if self.static_models.contains(&detail.name) {
+                    ModelDetailSourceWire::Static
+                } else {
+                    ModelDetailSourceWire::Configured
+                });
+                detail.display_name = None;
+                detail.context_window = None;
+                detail.max_output_tokens = None;
+                detail.supported_efforts.clear();
+                detail.default_effort = None;
+                detail.supported_speeds.clear();
+                detail.supports_thinking_type = None;
+                detail.supports_vision = None;
+            }
+        }
+        for name in self.configured_models.iter().chain(&self.static_models) {
+            if !self.model_details.iter().any(|detail| &detail.name == name) {
+                self.model_details.push(ModelDetailWire {
+                    source: Some(if self.static_models.contains(name) {
+                        ModelDetailSourceWire::Static
+                    } else {
+                        ModelDetailSourceWire::Configured
+                    }),
+                    name: name.clone(),
+                    display_name: None,
+                    context_window: None,
+                    max_output_tokens: None,
+                    supported_efforts: Vec::new(),
+                    default_effort: None,
+                    supported_speeds: Vec::new(),
+                    supports_thinking_type: None,
+                    supports_vision: None,
+                });
+            }
+        }
+        self.model_details.retain(|detail| {
+            matches!(
+                detail.source,
+                Some(ModelDetailSourceWire::Static | ModelDetailSourceWire::Configured)
+            )
+        });
+        self.models
+            .retain(|name| self.model_details.iter().any(|detail| &detail.name == name));
+        for name in self.configured_models.iter().chain(&self.static_models) {
+            if !self.models.contains(name) {
+                self.models.push(name.clone());
+            }
+        }
+        self.default_model = self
+            .default_model
+            .take()
+            .filter(|name| self.models.contains(name));
+        if self.has_static_models() {
+            self.inventory = ModelInventoryWire::Static;
+            self.availability_reason = (self.availability != ProviderAvailabilityWire::Available)
+                .then(|| "active account changed — refresh provider state".into());
+        } else {
+            self.inventory = if self.models.is_empty() {
+                ModelInventoryWire::NeverFetched
+            } else {
+                ModelInventoryWire::Configured
+            };
+            self.availability = ProviderAvailabilityWire::Unavailable;
+            self.availability_reason = Some("active account changed — fetch models".into());
+        }
+    }
+
     /// Whether a pickable row comes from the maintained static catalog.
     #[must_use]
     pub fn has_static_models(&self) -> bool {
@@ -3599,6 +3709,9 @@ pub enum RequestBody {
         cwd: String,
         provider: String,
         model: String,
+        /// Catalog owner observed by the client; mismatches require a fresh choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_catalog_key: Option<String>,
         max_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_overrides: Option<SessionPermissionOverridesV1>,
@@ -4106,6 +4219,9 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
         model: String,
+        /// Catalog owner observed by the client; mismatches require a fresh choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_catalog_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
@@ -5318,6 +5434,8 @@ pub enum ResponseBody {
         session_id: SessionId,
         provider: String,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_catalog_key: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
         /// `model_output_limits_v1`: the per-response budget this selection

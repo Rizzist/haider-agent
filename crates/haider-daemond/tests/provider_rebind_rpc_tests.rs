@@ -233,6 +233,7 @@ impl Client {
                     command_id: CommandId::new(format!("create-{suffix}")),
                     cwd: workspace.display().to_string(),
                     provider: PROVIDER.into(),
+                    expected_catalog_key: None,
                     model: MODEL.into(),
                     max_tokens: 4096,
                     permission_overrides: None,

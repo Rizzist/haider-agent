@@ -27,6 +27,7 @@ fn create_session(store: &Store, session_id: &SessionId) {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

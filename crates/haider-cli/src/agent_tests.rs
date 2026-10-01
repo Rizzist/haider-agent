@@ -14,6 +14,7 @@ fn agent_spawn_derives_output_budget_for_a_small_limit_model() {
     let request = agent_session_create_request("agent-test", "/tmp".into(), &spec);
     assert!(
         matches!(request, RequestBody::SessionCreateWithPermissionOverrides {
+        expected_catalog_key: None,
         max_tokens: 0, provider, model, ..
     } if provider == "openai" && model == "gpt-4o")
     );

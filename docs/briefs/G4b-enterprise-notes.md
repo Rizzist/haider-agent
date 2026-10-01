@@ -29,18 +29,18 @@ signing stayed OUT OF SCOPE.
   the login-validation adapter (`validate_openai_compatible_key`), the
   catalog discovery auth header (`CatalogAuthMode::AzureApiKey` — the v1
   surface documents `api-key` for keys; Bearer is Entra-only), and the
-  seeded-inventory availability fallback.
+  Azure request mode. Availability follows the revised LZ2 rule below.
 - Azure profiles are ordinary CUSTOM chat-completions profiles: the
   `AccountAddKind::AzureOpenAi` card collects the resource endpoint and
   DEPLOYMENT name, derives `{endpoint}/openai/v1` (the v1 surface has no
   api-version query, so the G4a query-string ban never fires), rides the
   existing `provider.configure` + key-card chain, and body.model carries
   the deployment name.
-- Discovery tolerance (LZ2): `GET {base}/openai/v1/models` may 404 —
-  discovery failure is non-fatal because an azure-origin custom profile
-  with configured deployments keeps them as its INVENTORY (see
-  availability below). The card collected the deployment at create time,
-  so the "manual deployment entry" is already durable.
+- Discovery tolerance (LZ2): configured deployments remain visible but
+  Unavailable until a model-list fetch succeeds. HTTP 404/405 or an explicit
+  unsupported response permits manual selection as `configured (unverified)`
+  with the actual reason. These rows cannot participate in automatic failover
+  or promotion. 5xx/timeouts remain Unavailable and can be retried.
 
 ### Bedrock — mantle surface only (decision 2, LB1/LB2)
 
@@ -126,13 +126,13 @@ and the LB1/LV1 goldens.
 `summaries()`/`summary()` now take an explicit `has_credential` predicate
 — every caller states its account truth (the accounts actor passes
 `provider_has_credential(accounts)`; init-time id listing passes a false
-predicate). With nothing discovered, a SEEDED-inventory profile
-(bedrock/vertex always; customs only at azure origins) serves its
-configured models as the inventory, enriched through the same
-`model_detail_wire` path; it lights Available exactly when `enabled` AND a
-credential exists AND an endpoint is configured, with honest reasons
-("provider has no credential" / "provider endpoint is not configured")
-otherwise. Non-azure customs keep the G4a discovery-only rule unchanged.
+predicate). Bedrock/vertex are release-owned offline catalogs: availability
+requires an enabled profile, credential and endpoint. Custom configured lists,
+including Azure deployments, stay Unavailable until successful discovery or
+explicitly unsupported listing. Unsupported configured rows are selectable
+as `configured (unverified)` with the actual failure reason, but remain outside
+automatic failover/promotion. Transient failures retain Unavailable and retry
+with their specific reason. The TUI and daemon share these selection rules.
 Because a login/import can now FLIP availability, `finalize_and_respond`
 and the gcloud import publish the FULL provider view (login previously
 published accounts only). Default-model selection validates against the
@@ -145,7 +145,7 @@ seeded inventory too (`selectable_slugs`).
   (provider openai tests);
   `azure_origin_custom_profiles_route_through_the_api_key_header_adapter`
   (daemon accounts tests — the factory route mapping).
-- LZ2: `lz2_azure_custom_keeps_manual_deployments_available_without_discovery`
+- LZ2: `lz2_azure_custom_keeps_manual_deployments_visible_without_discovery`
   (daemon registry tests).
 - LB1: `lb1_bedrock_mantle_golden_url_headers_body_and_sse`.
 - LB2: `lb2_new_endpoint_refuses_non_mantle_url_shapes`.
@@ -224,3 +224,14 @@ registry, 1 model_select, 6 accounts], 4 haider-tui).
 - **`model_capabilities` normalizes too** — enterprise spellings report
   their real context windows (1M for the 5-family) instead of the unknown
   100k row; same one `base_model` authority, no new guessing.
+
+## LZ2 ruling update (2026-09-30)
+
+This replaces the historical seeded-availability wording above. Configured
+Azure deployments stay visible but Unavailable until discovery succeeds.
+HTTP 404/405 or an explicit unsupported listing permits manual selection as
+`configured (unverified)`, retaining the specific reason. That inventory is
+excluded from automatic failover and promotion. Transient 5xx/timeouts stay
+Unavailable with their specific reason and can be retried. The daemon and
+TUI accept and refuse the same rows. See `docs/subscription-model-catalog.md`
+and `configured_deployments_are_selectable_only_after_success_or_unsupported_discovery`.

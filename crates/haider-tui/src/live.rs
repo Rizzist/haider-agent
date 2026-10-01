@@ -188,6 +188,7 @@ pub enum LiveCommand {
         message: String,
     },
     Create {
+        expected_catalog_key: Option<String>,
         command_id: CommandId,
         cwd: String,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
@@ -788,6 +789,7 @@ pub enum LiveCommand {
     /// selection. DURABLE — a reconnect resends under the same command id
     /// and the daemon replays the committed receipt.
     SelectModel {
+        expected_catalog_key: Option<String>,
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
@@ -1345,6 +1347,8 @@ pub enum LiveReply {
     },
     /// `session.create` answered: the daemon's own session id.
     Created {
+        provider: String,
+        model_catalog_key: Option<String>,
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
@@ -1847,6 +1851,7 @@ pub enum LiveReply {
         command_id: CommandId,
         session: SessionId,
         provider: String,
+        model_catalog_key: Option<String>,
         model: String,
         worker_generation: u64,
         /// Budget the selection committed; a clamp becomes a visible notice.
@@ -3551,6 +3556,8 @@ impl LiveDriver {
                 worker_generation,
                 cwd,
                 model: model_name,
+                provider,
+                model_catalog_key,
             } => {
                 let cwd_display = workspace_display_path(&cwd);
                 self.binding_worker_generation = Some(worker_generation);
@@ -3569,10 +3576,11 @@ impl LiveDriver {
                     // path the daemon was given.
                     row.dir = cwd_display.clone();
                     row.workspace_cwd = Some(cwd.clone());
-                    row.model_short = model_name;
+                    row.model_short = model_name.clone();
                 }
                 let commands = self.ensure_attached(model, &session);
                 model.open_session(&session);
+                model.apply_scoped_model_selected(&provider, &model_name, model_catalog_key);
                 model.session_dir = cwd_display;
                 model.session_workspace_cwd = Some(cwd);
                 // THE ORDER (R11 cut 4): create response → attach response
@@ -4489,11 +4497,55 @@ impl LiveDriver {
                 revision,
                 sources,
             } => {
+                let previous_scopes = model
+                    .accounts
+                    .rows
+                    .iter()
+                    .filter(|row| row.selected)
+                    .map(|row| {
+                        (
+                            row.provider.clone(),
+                            row.alias.clone(),
+                            model.accounts.catalog_incarnations.get(&row.alias).copied(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 let rows = descriptors
                     .iter()
                     .map(crate::app::AccountRow::from_descriptor)
                     .collect();
                 if model.accounts.apply_snapshot(rows, revision) {
+                    for (provider, alias, incarnation) in previous_scopes {
+                        let same = descriptors
+                            .iter()
+                            .find(|row| row.active && row.provider == provider)
+                            .is_some_and(|row| {
+                                row.alias.as_str() == alias && Some(row.incarnation) == incarnation
+                            });
+                        if !same
+                            && incarnation.is_some_and(|value| value != 0)
+                            && model.providers.revision < revision
+                            && let Some(summary) = model
+                                .providers
+                                .providers
+                                .iter_mut()
+                                .find(|row| row.provider == provider)
+                            && summary.catalog_scope.is_none()
+                            && !matches!(
+                                summary.catalog,
+                                haider_rpc::ProviderCatalogKindWire::Public
+                                    | haider_rpc::ProviderCatalogKindWire::Offline
+                            )
+                        {
+                            // Account and provider replies can arrive in either order.
+                            // Retire old remote metadata immediately at the account boundary.
+                            crate::app::retire_fetched_catalog(summary);
+                        }
+                    }
+                    model.accounts.catalog_incarnations = descriptors
+                        .iter()
+                        .map(|row| (row.alias.as_str().to_owned(), row.incarnation))
+                        .collect();
                     model.accounts.apply_sources(sources);
                     // Daemon truth landed: an unpinned identity follows the
                     // active account (W5f-2) so the first session can serve.
@@ -4579,7 +4631,7 @@ impl LiveDriver {
                     self.pending_account_select = None;
                 }
                 model.apply_account_selected(&descriptor, revision);
-                Vec::new()
+                vec![LiveCommand::AccountList, LiveCommand::ProviderList]
             }
             LiveReply::Providers {
                 providers,
@@ -4624,6 +4676,7 @@ impl LiveDriver {
                 model: model_name,
                 worker_generation,
                 output_budget,
+                model_catalog_key,
             } => {
                 self.retire(&command_id);
                 if self
@@ -4634,7 +4687,7 @@ impl LiveDriver {
                     self.pending_model_select = None;
                 }
                 self.generations.insert(session, worker_generation);
-                model.apply_model_selected(&provider, &model_name);
+                model.apply_scoped_model_selected(&provider, &model_name, model_catalog_key);
                 if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
                     model.apply_output_budget_clamp(&clamp);
                 }
@@ -6462,13 +6515,7 @@ impl LiveDriver {
             // transcript note so every later turn reads under the model
             // that served it.
             haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) => {
-                if model.identity.model_short != selected.model
-                    || model.identity.provider != selected.provider
-                {
-                    model.identity.provider = selected.provider.clone();
-                    model.identity.model_short = selected.model.clone();
-                    model.refresh_context_window();
-                }
+                model.apply_scoped_model_selected(&selected.provider, &selected.model, selected.model_catalog_key);
                 model.projection.push_note(format!(
                     "⇄ model → {} · {}",
                     selected.model, selected.provider
@@ -6476,11 +6523,7 @@ impl LiveDriver {
                 model.dirty = true;
             }
             haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(rebound) => {
-                if model.identity.provider != rebound.provider {
-                    model.identity.provider = rebound.provider;
-                    model.refresh_context_window();
-                    model.dirty = true;
-                }
+                model.apply_session_provider_rebound(&rebound);
             }
             // Dated-workspace addendum O5/O7: ONE replaceable context slot.
             // Replay folds by revision (the latest wins in place); no
@@ -6726,7 +6769,16 @@ impl LiveDriver {
                         ),
                         workspace_allocation,
                         provider: model.identity.provider.clone(),
-                        model: model.identity.model_short.clone(),
+                        model: if model.launcher_model_pick_is_ready() {
+                            model.identity.model_short.clone()
+                        } else {
+                            String::new()
+                        },
+                        expected_catalog_key: if model.launcher_model_pick_is_ready() {
+                            model.identity_choice_catalog_key()
+                        } else {
+                            None
+                        },
                         max_tokens: 0,
                         first_text: text,
                     },
@@ -6901,6 +6953,7 @@ impl LiveDriver {
                 })]
             }
             AppRequest::SelectModel {
+                expected_catalog_key,
                 session,
                 model: model_name,
                 provider,
@@ -6918,6 +6971,7 @@ impl LiveDriver {
                     command_id,
                     session,
                     worker_generation,
+                    expected_catalog_key,
                     model: model_name,
                     provider,
                     confirm_new_epoch,

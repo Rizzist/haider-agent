@@ -98,6 +98,7 @@ fn typed_session(store: &Store, session_id: &str, cwd: &Path) -> SessionId {
         session_id: SessionId::new(session_id),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4096,
         max_tokens_source: None,

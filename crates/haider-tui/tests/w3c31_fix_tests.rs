@@ -537,6 +537,8 @@ fn a_created_session_attaches_exactly_once_through_the_loop() {
             session: sid(1),
             worker_generation: 7,
             cwd: "~/dev".to_owned(),
+            provider: "anthropic".into(),
+            model_catalog_key: None,
             model: "fable-5".to_owned(),
         }),
     );

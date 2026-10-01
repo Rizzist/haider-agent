@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use haider_accounts::KeychainVault;
 use haider_accounts::{
     AccountIdentity, AccountStore, AccountsResult, AuthMethod, CredentialAlias,
-    CredentialDescriptor, CredentialStatus, ErrorCode, JsonFileStore, MemoryVault, Resolver,
-    RotationCallback, RotationDecision, RotationTrigger, StoreLike, Vault, import_env,
+    CredentialDescriptor, CredentialStatus, ErrorCode, HaiderError, JsonFileStore, MemoryVault,
+    Resolver, RotationCallback, RotationDecision, RotationTrigger, StoreLike, Vault, import_env,
 };
 use haider_protocol::credential::RotationCause;
 
@@ -885,6 +885,18 @@ impl SnapshotStore {
 }
 
 impl StoreLike for SnapshotStore {
+    fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        COUNTER
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| current.max(floor).checked_add(1),
+            )
+            .map(|previous| previous.max(floor) + 1)
+            .map_err(|_| HaiderError::new(ErrorCode::Internal, "test incarnation exhausted", false))
+    }
+
     fn load(&self) -> AccountsResult<Vec<CredentialDescriptor>> {
         Ok(self.descriptors.lock().unwrap().clone())
     }
@@ -899,6 +911,18 @@ impl StoreLike for SnapshotStore {
 struct FailingSaveStore;
 
 impl StoreLike for FailingSaveStore {
+    fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        COUNTER
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| current.max(floor).checked_add(1),
+            )
+            .map(|previous| previous.max(floor) + 1)
+            .map_err(|_| HaiderError::new(ErrorCode::Internal, "test incarnation exhausted", false))
+    }
+
     fn load(&self) -> AccountsResult<Vec<CredentialDescriptor>> {
         Ok(Vec::new())
     }
@@ -999,4 +1023,63 @@ fn labels_are_set_cleared_and_survive_rotation() {
             .set_label(&CredentialAlias::new("nope"), Some("x".into()))
             .is_err()
     );
+}
+
+#[test]
+fn manual_grant_identity_refresh_after_rotation_keeps_incarnation_but_intake_does_not() {
+    for provider in ["kimi-oauth", "grok-oauth", "anthropic-oauth"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+        let id = if provider == "anthropic-oauth" {
+            "anthropic:0123456789abcdef".to_owned()
+        } else {
+            format!("{provider}:grant-0123456789abcdef")
+        };
+        let row = oauth_incarnation_fixture(provider, &id, None, "A", 1);
+        accounts.add(row).unwrap();
+        let alias = CredentialAlias::new("linked");
+        let first = accounts.get(&alias).unwrap().incarnation;
+        let identity = accounts.get(&alias).unwrap().account_identity.clone();
+        accounts
+            .reconcile_identity(&alias, identity, Some("rotated".into()))
+            .unwrap();
+        assert_eq!(
+            accounts.get(&alias).unwrap().incarnation,
+            first,
+            "{provider} manual refresh"
+        );
+        let mut intake = accounts.get(&alias).unwrap().clone();
+        intake.credential_digest = Some("new-import".into());
+        accounts.replace(intake).unwrap();
+        assert!(
+            accounts.get(&alias).unwrap().incarnation > first,
+            "{provider} intake remains strict"
+        );
+    }
+}
+
+#[test]
+fn manual_refresh_does_not_treat_source_or_malformed_grant_labels_as_owned_grants() {
+    for (provider, id) in [
+        ("kimi-oauth", "kimi:source"),
+        ("grok-oauth", "grok:source"),
+        ("kimi-oauth", "kimi-oauth:grant-incomplete"),
+        ("anthropic-oauth", "anthropic:display-plan"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+        accounts
+            .add(oauth_incarnation_fixture(provider, id, None, "A", 1))
+            .unwrap();
+        let alias = CredentialAlias::new("linked");
+        let original = accounts.get(&alias).unwrap().incarnation;
+        let identity = accounts.get(&alias).unwrap().account_identity.clone();
+        accounts
+            .reconcile_identity(&alias, identity, Some("B".into()))
+            .unwrap();
+        assert!(
+            accounts.get(&alias).unwrap().incarnation > original,
+            "{provider}/{id}"
+        );
+    }
 }

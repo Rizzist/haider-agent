@@ -29,6 +29,7 @@ async fn metafork_content_is_in_child_journal_but_not_child_prompt() {
             session_id: source.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

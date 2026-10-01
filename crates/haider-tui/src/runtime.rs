@@ -432,11 +432,7 @@ pub fn sync_model_persistence(
     }
     *seen_commits = model.model_commits;
     if let Some(store) = settings.as_mut() {
-        store.save_last_model_if_changed(
-            model.theme_choice,
-            &model.identity.provider,
-            &model.identity.model_short,
-        );
+        store.save_last_model_if_changed(model.theme_choice, model.last_model_pick());
     }
 }
 
@@ -3842,16 +3838,13 @@ pub async fn run_live(
     // user last selected — seed the identity pair from the persisted pick.
     // The next CreateSession mints from this pair (M9), and live daemon
     // replies stay the running authority afterwards.
-    if let Some((provider, model_short)) = settings
+    if let Some(pick) = settings
         .as_ref()
         .and_then(crate::settings::SettingsStore::load_last_model)
     {
-        model.identity.provider = provider.clone();
-        model.identity.model_short = model_short.clone();
-        model.identity_pinned = true;
-        model.refresh_context_window();
+        model.restore_last_model_pick(&pick);
         if let Some(store) = settings.as_mut() {
-            store.set_last_model(Some((provider, model_short)));
+            store.set_last_model(Some(pick));
         }
     }
     // 970: see the demo loop — one boot read of the acknowledgement journal.

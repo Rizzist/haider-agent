@@ -16,6 +16,9 @@ pub(super) async fn pin_headless_turn_metadata(
     run_id: &RunId,
 ) -> Result<(), HaiderError> {
     metadata.model.clone_from(&spec.model);
+    metadata
+        .model_catalog_key
+        .clone_from(&spec.model_catalog_key);
     metadata.max_tokens = spec.max_output_tokens;
     metadata.effort.clone_from(&spec.effort);
     metadata.fast = spec.fast;
@@ -63,6 +66,19 @@ pub(super) async fn pin_headless_turn_metadata(
                     .filter(|model| !model.is_empty())
             {
                 metadata.model = model.to_owned();
+                metadata.model_catalog_key = data
+                    .get("model_catalog_key")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                if let Some(budget) = data.get("output_budget").and_then(|value| {
+                    serde_json::from_value::<haider_protocol::output_budget::SessionOutputBudgetV1>(
+                        value.clone(),
+                    )
+                    .ok()
+                }) {
+                    metadata.max_tokens = budget.max_tokens;
+                    metadata.max_tokens_source = Some(budget.source);
+                }
             }
         }
         if page_len < 256 {

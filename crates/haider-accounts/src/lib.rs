@@ -29,6 +29,8 @@ mod oauth;
 mod resolver;
 mod source_registry;
 mod store;
+#[cfg(test)]
+mod store_tests;
 mod vault;
 
 #[cfg(unix)]

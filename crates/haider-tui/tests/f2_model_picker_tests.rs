@@ -765,6 +765,7 @@ fn live_selection_is_receipted_and_renders_the_resolved_pair() {
             command_id,
             session: sid(),
             provider: "openai-oauth".to_owned(),
+            model_catalog_key: None,
             model: "o4-mini".to_owned(),
             worker_generation: 7,
             output_budget: None,
@@ -851,6 +852,7 @@ fn provider_stage_selection_preserves_pending_and_resolved_truth() {
             command_id,
             session: sid(),
             provider: "resolved-stage".to_owned(),
+            model_catalog_key: None,
             model: "stage-model-v2".to_owned(),
             worker_generation: 9,
             output_budget: None,
@@ -885,6 +887,7 @@ fn clamped_user_output_budget_shows_a_notice_on_model_switch() {
             command_id,
             session: sid(),
             provider: "openai".to_owned(),
+            model_catalog_key: None,
             model: "gpt-4o".to_owned(),
             worker_generation: 8,
             output_budget: Some(haider_protocol::output_budget::SessionOutputBudgetV1 {
@@ -1185,4 +1188,36 @@ fn never_fetched_picker_has_no_invented_model_and_enter_fetches() {
             .iter()
             .any(|row| row.model == "deepseek-v4-flash")
     );
+}
+
+#[test]
+fn configured_unverified_deployment_is_selectable_and_reason_fits_both_picker_sizes() {
+    let mut model = seeded_launcher();
+    add_api_provider(
+        &mut model,
+        ApiProviderFixture {
+            provider: "azure-deploy",
+            model: "my-gpt-deployment",
+            available: true,
+            reason: Some("configured (unverified): server returned 404 for /models"),
+            context_window: None,
+            fetched_at_ms: None,
+            lockdown: false,
+            is_default: true,
+        },
+    );
+    run_slash(&mut model, "/model my-gpt");
+    let row = model
+        .model_picker_filtered("my-gpt")
+        .pop()
+        .expect("deployment");
+    assert!(row.available && row.selectable);
+    for (width, height) in [(118, 36), (80, 24)] {
+        let text = draw_rows(&model, width, height).join("\n");
+        assert!(text.contains("configured (unverified)"), "{text}");
+        assert!(text.contains("404"), "{text}");
+    }
+    model.select_model_row(&row);
+    assert_eq!(model.identity.model_short, "my-gpt-deployment");
+    assert!(model.model_picker.is_none());
 }

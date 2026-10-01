@@ -53,6 +53,9 @@ impl AccountClient for FakeClient {
 
 fn provider() -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "router".into(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:8080".into()),
@@ -211,6 +214,11 @@ async fn keyed_add_reserves_one_stage_for_the_durable_login() {
         ResponseBody::AccountLoginApi {
             descriptor: descriptor(),
         },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
     ]);
     let result = execute(
         &client,
@@ -231,7 +239,21 @@ async fn keyed_add_reserves_one_stage_for_the_durable_login() {
     .await;
     assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
     let requests = client.requests();
-    assert_eq!(requests.len(), 4);
+    assert!(
+        matches!(requests.last(), Some(RequestBody::ProviderList { .. })),
+        "intake is read after commit"
+    );
+    assert!(
+        requests.iter().all(|request| !matches!(
+            request,
+            RequestBody::ProviderConfigure {
+                default_model: Some(_),
+                ..
+            }
+        )),
+        "fetched defaults are never echoed as config"
+    );
+    assert_eq!(requests.len(), 5);
     assert!(matches!(requests[0], RequestBody::ProviderList { .. }));
     assert!(matches!(requests[1], RequestBody::VaultStage { .. }));
     assert!(matches!(
@@ -269,6 +291,11 @@ async fn no_auth_add_skips_vault_and_login_and_discovers_empty_input() {
             provider: configured,
             revision: 4,
         },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
     ]);
     let result = execute(
         &client,
@@ -287,7 +314,21 @@ async fn no_auth_add_skips_vault_and_login_and_discovers_empty_input() {
     .await;
     assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
     let requests = client.requests();
-    assert_eq!(requests.len(), 2);
+    assert!(
+        matches!(requests.last(), Some(RequestBody::ProviderList { .. })),
+        "intake is read after commit"
+    );
+    assert!(
+        requests.iter().all(|request| !matches!(
+            request,
+            RequestBody::ProviderConfigure {
+                default_model: Some(_),
+                ..
+            }
+        )),
+        "fetched defaults are never echoed as config"
+    );
+    assert_eq!(requests.len(), 3);
     assert!(matches!(
         &requests[1],
         RequestBody::ProviderConfigure {
@@ -395,6 +436,11 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
         ResponseBody::AccountLoginApi {
             descriptor: descriptor(),
         },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
     ]);
     let result = execute(
         &client,
@@ -415,7 +461,21 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
     .await;
     assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
     let requests = client.requests();
-    assert_eq!(requests.len(), 4);
+    assert!(
+        matches!(requests.last(), Some(RequestBody::ProviderList { .. })),
+        "intake is read after commit"
+    );
+    assert!(
+        requests.iter().all(|request| !matches!(
+            request,
+            RequestBody::ProviderConfigure {
+                default_model: Some(_),
+                ..
+            }
+        )),
+        "fetched defaults are never echoed as config"
+    );
+    assert_eq!(requests.len(), 5);
     assert!(matches!(
         &requests[2],
         RequestBody::ProviderConfigure {
@@ -473,6 +533,11 @@ async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
             replacement_active_alias: None,
             revision: 32,
         },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
     ]);
     let result = execute(
         &client,
@@ -491,7 +556,21 @@ async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
     .await;
     assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
     let requests = client.requests();
-    assert_eq!(requests.len(), 4);
+    assert!(
+        matches!(requests.last(), Some(RequestBody::ProviderList { .. })),
+        "intake is read after commit"
+    );
+    assert!(
+        requests.iter().all(|request| !matches!(
+            request,
+            RequestBody::ProviderConfigure {
+                default_model: Some(_),
+                ..
+            }
+        )),
+        "fetched defaults are never echoed as config"
+    );
+    assert_eq!(requests.len(), 5);
     assert!(matches!(
         &requests[1],
         RequestBody::ProviderConfigure {

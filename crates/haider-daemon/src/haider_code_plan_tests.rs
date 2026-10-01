@@ -687,6 +687,7 @@ async fn real_session_hub_interest_requires_an_attached_haider_code_session() {
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: provider.into(),
+            model_catalog_key: None,
             model: "test-model".into(),
             max_tokens: 4_096,
             max_tokens_source: None,

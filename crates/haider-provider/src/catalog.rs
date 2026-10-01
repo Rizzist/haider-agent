@@ -116,6 +116,8 @@ pub enum CatalogError {
     /// The provider will not serve a list to this credential (or at all).
     /// The caller falls back; it must NOT fabricate a list.
     Unavailable { reason: String },
+    /// Listing is explicitly unsupported (including HTTP 404/405).
+    Unsupported { reason: String },
     /// Transport/guard failure — retryable.
     Transport { reason: String },
     /// The endpoint explicitly rejected the supplied credential.
@@ -137,7 +139,9 @@ impl std::fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotModified => write!(formatter, "model catalog is unchanged"),
-            Self::Unavailable { reason } | Self::Transport { reason } => {
+            Self::Unavailable { reason }
+            | Self::Unsupported { reason }
+            | Self::Transport { reason } => {
                 write!(formatter, "{reason}")
             }
             Self::Unauthorized => write!(formatter, "model catalog authentication failed"),
@@ -495,8 +499,13 @@ pub async fn discover_models_with_resolver(
             reason: "model catalog endpoint redirects; refusing to follow".to_owned(),
         });
     }
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
+    let response_status = response.status();
+    let compatible_listing = matches!(
+        source,
+        CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
+    );
+    if !response_status.is_success() {
+        let status = response_status.as_u16();
         if status == 401 {
             return Err(CatalogError::Unauthorized);
         }
@@ -510,20 +519,23 @@ pub async fn discover_models_with_resolver(
                 ),
             });
         }
-        if matches!(
-            source,
-            CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
-        ) {
+        if compatible_listing {
+            let reason = format!("server returned {status} for /models");
+            if matches!(status, 404 | 405) {
+                return Err(CatalogError::Unsupported { reason });
+            }
+            if status >= 500 {
+                return Err(CatalogError::Transport { reason });
+            }
+            // Some compatible services return a typed not-supported error
+            // instead of 404/405. Read it through the same body bound below.
+        } else {
             return Err(CatalogError::Unavailable {
-                reason: format!("server returned {status} for /models"),
+                reason: format!(
+                    "provider does not serve a model list to this credential ({status})"
+                ),
             });
         }
-        // 401/403/404 under a subscription token is the "not served to this
-        // credential" case the brief anticipated: honest unavailability, and
-        // the caller keeps its last-known list.
-        return Err(CatalogError::Unavailable {
-            reason: format!("provider does not serve a model list to this credential ({status})"),
-        });
     }
     let response_etag = response
         .headers()
@@ -548,10 +560,48 @@ pub async fn discover_models_with_resolver(
         }
         body.extend_from_slice(&chunk);
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|error| CatalogError::InvalidBody {
-            reason: format!("model catalog response is not JSON: {error}"),
-        })?;
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+        if response_status.is_success() {
+            CatalogError::InvalidBody {
+                reason: format!("model catalog response is not JSON: {error}"),
+            }
+        } else {
+            CatalogError::Unavailable {
+                reason: format!("server returned {} for /models", response_status.as_u16()),
+            }
+        }
+    })?;
+    if compatible_listing {
+        let code = [value.pointer("/error/code"), value.pointer("/error/type")]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .find(|code| {
+                [
+                    "OperationNotSupported",
+                    "NotSupported",
+                    "not_supported",
+                    "unsupported_operation",
+                    "not_implemented",
+                ]
+                .iter()
+                .any(|known| code.eq_ignore_ascii_case(known))
+            });
+        if let Some(code) = code {
+            return Err(CatalogError::Unsupported {
+                reason: format!(
+                    "server returned {} for /models: {code}",
+                    response_status.as_u16()
+                ),
+            });
+        }
+    }
+    if !response_status.is_success() {
+        return Err(CatalogError::Unavailable {
+            reason: format!("server returned {} for /models", response_status.as_u16()),
+        });
+    }
     let models = parse_catalog(source, &value)?;
     // A credential-reflecting server must not smuggle the key into a
     // public picker, receipt, cache, or event as a model id.

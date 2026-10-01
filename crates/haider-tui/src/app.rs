@@ -18,7 +18,7 @@ use haider_protocol::menu::{
 use haider_protocol::state::{HarnessStatus, RunState};
 use haider_protocol::{DeliveryMode, EventPayload};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Sim `autoBlurb` (tui.js:401-406): strip a leading slash-command token,
 /// keep the first seven words, cap at 46 chars, capitalize the first letter.
@@ -347,6 +347,7 @@ fn canonical_positive_decimal(value: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct AccountsState {
     pub rows: Vec<AccountRow>,
+    pub catalog_incarnations: std::collections::HashMap<String, u64>,
     /// Secret-free credential-source metadata from the same `account.list`
     /// snapshot. Entries join to rows by stable alias; alias-less/unmatched
     /// enrolled roots remain visible as sources without linked accounts.
@@ -1167,6 +1168,12 @@ fn normalize_provider_inventory(
         summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
     }
     summary
+}
+
+/// Keep provider configuration and release-owned rows, retiring discovery
+/// metadata and evidence of selectability from the previous account.
+pub(crate) fn retire_fetched_catalog(summary: &mut haider_rpc::ProviderSummaryWire) {
+    summary.retire_fetched_catalog();
 }
 
 fn provider_inventory_can_fetch(summary: &haider_rpc::ProviderSummaryWire) -> bool {
@@ -3986,6 +3993,7 @@ pub enum AppRequest {
     /// The provider always rides along; the identity pair moves only on the
     /// correlated RESOLVED reply.
     SelectModel {
+        expected_catalog_key: Option<String>,
         session: SessionId,
         model: String,
         provider: String,
@@ -5224,6 +5232,13 @@ pub struct AppModel {
     /// daemon-truth bootstrap below never overwrites their choice; until
     /// then the identity line is only a seed and daemon reality wins.
     pub identity_pinned: bool,
+    identity_catalog_scope: Option<(String, String, u64)>,
+    identity_catalog_key: Option<String>,
+    restored_model_catalog_pending: bool,
+    identity_unowned_configuration: bool,
+    session_catalog_keys: HashMap<SessionId, (String, String, Option<String>)>,
+    session_catalog_routes: HashMap<SessionId, (Option<String>, Option<String>)>,
+    pending_catalogs: HashMap<String, haider_rpc::ProviderSummaryWire>,
     /// The ACTIVE surface's composer (TUI5): text + first-class cursor +
     /// selection + input ring. Nothing in it persists (item 8).
     pub composer: crate::composer::Composer,
@@ -5949,6 +5964,13 @@ impl Default for AppModel {
             identity: IdentityLine::default(),
             launch_origin: None,
             identity_pinned: false,
+            identity_catalog_scope: None,
+            identity_catalog_key: None,
+            restored_model_catalog_pending: false,
+            identity_unowned_configuration: false,
+            session_catalog_keys: HashMap::new(),
+            session_catalog_routes: HashMap::new(),
+            pending_catalogs: HashMap::new(),
             composer: crate::composer::Composer::new(),
             mirrored_input_attachments: None,
             drafts: std::collections::HashMap::new(),
@@ -7120,6 +7142,9 @@ impl AppModel {
     /// of the effort ladder / default / fast gate — the TUI holds no tables.
     #[must_use]
     pub fn current_pair_detail(&self) -> Option<&haider_rpc::ModelDetailWire> {
+        if !self.current_catalog_matches_session_route() {
+            return None;
+        }
         self.providers
             .model_detail(&self.identity.provider, &self.identity.model_short)
     }
@@ -11688,7 +11713,18 @@ impl AppModel {
         // Choosing an account IS choosing the session identity (W5f-2):
         // the committed pick rides into the composer line and pins, so the
         // next `session.create` carries it and no later snapshot undoes it.
-        self.adopt_identity(&descriptor.provider, descriptor.alias.as_str(), true);
+        self.accounts
+            .catalog_incarnations
+            .insert(descriptor.alias.as_str().to_owned(), descriptor.incarnation);
+        self.identity.provider = descriptor.provider.clone();
+        self.identity.account = descriptor.alias.as_str().to_owned();
+        self.bootstrap_identity_from_daemon();
+        // Do not pin a model from a provider reply owned by the old account.
+        // A fresh provider snapshot completes the account selection.
+        if !self.identity.model_short.is_empty() {
+            self.adopt_identity(&descriptor.provider, descriptor.alias.as_str(), true);
+            self.pin_model_catalog_scope();
+        }
         self.dirty = true;
     }
 
@@ -11697,6 +11733,16 @@ impl AppModel {
     /// discovered slug — NEVER an invented one; with nothing discovered the
     /// current model stands until `/model` can offer real candidates).
     fn adopt_identity(&mut self, provider: &str, alias: &str, pin: bool) {
+        let anonymous = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .and_then(|summary| summary.catalog_scope.as_ref())
+            .is_some_and(|scope| {
+                scope.account_alias.is_none() && scope.account_incarnation.is_none()
+            });
+        let alias = if anonymous { "" } else { alias };
         if self.identity.provider != provider {
             self.identity.provider = provider.to_owned();
         }
@@ -11723,6 +11769,247 @@ impl AppModel {
         self.dirty = true;
     }
 
+    pub fn restore_last_model_pick(&mut self, pick: &crate::settings::LastModelPick) {
+        self.identity.provider = pick.provider.clone();
+        self.identity.model_short = pick.model.clone();
+        self.identity_pinned = true;
+        self.identity_catalog_scope = None;
+        self.identity_catalog_key = pick.catalog_key.clone();
+        self.restored_model_catalog_pending = !pick.scope_known;
+        self.identity_unowned_configuration = pick.scope_known && pick.catalog_key.is_none();
+        self.refresh_context_window();
+    }
+
+    pub fn last_model_pick(&self) -> Option<crate::settings::LastModelPick> {
+        (self.identity_pinned && !self.identity.model_short.is_empty()).then(|| {
+            crate::settings::LastModelPick {
+                provider: self.identity.provider.clone(),
+                model: self.identity.model_short.clone(),
+                catalog_key: self.identity_choice_catalog_key(),
+                scope_known: !self.restored_model_catalog_pending
+                    && (self.identity_unowned_configuration || self.identity_catalog_key.is_some()),
+            }
+        })
+    }
+
+    pub(crate) fn launcher_model_pick_is_ready(&self) -> bool {
+        self.identity_pinned && !self.restored_model_catalog_pending
+    }
+
+    pub(crate) fn identity_choice_catalog_key(&self) -> Option<String> {
+        if self.identity_unowned_configuration {
+            return None;
+        }
+        // A restored pick can issue before the first inventory reply. Keep
+        // its original producer even when a newer view no longer lists it.
+        self.identity_catalog_key.clone().or_else(|| {
+            self.catalog_key_for_model(&self.identity.provider, &self.identity.model_short)
+        })
+    }
+
+    fn model_is_configuration(&self, provider: &str, model: &str) -> bool {
+        let Some(summary) = self
+            .providers
+            .providers
+            .iter()
+            .find(|row| row.provider == provider)
+        else {
+            return true;
+        };
+        matches!(
+            summary.catalog,
+            haider_rpc::ProviderCatalogKindWire::Public
+                | haider_rpc::ProviderCatalogKindWire::Offline
+        ) || summary.configured_models.iter().any(|row| row == model)
+            || summary.static_models.iter().any(|row| row == model)
+            || summary.model_details.iter().any(|row| {
+                row.name == model
+                    && matches!(
+                        row.source,
+                        Some(
+                            haider_rpc::ModelDetailSourceWire::Static
+                                | haider_rpc::ModelDetailSourceWire::Configured
+                        )
+                    )
+            })
+            || !summary.models.iter().any(|row| row == model)
+    }
+
+    pub(crate) fn catalog_key_for_model(&self, provider: &str, model: &str) -> Option<String> {
+        if self.model_is_configuration(provider, model) {
+            return None;
+        }
+        self.providers
+            .providers
+            .iter()
+            .find(|row| row.provider == provider)?
+            .catalog_scope
+            .as_ref()
+            .map(|scope| scope.key.clone())
+    }
+
+    pub fn apply_scoped_model_selected(
+        &mut self,
+        provider: &str,
+        model: &str,
+        key: Option<String>,
+    ) {
+        self.apply_model_selected(provider, model);
+        if let Some(session) = self.active_session.clone() {
+            self.session_catalog_keys.insert(
+                session,
+                (provider.to_owned(), model.to_owned(), key.clone()),
+            );
+        }
+        // A delayed reply must retain its original owner, never borrow the
+        // current account's scope. Bootstrap then removes retired markers.
+        self.identity_catalog_key = key;
+        self.identity_unowned_configuration = self.identity_catalog_key.is_none();
+        self.bootstrap_identity_from_daemon();
+    }
+
+    /// A routing fact preserves the model's producer. A route mismatch retires
+    /// its current marker before the next provider snapshot arrives.
+    pub fn apply_session_provider_rebound(
+        &mut self,
+        rebound: &haider_protocol::session::SessionProviderRebound,
+    ) {
+        if let Some(session) = self.active_session.clone() {
+            self.session_catalog_routes.insert(
+                session.clone(),
+                (rebound.base_url.clone(), rebound.account.clone()),
+            );
+            if let Some((provider, _, _)) = self.session_catalog_keys.get_mut(&session) {
+                provider.clone_from(&rebound.provider);
+            }
+        }
+        self.identity.provider.clone_from(&rebound.provider);
+        self.bootstrap_identity_from_daemon();
+        self.refresh_context_window();
+        self.dirty = true;
+    }
+
+    fn pin_model_catalog_scope(&mut self) {
+        self.restored_model_catalog_pending = false;
+        self.identity_unowned_configuration =
+            self.model_is_configuration(&self.identity.provider, &self.identity.model_short);
+        let summary = self
+            .providers
+            .providers
+            .iter()
+            .find(|row| row.provider == self.identity.provider);
+        self.identity_catalog_key = summary
+            .and_then(|row| row.catalog_scope.as_ref())
+            .map(|scope| scope.key.clone());
+        self.identity_catalog_scope = summary
+            .and_then(|row| row.catalog_scope.as_ref())
+            .and_then(|scope| {
+                Some((
+                    self.identity.provider.clone(),
+                    scope.account_alias.clone()?,
+                    scope.account_incarnation?,
+                ))
+            })
+            .or_else(|| {
+                (!summary.is_some_and(|row| {
+                    row.catalog_scope.is_some()
+                        || matches!(
+                            row.catalog,
+                            haider_rpc::ProviderCatalogKindWire::Public
+                                | haider_rpc::ProviderCatalogKindWire::Offline
+                        )
+                }))
+                .then(|| {
+                    self.accounts
+                        .rows
+                        .iter()
+                        .find(|row| row.selected && row.provider == self.identity.provider)
+                        .and_then(|row| {
+                            self.accounts
+                                .catalog_incarnations
+                                .get(&row.alias)
+                                .filter(|incarnation| **incarnation != 0)
+                                .map(|incarnation| {
+                                    (row.provider.clone(), row.alias.clone(), *incarnation)
+                                })
+                        })
+                })
+                .flatten()
+            });
+    }
+
+    /// Retire stale catalogs independently of the global management revision.
+    /// A newer provider reply can precede its account reply: hold it until
+    /// that exact incarnation arrives, without exposing its rows as current.
+    fn fence_provider_catalogs(&mut self) {
+        if self.accounts.revision.is_none() {
+            return;
+        }
+        let active = self
+            .accounts
+            .rows
+            .iter()
+            .filter(|row| row.selected)
+            .filter_map(|row| {
+                self.accounts
+                    .catalog_incarnations
+                    .get(&row.alias)
+                    .filter(|incarnation| **incarnation != 0)
+                    .map(|incarnation| (row.provider.clone(), (row.alias.clone(), *incarnation)))
+            })
+            .collect::<HashMap<_, _>>();
+        self.pending_catalogs.retain(|provider, summary| {
+            let Some(scope) = summary.catalog_scope.as_ref() else {
+                return false;
+            };
+            let owner = scope.account_alias.as_ref().zip(scope.account_incarnation);
+            let current = active.get(provider);
+            if owner
+                .is_some_and(|(alias, incarnation)| current == Some(&(alias.clone(), incarnation)))
+            {
+                if let Some(slot) = self
+                    .providers
+                    .providers
+                    .iter_mut()
+                    .find(|row| &row.provider == provider)
+                {
+                    *slot = summary.clone();
+                }
+                return false;
+            }
+            owner.is_some_and(|(_, incarnation)| current.is_some_and(|(_, now)| incarnation > *now))
+        });
+        for summary in &mut self.providers.providers {
+            let Some(scope) = summary.catalog_scope.as_ref() else {
+                continue;
+            };
+            let Some((alias, incarnation)) =
+                scope.account_alias.as_ref().zip(scope.account_incarnation)
+            else {
+                continue;
+            };
+            let current = active.get(&summary.provider);
+            if current == Some(&(alias.clone(), incarnation)) {
+                continue;
+            }
+            if current.is_some_and(|(_, now)| incarnation > *now) && !summary.models.is_empty() {
+                let already_fenced =
+                    self.pending_catalogs
+                        .get(&summary.provider)
+                        .is_some_and(|pending| {
+                            let mut fenced = pending.clone();
+                            retire_fetched_catalog(&mut fenced);
+                            fenced == *summary
+                        });
+                if !already_fenced {
+                    self.pending_catalogs
+                        .insert(summary.provider.clone(), summary.clone());
+                }
+            }
+            retire_fetched_catalog(summary);
+        }
+    }
+
     /// Re-derives the identity's context window from the discovered catalog
     /// (W5g-1: real limits, never guessed). A provider-declared window
     /// always wins. With none declared, a LIVE identity's window becomes
@@ -11732,6 +12019,23 @@ impl AppModel {
     /// locally, keeps its sim seed. Idempotent, so catalog arrivals may call
     /// it even for a PINNED identity: the pin protects the user's
     /// provider/model choice, not a stale number.
+    fn summary_matches_session_route(&self, summary: &haider_rpc::ProviderSummaryWire) -> bool {
+        self.active_session
+            .as_ref()
+            .and_then(|session| self.session_catalog_routes.get(session))
+            .is_none_or(|(base_url, account)| {
+                summary.catalog_matches_session_route(base_url.as_deref(), account.as_deref())
+            })
+    }
+
+    fn current_catalog_matches_session_route(&self) -> bool {
+        self.providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == self.identity.provider)
+            .is_none_or(|summary| self.summary_matches_session_route(summary))
+    }
+
     pub fn refresh_context_window(&mut self) {
         let pair = (
             self.identity.provider.clone(),
@@ -11744,8 +12048,12 @@ impl AppModel {
             self.meter_identity = Some(pair);
         }
         let declared = self
-            .providers
-            .declared_window(&self.identity.provider, &self.identity.model_short);
+            .current_catalog_matches_session_route()
+            .then(|| {
+                self.providers
+                    .declared_window(&self.identity.provider, &self.identity.model_short)
+            })
+            .flatten();
         let window = match declared {
             Some(window) => window,
             None if self.mode.fabricates_locally() => return,
@@ -11773,6 +12081,7 @@ impl AppModel {
             && self.projection.latest_footprint() == self.meter_snapshot_before_switch.as_ref();
         let snapshot_window_allowed = self.mode.fabricates_locally()
             || !(snapshot_predates_model
+                || !self.current_catalog_matches_session_route()
                 || self
                     .providers
                     .model_listed(&self.identity.provider, &self.identity.model_short));
@@ -11783,8 +12092,8 @@ impl AppModel {
             snapshot_window_allowed,
             |window| {
                 crate::context_meter::derived_reserved_output(
-                    self.providers
-                        .declared_output_limit(&self.identity.provider, &self.identity.model_short),
+                    self.current_pair_detail()
+                        .and_then(|detail| detail.max_output_tokens),
                     window,
                 )
             },
@@ -11957,15 +12266,147 @@ impl AppModel {
     /// instead of the demo seed pair. Called by the LIVE driver whenever an
     /// account or provider snapshot applies; demo never calls it.
     pub fn bootstrap_identity_from_daemon(&mut self) {
-        if self.identity_pinned {
-            return;
-        }
-        let Some((provider, alias)) = self
+        self.fence_provider_catalogs();
+        let current_scope = self
             .accounts
             .rows
             .iter()
-            .find(|row| row.selected)
-            .map(|row| (row.provider.clone(), row.alias.clone()))
+            .find(|row| row.selected && row.provider == self.identity.provider)
+            .and_then(|row| {
+                self.accounts
+                    .catalog_incarnations
+                    .get(&row.alias)
+                    .filter(|incarnation| **incarnation != 0)
+                    .map(|incarnation| (row.provider.clone(), row.alias.clone(), *incarnation))
+            });
+        let summary = self
+            .providers
+            .providers
+            .iter()
+            .find(|row| row.provider == self.identity.provider);
+        let key = summary
+            .and_then(|row| row.catalog_scope.as_ref())
+            .map(|scope| scope.key.clone());
+        let public_catalog = summary.is_some_and(|row| {
+            matches!(
+                row.catalog,
+                haider_rpc::ProviderCatalogKindWire::Public
+                    | haider_rpc::ProviderCatalogKindWire::Offline
+            )
+        });
+        let account_changed = self.accounts.revision.is_some()
+            && self.identity_catalog_scope.is_some()
+            && self.identity_catalog_scope != current_scope;
+        let producer_retired = self.accounts.revision.is_some()
+            && summary
+                .and_then(|row| row.catalog_scope.as_ref())
+                .is_some_and(|scope| {
+                    scope
+                        .account_alias
+                        .as_ref()
+                        .zip(scope.account_incarnation)
+                        .is_some_and(|(alias, incarnation)| {
+                            current_scope
+                                .as_ref()
+                                .map(|(_, active_alias, active_incarnation)| {
+                                    (active_alias, *active_incarnation)
+                                })
+                                != Some((alias, incarnation))
+                        })
+                });
+        let catalog_changed = self.identity_catalog_key.is_some()
+            && (self.identity_catalog_key != key || producer_retired);
+        let owned_session_route_changed =
+            self.identity_catalog_key.is_some() && !self.current_catalog_matches_session_route();
+        // A legacy daemon cannot prove which account offered a choice made
+        // before its first account reply. Do not stamp it as the new owner.
+        let unknown_owner = self.identity_pinned
+            && !self.identity_unowned_configuration
+            && ((self.identity_catalog_scope.is_none()
+                && current_scope.is_some()
+                && self.identity_catalog_key.is_none())
+                || (self.restored_model_catalog_pending && summary.is_some()))
+            && !summary.is_some_and(|row| {
+                matches!(
+                    row.catalog,
+                    haider_rpc::ProviderCatalogKindWire::Public
+                        | haider_rpc::ProviderCatalogKindWire::Offline
+                )
+            });
+        if account_changed || catalog_changed || owned_session_route_changed || unknown_owner {
+            let unowned_session_configuration = self
+                .active_session
+                .as_ref()
+                .and_then(|session| self.session_catalog_keys.get(session))
+                .is_some_and(|(provider, model, key)| {
+                    key.is_none()
+                        && provider == &self.identity.provider
+                        && model == &self.identity.model_short
+                });
+            let permanent_choice = self.identity_unowned_configuration
+                || unowned_session_configuration
+                || summary.is_some_and(|summary| {
+                    summary
+                        .configured_models
+                        .contains(&self.identity.model_short)
+                        || summary.static_models.contains(&self.identity.model_short)
+                        || summary.model_details.iter().any(|detail| {
+                            detail.name == self.identity.model_short
+                                && matches!(
+                                    detail.source,
+                                    Some(
+                                        haider_rpc::ModelDetailSourceWire::Static
+                                            | haider_rpc::ModelDetailSourceWire::Configured
+                                    )
+                                )
+                        })
+                });
+            if permanent_choice
+                && !(self.active_session.is_some()
+                    && self.identity_catalog_key.is_some()
+                    && (account_changed || catalog_changed || owned_session_route_changed))
+            {
+                self.identity.account = current_scope
+                    .as_ref()
+                    .map(|(_, alias, _)| alias.clone())
+                    .unwrap_or_default();
+            } else {
+                if !self.identity.model_short.is_empty() {
+                    self.model_commits += 1;
+                }
+                self.identity.model_short.clear();
+                self.identity.context_window = 0;
+                self.identity_pinned = self.active_session.is_some();
+            }
+            if self.accounts.revision.is_some() {
+                self.identity_catalog_scope = current_scope.clone();
+            }
+            if self.active_session.is_none() || self.identity_catalog_key.is_some() {
+                self.identity_catalog_key = key;
+            }
+            self.restored_model_catalog_pending = false;
+            self.refresh_context_window();
+        }
+        if public_catalog {
+            self.restored_model_catalog_pending = false;
+        }
+        if current_scope.is_some() && self.providers.revision < self.accounts.revision {
+            return;
+        }
+        if self.identity_pinned {
+            return;
+        }
+        let selected = self
+            .identity_catalog_scope
+            .as_ref()
+            .and_then(|(provider, _, _)| {
+                self.accounts
+                    .rows
+                    .iter()
+                    .find(|row| row.selected && &row.provider == provider)
+            })
+            .or_else(|| self.accounts.rows.iter().find(|row| row.selected));
+        let Some((provider, alias)) = selected.map(|row| (row.provider.clone(), row.alias.clone()))
         else {
             return;
         };
@@ -11986,6 +12427,7 @@ impl AppModel {
             return;
         }
         self.adopt_identity(&provider, &alias, false);
+        self.pin_model_catalog_scope();
     }
 
     /// A failed `account.set_active`: clear the pending gate and surface the
@@ -13513,8 +13955,8 @@ impl AppModel {
             CustomCardKind::Azure => (
                 azure_v1_base(card.origin.trim()),
                 haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
-                Vec::new(),
-                None,
+                vec![model.clone()],
+                Some(model.clone()),
             ),
             CustomCardKind::Bedrock => {
                 let (models, default_model) = summary_inventory(&self.providers, &name);
@@ -17288,6 +17730,7 @@ impl AppModel {
                 };
                 let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
                 self.requests.push(AppRequest::SelectModel {
+                    expected_catalog_key: self.catalog_key_for_model(&provider, &resolved_model),
                     session,
                     model: resolved_model.clone(),
                     provider: provider.clone(),
@@ -17309,6 +17752,7 @@ impl AppModel {
                 self.identity.provider = provider.clone();
                 self.identity.model_short = resolved_model.clone();
                 self.identity_pinned = true;
+                self.pin_model_catalog_scope();
                 self.refresh_context_window();
                 format!(
                     "· /{} — model → {resolved_model} · {provider} (applies to the new session)",
@@ -18608,6 +19052,13 @@ impl AppModel {
         self.launch_origin = slot.launch_origin.take();
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
+        if let Some((provider, model, key)) = self.session_catalog_keys.get(id).cloned() {
+            self.identity.provider = provider;
+            self.identity.model_short = model;
+            self.identity_catalog_key = key;
+            self.identity_pinned = true;
+            self.bootstrap_identity_from_daemon();
+        }
         self.menu_selection = 0;
         self.view_path.clear();
         // CG-M1: read this session's graph reduction so the strip reflects a
@@ -19060,6 +19511,35 @@ impl AppModel {
     ///   checkin AFTER this call still beats a stale summary.
     pub fn note_summary_counts(&mut self, summary: &haider_rpc::SessionSummary) {
         if let Some(metadata) = &summary.metadata {
+            let first_catalog_snapshot =
+                !self.session_catalog_keys.contains_key(&summary.session_id);
+            self.session_catalog_keys
+                .entry(summary.session_id.clone())
+                .or_insert_with(|| {
+                    (
+                        metadata.provider.clone(),
+                        metadata.model.clone(),
+                        metadata.model_catalog_key.clone(),
+                    )
+                });
+            self.session_catalog_routes
+                .entry(summary.session_id.clone())
+                .or_insert_with(|| {
+                    (
+                        metadata.provider_base_url.clone(),
+                        metadata.account_alias.clone(),
+                    )
+                });
+            // Once an event/reply supplies a selection, a delayed session-list
+            // snapshot cannot overwrite it. Cold checkout still gets metadata.
+            if first_catalog_snapshot && self.active_session.as_ref() == Some(&summary.session_id) {
+                self.identity.provider = metadata.provider.clone();
+                self.identity.model_short = metadata.model.clone();
+                self.identity_pinned = true;
+                self.pin_model_catalog_scope();
+                self.identity_catalog_key = metadata.model_catalog_key.clone();
+                self.bootstrap_identity_from_daemon();
+            }
             let prior = self
                 .session_created_at_ms
                 .insert(summary.session_id.clone(), metadata.created_at_ms);
@@ -20172,6 +20652,9 @@ impl AppModel {
             query,
             ..ModelPicker::default()
         });
+        // The registry revision alone cannot identify a same-alias account
+        // replacement. Refresh both sides of the serving catalog boundary.
+        self.requests.push(AppRequest::AccountsRefresh);
         self.requests.push(AppRequest::ProvidersRefresh);
         self.dirty = true;
     }
@@ -20186,7 +20669,17 @@ impl AppModel {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
-        for summary in &self.providers.providers {
+        for published in &self.providers.providers {
+            let mut fenced;
+            let summary = if published.provider == self.identity.provider
+                && !self.summary_matches_session_route(published)
+            {
+                fenced = published.clone();
+                fenced.retire_fetched_catalog();
+                &fenced
+            } else {
+                published
+            };
             if !summary.enabled {
                 continue;
             }
@@ -20282,7 +20775,11 @@ impl AppModel {
                     lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: model.clone(),
                     auth,
-                    context_window: self.providers.declared_window(&summary.provider, model),
+                    context_window: summary
+                        .model_details
+                        .iter()
+                        .find(|detail| detail.name == *model)
+                        .and_then(|detail| detail.context_window),
                     source: summary
                         .model_details
                         .iter()
@@ -20302,7 +20799,8 @@ impl AppModel {
             // the current pair visible and typed as unlisted, but do not add
             // it to the discovered inventory or pretend it is an available
             // picker row.
-            if self.identity.provider == summary.provider
+            if !self.identity.model_short.is_empty()
+                && self.identity.provider == summary.provider
                 && matches!(
                     summary.inventory_authority,
                     haider_rpc::ModelInventoryAuthorityWire::Advisory
@@ -20434,8 +20932,18 @@ impl AppModel {
                         .join("; ")
                 ))
             }
+        } else if group.len() == 1 {
+            first.reason.clone()
         } else {
-            None
+            let notes = fact_rows
+                .iter()
+                .filter_map(|row| {
+                    row.reason
+                        .as_ref()
+                        .map(|reason| format!("{}: {reason}", row.provider))
+                })
+                .collect::<Vec<_>>();
+            (!notes.is_empty()).then(|| notes.join("; "))
         };
         let lockdown_providers = group.iter().filter(|row| row.lockdown).count();
         let default_providers = group.iter().filter(|row| row.is_default).count();
@@ -20728,6 +21236,7 @@ impl AppModel {
             self.identity.provider = row.provider.clone();
             self.identity.model_short = row.model.clone();
             self.identity_pinned = true;
+            self.pin_model_catalog_scope();
             self.refresh_context_window();
             self.model_picker = None;
             self.flash = Some(format!("· model → {} · {}", row.model, row.provider));
@@ -20754,6 +21263,7 @@ impl AppModel {
         };
         let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
         self.requests.push(AppRequest::SelectModel {
+            expected_catalog_key: self.catalog_key_for_model(&row.provider, &row.model),
             session,
             model: row.model.clone(),
             provider: row.provider.clone(),
@@ -20815,6 +21325,7 @@ impl AppModel {
             "· provider → {name} · {health} · selecting {model}…"
         ));
         self.requests.push(AppRequest::SelectModel {
+            expected_catalog_key: self.catalog_key_for_model(&name, &model),
             session,
             model,
             provider: name,
@@ -20828,6 +21339,7 @@ impl AppModel {
         self.identity.provider = provider.to_owned();
         self.identity.model_short = model.to_owned();
         self.identity_pinned = true;
+        self.pin_model_catalog_scope();
         self.refresh_context_window();
         self.model_picker = None;
         self.pending_cache_change = None;

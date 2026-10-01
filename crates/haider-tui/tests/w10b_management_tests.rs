@@ -46,6 +46,9 @@ fn account_row(alias: &str, selected: bool) -> AccountRow {
 
 fn provider_summary(name: &str) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: name.into(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:9999/v1".into()),

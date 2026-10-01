@@ -30,6 +30,9 @@ fn provider_summary_without_model_details_decodes_an_empty_vector() {
 #[test]
 fn provider_summary_model_details_round_trip_token_limits() {
     let summary = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "openai".to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: Some("https://api.openai.com/v1/responses".to_owned()),

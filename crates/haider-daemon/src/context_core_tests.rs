@@ -176,6 +176,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -590,6 +591,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -1035,6 +1037,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1705,6 +1708,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

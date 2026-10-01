@@ -323,7 +323,7 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
         (
             "404 Not Found",
             br#"{"error":"no models endpoint"}"#.as_slice(),
-            "unavailable",
+            "unsupported",
         ),
         ("200 OK", b"not-json".as_slice(), "invalid_body"),
         (
@@ -348,7 +348,7 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
             ("unauthorized", CatalogError::Unauthorized)
                 | ("invalid_body", CatalogError::InvalidBody { .. })
                 | ("empty", CatalogError::Empty)
-                | ("unavailable", CatalogError::Unavailable { .. })
+                | ("unsupported", CatalogError::Unsupported { .. })
         ));
     }
 }
@@ -514,5 +514,105 @@ async fn customprov_catalog_rejects_control_obfuscated_key_ids() {
             error.to_string(),
             "model catalog id contains characters that cannot be displayed safely"
         );
+    }
+}
+
+#[tokio::test]
+async fn listing_unsupported_is_distinct_from_retryable_server_failure() {
+    for (status, unsupported) in [
+        ("404 Not Found", true),
+        ("405 Method Not Allowed", true),
+        ("503 Service Unavailable", false),
+        ("500 Internal Server Error", false),
+    ] {
+        for anthropic in [false, true] {
+            let (origin, fixture) = one_shot_catalog(status, b"synthetic-error").await;
+            let source = if anthropic {
+                CatalogSource::AnthropicCompatible { origin }
+            } else {
+                CatalogSource::OpenAiCompatible { origin }
+            };
+            let error = discover_models(source, Some("synthetic-key"), None)
+                .await
+                .expect_err("listing failure");
+            fixture.await.expect("loopback fixture");
+            assert_eq!(
+                matches!(error, CatalogError::Unsupported { .. }),
+                unsupported
+            );
+            assert_eq!(
+                matches!(error, CatalogError::Transport { .. }),
+                !unsupported
+            );
+            assert!(error.to_string().contains(&status[..3]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_listing_not_supported_is_selectable_but_transient_and_other_errors_are_not() {
+    for (status, body, unsupported, transient) in [
+        (
+            "400 Bad Request",
+            br#"{"error":{"code":"OperationNotSupported"}}"#.as_slice(),
+            true,
+            false,
+        ),
+        (
+            "200 OK",
+            br#"{"error":{"type":"not_supported"}}"#.as_slice(),
+            true,
+            false,
+        ),
+        (
+            "503 Service Unavailable",
+            br#"{"error":{"code":"OperationNotSupported"}}"#.as_slice(),
+            false,
+            true,
+        ),
+        (
+            "400 Bad Request",
+            br#"{"error":{"code":"UnsupportedModel"}}"#.as_slice(),
+            false,
+            false,
+        ),
+        (
+            "400 Bad Request",
+            br#"{"error":{"code":"invalid_request_error","type":"not_supported"}}"#.as_slice(),
+            true,
+            false,
+        ),
+        (
+            "200 OK",
+            br#"{"error":{"code":"  operationnotsupported  "}}"#.as_slice(),
+            true,
+            false,
+        ),
+        (
+            "400 Bad Request",
+            br#"{"error":{"message":"listing not supported","code":"UnsupportedModel"}}"#
+                .as_slice(),
+            false,
+            false,
+        ),
+    ] {
+        let (origin, fixture) = one_shot_catalog(status, body).await;
+        let error = discover_models(
+            CatalogSource::OpenAiCompatible { origin },
+            Some("synthetic-key"),
+            None,
+        )
+        .await
+        .expect_err("listing error");
+        fixture.await.expect("fixture");
+        assert_eq!(
+            matches!(error, CatalogError::Unsupported { .. }),
+            unsupported
+        );
+        assert_eq!(matches!(error, CatalogError::Transport { .. }), transient);
+        assert!(error.to_string().contains(&status[..3]));
+        if unsupported {
+            assert!(error.to_string().to_ascii_lowercase().contains("supported"));
+        }
     }
 }

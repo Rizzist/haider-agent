@@ -19,6 +19,9 @@ fn summary(
     availability: ProviderAvailabilityWire,
 ) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
@@ -114,7 +117,8 @@ fn uncreatable_provider_is_refused_typed() {
     assert_eq!(
         refusal,
         SelectionRefusal::ProviderUnavailable {
-            provider: "frontier-imaginary".to_owned()
+            provider: "frontier-imaginary".to_owned(),
+            reason: None,
         }
     );
     assert_eq!(refusal.kind(), "provider_unavailable");
@@ -826,4 +830,226 @@ fn static_subscription_row_is_selectable_after_catalog_403() {
         authority.validate_selection("anthropic-oauth", None, "invented-model"),
         Err(SelectionRefusal::ModelUnknown { .. })
     ));
+}
+
+#[test]
+fn configured_azure_selection_reports_discovery_reason_and_accepts_unsupported_listing() {
+    let mut azure = summary(
+        "azure",
+        &["my-deployment"],
+        ProviderAvailabilityWire::Unavailable,
+    );
+    azure.endpoint = Some("https://synthetic.openai.azure.com/openai/v1".into());
+    azure.inventory = haider_rpc::ModelInventoryWire::Configured;
+    azure.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    for reason in [
+        "model list not fetched — fetch models before selecting",
+        "server returned 503 for /models — retry model-list fetch",
+        "model catalog timed out — retry model-list fetch",
+    ] {
+        azure.availability_reason = Some(reason.into());
+        for current in ["azure", "other"] {
+            let refusal = authority(&[], vec![azure.clone()])
+                .validate_selection(current, Some("azure"), "my-deployment")
+                .expect_err("unavailable deployment");
+            assert!(refusal.message().contains(reason));
+            assert_eq!(refusal.details()["reason"], reason);
+            assert_eq!(refusal.kind(), "provider_unavailable");
+        }
+    }
+    azure.availability = ProviderAvailabilityWire::Available;
+    azure.availability_reason =
+        Some("configured (unverified): server returned 404 for /models".into());
+    for current in ["azure", "other"] {
+        assert!(
+            authority(&["azure"], vec![azure.clone()])
+                .validate_selection(current, Some("azure"), "my-deployment")
+                .is_ok()
+        );
+    }
+    azure.endpoint = Some("http://127.0.0.1:18123/v1".into());
+    azure.availability = ProviderAvailabilityWire::Unavailable;
+    assert!(
+        authority(&[], vec![azure])
+            .validate_selection("azure", None, "my-deployment")
+            .is_ok(),
+        "ordinary advisory compatible servers keep their passthrough rule"
+    );
+}
+
+#[test]
+fn permanent_ids_do_not_inherit_their_remote_default_settings_as_unowned_configuration() {
+    let mut profile = summary(
+        "custom",
+        &["my-deployment"],
+        ProviderAvailabilityWire::Available,
+    );
+    profile.configured_models = vec!["my-deployment".into()];
+    profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "synthetic-account-A".into(),
+        account_alias: Some("work".into()),
+        account_incarnation: Some(1),
+    });
+    profile.model_details = vec![ModelDetailWire {
+        source: Some(haider_rpc::ModelDetailSourceWire::Remote),
+        name: "my-deployment".into(),
+        display_name: None,
+        context_window: Some(100_000),
+        max_output_tokens: Some(500),
+        supported_efforts: Vec::new(),
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    }];
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let derived = SessionOutputBudgetSourceV1::Derived.apply(500, 500);
+    let clamped = SessionOutputBudgetSourceV1::UserSet { requested: 1000 }.apply(500, 500);
+    let explicit = SessionOutputBudgetSourceV1::UserSet { requested: 100 }.apply(500, 500);
+    let selection = authority(&["custom"], vec![profile.clone()]);
+    assert_eq!(
+        selection.model_catalog_key("custom", "my-deployment"),
+        None,
+        "the declared ID is permanent"
+    );
+    assert_eq!(
+        selection
+            .model_settings_catalog_key("custom", "my-deployment", &derived)
+            .as_deref(),
+        Some("synthetic-account-A"),
+        "the fetched output default is A's data"
+    );
+    assert_eq!(
+        selection
+            .model_settings_catalog_key("custom", "my-deployment", &clamped)
+            .as_deref(),
+        Some("synthetic-account-A"),
+        "the effective ceiling is fetched even though the requested budget is user-set"
+    );
+    assert_eq!(
+        selection.model_settings_catalog_key("custom", "my-deployment", &explicit),
+        None,
+        "an unchanged explicit budget remains user configuration"
+    );
+    profile.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Configured);
+    profile.model_details[0].max_output_tokens = None;
+    let selection = authority(&["custom"], vec![profile]);
+    assert_eq!(
+        selection.model_settings_catalog_key("custom", "my-deployment", &derived),
+        None,
+        "ordinary configured fallback uses no fetched defaults"
+    );
+}
+
+#[test]
+fn selection_scope_follows_the_session_route_instead_of_borrowing_the_active_account() {
+    for (route, retired) in [
+        ("same", false),
+        ("endpoint", true),
+        ("account", true),
+        ("legacy", false),
+    ] {
+        let mut profile = summary(
+            "custom",
+            &["my-deployment", "a-private-only"],
+            ProviderAvailabilityWire::Available,
+        );
+        profile.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+        profile.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+        profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+        profile.endpoint = Some("http://127.0.0.1:23456/v1".into());
+        profile.configured_models = vec!["my-deployment".into()];
+        profile.catalog_scope = (route != "legacy").then(|| haider_rpc::ProviderCatalogScopeWire {
+            key: "synthetic-account-A".into(),
+            account_alias: Some("work".into()),
+            account_incarnation: Some(1),
+        });
+        profile.model_details = profile
+            .models
+            .iter()
+            .map(|name| ModelDetailWire {
+                source: Some(haider_rpc::ModelDetailSourceWire::Remote),
+                name: name.clone(),
+                display_name: Some("A's private label".into()),
+                context_window: Some(100_000),
+                max_output_tokens: Some(500),
+                supported_efforts: vec!["high".into()],
+                default_effort: Some("high".into()),
+                supported_speeds: vec!["fast".into()],
+                supports_thinking_type: Some(true),
+                supports_vision: Some(false),
+            })
+            .collect();
+        let current: haider_protocol::session::SessionMetadataV1 = serde_json::from_value(serde_json::json!({
+            "cwd":"/synthetic", "provider":"custom", "model":"my-deployment", "max_tokens":500, "created_at_ms":1,
+            "provider_base_url": if route == "endpoint" { "http://127.0.0.1:23457/v1" } else { "http://127.0.0.1:23456/v1" },
+            "account_alias": if route == "account" { "other" } else { "work" },
+        })).expect("typed session metadata");
+        let selected =
+            authority(&["custom"], vec![profile]).scoped_to_session_route(&current, "custom");
+        let resolved = selected
+            .validate_selection_with_status("custom", None, "my-deployment")
+            .expect("explicit declaration remains usable");
+        if retired {
+            assert!(!selected.catalog_key_is_current("custom", "synthetic-account-A"));
+            assert_eq!(resolved.context_window, None);
+            assert_ne!(resolved.max_output_tokens, 500);
+            assert!(
+                !selected.summaries[0]
+                    .models
+                    .iter()
+                    .any(|name| name == "a-private-only")
+            );
+            let detail = &selected.summaries[0].model_details[0];
+            assert_eq!(
+                detail.source,
+                Some(haider_rpc::ModelDetailSourceWire::Configured)
+            );
+            assert_eq!(detail.supports_vision, None);
+            assert!(detail.supported_efforts.is_empty());
+            let explicit = selected
+                .validate_selection_with_status("custom", None, "manual-unlisted")
+                .expect("advisory configuration is preserved");
+            assert_eq!(explicit.context_window, None);
+        } else {
+            assert_eq!(resolved.context_window, Some(100_000));
+            assert_eq!(resolved.max_output_tokens, 500);
+        }
+    }
+}
+
+#[test]
+fn unsupported_azure_evidence_cannot_be_borrowed_by_a_rebound_account() {
+    let mut azure = summary(
+        "azure",
+        &["my-deployment"],
+        ProviderAvailabilityWire::Available,
+    );
+    azure.endpoint = Some("https://synthetic.openai.azure.com/openai/v1".into());
+    azure.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    azure.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    azure.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "server returned 404 for /models".into(),
+    };
+    azure.configured_models = vec!["my-deployment".into()];
+    azure.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "synthetic-account-A".into(),
+        account_alias: Some("work".into()),
+        account_incarnation: Some(1),
+    });
+    for (account, allowed) in [("work", true), ("other", false)] {
+        let current = serde_json::from_value(serde_json::json!({
+            "cwd":"/synthetic", "provider":"azure", "model":"my-deployment", "max_tokens":500, "created_at_ms":1,
+            "account_alias":account,
+        })).expect("session metadata");
+        let selection = authority(&["azure"], vec![azure.clone()])
+            .scoped_to_session_route(&current, "azure")
+            .validate_selection_with_status("azure", None, "my-deployment");
+        assert_eq!(selection.is_ok(), allowed);
+        if !allowed {
+            let refusal = selection.expect_err("B needs its own discovery evidence");
+            assert!(!refusal.message().contains("404"));
+            assert_eq!(refusal.kind(), "provider_unavailable");
+        }
+    }
 }

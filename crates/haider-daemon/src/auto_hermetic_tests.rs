@@ -11,6 +11,9 @@ use super::auto_hermetic::{ProviderLockdownPolicy, provider_policy_with_override
 
 fn summary() -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "local-benchmark".into(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:9000/v1".into()),

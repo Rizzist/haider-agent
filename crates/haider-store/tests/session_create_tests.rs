@@ -19,6 +19,7 @@ fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateC
         session_id: SessionId::new(session_id),
         cwd: "/tmp/work".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -404,4 +405,40 @@ fn legacy_append_metadata_remains_none() {
     }];
     store.append(&mut envelope).expect("append");
     assert_eq!(store.session_metadata(&session_id).expect("metadata"), None);
+}
+
+#[test]
+fn derived_model_owner_is_durable_and_replayed_with_create_receipt() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut command = command("scoped-create", "scoped-session", "scoped-created");
+    command.model_catalog_key = Some("synthetic-account-incarnation-A".into());
+    let store = Store::open(root.path()).expect("store");
+    let SessionCreateOutcome::Committed { created, .. } =
+        store.create_session(&command).expect("create")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(
+        created.metadata.model_catalog_key,
+        command.model_catalog_key
+    );
+    drop(store);
+    let reopened = Store::open(root.path()).expect("reopen");
+    assert_eq!(
+        reopened
+            .session_metadata(&command.session_id)
+            .expect("metadata")
+            .expect("session")
+            .model_catalog_key,
+        command.model_catalog_key
+    );
+    let SessionCreateOutcome::IdempotentReplay { created } =
+        reopened.create_session(&command).expect("replay")
+    else {
+        panic!("receipt replay")
+    };
+    assert_eq!(
+        created.metadata.model_catalog_key,
+        command.model_catalog_key
+    );
 }

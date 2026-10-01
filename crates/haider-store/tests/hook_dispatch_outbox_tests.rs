@@ -64,6 +64,7 @@ fn hook_dispatch_outbox_is_atomic_persistent_and_idempotently_acknowledged() {
                 .expect("UTF-8")
                 .to_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -149,6 +150,7 @@ fn workspace_selection_atomically_fences_old_hook_dispatch_rows() {
                 session_id: session_id.clone(),
                 cwd: old_root.clone(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-model".into(),
                 max_tokens: 4096,
                 max_tokens_source: None,
@@ -238,6 +240,7 @@ fn batched_acknowledgement_is_one_atomic_durable_transaction() {
                 session_id: session_id.clone(),
                 cwd: cwd.clone(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-model".into(),
                 max_tokens: 4096,
                 max_tokens_source: None,
@@ -367,6 +370,7 @@ fn create_acknowledged_session(store: &Store, profile: &std::path::Path, session
                 .expect("UTF-8")
                 .to_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

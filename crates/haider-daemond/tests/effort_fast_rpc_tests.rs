@@ -412,6 +412,7 @@ async fn select_fast_gates_statically_and_empty_ladders_refuse() {
             command_id: CommandId::new("model-command"),
             session_id: session_id.clone(),
             worker_generation: generation,
+            expected_catalog_key: None,
             model: "claude-sonnet-5".into(),
             provider: None,
             confirm_new_epoch: false,

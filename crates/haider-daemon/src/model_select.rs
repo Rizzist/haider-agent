@@ -154,7 +154,10 @@ impl TuningRefusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectionRefusal {
     /// The selected row's provider attribute is not creatable on this daemon.
-    ProviderUnavailable { provider: String },
+    ProviderUnavailable {
+        provider: String,
+        reason: Option<String>,
+    },
     /// The provider has a KNOWN discovered inventory and the model is not in
     /// it.
     ModelUnknown {
@@ -191,9 +194,14 @@ impl SelectionRefusal {
     /// Human copy — model-selection language, never provider-switch language.
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::ProviderUnavailable { provider } => {
-                format!("this model row's provider `{provider}` is not available on this daemon")
-            }
+            Self::ProviderUnavailable { provider, reason } => reason.as_ref().map_or_else(
+                || {
+                    format!(
+                        "this model row's provider `{provider}` is not available on this daemon"
+                    )
+                },
+                |reason| format!("provider `{provider}` is unavailable: {reason}"),
+            ),
             Self::ModelUnknown {
                 provider,
                 model,
@@ -227,16 +235,19 @@ impl SelectionRefusal {
         }
     }
 
-    /// Structured coordinates for wire `details` / tool previews. Static
-    /// vocabulary plus the caller's own selector strings — never provider
-    /// response bytes.
+    /// Structured coordinates for wire `details` / tool previews. Discovery
+    /// reasons have already passed the catalog's credential-redaction boundary.
     pub(crate) fn details(&self) -> serde_json::Value {
         match self {
-            Self::ProviderUnavailable { provider } => serde_json::json!({
-                "kind": self.kind(),
-                "provider": provider,
-                "suggestions": [],
-            }),
+            Self::ProviderUnavailable { provider, reason } => {
+                let mut details = serde_json::json!({
+                    "kind": self.kind(), "provider": provider, "suggestions": [],
+                });
+                if let Some(reason) = reason {
+                    details["reason"] = serde_json::Value::String(reason.clone());
+                }
+                details
+            }
             Self::ModelUnknown {
                 provider,
                 model,
@@ -268,6 +279,16 @@ impl SelectionRefusal {
     }
 }
 
+/// Configured Azure deployments share the picker admission rule. A list
+/// fetch or an explicitly unsupported listing must establish selectability.
+pub(crate) fn configured_deployment_is_unavailable(summary: &ProviderSummaryWire) -> bool {
+    summary
+        .endpoint
+        .as_deref()
+        .is_some_and(haider_provider::azure_openai_origin)
+        && summary.availability != ProviderAvailabilityWire::Available
+}
+
 impl ModelSelectionAuthority {
     pub(crate) fn new(
         creatable: Option<BTreeSet<String>>,
@@ -277,6 +298,101 @@ impl ModelSelectionAuthority {
             creatable,
             summaries,
         }
+    }
+
+    /// Session overrides cannot inherit the active route's discovery evidence.
+    pub(crate) fn scoped_to_session_route(
+        mut self,
+        current: &haider_protocol::session::SessionMetadataV1,
+        provider: &str,
+    ) -> Self {
+        if current.provider == provider {
+            for summary in &mut self.summaries {
+                if summary.provider == provider
+                    && !summary.catalog_matches_session_route(
+                        current.provider_base_url.as_deref(),
+                        current.account_alias.as_deref(),
+                    )
+                {
+                    summary.retire_fetched_catalog();
+                    summary.catalog_scope = None;
+                }
+            }
+        }
+        self
+    }
+
+    pub(crate) fn catalog_key_is_current(&self, provider: &str, key: &str) -> bool {
+        self.summaries.iter().any(|summary| {
+            summary.provider == provider
+                && summary
+                    .catalog_scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.key == key)
+        })
+    }
+
+    /// Permanent rows and explicit unlisted configuration have no private owner.
+    pub(crate) fn model_catalog_key(&self, provider: &str, model: &str) -> Option<String> {
+        let summary = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider)?;
+        if summary.configured_models.iter().any(|row| row == model)
+            || summary.static_models.iter().any(|row| row == model)
+            || haider_provider::subscription_static_models(provider)
+                .iter()
+                .any(|row| row.slug == model)
+            || summary.model_details.iter().any(|row| {
+                row.name == model
+                    && matches!(
+                        row.source,
+                        Some(
+                            haider_rpc::ModelDetailSourceWire::Static
+                                | haider_rpc::ModelDetailSourceWire::Configured
+                        )
+                    )
+            })
+            || !summary.models.iter().any(|row| row == model)
+        {
+            return None;
+        }
+        summary
+            .catalog_scope
+            .as_ref()
+            .map(|scope| scope.key.clone())
+    }
+
+    /// Remote declarations may derive or clamp an effective session budget
+    /// even when the ID is permanent. The user's unclamped request is unowned.
+    pub(crate) fn model_settings_catalog_key(
+        &self,
+        provider: &str,
+        model: &str,
+        budget: &haider_protocol::output_budget::SessionOutputBudgetV1,
+    ) -> Option<String> {
+        if budget.source != haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived
+            && budget.clamped.is_none()
+        {
+            return None;
+        }
+        let summary = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider)?;
+        summary
+            .model_details
+            .iter()
+            .any(|row| {
+                row.name == model && row.source == Some(haider_rpc::ModelDetailSourceWire::Remote)
+            })
+            .then(|| {
+                summary
+                    .catalog_scope
+                    .as_ref()
+                    .map(|scope| scope.key.clone())
+            })
+            .flatten()
     }
 
     /// The `session.create` creatability rule: the installed static registry,
@@ -463,17 +579,24 @@ impl ModelSelectionAuthority {
             .map(str::trim)
             .filter(|provider| !provider.is_empty())
             .unwrap_or(current_provider);
+        let summary = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider);
+        if summary.is_some_and(configured_deployment_is_unavailable) {
+            return Err(SelectionRefusal::ProviderUnavailable {
+                provider: provider.to_owned(),
+                reason: summary.and_then(|row| row.availability_reason.clone()),
+            });
+        }
         // Staying on the current provider is not a create; only a row on a
         // DIFFERENT provider consults the creatability authority.
         if provider != current_provider && !self.provider_is_creatable(provider) {
             return Err(SelectionRefusal::ProviderUnavailable {
                 provider: provider.to_owned(),
+                reason: None,
             });
         }
-        let summary = self
-            .summaries
-            .iter()
-            .find(|summary| summary.provider == provider);
         if summary.is_some_and(|summary| {
             matches!(
                 summary.catalog,
@@ -483,6 +606,7 @@ impl ModelSelectionAuthority {
         }) {
             return Err(SelectionRefusal::ProviderUnavailable {
                 provider: provider.to_owned(),
+                reason: None,
             });
         }
         let resolved_model = summary

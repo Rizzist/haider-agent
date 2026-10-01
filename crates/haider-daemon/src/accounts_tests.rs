@@ -181,7 +181,7 @@ fn endpoint_boundary_mints_active_and_inactive_aliases_only_for_its_provider() {
 #[test]
 fn authenticated_catalog_key_changes_with_same_alias_identity_but_survives_relogin() {
     let mut accounts = memory_accounts();
-    let providers = test_provider_registry();
+    let mut providers = test_provider_registry();
     let mut descriptor = CredentialDescriptor {
         incarnation: 0,
         credential_digest: None,
@@ -253,7 +253,7 @@ fn authenticated_catalog_key_changes_with_same_alias_identity_but_survives_relog
         "B must not read A's durable row"
     );
     let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
-    clear_catalogs_after_account_change(&before, &accounts, &providers, &mut pending);
+    clear_catalogs_after_account_change(&before, &accounts, &mut providers, &mut pending);
     let models = providers
         .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
         .expect("summary")
@@ -312,6 +312,20 @@ fn linked_source_failure_health_states_remain_distinct() {
 pub(super) fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
     struct Ephemeral(StdMutex<Vec<CredentialDescriptor>>);
     impl StoreLike for Ephemeral {
+        fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            COUNTER
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |current| current.max(floor).checked_add(1),
+                )
+                .map(|previous| previous.max(floor) + 1)
+                .map_err(|_| {
+                    HaiderError::new(ErrorCode::Internal, "test incarnation exhausted", false)
+                })
+        }
+
         fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
             Ok(self.0.lock().map(|view| view.clone()).unwrap_or_default())
         }
@@ -465,7 +479,7 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
         .expect("seed key");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let management = ManagementSnapshot::new(0, accounts.list().to_vec(), Vec::new());
-    let providers = test_provider_registry();
+    let mut providers = test_provider_registry();
     let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
     let source_registry = empty_source_registry();
     let (sink, mut frames) = channel_sink();
@@ -477,7 +491,7 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
         &snapshot,
         Some(&management),
         RefreshIdentityCatalogContext {
-            providers: &providers,
+            providers: &mut providers,
             pending: &mut pending,
             source_registry: &source_registry,
         },
@@ -766,7 +780,7 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
     accounts.add(account("account-a", true)).expect("add A");
     accounts.add(account("account-b", false)).expect("add B");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
-    let providers = test_provider_registry();
+    let mut providers = test_provider_registry();
     let row = |slug: &str| DiscoveredModel {
         slug: slug.to_owned(),
         display_name: slug.to_owned(),
@@ -803,7 +817,7 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
             &mut accounts,
             &snapshot,
             None,
-            &providers,
+            &mut providers,
             &mut pending,
             SetActiveJob {
                 command_id: command_id.to_owned(),
@@ -932,7 +946,7 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
     for prune_succeeds in [true, false] {
         let dir = test_store_dir();
         let store = open_store(dir.path()).await;
-        let providers = registry();
+        let mut providers = registry();
         let mut accounts = memory_accounts();
         accounts.add(source_account(1_000, "A")).expect("account A");
         let key_a = ProviderModelCacheKey::for_account(
@@ -955,7 +969,8 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
         accounts
             .replace(source_account(1_000, "A"))
             .expect("unchanged re-read");
-        finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+        finish_catalog_account_mutation(&store, &before, &accounts, &mut providers, &mut pending)
+            .await;
         assert!(has_row(&providers), "an unchanged source keeps its catalog");
         assert!(refresh_completion_is_current(
             &producer_a,
@@ -976,7 +991,8 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
         accounts
             .replace(source_account(1_000, "B"))
             .expect("account B at the same source");
-        finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+        finish_catalog_account_mutation(&store, &before, &accounts, &mut providers, &mut pending)
+            .await;
         let key_b = ProviderModelCacheKey::for_account(
             kimi,
             accounts
@@ -1090,7 +1106,7 @@ fn grant_identity_is_a_per_login_account_boundary() {
 async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not() {
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
-    let providers = test_provider_registry();
+    let mut providers = test_provider_registry();
     let mut accounts = memory_accounts();
     let descriptor = |alias: &str, identity: &str, active: bool| CredentialDescriptor {
         incarnation: 0,
@@ -1133,7 +1149,7 @@ async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not(
     accounts
         .replace(descriptor("retired", "new", false))
         .expect("replace inactive");
-    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    finish_catalog_account_mutation(&store, &before, &accounts, &mut providers, &mut pending).await;
     assert!(
         providers
             .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
@@ -1146,7 +1162,7 @@ async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not(
     accounts
         .replace(descriptor("a", "identity-a", true))
         .expect("same identity re-login");
-    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    finish_catalog_account_mutation(&store, &before, &accounts, &mut providers, &mut pending).await;
     assert!(
         providers
             .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
@@ -1159,7 +1175,7 @@ async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not(
     accounts
         .add(descriptor("b", "identity-b", true))
         .expect("new active B");
-    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    finish_catalog_account_mutation(&store, &before, &accounts, &mut providers, &mut pending).await;
     let summary = providers
         .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
         .expect("B summary");
@@ -1193,7 +1209,7 @@ async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not(
     accounts
         .replace(descriptor("b", "different-identity", true))
         .expect("reimport other identity");
-    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    finish_catalog_account_mutation(&store, &before, &accounts, &mut providers, &mut pending).await;
     assert!(
         !providers
             .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
@@ -1514,6 +1530,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         cwd: "/tmp/haider-provider-dispatch".into(),
         provider: provider.into(),
         account_alias: None,
+        model_catalog_key: None,
         model: model.into(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -1632,6 +1649,9 @@ fn selected_session_account_bypasses_mutable_active_account() {
 
 pub(super) fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some(endpoint.to_owned()),
@@ -1946,7 +1966,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     let provider = "custom-llama";
     let alias = CredentialAlias::new("custom-llama-key");
     let descriptor = CredentialDescriptor {
-        incarnation: 0,
+        incarnation: 90042,
         credential_digest: None,
         alias: alias.clone(),
         provider: provider.to_owned(),
@@ -1960,6 +1980,9 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         created_at_ms: Some(42),
     };
     let summary = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
@@ -2044,6 +2067,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             cwd: "/tmp/custom-family-dispatch".to_owned(),
             provider: provider.to_owned(),
             account_alias: None,
+            model_catalog_key: None,
             model: "llama-fixture".to_owned(),
             max_tokens: 64,
             max_tokens_source: None,
@@ -2062,7 +2086,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         .expect("custom family dispatch");
     assert_eq!(resolved.provider_name, provider);
     assert_eq!(resolved.account_alias.as_deref(), Some(alias.as_str()));
-    assert_eq!(resolved.account_incarnation, Some(42));
+    assert_eq!(resolved.account_incarnation, Some(90042));
     assert_eq!(resolved.context_window, Some(131_072));
     assert_eq!(
         factory.model_context_window(provider, "not-in-the-catalog"),
@@ -2187,6 +2211,9 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
     let provider = "promotion-fixture";
     let alias = CredentialAlias::new("promotion-fixture-key");
     let summary = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
@@ -2238,6 +2265,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         cwd: "/tmp/compaction-promotion".to_owned(),
         provider: provider.to_owned(),
         account_alias: None,
+        model_catalog_key: None,
         model: "model-small".to_owned(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -2335,6 +2363,9 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
 
 fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some(origin.to_owned()),
@@ -2395,6 +2426,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         cwd: "/tmp/keyless-dispatch".to_owned(),
         provider: provider.to_owned(),
         account_alias: None,
+        model_catalog_key: None,
         model: "llama3.1:8b".to_owned(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -2573,6 +2605,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
                 cwd: "/tmp/keyless-scope".to_owned(),
                 provider: provider.clone(),
                 account_alias: None,
+                model_catalog_key: None,
                 model: "llama3.1:8b".to_owned(),
                 max_tokens: 64,
                 max_tokens_source: None,
@@ -2995,6 +3028,20 @@ async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
 async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_turn() {
     struct WriteRefusingStore(Vec<CredentialDescriptor>);
     impl StoreLike for WriteRefusingStore {
+        fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            COUNTER
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |current| current.max(floor).checked_add(1),
+                )
+                .map(|previous| previous.max(floor) + 1)
+                .map_err(|_| {
+                    HaiderError::new(ErrorCode::Internal, "test incarnation exhausted", false)
+                })
+        }
+
         fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
             Ok(self.0.clone())
         }
@@ -3078,6 +3125,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             cwd: "/tmp/wedged-store".into(),
             provider: OPENAI_PROVIDER_NAME.into(),
             account_alias: None,
+            model_catalog_key: None,
             model: "gpt-test".into(),
             max_tokens: 64,
             max_tokens_source: None,
@@ -3192,6 +3240,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         account_alias: None,
         // The current provider, not an exact optional model entry, anchors
         // traversal. Manual model selection must not disable the chain.
+        model_catalog_key: None,
         model: "claude-manual-selection".into(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -3435,6 +3484,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             cwd: "/tmp/resolver-factory".into(),
             provider: OPENAI_PROVIDER_NAME.into(),
             account_alias: None,
+            model_catalog_key: None,
             model: "gpt-test".into(),
             max_tokens: 64,
             max_tokens_source: None,
@@ -3654,6 +3704,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         cwd: "/tmp/haider-oauth-dispatch".into(),
         provider: provider.into(),
         account_alias: None,
+        model_catalog_key: None,
         model: model.into(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -4902,7 +4953,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         &validator,
         &snapshot,
         None,
-        &login_registry(),
+        &mut login_registry(),
         "profile-ttl",
         "claude-test",
         &mut pending,
@@ -4934,7 +4985,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         &validator,
         &snapshot,
         None,
-        &login_registry(),
+        &mut login_registry(),
         "profile-ttl",
         "claude-test",
         &mut pending,
@@ -6304,6 +6355,20 @@ async fn production_refresh_begin_durably_fences_restart_before_the_endpoint() {
     struct SharedDescriptorStore(Arc<StdMutex<Vec<CredentialDescriptor>>>);
 
     impl StoreLike for SharedDescriptorStore {
+        fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            COUNTER
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |current| current.max(floor).checked_add(1),
+                )
+                .map(|previous| previous.max(floor) + 1)
+                .map_err(|_| {
+                    HaiderError::new(ErrorCode::Internal, "test incarnation exhausted", false)
+                })
+        }
+
         fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
             Ok(self
                 .0
@@ -6382,6 +6447,20 @@ async fn production_descriptor_failure_tombstones_the_dead_rotated_refresh_token
     }
 
     impl StoreLike for FailingDescriptorStore {
+        fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            COUNTER
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |current| current.max(floor).checked_add(1),
+                )
+                .map(|previous| previous.max(floor) + 1)
+                .map_err(|_| {
+                    HaiderError::new(ErrorCode::Internal, "test incarnation exhausted", false)
+                })
+        }
+
         fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
             Ok(self
                 .durable
@@ -7366,6 +7445,7 @@ async fn provider_trust_toggle_is_receipted_persisted_and_journaled_raw() {
             session_id: session_id.clone(),
             cwd: dir.path().to_string_lossy().into_owned(),
             provider: OPENAI_PROVIDER_NAME.into(),
+            model_catalog_key: None,
             model: "gpt-test".into(),
             max_tokens: 4_096,
             max_tokens_source: None,
@@ -7514,6 +7594,7 @@ fn endpoint_edit_profile(provider: &str, origin: &str) -> ProviderProfileV1 {
         configured_models: vec!["model-a".to_owned()],
         default_model: Some("model-a".to_owned()),
         promotion_model: None,
+        catalog_selection_key: None,
         provenance: ProviderProvenance::Custom,
         trust: haider_rpc::ProviderTrustWire::Full,
     }
@@ -8312,6 +8393,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
             ],
             default_model: Some("frontier-legacy-a".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: crate::provider_registry::ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         },
@@ -8328,6 +8410,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
             configured_models: vec!["frontier-legacy-old".to_owned()],
             default_model: Some("frontier-legacy-old".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: crate::provider_registry::ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         },
@@ -9203,6 +9286,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             configured_models: vec!["seed-key".to_owned()],
             default_model: Some("seed-key".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         },
@@ -9219,6 +9303,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             configured_models: vec!["seed-none".to_owned()],
             default_model: Some("seed-none".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         },
@@ -9235,6 +9320,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             configured_models: Vec::new(),
             default_model: None,
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::BuiltIn,
             trust: haider_rpc::ProviderTrustWire::Full,
         },
@@ -11172,7 +11258,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     };
     accounts.add(expired.clone()).expect("seed expired account");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![expired]));
-    let providers = test_provider_registry();
+    let mut providers = test_provider_registry();
     let management = ManagementSnapshot::new(
         0,
         accounts.list().to_vec(),
@@ -11207,7 +11293,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         Arc::clone(&vault) as Arc<dyn Vault>,
         &snapshot,
         Some(&management),
-        &providers,
+        &mut providers,
         &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
@@ -12055,6 +12141,7 @@ fn removable_provider_profile(provider: &str) -> ProviderProfileV1 {
         configured_models: vec!["custom-model".to_owned()],
         default_model: Some("custom-model".to_owned()),
         promotion_model: None,
+        catalog_selection_key: None,
         provenance: ProviderProvenance::Custom,
         trust: haider_rpc::ProviderTrustWire::Full,
     }
@@ -12473,6 +12560,9 @@ fn custom_login_targets_only_custom_compatible_profiles() {
         Vec::new(),
         vec![
             ProviderSummaryWire {
+                catalog_scope: None,
+                configured_models: Vec::new(),
+                static_models: Vec::new(),
                 provider: "custom-llama".to_owned(),
                 api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                 endpoint: Some("http://127.0.0.1:18123/v1".to_owned()),
@@ -12492,6 +12582,9 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 trust: haider_rpc::ProviderTrustWire::Full,
             },
             ProviderSummaryWire {
+                catalog_scope: None,
+                configured_models: Vec::new(),
+                static_models: Vec::new(),
                 provider: "openai".to_owned(),
                 api_family: ProviderApiFamilyWire::OpenAiResponses,
                 endpoint: Some("https://api.openai.com/v1/responses".to_owned()),
@@ -12511,6 +12604,9 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 trust: haider_rpc::ProviderTrustWire::Full,
             },
             ProviderSummaryWire {
+                catalog_scope: None,
+                configured_models: Vec::new(),
+                static_models: Vec::new(),
                 provider: "custom-claude".to_owned(),
                 api_family: ProviderApiFamilyWire::AnthropicMessages,
                 endpoint: Some("https://claude-gateway.example.invalid/v1".to_owned()),
@@ -12530,6 +12626,9 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 trust: haider_rpc::ProviderTrustWire::Full,
             },
             ProviderSummaryWire {
+                catalog_scope: None,
+                configured_models: Vec::new(),
+                static_models: Vec::new(),
                 provider: "azure".to_owned(),
                 api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                 endpoint: Some("https://contoso.openai.azure.com/openai/v1".to_owned()),
@@ -12549,6 +12648,9 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 trust: haider_rpc::ProviderTrustWire::Full,
             },
             ProviderSummaryWire {
+                catalog_scope: None,
+                configured_models: Vec::new(),
+                static_models: Vec::new(),
                 provider: ANTHROPIC_PROVIDER_NAME.to_owned(),
                 api_family: ProviderApiFamilyWire::AnthropicMessages,
                 endpoint: Some("https://api.anthropic.com/v1".to_owned()),
@@ -12578,6 +12680,9 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 ),
             ),
             ProviderSummaryWire {
+                catalog_scope: None,
+                configured_models: Vec::new(),
+                static_models: Vec::new(),
                 provider: DEEPSEEK_PROVIDER_NAME.to_owned(),
                 api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                 endpoint: Some(DEEPSEEK_BASE_URL.to_owned()),
@@ -12598,6 +12703,26 @@ fn custom_login_targets_only_custom_compatible_profiles() {
             },
         ],
     );
+    // These three fixtures state an explicit deployment list. Pin that
+    // provenance so a fetched default cannot become a new login's hint.
+    let mut rows = management.read().expect("profiles").providers;
+    let prototype = test_provider_registry()
+        .summary(OPENAI_PROVIDER_NAME, &|_| true)
+        .expect("prototype")
+        .model_details[0]
+        .clone();
+    for profile in &mut rows {
+        if matches!(
+            profile.provider.as_str(),
+            "custom-llama" | "custom-claude" | "azure"
+        ) {
+            let mut detail = prototype.clone();
+            detail.name = profile.default_model.clone().expect("configured model");
+            detail.source = Some(haider_rpc::ModelDetailSourceWire::Configured);
+            profile.model_details = vec![detail];
+        }
+    }
+    management.publish(0, Vec::new(), rows);
     let target = custom_login_target(Some(&management), "custom-llama")
         .expect("chat-completions profile is a login target");
     assert_eq!(target.0, "http://127.0.0.1:18123/v1");
@@ -12647,6 +12772,20 @@ fn custom_login_targets_only_custom_compatible_profiles() {
         "the named Haider Code builtin never routes through custom validation"
     );
     assert!(custom_login_target(None, "custom-llama").is_none());
+    let mut rows = management.read().expect("profiles").providers;
+    let custom = rows
+        .iter_mut()
+        .find(|row| row.provider == "custom-llama")
+        .expect("custom");
+    custom.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Remote);
+    management.publish(1, Vec::new(), rows);
+    assert_eq!(
+        custom_login_target(Some(&management), "custom-llama")
+            .expect("target")
+            .1,
+        None,
+        "the previous account's fetched default is not explicit validation configuration"
+    );
 }
 
 // ───────────────────── D1 device candidate import laws ──────────────────────
@@ -13166,6 +13305,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
         cwd: "/tmp".into(),
         provider: "anthropic-oauth".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "claude-opus-5".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -13270,6 +13410,9 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
     );
 
     let summary = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "openai-oauth".to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
@@ -13361,6 +13504,9 @@ fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummary
         )
     };
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::AnthropicMessages,
         endpoint: endpoint.map(str::to_owned),
@@ -13390,6 +13536,7 @@ fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session:
         cwd: "/tmp/enterprise-dispatch".to_owned(),
         provider: provider.to_owned(),
         account_alias: None,
+        model_catalog_key: None,
         model: model.to_owned(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -13759,7 +13906,7 @@ async fn enterprise_login_validates_at_the_profile_endpoint_with_its_default_mod
         &validator,
         &snapshot,
         Some(&management),
-        &login_registry(),
+        &mut login_registry(),
         "profile-bedrock",
         "claude-global-default",
         &mut pending,
@@ -13954,7 +14101,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         Arc::clone(&vault),
         &snapshot,
         Some(&management),
-        &providers,
+        &mut providers,
         &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
@@ -14014,7 +14161,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         Arc::clone(&vault),
         &snapshot,
         Some(&management),
-        &providers,
+        &mut providers,
         &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
@@ -14068,7 +14215,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         Arc::clone(&vault),
         &snapshot,
         Some(&management),
-        &providers,
+        &mut providers,
         &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
@@ -14230,6 +14377,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         cwd: "/tmp/haider-web-degrade".into(),
         provider: provider.into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "web-test".into(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -14391,6 +14539,9 @@ async fn each_turn_resolves_the_currently_active_account() {
     // The provider must be a registered profile for an adapter to exist; the
     // account choice is what this pin is about, not the adapter.
     let summary = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
@@ -14436,6 +14587,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         cwd: "/tmp/switch-fixture".to_owned(),
         provider: provider.to_owned(),
         account_alias: None,
+        model_catalog_key: None,
         model: "llama-fixture".to_owned(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -14914,7 +15066,7 @@ fn vanished_linked_source_reappearing_with_identical_bytes_keeps_a_new_incarnati
 }
 
 #[test]
-fn malformed_linked_source_invalidates_once_before_a_recovered_intake() {
+fn partial_linked_source_preserves_incarnation_until_a_different_intake() {
     let profile = test_store_dir();
     let root = profile.path().join("kimi-source");
     let file = root.join("credentials/kimi-code.json");
@@ -14935,7 +15087,10 @@ fn malformed_linked_source_invalidates_once_before_a_recovered_intake() {
         .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
         .expect("linked account remains present")
         .incarnation;
-    assert!(invalidated > original);
+    assert_eq!(
+        invalidated, original,
+        "a partial write is not an account replacement"
+    );
     reconcile_credential_sources(&mut registry, &mut accounts).expect("repeat invalid scan");
     assert_eq!(
         accounts
@@ -15498,6 +15653,9 @@ fn antigravity_descriptor(alias: &str) -> CredentialDescriptor {
 
 fn antigravity_summary(models: &[&str], default_model: Option<&str>) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: GOOGLE_ANTIGRAVITY_PROVIDER_NAME.into(),
         api_family: ProviderApiFamilyWire::AcpAgent,
         endpoint: None,
@@ -15527,6 +15685,7 @@ fn antigravity_metadata(model: &str) -> haider_protocol::session::SessionMetadat
         cwd: "/tmp/haider-antigravity-workspace".into(),
         provider: GOOGLE_ANTIGRAVITY_PROVIDER_NAME.into(),
         account_alias: None,
+        model_catalog_key: None,
         model: model.into(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -16441,7 +16600,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
         &ProviderCredentialValidator,
         &snapshot,
         Some(&management),
-        &providers,
+        &mut providers,
         "customprov-offline-profile",
         "unused-global-model",
         &mut pending,
@@ -16521,6 +16680,7 @@ async fn create_provider_trust_test_session(
             session_id: session_id.clone(),
             cwd: dir.to_string_lossy().into_owned(),
             provider: OPENAI_PROVIDER_NAME.into(),
+            model_catalog_key: None,
             model: "gpt-test".into(),
             max_tokens: 4_096,
             max_tokens_source: None,
@@ -16953,4 +17113,543 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
     }
     while tasks.join_next().await.is_some() {}
     store.close().await.expect("close");
+}
+
+/// Exercise the actor's completion CALL SITE, not just its predicate. A
+/// retired producer must neither publish rows nor write them to SQLite.
+#[tokio::test]
+async fn actor_completion_after_incarnation_mint_rejects_retired_producer() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut accounts = memory_accounts();
+    accounts
+        .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: Some("synthetic-A".into()),
+            alias: CredentialAlias::new("work"),
+            provider: KIMI_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "synthetic".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("A");
+    let providers = ProviderRegistry::new(
+        Box::new(TestProviderStore::default()) as Box<dyn ProviderRegistryStoreLike>,
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([KIMI_OAUTH_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("authenticated catalog provider");
+    let retired = catalog_producer(
+        "actor-fence",
+        KIMI_OAUTH_PROVIDER_NAME,
+        &accounts,
+        &providers,
+    )
+    .expect("A producer");
+    accounts
+        .mint_incarnation(&CredentialAlias::new("work"))
+        .expect("new incarnation");
+    let current = catalog_producer(
+        "actor-fence",
+        KIMI_OAUTH_PROVIDER_NAME,
+        &accounts,
+        &providers,
+    )
+    .expect("B producer");
+    let snapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let management =
+        ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries(&|_| true));
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot,
+        management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(true),
+        profile_id: "actor-fence".into(),
+        default_model: "unused".into(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
+    });
+    let current_incarnation = current.incarnation;
+    for (producer, slug, accepted) in [(retired, "a-private", false), (current, "b-current", true)]
+    {
+        let key = producer.cache_key.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        actor
+            .commands()
+            .send(AccountCommand::ProviderModelsRefreshCompleted {
+                provider: KIMI_OAUTH_PROVIDER_NAME.into(),
+                producer,
+                cache_key: key.clone(),
+                cached: None,
+                result: ProviderModelsRefreshResult::Discovery(Ok(DiscoveredCatalog {
+                    models: vec![DiscoveredModel {
+                        slug: slug.into(),
+                        display_name: slug.into(),
+                        context_window: None,
+                        max_output_tokens: None,
+                        description: None,
+                        default_effort: None,
+                        supported_efforts: vec![],
+                        visible: true,
+                        priority: None,
+                        use_responses_lite: None,
+                        extensions: None,
+                    }],
+                    etag: None,
+                })),
+                completed: ProviderModelsRefreshCompletion::internal(sender),
+            })
+            .await
+            .expect("completion command");
+        let result = tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .expect("completion deadline")
+            .expect("completion");
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "actor must fence the retired producer"
+        );
+        assert_eq!(
+            store
+                .provider_models(key.into())
+                .await
+                .expect("durable rows")
+                .is_some(),
+            accepted
+        );
+        let view = management.read().expect("management");
+        assert!(
+            !view
+                .providers
+                .iter()
+                .any(|row| row.models.contains(&"a-private".into()))
+        );
+        if accepted {
+            let summary = view
+                .providers
+                .iter()
+                .find(|row| row.provider == KIMI_OAUTH_PROVIDER_NAME)
+                .expect("current summary");
+            let scope = summary
+                .catalog_scope
+                .as_ref()
+                .expect("authenticated catalog owner");
+            assert_eq!(scope.account_alias.as_deref(), Some("work"));
+            assert_eq!(scope.account_incarnation, current_incarnation);
+            assert!(!scope.key.is_empty());
+        }
+    }
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+#[test]
+fn transient_linked_source_failure_preserves_proof_and_recovery_requeues() {
+    let profile = test_store_dir();
+    let root = profile.path().join("kimi-source");
+    write_linked_kimi_source(&root, "synthetic-A", "kimi-code.json");
+    let file = root.join("credentials/kimi-code.json");
+    let bytes = std::fs::read(&file).expect("source bytes");
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("registry");
+    registry
+        .enroll(CredentialSourceKind::KimiCodeHome, &root, None)
+        .expect("enroll");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("initial scan");
+    let original = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .expect("A")
+        .clone();
+    std::fs::write(&file, b"{").expect("partial write");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("partial scan");
+    let partial = accounts
+        .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+        .expect("partial")
+        .clone();
+    assert_eq!(original.incarnation, partial.incarnation);
+    assert_eq!(original.credential_digest, partial.credential_digest);
+    std::fs::write(&file, bytes).expect("restore source");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("recovery");
+    assert_eq!(
+        original.incarnation,
+        accounts
+            .active_for_provider(KIMI_OAUTH_PROVIDER_NAME)
+            .expect("recovered")
+            .incarnation
+    );
+    let mut providers = ProviderRegistry::new(
+        Box::new(TestProviderStore::default()) as Box<dyn ProviderRegistryStoreLike>,
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([KIMI_OAUTH_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("linked provider registry");
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+    clear_catalogs_after_account_change(&[partial], &accounts, &mut providers, &mut pending);
+    assert!(pending.providers.contains(KIMI_OAUTH_PROVIDER_NAME));
+}
+
+#[tokio::test]
+async fn same_account_linked_rotation_race_completes_then_reconciles_and_retries() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let root = dir.path().join("grok-source");
+    write_linked_grok_source(&root, "stable-user", "stable@example.test");
+    let mut sources = CredentialSourceRegistry::load(dir.path()).expect("registry");
+    sources
+        .enroll(CredentialSourceKind::GrokHome, &root, None)
+        .expect("enroll");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut sources, &mut accounts).expect("A scan");
+    let incarnation = accounts
+        .active_for_provider(GROK_OAUTH_PROVIDER_NAME)
+        .expect("A")
+        .incarnation;
+    let snapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let sources = Arc::new(StdMutex::new(sources));
+    let file = root.join("auth.json");
+    let bytes = std::fs::read_to_string(&file).expect("synthetic source");
+    std::fs::write(
+        &file,
+        bytes.replace("grok-access-token-fixture", "grok-access-token-rotated"),
+    )
+    .expect("same-user rotation");
+    let providers = ProviderRegistry::new(
+        Box::new(TestProviderStore::default()) as Box<dyn ProviderRegistryStoreLike>,
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([GROK_OAUTH_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("linked provider registry");
+    let (commands, mut received) = mpsc::channel(8);
+    let broker = CredentialBroker::new(
+        Arc::new(MemoryVault::new()),
+        OAuthProviderCatalog::default(),
+        snapshot,
+        commands.clone(),
+    )
+    .expect("broker");
+    let discoverer: Arc<dyn ProviderModelDiscoverer> = Arc::new(BlockingModelDiscoverer {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        seen: StdMutex::new(Vec::new()),
+        results: StdMutex::new(std::collections::VecDeque::new()),
+    });
+    let mut tasks = JoinSet::new();
+    let mut routes = HashMap::new();
+    let mut followers = HashMap::new();
+    let mut refreshing = HashSet::new();
+    begin_provider_models_refresh(
+        &store,
+        &accounts,
+        &providers,
+        "race-profile",
+        &sources,
+        Some(&broker),
+        &discoverer,
+        &commands,
+        &mut tasks,
+        &mut routes,
+        &mut followers,
+        &mut refreshing,
+        GROK_OAUTH_PROVIDER_NAME.into(),
+        ProviderModelsRefreshCompletion::Automatic,
+    )
+    .await;
+    let first = tokio::time::timeout(Duration::from_secs(10), received.recv())
+        .await
+        .expect("completion deadline")
+        .expect("completion");
+    assert!(matches!(
+        first,
+        AccountCommand::ProviderModelsRefreshCompleted {
+            result: ProviderModelsRefreshResult::Credential(_),
+            ..
+        }
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(10), received.recv())
+            .await
+            .expect("reconcile deadline"),
+        Some(AccountCommand::ReconcileSources)
+    ));
+    reconcile_credential_sources(&mut sources.lock().expect("registry"), &mut accounts)
+        .expect("B scan");
+    assert_eq!(
+        accounts
+            .active_for_provider(GROK_OAUTH_PROVIDER_NAME)
+            .expect("B")
+            .incarnation,
+        incarnation
+    );
+    let retry = tokio::time::timeout(Duration::from_secs(10), received.recv())
+        .await
+        .expect("retry deadline")
+        .expect("retry");
+    let AccountCommand::RetryCatalogAfterSourceReconcile { provider } = retry else {
+        panic!("expected catalog retry");
+    };
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+    retry_catalog_after_source_reconcile(&provider, &accounts, &providers, &sources, &mut pending);
+    assert!(pending.providers.contains(GROK_OAUTH_PROVIDER_NAME));
+    // An unreadable source must not create an unbounded retry loop.
+    std::fs::write(&file, b"{").expect("partial write");
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+    retry_catalog_after_source_reconcile(&provider, &accounts, &providers, &sources, &mut pending);
+    assert!(pending.is_empty());
+    while tasks.join_next().await.is_some() {}
+    store.close().await.expect("close");
+}
+
+#[test]
+fn frozen_resilience_selections_are_fenced_by_active_incarnation() {
+    let mut accounts = memory_accounts();
+    accounts
+        .add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: Some("synthetic".into()),
+            alias: CredentialAlias::new("work"),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "synthetic".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("A");
+    let snapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let factory = AccountsProviderFactory::new(
+        snapshot.clone(),
+        VaultProvision::Unsupported,
+        Arc::new(ProductionAccountBuilder::default()),
+    )
+    .with_resilience(AccountsResilienceConfig {
+        fallback_chain: vec![ProviderTargetV1 {
+            provider: OPENAI_PROVIDER_NAME.into(),
+            model: Some("a-private".into()),
+        }],
+        promotion_targets: HashMap::new(),
+    });
+    let mut profile = test_provider_registry()
+        .summary(OPENAI_PROVIDER_NAME, &|_| true)
+        .expect("profile");
+    let mut model = profile.model_details[0].clone();
+    model.name = "a-private".into();
+    model.source = Some(haider_rpc::ModelDetailSourceWire::Remote);
+    profile.model_details = vec![model];
+    assert!(factory.resilience_model_is_current(&profile, "a-private"));
+    accounts
+        .mint_incarnation(&CredentialAlias::new("work"))
+        .expect("B");
+    *snapshot.lock().expect("snapshot") = accounts.list().to_vec();
+    assert!(!factory.resilience_model_is_current(&profile, "a-private"));
+    profile.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Configured);
+    assert!(
+        factory.resilience_model_is_current(&profile, "a-private"),
+        "explicit configuration survives"
+    );
+}
+
+#[test]
+fn persisted_configured_deployment_turns_share_the_selection_availability_rule() {
+    let mut summary = keyless_summary("azure-test", "https://synthetic.openai.azure.com/openai/v1");
+    summary.models = vec!["my-deployment".into()];
+    summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+    summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    let management = ManagementSnapshot::new(0, Vec::new(), vec![summary.clone()]);
+    let factory = AccountsProviderFactory::new_with_management(
+        Arc::new(StdMutex::new(Vec::new())),
+        management.clone(),
+        VaultProvision::Unsupported,
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    let metadata = enterprise_metadata("azure-test", "my-deployment");
+    for (reason, selectable) in [
+        (
+            "model list not fetched — fetch models before selecting",
+            false,
+        ),
+        (
+            "server returned 503 for /models — retry model-list fetch",
+            false,
+        ),
+        (
+            "configured (unverified): server returned 404 for /models",
+            true,
+        ),
+    ] {
+        summary.availability = if selectable {
+            ProviderAvailabilityWire::Available
+        } else {
+            ProviderAvailabilityWire::Unavailable
+        };
+        summary.availability_reason = Some(reason.into());
+        management.publish(1, Vec::new(), vec![summary.clone()]);
+        let result = factory.admit_persisted_model(&metadata);
+        assert_eq!(result.is_ok(), selectable);
+        if !selectable {
+            assert_eq!(result.expect_err("refusal").message, reason);
+        }
+    }
+    summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+    summary.models.clear();
+    summary.availability = ProviderAvailabilityWire::Unavailable;
+    summary.availability_reason = Some("model list is empty".into());
+    management.publish(2, Vec::new(), vec![summary.clone()]);
+    assert!(factory.admit_persisted_model(&metadata).is_err());
+    summary.endpoint = Some("http://127.0.0.1:18123/v1".into());
+    summary.availability = ProviderAvailabilityWire::Unavailable;
+    management.publish(3, Vec::new(), vec![summary]);
+    assert!(
+        factory.admit_persisted_model(&metadata).is_ok(),
+        "ordinary compatible endpoints retain advisory passthrough"
+    );
+}
+
+#[tokio::test]
+async fn pending_fetched_default_recovery_keeps_its_owner_and_drops_retired_owners() {
+    for (model, retire, expected) in [
+        ("a-private", false, Some("a-private")),
+        ("a-private", true, None),
+        ("configured-deployment", true, Some("configured-deployment")),
+    ] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let mut accounts = memory_accounts();
+        accounts
+            .add(CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: Some("synthetic-A".into()),
+                alias: CredentialAlias::new("work"),
+                provider: "work".into(),
+                base_url: None,
+                auth_method: AuthMethod::ApiKey,
+                identity: "synthetic".into(),
+                status: CredentialStatus::Ok,
+                active: true,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            })
+            .expect("A");
+        let mut providers = test_provider_registry();
+        providers
+            .configure(ProviderConfigureInput {
+                provider: "work".into(),
+                api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+                origin: Some("https://synthetic.example.test/v1".into()),
+                auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+                enabled: true,
+                models: vec!["configured-deployment".into()],
+                default_model: Some("configured-deployment".into()),
+                response_open_timeout_ms: None,
+                chunk_idle_timeout_ms: None,
+                semantic_progress_timeout_ms: None,
+                trust: None,
+            })
+            .expect("provider");
+        let owner = catalog_selection_scope("work", &accounts, &providers);
+        providers
+            .reconcile_catalog_scope("work", owner.clone())
+            .expect("scope");
+        if model == "a-private" {
+            providers.replace_discovered_models(
+                "work".into(),
+                vec![DiscoveredModel {
+                    slug: model.into(),
+                    display_name: model.into(),
+                    context_window: None,
+                    max_output_tokens: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: vec![],
+                    visible: true,
+                    priority: None,
+                    use_responses_lite: None,
+                    extensions: None,
+                }],
+                u64::MAX,
+            );
+        } else {
+            providers.models_unsupported("work", "not supported".into());
+        }
+        providers
+            .set_default_model("work", model)
+            .expect("validated selection");
+        let (json, digest) = command_json(&SetDefaultModelIdentity {
+            provider: "work".into(),
+            model: model.into(),
+            expected_revision: 0,
+        })
+        .expect("identity");
+        store
+            .management_claim_receipt::<ProviderReceipt>(
+                "pending-default".into(),
+                ACCOUNT_SET_DEFAULT_MODEL_METHOD.into(),
+                digest,
+                json,
+                Some(
+                    serde_json::to_string(&SetDefaultModelRecovery {
+                        catalog_selection_key: owner,
+                    })
+                    .expect("recovery"),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("claim");
+        if retire {
+            accounts
+                .mint_incarnation(&CredentialAlias::new("work"))
+                .expect("B");
+        }
+        providers.clear_discovered_models("work");
+        reconcile_provider_receipts(&store, "test-profile", &accounts, &mut providers)
+            .await
+            .expect("crash recovery");
+        assert_eq!(
+            providers
+                .get("work")
+                .expect("profile")
+                .default_model
+                .as_deref(),
+            expected
+        );
+        assert_eq!(
+            providers.get("work").expect("profile").configured_models,
+            ["configured-deployment"]
+        );
+        assert!(
+            store
+                .management_receipts(ACCOUNT_SET_DEFAULT_MODEL_METHOD.into())
+                .await
+                .expect("receipts")
+                .iter()
+                .all(|row| row.state == "committed")
+        );
+        store.close().await.expect("close");
+    }
 }

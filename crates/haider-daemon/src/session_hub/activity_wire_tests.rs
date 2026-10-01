@@ -188,6 +188,7 @@ async fn activity_refused_signal_closes_transport_and_reconnect_read_repairs_inv
         session_id: session.clone(),
         cwd: root.path().to_string_lossy().into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

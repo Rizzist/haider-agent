@@ -208,6 +208,7 @@ fn select_body(
         command_id: CommandId::new(command_id),
         session_id: session_id.clone(),
         worker_generation: generation,
+        expected_catalog_key: None,
         model: model.into(),
         provider: provider.map(str::to_owned),
         confirm_new_epoch: false,

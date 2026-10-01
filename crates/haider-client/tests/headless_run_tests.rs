@@ -244,6 +244,7 @@ async fn respond_create_and_attach_with_account(
                 cwd: "/tmp".into(),
                 provider: provider.into(),
                 account_alias: account_alias.map(Into::into),
+                model_catalog_key: None,
                 model: model.into(),
                 max_tokens: 4096,
                 max_tokens_source: None,
@@ -470,6 +471,7 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
                     cwd: "/tmp".into(),
                     provider: "fake".into(),
                     account_alias: None,
+                    model_catalog_key: None,
                     model: "fake-model".into(),
                     max_tokens: 4_096,
                     max_tokens_source: None,
@@ -666,6 +668,9 @@ fn provider_summary_fixture(
     models: &[&str],
 ) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.into(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: Some("https://example.test/v1/responses".into()),
@@ -3303,6 +3308,7 @@ async fn resume_budget_checkpoint_submits_new_turn_in_original_session() {
                     agent_spawn: None,
                     cwd: "/original-workspace".into(),
                     provider: "fake".into(),
+                    model_catalog_key: None,
                     model: "original-model".into(),
                     max_output_tokens: 1024,
                     effort: None,

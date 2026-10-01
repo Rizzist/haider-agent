@@ -46,6 +46,11 @@ struct SettingsDto {
     last_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_model_catalog_key: Option<String>,
+    /// Distinguishes a proven unowned choice from a legacy ownerless pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_model_scope_version: Option<u32>,
     /// 971-tui-collapse: the tool-output verbosity mode. Additive — files
     /// written before this wave omit it and load as `normal` (the default),
     /// so old settings stay valid.
@@ -76,6 +81,14 @@ struct ToolRowsDto {
 
 /// The current [`ToolRowsDto`] shape.
 const TOOL_ROWS_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastModelPick {
+    pub provider: String,
+    pub model: String,
+    pub catalog_key: Option<String>,
+    pub scope_known: bool,
+}
 
 /// One session's disclosure state, decoded. Unknown names are dropped
 /// rather than guessed — a stale row simply opens collapsed.
@@ -114,7 +127,7 @@ pub struct SettingsStore {
     last_saved_notifications: Option<bool>,
     /// Model retention: the `(provider, model)` pair mirrored into every
     /// write so a theme/notification save never drops it. Seeded at boot.
-    last_model: Option<(String, String)>,
+    last_model: Option<LastModelPick>,
     /// The tool-output verbosity mirrored into every write, so a theme or
     /// model save never drops it. Seeded from the file at boot.
     verbosity: Verbosity,
@@ -310,25 +323,29 @@ impl SettingsStore {
     /// pick, or `None` on a missing/corrupt/foreign file or a pre-retention
     /// file (either half absent).
     #[must_use]
-    pub fn load_last_model(&self) -> Option<(String, String)> {
+    pub fn load_last_model(&self) -> Option<LastModelPick> {
         let dto = self.load_dto()?;
-        Some((dto.last_provider?, dto.last_model?))
+        Some(LastModelPick {
+            provider: dto.last_provider?,
+            model: dto.last_model?,
+            catalog_key: dto.last_model_catalog_key,
+            scope_known: dto.last_model_scope_version == Some(1),
+        })
     }
 
     /// Seed the tracked pair (from a boot-time load) so a later theme or
     /// notification save preserves it.
-    pub fn set_last_model(&mut self, pair: Option<(String, String)>) {
+    pub fn set_last_model(&mut self, pair: Option<LastModelPick>) {
         self.last_model = pair;
     }
 
     /// Persist a committed model pick, carrying the current theme +
     /// notification toggle. A no-op when the pair is unchanged.
-    pub fn save_last_model_if_changed(&mut self, theme: ThemeChoice, provider: &str, model: &str) {
-        let pair = (provider.to_owned(), model.to_owned());
-        if self.last_model.as_ref() == Some(&pair) {
+    pub fn save_last_model_if_changed(&mut self, theme: ThemeChoice, pair: Option<LastModelPick>) {
+        if self.last_model == pair {
             return;
         }
-        self.last_model = Some(pair);
+        self.last_model = pair;
         if self.write_dto(theme, self.notifications) {
             self.last_saved = Some(theme);
             self.last_saved_notifications = Some(self.notifications);
@@ -371,11 +388,16 @@ impl SettingsStore {
             version: SETTINGS_VERSION,
             theme: theme.name().to_owned(),
             notifications,
-            last_provider: self
+            last_provider: self.last_model.as_ref().map(|pick| pick.provider.clone()),
+            last_model: self.last_model.as_ref().map(|pick| pick.model.clone()),
+            last_model_catalog_key: self
                 .last_model
                 .as_ref()
-                .map(|(provider, _)| provider.clone()),
-            last_model: self.last_model.as_ref().map(|(_, model)| model.clone()),
+                .and_then(|pick| pick.catalog_key.clone()),
+            last_model_scope_version: self
+                .last_model
+                .as_ref()
+                .and_then(|pick| pick.scope_known.then_some(1)),
             tool_verbosity: Some(self.verbosity.name().to_owned()),
             tool_rows: self
                 .tool_rows

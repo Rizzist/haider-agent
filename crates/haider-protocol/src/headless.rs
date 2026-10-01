@@ -80,6 +80,9 @@ pub struct HeadlessRunSpecV1 {
     pub cwd: String,
     pub provider: String,
     pub model: String,
+    /// Owner of a catalog-derived model pin; absent for explicit/legacy pins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
     pub max_output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,

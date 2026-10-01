@@ -782,6 +782,7 @@ impl DelegationHandle {
                     session_id: child_session_id.clone(),
                     cwd: coordinates.metadata.cwd.clone(),
                     provider: coordinates.metadata.provider.clone(),
+                    model_catalog_key: coordinates.metadata.model_catalog_key.clone(),
                     model: coordinates.metadata.model.clone(),
                     max_tokens: coordinates.metadata.max_tokens,
                     max_tokens_source: coordinates.metadata.max_tokens_source,

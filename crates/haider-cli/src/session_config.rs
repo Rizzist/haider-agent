@@ -382,6 +382,7 @@ async fn apply_mutations(
                 command_id: CommandId::new(command_id("session-config-model")),
                 session_id: session_id.clone(),
                 worker_generation: *worker_generation,
+                expected_catalog_key: None,
                 model,
                 provider,
                 confirm_new_epoch: options.confirm_epoch,

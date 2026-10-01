@@ -283,6 +283,7 @@ async fn toolshape_task_output_original_hash_survives_completion_eviction_and_ad
         session_id: session.clone(),
         cwd: profile.path().to_string_lossy().into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

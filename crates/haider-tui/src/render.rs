@@ -3632,7 +3632,14 @@ fn render_providers(
         ) && summary.endpoint.is_some()
             && summary.auth_methods.is_empty();
         let (dot, dot_style, health) = match summary.availability {
-            ProviderAvailabilityWire::Available => ("●", theme.ok_style(), "available".to_owned()),
+            ProviderAvailabilityWire::Available => (
+                "●",
+                theme.ok_style(),
+                summary.availability_reason.as_ref().map_or_else(
+                    || "available".to_owned(),
+                    |reason| format!("available — {reason}"),
+                ),
+            ),
             ProviderAvailabilityWire::Unavailable if keyless_local && summary.models.is_empty() => {
                 (
                     "○",
@@ -5752,6 +5759,15 @@ fn render_model_picker(
             ])),
             note_area,
         );
+    } else if let Some(reason) = rows
+        .get(picker.selection)
+        .filter(|row| row.available)
+        .and_then(|row| row.reason.as_ref())
+    {
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!("   {reason}"), theme.dim_style())),
+            note_area,
+        );
     } else {
         let count = if top_level {
             format!(
@@ -5912,7 +5928,7 @@ fn render_model_picker(
         }
         // Refusal truth is mandatory row grammar; aggregate diagnostics are
         // optional detail and must never displace it at bounded widths.
-        if let Some(reason) = row.reason.as_ref().filter(|_| !row.available) {
+        if let Some(reason) = row.reason.as_ref() {
             spans.push(Span::styled(format!("  {reason}"), theme.faint_style()));
         }
         if is_top_api_group(row) {

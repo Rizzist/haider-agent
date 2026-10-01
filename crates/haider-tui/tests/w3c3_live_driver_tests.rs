@@ -719,6 +719,8 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
             session: sid(1),
             worker_generation: 7,
             cwd: "/tmp/created-workspace".to_owned(),
+            provider: "anthropic".into(),
+            model_catalog_key: None,
             model: "fable-5".to_owned(),
         },
     );
@@ -1362,6 +1364,8 @@ fn an_attached_dated_session_speaks_uncreated_until_its_leaf_exists() {
             session: sid(1),
             worker_generation: 3,
             cwd: leaf_text.clone(),
+            provider: "anthropic".into(),
+            model_catalog_key: None,
             model: "fable-5".to_owned(),
         },
     );
@@ -1466,6 +1470,8 @@ fn rapid_session_switches_cannot_exceed_the_probe_bound() {
                 session: sid(n),
                 worker_generation: 1,
                 cwd: leaf.clone(),
+                provider: "anthropic".into(),
+                model_catalog_key: None,
                 model: "fable-5".to_owned(),
             },
         );
@@ -1552,6 +1558,8 @@ fn an_absent_non_dated_workspace_never_claims_the_uncreated_cue() {
             session: sid(2),
             worker_generation: 1,
             cwd: "/definitely/not/a/real/haider/workspace".to_owned(),
+            provider: "anthropic".into(),
+            model_catalog_key: None,
             model: "fable-5".to_owned(),
         },
     );

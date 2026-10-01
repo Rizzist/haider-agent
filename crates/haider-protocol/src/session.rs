@@ -249,6 +249,10 @@ pub struct SessionMetadataV1 {
     pub account_alias: Option<String>,
     /// Full provider model identifier — the current model selection.
     pub model: String,
+    /// Producer of a catalog-derived selection. An absent key preserves explicit
+    /// configuration and legacy metadata; a retired key requires reselection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
     /// Maximum output tokens for each provider request.
     pub max_tokens: u64,
     /// Whether `max_tokens` was derived from the selected model or set by the
@@ -340,6 +344,8 @@ pub struct ModelSelected {
     pub provider: String,
     /// The selected full model identifier.
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
 }
 
 /// Additive replay fact emitted atomically with a committed live-session
@@ -533,6 +539,9 @@ impl SessionProviderRebound {
 
     /// Rebuild the routing projection from a replayed committed fact.
     pub fn apply_to_metadata(&self, metadata: &mut SessionMetadataV1) {
+        // A route edit is not a new model selection. Preserve the original
+        // producer so admission cannot treat its derived model/settings as
+        // explicit configuration for another account or endpoint.
         metadata.provider_rebind_id = Some(self.rebind_id.clone());
         metadata.provider.clone_from(&self.provider);
         metadata.provider_base_url.clone_from(&self.base_url);

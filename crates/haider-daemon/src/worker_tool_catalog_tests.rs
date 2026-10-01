@@ -447,6 +447,8 @@ fn automatic_pair_switches_cannot_cross_a_lockdown_boundary() {
         from_provider: "source".to_owned(),
         from_model: "source-model".to_owned(),
         to_provider: "target".to_owned(),
+        model_catalog_key: None,
+        output_budget: None,
         to_model: "target-model".to_owned(),
         cause: haider_core::ProviderPairSwitchCause::FallbackChain,
     };

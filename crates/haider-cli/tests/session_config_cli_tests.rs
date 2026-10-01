@@ -18,6 +18,9 @@ fn args(list: &[&str]) -> Vec<String> {
 
 fn provider_summary(provider: &str) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,

@@ -70,7 +70,7 @@ policy, and preset machinery are on main; build on them.
 - LZ1 azure header mode: request golden with `api-key` header and NO
   Authorization header; deployment name rides body.model.
 - LZ2 azure discovery-404 fallback → manual deployment entry persists and
-  the profile lights Available.
+  the profile follows the revised LZ2 availability rule below.
 - LB1 mantle golden: URL shape, x-api-key header, anthropic-version
   header, model in body, SSE decode of a scripted stream.
 - LB2 endpoint pinning: `new_endpoint` refuses non-mantle URL shapes.
@@ -94,3 +94,14 @@ commit; named-path adds; ledger truthful; notes + mutation-notes with ≥6
 executed kills incl. the azure header mode, vertex body deltas, fast
 refusal, and effort naming). No version bumps/tags/MCP/renames; no real
 network calls (mock everything); never delete ~/.codex/sessions.
+
+## LZ2 ruling update (2026-09-30)
+
+This replaces the historical seeded-availability wording above. Configured
+Azure deployments stay visible but Unavailable until discovery succeeds.
+HTTP 404/405 or an explicit unsupported listing permits manual selection as
+`configured (unverified)`, retaining the specific reason. That inventory is
+excluded from automatic failover and promotion. Transient 5xx/timeouts stay
+Unavailable with their specific reason and can be retried. The daemon and
+TUI accept and refuse the same rows. See `docs/subscription-model-catalog.md`
+and `configured_deployments_are_selectable_only_after_success_or_unsupported_discovery`.
