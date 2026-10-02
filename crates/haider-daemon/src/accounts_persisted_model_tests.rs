@@ -143,21 +143,24 @@ fn factory(
 
 async fn exercise_admitted_turn(result: &Result<crate::worker::ResolvedTurnProvider, HaiderError>) {
     if let Ok(turn) = result {
-        let _ = turn
-            .provider
-            .stream_turn(TurnRequest {
-                messages: Vec::new(),
-                model: turn.model.clone(),
-                max_tokens: 16,
-                system_prompt: None,
-                tools: Vec::new(),
-                attachments: Vec::new(),
-                cache_metadata: None,
-                tool_result_image_projection: Default::default(),
-            })
-            .await
-            .expect("record physical provider round");
+        exercise_provider_round(&turn.provider, &turn.model).await;
     }
+}
+
+async fn exercise_provider_round(provider: &Arc<dyn Provider>, model: &str) {
+    let _ = provider
+        .stream_turn(TurnRequest {
+            messages: Vec::new(),
+            model: model.into(),
+            max_tokens: 16,
+            system_prompt: None,
+            tools: Vec::new(),
+            attachments: Vec::new(),
+            cache_metadata: None,
+            tool_result_image_projection: Default::default(),
+        })
+        .await
+        .expect("record physical provider round");
 }
 
 fn assert_reselection(error: &HaiderError) {
@@ -172,6 +175,180 @@ fn assert_reselection(error: &HaiderError) {
         error.details.as_ref().expect("selection coordinates")["model"],
         "Go"
     );
+}
+
+/// Explicit names remain configuration, but their discovery admission cannot
+/// be borrowed from an inventory published before a credential/route change.
+#[tokio::test]
+async fn explicit_model_cannot_borrow_retired_inventory_eligibility() {
+    for azure in [false, true] {
+        for repoint in [false, true] {
+            let mut profile = summary(ModelInventoryWire::Fetched { fetched_at_ms: 1 });
+            profile.catalog = ProviderCatalogKindWire::Authenticated;
+            profile.models = vec!["Go".into()];
+            if azure {
+                profile.catalog = ProviderCatalogKindWire::Custom;
+                profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+                profile.endpoint = Some("https://synthetic.openai.azure.com".into());
+                profile.configured_models = profile.models.clone();
+                profile.inventory = ModelInventoryWire::Configured;
+                profile.availability_reason = Some("synthetic listing HTTP 404".into());
+            }
+            profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+                key: "pending".into(),
+                account_alias: Some("upgrade-fixture".into()),
+                account_incarnation: Some(0),
+            });
+            let (factory, provider, alias) = factory(profile.clone());
+            let mut descriptor = factory.snapshot.lock().expect("snapshot")[0].clone();
+            profile.catalog_scope.as_mut().expect("scope").key =
+                AccountsProviderFactory::descriptor_catalog_key(&profile, Some(&descriptor))
+                    .expect("A's producer");
+            let management = factory.management.as_ref().expect("management");
+            management.publish(2, vec![descriptor.clone()], vec![profile.clone()]);
+            let mut metadata = old_metadata();
+            metadata.account_alias = Some(alias.as_str().into());
+            assert_eq!(metadata.model_catalog_key, None, "explicit configuration");
+            let admitted = factory.resolve_for_turn(&metadata).await;
+            exercise_admitted_turn(&admitted).await;
+            assert!(admitted.is_ok(), "unchanged producer remains available");
+            assert_eq!(provider.requests().len(), 1);
+
+            if repoint {
+                metadata.provider_base_url = Some("http://127.0.0.1:23456/v1".into());
+            } else {
+                descriptor.incarnation = 1;
+                *factory.snapshot.lock().expect("snapshot") = vec![descriptor.clone()];
+            }
+            // Mirror the real writer's account-before-inventory publish order.
+            for resumed in [false, true] {
+                let result = if resumed {
+                    factory
+                        .resolve_for_turn_with_web(&metadata, Default::default())
+                        .await
+                } else {
+                    factory.resolve_for_turn(&metadata).await
+                };
+                exercise_admitted_turn(&result).await;
+                let error = result.err().expect("retired eligibility refused");
+                assert_eq!(error.code, ErrorCode::ProviderError);
+                assert!(error.retryable);
+                assert!(error.message.contains("different account or endpoint"));
+                assert_eq!(
+                    provider.requests().len(),
+                    1,
+                    "no round using A's eligibility"
+                );
+            }
+            // A fresh listing for B (or the new route) restores availability.
+            if let Some(origin) = &metadata.provider_base_url {
+                profile.endpoint = Some(origin.clone());
+                descriptor.base_url = Some(origin.clone());
+                descriptor.incarnation = 1;
+                *factory.snapshot.lock().expect("snapshot") = vec![descriptor.clone()];
+            }
+            profile.catalog_scope.as_mut().expect("scope").key =
+                AccountsProviderFactory::descriptor_catalog_key(&profile, Some(&descriptor))
+                    .expect("replacement producer");
+            profile
+                .catalog_scope
+                .as_mut()
+                .expect("scope")
+                .account_incarnation = Some(descriptor.incarnation);
+            management.publish(3, vec![descriptor], vec![profile]);
+            let refreshed = factory.resolve_for_turn(&metadata).await;
+            exercise_admitted_turn(&refreshed).await;
+            assert!(
+                refreshed.is_ok(),
+                "the model remains explicit configuration"
+            );
+            assert_eq!(provider.requests().len(), 2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_model_checks_resolved_credential_before_adapter_construction() {
+    for kind in ["authoritative", "azure", "advisory"] {
+        let mut profile = summary(ModelInventoryWire::Fetched { fetched_at_ms: 1 });
+        profile.catalog = ProviderCatalogKindWire::Authenticated;
+        profile.models = vec!["Go".into()];
+        if kind != "authoritative" {
+            profile.catalog = ProviderCatalogKindWire::Custom;
+            profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+            profile.configured_models = profile.models.clone();
+        }
+        if kind == "azure" {
+            profile.endpoint = Some("https://synthetic.openai.azure.com".into());
+            profile.inventory = ModelInventoryWire::Configured;
+            profile.availability_reason = Some("synthetic listing HTTP 405".into());
+        }
+        profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+            key: "pending".into(),
+            account_alias: Some("upgrade-fixture".into()),
+            account_incarnation: Some(1),
+        });
+        let (factory, provider, alias) = factory(profile.clone());
+        let previous = factory.snapshot.lock().expect("snapshot")[0].clone();
+        let mut current = previous.clone();
+        current.incarnation = 1;
+        *factory.snapshot.lock().expect("snapshot") = vec![current.clone()];
+        profile.catalog_scope.as_mut().expect("scope").key =
+            AccountsProviderFactory::descriptor_catalog_key(&profile, Some(&current))
+                .expect("B's current producer");
+        let endpoint = profile.endpoint.clone();
+        factory
+            .management
+            .as_ref()
+            .expect("management")
+            .publish(2, vec![current], vec![profile]);
+        let metadata = old_metadata();
+        assert!(factory.admit_persisted_model(&metadata).is_ok());
+        let vault = MemoryVault::default();
+        vault
+            .put(&alias, b"synthetic-resolved-key")
+            .expect("test key");
+        // The credential was resolved before B's current catalog was published.
+        let result = factory.build_provider(
+            &previous,
+            vault.resolve(&alias).expect("test handle"),
+            &metadata,
+            &ProviderTuning::default(),
+        );
+        if let Ok(adapter) = &result {
+            exercise_provider_round(adapter, &metadata.model).await;
+        }
+        if kind == "advisory" {
+            assert!(
+                result.is_ok(),
+                "ordinary explicit custom passthrough is preserved"
+            );
+            assert_eq!(provider.requests().len(), 1);
+        } else {
+            let error = result.err().expect("cannot borrow B's eligibility for A");
+            assert_eq!(error.code, ErrorCode::ProviderError);
+            assert!(error.retryable);
+            assert!(provider.requests().is_empty());
+        }
+        let fresh = factory.resolve_for_turn(&metadata).await;
+        exercise_admitted_turn(&fresh).await;
+        assert!(fresh.is_ok(), "matching resolved credential remains usable");
+        assert_eq!(
+            provider.requests().len(),
+            if kind == "advisory" { 2 } else { 1 }
+        );
+        // Spelling the already-current effective origin explicitly does not
+        // create a different credential or invalidate its discovery result.
+        let mut same_route = metadata;
+        same_route.provider_base_url = endpoint;
+        let routed = factory.resolve_for_turn(&same_route).await;
+        exercise_admitted_turn(&routed).await;
+        assert!(routed.is_ok(), "same effective origin remains available");
+        assert_eq!(
+            provider.requests().len(),
+            if kind == "advisory" { 3 } else { 2 }
+        );
+    }
 }
 
 /// MUTATION: remove persisted-session admission. This release fixture must

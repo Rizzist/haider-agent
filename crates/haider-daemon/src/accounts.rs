@@ -10937,6 +10937,40 @@ impl AccountsProviderFactory {
         Ok(())
     }
 
+    fn inventory_requires_current_producer(profile: &ProviderSummaryWire) -> bool {
+        profile.catalog_scope.is_some()
+            && (profile
+                .endpoint
+                .as_deref()
+                .is_some_and(haider_provider::azure_openai_origin)
+                || (matches!(
+                    profile.catalog,
+                    haider_rpc::ProviderCatalogKindWire::Public
+                        | haider_rpc::ProviderCatalogKindWire::Authenticated
+                ) && profile.inventory_authority
+                    == haider_rpc::ModelInventoryAuthorityWire::Authoritative))
+    }
+
+    fn admit_inventory_producer(
+        profile: &ProviderSummaryWire,
+        current: Option<&str>,
+    ) -> Result<(), HaiderError> {
+        if Self::inventory_requires_current_producer(profile)
+            && profile
+                .catalog_scope
+                .as_ref()
+                .map(|scope| scope.key.as_str())
+                != current
+        {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "model inventory belongs to a different account or endpoint; refresh models before using this selection",
+                true,
+            ));
+        }
+        Ok(())
+    }
+
     /// Persistence is not catalog admission. This is shared by ordinary /
     /// recovered turns and attempt resolution, including retries that reuse
     /// an adapter. Only authoritative remote catalogs revoke a saved model;
@@ -10962,10 +10996,16 @@ impl AccountsProviderFactory {
             // Test/injected factories may have no management authority.
             None => Vec::new(),
         };
-        if metadata.model_catalog_key.is_some() {
-            let profile = summaries
-                .iter()
-                .find(|summary| summary.provider == metadata.provider);
+        let profile = summaries
+            .iter()
+            .find(|summary| summary.provider == metadata.provider);
+        // Even an explicitly configured model can borrow fetched eligibility:
+        // Azure requires a successful or unsupported listing, and authoritative
+        // inventories require membership. Account and inventory snapshots are
+        // published separately, so fence that eligibility against the actual
+        // credential and route before using either snapshot's result.
+        let borrows_inventory = profile.is_some_and(Self::inventory_requires_current_producer);
+        if metadata.model_catalog_key.is_some() || borrows_inventory {
             let descriptors = self.snapshot.lock().map_err(|_| {
                 HaiderError::new(
                     ErrorCode::ProviderError,
@@ -10987,7 +11027,10 @@ impl AccountsProviderFactory {
                 }
                 Self::descriptor_catalog_key(&routed, descriptor)
             });
-            Self::admit_catalog_key(metadata, current)?;
+            Self::admit_catalog_key(metadata, current.clone())?;
+            if let Some(profile) = profile {
+                Self::admit_inventory_producer(profile, current.as_deref())?;
+            }
         }
 
         if let Some(summary) = summaries.iter().find(|summary| {
@@ -11187,6 +11230,10 @@ impl AccountsProviderFactory {
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         self.admit_persisted_model(metadata)?;
         let mut profile = self.provider_profile(&descriptor.provider);
+        // A session route changes the effective origin, not the stored
+        // credential's producer coordinate. Keep that coordinate intact when
+        // projecting the route into the adapter descriptor below.
+        let catalog_descriptor = descriptor;
         let mut routed_descriptor;
         let descriptor = if let Some(base_url) = metadata.provider_base_url.as_ref() {
             routed_descriptor = descriptor.clone();
@@ -11198,16 +11245,18 @@ impl AccountsProviderFactory {
         } else {
             descriptor
         };
-        Self::admit_catalog_key(
-            metadata,
-            profile
-                .as_ref()
-                .and_then(|profile| Self::descriptor_catalog_key(profile, Some(descriptor))),
-        )?;
+        let current = profile
+            .as_ref()
+            .and_then(|profile| Self::descriptor_catalog_key(profile, Some(catalog_descriptor)));
+        Self::admit_catalog_key(metadata, current.clone())?;
+        if let Some(profile) = &profile {
+            Self::admit_inventory_producer(profile, current.as_deref())?;
+        }
         let catalog_is_current = profile.as_ref().is_none_or(|profile| {
-            profile.catalog_scope.as_ref().is_none_or(|scope| {
-                Self::descriptor_catalog_key(profile, Some(descriptor)).as_ref() == Some(&scope.key)
-            })
+            profile
+                .catalog_scope
+                .as_ref()
+                .is_none_or(|scope| current.as_ref() == Some(&scope.key))
         });
         if !catalog_is_current && let Some(profile) = profile.as_mut() {
             profile.model_details.retain(|row| {
