@@ -69,6 +69,7 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
             provider: "executing-provider".into(),
             model: "test-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -111,6 +112,7 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
             provider: "pending-provider".into(),
             model: "test-model".into(),
             expected_pair: None,
+            output_budget: None,
             event_id: EventId::new("selected"),
             device_id,
         })

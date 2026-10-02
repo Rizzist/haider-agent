@@ -1097,9 +1097,16 @@ pub(crate) fn catalog_issuer(provider: &str) -> Option<String> {
 }
 
 /// One availability authority shared by RPC and the later management view.
+#[cfg(test)]
+type TestOAuthRegistrations = Arc<Mutex<HashMap<String, Arc<OAuthProviderRegistration>>>>;
+
 #[derive(Clone)]
 pub struct OAuthProviderCatalog {
     registrations: Arc<HashMap<String, Arc<OAuthProviderRegistration>>>,
+    // Only unit fixtures may switch a registration while a flight is parked.
+    // Production and integration-test catalogs remain immutable.
+    #[cfg(test)]
+    test_registrations: Option<TestOAuthRegistrations>,
 }
 
 impl Default for OAuthProviderCatalog {
@@ -1185,6 +1192,8 @@ impl OAuthProviderCatalog {
             .collect::<HashMap<_, _>>();
         Self {
             registrations: Arc::new(registrations),
+            #[cfg(test)]
+            test_registrations: None,
         }
     }
 
@@ -1210,6 +1219,8 @@ impl OAuthProviderCatalog {
             }
         }
         Ok(Self {
+            #[cfg(test)]
+            test_registrations: Some(Arc::new(Mutex::new(by_provider.clone()))),
             registrations: Arc::new(by_provider),
         })
     }
@@ -1247,6 +1258,10 @@ impl OAuthProviderCatalog {
     }
 
     fn registration(&self, provider: &str) -> Option<Arc<OAuthProviderRegistration>> {
+        #[cfg(test)]
+        if let Some(registrations) = &self.test_registrations {
+            return registrations.lock().ok()?.get(provider).cloned();
+        }
         self.registrations.get(provider).cloned()
     }
 
@@ -3900,6 +3915,7 @@ async fn validate_kimi_oauth_bundle(bundle: &OAuthTokenBundleV1) -> Result<(), O
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     let mut stream = adapter
         .stream_turn(request)
@@ -5075,16 +5091,30 @@ pub(crate) async fn legacy_anthropic_profile_identity(
 ) -> Option<AccountIdentity> {
     let registration = OAuthProviderCatalog::default()
         .registration(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)?;
-    if registration.issuer != expected_issuer {
-        return None;
-    }
-    legacy_anthropic_profile_identity_with_registration(access_token, &registration).await
+    // Account-actor unit fixtures use live-shaped identities, but a removed
+    // issuer guard must still never give them a live profile transport.
+    #[cfg(test)]
+    let registration = {
+        let mut registration = (*registration).clone();
+        registration.identity_endpoint = Some(Url::parse("http://127.0.0.1:9/profile").ok()?);
+        registration
+    };
+    legacy_anthropic_profile_identity_with_registration(
+        access_token,
+        expected_issuer,
+        &registration,
+    )
+    .await
 }
 
 async fn legacy_anthropic_profile_identity_with_registration(
     access_token: &[u8],
+    expected_issuer: &str,
     registration: &OAuthProviderRegistration,
 ) -> Option<AccountIdentity> {
+    if registration.issuer != expected_issuer {
+        return None;
+    }
     let client = haider_platform::native_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
@@ -7529,4 +7559,7 @@ mod openai_tests;
 mod tests;
 
 #[cfg(test)]
-pub(crate) use tests::{live_issued_broker_for_sendpoint, non_live_issued_broker_for_sendpoint};
+pub(crate) use tests::{
+    isolated_oauth_catalog_for_test, live_issued_broker_for_sendpoint,
+    non_live_issued_broker_for_sendpoint,
+};

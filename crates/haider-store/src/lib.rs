@@ -19,6 +19,7 @@ mod cas;
 mod event_store;
 mod migrations;
 mod profile_lock;
+mod provider_model_cache_key;
 mod provider_view_store;
 mod usage_ledger;
 
@@ -68,6 +69,7 @@ pub use event_store::{
     graph_finalization_state_digest,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
+pub use provider_model_cache_key::ProviderModelCacheKey;
 pub use usage_ledger::{
     UsageLedgerCounters, UsageLedgerLane, UsageLedgerSlot, UsageLedgerWriter, UsageSlotAddress,
     read_usage_day, read_usage_range, reduce_journal_usage, slot_address,
@@ -136,6 +138,25 @@ pub(crate) fn store_error(
     retryable: bool,
 ) -> HaiderError {
     HaiderError::new(code, message, retryable)
+}
+
+/// `details.durable_run_state` value on the refusal the journal returns when
+/// a worker appends anything but `Cancelled` to a run that is durably
+/// `cancelling` (the user's cancellation won the race to the journal).
+pub const DURABLY_CANCELLING_DETAIL: &str = "cancelling";
+
+/// Whether `error` is the journal's "run is durably cancelling; only
+/// Cancelled may follow" refusal. A worker that receives it lost a race with
+/// a committed cancellation and must settle the turn as cancelled.
+#[must_use]
+pub fn is_durably_cancelling_refusal(error: &HaiderError) -> bool {
+    error.code == ErrorCode::RunNotActive
+        && error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("durable_run_state"))
+            .and_then(serde_json::Value::as_str)
+            == Some(DURABLY_CANCELLING_DETAIL)
 }
 
 /// Current wall-clock time as Unix milliseconds.

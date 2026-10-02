@@ -569,6 +569,7 @@ fn registered_workflow_is_pinnable_by_name() {
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -638,6 +639,7 @@ fn pinned_workflow_revision_survives_registry_edit_and_stale_fences_name_current
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -835,6 +837,9 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
          DROP TABLE workflow_graph_instances;
          ALTER TABLE profile_meta DROP COLUMN boot_publication_pending;
          ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
+         DROP TABLE provider_view_request_history;
+         DROP TABLE provider_view_history_blocks;
+         DROP TABLE provider_view_history_segments;
          DROP TABLE provider_view_gc;
          DROP TABLE provider_view_blocks;
          DROP TABLE provider_view_requests;
@@ -850,7 +855,7 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     drop(raw);
 
     let store = Store::open(root.path()).expect("migrate legacy database");
-    assert_eq!(store.schema_version().expect("schema version"), 31);
+    assert_eq!(store.schema_version().expect("schema version"), 33);
     let legacy = store
         .loom_workflow("legacy-retained")
         .expect("read migrated current")
@@ -870,6 +875,7 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,

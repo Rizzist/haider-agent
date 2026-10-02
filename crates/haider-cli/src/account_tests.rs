@@ -421,6 +421,35 @@ async fn account_use_cache_warning_names_the_exact_confirmation_command() {
             .to_string()
             .contains("run `haider account use work --confirm`")
     );
+    let hint = error.to_string();
+    let instruction = hint
+        .split('`')
+        .find(|part| part.starts_with("haider account "))
+        .expect("printed command");
+    let words = instruction
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let command = parse_account_command(&words[2..]).expect("literal selection hint");
+    let client = FakeAccountClient::new([
+        list_response("work", Some(3)),
+        ResponseBody::AccountSetActive {
+            descriptor: descriptor("work"),
+            prior_alias: None,
+            revision: 4,
+        },
+    ]);
+    assert!(matches!(execute(&client, command).await, Ok(code) if code == ExitCode::SUCCESS));
+    assert!(matches!(
+        client.requests().as_slice(),
+        [
+            RequestBody::AccountList { .. },
+            RequestBody::AccountSetActive {
+                confirm_new_epoch: true,
+                ..
+            }
+        ]
+    ));
 }
 
 #[tokio::test]
@@ -579,4 +608,140 @@ async fn confirmed_remove_refuses_to_mutate_without_a_snapshot_revision() {
         client.requests().as_slice(),
         [RequestBody::AccountList { provider: None }]
     ));
+}
+
+/// Execute the entire advertised command literally through the CLI parser and
+/// request dispatcher. Unsupported rows must never advertise a confirmation.
+#[tokio::test]
+async fn every_printed_account_suggestion_runs_as_written() {
+    let supported = codex_candidate();
+    let instruction = import_confirmation_instruction(&supported).expect("supported instruction");
+    let words = instruction
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(&words[..2], &["haider", "account"]);
+    let command = parse_account_command(&words[2..]).expect("literal suggestion parses");
+    let client = FakeAccountClient::new([
+        ResponseBody::AccountDeviceCandidates {
+            discovery_disabled: false,
+            candidates: vec![supported],
+            adoption_available: Vec::new(),
+        },
+        ResponseBody::AccountImportDevice {
+            descriptor: descriptor("imported"),
+            revision: 2,
+        },
+    ]);
+    assert!(matches!(execute(&client, command).await, Ok(code) if code == ExitCode::SUCCESS));
+    assert!(matches!(
+        client.requests().as_slice(),
+        [
+            RequestBody::AccountDeviceCandidates,
+            RequestBody::AccountImportDevice { .. }
+        ]
+    ));
+
+    for source in ["codex", "claude-code"] {
+        let mut unsupported = codex_candidate();
+        unsupported.source = source.into();
+        unsupported.import_supported = false;
+        unsupported.unsupported_reason = Some("synthetic unsupported source".into());
+        assert_eq!(import_confirmation_instruction(&unsupported), None);
+        let client = FakeAccountClient::new([ResponseBody::AccountDeviceCandidates {
+            discovery_disabled: false,
+            candidates: vec![unsupported],
+            adoption_available: Vec::new(),
+        }]);
+        assert!(
+            matches!(execute(&client, AccountCommand::Import { source: source.into(), confirm: false }).await,
+            Ok(code) if code == ExitCode::from(EX_USAGE))
+        );
+        assert!(matches!(
+            client.requests().as_slice(),
+            [RequestBody::AccountDeviceCandidates]
+        ));
+    }
+    for old_id in ["account=a;organization=o", "anthropic:0123456789abcdef"] {
+        let document = AccountsDocument {
+            schema: ACCOUNTS_SCHEMA,
+            accounts: vec![
+                claude_view("old-dead", old_id, false, false),
+                claude_view("fresh", "account=a;organization=o", true, true),
+            ],
+        };
+        let printed = render_human(&document);
+        let suggestions = printed
+            .split('`')
+            .filter(|part| part.starts_with("haider account "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            suggestions.len(),
+            1,
+            "each duplicate variant advertises one executable command"
+        );
+        for suggestion in suggestions {
+            let words = suggestion
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let command = parse_account_command(&words[2..]).expect("literal removal hint");
+            let client = FakeAccountClient::new([
+                list_response("old-dead", Some(1)),
+                ResponseBody::AccountRemove {
+                    removed_alias: CredentialAlias::new("old-dead"),
+                    replacement_active_alias: None,
+                    revision: 2,
+                },
+            ]);
+            assert!(
+                matches!(execute(&client, command).await, Ok(code) if code == ExitCode::SUCCESS)
+            );
+            assert!(
+                matches!(client.requests().as_slice(), [RequestBody::AccountList { .. }, RequestBody::AccountRemove { alias, expected_revision: Some(1), .. }] if alias == "old-dead")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_unsupported_claude_import_reaches_live_and_fake_daemon_policy() {
+    for reason in [
+        "owned by the official client",
+        "fake OAuth mode refuses Claude Code import",
+    ] {
+        let mut candidate = codex_candidate();
+        candidate.source = "claude-code".into();
+        candidate.import_supported = false;
+        candidate.unsupported_reason = Some("owned by the official client".into());
+        let client = FakeAccountClient::new([
+            ResponseBody::AccountDeviceCandidates {
+                discovery_disabled: false,
+                candidates: vec![candidate],
+                adoption_available: Vec::new(),
+            },
+            ResponseBody::Error {
+                code: "invalid_argument".into(),
+                message: reason.into(),
+                retryable: false,
+                data: None,
+            },
+        ]);
+        let result = execute(
+            &client,
+            AccountCommand::Import {
+                source: "claude-code".into(),
+                confirm: true,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(AccountError::Rpc { message, .. }) if message == reason));
+        assert!(matches!(
+            client.requests().as_slice(),
+            [
+                RequestBody::AccountDeviceCandidates,
+                RequestBody::AccountImportDevice { .. }
+            ]
+        ));
+    }
 }

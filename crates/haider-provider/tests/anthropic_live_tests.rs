@@ -190,6 +190,7 @@ fn cache_assertion_request(
             expected_later_reads: 2,
             reuse_gap_ms: Some(1_000),
         }),
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -742,6 +743,7 @@ fn text_request(model: &str, prompt: &str) -> TurnRequest {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -764,6 +766,7 @@ fn tool_request(model: &str) -> TurnRequest {
         }],
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -795,6 +798,7 @@ fn image_request(model: &str, artifact: ArtifactRef) -> TurnRequest {
                     .into(),
         }],
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -809,6 +813,7 @@ fn usage_request(model: &str) -> TurnRequest {
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     }
 }
 
@@ -943,6 +948,7 @@ fn text_capture_for_gate_tests() -> (TurnRequest, Vec<u8>, Vec<ProviderStreamIte
         tools: Vec::new(),
         attachments: Vec::new(),
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
     (request, body, items)
 }

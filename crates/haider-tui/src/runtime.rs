@@ -3673,6 +3673,7 @@ pub fn live_pass(
     commands.extend(driver.busy_retries_due());
     // The OAuth poll sweep (W5e-1): same clock as the login deadline.
     commands.extend(driver.oauth_poll());
+    let reply_arrived = reply.is_some();
     if let Some(reply) = reply {
         commands.extend(driver.apply(model, reply));
     }
@@ -3699,6 +3700,7 @@ pub fn live_pass(
     model.demo_requests.clear();
     commands.extend(driver.sync_selection(model));
     commands.extend(driver.drain_answers(model));
+    driver.sync_workspace_presence(model, reply_arrived);
     LivePass { commands, shell }
 }
 

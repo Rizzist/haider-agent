@@ -463,6 +463,9 @@ pub const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
 /// Daemon resolves provider/default-model and validates initial effort/speed
 /// inside the durable `session.create` admission request.
 pub const FEATURE_SESSION_CREATE_ADMISSION_V1: &str = "session_create_admission_v1";
+/// `session.create.max_tokens == 0` asks the daemon to derive the effective
+/// per-response budget from its resolved provider/model row.
+pub const FEATURE_MODEL_OUTPUT_LIMITS_V1: &str = "model_output_limits_v1";
 /// `session.create` accepts an exact account alias and durably pins provider
 /// resolution for the session to that credential.
 pub const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
@@ -1288,6 +1291,14 @@ pub struct ModelDetailWire {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Origin of this row; older peers omit it and therefore leave it unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ModelDetailSourceWire>,
+    /// Maximum response size for this provider/model row. The provider's
+    /// catalog declaration wins; the daemon supplies a pinned fallback when
+    /// the remote catalog omits the field or cannot be reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     /// The pair's effort ladder, in the provider's own vocabulary and order.
     /// EMPTY (absent on the wire) means "no declared ladder".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1314,6 +1325,34 @@ pub struct ModelDetailWire {
     /// nothing, and a client must then attach and let the daemon answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+}
+
+/// Where the daemon got one [`ModelDetailWire`] row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDetailSourceWire {
+    /// The release's maintained subscription catalog.
+    Static,
+    /// The provider's own model list.
+    Remote,
+    /// An offline catalog or the user's configured deployment list.
+    Configured,
+    /// A source this peer does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ModelDetailSourceWire {
+    /// The wire spelling, for display.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Remote => "remote",
+            Self::Configured => "configured",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// One provider's read-only management projection.
@@ -1431,6 +1470,13 @@ impl ModelInventoryWire {
         }
     }
 
+    /// Whether this state stands behind the summary's rows. `NeverFetched`
+    /// and `Unavailable` carry no list.
+    #[must_use]
+    pub fn lists_models(&self) -> bool {
+        !matches!(self, Self::NeverFetched | Self::Unavailable { .. })
+    }
+
     #[must_use]
     pub fn fetched_at_ms(&self) -> Option<u64> {
         match self {
@@ -1511,20 +1557,45 @@ pub struct ProviderSummaryWire {
 }
 
 impl ProviderSummaryWire {
+    /// Whether a pickable row comes from the maintained static catalog.
+    #[must_use]
+    pub fn has_static_models(&self) -> bool {
+        self.models.iter().any(|model| self.is_static_model(model))
+    }
+
+    /// Whether the pickable rows are known: an inventory list stands behind
+    /// them, or the maintained static catalog supplies them.
+    #[must_use]
+    pub fn has_known_models(&self) -> bool {
+        self.inventory.lists_models() || self.has_static_models()
+    }
+
+    fn is_static_model(&self, model: &str) -> bool {
+        self.model_details.iter().any(|detail| {
+            detail.name == model && detail.source == Some(ModelDetailSourceWire::Static)
+        })
+    }
+
     /// Classifies `model` without changing the advertised/pickable inventory.
     /// In particular, an unlisted custom passthrough id is never appended to
     /// `models` or fabricated as an available [`ModelDetailWire`] row.
     #[must_use]
     pub fn model_inventory_status(&self, model: &str) -> ModelInventoryStatusWire {
-        if matches!(
-            self.inventory,
-            ModelInventoryWire::NeverFetched | ModelInventoryWire::Unavailable { .. }
-        ) {
-            ModelInventoryStatusWire::Unknown
-        } else if self.models.iter().any(|known| known == model) {
+        let listed = self.models.iter().any(|known| known == model);
+        if self.inventory.lists_models() {
+            return if listed {
+                ModelInventoryStatusWire::Listed
+            } else {
+                ModelInventoryStatusWire::Unlisted
+            };
+        }
+        // Without a list, only maintained static rows are known.
+        if listed && self.is_static_model(model) {
             ModelInventoryStatusWire::Listed
-        } else {
+        } else if self.has_static_models() {
             ModelInventoryStatusWire::Unlisted
+        } else {
+            ModelInventoryStatusWire::Unknown
         }
     }
 }
@@ -2410,6 +2481,10 @@ pub struct SessionObserveDigest {
     /// Latest orchestration terminal from this selected run only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<haider_protocol::orchestration::OrchestrationRunDigestV1>,
+    /// Request-count policy of the selected run, when it explicitly opted in.
+    /// Older daemons and unbounded runs omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
     /// `None` names the implicit main branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_branch_id: Option<BranchId>,
@@ -4035,6 +4110,15 @@ pub enum RequestBody {
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         confirm_new_epoch: bool,
+        /// `model_output_limits_v1`: explicit per-response output budget.
+        /// Absent keeps the session's budget policy (a derived budget
+        /// re-derives for the new model; a user-set one is clamped with a
+        /// notice). `0` returns the session to the derived budget; a positive
+        /// value becomes the user-set budget and is refused when it exceeds
+        /// the selected model's maximum. Select the current model to change
+        /// only the budget.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u64>,
     },
     /// Receipted live-session rename (G2). `title` is normalized by the
     /// daemon (trimmed, control characters stripped, ≤ 80 chars; empty
@@ -5236,6 +5320,11 @@ pub enum ResponseBody {
         model: String,
         selected_seq: u64,
         worker_generation: u64,
+        /// `model_output_limits_v1`: the per-response budget this selection
+        /// committed, its source, and a typed clamp notice when a user-set
+        /// budget exceeded the new model's maximum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     },
     /// Durable coordinates of a committed rename (G2): the NORMALIZED title
     /// — never an echo of the request — plus the committed journal sequence
@@ -5786,6 +5875,16 @@ pub enum CancelStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ErrorData {
+    /// A session requested more response tokens than its resolved model row
+    /// permits.
+    ModelOutputLimit {
+        provider: String,
+        model: String,
+        requested: u64,
+        max_output_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
+    },
     /// Decoded `artifact.put` bytes exceeded the hard request cap.
     ArtifactTooLarge { actual_bytes: u64, max_bytes: u64 },
     /// One attachment reference was absent from the verified CAS.

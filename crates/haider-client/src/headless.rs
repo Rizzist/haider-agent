@@ -412,6 +412,8 @@ pub struct HeadlessRunRequest {
     pub provider: Option<String>,
     /// Explicit model override. `None` follows the selected provider summary.
     pub model: Option<String>,
+    /// Per-response output budget. Zero asks a supporting daemon to derive
+    /// the effective value from the resolved provider/model row.
     pub max_tokens: u64,
     pub budget: RunBudgetV1,
     pub seed: Option<u64>,
@@ -512,8 +514,8 @@ pub enum HeadlessEventMode {
     /// Stream every envelope (for JSONL and general API consumers).
     Stream,
     /// Stream every envelope without cloning it into the returned result.
-    /// Intended for adapters, such as CLI JSONL, whose output is itself the
-    /// lossless record and which never consume `HeadlessRunResult::events`.
+    /// Intended for adapters, such as CLI JSONL, whose projected output is
+    /// streamed directly and never copied into `HeadlessRunResult::events`.
     StreamWithoutResultLedger,
     /// Stream announcements/denials only; retain the ledger for the result.
     Summary,
@@ -660,6 +662,13 @@ pub struct HeadlessRunResult {
     /// Background tasks with a durable started fact and no completed fact
     /// when the run's terminal was observed (W-A decision 8).
     pub background_tasks_running: Vec<HeadlessBackgroundTask>,
+    /// OWNER-LOCAL ONLY: the terminal `RunFailed`'s raw provider text (see
+    /// `haider_protocol::error::ErrorPresentation::provider_raw_detail`).
+    /// Every other part of this result is shareable: `events` and
+    /// `failure.presentation` have the field stripped. Only owner-local
+    /// renderers (the CLI's print output) may display this value; Haider's
+    /// JSON/JSONL adapters never serialize it.
+    pub provider_raw_detail_local: Option<String>,
 }
 
 /// Lossless correlated journal stream for a headless run.
@@ -1405,41 +1414,18 @@ impl HeadlessEventLedgerWriter {
         if self.error.is_some() {
             return;
         }
-        let estimate = envelope_weight_bytes(envelope);
-        let should_spill = match &self.state {
-            HeadlessEventLedgerState::Memory {
-                estimated_bytes, ..
-            } => {
-                self.spool_immediately
-                    || estimated_bytes.saturating_add(estimate)
-                        > HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES
-            }
-            HeadlessEventLedgerState::Spool(_) => false,
-        };
-        if should_spill {
-            self.spill_and_record(envelope, estimate);
-            return;
-        }
-        match &mut self.state {
-            HeadlessEventLedgerState::Memory {
-                events,
-                estimated_bytes,
-            } => {
-                events.push(envelope.clone());
-                *estimated_bytes = estimated_bytes.saturating_add(estimate);
-            }
-            HeadlessEventLedgerState::Spool(spool) => {
-                if let Err(error) = write_event_spool_record(spool, envelope, estimate) {
-                    self.error = Some(error.to_string());
-                }
-            }
-        }
+        self.record_owned(envelope.clone());
     }
 
-    fn record_owned(&mut self, envelope: RawEnvelope) {
+    /// Every retained or spooled headless ledger (run results, `--output
+    /// json` events, `haider run --replay`, SDK `headless_run_events`) is a
+    /// shareable surface: owner-local provider text is removed here, the one
+    /// path every ledger record takes.
+    fn record_owned(&mut self, mut envelope: RawEnvelope) {
         if self.error.is_some() {
             return;
         }
+        envelope.payload.strip_local_only_fields();
         let estimate = envelope_weight_bytes(&envelope);
         let should_spill = match &self.state {
             HeadlessEventLedgerState::Memory {
@@ -1584,6 +1570,152 @@ struct HeadlessEventOutput {
     ledger: Option<HeadlessEventLedgerWriter>,
 }
 
+/// Run output can be consumed by agents and shared. Exact integrity facts
+/// about redacted content (digests, byte counts, keyed freshness) remain only
+/// in the owner's durable journal (`haider events`). Unredacted content keeps
+/// its provenance unchanged. The reducer applies the original envelope first.
+fn public_headless_envelope(envelope: RawEnvelope) -> RawEnvelope {
+    public_headless_projection(&envelope).unwrap_or(envelope)
+}
+
+/// Placeholder for a required digest field whose exact value is owner-local.
+const WITHHELD_DIGEST: &str = "withheld:redacted_content";
+
+/// `Some` only when the public projection differs from the journal envelope.
+fn public_headless_projection(envelope: &RawEnvelope) -> Option<RawEnvelope> {
+    let payload: &serde_json::Value = &envelope.payload;
+    let kind = payload.get("type").and_then(serde_json::Value::as_str)?;
+    let redacted_flag = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(|value| value.get("redacted_content"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let needs = match kind {
+        "effect" => {
+            redacted_flag(payload.get("workspace_mutation"))
+                || payload
+                    .get("freshness")
+                    .and_then(|freshness| freshness.get("digest"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|digest| digest.starts_with("blake3k:"))
+        }
+        "checkpoint_recorded" => redacted_flag(Some(payload)),
+        "tool_result" => payload
+            .get("result")
+            .and_then(|result| result.get("preview"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|preview| {
+                redacted_mutation_preview(preview)
+                    || haider_rpc::haider_protocol::pipe::stale_read_preview_without_digests(
+                        preview,
+                    )
+                    .is_some()
+            }),
+        "menu_opened" => payload
+            .get("kind")
+            .and_then(|kind| kind.get("file_review"))
+            .is_some_and(|review| !review.is_null()),
+        _ => false,
+    };
+    if !needs {
+        return None;
+    }
+    let mut envelope = envelope.clone();
+    let Some(fields) = envelope.payload.as_object_mut() else {
+        return Some(envelope);
+    };
+    match kind {
+        "effect" => {
+            // Keyed or not, a redacted freshness claim stays internal.
+            fields.remove("freshness");
+            if let Some(mutation) = fields
+                .get_mut("workspace_mutation")
+                .and_then(serde_json::Value::as_object_mut)
+                && mutation
+                    .get("redacted_content")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            {
+                mutation.insert("mutation_digest".into(), WITHHELD_DIGEST.into());
+                mutation.remove("subject_digest");
+            }
+        }
+        "checkpoint_recorded" => {
+            // The checkpoint id is derived from the aggregate digest.
+            fields.insert("checkpoint_id".into(), "checkpoint:withheld".into());
+            fields.insert("post_digest".into(), WITHHELD_DIGEST.into());
+            if let Some(paths) = fields
+                .get_mut("paths")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for path in paths
+                    .iter_mut()
+                    .filter_map(serde_json::Value::as_object_mut)
+                {
+                    for key in [
+                        "pre_artifact",
+                        "pre_digest",
+                        "post_digest",
+                        "truncated_reason",
+                    ] {
+                        path.remove(key);
+                    }
+                }
+            }
+        }
+        "tool_result" => {
+            let stale = fields
+                .get("result")
+                .and_then(|result| result.get("preview"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(haider_rpc::haider_protocol::pipe::stale_read_preview_without_digests);
+            if let Some(preview) = stale {
+                // Stale-read digests (keyed for redacted files) stay in the
+                // owner's journal, exactly as the provider projection drops
+                // them; the refusal kind and remedy remain.
+                if let Some(result) = fields
+                    .get_mut("result")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    result.insert("preview".into(), preview.into());
+                }
+                return Some(envelope);
+            }
+            // File effects carry exact byte counts of the redacted content.
+            fields.remove("effects");
+            if let Some(result) = fields
+                .get_mut("result")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                result.remove("effects");
+            }
+        }
+        "menu_opened" => {
+            // Raw old/new digests belong to the interactive human Ask
+            // surface only; headless runs never present a review.
+            if let Some(kind) = fields
+                .get_mut("kind")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                kind.remove("file_review");
+            }
+        }
+        _ => {}
+    }
+    Some(envelope)
+}
+
+fn redacted_mutation_preview(preview: &str) -> bool {
+    preview.contains("\"redacted_content\":true")
+        && serde_json::from_str::<serde_json::Value>(preview).is_ok_and(|value| {
+            value
+                .get("redacted_content")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+}
+
 impl HeadlessEventOutput {
     fn new(sender: mpsc::UnboundedSender<HeadlessEvent>, mode: HeadlessEventMode) -> Self {
         Self {
@@ -1606,6 +1738,7 @@ impl HeadlessEventOutput {
     }
 
     fn emit_envelope(&mut self, envelope: RawEnvelope, correlated: bool) {
+        let envelope = public_headless_envelope(envelope);
         if correlated && !self.stream_envelopes {
             if let Some(ledger) = self.ledger.as_mut() {
                 ledger.record_owned(envelope);
@@ -1625,7 +1758,10 @@ impl HeadlessEventOutput {
         // (`retains_result_ledger`). Without one, `finish` returns an empty
         // run, so recording is correctly a no-op rather than an error.
         if let Some(ledger) = self.ledger.as_mut() {
-            ledger.record(envelope);
+            match public_headless_projection(envelope) {
+                Some(projected) => ledger.record(&projected),
+                None => ledger.record(envelope),
+            }
         }
     }
 
@@ -1663,6 +1799,9 @@ struct HeadlessReducer {
     event_count: usize,
     budget_exhausted: Option<RunBudgetExhaustedV1>,
     deadline_exceeded: bool,
+    /// Owner-local raw provider text removed from the last correlated
+    /// `RunFailed` before it entered any shareable projection.
+    run_failed_raw_detail: Option<(u64, String)>,
 }
 
 impl HeadlessReducer {
@@ -1686,6 +1825,7 @@ impl HeadlessReducer {
             event_count: 0,
             budget_exhausted: None,
             deadline_exceeded: false,
+            run_failed_raw_detail: None,
             output,
         }
     }
@@ -1700,7 +1840,7 @@ impl HeadlessReducer {
         self.output.emit(event);
     }
 
-    async fn apply(&mut self, envelope: RawEnvelope) -> ApplyStatus {
+    async fn apply(&mut self, mut envelope: RawEnvelope) -> ApplyStatus {
         if envelope.session_id != self.session_id || envelope.seq <= self.last_applied {
             return ApplyStatus::Duplicate;
         }
@@ -1712,7 +1852,20 @@ impl HeadlessReducer {
         }
 
         self.last_applied = envelope.seq;
+        // Headless results, JSON/JSONL output and SDK consumers are shareable
+        // surfaces: owner-local provider text leaves every envelope here,
+        // before it is retained, streamed or decoded.
+        let stripped_raw_detail = envelope.payload.strip_local_only_fields();
         let correlated = self.is_correlated(&envelope);
+        if correlated
+            && envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("run_failed")
+        {
+            self.run_failed_raw_detail = stripped_raw_detail.map(|raw| (envelope.seq, raw));
+        }
         if correlated {
             self.event_count = self.event_count.saturating_add(1);
         }
@@ -1760,7 +1913,7 @@ impl HeadlessReducer {
         }
         // Only payload families that change the headless projection need a
         // typed decode. Decode from the already-parsed JSON value by reference:
-        // streamed/retained envelopes keep their original lossless payload,
+        // reduction reads the original durable payload before public projection,
         // while unrelated large tool/history payloads avoid a second walk.
         let reduce_core_payload = match payload_type {
             Some("item") => {
@@ -2121,7 +2274,7 @@ pub async fn run_headless_with_session_config_event_mode_and_interrupts(
 }
 
 /// Submits a new ordinary turn in an existing native session. The session's
-/// workspace, model, permissions and request ceiling remain authoritative.
+/// workspace, model, permissions and any request policy remain authoritative.
 /// Run pins/budget continuation use their separate lifecycle entry points.
 /// Streaming modes emit only the new run's correlated envelopes; prior session
 /// history is replayed internally without re-emitting old terminal records.
@@ -2931,6 +3084,11 @@ async fn run_headless_inner(
         !request.attachments.is_empty(),
         request.trust_hooks,
     );
+    if request.max_tokens == 0 && resume_run_id.is_none() && existing_session_id.is_none() {
+        ensure
+            .required_features
+            .insert(haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1.to_owned());
+    }
     let pinned_headless = resume_run_id.is_some()
         || request.journal_pin
         || request.detached
@@ -3214,7 +3372,7 @@ async fn run_headless_inner(
             cwd: created_metadata.cwd.clone(),
             provider: provider.clone(),
             model: model.clone(),
-            max_output_tokens: request.max_tokens,
+            max_output_tokens: created_metadata.max_tokens,
             effort: session_config.effort.clone(),
             fast: session_config.fast.unwrap_or(false),
             seed: request.seed,
@@ -3405,6 +3563,7 @@ async fn run_headless_inner(
             failure: None,
             terminal_seq: None,
             background_tasks_running: Vec::new(),
+            provider_raw_detail_local: None,
         };
         if ensure.daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
             teardown_owned_daemon_on_connection(profile, &mut connection, &daemon_ownership)
@@ -5088,6 +5247,7 @@ fn finalize(
         background_tasks,
         event_count,
         budget_exhausted,
+        run_failed_raw_detail,
         mut output,
         ..
     } = reducer;
@@ -5174,6 +5334,15 @@ fn finalize(
             error_code,
         }));
     }
+    // Only the RunFailed adjacent to the reported terminal owns raw text.
+    let provider_raw_detail_local = run_failed_raw_detail
+        .filter(|(failed_seq, _)| {
+            matches!(
+                failure.as_ref().map(|failure| &failure.code),
+                Some(HeadlessFailureCode::Run(_))
+            ) && terminal_seq.is_some_and(|seq| failed_seq.saturating_add(1) == seq)
+        })
+        .map(|(_, raw)| raw);
     let events = output.finish(run_id.clone(), event_count)?;
     let background_tasks_running = background_tasks
         .iter()
@@ -5200,6 +5369,7 @@ fn finalize(
         failure,
         terminal_seq,
         background_tasks_running,
+        provider_raw_detail_local,
     })
 }
 

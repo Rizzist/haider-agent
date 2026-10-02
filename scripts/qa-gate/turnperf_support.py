@@ -1044,7 +1044,8 @@ def runtime_socket_paths(runtime: Path) -> list[Path]:
 
 
 def validate_jsonl(
-    stdout: str, shape: str, *, continuation: bool = False
+    stdout: str, shape: str, *, continuation: bool = False,
+    allow_intervening: bool = False,
 ) -> dict[str, Any]:
     documents = parse_json_lines(stdout, f"{shape} JSONL")
     if not documents or documents[0].get("event") != "accepted":
@@ -1058,7 +1059,13 @@ def validate_jsonl(
     expected_first = accepted.get("head_seq")
     if continuation and isinstance(expected_first, int):
         expected_first += 1
-    if sequences[0] != expected_first:
+    if sequences[0] != expected_first and not (
+        allow_intervening
+        and continuation
+        and isinstance(sequences[0], int)
+        and isinstance(expected_first, int)
+        and sequences[0] > expected_first
+    ):
         relationship = "pre-submit head_seq + 1" if continuation else "head_seq"
         raise ProofError(
             f"{shape} JSONL {relationship} does not match first envelope"

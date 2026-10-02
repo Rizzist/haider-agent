@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The probe ladder — 14 DEMO runs plus the 2 LIVE runs that gate the swap.
+# The probe ladder — 14 DEMO runs plus the 3 LIVE runs that gate the swap.
 #
 # Usage: scripts/tui-probes/ladder.sh [path-to-haider-binary] [path-to-haiderd]
 # Defaults: target/release/{haider,haiderd}, with haider-tui beside haider
@@ -63,6 +63,7 @@ runs=(
 live_runs=(
   "pty-probe-live.py 118 36"
   "pty-probe-live.py 90 10"
+  "pty-probe-workspace-preview.py 120 30"
 )
 
 fails=0

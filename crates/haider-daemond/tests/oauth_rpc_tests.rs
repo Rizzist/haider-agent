@@ -240,6 +240,39 @@ struct OAuthTurnBuilder {
     builds: AtomicU64,
 }
 
+/// Catalog admission is independent of the injected inference adapter. Keep
+/// every OAuth RPC fixture's model discovery in memory, including when an
+/// issuer refusal is removed or an account-scoped cache has no entry yet.
+struct SyntheticOAuthCatalog;
+
+#[async_trait::async_trait]
+impl haider_daemon::ProviderModelDiscoverer for SyntheticOAuthCatalog {
+    async fn discover(
+        &self,
+        _source: haider_provider::CatalogSource,
+        _destination: haider_daemon::CatalogDestination,
+        _access_token: Option<&str>,
+        _etag: Option<&str>,
+    ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
+        Ok(haider_provider::DiscoveredCatalog {
+            models: vec![haider_provider::DiscoveredModel {
+                slug: "fake-model".into(),
+                display_name: "Fake barrier model".into(),
+                context_window: Some(4096),
+                max_output_tokens: None,
+                description: None,
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: None,
+                use_responses_lite: None,
+                extensions: None,
+            }],
+            etag: None,
+        })
+    }
+}
+
 impl AccountProviderBuilder for OAuthTurnBuilder {
     fn providers(&self) -> std::collections::BTreeSet<String> {
         std::collections::BTreeSet::from([self.provider.to_owned()])
@@ -641,6 +674,7 @@ fn dependencies(server: &FakeServer, vault: Arc<MemoryVault>) -> DaemonDependenc
         accounts: AccountsDependencies {
             vault: VaultProvision::Available(vault as Arc<dyn Vault>),
             oauth_catalog: server.catalog(),
+            model_discoverer: Some(Arc::new(SyntheticOAuthCatalog)),
             oauth_coordinator: OAuthCoordinatorConfig {
                 max_flows: 8,
                 max_invalid_callbacks: 4,
@@ -1121,38 +1155,6 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         Some("https://auth.kimi.com"),
     )
     .await;
-    // Remote providers require a fetched catalog for turn admission. Seed a
-    // synthetic model rather than fetching the live provider catalog.
-    {
-        let store = haider_store::Store::open(&config.store_dir).expect("seed barrier catalog");
-        // A stale catalog triggers an explicit refresh during session.create,
-        // even with automatic discovery disabled. Keep this fixture fresh.
-        let fetched_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("catalog clock")
-            .as_millis()
-            .try_into()
-            .expect("catalog millisecond clock");
-        let models = vec![haider_provider::DiscoveredModel {
-            slug: "fake-model".into(),
-            display_name: "Fake barrier model".into(),
-            context_window: Some(4096),
-            description: None,
-            default_effort: None,
-            supported_efforts: Vec::new(),
-            visible: true,
-            priority: None,
-            extensions: None,
-        }];
-        store
-            .put_provider_models(
-                server.provider,
-                &serde_json::to_string(&models).expect("serialize barrier catalog"),
-                None,
-                fetched_at,
-            )
-            .expect("write barrier catalog");
-    }
     let vault = Arc::new(BlockingRotationVault::new());
     let builder = Arc::new(OAuthTurnBuilder {
         provider: server.provider,
@@ -1166,6 +1168,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         accounts: AccountsDependencies {
             vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
             oauth_catalog: server.catalog(),
+            model_discoverer: Some(Arc::new(SyntheticOAuthCatalog)),
             oauth_coordinator: OAuthCoordinatorConfig {
                 max_flows: 8,
                 max_invalid_callbacks: 4,
@@ -1221,6 +1224,21 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         descriptor.account_identity.is_none(),
         "the shutdown fixture retains the legacy identity-free row shape"
     );
+    // Publish under the actor's active account key while the token is fresh.
+    // A bare provider cache no longer supplies this OAuth account's inventory.
+    let refreshed = request(
+        &mut client,
+        "barrier-models-refresh",
+        RequestBody::ProviderModelsRefresh {
+            provider: server.provider.into(),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed else {
+        panic!("synthetic catalog refresh failed: {refreshed:?}");
+    };
+    assert!(provider.models.contains(&"fake-model".into()));
+
     let stored = vault
         .resolve(&haider_daemon::scoped_vault_alias(
             profile_id,

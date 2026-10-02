@@ -134,6 +134,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,

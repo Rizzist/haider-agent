@@ -47,7 +47,12 @@ fn fake_script() -> String {
 }
 
 fn haider_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_haider"))
+    // Shared-target lanes can replace the top-level binary between the cargo
+    // build and this test. A pinned sibling pair keeps the subprocess golden
+    // tied to the candidate that the test binary was compiled against.
+    std::env::var_os("HAIDER_TEST_BINARY_OVERRIDE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_haider")))
 }
 
 fn ensure_haiderd_present() {
@@ -911,11 +916,11 @@ fn fresh_daemon_reconciles_seeded_lockdown_quota_before_its_first_command() {
 
 /// The built-in provider catalog a fresh profile exposes through `models
 /// --json` is a golden (ids, families, endpoints, auth methods, inventory
-/// provenance, offline rows and defaults). `provider list --json` names the
-/// same ids. Remote catalogs start never-fetched with no invented default.
+/// provenance, maintained static subscription rows and defaults). `provider
+/// list --json` names the same ids. Discovery remains enabled after login.
 ///
 /// MUTATION CHECK: dropping a built-in, changing its family/endpoint, or
-/// inventing a remote model row changes the golden.
+/// dropping a maintained fallback row changes the golden.
 #[test]
 fn fresh_profile_models_catalog_matches_the_golden() {
     let profile = Profile::new();
@@ -924,6 +929,20 @@ fn fresh_profile_models_catalog_matches_the_golden() {
         "models",
     );
     assert_eq!(models["schema"], "haider.models.v1");
+    let anthropic = models["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["provider"] == "anthropic-oauth")
+        .expect("Anthropic OAuth provider");
+    let static_row = anthropic["models"]
+        .as_array()
+        .expect("Anthropic OAuth models")
+        .iter()
+        .find(|model| model["model"] == "claude-fable-5-1")
+        .expect("fresh static subscription row");
+    assert_eq!(static_row["source"], "static");
+    assert_eq!(static_row["context_window"], 1_000_000_u64);
     let ids = models["providers"]
         .as_array()
         .expect("providers")

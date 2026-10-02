@@ -427,9 +427,11 @@ fn transcript_typography_matches_the_sim() {
     // `fs_read(crates/…)`, the reference TUI's own form — so a collapsed row
     // reads as one call with its arguments rather than two space-separated
     // fields. The sim's INK law is what this pin protects and it is
-    // unchanged: the name is maroon, the summary is dim.
-    let tool_y = row_of(&rows, "✓ fs_read(crates/haider-store/src/event_store.rs)");
-    let name_x = col_of(&rows[tool_y as usize], "fs_read");
+    // unchanged: the name is maroon, the summary is dim. 973-tui-toolview
+    // swapped the raw tool name for its human verb (`Read`) and the status
+    // glyph for the reference's `●`; the ink law still holds on both.
+    let tool_y = row_of(&rows, "● Read(crates/haider-store/src/event_store.rs)");
+    let name_x = col_of(&rows[tool_y as usize], "Read(");
     assert_eq!(buffer[(name_x, tool_y)].fg, Color::from(theme.maroon));
     let desc_x = col_of(&rows[tool_y as usize], "crates/haider-store");
     assert_eq!(buffer[(desc_x, tool_y)].fg, Color::from(theme.dim));

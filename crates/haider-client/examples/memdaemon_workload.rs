@@ -149,7 +149,7 @@ async fn drive_turns(
             cwd: workspace.to_string_lossy().into_owned(),
             provider: "fake".into(),
             model: "fake-v1".into(),
-            max_tokens: 4096,
+            max_tokens: 0,
             permission_overrides: Some(SessionPermissionOverridesV1 {
                 allow_exec: true,
                 ..SessionPermissionOverridesV1::default()

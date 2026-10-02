@@ -38,7 +38,7 @@ fn live_ready_prompt_remains_immediate_without_newline() {
 #[test]
 fn multiline_secret_snapshots_never_publish_or_page_the_tail() {
     let input = b"password=\"abc\\\nSYNTHETICTAIL987\" after\npublic";
-    let expected = b"password=[REDACTED:secret_value]\n[REDACTED:secret_value] after\npublic";
+    let expected = b"password=[REDACTED:password]\n[REDACTED:password] after\npublic";
     for boundary in 0..=input.len() {
         let mut buffer = TaskOutputBuffer::new(4096, 4096);
         buffer.append_stream(OutputStream::Stdout, &input[..boundary]);

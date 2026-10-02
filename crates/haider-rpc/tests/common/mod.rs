@@ -107,6 +107,7 @@ pub fn transcript() -> Vec<WireFrame> {
         account_alias: None,
         model: "claude-test".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         system_prompt_version: Some("fork-policy-v1".into()),
         permission_overrides: None,
         interaction_mode: Default::default(),
@@ -429,6 +430,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     account_alias: None,
                     model: "claude-test".into(),
                     max_tokens: 4096,
+                    max_tokens_source: None,
                     permission_overrides: None,
                     interaction_mode: Default::default(),
                     system_prompt_version: None,
@@ -710,9 +712,11 @@ pub fn transcript() -> Vec<WireFrame> {
                     semantic_progress_timeout_ms: None,
                     models: vec!["frontier-a".into()],
                     model_details: vec![ModelDetailWire {
+                        source: None,
                         name: "frontier-a".into(),
                         display_name: None,
                         context_window: None,
+                        max_output_tokens: Some(16_384),
                         supported_efforts: Vec::new(),
                         default_effort: None,
                         supported_speeds: Vec::new(),
@@ -786,9 +790,11 @@ pub fn transcript() -> Vec<WireFrame> {
                     semantic_progress_timeout_ms: None,
                     models: vec!["frontier-a".into()],
                     model_details: vec![ModelDetailWire {
+                        source: None,
                         name: "frontier-a".into(),
                         display_name: None,
                         context_window: None,
+                        max_output_tokens: Some(16_384),
                         supported_efforts: Vec::new(),
                         default_effort: None,
                         supported_speeds: Vec::new(),
@@ -839,9 +845,11 @@ pub fn transcript() -> Vec<WireFrame> {
                     semantic_progress_timeout_ms: None,
                     models: vec!["local-frontier-a".into()],
                     model_details: vec![ModelDetailWire {
+                        source: None,
                         name: "local-frontier-a".into(),
                         display_name: None,
                         context_window: None,
+                        max_output_tokens: Some(16_384),
                         supported_efforts: Vec::new(),
                         default_effort: None,
                         supported_speeds: Vec::new(),
@@ -909,9 +917,11 @@ pub fn transcript() -> Vec<WireFrame> {
                     models: vec!["frontier-a".into(), "frontier-b".into()],
                     model_details: vec![
                         ModelDetailWire {
+                            source: None,
                             name: "frontier-a".into(),
                             display_name: None,
                             context_window: None,
+                            max_output_tokens: Some(16_384),
                             supported_efforts: Vec::new(),
                             default_effort: None,
                             supported_speeds: Vec::new(),
@@ -919,9 +929,11 @@ pub fn transcript() -> Vec<WireFrame> {
                             supports_vision: None,
                         },
                         ModelDetailWire {
+                            source: None,
                             name: "frontier-b".into(),
                             display_name: None,
                             context_window: None,
+                            max_output_tokens: Some(16_384),
                             supported_efforts: Vec::new(),
                             default_effort: None,
                             supported_speeds: Vec::new(),
@@ -1357,9 +1369,11 @@ pub fn transcript() -> Vec<WireFrame> {
                     semantic_progress_timeout_ms: None,
                     models: vec!["gemini-2.5-flash".into()],
                     model_details: vec![ModelDetailWire {
+                        source: None,
                         name: "gemini-2.5-flash".into(),
                         display_name: None,
                         context_window: Some(1_048_576),
+                        max_output_tokens: Some(65_536),
                         supported_efforts: Vec::new(),
                         default_effort: None,
                         supported_speeds: Vec::new(),
@@ -1405,6 +1419,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     task_outcome: None,
                     task_outcome_version: None,
                     orchestration: None,
+                    request_budget: None,
                     active_branch_id: None,
                     branches: Vec::new(),
                     main_head_node_id: None,
@@ -2112,6 +2127,53 @@ pub fn transcript() -> Vec<WireFrame> {
     append_agent_cancel_contract_tail(&mut frames);
     append_acp_agent_family_tail(&mut frames);
     append_workspace_allocation_tail(&mut frames);
+    // 973: additive fallback provider.list response as consumed by Android.
+    let mut subscription = frames
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                body: ResponseBody::ProviderList { providers, .. },
+                ..
+            } => providers.first().cloned(),
+            _ => None,
+        })
+        .expect("provider.list fixture summary");
+    subscription.provider = "anthropic-oauth".into();
+    subscription.api_family = ProviderApiFamilyWire::AnthropicMessages;
+    subscription.endpoint = Some("https://api.anthropic.com".into());
+    subscription.models = vec!["claude-fable-5-1".into(), "claude-sonnet-5".into()];
+    subscription.model_details = subscription
+        .models
+        .iter()
+        .map(|id| ModelDetailWire {
+            source: Some(haider_rpc::ModelDetailSourceWire::Static),
+            name: id.clone(),
+            display_name: Some(id.clone()),
+            context_window: Some(1_000_000),
+            max_output_tokens: None,
+            supported_efforts: Vec::new(),
+            default_effort: None,
+            supported_speeds: Vec::new(),
+            supports_thinking_type: None,
+            supports_vision: Some(true),
+        })
+        .collect();
+    subscription.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "provider does not serve a model list to this credential (403)".into(),
+    };
+    subscription.catalog = haider_rpc::ProviderCatalogKindWire::Authenticated;
+    subscription.auth_methods = vec![AuthMethod::OAuth];
+    subscription.availability = ProviderAvailabilityWire::Available;
+    subscription.availability_reason = None;
+    subscription.default_model = Some("claude-fable-5-1".into());
+    frames.push(WireFrame::Response {
+        request_id: RequestId::new("request-subscription-static-catalog"),
+        body: ResponseBody::ProviderList {
+            providers: vec![subscription],
+            revision: 73,
+            availability: None,
+        },
+    });
     frames
 }
 

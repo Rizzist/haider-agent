@@ -10496,3 +10496,191 @@ async fn graceful_drain_parks_a_request_input_checkpoint_for_recovery() {
     second_task.shutdown_handle().request("test complete");
     second_task.join().await.expect("daemon joins");
 }
+
+fn output_limited_write(call_id: &str) -> Vec<FakeStep> {
+    vec![
+        FakeStep::EmitToolCallStart {
+            call_id: call_id.into(),
+            name: "fs_write".into(),
+        },
+        FakeStep::EmitToolArgsDelta {
+            call_id: call_id.into(),
+            fragment: r#"{"path":"flappy.html","content":"<html><canvas"#.into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+    ]
+}
+
+fn truncation_subcode(payload: &EventPayload, call: &str) -> Option<String> {
+    match payload {
+        EventPayload::ToolResult { call_id, result } if call_id == call => result
+            .presentation
+            .as_ref()
+            .map(|presentation| presentation.subcode.as_str().to_owned()),
+        _ => None,
+    }
+}
+
+/// 973 output cap (restart gap): a run in the middle of an output-limit
+/// truncation sequence (two consecutive truncations recorded) is parked in a
+/// route wait when the daemon crashes. The next daemon generation resumes it
+/// through startup recovery, and the resumed run applies the SAME policy as
+/// the live path: the third consecutive truncation is the typed
+/// `output_limit_truncation_repeated` tool error, no truncated call is ever
+/// executed, and the run continues to Done instead of failing.
+///
+/// MUTATION CHECK: make `recover_tool_repair_state` ignore the durable
+/// `output_truncation_count` marker (or count truncations as malformed
+/// strikes). Expected runtime failure: the resumed third truncation carries
+/// `output-limit-truncation` instead of `-repeated`, or the run errors.
+#[tokio::test]
+async fn restart_mid_truncation_sequence_resumes_the_same_truncation_policy() {
+    let root = test_root("w973-trunc-restart-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "trunc-restart",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let route = Arc::new(StdMutex::new(haider_platform::RouteStatus::Unavailable));
+    let mut script = output_limited_write("trunc-1");
+    script.extend(output_limited_write("trunc-2"));
+    // The third request loses its route and never answers before the crash.
+    script.extend([FakeStep::EmitNetworkUnavailable, FakeStep::Hang]);
+    // The resumed request truncates a third consecutive time.
+    script.extend(output_limited_write("trunc-3"));
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "trunc-3".into(),
+        },
+        FakeStep::EmitText {
+            text: "I will split the file into smaller writes.".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let fake = Arc::new(FakeProvider::new(script).with_route_status(Arc::clone(&route)));
+    let dependencies = DaemonDependencies {
+        provider_factory: ProviderFactoryConfig::Injected {
+            factory: Arc::new(FakeFactory { fake: fake.clone() }),
+            providers: std::collections::BTreeSet::from(["fake".to_owned()]),
+        },
+        ..DaemonDependencies::default()
+    };
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w973-trunc-restart",
+        "trunc-before",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut first, &config, &workspace).await;
+    send_request(
+        &mut first,
+        &config,
+        "trunc-submit",
+        submit_body(
+            "trunc-command",
+            session_id.clone(),
+            generation,
+            "write a single-file flappy bird",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut first).await;
+    let mut before = Vec::new();
+    tokio::time::timeout(support::DEADLINE, async {
+        loop {
+            if let WireFrame::Event { envelope, .. } = first.next().await
+                && envelope.run_id.as_ref() == Some(&run_id)
+                && let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.into())
+            {
+                let waiting = matches!(payload, EventPayload::RunState(RunState::Waiting { .. }));
+                before.push(payload);
+                if waiting {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the third request parks in a route wait");
+    assert_eq!(fake.requests().len(), 3);
+    for call in ["trunc-1", "trunc-2"] {
+        assert_eq!(
+            before
+                .iter()
+                .find_map(|payload| truncation_subcode(payload, call))
+                .as_deref(),
+            Some("output-limit-truncation"),
+            "{call} is an ordinary truncation before the crash"
+        );
+    }
+    drop(first);
+    first_task.crash().await;
+
+    *route.lock().expect("route lock") = haider_platform::RouteStatus::Available;
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w973-trunc-restart",
+        "trunc-after",
+        ClientKind::Headless,
+    )
+    .await;
+    let durable = tokio::time::timeout(support::DEADLINE, async {
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            let envelopes = read_session(
+                &mut second,
+                &config,
+                session_id.clone(),
+                &format!("trunc-read-{attempt}"),
+            )
+            .await;
+            if payloads_for_run(&envelopes, &run_id).any(
+                |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
+            ) {
+                return envelopes;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the resumed run reaches a terminal state");
+    let payloads = payloads_for_run(&durable, &run_id).collect::<Vec<_>>();
+    assert!(
+        payloads.contains(&EventPayload::RunState(RunState::Done)),
+        "the resumed run continues to Done: {payloads:?}"
+    );
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunFailed { .. })),
+        "a truncation never ends the run"
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .find_map(|payload| truncation_subcode(payload, "trunc-3"))
+            .as_deref(),
+        Some("output-limit-truncation-repeated"),
+        "the resumed run applies the live third-truncation policy"
+    );
+    assert_eq!(fake.requests().len(), 5, "resume plus one continuation");
+    assert!(
+        !workspace.join("flappy.html").exists(),
+        "no truncated call is ever executed"
+    );
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("daemon joins");
+}

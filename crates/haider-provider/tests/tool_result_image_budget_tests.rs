@@ -28,6 +28,14 @@ fn tool_image(message: &Message) -> (&str, &[ImageBlockRef]) {
     }
 }
 
+fn computer_call(index: usize) -> Message {
+    Message::assistant(vec![Block::ToolCall {
+        call_id: format!("computer-{index}"),
+        name: "computer".into(),
+        args: serde_json::json!({"action":"screenshot"}),
+    }])
+}
+
 #[test]
 fn count_budget_drops_the_oldest_prefix_and_keeps_durable_source_unchanged() {
     let durable = (0..=TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN)
@@ -139,4 +147,67 @@ fn same_result_cutoff_and_placeholder_labels_are_hard_bounded() {
     assert!(preview.contains("\"scope\":\"tool_result_image_capability_degradation\""));
     assert!(!preview.contains(control_artifact));
     assert!(!preview.contains("\n[forged-context]"));
+}
+
+#[test]
+fn repeated_computer_screenshots_retain_only_latest_full_image() {
+    let durable = (0..4)
+        .flat_map(|index| {
+            [
+                computer_call(index),
+                Message::tool_result_with_images(
+                    format!("computer-{index}"),
+                    format!("screenshot {index}"),
+                    false,
+                    vec![image(index, 1_000_000)],
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut projected = durable.clone();
+
+    apply_tool_result_image_budget(&mut projected);
+
+    assert_eq!(
+        durable
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::ToolResult { images, .. } => Some(images.len()),
+                _ => None,
+            })
+            .sum::<usize>(),
+        4,
+        "the durable source remains retrievable"
+    );
+    let projected_results = projected
+        .iter()
+        .filter(|message| matches!(message.blocks.first(), Some(Block::ToolResult { .. })))
+        .collect::<Vec<_>>();
+    for result in &projected_results[..3] {
+        let (preview, images) = tool_image(result);
+        assert!(images.is_empty());
+        assert!(preview.contains("\"scope\":\"computer_screenshot_history\""));
+        assert!(preview.contains("full image retrievable from CAS"));
+    }
+    assert_eq!(
+        tool_image(projected_results[3]).1,
+        std::slice::from_ref(&image(3, 1_000_000))
+    );
+}
+
+#[test]
+fn non_computer_tool_images_keep_the_existing_count_budget() {
+    let mut messages = vec![
+        Message::assistant(vec![Block::ToolCall {
+            call_id: "image-tool".into(),
+            name: "render".into(),
+            args: serde_json::json!({}),
+        }]),
+        Message::tool_result_with_images("image-tool", "rendered", false, vec![image(0, 1)]),
+    ];
+
+    apply_tool_result_image_budget(&mut messages);
+
+    assert_eq!(tool_image(&messages[1]).1.len(), 1);
 }

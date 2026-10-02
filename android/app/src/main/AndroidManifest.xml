@@ -115,6 +115,11 @@
             android:process=":daemon"
             android:exported="false" />
 
+        <receiver
+            android:name=".service.presence.PresenceStopReceiver"
+            android:process=":daemon"
+            android:exported="false" />
+
         <!-- Navigation hint only. Browser authorization results never enter this process. -->
         <activity
             android:name=".daemon.OAuthReturnActivity"

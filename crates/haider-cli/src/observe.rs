@@ -220,6 +220,7 @@ pub(crate) struct SessionSummaryView {
 }
 
 pub(crate) struct SessionDepthView {
+    pub request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
     pub pending_follow_ups: Vec<haider_protocol::completion::CompletionObligation>,
     pub summary: SessionSummaryView,
     pub pending_menus: Vec<haider_rpc::ObserveMenuWire>,
@@ -402,6 +403,9 @@ impl ObserveJson for SessionSummaryView {
 impl ObserveJson for SessionDepthView {
     fn json(&self) -> Value {
         let mut object = self.summary.json().as_object().cloned().unwrap_or_default();
+        if let Some(budget) = self.request_budget {
+            object.insert("request_budget".into(), json!(budget));
+        }
         if !self.pending_follow_ups.is_empty() {
             object.insert("pending_follow_ups".into(), json!(self.pending_follow_ups));
         }
@@ -1090,6 +1094,7 @@ pub(crate) fn merge_roster_summary(
 }
 
 pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {
+    let request_budget = digest.request_budget;
     let branch_heads = std::iter::once(BranchView {
         id: None,
         name: "main".into(),
@@ -1125,6 +1130,7 @@ pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {
     let pending_menus = digest.pending_menus.clone();
     let last_event_kinds = digest.last_event_kinds.clone();
     SessionDepthView {
+        request_budget,
         pending_follow_ups,
         summary: summary_view(digest),
         pending_menus,
@@ -1403,6 +1409,10 @@ pub(crate) fn session_human_text(document: &SessionDocument) -> String {
         session.summary.subagent_count,
         session.summary.updated_at,
     );
+    if let Some(budget) = session.request_budget {
+        text.push_str(&budget.status_label());
+        text.push('\n');
+    }
     for obligation in &session.pending_follow_ups {
         text.push_str(&format!(
             "pending follow-up: {} — attempt {} — {}\n",

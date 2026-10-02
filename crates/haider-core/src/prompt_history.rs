@@ -4861,7 +4861,7 @@ fn render_journal_with_facts(
                     // Match the live repair continuation's empty placeholder.
                     let args = if pending_tool_results
                         .get(&call_id)
-                        .is_some_and(crate::actor::invalid_tool_call_result)
+                        .is_some_and(crate::actor::repairable_tool_call_result)
                     {
                         serde_json::json!({})
                     } else {
@@ -4890,6 +4890,15 @@ fn render_journal_with_facts(
                 {
                     if let Some(status) = haider_protocol::request_budget::RequestBudgetStatusV1::from_extension_item(&item) {
                         messages.push(Message::user_text(status.model_note()));
+                    }
+                }
+                TurnItem::Extension { ref kind, .. }
+                    if kind == haider_protocol::loop_guard::LOOP_SUSPECTED_EXTENSION_KIND =>
+                {
+                    if let Some(note) =
+                        haider_protocol::loop_guard::LoopSuspectedV1::from_extension_item(&item)
+                    {
+                        messages.push(Message::user_text(note.model_note()));
                     }
                 }
                 TurnItem::Extension { kind, data } if kind == PROVIDER_OPAQUE_EXTENSION_KIND => {

@@ -376,7 +376,11 @@ fn model_precedence_is_env_then_config_then_packaged() {
     let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(profile.default_model, PACKAGED_DEFAULT_MODEL);
     assert_eq!(profile.default_provider, DEFAULT_PROVIDER);
-    assert_eq!(profile.default_max_tokens, DEFAULT_MAX_TOKENS);
+    assert_eq!(profile.default_max_tokens, 0);
+    assert_eq!(
+        DEFAULT_MAX_TOKENS,
+        haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT
+    );
 
     std::fs::write(
         root.path().join(PROFILE_CONFIG_FILE),

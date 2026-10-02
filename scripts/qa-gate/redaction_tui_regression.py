@@ -65,9 +65,26 @@ def run(bin_dir: Path, evidence: Path) -> int:
         script=steps,
         report_artefact_root=evidence,
     )
+    def encode(value: bytes) -> str:
+        return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+    jwt = ".".join([
+        encode(b'{"alg":"HS256","typ":"JWT"}'),
+        encode(b'{"sub":"synthetic-user"}'),
+        encode(b"synthetic-signature"),
+    ])
+    typed_cases = [
+        (jwt, "[REDACTED:jwt]"),
+        ("eyJabcdefghijk.eyJabcdefghijk.abcdefghijkl", "[REDACTED:high_entropy]"),
+        ("api_key=ordinary-fixture-value", "api_key=[REDACTED:api_key]"),
+        ("api_key=eyJabcdefghijk.eyJabcdefghijk.abcdefghijkl",
+         "api_key=[REDACTED:api_key]"),
+        ("Bearer 859c9fd11efbc93ee3d6b5458111b031d4a6477f405146d65d543732901bdfc4",
+         "Bearer [REDACTED:bearer_token]"),
+    ]
     fixture = "\n".join([
         "BEGIN_MULTILINE_OUTPUT", *MULTILINE,
-        *(url for url, _ in URLS), *CARRIERS, "END_MULTILINE_OUTPUT", "",
+        *(url for url, _ in URLS), *CARRIERS,
+        *(value for value, _ in typed_cases), "END_MULTILINE_OUTPUT", "",
     ])
     (ctx.workspace_dir / "multiline.txt").write_bytes(fixture.encode())
     (evidence / "synthetic-input.txt").write_bytes(fixture.encode())
@@ -91,29 +108,43 @@ def run(bin_dir: Path, evidence: Path) -> int:
         session = next(doc["session_id"] for doc in docs if doc.get("session_id"))
         report["session_id"] = session
         tui = TuiProcess(ctx, session_id=session)
+        tui.type_slow("/verbosity verbose")
+        tui.enter()
+        tui.settle(0.3)
         tui.type_slow("!cat multiline.txt")
         tui.enter()
         deadline = time.monotonic() + 20
         while True:
-            frame = tui.repaint(180, 60)
-            if "END_MULTILINE_OUTPUT" in frame.text or time.monotonic() >= deadline:
+            frame = tui.repaint(180, 80)
+            if "cat multiline.txt" in frame.text or time.monotonic() >= deadline:
                 break
             tui.settle(0.3)
+        # Verbose still bounds long rows. Focus this row and use the shipped
+        # Enter affordance to reveal its complete safe output.
+        tui.type_slow("/collapse next")
+        tui.enter()
+        tui.settle(0.3)
+        tui.enter()
+        frame = tui.repaint(180, 80)
         (evidence / "frame.txt").write_text(frame.text)
         (evidence / "frame.ansi").write_bytes(frame.raw)
         check("actual command and full fixture visible", all(text in frame.text for text in [
             "cat multiline.txt", "BEGIN_MULTILINE_OUTPUT", "END_MULTILINE_OUTPUT",
         ]))
-        secrets = ["SYNTHETICTAIL987", *(secret for _, secret in URLS)]
+        secrets = ["SYNTHETICTAIL987", *(secret for _, secret in URLS),
+                   *(value for value, _ in typed_cases)]
         check("no synthetic secret in frame or PTY history", all(
             secret not in frame.text and secret.encode() not in tui.sink[0]
             for secret in secrets
         ))
         check("all multiline values visibly replaced", frame.text.count(
-            "[REDACTED:secret_value] after") == len(MULTILINE))
+            "[REDACTED:password] after") == len(MULTILINE))
         check("URL usernames retained", all(
-            url.replace(secret, "[REDACTED:secret_value]") in frame.text
+            url.replace(secret, "[REDACTED:password]") in frame.text
             for url, secret in URLS
+        ))
+        check("typed labels distinguish JWT, lookalike and explicit context", all(
+            marker in frame.text for _, marker in typed_cases
         ))
         check("six public carriers visible", all(value in frame.text for value in CARRIERS))
         events = ctx.run_haider(["events", "--no-spawn"], timeout=STATUS_REQUEST)

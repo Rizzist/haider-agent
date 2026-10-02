@@ -929,6 +929,14 @@ async fn execute_refresh(
     }
 }
 
+fn import_confirmation_instruction(
+    candidate: &haider_rpc::DeviceCredentialCandidateWire,
+) -> Option<String> {
+    candidate
+        .import_supported
+        .then(|| format!("haider account import {} --confirm", candidate.source))
+}
+
 async fn execute_import(
     client: &impl AccountClient,
     source: &str,
@@ -963,14 +971,18 @@ async fn execute_import(
         .into_iter()
         .find(|candidate| candidate.source == source)
         .ok_or_else(|| AccountError::MissingAlias(format!("{source} local login")))?;
-    // The daemon owns the Claude Code policy gate. Forward this candidate so
-    // fake mode reports its typed refusal before the ordinary unsupported
-    // source reason; the daemon still refuses the import in live mode.
-    if !candidate.import_supported && source != "claude-code" {
-        return Err(AccountError::Protocol(
-            "the discovered local login cannot be imported safely",
-        ));
+    if !candidate.import_supported && (!confirm || source != "claude-code") {
+        eprintln!(
+            "haider account: {}",
+            candidate
+                .unsupported_reason
+                .as_deref()
+                .unwrap_or("the discovered local login cannot be imported safely")
+        );
+        return Ok(ExitCode::from(EX_USAGE));
     }
+    // Explicit confirmation reaches the daemon's typed policy gate, including
+    // the debug fake-mode refusal. Unsupported candidates get no suggestion.
     let summary = candidate.identity.as_ref().map_or_else(
         || {
             candidate
@@ -982,9 +994,9 @@ async fn execute_import(
     );
     println!("found {source} login: {summary}");
     if !confirm {
-        eprintln!(
-            "haider account: review the identity, then run `haider account import {source} --confirm`"
-        );
+        if let Some(instruction) = import_confirmation_instruction(&candidate) {
+            eprintln!("haider account: review the identity, then run `{instruction}`");
+        }
         return Ok(ExitCode::from(EX_USAGE));
     }
     match client
