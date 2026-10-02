@@ -298,3 +298,167 @@ fn status_line_without_window_omits_the_meter() {
     let projection = SessionProjection::new();
     assert_eq!(status_line(&projection, 0), "IDLE · 0 tok");
 }
+
+#[test]
+fn plain_session_paths_keep_workspace_context_for_all_path_keys() {
+    use haider_tui::{app::AppModel, runtime::run_demo_plain, toolview::header_args};
+    use serde_json::json;
+    for (workspace, path) in [
+        (
+            "C:/Users/alice/project",
+            "C:/Users/alice/project/src/probe.rs",
+        ),
+        (
+            "C:/Users/alice/project",
+            r"c:\users\ALICE\PROJECT\src\probe.rs",
+        ),
+        ("/opt/project", "/opt/project/src/probe.rs"),
+        ("D:/repo", "D:/repo/src/probe.rs"),
+        (r"\\srv\share\repo", r"\\srv\share\repo\src\probe.rs"),
+        (
+            r"\\?\C:\Users\alice\project",
+            r"\\?\C:\Users\alice\project\src\probe.rs",
+        ),
+        (r"\\.\C:\repo", r"\\.\C:\repo\src\probe.rs"),
+    ] {
+        for key in [
+            "path",
+            "file",
+            "file_path",
+            "cwd",
+            "directory",
+            "workspace",
+            "root",
+        ] {
+            for name in ["fs_read", "fs_list", "fs_edit", "custom_tool"] {
+                let mut model = AppModel::new();
+                model.cwd = workspace.into();
+                model.session_workspace_cwd = Some(workspace.into());
+                model.display_homes = vec!["C:/Users/alice".into()];
+                let args = json!({key: path});
+                let expected = header_args(name, &args, &model.tool_path_context());
+                assert_eq!(expected, "src/probe.rs");
+                model
+                    .projection
+                    .apply(&EventPayload::Item(ItemEvent::Started {
+                        item_id: ItemId::new("context-probe"),
+                        item: TurnItem::ToolCall {
+                            call_id: "context-probe".into(),
+                            name: name.into(),
+                            args,
+                            status: ToolStatus::InProgress,
+                        },
+                    }));
+                let plain = run_demo_plain(model);
+                assert!(
+                    plain
+                        .lines()
+                        .any(|line| line.starts_with(&format!("⚒ {name} ◐ · {expected}"))),
+                    "{name} {key} {workspace}: {plain}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn plain_pattern_scope_uses_session_context() {
+    use haider_tui::{app::AppModel, runtime::run_demo_plain};
+    use serde_json::json;
+    for (name, args, expected) in [
+        (
+            "fs_read",
+            json!({"file_path":"C:/repo/src/key_probe.rs", "file":"C:/Users/bob/other"}),
+            "src/key_probe.rs",
+        ),
+        (
+            "custom_tool",
+            json!({"cwd":"C:/repo", "root":"C:/repo/src", "description":"inspect"}),
+            ".",
+        ),
+        (
+            "fs_search",
+            json!({"query":"needle", "cwd":"C:/repo", "root":"C:/repo/src"}),
+            "\"needle\" in src",
+        ),
+        (
+            "fs_search",
+            json!({"root":"C:/repo/src", "description":"inspect"}),
+            "src",
+        ),
+        (
+            "fs_search",
+            json!({"query":"needle", "root":"C:/repo/src"}),
+            "\"needle\" in src",
+        ),
+        (
+            "fs_search",
+            json!({"query":"needle", "path":"C:/repo/src", "glob":"C:/repo/src/**"}),
+            "\"needle\" in src src/**",
+        ),
+        (
+            "fs_search",
+            json!({"query":"needle", "include":"C:/repo/src/**"}),
+            "\"needle\" src/**",
+        ),
+        (
+            "glob",
+            json!({"pattern":"C:/repo/src/**", "path":"C:/repo/src"}),
+            "src/** in src",
+        ),
+        ("fs_glob", json!({"query":"!C:/repo/src/**"}), "!src/**"),
+        ("fs_read", json!({"path":"C:/repo"}), "."),
+        (
+            "custom_tool",
+            json!({"cwd":"C:/repo", "description":"inspect workspace", "desc":"inspect", "action":"inspect"}),
+            ".",
+        ),
+        (
+            "agent_spawn",
+            json!({"cwd":"C:/repo", "label":"verify"}),
+            "verify in .",
+        ),
+        (
+            "shell",
+            json!({"cwd":"C:/repo", "description":"inspect workspace"}),
+            ".",
+        ),
+        (
+            "fs_read",
+            json!({"path":"C:/Users/alice/notes.md"}),
+            "~/notes.md",
+        ),
+        (
+            "fs_read",
+            json!({"path":"C:/Users/bob/notes.md"}),
+            "C:/Users/<user>/notes.md",
+        ),
+        (
+            "fs_search",
+            json!({"query":"/Users/bob", "path":"src"}),
+            "\"/Users/bob\" in src",
+        ),
+    ] {
+        let mut model = AppModel::new();
+        model.cwd = "C:/repo".into();
+        model.display_homes = vec!["C:/Users/alice".into()];
+        model
+            .projection
+            .apply(&EventPayload::Item(ItemEvent::Started {
+                item_id: ItemId::new("scope-probe"),
+                item: TurnItem::ToolCall {
+                    call_id: "scope-probe".into(),
+                    name: name.into(),
+                    args,
+                    status: ToolStatus::InProgress,
+                },
+            }));
+        let plain = run_demo_plain(model);
+        assert!(
+            plain
+                .lines()
+                .any(|line| line.starts_with(&format!("⚒ {name} ◐ · {expected}"))),
+            "{name} {expected}: {plain}"
+        );
+    }
+}

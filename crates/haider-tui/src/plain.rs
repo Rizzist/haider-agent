@@ -83,6 +83,38 @@ pub fn render_plain_with_status(
         throughput,
         Some(cache_usage),
         Some(background),
+        &crate::toolview::PathContext::process_homes(),
+    )
+}
+
+/// Projection-only rendering with an explicit session path snapshot.
+#[must_use]
+pub fn render_plain_with_context(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+    paths: &crate::toolview::PathContext,
+) -> String {
+    render_plain_impl_with_status(projection, window, throughput, None, None, paths)
+}
+
+/// Render with the same workspace and home snapshot as the styled session.
+#[must_use]
+pub fn render_plain_with_status_and_context(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+    cache_usage: &crate::cache_usage::SessionUsageFold,
+    background: &crate::statusline::StatusLine,
+    paths: &crate::toolview::PathContext,
+) -> String {
+    render_plain_impl_with_status(
+        projection,
+        window,
+        throughput,
+        Some(cache_usage),
+        Some(background),
+        paths,
     )
 }
 
@@ -92,7 +124,14 @@ fn render_plain_impl(
     throughput: Option<&crate::throughput::ThroughputReadout>,
     cache_usage: Option<&crate::cache_usage::SessionUsageFold>,
 ) -> String {
-    render_plain_impl_with_status(projection, window, throughput, cache_usage, None)
+    render_plain_impl_with_status(
+        projection,
+        window,
+        throughput,
+        cache_usage,
+        None,
+        &crate::toolview::PathContext::process_homes(),
+    )
 }
 
 fn render_plain_impl_with_status(
@@ -101,6 +140,7 @@ fn render_plain_impl_with_status(
     throughput: Option<&crate::throughput::ThroughputReadout>,
     cache_usage: Option<&crate::cache_usage::SessionUsageFold>,
     background: Option<&crate::statusline::StatusLine>,
+    paths: &crate::toolview::PathContext,
 ) -> String {
     let mut out = String::new();
     for entry in projection.entries() {
@@ -161,7 +201,7 @@ fn render_plain_impl_with_status(
                     out.push('\n');
                 }
             }
-            TranscriptEntry::Item(block) => render_item(&mut out, block),
+            TranscriptEntry::Item(block) => render_item(&mut out, block, paths),
             TranscriptEntry::Note { text } => {
                 out.push_str(text);
                 out.push('\n');
@@ -574,7 +614,7 @@ pub fn status_line(projection: &SessionProjection, window: u64) -> String {
     )
 }
 
-fn render_item(out: &mut String, block: &ItemBlock) {
+fn render_item(out: &mut String, block: &ItemBlock, paths: &crate::toolview::PathContext) {
     match &block.item {
         TurnItem::AgentMessage { text } => {
             text.visit_strs(|part| out.push_str(part));
@@ -598,7 +638,7 @@ fn render_item(out: &mut String, block: &ItemBlock) {
         TurnItem::ToolCall {
             name, status, args, ..
         } => {
-            let summary = crate::toolfold::semantic_summary(name, args);
+            let summary = crate::toolfold::semantic_summary_with_context(name, args, paths);
             out.push_str(&format!("⚒ {name}"));
             out.push(' ');
             out.push_str(status_glyph(*status));

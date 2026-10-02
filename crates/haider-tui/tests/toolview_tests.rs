@@ -1218,3 +1218,143 @@ fn every_tool_row_text_ink_clears_4_5_on_its_ground_in_every_theme() {
         assert_ne!(theme.diff_added_ground(), theme.diff_removed_ground());
     }
 }
+
+#[test]
+fn syntax_prefixed_glob_branches_use_the_shared_projection() {
+    use haider_tui::{toolfold::semantic_summary, toolview::project_absolute_pattern};
+    for (pattern, expected) in [
+        ("!/Users/bob/**", "!/Users/<user>/**"),
+        ("!!/Users/bob/**", "!!/Users/<user>/**"),
+        (
+            "{/Users/bob,/home/carol}/**",
+            "{/Users/<user>,/home/<user>}/**",
+        ),
+        ("{src,/Users/bob}/**", "{src,/Users/<user>}/**"),
+        (" /Users/bob/**", " /Users/<user>/**"),
+        ("\t/Users/bob/**", "\t/Users/<user>/**"),
+        ("~bob/**", "~<user>/**"),
+        ("!~BOB/**", "!~<user>/**"),
+        ("{~bob,~carol}/**", "{~<user>,~<user>}/**"),
+        (r"!C:\Users\bob\**", "!C:/Users/<user>/**"),
+        (
+            r"{C:\Users\bob,D:\temp}\**",
+            r"{C:/Users/<user>,D:/temp}\**",
+        ),
+        (r"!\\server\Users\bob\**", "!//server/Users/<user>/**"),
+        (r"!\\?\C:\Users\bob\**", "!C:/Users/<user>/**"),
+        (r"!\\.\C:\Users\bob\**", "!C:/Users/<user>/**"),
+        (
+            r"!\\?\Volume{abc}\Users\bob\**",
+            "!//device/Volume{abc}/Users/<user>/**",
+        ),
+        (r"!\??\C:\Users\bob\**", "!C:/Users/<user>/**"),
+        (
+            "{!/Users/bob,{/home/carol,src}}/**",
+            "{!/Users/<user>,{/home/<user>,src}}/**",
+        ),
+        ("**/Users/bob/**", "**/Users/bob/**"),
+        ("src/**", "src/**"),
+        ("../bob/**", "../bob/**"),
+        ("~/**", "~/**"),
+        ("!src/**", "!src/**"),
+        ("{src,tests}/**", "{src,tests}/**"),
+        ("src/~bob/**", "src/~bob/**"),
+        ("src!/Users/bob/**", "src!/Users/bob/**"),
+        ("src/{/Users/bob,lib}/**", "src/{/Users/bob,lib}/**"),
+        ("src,/Users/bob/**", "src,/Users/bob/**"),
+        ("/Users/{bob,carol}/**", "/Users/<user>/**"),
+        ("!/Users/{bob,carol}/**", "!/Users/<user>/**"),
+        ("/Users/bob/{src,tests}/**", "/Users/<user>/{src,tests}/**"),
+        (
+            "@(/Users/bob|/home/carol)/**",
+            "@(/Users/<user>|/home/<user>)/**",
+        ),
+        (
+            "!(/Users/bob|/home/carol)/**",
+            "!(/Users/<user>|/home/<user>)/**",
+        ),
+        (
+            "/Users/bob/** /home/carol/**",
+            "/Users/<user>/** /home/<user>/**",
+        ),
+        (
+            "!C:/Documents and Settings/bob/**",
+            "!C:/Documents and Settings/<user>/**",
+        ),
+    ] {
+        assert_eq!(project_absolute_pattern(pattern), expected, "{pattern}");
+        for key in ["glob", "include"] {
+            assert_eq!(
+                haider_tui::toolfold::arg_summary(&json!({key:pattern})),
+                expected
+            );
+        }
+        let paths = PathContext::default();
+        for (name, args) in [
+            ("fs_search", json!({"query":"x", "glob":pattern})),
+            ("fs_search", json!({"query":"x", "include":pattern})),
+            ("glob", json!({"pattern":pattern})),
+            ("fs_glob", json!({"query":pattern})),
+        ] {
+            let header = tv::header_args(name, &args, &paths);
+            let plain = semantic_summary(name, &args);
+            // Tool headers intentionally collapse whitespace onto one line.
+            assert!(
+                header.contains(&haider_tui::toolview::one_line(expected)),
+                "{name} {pattern}: {header}"
+            );
+            assert!(plain.contains(expected), "{name} {pattern}: {plain}");
+        }
+    }
+}
+
+#[test]
+fn expanded_broad_workspace_roots_never_restore_the_account() {
+    for (workspace, path) in [
+        (r"\\srv\share\msys64", r"\\srv\share\msys64\home\bob\x"),
+        (r"\\srv\msys64\home", r"\\srv\msys64\home\bob\x"),
+        (
+            r"\\srv\share\Documents and Settings",
+            r"\\srv\share\Documents and Settings\bob\x",
+        ),
+        (
+            r"\\srv\Documents and Settings",
+            r"\\srv\Documents and Settings\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Documents and Settings",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Documents and Settings\bob\x",
+        ),
+        (
+            r"\\?\Volume{abc}\cache\alice",
+            r"\\?\Volume{abc}\cache\alice\Users\bob\x",
+        ),
+        ("C:/msys64", "C:/msys64/home/bob/x"),
+        ("C:/msys64/home", "C:/msys64/home/bob/x"),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users\bob\x",
+        ),
+        (
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users\bob\x",
+        ),
+    ] {
+        let paths = PathContext {
+            workspace: Some(workspace.into()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        assert!(
+            !paths.shorten(path).to_ascii_lowercase().contains("bob"),
+            "{workspace} {path}"
+        );
+    }
+}

@@ -95,7 +95,14 @@ pub fn workspace_relative_display(path: &Path, root: &Path) -> Option<String> {
     let parsed_root = DisplayPath::parse(root);
     let windows = parsed_path.windows || parsed_root.windows;
     let has_dot_segment = |path: &Path| {
-        path.to_string_lossy().split(['/', '\\']).any(|component| {
+        let spelling = path.to_string_lossy();
+        // The dot in a Win32 device namespace identifies the namespace,
+        // not a traversal component. Only inspect its filesystem tail.
+        let tail = spelling
+            .strip_prefix(r"\\.\")
+            .or_else(|| windows.then(|| spelling.strip_prefix("//./")).flatten())
+            .unwrap_or(&spelling);
+        tail.split(['/', '\\']).any(|component| {
             matches!(component, "." | "..")
                     // Win32 normally strips trailing ASCII spaces and dots
                     // from components. A dot-only spelling can therefore be
@@ -112,13 +119,31 @@ pub fn workspace_relative_display(path: &Path, root: &Path) -> Option<String> {
     if !parsed_path.absolute || !parsed_root.absolute {
         return None;
     }
-    let relative = parsed_path.relative_to(&parsed_root).or_else(|| {
+    // Shortening must remove the recognized account component rather than
+    // expose it in the remainder. Compare the identities that matched: a
+    // canonical workspace alias can have a different component depth.
+    let exposes_account = |path: &DisplayPath, root: &DisplayPath| {
+        path.account_index()
+            .filter(|index| *index < path.parts.len())
+            .is_some_and(|index| index >= root.parts.len())
+    };
+    let relative = if let Some(relative) = parsed_path.relative_to(&parsed_root) {
+        // A known unsafe lexical match needs no filesystem lookup.
+        if exposes_account(&parsed_path, &parsed_root) {
+            return None;
+        }
+        relative
+    } else {
         // Canonical spellings cover host aliases such as /tmp -> /private/tmp.
-        // A failure to resolve either side keeps the lexical fallback.
-        let path = canonicalize_existing_prefix(path)?;
-        let root = canonicalize_existing_prefix(root)?;
-        DisplayPath::parse(&path).relative_to(&DisplayPath::parse(&root))
-    })?;
+        // A failure to resolve either side keeps the original projected label.
+        let path = DisplayPath::parse(&canonicalize_existing_prefix(path)?);
+        let root = DisplayPath::parse(&canonicalize_existing_prefix(root)?);
+        let relative = path.relative_to(&root)?;
+        if exposes_account(&path, &root) {
+            return None;
+        }
+        relative
+    };
     let label = if relative.is_empty() {
         ".".to_owned()
     } else {
@@ -226,6 +251,8 @@ fn redirected_home_root(home: &Path, profile: &Path) -> bool {
         && home.windows
         && (home.root.ends_with(':') || home.root.starts_with("//"))
         && !admin_share
+        && home.account_index() != Some(0)
+        && !home.is_device()
         && home.parts.is_empty()
         && profile_usable
         && profile.windows
@@ -318,33 +345,42 @@ fn sanitize_with_canonicalizers(
         // A redirected root may contain an own Users/<profile-name> path,
         // but it must not turn a different account into ~/Users/<name>/....
         let redirected_root = !usable_home(home);
-        if redirected_root && parsed.mask_other_user().is_some() {
-            let own_profile_account = homes.get(1).is_some_and(|profile| {
-                let profile = DisplayPath::parse(profile);
-                parsed.parts.get(1).zip(profile.parts.last()).is_some_and(
-                    |(path_name, profile_name)| path_name.eq_ignore_ascii_case(profile_name),
-                )
-            });
-            if !own_profile_account {
-                continue;
-            }
-        }
         let home_parsed = DisplayPath::parse(home);
-        let relative = parsed.relative_to(&home_parsed).or_else(|| {
-            if !parsed.absolute || parsed.had_parent {
-                return None;
-            }
-            let canonical_home = canonicalize(home).map(|p| DisplayPath::parse(&p))?;
-            canonical_path.as_ref()?.relative_to(&canonical_home)
-        });
-        if let Some(mut relative) = relative {
-            if redirected_root
-                && relative
-                    .first()
-                    .is_some_and(|part| part.eq_ignore_ascii_case("Users"))
-                && relative.len() > 1
+        let relative = parsed
+            .relative_to(&home_parsed)
+            .map(|relative| (relative, &parsed, home_parsed.parts.len()))
+            .or_else(|| {
+                if !parsed.absolute || parsed.had_parent {
+                    return None;
+                }
+                let canonical_home = canonicalize(home).map(|p| DisplayPath::parse(&p))?;
+                let source = canonical_path.as_ref()?;
+                Some((
+                    source.relative_to(&canonical_home)?,
+                    source,
+                    canonical_home.parts.len(),
+                ))
+            });
+        if let Some((mut relative, source, home_depth)) = relative {
+            if let Some(index) = source
+                .account_index()
+                .filter(|index| *index < source.parts.len())
+                && index >= home_depth
             {
-                relative[1] = "<user>".to_owned();
+                let own_profile_account = homes.get(1).is_some_and(|profile| {
+                    let profile = DisplayPath::parse(profile);
+                    let profile_name = profile
+                        .account_index()
+                        .and_then(|index| profile.parts.get(index))
+                        .or_else(|| profile.parts.last());
+                    source.parts.get(index).zip(profile_name).is_some_and(
+                        |(path_name, profile_name)| source.component_eq(path_name, profile_name),
+                    )
+                });
+                if !redirected_root || !own_profile_account {
+                    continue;
+                }
+                relative[index - home_depth] = "<user>".to_owned();
             }
             let rank = home_parsed.parts.len();
             if best.as_ref().is_none_or(|(previous, _)| rank > *previous) {
@@ -509,55 +545,145 @@ impl DisplayPath {
             })
     }
 
-    fn is_multiuser_ancestor(&self) -> bool {
-        let roots: &[&[&str]] = if self.root == "/" {
-            &[
-                &["Users"],
-                &["home"],
-                &["var", "home"],
-                &["private", "var", "home"],
-                &["System", "Volumes", "Data", "Users"],
-                &["usr", "home"],
-                &["export", "home"],
-            ]
+    fn component_eq(&self, part: &str, known: &str) -> bool {
+        if self.windows {
+            part.trim_end_matches(['.', ' '])
+                .eq_ignore_ascii_case(known.trim_end_matches(['.', ' ']))
         } else {
-            &[&["Users"], &["Documents and Settings"]]
-        };
-        let known = roots.iter().any(|root| {
-            self.parts.len() <= root.len()
-                && self.parts.iter().zip(*root).all(|(part, known)| {
-                    (if self.windows {
-                        part.trim_end_matches(['.', ' '])
-                    } else {
-                        part
-                    })
-                    .eq_ignore_ascii_case(known)
+            part.eq_ignore_ascii_case(known)
+        }
+    }
+
+    fn is_device(&self) -> bool {
+        self.root
+            .get(..9)
+            .is_some_and(|root| root.eq_ignore_ascii_case("//device/"))
+    }
+
+    /// Account-parent components, shared by masking and ancestor validation.
+    /// Device paths can contain account parents at any depth; retain that offset.
+    fn account_roots(&self) -> Vec<Vec<&str>> {
+        if self.is_device() {
+            for (index, part) in self.parts.iter().enumerate() {
+                if self.component_eq(part, "Users")
+                    || self.component_eq(part, "Documents and Settings")
+                {
+                    return vec![self.parts[..=index].iter().map(String::as_str).collect()];
+                }
+                if self.component_eq(part, "msys64")
+                    && self
+                        .parts
+                        .get(index + 1)
+                        .is_none_or(|next| self.component_eq(next, "home"))
+                {
+                    let mut root: Vec<_> =
+                        self.parts[..=index].iter().map(String::as_str).collect();
+                    root.push("home");
+                    return vec![root];
+                }
+            }
+            if self
+                .root
+                .rsplit('/')
+                .next()
+                .is_some_and(|part| self.component_eq(part, "GLOBALROOT"))
+            {
+                let volume = self.parts.get(1).map_or("", String::as_str);
+                return vec![vec!["Device", volume, "Users"]];
+            }
+            return vec![vec!["Users"]];
+        }
+        if self.root == "/" {
+            let mut roots = vec![
+                vec!["Users"],
+                vec!["home"],
+                vec!["var", "home"],
+                vec!["private", "var", "home"],
+                vec!["System", "Volumes", "Data", "Users"],
+                vec!["usr", "home"],
+                vec!["export", "home"],
+            ];
+            if self
+                .parts
+                .first()
+                .is_some_and(|part| self.component_eq(part, "Volumes"))
+            {
+                roots.push(vec![
+                    "Volumes",
+                    self.parts.get(1).map_or("", String::as_str),
+                    "Users",
+                ]);
+            }
+            if self
+                .parts
+                .first()
+                .is_some_and(|part| self.component_eq(part, "mnt"))
+                && self.parts.get(1).is_none_or(|drive| {
+                    drive.len() == 1 && drive.as_bytes()[0].is_ascii_alphabetic()
                 })
-        });
-        known
-            || (self.root == "/"
+            {
+                roots.push(vec![
+                    "mnt",
+                    self.parts.get(1).map_or("", String::as_str),
+                    "Users",
+                ]);
+            }
+            return roots;
+        }
+        if self.root.starts_with("//")
+            && self.root.rsplit('/').next().is_some_and(|share| {
+                self.component_eq(share, "Users")
+                    || self.component_eq(share, "Documents and Settings")
+            })
+        {
+            return vec![vec![]];
+        }
+        let mut roots = vec![
+            vec!["Users"],
+            vec!["Documents and Settings"],
+            vec!["msys64", "home"],
+        ];
+        if self.is_wsl_share()
+            || self.root.starts_with("//")
+                && self
+                    .root
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|share| self.component_eq(share, "msys64"))
+        {
+            roots.push(vec!["home"]);
+        }
+        roots
+    }
+
+    fn is_multiuser_ancestor(&self) -> bool {
+        self.absolute
+            && self.account_roots().iter().any(|root| {
+                self.parts.len() <= root.len()
+                    && self
+                        .parts
+                        .iter()
+                        .zip(root)
+                        .all(|(part, known)| self.component_eq(part, known))
+            })
+    }
+
+    /// Index of the account, including a bare parent with no account yet.
+    fn account_index(&self) -> Option<usize> {
+        if !self.absolute
+            || !self.windows && (self.root.starts_with("//?/") || self.root.starts_with("//./"))
+        {
+            return None;
+        }
+        self.account_roots().iter().find_map(|root| {
+            (self.parts.len() >= root.len()
                 && self
                     .parts
-                    .first()
-                    .is_some_and(|part| part.eq_ignore_ascii_case("mnt"))
-                && self.parts.len() <= 3
-                && (self.parts.len() == 1
-                    || self.parts[1].len() == 1
-                        && self.parts[1].as_bytes()[0].is_ascii_alphabetic()
-                        && (self.parts.len() == 2 || self.parts[2].eq_ignore_ascii_case("Users"))))
-            || (self.root == "/"
-                && self
-                    .parts
-                    .first()
-                    .is_some_and(|part| part.eq_ignore_ascii_case("Volumes"))
-                && self.parts.len() <= 3
-                && (self.parts.len() < 3 || self.parts[2].eq_ignore_ascii_case("Users")))
-            || self.is_wsl_share()
-                && self.parts.len() <= 1
-                && self
-                    .parts
-                    .first()
-                    .is_none_or(|part| part.eq_ignore_ascii_case("home"))
+                    .iter()
+                    .zip(root)
+                    .all(|(part, known)| self.component_eq(part, known)))
+            .then_some(root.len())
+        })
     }
 
     fn parse(path: &Path) -> Self {
@@ -753,98 +879,7 @@ impl DisplayPath {
     }
 
     fn mask_other_user(&self) -> Option<String> {
-        if !self.absolute {
-            return None;
-        }
-        if !self.windows && (self.root.starts_with("//?/") || self.root.starts_with("//./")) {
-            return None;
-        }
-        let lower = |part: &str, value: &str| {
-            if self.windows {
-                part.trim_end_matches(['.', ' '])
-                    .eq_ignore_ascii_case(value)
-            } else {
-                part.eq_ignore_ascii_case(value)
-            }
-        };
-        let index = if self.root == "/" {
-            if self
-                .parts
-                .first()
-                .is_some_and(|p| lower(p, "Users") || lower(p, "home"))
-            {
-                Some(1)
-            } else if self.parts.len() >= 2
-                && lower(&self.parts[0], "var")
-                && lower(&self.parts[1], "home")
-            {
-                Some(2)
-            } else if self.parts.len() >= 3
-                && lower(&self.parts[0], "private")
-                && lower(&self.parts[1], "var")
-                && lower(&self.parts[2], "home")
-            {
-                Some(3)
-            } else if self.parts.len() >= 4
-                && lower(&self.parts[0], "System")
-                && lower(&self.parts[1], "Volumes")
-                && lower(&self.parts[2], "Data")
-                && lower(&self.parts[3], "Users")
-            {
-                Some(4)
-            } else if self.parts.len() >= 4
-                && lower(&self.parts[2], "Users")
-                && (lower(&self.parts[0], "Volumes")
-                    || lower(&self.parts[0], "mnt")
-                        && self.parts[1].len() == 1
-                        && self.parts[1].as_bytes()[0].is_ascii_alphabetic())
-            {
-                Some(3)
-            } else if self.parts.len() >= 3
-                && (lower(&self.parts[0], "usr") || lower(&self.parts[0], "export"))
-                && lower(&self.parts[1], "home")
-            {
-                Some(2)
-            } else {
-                None
-            }
-        // A real UNC server named `device` shares this lexical spelling.
-        // Conservatively mask any Users component there as well.
-        } else if self.root.starts_with("//device/") {
-            self.parts
-                .iter()
-                .position(|part| lower(part, "Users"))
-                .map(|index| index + 1)
-        } else if self.root.ends_with(':') || self.root.starts_with("//") {
-            if self.parts.first().is_some_and(|p| {
-                lower(p, "Users") || self.root.ends_with(':') && lower(p, "Documents and Settings")
-            }) {
-                Some(1)
-            } else if self.root.starts_with("//")
-                && self
-                    .root
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|share| lower(share, "Users"))
-            {
-                Some(0)
-            } else if self.is_wsl_share() {
-                self.parts
-                    .first()
-                    .is_some_and(|part| lower(part, "home"))
-                    .then_some(1)
-            } else if self.root.ends_with(':')
-                && self.parts.len() >= 3
-                && lower(&self.parts[0], "msys64")
-                && lower(&self.parts[1], "home")
-            {
-                Some(2)
-            } else {
-                None
-            }
-        } else {
-            None
-        }?;
+        let index = self.account_index()?;
         if self.parts.len() <= index {
             return None;
         } // bare root has no identity

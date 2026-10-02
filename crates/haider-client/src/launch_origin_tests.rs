@@ -959,3 +959,202 @@ fn wire_kind_vocabulary_is_pinned() {
     assert_eq!(OriginPathKind::Redacted.as_wire(), "redacted");
     assert_eq!(OriginPathKind::Unavailable.as_wire(), "unavailable");
 }
+
+#[test]
+fn redirected_home_uses_the_actual_account_component() {
+    for (home, profile, path) in [
+        (r"\\srv\Users", "C:/Users/alice", r"\\srv\Users\bob\alice\x"),
+        ("//srv/Users", "C:/Users/alice", "//srv/Users/bob/alice/x"),
+        (
+            r"\\?\UNC\srv\Users",
+            "C:/Users/alice",
+            r"\\?\UNC\srv\Users\bob\alice\x",
+        ),
+        (r"\\SRV\USERS", "C:/Users/alice", r"\\srv\users\BOB\ALICE\x"),
+        (
+            r"\\srv\Users. ",
+            "C:/Users/alice",
+            r"\\srv\Users. \bob\alice\x",
+        ),
+        ("H:/", "C:/Users/home", "H:/msys64/home/bob/x"),
+        (
+            r"\\?\Volume{abc}\",
+            "C:/Users/alice",
+            r"\\?\Volume{abc}\cache\alice\Users\bob\x",
+        ),
+        (
+            r"\\?\Volume{abc}\cache\alice",
+            "C:/Users/alice",
+            r"\\?\Volume{abc}\cache\alice\Users\bob\x",
+        ),
+        ("H:/", "C:/Users/alice/nested", "H:/Users/bob/nested/x"),
+    ] {
+        let actual = projected(path, &[home, profile]).1;
+        assert!(
+            !actual.to_ascii_lowercase().contains("bob"),
+            "{home} {profile} {path}: {actual}"
+        );
+    }
+    for (profile, path, expected) in [
+        ("C:/Users/alice", "H:/Users./alice/x", "~/Users./<user>/x"),
+        ("C:/Users/alice", "H:/Users /alice/x", "~/Users /<user>/x"),
+        ("C:/Users/alice.", "H:/Users/alice/x", "~/Users/<user>/x"),
+        (
+            "C:/Users/alice",
+            "H:/Documents and Settings/alice/x",
+            "~/Documents and Settings/<user>/x",
+        ),
+        (
+            "C:/Users/alice",
+            "H:/msys64/home/alice/x",
+            "~/msys64/home/<user>/x",
+        ),
+    ] {
+        assert_eq!(projected(path, &["H:/", profile]).1, expected);
+    }
+}
+
+#[test]
+fn account_roots_share_home_and_workspace_validation() {
+    for (root, path) in [
+        (r"\\srv\share\msys64", r"\\srv\share\msys64\home\bob\x"),
+        (r"\\srv\msys64\home", r"\\srv\msys64\home\bob\x"),
+        (
+            r"\\srv\share\Documents and Settings",
+            r"\\srv\share\Documents and Settings\bob\x",
+        ),
+        (
+            r"\\srv\Documents and Settings",
+            r"\\srv\Documents and Settings\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Documents and Settings",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Documents and Settings\bob\x",
+        ),
+        ("C:/msys64", "C:/msys64/home/bob/x"),
+        ("C:/msys64/home", "C:/msys64/home/bob/x"),
+        (r"c:\MSYS64\HOME", r"C:\msys64\home\BOB\x"),
+        (r"C:\msys64. \home. ", r"C:\msys64\home\bob\x"),
+        (r"\\?\C:\msys64\home", r"C:\msys64\home\bob\x"),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1",
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Users\bob\x",
+        ),
+        (
+            r"\??\GLOBALROOT\Device\HarddiskVolume3\Users",
+            r"\??\GLOBALROOT\Device\HarddiskVolume3\Users\bob\x",
+        ),
+        (
+            r"\\?\globalroot\device\harddiskvolume3\USERS",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users\BOB\x",
+        ),
+        (
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users\bob\x",
+        ),
+        (r"\\?\Volume{abc}\", r"\\?\Volume{abc}\Users\bob\x"),
+        (r"\\srv\Users", r"\\srv\Users\bob\x"),
+    ] {
+        assert!(!usable_home(Path::new(root)), "home {root}");
+        assert!(
+            super::is_multiuser_workspace_root(Path::new(root)),
+            "workspace {root}"
+        );
+        assert!(
+            !projected(path, &[root])
+                .1
+                .to_ascii_lowercase()
+                .contains("bob"),
+            "{root} {path}"
+        );
+        assert_eq!(
+            super::workspace_relative_display(Path::new(path), Path::new(root)),
+            None,
+            "{root} {path}"
+        );
+        assert_eq!(
+            super::workspace_relative_display(Path::new(root), Path::new(root)).as_deref(),
+            Some("."),
+            "bare parent {root}"
+        );
+        assert!(
+            !projected(path, &["D:/safe", root])
+                .1
+                .to_ascii_lowercase()
+                .contains("bob")
+        );
+    }
+    for (root, path) in [
+        (
+            "C:/msys64/home/alice/project",
+            "C:/msys64/home/alice/project/src/x.rs",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users\bob\project",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users\bob\project\src\x.rs",
+        ),
+        (r"\\srv\alice\project", r"\\srv\alice\project\src\x.rs"),
+        ("D:/safe", "D:/safe/src/x.rs"),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\project",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\project\src\x.rs",
+        ),
+    ] {
+        assert!(usable_home(Path::new(root)), "{root}");
+        assert!(
+            !super::is_multiuser_workspace_root(Path::new(root)),
+            "{root}"
+        );
+        assert_eq!(projected(path, &[root]).1, "~/src/x.rs");
+        assert_eq!(
+            super::workspace_relative_display(Path::new(path), Path::new(root)).as_deref(),
+            Some("src/x.rs")
+        );
+    }
+}
+
+#[test]
+fn dot_device_namespace_is_not_a_traversal_component() {
+    for (root, path) in [
+        (r"\\.\C:\w", r"\\.\C:\w\src\x.rs"),
+        (r"\\.\C:\w", r"c:\W\src\x.rs"),
+        (r"C:\w", r"\\.\c:\W\src\x.rs"),
+        (r"\\.\UNC\srv\share\w", r"\\srv\share\w\src\x.rs"),
+        (
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users\alice\project",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users\alice\project\src\x.rs",
+        ),
+    ] {
+        assert_eq!(
+            super::workspace_relative_display(Path::new(path), Path::new(root)).as_deref(),
+            Some("src/x.rs"),
+            "{root} {path}"
+        );
+    }
+    for path in [
+        r"\\.\C:\w\..\Users\bob\x",
+        r"\\.\C:\w\sub\.. \x",
+        r"\\.\C:\w\.\x",
+    ] {
+        assert_eq!(
+            super::workspace_relative_display(Path::new(path), Path::new(r"\\.\C:\w")),
+            None
+        );
+    }
+}

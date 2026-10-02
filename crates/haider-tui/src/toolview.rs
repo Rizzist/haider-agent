@@ -119,6 +119,13 @@ pub struct PathContext {
 }
 
 impl PathContext {
+    #[must_use]
+    pub fn process_homes() -> Self {
+        Self {
+            workspace: None,
+            homes: haider_client::launch_origin::process_display_homes(),
+        }
+    }
     /// Mask another account before workspace shortening. A workspace root
     /// that can contain separate accounts keeps the masked label. A path
     /// beneath a narrower workspace can use a safe relative remainder.
@@ -202,11 +209,7 @@ fn arg_text<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
 /// shared home/account mask before putting them in a compact tool row.
 #[must_use]
 pub fn project_absolute_pattern(pattern: &str) -> String {
-    if is_absolute_pattern(pattern) {
-        crate::live::workspace_display_path(pattern)
-    } else {
-        pattern.to_owned()
-    }
+    project_pattern_in_context(pattern, &PathContext::process_homes())
 }
 
 fn is_absolute_pattern(pattern: &str) -> bool {
@@ -217,12 +220,77 @@ fn is_absolute_pattern(pattern: &str) -> bool {
         || (bytes.get(1) == Some(&b':') && matches!(bytes.get(2).copied(), Some(b'/' | b'\\')))
 }
 
-fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> String {
-    if is_absolute_pattern(pattern) {
-        paths.shorten(pattern)
-    } else {
-        pattern.to_owned()
+pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> String {
+    let mut prefix = pattern.trim_start();
+    while let Some(tail) = prefix.strip_prefix('!') {
+        if tail.starts_with('(') {
+            break;
+        }
+        prefix = tail.trim_start();
     }
+    if !is_absolute_pattern(prefix)
+        && !prefix.starts_with(['~', '{', '\'', '"'])
+        && !["@(", "!(", "?(", "+(", "*("]
+            .iter()
+            .any(|syntax| prefix.starts_with(syntax))
+    {
+        return pattern.to_owned();
+    }
+    // Glob expressions can place an absolute branch after negation, spaces
+    // or brace syntax. Project each such branch while retaining the syntax.
+    // A slash inside a relative pattern is not a branch boundary.
+    let mut output = String::new();
+    let mut rest = pattern;
+    let mut boundary = true;
+    while !rest.is_empty() {
+        if boundary && (is_absolute_pattern(rest) || rest.starts_with('~')) {
+            // Nested braces belong to this path (including volume GUIDs
+            // and account alternatives); only an outer separator ends it.
+            let mut depth = 0_u32;
+            let end = rest
+                .char_indices()
+                .find_map(|(index, ch)| {
+                    match ch {
+                        '{' | '(' => depth += 1,
+                        '}' | ')' if depth > 0 => depth -= 1,
+                        ',' | '}' | ')' | '|' | '\'' | '"' if depth == 0 => return Some(index),
+                        _ if ch.is_whitespace() && depth == 0 => {
+                            let next = rest[index..].trim_start();
+                            if is_absolute_pattern(next) || next.starts_with('~') {
+                                return Some(index);
+                            }
+                        }
+                        _ => {}
+                    }
+                    None
+                })
+                .unwrap_or(rest.len());
+            let branch = &rest[..end];
+            if let Some(user) = branch.strip_prefix('~') {
+                let name_end = user.find(['/', '\\']).unwrap_or(user.len());
+                if name_end > 0 {
+                    output.push_str("~<user>");
+                    output.push_str(&user[name_end..]);
+                } else {
+                    output.push_str(branch);
+                }
+            } else {
+                output.push_str(&paths.shorten(branch));
+            }
+            rest = &rest[end..];
+            boundary = false;
+        } else {
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            output.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            boundary = ch.is_whitespace()
+                || matches!(ch, '{' | '(' | ',' | '|' | '\'' | '"')
+                || ch == '!' && boundary;
+        }
+    }
+    output
 }
 
 /// The FULL command a shell-ish call ran: `command`/`cmd`, or an `argv`
@@ -257,7 +325,11 @@ pub fn header_args(name: &str, args: &serde_json::Value, paths: &PathContext) ->
             ],
         )
         .map(|path| paths.shorten(path))
-        .unwrap_or_else(|| one_line(&crate::toolfold::semantic_summary(name, args)))
+        .unwrap_or_else(|| {
+            one_line(&crate::toolfold::semantic_summary_with_context(
+                name, args, paths,
+            ))
+        })
     };
     match tool_kind(name) {
         ToolKind::Read | ToolKind::Write | ToolKind::Edit => path.unwrap_or_else(fallback),
