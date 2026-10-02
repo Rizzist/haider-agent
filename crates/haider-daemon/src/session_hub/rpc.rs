@@ -23,6 +23,10 @@ mod direct_ssh_tests;
 #[path = "activity_wire_tests.rs"]
 mod activity_wire_tests;
 
+#[cfg(test)]
+#[path = "inventory_refresh_tests.rs"]
+mod inventory_refresh_tests;
+
 use super::*;
 use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
@@ -1206,6 +1210,12 @@ fn fleet_now_ms() -> u64 {
 
 pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, model: &str) -> bool {
     summary.inventory.needs_refresh()
+        // User declarations are not discovery evidence for a compatible
+        // endpoint. Azure's unsupported-listing projection is terminal and
+        // already permits an explicitly configured, unverified deployment.
+        || matches!(summary.inventory, haider_rpc::ModelInventoryWire::Configured)
+            && summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory
+            && !summary.endpoint.as_deref().is_some_and(haider_provider::azure_openai_origin)
         || matches!(
             summary.inventory,
             haider_rpc::ModelInventoryWire::Fetched { .. }

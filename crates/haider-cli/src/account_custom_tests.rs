@@ -93,6 +93,134 @@ fn descriptor() -> CredentialDescriptor {
     }
 }
 
+fn readd_options() -> CustomAccountOptions {
+    CustomAccountOptions {
+        alias: "router".into(),
+        base_url: Some("http://127.0.0.1:8080".into()),
+        secret: Some(SecretInput::Direct(haider_rpc::SecretWire::new(
+            "fixture-secret",
+        ))),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        trust: None,
+        json: true,
+    }
+}
+
+#[tokio::test]
+async fn removed_custom_account_can_be_readded_to_its_retained_profile() {
+    let mut retained = provider();
+    retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    let client = FakeClient::new([
+        ResponseBody::ProviderList {
+            providers: vec![retained.clone()],
+            revision: 8,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::AccountList {
+            descriptors: Vec::new(),
+            revision: Some(9),
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::VaultStage {
+            stage_id: "stage".into(),
+            vault_reference: "vaultref-new".into(),
+            expires_at_ms: 99,
+        },
+        ResponseBody::ProviderConfigure {
+            provider: retained.clone(),
+            revision: 9,
+        },
+        ResponseBody::AccountLoginApi {
+            descriptor: descriptor(),
+        },
+        ResponseBody::ProviderList {
+            providers: vec![retained],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+    ]);
+    assert!(
+        matches!(execute_custom(&client, readd_options(), true).await, Ok(code) if code == ExitCode::SUCCESS)
+    );
+    assert!(client.requests().iter().any(|request| matches!(
+        request,
+        RequestBody::AccountLoginApi {
+            replace_existing: false,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn add_never_replaces_an_existing_account_or_builtin_or_no_auth_profile() {
+    for active in [true, false] {
+        let mut retained = provider();
+        retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+        let mut account = descriptor();
+        account.active = active;
+        let client = FakeClient::new([
+            ResponseBody::ProviderList {
+                providers: vec![retained],
+                revision: 8,
+                availability: Some(SnapshotAvailabilityWire::Available),
+            },
+            ResponseBody::AccountList {
+                descriptors: vec![account],
+                revision: Some(9),
+                availability: Some(SnapshotAvailabilityWire::Available),
+            },
+        ]);
+        assert!(matches!(
+            execute_custom(&client, readd_options(), true).await,
+            Err(AccountError::Protocol(_))
+        ));
+        assert_eq!(client.requests().len(), 2);
+    }
+    for no_auth in [true, false] {
+        let mut retained = provider();
+        if no_auth {
+            retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+            retained.auth_methods.clear();
+        }
+        let client = FakeClient::new([ResponseBody::ProviderList {
+            providers: vec![retained],
+            revision: 8,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        }]);
+        assert!(matches!(
+            execute_custom(&client, readd_options(), true).await,
+            Err(AccountError::Protocol(_))
+        ));
+        assert_eq!(client.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn readd_requires_an_available_account_snapshot() {
+    let mut retained = provider();
+    retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    let client = FakeClient::new([
+        ResponseBody::ProviderList {
+            providers: vec![retained],
+            revision: 8,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::AccountList {
+            descriptors: Vec::new(),
+            revision: Some(9),
+            availability: Some(SnapshotAvailabilityWire::Unknown),
+        },
+    ]);
+    assert!(matches!(
+        execute_custom(&client, readd_options(), true).await,
+        Err(AccountError::SnapshotUnavailable(_))
+    ));
+    assert_eq!(client.requests().len(), 2);
+}
+
 #[test]
 fn add_parser_accepts_every_secret_source_and_redacts_inline_keys() {
     let command = parse_account_command(&[

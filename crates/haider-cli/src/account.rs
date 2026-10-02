@@ -1012,10 +1012,22 @@ async fn execute_custom(
         .iter()
         .find(|provider| provider.provider == options.alias)
         .cloned();
-    if create && existing.is_some() {
-        return Err(AccountError::Protocol(
-            "account add alias already names a provider; use account update",
-        ));
+    if create && let Some(provider) = &existing {
+        // Removing a credential deliberately retains its custom profile. A
+        // vacant credential slot can be filled again, but an existing account
+        // (including an inactive or expired one) still requires update.
+        let vacant_custom_account = provider.catalog == haider_rpc::ProviderCatalogKindWire::Custom
+            && !provider.auth_methods.is_empty()
+            && !account_snapshot(client)
+                .await?
+                .0
+                .iter()
+                .any(|descriptor| descriptor.alias.as_str() == options.alias);
+        if !vacant_custom_account {
+            return Err(AccountError::Protocol(
+                "account add alias already names a provider; use account update",
+            ));
+        }
     }
     if !create && existing.is_none() {
         return Err(AccountError::MissingAlias(options.alias));

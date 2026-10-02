@@ -1221,3 +1221,56 @@ fn configured_unverified_deployment_is_selectable_and_reason_fits_both_picker_si
     assert_eq!(model.identity.model_short, "my-gpt-deployment");
     assert!(model.model_picker.is_none());
 }
+
+#[test]
+fn refused_pick_keeps_its_specific_reason_and_provider_visible_after_roster_refresh() {
+    for (width, height) in [(118, 36), (80, 24)] {
+        let mut model = seeded_launcher();
+        add_api_provider(
+            &mut model,
+            ApiProviderFixture {
+                provider: "azure-deploy",
+                model: "my-gpt-deployment",
+                available: false,
+                reason: Some("server returned 503 for /models; retry discovery"),
+                context_window: None,
+                fetched_at_ms: None,
+                lockdown: false,
+                is_default: false,
+            },
+        );
+        let old_pair = (
+            model.identity.provider.clone(),
+            model.identity.model_short.clone(),
+        );
+        run_slash(&mut model, "/model my-gpt");
+        model.handle(key(KeyCode::Enter));
+        let text = draw_rows(&model, width, height).join("\n");
+        assert!(
+            text.contains("Unavailable") && text.contains("503"),
+            "{text}"
+        );
+        assert_eq!(
+            (
+                model.identity.provider.clone(),
+                model.identity.model_short.clone()
+            ),
+            old_pair
+        );
+        model.handle(key(KeyCode::Esc));
+        run_slash(&mut model, "/providers");
+        // The actual provider-list reply may insert/reorder providers before
+        // the refused row. Focus follows its ID, never a stale cursor index.
+        let mut refreshed = model.providers.providers.clone();
+        let mut inserted = refreshed[0].clone();
+        inserted.provider = "inserted-provider".into();
+        refreshed.insert(0, inserted);
+        model.providers.apply_snapshot(refreshed, 2);
+        let text = draw_rows(&model, width, height).join("\n");
+        assert!(text.contains("azure-deploy"), "{text}");
+        assert_eq!(
+            model.providers.providers[model.providers.cursor].provider,
+            "azure-deploy"
+        );
+    }
+}

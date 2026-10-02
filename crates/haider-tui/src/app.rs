@@ -1148,6 +1148,8 @@ pub struct ProvidersState {
     /// Armed by a cursor move: the next frame scrolls the cursor's
     /// provider block into view, then clears the latch.
     pub follow_cursor: std::cell::Cell<bool>,
+    /// Keep a refused pick's provider visible when the roster refresh arrives.
+    focus_after_refresh: Option<String>,
 }
 
 /// Normalize wire compatibility projections at the client snapshot boundary.
@@ -1188,6 +1190,18 @@ fn provider_inventory_can_fetch(summary: &haider_rpc::ProviderSummaryWire) -> bo
 }
 
 impl ProvidersState {
+    fn focus_provider(&mut self, provider: &str) {
+        self.focus_after_refresh = Some(provider.to_owned());
+        if let Some(cursor) = self
+            .providers
+            .iter()
+            .position(|row| row.provider == provider)
+        {
+            self.cursor = cursor;
+            self.follow_cursor.set(true);
+        }
+    }
+
     /// Applies a `provider.list` snapshot, gated on revision monotonicity.
     pub fn apply_snapshot(
         &mut self,
@@ -1206,6 +1220,15 @@ impl ProvidersState {
         self.revision = Some(revision);
         if self.cursor >= self.providers.len() {
             self.cursor = self.providers.len().saturating_sub(1);
+        }
+        if let Some(provider) = self.focus_after_refresh.take()
+            && let Some(cursor) = self
+                .providers
+                .iter()
+                .position(|row| row.provider == provider)
+        {
+            self.cursor = cursor;
+            self.follow_cursor.set(true);
         }
         true
     }
@@ -21142,8 +21165,9 @@ impl AppModel {
                 .clone()
                 .unwrap_or_else(|| "API providers unavailable".to_owned());
             if let Some(picker) = self.model_picker.as_mut() {
-                picker.error = Some(format!("{} — {reason}", row.model));
+                picker.error = Some(format!("Unavailable: {reason} · {}", row.provider));
             }
+            self.providers.focus_provider(&row.provider);
             return;
         }
         self.enter_model_provider_stage(&row.model);
@@ -21220,8 +21244,9 @@ impl AppModel {
                 .clone()
                 .unwrap_or_else(|| "provider unavailable".to_owned());
             if let Some(picker) = self.model_picker.as_mut() {
-                picker.error = Some(format!("{} — {reason}", row.provider));
+                picker.error = Some(format!("Unavailable: {reason} · {}", row.provider));
             }
+            self.providers.focus_provider(&row.provider);
             return;
         }
         // Demo fabricates locally; the launcher (no attached session)
