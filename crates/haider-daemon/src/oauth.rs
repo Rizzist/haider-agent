@@ -5113,9 +5113,106 @@ impl RefreshFlight {
 #[derive(Clone, Default)]
 pub(crate) struct RefreshFenceRegistry {
     fences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    credential_writes: Arc<Mutex<HashMap<String, Arc<CredentialWriteState>>>>,
+}
+
+#[derive(Default)]
+struct CredentialWriteState {
+    generation: AtomicU64,
+    legacy_digest: Mutex<Option<LegacyApiKeyBinding>>,
+}
+
+struct LegacyApiKeyBinding {
+    incarnation: u64,
+    digest: Option<String>,
+}
+
+/// Covers the vault-first commit, snapshot publication and any rollback.
+/// An odd generation denies readers, including legacy descriptors with no digest.
+pub(crate) struct CredentialWriteGuard(Arc<CredentialWriteState>);
+
+impl Drop for CredentialWriteGuard {
+    fn drop(&mut self) {
+        self.0.generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl RefreshFenceRegistry {
+    fn credential_write_counter(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<Arc<CredentialWriteState>, HaiderError> {
+        let mut writes = self
+            .credential_writes
+            .lock()
+            .map_err(|_| credential_changed())?;
+        Ok(Arc::clone(
+            writes
+                .entry(alias.as_str().to_owned())
+                .or_insert_with(|| Arc::new(CredentialWriteState::default())),
+        ))
+    }
+
+    /// Bind a migrated API key before replacing its bytes. The binding survives
+    /// receipt failure while the published snapshot still refers to that incarnation.
+    pub(crate) fn bind_legacy_api_key(
+        &self,
+        descriptor: Option<&CredentialDescriptor>,
+        secret: Option<&SecretHandle>,
+    ) -> Result<(), HaiderError> {
+        if let Some(descriptor) = descriptor
+            && descriptor.auth_method == AuthMethod::ApiKey
+            && descriptor.credential_digest.is_none()
+            && !crate::gcloud::is_gcloud_refresh_descriptor(descriptor)
+        {
+            let state = self.credential_write_counter(&descriptor.alias)?;
+            *state
+                .legacy_digest
+                .lock()
+                .map_err(|_| credential_changed())? = Some(LegacyApiKeyBinding {
+                incarnation: descriptor.incarnation,
+                // An unreadable old secret cannot authorize any replacement bytes.
+                digest: secret
+                    .map(|secret| blake3::hash(secret.expose_secret()).to_hex().to_string()),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_credential_write(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<CredentialWriteGuard, HaiderError> {
+        let counter = self.credential_write_counter(alias)?;
+        let generation = counter.generation.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2)
+            || counter
+                .generation
+                .compare_exchange(
+                    generation,
+                    generation + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(credential_changed());
+        }
+        Ok(CredentialWriteGuard(counter))
+    }
+
+    fn credential_read_generation(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<(Arc<CredentialWriteState>, u64), HaiderError> {
+        let counter = self.credential_write_counter(alias)?;
+        let generation = counter.generation.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2) {
+            return Err(credential_changed());
+        }
+        Ok((counter, generation))
+    }
+
     fn fence_for(&self, alias: &CredentialAlias) -> Arc<AtomicU64> {
         self.fences
             .lock()
@@ -5154,6 +5251,40 @@ struct BrokerInner {
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     #[cfg(test)]
     panic_refresh_worker: AtomicBool,
+}
+
+pub(crate) fn api_key_descriptor_is_current(
+    snapshot: &crate::accounts::AccountsSnapshot,
+    expected: &CredentialDescriptor,
+) -> bool {
+    snapshot.lock().is_ok_and(|descriptors| {
+        descriptors.iter().any(|current| {
+            current.alias == expected.alias
+                && current.provider == expected.provider
+                && current.auth_method == expected.auth_method
+                && current.base_url == expected.base_url
+                && current.incarnation == expected.incarnation
+        })
+    })
+}
+
+pub(crate) fn validate_api_key_secret(
+    descriptor: &CredentialDescriptor,
+    secret: &SecretHandle,
+) -> Result<(), HaiderError> {
+    // The native gcloud account deliberately rotates its access token without
+    // replacing the account. Ordinary API keys are immutable within an incarnation.
+    if !crate::gcloud::is_gcloud_refresh_descriptor(descriptor)
+        && descriptor
+            .credential_digest
+            .as_ref()
+            .is_some_and(|expected| {
+                expected != &blake3::hash(secret.expose_secret()).to_hex().to_string()
+            })
+    {
+        return Err(credential_changed());
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -5432,7 +5563,41 @@ impl CredentialBroker {
             return Err(broker_stopped());
         }
         match descriptor.auth_method {
-            AuthMethod::ApiKey => self.resolve_vault(&descriptor.alias).await,
+            AuthMethod::ApiKey => {
+                let (counter, generation) = self
+                    .inner
+                    .fences
+                    .credential_read_generation(&descriptor.alias)?;
+                if !api_key_descriptor_is_current(&self.inner.snapshot, descriptor) {
+                    return Err(credential_changed());
+                }
+                let secret = self.resolve_vault(&descriptor.alias).await?;
+                if counter.generation.load(Ordering::Acquire) != generation
+                    || !api_key_descriptor_is_current(&self.inner.snapshot, descriptor)
+                {
+                    return Err(credential_changed());
+                }
+                validate_api_key_secret(descriptor, &secret)?;
+                if descriptor.credential_digest.is_none()
+                    && counter
+                        .legacy_digest
+                        .lock()
+                        .map_err(|_| credential_changed())?
+                        .as_ref()
+                        .is_some_and(|binding| {
+                            binding.incarnation == descriptor.incarnation
+                                && binding.digest.as_ref().is_none_or(|expected| {
+                                    expected
+                                        != &blake3::hash(secret.expose_secret())
+                                            .to_hex()
+                                            .to_string()
+                                })
+                        })
+                {
+                    return Err(credential_changed());
+                }
+                Ok(secret)
+            }
             AuthMethod::OAuth => match Self::snapshot_oauth_state(&self.inner, descriptor) {
                 SnapshotOAuthState::Current | SnapshotOAuthState::Expired => {
                     self.resolve_oauth(descriptor, false, None).await
@@ -6964,6 +7129,14 @@ fn expired_or_replaced(descriptor: &CredentialDescriptor) -> HaiderError {
         haider_accounts::RotationTrigger::AuthExpired,
         false,
         "OAuth credential is expired or was replaced",
+    )
+}
+
+fn credential_changed() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::ProviderError,
+        "the account credential changed while resolving it; retry with the current account",
+        true,
     )
 }
 

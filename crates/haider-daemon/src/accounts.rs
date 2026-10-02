@@ -1914,6 +1914,7 @@ async fn run_account_actor(
             AccountCommand::Login(job) => {
                 pending.retain(|_, entry| entry.claimed_at.elapsed() < SECRET_TTL);
                 handle_login(
+                    &refresh_fences,
                     &store,
                     &mut accounts,
                     vault.as_ref(),
@@ -1932,6 +1933,7 @@ async fn run_account_actor(
             }
             AccountCommand::AddOAuth(job) => {
                 handle_oauth_add(
+                    &refresh_fences,
                     &store,
                     &mut accounts,
                     Arc::clone(&vault),
@@ -7084,6 +7086,7 @@ const fn provider_auth_label(auth: ProviderAuthRequirementWire) -> &'static str 
 /// commit-order and ownership laws this implements.
 #[allow(clippy::too_many_arguments)]
 async fn handle_login(
+    refresh_fences: &RefreshFenceRegistry,
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &dyn Vault,
@@ -7339,6 +7342,20 @@ async fn handle_login(
             let same_key = prior_secret
                 .as_ref()
                 .is_some_and(|prior| bool::from(prior.expose_secret().ct_eq(secret.as_ref())));
+            if let Err(error) =
+                refresh_fences.bind_legacy_api_key(accounts.get(&alias), prior_secret.as_ref())
+            {
+                respond_management_error(&route, &error);
+                return;
+            }
+            // Deny inference/discovery reads until descriptor publication or rollback.
+            let _credential_write = match refresh_fences.begin_credential_write(&alias) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    respond_management_error(&route, &error);
+                    return;
+                }
+            };
             // Keychain first (R10 step 9).
             if let Err(error) = vault.put(&alias, &secret) {
                 pending.insert(
@@ -7546,6 +7563,7 @@ impl OAuthAddIdentity {
 /// Neither it nor the ready reference is ever serialized into SQLite.
 #[allow(clippy::too_many_arguments)]
 async fn handle_oauth_add(
+    refresh_fences: &RefreshFenceRegistry,
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
@@ -7721,6 +7739,13 @@ async fn handle_oauth_add(
         return;
     }
     let before = accounts.list().to_vec();
+    let _credential_write = match refresh_fences.begin_credential_write(&alias) {
+        Ok(guard) => guard,
+        Err(error) => {
+            respond_management_error(&route, &error);
+            return;
+        }
+    };
     if let Err(error) = persist_oauth_bundle(
         accounts,
         Arc::clone(&vault),
@@ -8834,6 +8859,19 @@ async fn handle_oauth_import(
     if replacing.is_some() {
         refresh_fences.invalidate(&alias);
     }
+    if let Err(error) =
+        refresh_fences.bind_legacy_api_key(accounts.get(&alias), prior_secret.as_ref())
+    {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let _credential_write = match refresh_fences.begin_credential_write(&alias) {
+        Ok(guard) => guard,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
     if let Err(error) = persist_oauth_import_material(
         accounts,
         Arc::clone(&vault),
@@ -11565,7 +11603,16 @@ impl AccountsProviderFactory {
                     false,
                 ));
             };
-            vault.resolve(&descriptor.alias)
+            if !crate::oauth::api_key_descriptor_is_current(&self.snapshot, descriptor) {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "credential changed while resolving the account; retry",
+                    true,
+                ));
+            }
+            let secret = vault.resolve(&descriptor.alias)?;
+            crate::oauth::validate_api_key_secret(descriptor, &secret)?;
+            Ok(secret)
         }
     }
 

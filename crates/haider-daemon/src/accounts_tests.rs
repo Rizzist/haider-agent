@@ -4947,6 +4947,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
     // Retryable validation failure: the COMMAND keeps the claimed secret so
     // the same command can retry without retyping the key.
     handle_login(
+        &RefreshFenceRegistry::default(),
         &store,
         &mut accounts,
         &vault,
@@ -4979,6 +4980,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
 
     // Stage-less retry of the SAME command, now past the TTL.
     handle_login(
+        &RefreshFenceRegistry::default(),
         &store,
         &mut accounts,
         &vault,
@@ -13900,6 +13902,7 @@ async fn enterprise_login_validates_at_the_profile_endpoint_with_its_default_mod
     let mut pending: HashMap<String, PendingSecret> = HashMap::new();
     let (sink, mut frames) = channel_sink();
     handle_login(
+        &RefreshFenceRegistry::default(),
         &store,
         &mut accounts,
         &vault,
@@ -16594,6 +16597,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     let snapshot = Arc::new(StdMutex::new(Vec::new()));
     let mut pending = HashMap::new();
     handle_login(
+        &RefreshFenceRegistry::default(),
         &store,
         &mut accounts,
         &vault,
@@ -17651,5 +17655,248 @@ async fn pending_fetched_default_recovery_keeps_its_owner_and_drops_retired_owne
                 .all(|row| row.state == "committed")
         );
         store.close().await.expect("close");
+    }
+}
+
+/// Exercise the real vault-first login at the descriptor persistence boundary.
+/// A failed commit must not let a discovery read B's bytes as A, even when A
+/// was migrated without a credential digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_login_fences_reads_until_commit_or_rollback() {
+    struct HeldDescriptorStore {
+        durable: StdMutex<Vec<CredentialDescriptor>>,
+        armed: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        released: (StdMutex<bool>, std::sync::Condvar),
+        fail: bool,
+    }
+    struct HeldStore(Arc<HeldDescriptorStore>);
+    impl StoreLike for HeldStore {
+        fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+            Ok(floor + 1)
+        }
+        fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
+            Ok(self.0.durable.lock().expect("durable rows").clone())
+        }
+        fn save(&self, descriptors: &[CredentialDescriptor]) -> Result<(), HaiderError> {
+            if self.0.armed.swap(false, Ordering::AcqRel) {
+                self.0.entered.notify_one();
+                let (lock, wake) = &self.0.released;
+                let (released, _) = wake
+                    .wait_timeout_while(
+                        lock.lock().expect("release lock"),
+                        Duration::from_secs(30),
+                        |released| !*released,
+                    )
+                    .expect("held descriptor commit");
+                assert!(*released, "test released the descriptor commit");
+                if self.0.fail {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreLocked,
+                        "synthetic descriptor failure",
+                        true,
+                    ));
+                }
+            }
+            *self.0.durable.lock().expect("durable rows") = descriptors.to_vec();
+            Ok(())
+        }
+    }
+    struct SuccessValidator;
+    #[async_trait::async_trait]
+    impl CredentialValidator for SuccessValidator {
+        fn supports(&self, provider: &str) -> bool {
+            provider == "anthropic"
+        }
+        async fn validate(
+            &self,
+            _provider: &str,
+            _model: &str,
+            _secret: &[u8],
+            _endpoint: Option<&str>,
+        ) -> Result<ValidatedIdentity, ValidationError> {
+            Ok(ValidatedIdentity {
+                identity: "synthetic key B".into(),
+            })
+        }
+    }
+    for legacy in [false, true] {
+        for failure in [0, 1, 2] {
+            for prior_missing in [false, true] {
+                let dir = test_store_dir();
+                let store = open_store(dir.path()).await;
+                let alias = CredentialAlias::new("work");
+                let prior = CredentialDescriptor {
+                    incarnation: 1,
+                    credential_digest: (!legacy)
+                        .then(|| blake3::hash(b"SYNTHETIC_KEY_A").to_hex().to_string()),
+                    alias: alias.clone(),
+                    provider: "anthropic".into(),
+                    base_url: None,
+                    auth_method: AuthMethod::ApiKey,
+                    identity: "synthetic key A".into(),
+                    status: CredentialStatus::Ok,
+                    active: true,
+                    label: None,
+                    account_identity: None,
+                    created_at_ms: None,
+                };
+                let held = Arc::new(HeldDescriptorStore {
+                    durable: StdMutex::new(vec![prior.clone()]),
+                    armed: std::sync::atomic::AtomicBool::new(true),
+                    entered: tokio::sync::Notify::new(),
+                    released: (StdMutex::new(false), std::sync::Condvar::new()),
+                    fail: failure == 1,
+                });
+                let backing: Box<dyn StoreLike> = Box::new(HeldStore(Arc::clone(&held)));
+                let mut accounts = AccountStore::new(backing).expect("held accounts");
+                let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![prior.clone()]));
+                let vault = Arc::new(MemoryVault::new());
+                if !prior_missing {
+                    vault.put(&alias, b"SYNTHETIC_KEY_A").expect("seed A");
+                }
+                let fences = RefreshFenceRegistry::default();
+                let (commands, _receiver) = mpsc::channel(2);
+                let broker = CredentialBroker::new_with_fences(
+                    vault.clone() as Arc<dyn Vault>,
+                    OAuthProviderCatalog::default(),
+                    Arc::clone(&snapshot),
+                    commands,
+                    fences.clone(),
+                )
+                .expect("API key broker");
+                if prior_missing {
+                    assert!(broker.resolve(&prior).await.is_err());
+                } else {
+                    assert_eq!(
+                        broker
+                            .resolve(&prior)
+                            .await
+                            .expect("A before replacement")
+                            .expose_secret(),
+                        b"SYNTHETIC_KEY_A"
+                    );
+                }
+                let (sink, mut frames) = channel_sink();
+                let mut job = login_job(
+                    "synthetic-replace",
+                    "synthetic-replace-request",
+                    Some(b"SYNTHETIC_KEY_B"),
+                    &sink,
+                );
+                job.replace_existing = true;
+                let task_store = store.clone();
+                let task_snapshot = Arc::clone(&snapshot);
+                let task_vault = Arc::clone(&vault);
+                let task = tokio::spawn(async move {
+                    handle_login(
+                        &fences,
+                        &task_store,
+                        &mut accounts,
+                        task_vault.as_ref(),
+                        &SuccessValidator,
+                        &task_snapshot,
+                        None,
+                        &mut login_registry(),
+                        "synthetic-profile",
+                        "claude-test",
+                        &mut HashMap::new(),
+                        &mut AutomaticCatalogDiscoveryQueue::new(true),
+                        &HashSet::new(),
+                        job,
+                    )
+                    .await;
+                });
+                let entered =
+                    tokio::time::timeout(Duration::from_secs(10), held.entered.notified()).await;
+                let read =
+                    tokio::time::timeout(Duration::from_secs(10), broker.resolve(&prior)).await;
+                if failure == 2 {
+                    store.clone().close().await.expect("inject receipt failure");
+                }
+                *held.released.0.lock().expect("release commit") = true;
+                held.released.1.notify_all();
+                task.await.expect("login task");
+                entered.expect("replacement reached descriptor commit");
+                assert!(
+                    read.expect("read completed").is_err(),
+                    "legacy={legacy}, failure={failure}, prior_missing={prior_missing}: B cannot be returned under A's descriptor"
+                );
+                let frame = frames.try_recv().expect("login response");
+                if failure == 1 {
+                    assert!(matches!(
+                        frame,
+                        WireFrame::Response {
+                            body: ResponseBody::Error { .. },
+                            ..
+                        }
+                    ));
+                    if prior_missing {
+                        assert!(
+                            broker.resolve(&prior).await.is_err(),
+                            "rollback deleted uncommitted B"
+                        );
+                    } else {
+                        assert_eq!(
+                            broker
+                                .resolve(&prior)
+                                .await
+                                .expect("A after rollback")
+                                .expose_secret(),
+                            b"SYNTHETIC_KEY_A"
+                        );
+                    }
+                } else if failure == 2 {
+                    assert!(matches!(
+                        frame,
+                        WireFrame::Response {
+                            body: ResponseBody::Error { .. },
+                            ..
+                        }
+                    ));
+                    assert_eq!(
+                        snapshot.lock().expect("old published snapshot")[0].incarnation,
+                        prior.incarnation
+                    );
+                    assert_eq!(
+                        vault
+                            .resolve(&alias)
+                            .expect("committed B vault")
+                            .expose_secret(),
+                        b"SYNTHETIC_KEY_B"
+                    );
+                    assert!(
+                        broker.resolve(&prior).await.is_err(),
+                        "failed receipt publication cannot expose B under legacy A"
+                    );
+                } else {
+                    assert!(matches!(
+                        frame,
+                        WireFrame::Response {
+                            body: ResponseBody::AccountLoginApi { .. },
+                            ..
+                        }
+                    ));
+                    assert!(
+                        broker.resolve(&prior).await.is_err(),
+                        "retired descriptor cannot read B"
+                    );
+                    let current = snapshot.lock().expect("snapshot")[0].clone();
+                    assert!(current.incarnation > prior.incarnation);
+                    assert_eq!(
+                        broker
+                            .resolve(&current)
+                            .await
+                            .expect("B after commit")
+                            .expose_secret(),
+                        b"SYNTHETIC_KEY_B"
+                    );
+                }
+                broker.shutdown().await;
+                if failure != 2 {
+                    store.close().await.expect("close store");
+                }
+            }
+        }
     }
 }
