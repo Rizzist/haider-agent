@@ -71,3 +71,4 @@ daemon-native-close-replay	linux	haider-daemon	lib	native_close_joins_detached_r
 daemon-native-close-publication	linux	haider-daemon	lib	native_close_refuses_monitor_registration_between_commit_and_publication	crates/haider-daemon/src/session_close_tests.rs
 daemon-native-close-process-owner	linux	haider-daemon	lib	native_close_waits_for_cancelled_process_owner_cleanup	crates/haider-daemon/src/session_close_tests.rs
 warm-projection-seed-share	macos	haider-daemon	lib	concurrent_warm_readers_share_one_reducer_seed	crates/haider-daemon/src/worker_warm_journal_projection_tests.rs
+tui-frame-publication	all	haider-tui	lib	a_reader_racing_frame_publication_keeps_the_previous_arrival_stamp	crates/haider-tui/src/input_typeahead_tests.rs

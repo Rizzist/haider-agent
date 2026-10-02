@@ -308,6 +308,7 @@ impl SshRuntime {
             controls,
             activation,
         } = request;
+        let mut close = shell.close_receiver();
         let setup = async {
             validate_pty_request(&term, size)?;
             let slot = self.session_slot(&requested_profile).await;
@@ -367,11 +368,27 @@ impl SshRuntime {
                 .await
                 .map_err(connection_error)?;
             Ok::<_, SshError>((profile.name, channel, lease))
-        }
-        .await;
+        };
+        let setup = tokio::select! {
+            biased;
+            () = async {
+                while !*close.borrow_and_update() {
+                    if close.changed().await.is_err() { break; }
+                }
+            } => Err(registry_error("SSH terminal connection cancelled".into())),
+            result = setup => result,
+        };
         let (profile_name, channel, lease) = match setup {
             Ok(setup) => setup,
             Err(error) => {
+                if !*close.borrow() {
+                    // Pending admission already replied. Preserve the setup
+                    // failure on this shell's owned output stream before exit.
+                    let _ = shell.publish_output(
+                        ShellOutputStreamWire::Stderr,
+                        format!("{error}\r\n").as_bytes(),
+                    );
+                }
                 let _ = shell.exited(None);
                 return Err(error);
             }
@@ -1010,7 +1027,7 @@ fn registry_error(message: String) -> SshError {
     SshError::SshConnection { message }
 }
 
-fn validate_pty_request(term: &str, size: SshPtySizeWire) -> Result<(), SshError> {
+pub(crate) fn validate_pty_request(term: &str, size: SshPtySizeWire) -> Result<(), SshError> {
     if term.is_empty() || term.len() > MAX_TERM_BYTES || term.chars().any(char::is_control) {
         return Err(SshError::SshProfileInvalid {
             field: "term",

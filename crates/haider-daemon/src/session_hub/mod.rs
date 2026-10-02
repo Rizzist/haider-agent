@@ -90,6 +90,10 @@
 mod session_hub_private_tests;
 
 #[cfg(test)]
+#[path = "../session_hub_ssh_tests.rs"]
+mod session_hub_ssh_tests;
+
+#[cfg(test)]
 #[path = "../session_close_tests.rs"]
 mod session_close_tests;
 

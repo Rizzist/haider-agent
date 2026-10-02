@@ -657,6 +657,9 @@ pub struct SessionProjection {
     /// the same failure.
     pending_effect_failures: Vec<PendingEffectFailure>,
     menu: Option<Menu>,
+    pending_menus: std::collections::HashSet<haider_protocol::ids::MenuId>,
+    menu_instance: u64,
+    permission_instance: u64,
     /// Menu-id → opening scope (report R11 cut 2). Stream-scoped: hydration
     /// starts it empty, and a menu with no recorded opening falls back to
     /// the pre-W3c3 broadcast.
@@ -858,6 +861,7 @@ impl SessionProjection {
             user_entries,
             screen_control_items,
             has_tool_entries,
+            pending_menus: menu.iter().map(|menu| menu.id.clone()).collect(),
             menu,
             todos,
             usage,
@@ -1104,8 +1108,13 @@ impl SessionProjection {
                 self.run = Some(run.clone());
             }
             EventPayload::IdleDecayed => self.interrupted = false,
-            EventPayload::MenuOpened(menu) => self.menu = Some(menu.clone()),
+            EventPayload::MenuOpened(menu) => {
+                self.pending_menus.insert(menu.id.clone());
+                self.menu_instance = self.menu_instance.wrapping_add(1);
+                self.menu = Some(menu.clone());
+            }
             EventPayload::MenuAnswered(answer) => {
+                self.pending_menus.remove(&answer.menu);
                 if self.menu.as_ref().is_some_and(|m| m.id == answer.menu) {
                     if let Some(menu) = self.menu.as_ref()
                         && matches!(
@@ -1140,6 +1149,7 @@ impl SessionProjection {
                 }
             }
             EventPayload::MenuClosed { menu, .. } => {
+                self.pending_menus.remove(menu);
                 if self.menu.as_ref().is_some_and(|open| open.id == *menu) {
                     self.menu = None;
                 }
@@ -2619,6 +2629,30 @@ impl SessionProjection {
         self.menu.as_ref()
     }
 
+    /// Incarnations are minted at ingestion, so input identity does not
+    /// format or copy the card body (which can contain a large file diff).
+    #[must_use]
+    pub(crate) fn menu_instance(&self) -> u64 {
+        self.menu_instance
+    }
+
+    #[must_use]
+    pub(crate) fn permission_instance(&self) -> u64 {
+        self.permission_instance
+    }
+
+    /// Number of unresolved decisions, including cards covered by a later
+    /// question. This count is independent of which card currently paints.
+    #[must_use]
+    pub fn pending_menu_count(&self) -> usize {
+        self.pending_menus.len()
+            + usize::from(
+                self.permission_card
+                    .as_ref()
+                    .is_some_and(|card| !self.pending_menus.contains(&card.menu_id)),
+            )
+    }
+
     /// The active computer OS-permission grant card, if any.
     #[must_use]
     pub fn permission_card(&self) -> Option<&haider_protocol::permission::PermissionGrantNeeded> {
@@ -2631,6 +2665,7 @@ impl SessionProjection {
         &mut self,
         card: haider_protocol::permission::PermissionGrantNeeded,
     ) {
+        self.permission_instance = self.permission_instance.wrapping_add(1);
         self.permission_card = Some(card);
     }
 

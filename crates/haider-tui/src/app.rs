@@ -271,6 +271,9 @@ pub enum InputOwner {
     CustomProviderForm,
     AccountsReplace,
     SessionMenu,
+    /// Integration seam for a deferred usage decision. Its visibility
+    /// predicate must rank it below pickers, Search and History.
+    SpendCard,
     SubagentQuestion,
     PlanDoc,
     FileReviewDoc,
@@ -293,6 +296,16 @@ pub struct PresentedInput {
 }
 
 impl InputOwner {
+    pub(crate) const fn confirms_decision(self) -> bool {
+        matches!(
+            self,
+            Self::SessionMenu
+                | Self::SpendCard
+                | Self::SubagentQuestion
+                | Self::PlanDoc
+                | Self::FileReviewDoc
+        )
+    }
     /// Owners with a visible draft field. A shared answer-line card joins
     /// here without changing every input route independently.
     const fn accepts_composer_edits(self) -> bool {
@@ -308,6 +321,7 @@ impl InputOwner {
             self,
             Self::Composer(Screen::Session | Screen::Subagent)
                 | Self::SessionMenu
+                | Self::SpendCard
                 | Self::Search
                 | Self::ThemePicker
                 | Self::EffortPicker
@@ -3218,6 +3232,7 @@ impl std::fmt::Debug for SshTerminalInput {
 pub struct SshTerminalPane {
     pub profile: String,
     pub shell_id: Option<String>,
+    pub connecting: bool,
     output: zeroize::Zeroizing<Vec<u8>>,
     pub size: haider_rpc::SshPtySizeWire,
 }
@@ -3241,6 +3256,7 @@ impl SshTerminalPane {
         Self {
             profile,
             shell_id: None,
+            connecting: true,
             output: zeroize::Zeroizing::new(Vec::new()),
             size,
         }
@@ -5967,8 +5983,16 @@ pub struct AppModel {
     pub(crate) mouse_press_hit: Option<Hit>,
     pub(crate) mouse_press_rect: Option<ratatui::layout::Rect>,
     pub(crate) mouse_press_epoch: Option<u64>,
+    pub(crate) mouse_press_dwell_ready: bool,
     pub(crate) painted_input: std::cell::RefCell<Option<PresentedInput>>,
     pub(crate) painted_epoch: std::cell::Cell<u64>,
+    pub(crate) input_rebase: Option<crate::runtime::InputRebase>,
+    pub(crate) input_refused: bool,
+    /// Foreign mirror and inject replacements own a fresh draft. Local
+    /// typing keeps this revision stable so a burst can remain one cohort.
+    composer_replacement_epoch: u64,
+    pub(crate) pointer_presentation:
+        std::cell::RefCell<Option<(PresentedInput, std::time::Instant)>>,
     /// TUI5 item 5 — a left button went down INSIDE the composer text: the
     /// drag (if any) is a COMPOSER selection, never the transcript's
     /// screen-space drag (region disambiguation by drag START). Transient
@@ -6303,8 +6327,13 @@ impl Default for AppModel {
             mouse_press_hit: None,
             mouse_press_rect: None,
             mouse_press_epoch: None,
+            mouse_press_dwell_ready: false,
             painted_input: std::cell::RefCell::new(None),
             painted_epoch: std::cell::Cell::new(0),
+            input_rebase: None,
+            input_refused: false,
+            composer_replacement_epoch: 0,
+            pointer_presentation: std::cell::RefCell::new(None),
             composer_drag: false,
             should_quit: false,
             dirty: true,
@@ -8018,6 +8047,7 @@ impl AppModel {
                 if !self.accepts_injected_edits() {
                     return;
                 }
+                self.composer_replacement_epoch = self.composer_replacement_epoch.wrapping_add(1);
                 self.composer.set_text(text);
                 self.dirty = true;
             }
@@ -10032,6 +10062,10 @@ impl AppModel {
     /// against the current value before they can change state.
     #[must_use]
     pub fn input_owner(&self) -> InputOwner {
+        self.primary_input_owner()
+    }
+
+    fn primary_input_owner(&self) -> InputOwner {
         if self.lockdown_overlay {
             return InputOwner::Lockdown;
         }
@@ -10136,39 +10170,126 @@ impl AppModel {
         }
     }
 
+    /// Deferred-decision plug-in seam. The usage projection supplies the
+    /// current spend-menu id; this runtime supplies visibility and precedence.
+    /// Ordinary blocking menus continue to use `input_owner()`.
+    #[must_use]
+    pub fn spend_card_input_owner(&self, card: &MenuId) -> InputOwner {
+        // The deferred-card extension can call this from input_owner()
+        // without recursively asking that extension to route itself.
+        let owner = self.primary_input_owner();
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        let permission_cover = match self.screen {
+            Screen::Session => self.projection.permission_card().is_some(),
+            Screen::Subagent => self
+                .viewed_chip()
+                .is_some_and(|chip| chip.transcript.permission_card().is_some()),
+            _ => false,
+        };
+        let card_visible = !permission_cover && menu.is_some_and(|menu| &menu.id == card);
+        if !card_visible
+            || !matches!(
+                owner,
+                InputOwner::SessionMenu | InputOwner::SpendCard | InputOwner::SubagentQuestion
+            )
+        {
+            return owner;
+        }
+        if self.transcript_search.is_some() {
+            InputOwner::Search
+        } else if self.effort_picker.is_some() {
+            InputOwner::EffortPicker
+        } else if self.theme_picker.is_some() {
+            InputOwner::ThemePicker
+        } else if self.backtrack.is_some() {
+            InputOwner::HistoryChooser
+        } else if !self.composer.is_empty()
+            || !self.mirrored_input_attachments().is_empty()
+            || self.talk.engaged()
+        {
+            InputOwner::Composer(self.screen)
+        } else {
+            InputOwner::SpendCard
+        }
+    }
+
+    /// Popup identity uses the revision, never the composer's text bytes.
+    fn composer_popup_identity(&self) -> Option<String> {
+        if self.palette_open() {
+            Some(format!(
+                "palette:{}:{}",
+                self.composer.revision(),
+                self.palette_selection
+            ))
+        } else {
+            self.mention_completion.as_ref().map(|completion| {
+                format!(
+                    "mentions:{}:{}:{}",
+                    self.composer.revision(),
+                    completion.start,
+                    completion.selected
+                )
+            })
+        }
+    }
+
     /// Stable identity for the topmost input target, independent of cadence
     /// redraws and geometry epochs.
     #[must_use]
     pub fn presented_input(&self) -> PresentedInput {
         let owner = self.input_owner();
         let instance = match owner {
+            InputOwner::SpendCard => self
+                .decision_identity()
+                .map(|identity| format!("{identity}:{}", self.menu_selection)),
             InputOwner::SessionMenu => Some(format!(
                 "{}:{}:{}",
                 self.projection
                     .open_menu()
-                    .map(|menu| menu.id.to_string())
+                    .map(|menu| format!("{}:{}", menu.id, self.projection.menu_instance()))
                     .unwrap_or_default(),
                 self.projection
                     .permission_card()
-                    .map(|card| card.request_id.as_str())
+                    .map(|card| format!(
+                        "{}:{}",
+                        card.request_id,
+                        self.projection.permission_instance()
+                    ))
                     .unwrap_or_default(),
                 self.menu_selection
             )),
-            InputOwner::PlanDoc | InputOwner::FileReviewDoc => self
-                .projection
-                .open_menu()
-                .map(|menu| format!("{}:{}", menu.id, self.menu_selection)),
-            InputOwner::Composer(Screen::Session) => self
-                .projection
-                .open_menu()
-                .filter(|menu| menu.options.is_empty())
-                .map(|menu| format!("answer:{}", menu.id)),
+            InputOwner::PlanDoc | InputOwner::FileReviewDoc => {
+                self.projection.open_menu().map(|menu| {
+                    format!(
+                        "{}:{}:{}",
+                        menu.id,
+                        self.projection.menu_instance(),
+                        self.menu_selection
+                    )
+                })
+            }
+            InputOwner::Composer(Screen::Session) => {
+                let answer = self
+                    .projection
+                    .open_menu()
+                    .filter(|menu| menu.options.is_empty())
+                    .map(|menu| format!("answer:{}:{}", menu.id, self.projection.menu_instance()));
+                match (answer, self.composer_popup_identity()) {
+                    (Some(answer), Some(popup)) => Some(format!("{answer}:{popup}")),
+                    (answer, popup) => answer.or(popup),
+                }
+            }
+            InputOwner::Composer(_) => self.composer_popup_identity(),
             InputOwner::SubagentQuestion => self.viewed_chip().map(|chip| {
                 format!(
                     "{}:{}:{}",
                     chip.agent,
                     chip.question_menu()
-                        .map(|menu| menu.id.to_string())
+                        .map(|menu| format!("{}:{}", menu.id, chip.transcript.menu_instance()))
                         .unwrap_or_default(),
                     self.menu_selection
                 )
@@ -10330,6 +10451,7 @@ impl AppModel {
             )),
             _ => None,
         };
+        let instance = self.composer_replacement_identity(owner, instance);
         PresentedInput {
             owner,
             surface: self.ui_generation(),
@@ -10356,6 +10478,7 @@ impl AppModel {
         self.mouse_press_hit = None;
         self.mouse_press_rect = None;
         self.mouse_press_epoch = None;
+        self.mouse_press_dwell_ready = false;
         self.composer_drag = false;
         if let Some(selection) = &mut self.selection {
             selection.dragging = false;
@@ -10377,13 +10500,124 @@ impl AppModel {
     }
 
     pub(crate) fn record_painted_input(&self) {
+        self.record_painted_input_at(std::time::Instant::now());
+    }
+
+    pub(crate) fn record_painted_input_at(&self, now: std::time::Instant) {
         let next = self.presented_input();
+        let pointer_owner = self.pointer_input_owner();
+        let mut pointer = self.pointer_presentation.borrow_mut();
+        if pointer
+            .as_ref()
+            .is_none_or(|(owner, _)| owner != &pointer_owner)
+        {
+            *pointer = Some((pointer_owner, now));
+        }
         let mut painted = self.painted_input.borrow_mut();
         if painted.as_ref() != Some(&next) {
             self.painted_epoch
                 .set(self.painted_epoch.get().wrapping_add(1));
         }
         *painted = Some(next);
+    }
+
+    fn decision_identity(&self) -> Option<String> {
+        if !self.input_owner().confirms_decision() {
+            return None;
+        }
+        let (origin, projection) = if self.screen == Screen::Subagent {
+            let chip = self.viewed_chip()?;
+            (chip.agent.as_str(), &chip.transcript)
+        } else {
+            ("session", &self.projection)
+        };
+        Some(format!(
+            "{}:{}:{}:{:?}",
+            origin,
+            projection
+                .open_menu()
+                .map(|menu| menu.id.as_str())
+                .unwrap_or_default(),
+            projection.menu_instance(),
+            projection
+                .permission_card()
+                .map(|_| projection.permission_instance())
+        ))
+    }
+
+    /// Cursor, hover and field focus do not replace a pointer surface.
+    /// Card incarnations and form/picker stages do.
+    pub(crate) fn pointer_input_owner(&self) -> PresentedInput {
+        let mut owner = self.presented_input();
+        owner.instance =
+            match owner.owner {
+                InputOwner::CustomProviderForm => self.custom_add.as_ref().map(|card| {
+                    format!("{}:{:?}", card.attempt, std::mem::discriminant(&card.phase))
+                }),
+                InputOwner::Login => self.login.as_ref().map(|card| {
+                    format!("{}:{:?}", card.attempt, std::mem::discriminant(&card.stage))
+                }),
+                InputOwner::TalkSetup => self
+                    .talk_setup
+                    .as_ref()
+                    .map(|card| format!("{:?}:{:?}", card.stage, card.key_stage)),
+                InputOwner::ModelPicker => self.model_picker.as_ref().map(|picker| {
+                    format!(
+                        "{:?}",
+                        picker.provider_stage.as_ref().map(|stage| &stage.model)
+                    )
+                }),
+                InputOwner::SshForm => self
+                    .ssh_form
+                    .as_ref()
+                    .map(|form| format!("{:?}", form.original)),
+                InputOwner::Composer(_) => {
+                    if self.palette_open() {
+                        Some("palette".into())
+                    } else if self.mention_completion.is_some() {
+                        Some("mentions".into())
+                    } else {
+                        self.projection
+                            .open_menu()
+                            .filter(|menu| menu.options.is_empty())
+                            .map(|menu| {
+                                format!("answer:{}:{}", menu.id, self.projection.menu_instance())
+                            })
+                    }
+                }
+                InputOwner::ToolDetail
+                | InputOwner::FleetMemberDetail
+                | InputOwner::SshTerminal
+                | InputOwner::AccountsReplace => owner.instance.clone(),
+                _ => self.decision_identity(),
+            };
+        owner.instance = self.composer_replacement_identity(owner.owner, owner.instance);
+        owner
+    }
+
+    fn composer_replacement_identity(
+        &self,
+        owner: InputOwner,
+        instance: Option<String>,
+    ) -> Option<String> {
+        if matches!(owner, InputOwner::Composer(_)) && self.composer_replacement_epoch != 0 {
+            Some(format!(
+                "replaced:{}:{}",
+                self.composer_replacement_epoch,
+                instance.unwrap_or_default()
+            ))
+        } else {
+            instance
+        }
+    }
+
+    pub(crate) fn pointer_commit_ready(&self, now: std::time::Instant) -> bool {
+        self.pointer_presentation
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, shown)| {
+                now.saturating_duration_since(*shown) >= std::time::Duration::from_millis(400)
+            })
     }
 
     /// Whether the visible Session answer line accepts an external edit.
@@ -14906,6 +15140,16 @@ impl AppModel {
                 InboxKind::Unseen => counts.unseen += 1,
             }
         }
+        let current_counted = self.projection.open_menu().is_some()
+            || self.active_session.as_ref().is_some_and(|active| {
+                self.session_rows_for_query("")
+                    .iter()
+                    .any(|row| &row.id == active && row.needs_input.is_some())
+            });
+        counts.asks += self
+            .projection
+            .pending_menu_count()
+            .saturating_sub(usize::from(current_counted));
         counts
     }
 
@@ -17930,8 +18174,16 @@ impl AppModel {
                 haider_rpc::ShellKindWire::Ssh { profile } if profile == &terminal.profile
             )
         {
+            terminal.connecting = shell.status == haider_rpc::ShellStatusWire::Starting;
             terminal.shell_id = Some(shell.id);
-            self.flash = Some("· remote terminal connected · ⌃] close".into());
+            self.flash = Some(
+                if terminal.connecting {
+                    "· opening remote terminal…"
+                } else {
+                    "· remote terminal connected · ⌃] close"
+                }
+                .into(),
+            );
             self.dirty = true;
         } else {
             // The user closed the connecting pane before the open reply.
@@ -17949,6 +18201,13 @@ impl AppModel {
     }
 
     pub(crate) fn apply_ssh_shell_terminal_state(&mut self, shell: &haider_rpc::ShellWire) {
+        if shell.status == haider_rpc::ShellStatusWire::Running
+            && let Some(terminal) = self.ssh_terminal.as_mut()
+            && terminal.shell_id.as_deref() == Some(shell.id.as_str())
+        {
+            terminal.connecting = false;
+            self.flash = Some("· remote terminal connected · ⌃] close".into());
+        }
         let closes = self
             .ssh_terminal
             .as_ref()
@@ -17959,9 +18218,23 @@ impl AppModel {
                 haider_rpc::ShellStatusWire::Exited { .. } | haider_rpc::ShellStatusWire::Closed
             );
         if closes {
-            self.ssh_terminal = None;
-            self.flash = Some(match &shell.status {
-                haider_rpc::ShellStatusWire::Exited { code } => code.map_or_else(
+            let setup_error = self.ssh_terminal.take().and_then(|terminal| {
+                terminal
+                    .connecting
+                    .then(|| {
+                        terminal
+                            .display_text()
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .collect::<String>()
+                    })
+                    .filter(|text| !text.is_empty())
+            });
+            self.flash = Some(match (&shell.status, setup_error) {
+                (haider_rpc::ShellStatusWire::Exited { .. }, Some(error)) => {
+                    format!("· remote terminal failed: {error}")
+                }
+                (haider_rpc::ShellStatusWire::Exited { code }, None) => code.map_or_else(
                     || "· remote terminal exited".into(),
                     |code| format!("· remote terminal exited {code}"),
                 ),
@@ -17997,7 +18270,16 @@ impl AppModel {
         };
         if close {
             self.requests.push(AppRequest::ShellClose { id });
-            self.flash = Some("· closing remote terminal…".into());
+            if self
+                .ssh_terminal
+                .as_ref()
+                .is_some_and(|pane| pane.connecting)
+            {
+                self.ssh_terminal = None;
+                self.flash = Some("· remote terminal connection cancelled".into());
+            } else {
+                self.flash = Some("· closing remote terminal…".into());
+            }
             return;
         }
         if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -20294,7 +20576,7 @@ impl AppModel {
             InputOwner::CustomProviderForm => {
                 matches!(hit, Hit::CustomProviderField { .. } | Hit::AccountAdd(_))
             }
-            InputOwner::SessionMenu => {
+            InputOwner::SessionMenu | InputOwner::SpendCard => {
                 transcript
                     || matches!(
                         hit,

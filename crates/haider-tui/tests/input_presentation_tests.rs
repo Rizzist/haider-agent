@@ -12,7 +12,7 @@ use haider_tui::{
         LoginCard, PromptBacktrack, RuntimeMode, Screen, ThemePicker, ToolDetailView,
         TranscriptSearch,
     },
-    runtime::dispatch_input,
+    runtime::dispatch_input_at,
     script::{ChipDisplayState, ChipSeed},
 };
 use ratatui::{
@@ -23,6 +23,17 @@ use ratatui::{
     },
     layout::Rect,
 };
+
+// These legacy controls exercise deliberate interaction with an already
+// presented surface. Fresh-owner timing is tested in runtime_pointer_tests.
+fn dispatch_input(model: &mut AppModel, hits: &[(Rect, Hit)], event: Event) {
+    dispatch_input_at(
+        model,
+        hits,
+        event,
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+    );
+}
 
 const DRAFT: &str = "KEEP_THIS_DRAFT words";
 

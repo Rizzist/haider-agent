@@ -359,3 +359,89 @@ fn ssh_test_host_key_mismatch_keeps_its_typed_code() {
             if code == "ssh_host_key_changed"
     ));
 }
+
+#[test]
+fn pending_shell_reply_can_be_cancelled_before_connecting_and_running_is_separate() {
+    let mut model = live_session();
+    model.ssh_terminal = Some(SshTerminalPane::opening(
+        "prod".into(),
+        model.ssh_terminal_size,
+    ));
+    let mut pending = shell(
+        "pending-shell",
+        haider_rpc::ShellKindWire::Ssh {
+            profile: "prod".into(),
+        },
+    );
+    pending.status = haider_rpc::ShellStatusWire::Starting;
+    model.apply_ssh_shell_opened(pending.clone());
+    assert!(
+        model
+            .ssh_terminal
+            .as_ref()
+            .expect("pending pane")
+            .connecting
+    );
+    assert_eq!(
+        model
+            .ssh_terminal
+            .as_ref()
+            .expect("pending pane")
+            .shell_id
+            .as_deref(),
+        Some("pending-shell")
+    );
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('5'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(model.ssh_terminal.is_none());
+    assert!(
+        matches!(model.requests.last(), Some(AppRequest::ShellClose { id }) if id == "pending-shell")
+    );
+    // A subsequent state event cannot resurrect a cancelled pane.
+    pending.status = haider_rpc::ShellStatusWire::Running;
+    model.apply_shell_event(pending.clone());
+    assert!(model.ssh_terminal.is_none());
+    model.ssh_terminal = Some(SshTerminalPane::opening(
+        "prod".into(),
+        model.ssh_terminal_size,
+    ));
+    pending.id = "deliberate-new-shell".into();
+    pending.status = haider_rpc::ShellStatusWire::Starting;
+    model.apply_ssh_shell_opened(pending.clone());
+    pending.status = haider_rpc::ShellStatusWire::Running;
+    model.apply_shell_event(pending);
+    assert!(
+        !model
+            .ssh_terminal
+            .as_ref()
+            .expect("connected pane")
+            .connecting
+    );
+}
+
+#[test]
+fn failed_pending_setup_keeps_the_owned_error_visible() {
+    let mut model = live_session();
+    model.ssh_terminal = Some(SshTerminalPane::opening(
+        "prod".into(),
+        model.ssh_terminal_size,
+    ));
+    let mut pending = shell(
+        "failed-pending",
+        haider_rpc::ShellKindWire::Ssh {
+            profile: "prod".into(),
+        },
+    );
+    pending.status = haider_rpc::ShellStatusWire::Starting;
+    model.apply_ssh_shell_opened(pending.clone());
+    model.apply_ssh_shell_output(&pending.id, b"SSH fixture setup failed\r\n");
+    pending.status = haider_rpc::ShellStatusWire::Exited { code: None };
+    model.apply_shell_event(pending);
+    assert!(model.ssh_terminal.is_none());
+    assert_eq!(
+        model.flash.as_deref(),
+        Some("· remote terminal failed: SSH fixture setup failed")
+    );
+}

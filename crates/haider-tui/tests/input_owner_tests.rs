@@ -14,7 +14,7 @@ use haider_tui::{
         TranscriptSearch,
     },
     live::{LiveDriver, LiveReply},
-    runtime::dispatch_input,
+    runtime::dispatch_input_at,
     script::{ChipDisplayState, ChipSeed},
     talk::{CommitIntent, TalkEvent, TalkPhase},
 };
@@ -26,6 +26,17 @@ use ratatui::{
     },
     layout::Rect,
 };
+
+// These legacy controls exercise deliberate interaction with an already
+// presented surface. Fresh-owner timing is tested in runtime_pointer_tests.
+fn dispatch_input(model: &mut AppModel, hits: &[(Rect, Hit)], event: Event) {
+    dispatch_input_at(
+        model,
+        hits,
+        event,
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+    );
+}
 
 const DRAFT: &str = "KEEP_THIS_DRAFT words";
 
@@ -1812,6 +1823,7 @@ fn owner_label(owner: InputOwner) -> &'static str {
         InputOwner::CustomProviderForm => "custom provider",
         InputOwner::AccountsReplace => "accounts replace",
         InputOwner::SessionMenu => "session menu",
+        InputOwner::SpendCard => "spend card",
         InputOwner::SubagentQuestion => "subagent question",
         InputOwner::PlanDoc => "plan",
         InputOwner::FileReviewDoc => "file review",

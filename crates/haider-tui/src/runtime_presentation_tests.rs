@@ -13,7 +13,10 @@ fn input_stamp_uses_the_frame_completed_before_event_ingress() {
     let owner = AppModel::new().presented_input();
     let before = Instant::now();
     let paint_done = before + Duration::from_millis(10);
-    let state = Mutex::new(Some(((owner.clone(), 7), paint_done)));
+    let state = Mutex::new(std::collections::VecDeque::from([(
+        (owner.clone(), 7),
+        paint_done,
+    )]));
     assert_eq!(input_stamp(&state, before), None);
     assert_eq!(input_stamp(&state, paint_done), Some((owner, 7)));
 }
@@ -26,6 +29,7 @@ fn queued_input_requires_a_painted_owner_and_retires_stale_mouse_press() {
         &mut model,
         &[],
         QueuedInput {
+            received_at: Instant::now(),
             event: Event::Key(ratatui::crossterm::event::KeyEvent::new(
                 KeyCode::Char('x'),
                 KeyModifiers::NONE,
@@ -40,6 +44,7 @@ fn queued_input_requires_a_painted_owner_and_retires_stale_mouse_press() {
         &mut model,
         &[],
         QueuedInput {
+            received_at: Instant::now(),
             event: Event::Mouse(ratatui::crossterm::event::MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 1,
@@ -95,6 +100,7 @@ fn paint_generation_changes_on_owner_transition_but_not_a_same_owner_redraw() {
         &mut model,
         &[],
         QueuedInput {
+            received_at: Instant::now(),
             event: Event::Key(ratatui::crossterm::event::KeyEvent::new(
                 KeyCode::Char('x'),
                 KeyModifiers::NONE,

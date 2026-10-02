@@ -35,16 +35,28 @@ use tokio::sync::mpsc;
 struct QueuedInput {
     event: Event,
     presented: Option<(PresentedInput, u64)>,
+    received_at: Instant,
 }
 
-type PresentedFrame = Mutex<Option<((PresentedInput, u64), Instant)>>;
+type PresentedFrame = Mutex<std::collections::VecDeque<((PresentedInput, u64), Instant)>>;
+
+/// Only an accepted queued dispatch may extend this chain. The expected
+/// stamp includes the paint epoch, so an outside transition (even away and
+/// back to the same owner) breaks it.
+#[derive(Clone, Debug)]
+pub(crate) struct InputRebase {
+    source: Option<(PresentedInput, u64)>,
+    expected: Option<(PresentedInput, u64)>,
+    pointer_stable: bool,
+}
 
 fn input_stamp(frame: &PresentedFrame, received_at: Instant) -> Option<(PresentedInput, u64)> {
     frame
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .and_then(|(owner, painted_at)| (*painted_at <= received_at).then(|| owner.clone()))
+        .iter()
+        .rev()
+        .find_map(|(owner, painted_at)| (*painted_at <= received_at).then(|| owner.clone()))
 }
 
 fn dispatch_queued_input(
@@ -52,25 +64,160 @@ fn dispatch_queued_input(
     hits: &[(ratatui::layout::Rect, crate::app::Hit)],
     input: QueuedInput,
 ) -> bool {
+    let current = model.painted_stamp();
+    let rebased = model
+        .input_rebase
+        .as_ref()
+        .is_some_and(|chain| chain.source == input.presented && chain.expected == current);
+    let pointer_rebased = rebased
+        && model
+            .input_rebase
+            .as_ref()
+            .is_some_and(|chain| chain.pointer_stable);
     if matches!(
         &input.event,
         Event::Key(_) | Event::Paste(_) | Event::Mouse(_)
-    ) && (input.presented.is_none() || input.presented != model.painted_stamp())
+    ) && (input.presented.is_none()
+        || (input.presented != current
+            && (!rebased || (matches!(&input.event, Event::Mouse(_)) && !pointer_rebased)))
+        || model.painted_input().as_ref() != Some(&model.presented_input()))
     {
         if matches!(&input.event, Event::Mouse(_)) {
             model.clear_mouse_press();
         }
+        model.flash = Some("· Input changed: please try again".to_owned());
+        model.input_refused = true;
+        model.dirty = true;
         return false;
     }
-    dispatch_input(model, hits, input.event);
+    // Navigation is lossless, but a decision may only confirm the option
+    // presented when this key arrived. Painting after Down does not turn
+    // an already queued Enter into informed confirmation.
+    if matches!(&input.event, Event::Key(key) if key.code == KeyCode::Enter)
+        && model.input_owner().confirms_decision()
+        && input.presented != current
+    {
+        model.flash = Some("· Selection changed: press Enter again to confirm".to_owned());
+        model.input_refused = true;
+        model.dirty = true;
+        return false;
+    }
+    // Focus and resize reports are external events, even though they share
+    // the terminal queue. They must not turn a stale ingress stamp into a
+    // valid chain for keys following an outside owner change.
+    if !matches!(
+        &input.event,
+        Event::Key(_) | Event::Paste(_) | Event::Mouse(_)
+    ) {
+        model.input_rebase = None;
+        dispatch_input(model, hits, input.event);
+        return true;
+    }
+    let source = if rebased {
+        model
+            .input_rebase
+            .as_ref()
+            .and_then(|chain| chain.source.clone())
+    } else {
+        input.presented.clone()
+    };
+    let pointer_before = model.pointer_input_owner();
+    let pointer_stable = !rebased
+        || model
+            .input_rebase
+            .as_ref()
+            .is_some_and(|chain| chain.pointer_stable);
+    if matches!(&input.event, Event::Mouse(_)) {
+        dispatch_input_at(model, hits, input.event, input.received_at);
+    } else {
+        dispatch_input(model, hits, input.event);
+    }
+    let pointer_stable = pointer_stable && pointer_before == model.pointer_input_owner();
+    let next = model.presented_input();
+    let expected = current.map(|(owner, epoch)| {
+        let epoch = if owner == next {
+            epoch
+        } else {
+            epoch.wrapping_add(1)
+        };
+        (next, epoch)
+    });
+    model.input_rebase = Some(InputRebase {
+        source,
+        expected,
+        pointer_stable,
+    });
     true
 }
 
 fn owner_needs_presentation(model: &AppModel) -> bool {
-    model.painted_input().as_ref() != Some(&model.presented_input())
+    model.painted_input().as_ref() != Some(&model.presented_input()) || model.input_refused
 }
 
 const SYSTEM_THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(20);
+static STARTUP_INPUT: Mutex<std::collections::VecDeque<(Event, Instant)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+fn take_startup_input() -> std::collections::VecDeque<(Event, Instant)> {
+    std::mem::take(
+        &mut *STARTUP_INPUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+fn read_input(
+    startup: &mut std::collections::VecDeque<(Event, Instant)>,
+) -> std::io::Result<(Event, Instant, bool)> {
+    if let Some((event, received_at)) = startup.pop_front() {
+        Ok((event, received_at, true))
+    } else {
+        event::read().map(|event| (event, Instant::now(), false))
+    }
+}
+
+/// A free-text question shares the composer owner, but still needs a
+/// presented decision target. Only an ordinary draft gets startup rebasing.
+fn startup_input_presentation(model: &AppModel) -> Option<(PresentedInput, u64)> {
+    let menu = match model.input_owner() {
+        crate::app::InputOwner::Composer(crate::app::Screen::Session) => {
+            model.projection.open_menu()
+        }
+        crate::app::InputOwner::Composer(crate::app::Screen::Subagent) => model
+            .viewed_chip()
+            .and_then(crate::app::ChipModel::question_menu),
+        _ => None,
+    };
+    if menu.is_some_and(|menu| menu.options.is_empty()) {
+        return None;
+    }
+    model.painted_stamp()
+}
+
+fn stamped_input(
+    frame: &PresentedFrame,
+    event: Event,
+    received_at: Instant,
+    from_startup: bool,
+    initial_presentation: Option<&(PresentedInput, u64)>,
+) -> QueuedInput {
+    // Preserve typing collected before the first frame. Pointer reports and
+    // decision keys still need a target that existed when they were received.
+    let presented = if from_startup
+        && matches!(&event, Event::Key(_) | Event::Paste(_))
+        && initial_presentation
+            .is_some_and(|(owner, _)| matches!(owner.owner, crate::app::InputOwner::Composer(_)))
+    {
+        initial_presentation.cloned()
+    } else {
+        input_stamp(frame, received_at)
+    };
+    QueuedInput {
+        event,
+        presented,
+        received_at,
+    }
+}
 
 /// OSC 11 sequence setting the terminal's own background — the emulator's
 /// window padding around the cell grid then matches the theme ground, so the
@@ -150,11 +297,9 @@ fn sync_terminal_bg(theme: ThemeKey) {
 /// terminals that set it but stay silent on OSC (e.g. rxvt lineage,
 /// some tmux setups). Call BEFORE entering raw mode/alt screen.
 ///
-/// Known residual (review TUI1 P2): the probe owns the tty for its bounded
-/// window, so a keystroke typed in that pre-UI instant is consumed, not
-/// forwarded. The window is kept tiny (20ms) and runs before any UI invites
-/// input. The loss-free design — parsing the OSC reply inside the sole input
-/// reader — lands with the daemon-era input stack (see OPTIMIZATIONS.md).
+/// The bounded probe retains every event except a complete OSC colour
+/// response. The sole input pump drains those retained events after the
+/// first frame, so typing during detection survives startup.
 #[must_use]
 pub fn detect_system_theme() -> ThemeKey {
     let osc = probe_terminal_theme(SYSTEM_THEME_PROBE_TIMEOUT);
@@ -214,9 +359,16 @@ fn probe_terminal_theme(timeout: Duration) -> Option<termbg::Theme> {
         disable_on_drop: !raw_before,
     };
     let mut events = CrosstermThemeEventReader;
-    query_terminal_theme(terminal, timeout, &mut events, &mut stderr())
-        .ok()
-        .flatten()
+    let mut retained = Vec::new();
+    let result = query_terminal_theme(terminal, timeout, &mut events, &mut stderr(), &mut retained);
+    // All retained events precede this instant and the first paint. Keeping
+    // that boundary prevents a startup pointer report becoming a fresh click.
+    let received_at = Instant::now();
+    STARTUP_INPUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(retained.into_iter().map(|event| (event, received_at)));
+    result.ok().flatten()
 }
 
 fn query_terminal_theme(
@@ -224,6 +376,7 @@ fn query_terminal_theme(
     timeout: Duration,
     events: &mut dyn ThemeEventReader,
     output: &mut dyn Write,
+    retained: &mut Vec<Event>,
 ) -> std::io::Result<Option<termbg::Theme>> {
     let query = match terminal {
         termbg::Terminal::Tmux => "\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\",
@@ -235,30 +388,55 @@ fn query_terminal_theme(
     output.flush()?;
 
     let deadline = Instant::now() + timeout;
-    let mut response = String::new();
+    // Crossterm parses OSC's ESC ] as Alt+]. Only consume a complete,
+    // recognized colour response; every other event remains user input.
+    let mut response: Option<(usize, String)> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || !events.poll(remaining)? {
-            return Ok(terminal_appearance_from_response(&response));
+            return Ok(None);
         }
-        let Event::Key(key) = events.read()? else {
+        retained.push(events.read()?);
+        let Some(Event::Key(key)) = retained.last() else {
+            response = None;
             continue;
         };
+        let key = *key;
         if key.kind == KeyEventKind::Release {
+            response = None;
             continue;
         }
         match (key.code, key.modifiers) {
+            (KeyCode::Char(']'), KeyModifiers::ALT) => {
+                response = Some((retained.len() - 1, String::new()));
+            }
             (KeyCode::Char('\\'), KeyModifiers::ALT | KeyModifiers::NONE)
             | (KeyCode::Char('g'), KeyModifiers::CONTROL)
             | (KeyCode::Char('\u{0007}'), KeyModifiers::NONE) => {
-                return Ok(terminal_appearance_from_response(&response));
+                if let Some((start, text)) = response.take()
+                    && text.strip_prefix("11;rgb:").is_some_and(|rgb| {
+                        let parts: Vec<_> = rgb.split('/').collect();
+                        parts.len() == 3
+                            && parts.iter().all(|part| {
+                                !part.is_empty()
+                                    && part.len() <= 4
+                                    && part.chars().all(|c| c.is_ascii_hexdigit())
+                            })
+                    })
+                    && let Some(appearance) = terminal_appearance_from_response(&text)
+                {
+                    retained.truncate(start);
+                    return Ok(Some(appearance));
+                }
             }
             (KeyCode::Char(character), modifiers)
                 if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
             {
-                response.push(character);
+                if let Some((_, text)) = &mut response {
+                    text.push(character);
+                }
             }
-            _ => {}
+            _ => response = None,
         }
     }
 }
@@ -356,6 +534,77 @@ mod theme_probe_tests {
     }
 
     #[test]
+    fn startup_probe_retains_typing_paste_focus_and_incomplete_answers() {
+        for mut input in [
+            "/theme"
+                .chars()
+                .map(|c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)))
+                .collect::<Vec<_>>(),
+            vec![
+                Event::Paste("@path".into()),
+                Event::FocusLost,
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            ],
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT)),
+                Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            ],
+        ] {
+            let expected = input.clone();
+            let mut events = AnswerEvents {
+                events: input.drain(..).collect(),
+            };
+            let mut retained = Vec::new();
+            assert_eq!(
+                query_terminal_theme(
+                    termbg::Terminal::XtermCompatible,
+                    SYSTEM_THEME_PROBE_TIMEOUT,
+                    &mut events,
+                    &mut Vec::new(),
+                    &mut retained
+                )
+                .expect("query"),
+                None
+            );
+            assert_eq!(
+                retained, expected,
+                "the first frame must receive every user event"
+            );
+        }
+    }
+
+    #[test]
+    fn colour_answer_only_consumes_its_own_events_between_startup_keys() {
+        let key = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let mut input = std::collections::VecDeque::from([key('a')]);
+        input.push_back(Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT,
+        )));
+        input.extend("11;rgb:ffff/ffff/ffff".chars().map(key));
+        input.push_back(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
+        input.push_back(key('b'));
+        let mut events = AnswerEvents { events: input };
+        let mut retained = Vec::new();
+        assert_eq!(
+            query_terminal_theme(
+                termbg::Terminal::XtermCompatible,
+                SYSTEM_THEME_PROBE_TIMEOUT,
+                &mut events,
+                &mut Vec::new(),
+                &mut retained
+            )
+            .expect("query"),
+            Some(termbg::Theme::Light)
+        );
+        assert_eq!(retained, [key('a')]);
+        assert_eq!(events.events, VecDeque::from([key('b')]));
+    }
+
+    #[test]
     fn silent_osc_probe_uses_only_the_short_bounded_poll() {
         let mut events = SilentEvents::default();
         let mut output = Vec::new();
@@ -364,6 +613,7 @@ mod theme_probe_tests {
             SYSTEM_THEME_PROBE_TIMEOUT,
             &mut events,
             &mut output,
+            &mut Vec::new(),
         )
         .expect("silent query");
 
@@ -376,12 +626,16 @@ mod theme_probe_tests {
 
     #[test]
     fn prompt_osc_answer_is_parsed_before_the_deadline() {
-        let mut input: VecDeque<_> = "]11;rgb:ffff/ffff/ffff"
+        let mut input: VecDeque<_> = "11;rgb:ffff/ffff/ffff"
             .chars()
             .map(|character| {
                 Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
             })
             .collect();
+        input.push_front(Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT,
+        )));
         input.push_back(Event::Key(KeyEvent::new(
             KeyCode::Char('g'),
             KeyModifiers::CONTROL,
@@ -395,6 +649,7 @@ mod theme_probe_tests {
                 SYSTEM_THEME_PROBE_TIMEOUT,
                 &mut events,
                 &mut output,
+                &mut Vec::new(),
             )
             .expect("answered query"),
             Some(termbg::Theme::Light)
@@ -763,41 +1018,13 @@ pub async fn run_demo(
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
-    // Query the terminal for a graphics protocol and build the wordmark image
-    // NOW — after raw mode, before the input pump claims stdin — so the
-    // capability response is not eaten by the pump. Degrades to None (the
-    // half-block art) on a non-graphics or non-answering terminal; never hangs.
+    // Resolve the terminal graphics hint and build the wordmark image
+    // without reading stdin. Unknown protocols use the crafted half-block art.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
     // Pin the truecolor capability once (read by render for the Thinking
     // shimmer's fidelity); the default is true, so this only downgrades a
     // proven 16-color terminal.
     model.truecolor = truecolor_capable(&|name| std::env::var(name).ok());
-
-    // Input pump: crossterm's blocking read on a dedicated thread, forwarded
-    // into the async loop (no event-stream feature needed).
-    let presented = Arc::new(Mutex::new(None::<((PresentedInput, u64), Instant)>));
-    let input_presentation = Arc::clone(&presented);
-    let (input_tx, mut input_rx) = mpsc::channel::<QueuedInput>(64);
-    std::thread::spawn(move || {
-        loop {
-            match event::read() {
-                Ok(item) => {
-                    let received_at = Instant::now();
-                    let shown = input_stamp(&input_presentation, received_at);
-                    if input_tx
-                        .blocking_send(QueuedInput {
-                            event: item,
-                            presented: shown,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
 
     // The demo driver owns the generation-tagged envelope channel and the
     // script/decay timers — the SAME production seams the tests drive
@@ -842,6 +1069,33 @@ pub async fn run_demo(
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
     // The last pointer cell, for post-draw hover settling (W5g-7).
     let mut pointer: Option<(u16, u16)> = None;
+    // Input pump: crossterm's blocking read on a dedicated thread, forwarded
+    // into the async loop (no event-stream feature needed).
+    let presented = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
+    let input_presentation = Arc::clone(&presented);
+    let initial_presentation = startup_input_presentation(&model);
+    let (input_tx, mut input_rx) = mpsc::channel::<QueuedInput>(64);
+    let mut startup = take_startup_input();
+    std::thread::spawn(move || {
+        loop {
+            match read_input(&mut startup) {
+                Ok((item, received_at, from_startup)) => {
+                    let input = stamped_input(
+                        &input_presentation,
+                        item,
+                        received_at,
+                        from_startup,
+                        initial_presentation.as_ref(),
+                    );
+                    if input_tx.blocking_send(input).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
 
     while !model.should_quit {
         tokio::select! {
@@ -1139,6 +1393,17 @@ pub fn dispatch_input(
     hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
     event: Event,
 ) {
+    dispatch_input_at(model, hit_map, event, Instant::now());
+}
+
+/// Clock seam for pointer dwell and reducer deadline regressions.
+#[doc(hidden)]
+pub fn dispatch_input_at(
+    model: &mut AppModel,
+    hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
+    event: Event,
+    now: Instant,
+) {
     model.retire_stale_press();
     // The completed render records its owner separately from logical state.
     // A queued key or mouse report cannot migrate to a newly opened owner.
@@ -1150,11 +1415,14 @@ pub fn dispatch_input(
         if matches!(&event, Event::Mouse(_)) {
             model.clear_mouse_press();
         }
+        model.flash = Some("· Input changed: please try again".to_owned());
+        model.input_refused = true;
+        model.dirty = true;
         return;
     }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
-            model.handle(AppEvent::Key(key));
+            model.handle_at(AppEvent::Key(key), now);
         }
         // TUI6.3 fix 2: the paste is wrapped at RECEIPT — the zeroizing
         // buffer takes the same allocation, so our one owned copy wipes
@@ -1246,6 +1514,7 @@ pub fn dispatch_input(
                     model.mouse_down = Some((mouse.column, mouse.row));
                     model.mouse_press_owner = Some(model.presented_input());
                     model.mouse_press_epoch = Some(model.painted_epoch.get());
+                    model.mouse_press_dwell_ready = model.pointer_commit_ready(now);
                     if let Some((rect, hit)) = hit_rect_at(hit_map, mouse.column, mouse.row) {
                         model.mouse_press_rect = Some(rect);
                         model.mouse_press_hit = Some(hit);
@@ -1328,6 +1597,7 @@ pub fn dispatch_input(
                     let press_hit = model.mouse_press_hit.take();
                     let press_rect = model.mouse_press_rect.take();
                     let press_epoch = model.mouse_press_epoch.take();
+                    let press_dwell_ready = std::mem::take(&mut model.mouse_press_dwell_ready);
                     if let Some(selection) = &mut model.selection
                         && down.is_some()
                     {
@@ -1342,7 +1612,38 @@ pub fn dispatch_input(
                         && hit_rect_at(hit_map, column, row).as_ref()
                             == Some(&(rect, action.clone()))
                     {
-                        model.handle_hit(action);
+                        if !matches!(
+                            action,
+                            crate::app::Hit::MenuOption { .. }
+                                | crate::app::Hit::PermissionRetry
+                                | crate::app::Hit::PermissionOpenSettings
+                                | crate::app::Hit::PaletteRow(_)
+                                | crate::app::Hit::ThemeOption(_)
+                                | crate::app::Hit::EffortOption(_)
+                                | crate::app::Hit::ModelPickerRow { .. }
+                                | crate::app::Hit::AccountRow(_)
+                                | crate::app::Hit::ProviderModel { .. }
+                                | crate::app::Hit::RetryRun
+                                | crate::app::Hit::ShellClose(_)
+                                | crate::app::Hit::MonitorStop(_)
+                                | crate::app::Hit::MonitorPause(_)
+                                | crate::app::Hit::MonitorTrigger(_)
+                                | crate::app::Hit::FleetKill(_)
+                                | crate::app::Hit::QueueRowSteer(_)
+                                | crate::app::Hit::QueueRowToggle(_)
+                                | crate::app::Hit::TalkChip
+                                | crate::app::Hit::AuraTalkBtn
+                        ) || (press_dwell_ready && model.pointer_commit_ready(now))
+                        {
+                            model.handle_hit(action);
+                        } else {
+                            // A premature click may still hover/select the
+                            // target; it cannot activate that new surface.
+                            model.handle_hover(Some(action));
+                            model.input_refused = true;
+                            model.flash = Some("· New surface: click again to confirm".to_owned());
+                            model.dirty = true;
+                        }
                     }
                 }
                 // Hover (owner ask, TUI3a item 6): motion events flood —
@@ -3159,12 +3460,34 @@ fn present_frame(
     presented: &Arc<PresentedFrame>,
 ) -> std::io::Result<()> {
     model.retire_stale_press();
+    let pointer_before = model
+        .pointer_presentation
+        .borrow()
+        .as_ref()
+        .map(|(owner, _)| owner.clone());
     *hit_map = draw(terminal, model)?;
-    *presented
+    let completed_at = Instant::now();
+    if pointer_before.as_ref() != Some(&model.pointer_input_owner()) {
+        *model.pointer_presentation.borrow_mut() =
+            Some((model.pointer_input_owner(), completed_at));
+    }
+    // Retain transition history across the reader/publication race. A key
+    // read just before this draw completed still belongs to the prior frame.
+    let mut frames = presented
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        model.painted_stamp().map(|stamp| (stamp, Instant::now()));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(stamp) = model.painted_stamp()
+        && frames.back().is_none_or(|(shown, _)| shown != &stamp)
+    {
+        frames.push_back((stamp, completed_at));
+        // More than the 64 queued reports plus the reader and active dispatch.
+        if frames.len() > 128 {
+            frames.pop_front();
+        }
+    }
+    drop(frames);
     model.dirty = false;
+    model.input_refused = false;
     // W5g-7: hover survives a redraw only while the pointer still resolves
     // to it; this applies identically to cadence and semantic-edge frames.
     settle_hover_after_draw(model, hit_map, pointer);
@@ -3197,9 +3520,11 @@ pub fn rendered_selection_text(
     let Ok(mut scratch) = Terminal::new(backend);
     let prior_presentation = model.painted_input();
     let prior_epoch = model.painted_epoch.get();
+    let prior_pointer = model.pointer_presentation.borrow().clone();
     let drawn = scratch.draw(|frame| drop(render(model, frame)));
     *model.painted_input.borrow_mut() = prior_presentation;
     model.painted_epoch.set(prior_epoch);
+    *model.pointer_presentation.borrow_mut() = prior_pointer;
     if drawn.is_err() {
         return String::new();
     }
@@ -3972,35 +4297,11 @@ pub async fn run_live(
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
-    // Graphics wordmark query — after raw mode, before the input pump (see the
-    // run_demo note); None on non-graphics terminals falls back to `crate::mark`.
+    // Graphics wordmark detection uses environment hints and terminal geometry;
+    // it never reads stdin. Unknown terminals use the crafted `crate::mark`.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
     // Truecolor capability (see run_demo) — pinned once for render's shimmer.
     model.truecolor = truecolor_capable(&|name| std::env::var(name).ok());
-
-    let presented = Arc::new(Mutex::new(None::<((PresentedInput, u64), Instant)>));
-    let input_presentation = Arc::clone(&presented);
-    let (input_tx, mut input_rx) = mpsc::channel::<QueuedInput>(64);
-    std::thread::spawn(move || {
-        loop {
-            match event::read() {
-                Ok(item) => {
-                    let received_at = Instant::now();
-                    let shown = input_stamp(&input_presentation, received_at);
-                    if input_tx
-                        .blocking_send(QueuedInput {
-                            event: item,
-                            presented: shown,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
 
     // Entering live mode boots on the ready Welcome (already negotiated by
     // the caller) and LISTS sessions. It attaches only on selection — a
@@ -4039,6 +4340,31 @@ pub async fn run_live(
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
     // The last pointer cell, for post-draw hover settling (W5g-7).
     let mut pointer: Option<(u16, u16)> = None;
+    let presented = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
+    let input_presentation = Arc::clone(&presented);
+    let initial_presentation = startup_input_presentation(&model);
+    let (input_tx, mut input_rx) = mpsc::channel::<QueuedInput>(64);
+    let mut startup = take_startup_input();
+    std::thread::spawn(move || {
+        loop {
+            match read_input(&mut startup) {
+                Ok((item, received_at, from_startup)) => {
+                    let input = stamped_input(
+                        &input_presentation,
+                        item,
+                        received_at,
+                        from_startup,
+                        initial_presentation.as_ref(),
+                    );
+                    if input_tx.blocking_send(input).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
     let mut update_events_open = true;
     let mut update_in_progress = false;
     // Finding 5 (rev933): the update transaction RESTARTS the daemon, and
@@ -4333,3 +4659,11 @@ pub async fn run_live(
 #[cfg(test)]
 #[path = "runtime_presentation_tests.rs"]
 mod runtime_presentation_tests;
+
+#[cfg(test)]
+#[path = "input_typeahead_tests.rs"]
+mod input_typeahead_tests;
+
+#[cfg(test)]
+#[path = "runtime_pointer_tests.rs"]
+mod runtime_pointer_tests;
