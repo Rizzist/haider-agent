@@ -554,6 +554,47 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::ResolvedRoute {
+                provider,
+                model,
+                epoch,
+                alias,
+                device_id,
+                completed,
+            } => {
+                let result = store
+                    .commit_resolved_route_fact(
+                        &session_id,
+                        &provider,
+                        &model,
+                        epoch,
+                        alias.as_deref(),
+                        &device_id,
+                    )
+                    .await;
+                if let Ok((_, envelopes)) = &result
+                    && let Some(last) = envelopes.last()
+                {
+                    head = last.seq;
+                    authority_epoch = last.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result.map(|(epoch, _)| epoch));
+            }
             ActorCommand::SelectModel { command, completed } => {
                 // The metadata update, model_selected fact, and R2 receipt
                 // are one transaction. Only the committed fact is

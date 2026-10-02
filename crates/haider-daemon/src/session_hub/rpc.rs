@@ -12343,6 +12343,7 @@ impl HubConnection {
                 worker_generation: selected.worker_generation,
                 output_budget: selected.output_budget,
                 cleared_account_pin: selected.cleared_account_pin,
+                cleared_provider_endpoint: selected.cleared_provider_endpoint,
             },
         })
     }

@@ -54,7 +54,7 @@ fn workspace_notice_is_visible_and_not_counted_unknown() {
     assert!(model.projection.entries().iter().any(|entry| {
         matches!(
             entry,
-            haider_tui::projection::TranscriptEntry::Note { text }
+            haider_tui::projection::TranscriptEntry::Note { text, .. }
                 if text.contains("workspace unavailable") && text.contains("/gone")
         )
     }));

@@ -717,6 +717,8 @@ fn deliver_model_fact(
         model: slug.to_owned(),
         route_only: false,
         cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     };
     deliver(
         driver,
@@ -771,6 +773,12 @@ fn two_attached_sessions() -> (AppModel, LiveDriver) {
             Some(0),
             Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived),
         );
+        let mut metadata = listed_summary(&id, "anthropic-oauth", "claude-opus-5-5", 30_000)
+            .metadata
+            .expect("fresh session metadata");
+        metadata.selection_epoch = Some(0);
+        metadata.route_reset_epoch = Some(0);
+        model.note_session_account(&id, &metadata);
     }
     model.open_session(&session_id("s-meter-a"));
     for name in ["s-meter-a", "s-meter-b"] {
@@ -1358,6 +1366,8 @@ fn listed_summary(
 ) -> haider_rpc::SessionSummary {
     let metadata = haider_protocol::session::SessionMetadataV1 {
         selection_epoch: Some(3),
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
         resolved_route_alias: None,
         resolved_route_seen: false,
         launch_origin: None,
@@ -1414,7 +1424,7 @@ fn listed_summary(
 }
 
 #[test]
-fn launcher_create_reply_binds_pair_budget_and_account_before_first_list_refresh() {
+fn launcher_create_reply_binds_pair_budget_and_waits_for_current_account_truth() {
     let (mut model, mut driver) = live_session(true);
     let session = session_id("launcher-created-meter");
     let mut metadata = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000)
@@ -1439,19 +1449,31 @@ fn launcher_create_reply_binds_pair_budget_and_account_before_first_list_refresh
     );
     assert_eq!(model.context_meter().window, Some(1_000_000));
     assert_eq!(model.context_meter().auto_compact_at, Some(850_000));
-    assert_eq!(model.attached_account_label(), "anthropic-oauth (default)");
+    assert_eq!(model.attached_account_label(), "unknown/not recorded");
     for width in [80, 118] {
         let header = draw(&model, width, if width == 80 { 24 } else { 36 });
         let expected = if width == 80 {
-            "@anthropic-oauth (default)"
+            "@unknown/not recorded"
         } else {
-            "account anthropic-oauth (default)"
+            "account unknown/not recorded"
         };
         assert!(
             header[..3].iter().any(|line| line.contains(expected)),
             "{width}-column header: {header:?}"
         );
     }
+    // A current read can prove that this session is genuinely unserved.
+    metadata.route_reset_epoch = Some(0);
+    let mut current = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    current.metadata = Some(metadata.clone());
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![current],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "anthropic-oauth (default)");
     let mut changed =
         haider_tui::link::map_frame(haider_rpc::WireFrame::AccountsChanged { revision: 2 });
     let refresh = driver.apply(&mut model, changed.pop().expect("account notice"));
@@ -1575,6 +1597,8 @@ fn cross_provider_pick_shows_new_default_and_pin_notice_at_both_widths() {
         model: "claude-opus-5-5".into(),
         route_only: false,
         cleared_account_pin: Some("bed-b".into()),
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     };
     deliver(
         &mut driver,
@@ -1593,6 +1617,8 @@ fn cross_provider_pick_shows_new_default_and_pin_notice_at_both_widths() {
     metadata.provider = "anthropic-oauth".into();
     metadata.model = "claude-opus-5-5".into();
     metadata.selection_epoch = Some(2);
+    // Current Store picks prove that this provider route has not served yet.
+    metadata.route_reset_epoch = Some(2);
     metadata.account_alias = None;
     metadata.resolved_route_alias = None;
     metadata.resolved_route_seen = false;
@@ -1600,7 +1626,7 @@ fn cross_provider_pick_shows_new_default_and_pin_notice_at_both_widths() {
     assert_eq!(model.attached_account_label(), "ant-a (default)");
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        haider_tui::projection::TranscriptEntry::Note { text }
+        haider_tui::projection::TranscriptEntry::Note { text, .. }
             if text.contains("account pin bed-b cleared")
     )));
     for width in [80, 118] {
@@ -1698,6 +1724,8 @@ fn same_pair_route_fact_keeps_budget_and_has_no_model_note() {
             model: "claude-opus-5-5".into(),
             route_only: true,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("route fact"),
@@ -2016,6 +2044,8 @@ fn astra_noop_selection_fact_does_not_hide_current_daemon_truth() {
         model: "eq-wide".into(),
         route_only: false,
         cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     }
     .to_payload_value()
     .expect("no-op fact");
@@ -2209,6 +2239,8 @@ fn astra_a_fact_during_an_inflight_list_gets_a_fresh_budget_read() {
             model: m.into(),
             route_only: false,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("fact")
@@ -2372,6 +2404,8 @@ fn astra_failed_metadata_read_releases_the_refresh_latch() {
             model: m.into(),
             route_only: false,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("fact")
@@ -2430,6 +2464,8 @@ fn newer_selection_dirty_during_a_failed_list_gets_one_followup() {
             model: "eq-small".into(),
             route_only: false,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("fact"),
@@ -2505,7 +2541,7 @@ fn astra_compaction_preannounce_does_not_reuse_the_previous_models_window() {
         .entries()
         .iter()
         .find_map(|entry| match entry {
-            haider_tui::projection::TranscriptEntry::Note { text }
+            haider_tui::projection::TranscriptEntry::Note { text, .. }
                 if text.contains("compacting") =>
             {
                 Some(text.clone())
@@ -2526,7 +2562,7 @@ fn astra_compaction_preannounce_does_not_reuse_the_previous_models_window() {
     assert_eq!(model.meter_epoch.selection_epoch, Some(5));
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        haider_tui::projection::TranscriptEntry::Note { text } if text == &recorded_note
+        haider_tui::projection::TranscriptEntry::Note { text, .. } if text == &recorded_note
     )));
 }
 #[test]
@@ -3215,6 +3251,8 @@ fn older_daemon_selection_fact_and_metadata_bind_pair_without_claiming_snapshot_
             model: "eq-mid".into(),
             route_only: false,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("legacy fact"),
@@ -3256,6 +3294,8 @@ fn epochless_durable_fact_after_a_selection_reply_still_advances_its_pair() {
             model: "eq-mid".into(),
             route_only: false,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("legacy fact"),
@@ -3523,6 +3563,8 @@ fn cross_session_fact_during_paginated_list_gets_one_dirty_followup() {
             model: "claude-sonnet-4-6".into(),
             route_only: false,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("probe fixture"),
@@ -3558,6 +3600,8 @@ fn cross_session_fact_during_paginated_list_gets_one_dirty_followup() {
             model: "claude-sonnet-4-6".into(),
             route_only: false,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("probe fixture"),
@@ -3933,7 +3977,7 @@ fn parked_budget_clamp_notice_stays_with_its_own_session() {
             .projection
             .entries()
             .iter()
-            .any(|entry| matches!(entry, haider_tui::projection::TranscriptEntry::Note { text } if text.contains("8192") || text.contains("8,192"))),
+            .any(|entry| matches!(entry, haider_tui::projection::TranscriptEntry::Note { text, .. } if text.contains("8192") || text.contains("8,192"))),
         "B receives its own clamp notice"
     );
 }
@@ -4014,6 +4058,8 @@ fn boot_list_in_flight_gets_one_dirty_followup_for_a_new_selection() {
             model: "eq-small".into(),
             route_only: false,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("fact"),
@@ -4037,4 +4083,2375 @@ fn boot_list_in_flight_gets_one_dirty_followup_for_a_new_selection() {
             .count(),
         1
     );
+}
+
+#[test]
+fn astra15_parked_first_route_requests_its_own_metadata() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    let b = session_id("s-meter-b");
+    // A's first turn has already resolved its route in the store; the initial
+    // route has no journal fact. View B before A's first terminal event.
+    model.open_session(&b);
+    let commands = deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        1,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Done,
+        ))
+        .expect("Astra probe fixture"),
+    );
+    println!("parked terminal followups: {commands:?}");
+    let mut old = oauth_descriptor("anthropic-oauth");
+    old.active = false;
+    let mut new = oauth_descriptor("anthropic-oauth");
+    new.alias = CredentialAlias::new("new-global-default");
+    driver.apply(
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![old, new],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    model.open_session(&a);
+    let reopen = driver.sync_selection(&model);
+    println!(
+        "reopen followups: {reopen:?}; label={}",
+        model.attached_account_label()
+    );
+    assert!(
+        commands
+            .iter()
+            .chain(reopen.iter())
+            .any(|c| matches!(c, LiveCommand::ListAt { .. } | LiveCommand::List { .. })),
+        "first route is never refreshed; a served session now names the new global default"
+    );
+}
+
+#[test]
+fn astra15_older_clear_fact_keeps_notice_when_newer_metadata_already_loaded() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    model.apply_session_model_selected_at(&a, "anthropic-oauth", "claude-opus-5-5", None, Some(2));
+    let fact = haider_protocol::session::ModelSelected {
+        selection_epoch: Some(1),
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-5-5".into(),
+        route_only: false,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
+        cleared_account_pin: Some("previous-explicit-pin".into()),
+    };
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        1,
+        fact.to_payload_value().expect("Astra probe fixture"),
+    );
+    assert_eq!(
+        model.meter_epoch.selection_epoch,
+        Some(2),
+        "preserving history must not roll back current selection truth"
+    );
+    println!(
+        "current epoch {:?}; entries {:?}",
+        model.meter_epoch,
+        model.projection.entries()
+    );
+    assert!(model.projection.entries().iter().any(|e|matches!(e,haider_tui::projection::TranscriptEntry::Note { text, .. } if text.contains("account pin previous-explicit-pin cleared"))),
+        "selection admission should not erase a historical account-clear notice");
+}
+
+#[test]
+fn astra15_parked_clear_notice_control_with_newer_metadata() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    let b = session_id("s-meter-b");
+    model.apply_session_model_selected_at(&a, "anthropic-oauth", "claude-opus-5-5", None, Some(2));
+    model.open_session(&b);
+    let fact = haider_protocol::session::ModelSelected {
+        selection_epoch: Some(1),
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-5-5".into(),
+        route_only: false,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
+        cleared_account_pin: Some("previous-explicit-pin".into()),
+    };
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        1,
+        fact.to_payload_value().expect("Astra probe fixture"),
+    );
+    model.open_session(&a);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(2));
+    assert!(model.projection.entries().iter().any(|e|matches!(e,haider_tui::projection::TranscriptEntry::Note { text, .. } if text.contains("account pin previous-explicit-pin cleared"))));
+}
+
+#[test]
+fn astra15_cross_provider_rebind_does_not_attribute_old_route_to_new_provider() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    let mut row = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", 50_000);
+    let metadata = row.metadata.as_mut().expect("Astra probe fixture");
+    metadata.resolved_route_seen = true;
+    metadata.resolved_route_alias = Some("previous-provider-account".into());
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row.clone()],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "previous-provider-account");
+    let rebound = haider_protocol::session::SessionProviderRebound {
+        selection_epoch: Some(4),
+        rebind_id: "synthetic-cross-provider".into(),
+        provider: "other-provider".into(),
+        base_url: None,
+        account: None,
+    };
+    // This is the same protocol mutation that Store::rebind_session_provider
+    // commits. Follow its event with the daemon's resulting metadata row.
+    rebound.apply_to_metadata(row.metadata.as_mut().expect("Astra probe fixture"));
+    row.head_seq = 4;
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        4,
+        rebound.to_payload_value().expect("Astra probe fixture"),
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(
+        model.identity.provider, "other-provider",
+        "the provider transition must have committed before checking the account label"
+    );
+    println!(
+        "provider={} account={}",
+        model.identity.provider,
+        model.attached_account_label()
+    );
+    for width in [118, 80] {
+        println!("width={width} header={:?}", &draw(&model, width, 36)[..3]);
+    }
+    assert_ne!(
+        model.attached_account_label(),
+        "previous-provider-account",
+        "the new provider cannot have served the old provider's account"
+    );
+}
+
+#[test]
+fn astra15_viewed_child_shows_its_explicit_pin_clear_notice() {
+    let (mut model, mut driver) = astra_child_setup();
+    let child = session_id("astra-child-session");
+    let mut row = listed_summary(&child, "q-oauth", "shared-model", 16_384);
+    row.head_seq = 0;
+    row.metadata
+        .as_mut()
+        .expect("Astra probe fixture")
+        .selection_epoch = Some(0);
+    row.metadata
+        .as_mut()
+        .expect("Astra probe fixture")
+        .account_alias = Some("kid-pin".into());
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row],
+            next_cursor: None,
+        },
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: child.clone(),
+            attachment: attachment_of(&child),
+            worker_generation: 7,
+            replay_through_seq: 0,
+            launch_origin: None,
+        },
+    );
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    assert_eq!(model.screen, Screen::Subagent);
+    let parent_meter = model.context_meter();
+    assert_eq!(
+        model
+            .active_session
+            .as_ref()
+            .expect("Astra probe fixture")
+            .as_str(),
+        "s-meter-a"
+    );
+    let fact = haider_protocol::session::ModelSelected {
+        selection_epoch: Some(1),
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-5-5".into(),
+        route_only: false,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
+        cleared_account_pin: Some("kid-pin".into()),
+    };
+    deliver(
+        &mut driver,
+        &mut model,
+        &child,
+        1,
+        fact.to_payload_value().expect("Astra probe fixture"),
+    );
+    assert_eq!(
+        model.context_meter(),
+        parent_meter,
+        "child feedback must not rebind the parent meter"
+    );
+    let parked = model
+        .sessions
+        .iter()
+        .find(|r| r.id == child)
+        .expect("Astra probe fixture");
+    assert!(parked.projection.entries().iter().any(|e|matches!(e,
+        haider_tui::projection::TranscriptEntry::Note { text, .. } if text.contains("account pin kid-pin cleared"))),
+        "control: the live fact must have been handled and the note generated");
+    let frames = [draw(&model, 118, 36), draw(&model, 80, 24)];
+    for (index, frame) in frames.iter().enumerate() {
+        println!("child frame {index}:\n{}", frame.join("\n"));
+    }
+    assert!(
+        frames.iter().all(|frame| frame
+            .iter()
+            .any(|line| line.contains("account pin kid-pin cleared"))),
+        "the viewed child renders chip.transcript, while its clear notice exists only in the parked session projection"
+    );
+}
+
+#[test]
+fn astra15_viewed_child_shows_its_output_budget_clamp_notice() {
+    let (mut model, mut driver) = astra_child_setup();
+    let child = session_id("astra-child-session");
+    let mut row = listed_summary(&child, "q-oauth", "shared-model", 50_000);
+    row.head_seq = 0;
+    row.metadata
+        .as_mut()
+        .expect("Astra probe fixture")
+        .selection_epoch = Some(0);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row],
+            next_cursor: None,
+        },
+    );
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    assert_eq!(model.screen, Screen::Subagent);
+    let parent_meter = model.context_meter();
+    let selected_budget = budget(8192, 50_000, true);
+    let notice = selected_budget
+        .clamped
+        .as_ref()
+        .expect("Astra probe fixture")
+        .notice();
+    driver.apply(
+        &mut model,
+        model_selected_reply_at(&child, "q-oauth", "big-model", Some(selected_budget), 1),
+    );
+    assert_eq!(
+        model.context_meter(),
+        parent_meter,
+        "child feedback must not rebind the parent meter"
+    );
+    let parked = model
+        .sessions
+        .iter()
+        .find(|r| r.id == child)
+        .expect("Astra probe fixture");
+    assert!(
+        parked.projection.entries().iter().any(|e| matches!(e,
+        haider_tui::projection::TranscriptEntry::Note { text, .. } if text.contains(&notice))),
+        "control: the committed reply must have generated the clamp notice"
+    );
+    println!(
+        "viewed child flash={:?}; expected notice={notice}",
+        model.flash
+    );
+    let frames = [draw(&model, 118, 36), draw(&model, 80, 24)];
+    for (index, frame) in frames.iter().enumerate() {
+        println!("clamp child frame {index}:\n{}", frame.join("\n"));
+    }
+    assert!(
+        frames.iter().all(|frame| frame
+            .join("\n")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("using 8192 per response.")),
+        "the viewed child must see the clamp, not only a model-selected flash and an invisible parked-row note"
+    );
+}
+
+#[test]
+fn sol16_viewed_child_and_nested_child_subscribe_and_follow_external_selection() {
+    for nested in [false, true] {
+        let (mut model, mut driver) = astra_child_setup();
+        let child = session_id("astra-child-session");
+        let parent_meter = model.context_meter();
+        // A fresh delegated child may be entered before any session list
+        // contains it; its attach cursor must still exist.
+        model.sessions.retain(|row| row.id != child);
+        if nested {
+            // Put the same child below another existing tree node. The path
+            // resolver must subscribe to the last session, not its ancestor.
+            let child_chip = model.chips.remove(0);
+            let mut seed = haider_tui::mock::sample_seed_chip(2).expect("seed");
+            seed.agent = "outer".into();
+            let mut outer = haider_tui::app::ChipModel::from_seed(seed);
+            outer.children.clear();
+            outer.children.push(child_chip);
+            model.chips.push(outer);
+        }
+        model.subtree_collapsed = false;
+        model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+        let child_row = model
+            .sessions
+            .iter()
+            .find(|row| row.id == child)
+            .expect("view creates child row");
+        assert!(
+            child_row.meter_epoch.pair.is_none(),
+            "parent selection must not seed the child"
+        );
+        assert_eq!(model.context_meter(), parent_meter);
+        let commands = driver.sync_selection(&model);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, LiveCommand::ListAt { .. })),
+            "first view reads current child selection without /usage: {commands:?}"
+        );
+        assert!(commands.iter().any(|command| matches!(command,
+            LiveCommand::Attach { session, .. } | LiveCommand::AttachWithOrigin { session, .. } if session == &child)), "{commands:?}");
+        driver.apply(
+            &mut model,
+            LiveReply::Attached {
+                session: child.clone(),
+                attachment: attachment_of(&child),
+                worker_generation: 7,
+                replay_through_seq: 0,
+                launch_origin: None,
+            },
+        );
+        let mut initial = listed_summary(&child, "q-oauth", "shared-model", 50_000);
+        initial.head_seq = 0;
+        initial.metadata.as_mut().expect("metadata").selection_epoch = Some(0);
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![initial],
+                next_cursor: None,
+            },
+        );
+        let read = deliver(
+            &mut driver,
+            &mut model,
+            &child,
+            1,
+            haider_protocol::session::ModelSelected {
+                selection_epoch: Some(1),
+                provider: "q-oauth".into(),
+                model: "big-model".into(),
+                route_only: false,
+                cleared_account_pin: None,
+                cleared_provider_endpoint: None,
+                output_budget_clamp: None,
+            }
+            .to_payload_value()
+            .expect("selection"),
+        );
+        assert!(
+            read.iter().any(|c| matches!(c, LiveCommand::ListAt { .. })),
+            "fresh budget read: {read:?}"
+        );
+        assert!(
+            model
+                .surface_composer_identity(100)
+                .expect("composer")
+                .contains("big-model")
+        );
+        assert_eq!(
+            model.context_meter(),
+            parent_meter,
+            "root selection unchanged"
+        );
+        model.screen = Screen::Session;
+        assert_eq!(model.context_meter(), parent_meter);
+    }
+}
+
+#[test]
+fn sol16_running_and_legacy_session_headers_never_attribute_the_global_default() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        1,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Thinking,
+        ))
+        .expect("running"),
+    );
+    let mut changed = oauth_descriptor("anthropic-oauth");
+    changed.alias = CredentialAlias::new("new-default");
+    driver.apply(
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![changed],
+            revision: Some(8),
+            sources: vec![],
+        },
+    );
+    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    for (w, h) in [(118, 36), (80, 24)] {
+        assert!(!draw(&model, w, h)[..3].join("\n").contains("new-default"));
+    }
+    let mut row = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    row.turn_count = Some(2);
+    row.footprint_tokens = Some(20_000);
+    row.head_seq = 3;
+    row.metadata.as_mut().expect("meta").resolved_route_seen = false;
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        2,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Done,
+        ))
+        .expect("done"),
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    let mut legacy = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    legacy.metadata = None;
+    legacy.turn_count = Some(2);
+    legacy.footprint_tokens = Some(20_000);
+    legacy.head_seq = 3;
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![legacy],
+            next_cursor: None,
+        },
+    );
+    model
+        .sessions
+        .iter_mut()
+        .find(|row| row.id == a)
+        .expect("legacy row")
+        .account_provider = None;
+    for (w, h) in [(118, 36), (80, 24)] {
+        let header = draw(&model, w, h)[..3].join("\n");
+        assert!(
+            header.contains("unknown"),
+            "missing-metadata account must stay visible: {header}"
+        );
+        assert!(!header.contains("new-default"));
+    }
+}
+
+#[test]
+fn sol16_failed_first_route_read_is_retried_without_another_fact() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    let commands = deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        1,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Done,
+        ))
+        .expect("done"),
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, LiveCommand::ListAt { .. }))
+    );
+    driver.apply(&mut model, LiveReply::ListFailed);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        driver
+            .sync_selection(&model)
+            .iter()
+            .any(|c| matches!(c, LiveCommand::ListAt { .. })),
+        "a lone failed read must retry"
+    );
+    let mut reply = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    reply
+        .metadata
+        .as_mut()
+        .expect("metadata")
+        .resolved_route_seen = true;
+    reply
+        .metadata
+        .as_mut()
+        .expect("metadata")
+        .resolved_route_alias = Some("actually-served".into());
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![reply],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "actually-served");
+}
+
+#[test]
+fn sol16_running_first_request_after_provider_reset_rejects_a_new_default() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    deliver_model_fact(&mut driver, &mut model, &a, 1, "openai-oauth", "gpt-6-sol");
+    let mut fresh = listed_summary(&a, "openai-oauth", "gpt-6-sol", 30_000);
+    fresh.head_seq = 1;
+    fresh.metadata.as_mut().expect("metadata").selection_epoch = Some(1);
+    fresh.metadata.as_mut().expect("metadata").route_reset_epoch = Some(1);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![fresh.clone()],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(
+        model.attached_account_label(),
+        "openai-oauth (default)",
+        "known unserved reset control"
+    );
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        2,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Thinking,
+        ))
+        .expect("running"),
+    );
+    let mut changed = oauth_descriptor("openai-oauth");
+    changed.alias = CredentialAlias::new("new-openai-default");
+    driver.apply(
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![changed],
+            revision: Some(9),
+            sources: vec![],
+        },
+    );
+    fresh.head_seq = 2;
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![fresh],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    for (w, h) in [(118, 36), (80, 24)] {
+        assert!(
+            !draw(&model, w, h)[..3]
+                .join("\n")
+                .contains("new-openai-default")
+        );
+    }
+}
+
+#[test]
+fn sol16_cold_unserved_route_keeps_its_forecast_through_older_run_replay() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    let mut current = listed_summary(&a, "openai-oauth", "gpt-6-sol", 30_000);
+    current.head_seq = 7;
+    let metadata = current.metadata.as_mut().expect("metadata");
+    metadata.selection_epoch = Some(7);
+    metadata.route_reset_epoch = Some(7);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![current],
+            next_cursor: None,
+        },
+    );
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        1,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Thinking,
+        ))
+        .expect("old thinking"),
+    );
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        2,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Done,
+        ))
+        .expect("old done"),
+    );
+    assert_eq!(
+        model.attached_account_label(),
+        "openai-oauth (default)",
+        "the later route remains unserved"
+    );
+    // A current budget epoch cannot turn served legacy route history into a
+    // new route. The legacy summary has no route-reset provenance.
+    let mut legacy = listed_summary(&a, "openai-oauth", "gpt-6-sol", 30_000);
+    legacy.head_seq = 8;
+    legacy.turn_count = Some(1);
+    legacy.footprint_tokens = Some(20_000);
+    legacy.metadata.as_mut().expect("metadata").selection_epoch = Some(8);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![legacy],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+}
+
+#[test]
+fn sol16_cold_legacy_without_route_provenance_never_uses_a_zero_epoch_as_freshness() {
+    for typed in [false, true] {
+        let (mut model, mut driver) = live_session(true);
+        model.sessions.clear();
+        let id = session_id("cold-legacy-no-route");
+        let mut old = listed_summary(&id, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        old.head_seq = 0;
+        if typed {
+            old.metadata
+                .as_mut()
+                .expect("legacy metadata")
+                .selection_epoch = Some(0);
+        } else {
+            old.metadata = None;
+            old.provider = Some("anthropic-oauth".into());
+            old.last_model = Some("claude-opus-5-5".into());
+        }
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![old],
+                next_cursor: None,
+            },
+        );
+        model.open_session(&id);
+        assert_eq!(model.attached_account_label(), "unknown/not recorded");
+        for (w, h) in [(118, 36), (80, 24)] {
+            let header = draw(&model, w, h)[..3].join("\n");
+            assert!(header.contains("unknown"), "{header}");
+            assert!(!header.contains("(default)"));
+        }
+    }
+}
+
+#[test]
+fn sol16_recreated_nested_child_restores_owned_notices_without_duplicating_them() {
+    let (mut model, mut driver) = astra_child_setup();
+    let child = session_id("astra-child-session");
+    let mut row = listed_summary(&child, "q-oauth", "shared-model", 50_000);
+    row.head_seq = 0;
+    row.metadata.as_mut().expect("metadata").selection_epoch = Some(0);
+    row.metadata.as_mut().expect("metadata").account_alias = Some("kid-pin".into());
+    row.metadata.as_mut().expect("metadata").provider_base_url =
+        Some("http://127.0.0.1:8010".into());
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row],
+            next_cursor: None,
+        },
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: child.clone(),
+            attachment: attachment_of(&child),
+            worker_generation: 7,
+            replay_through_seq: 0,
+            launch_origin: None,
+        },
+    );
+    let detached = model.chips.remove(0);
+    let parent = model.context_meter();
+    let fact = haider_protocol::session::ModelSelected {
+        selection_epoch: Some(1),
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-5-5".into(),
+        route_only: false,
+        cleared_account_pin: Some("kid-pin".into()),
+        cleared_provider_endpoint: Some("http://127.0.0.1:8010".into()),
+        output_budget_clamp: None,
+    };
+    deliver(
+        &mut driver,
+        &mut model,
+        &child,
+        1,
+        fact.to_payload_value().expect("clear fact"),
+    );
+    driver.apply(
+        &mut model,
+        model_selected_reply_at(
+            &child,
+            "anthropic-oauth",
+            "claude-opus-5-5",
+            Some(budget(8192, 50_000, true)),
+            2,
+        ),
+    );
+    let mut seed = haider_tui::mock::sample_seed_chip(2).expect("outer seed");
+    seed.agent = "outer".into();
+    let mut outer = haider_tui::app::ChipModel::from_seed(seed);
+    outer.children.clear();
+    outer.children.push(detached);
+    model.chips.push(outer);
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    assert_eq!(model.screen, Screen::Subagent);
+    model.subtree_collapsed = true;
+    assert_eq!(model.context_meter(), parent);
+    for (w, h) in [(118, 36), (80, 24)] {
+        let frame = draw(&model, w, h)
+            .join("\n")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(frame.contains("account pin kid-pin cleared"), "{frame}");
+        assert!(
+            frame.contains("endpoint http://127.0.0.1:8010 cleared"),
+            "{frame}"
+        );
+        assert!(frame.contains("using 8192 per response."), "{frame}");
+    }
+    let clear = model
+        .viewed_chip()
+        .expect("nested child")
+        .transcript
+        .entries()
+        .iter()
+        .find_map(|entry| {
+            if let haider_tui::projection::TranscriptEntry::Note { text, .. } = entry
+                && text.contains("account pin kid-pin cleared")
+            {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+        .expect("clear note");
+    model.screen = Screen::Session;
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    assert_eq!(model.screen, Screen::Subagent);
+    let count = |model: &AppModel| {
+        model
+            .viewed_chip()
+            .expect("child")
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(entry,
+        haider_tui::projection::TranscriptEntry::Note { text, .. } if text==&clear)
+            })
+            .count()
+    };
+    assert_eq!(count(&model), 1, "reopening does not duplicate history");
+    model.record_selection_notice(&child, clear.clone());
+    model.screen = Screen::Session;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    assert_eq!(model.screen, Screen::Subagent);
+    assert_eq!(
+        count(&model),
+        2,
+        "a second identical notice is still a distinct occurrence"
+    );
+}
+
+#[test]
+fn sol16_child_external_budget_endpoint_and_away_changes_keep_own_meter() {
+    let (mut model, mut driver) = astra_child_setup();
+    let child = session_id("astra-child-session");
+    let mut row = listed_summary(&child, "q-oauth", "shared-model", 50_000);
+    row.head_seq = 0;
+    row.metadata.as_mut().expect("metadata").selection_epoch = Some(0);
+    row.footprint_tokens = Some(64_000);
+    row.footprint_truth = Some(ContextFootprintTruth::Exact);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row.clone()],
+            next_cursor: None,
+        },
+    );
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    assert!(!driver.sync_selection(&model).is_empty());
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: child.clone(),
+            attachment: attachment_of(&child),
+            worker_generation: 7,
+            replay_through_seq: 0,
+            launch_origin: None,
+        },
+    );
+    // Opening the child now requests a current metadata read. Complete it
+    // before checking that each subsequent external commit starts its read.
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row],
+            next_cursor: None,
+        },
+    );
+    let parent = model.context_meter();
+    for epoch in 1..=3 {
+        let (provider, slug, reserve) = if epoch == 1 {
+            ("q-oauth", "shared-model", 90_000)
+        } else {
+            ("anthropic-oauth", "claude-sonnet-4-6", 80_000)
+        };
+        // A rebind keeps the model. Cross-provider model selection at epoch
+        // two establishes the pair before the endpoint-only rebind at three.
+        let fact = if epoch <= 2 {
+            haider_protocol::session::ModelSelected {
+                selection_epoch: Some(epoch),
+                provider: provider.into(),
+                model: slug.into(),
+                route_only: false,
+                cleared_account_pin: None,
+                cleared_provider_endpoint: None,
+                output_budget_clamp: None,
+            }
+            .to_payload_value()
+            .expect("budget fact")
+        } else {
+            haider_protocol::session::SessionProviderRebound {
+                selection_epoch: Some(epoch),
+                rebind_id: format!("endpoint-{epoch}"),
+                provider: provider.into(),
+                base_url: Some("http://127.0.0.1:8020".into()),
+                account: None,
+            }
+            .to_payload_value()
+            .expect("rebind")
+        };
+        if epoch == 3 {
+            model.screen = Screen::Session;
+        }
+        let commands = deliver(&mut driver, &mut model, &child, epoch, fact);
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, LiveCommand::ListAt { .. })),
+            "{commands:?}"
+        );
+        let mut row = listed_summary(&child, provider, slug, reserve);
+        row.head_seq = epoch;
+        let metadata = row.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(epoch);
+        metadata.max_tokens_source = Some(
+            haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                requested: reserve,
+            },
+        );
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![row],
+                next_cursor: None,
+            },
+        );
+        model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+        assert!(
+            model
+                .surface_composer_identity(100)
+                .expect("composer")
+                .contains(slug)
+        );
+        let meter = model.viewed_context_meter().expect("child meter");
+        assert_eq!(
+            meter.window,
+            Some(if epoch == 1 { 128_000 } else { 200_000 })
+        );
+        assert_eq!(
+            meter.auto_compact_at,
+            Some(if epoch == 1 { 38_000 } else { 120_000 })
+        );
+        assert_eq!(model.context_meter(), parent);
+    }
+}
+
+#[test]
+fn sol16_historical_child_clamp_reply_survives_newer_metadata_without_rollback() {
+    let (mut model, mut driver) = astra_child_setup();
+    let child = session_id("astra-child-session");
+    let mut row = listed_summary(&child, "q-oauth", "big-model", 30_000);
+    row.head_seq = 5;
+    row.metadata.as_mut().expect("metadata").selection_epoch = Some(5);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![row],
+            next_cursor: None,
+        },
+    );
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    driver.apply(
+        &mut model,
+        model_selected_reply_at(
+            &child,
+            "q-oauth",
+            "shared-model",
+            Some(budget(8192, 50_000, true)),
+            1,
+        ),
+    );
+    assert_eq!(
+        model.child_display_model(model.viewed_chip().expect("child")),
+        "big-model"
+    );
+    for (w, h) in [(118, 36), (80, 24)] {
+        assert!(
+            draw(&model, w, h)
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("using 8192 per response.")
+        );
+    }
+}
+
+#[test]
+fn sol16_first_route_fact_dirties_an_inflight_read_at_the_same_epoch() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    let first = deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        1,
+        haider_protocol::session::ModelSelected {
+            selection_epoch: Some(0),
+            provider: "anthropic-oauth".into(),
+            model: "claude-opus-5-5".into(),
+            route_only: false,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
+        }
+        .to_payload_value()
+        .expect("fact"),
+    );
+    assert!(
+        first
+            .iter()
+            .any(|c| matches!(c, LiveCommand::ListAt { .. }))
+    );
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        2,
+        haider_protocol::session::ModelSelected {
+            selection_epoch: Some(0),
+            provider: "anthropic-oauth".into(),
+            model: "claude-opus-5-5".into(),
+            route_only: true,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
+        }
+        .to_payload_value()
+        .expect("first-route fact"),
+    );
+    let mut stale = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    stale.metadata.as_mut().expect("metadata").selection_epoch = Some(0);
+    let follow = driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![stale],
+            next_cursor: None,
+        },
+    );
+    assert!(
+        follow
+            .iter()
+            .any(|c| matches!(c, LiveCommand::ListAt { .. })),
+        "first route must refresh even though its epoch stayed zero"
+    );
+    let mut current = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    let metadata = current.metadata.as_mut().expect("metadata");
+    metadata.selection_epoch = Some(0);
+    metadata.resolved_route_seen = true;
+    metadata.resolved_route_alias = Some("actual-served-account".into());
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![current],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "actual-served-account");
+}
+
+#[test]
+fn sol16_provider_a_b_a_cannot_revive_cached_pin_or_served_route_before_list() {
+    for pinned in [false, true] {
+        let (mut model, mut driver) = two_attached_sessions();
+        let session = session_id("s-meter-a");
+        let mut original = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        original.head_seq = 0;
+        let metadata = original.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(0);
+        metadata.route_reset_epoch = Some(0);
+        metadata.account_alias = pinned.then(|| "original-pin".into());
+        metadata.resolved_route_alias = Some("original-served-route".into());
+        metadata.resolved_route_seen = true;
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![original.clone()],
+                next_cursor: None,
+            },
+        );
+        assert!(model.attached_account_label().contains("original"));
+        driver.apply(
+            &mut model,
+            model_selected_reply_at(&session, "q-oauth", "shared-model", None, 1),
+        );
+        driver.apply(
+            &mut model,
+            model_selected_reply_at(&session, "anthropic-oauth", "claude-opus-5-5", None, 2),
+        );
+        let row = model
+            .sessions
+            .iter()
+            .find(|row| row.id == session)
+            .expect("row");
+        assert_eq!(row.account_alias, None);
+        assert_eq!(row.resolved_route_alias, None);
+        assert!(!row.resolved_route_seen);
+        assert_eq!(row.route_reset_epoch, Some(2));
+        assert!(!model.attached_account_label().contains("original"));
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![original],
+                next_cursor: None,
+            },
+        );
+        assert!(
+            !model.attached_account_label().contains("original"),
+            "an old A list cannot revive the cleared route"
+        );
+        assert_eq!(model.meter_epoch.selection_epoch, Some(2));
+    }
+}
+
+#[test]
+fn sol16_rebind_updates_cached_route_before_list_and_preserves_noop_truth() {
+    for alias in [None, Some("actually-served")] {
+        for changed in [false, true] {
+            let (mut model, mut driver) = two_attached_sessions();
+            let session = session_id("s-meter-a");
+            let mut summary =
+                listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+            summary.head_seq = 0;
+            let metadata = summary.metadata.as_mut().expect("metadata");
+            metadata.selection_epoch = Some(0);
+            metadata.route_reset_epoch = Some(0);
+            metadata.provider_base_url = Some("http://127.0.0.1:8000".into());
+            metadata.resolved_route_seen = true;
+            metadata.resolved_route_alias = alias.map(str::to_owned);
+            driver.apply(
+                &mut model,
+                LiveReply::Listed {
+                    sessions: vec![summary],
+                    next_cursor: None,
+                },
+            );
+            let original = model.attached_account_label();
+            let fact = haider_protocol::session::SessionProviderRebound {
+                rebind_id: "rebind-cache".into(),
+                provider: "anthropic-oauth".into(),
+                base_url: Some(
+                    if changed {
+                        "http://127.0.0.1:8001"
+                    } else {
+                        "http://127.0.0.1:8000"
+                    }
+                    .into(),
+                ),
+                account: None,
+                selection_epoch: Some(1),
+            };
+            deliver(
+                &mut driver,
+                &mut model,
+                &session,
+                1,
+                fact.to_payload_value().expect("rebind"),
+            );
+            let row = model
+                .sessions
+                .iter()
+                .find(|row| row.id == session)
+                .expect("row");
+            if changed {
+                assert!(!row.resolved_route_seen);
+                assert_eq!(row.resolved_route_alias, None);
+                assert_eq!(row.route_reset_epoch, Some(1));
+            } else {
+                assert!(row.resolved_route_seen);
+                assert_eq!(row.resolved_route_alias.as_deref(), alias);
+                assert_eq!(row.route_reset_epoch, Some(0));
+                assert_eq!(model.attached_account_label(), original);
+            }
+        }
+    }
+}
+
+#[test]
+fn sol16_rebind_behind_served_metadata_preserves_actual_route_and_legacy_noop_stays_unknown() {
+    for legacy in [false, true] {
+        let (mut model, mut driver) = two_attached_sessions();
+        let session = session_id("s-meter-a");
+        if legacy {
+            let row = model
+                .sessions
+                .iter_mut()
+                .find(|row| row.id == session)
+                .expect("cold legacy row");
+            row.route_reset_epoch = None;
+            row.account_default_epoch = None;
+        }
+        let mut summary = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        summary.head_seq = if legacy { 0 } else { 1 };
+        let metadata = summary.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(if legacy { 0 } else { 1 });
+        metadata.route_reset_epoch = (!legacy).then_some(1);
+        metadata.resolved_route_seen = !legacy;
+        metadata.resolved_route_alias = (!legacy).then(|| "actually-served".into());
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![summary],
+                next_cursor: None,
+            },
+        );
+        let fact = haider_protocol::session::SessionProviderRebound {
+            rebind_id: "same-route".into(),
+            provider: "anthropic-oauth".into(),
+            base_url: None,
+            account: None,
+            selection_epoch: Some(1),
+        };
+        deliver(
+            &mut driver,
+            &mut model,
+            &session,
+            1,
+            fact.to_payload_value().expect("rebind"),
+        );
+        assert_eq!(
+            model.attached_account_label(),
+            if legacy {
+                "unknown/not recorded"
+            } else {
+                "actually-served"
+            }
+        );
+    }
+}
+
+#[test]
+fn sol16_first_route_fact_before_run_history_disables_default_forecast() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let session = session_id("s-meter-a");
+    model.projection = haider_tui::projection::SessionProjection::new();
+    let mut summary = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    summary.head_seq = 0;
+    let metadata = summary.metadata.as_mut().expect("metadata");
+    metadata.selection_epoch = Some(0);
+    metadata.route_reset_epoch = Some(0);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary.clone()],
+            next_cursor: None,
+        },
+    );
+    assert!(
+        model.attached_account_label().contains("(default)"),
+        "known unserved control"
+    );
+    let fact = haider_protocol::session::ModelSelected {
+        selection_epoch: Some(0),
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-5-5".into(),
+        route_only: true,
+        cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
+    };
+    deliver(
+        &mut driver,
+        &mut model,
+        &session,
+        1,
+        fact.to_payload_value().expect("route"),
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary.clone()],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(
+        model.attached_account_label(),
+        "unknown/not recorded",
+        "stale unseen metadata cannot revive the forecast"
+    );
+    let metadata = summary.metadata.as_mut().expect("metadata");
+    metadata.resolved_route_seen = true;
+    metadata.resolved_route_alias = Some("actual-first-route".into());
+    summary.head_seq = 1;
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "actual-first-route");
+}
+
+#[test]
+fn sol16_rotation_waits_for_actual_account_and_same_epoch_metadata_wins() {
+    for metadata_first in [false, true] {
+        let (mut model, mut driver) = two_attached_sessions();
+        let session = session_id("s-meter-a");
+        let mut summary = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        summary.head_seq = 0;
+        let metadata = summary.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(0);
+        metadata.route_reset_epoch = Some(0);
+        metadata.account_alias = Some("original-pin".into());
+        metadata.resolved_route_seen = true;
+        metadata.resolved_route_alias = Some("original-pin".into());
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![summary.clone()],
+                next_cursor: None,
+            },
+        );
+        let metadata = summary.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(1);
+        metadata.account_alias = Some("promoted-actual".into());
+        metadata.resolved_route_alias = Some("promoted-actual".into());
+        if metadata_first {
+            summary.head_seq = 1;
+            driver.apply(
+                &mut model,
+                LiveReply::Listed {
+                    sessions: vec![summary.clone()],
+                    next_cursor: None,
+                },
+            );
+        }
+        let fact = haider_protocol::session::ModelSelected {
+            selection_epoch: Some(1),
+            provider: "anthropic-oauth".into(),
+            model: "claude-opus-5-5".into(),
+            route_only: true,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
+        };
+        deliver(
+            &mut driver,
+            &mut model,
+            &session,
+            1,
+            fact.to_payload_value().expect("rotation"),
+        );
+        assert_eq!(
+            model.attached_account_label(),
+            if metadata_first {
+                "promoted-actual (pinned)"
+            } else {
+                "unknown/not recorded"
+            }
+        );
+        summary.head_seq = 1;
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![summary],
+                next_cursor: None,
+            },
+        );
+        assert_eq!(model.attached_account_label(), "promoted-actual (pinned)");
+    }
+}
+
+#[test]
+fn sol16_noop_rebind_after_unread_route_cannot_borrow_old_metadata_or_erase_budget_only_truth() {
+    for route_commit in [false, true] {
+        let (mut model, mut driver) = two_attached_sessions();
+        let session = session_id("s-meter-a");
+        let mut summary = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        summary.head_seq = 0;
+        let metadata = summary.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(0);
+        metadata.route_reset_epoch = Some(0);
+        metadata.resolved_route_seen = true;
+        metadata.resolved_route_alias = Some("actually-served".into());
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![summary],
+                next_cursor: None,
+            },
+        );
+        let selected = haider_protocol::session::ModelSelected {
+            selection_epoch: Some(1),
+            provider: "anthropic-oauth".into(),
+            model: "claude-opus-5-5".into(),
+            route_only: route_commit,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
+        };
+        deliver(
+            &mut driver,
+            &mut model,
+            &session,
+            1,
+            selected.to_payload_value().expect("selection"),
+        );
+        let rebound = haider_protocol::session::SessionProviderRebound {
+            selection_epoch: Some(2),
+            rebind_id: "noop-after-unread".into(),
+            provider: "anthropic-oauth".into(),
+            base_url: None,
+            account: None,
+        };
+        deliver(
+            &mut driver,
+            &mut model,
+            &session,
+            2,
+            rebound.to_payload_value().expect("rebind"),
+        );
+        assert_eq!(
+            model.attached_account_label(),
+            if route_commit {
+                "unknown/not recorded"
+            } else {
+                "actually-served"
+            }
+        );
+        let row = model
+            .sessions
+            .iter()
+            .find(|row| row.id == session)
+            .expect("row");
+        assert_eq!(
+            row.route_reset_epoch,
+            Some(0),
+            "an unchanged rebind cannot invent a fresh route"
+        );
+    }
+}
+
+#[test]
+fn sol16_external_and_historical_child_clamp_facts_are_visible_and_echo_once() {
+    for historical in [false, true] {
+        let (mut model, mut driver) = astra_child_setup();
+        let child = session_id("astra-child-session");
+        let mut row = listed_summary(&child, "q-oauth", "big-model", 30_000);
+        row.head_seq = if historical { 5 } else { 0 };
+        let metadata = row.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(row.head_seq);
+        metadata.budget_clamp_notice_epoch = None;
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![row],
+                next_cursor: None,
+            },
+        );
+        driver.apply(
+            &mut model,
+            LiveReply::Attached {
+                session: child.clone(),
+                attachment: attachment_of(&child),
+                worker_generation: 7,
+                replay_through_seq: 0,
+                launch_origin: None,
+            },
+        );
+        model.subtree_collapsed = false;
+        model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+        let selected_budget = budget(8192, 50_000, true);
+        let clamp = selected_budget.clamped.expect("clamp");
+        deliver(
+            &mut driver,
+            &mut model,
+            &child,
+            1,
+            haider_protocol::session::ModelSelected {
+                selection_epoch: Some(1),
+                provider: "q-oauth".into(),
+                model: "shared-model".into(),
+                route_only: false,
+                cleared_account_pin: None,
+                cleared_provider_endpoint: None,
+                output_budget_clamp: Some(clamp),
+            }
+            .to_payload_value()
+            .expect("clamp fact"),
+        );
+        for (w, h) in [(118, 36), (80, 24)] {
+            let frame = draw(&model, w, h)
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                frame.contains("using 8192 per response."),
+                "external/replayed clamp missing: {frame}"
+            );
+        }
+        driver.apply(
+            &mut model,
+            model_selected_reply_at(&child, "q-oauth", "shared-model", Some(selected_budget), 1),
+        );
+        let count = |projection: &haider_tui::projection::SessionProjection| {
+            projection.entries().iter().filter(|entry| matches!(entry,
+            haider_tui::projection::TranscriptEntry::Note { text, .. } if text.contains(&clamp.notice()))).count()
+        };
+        assert_eq!(
+            count(
+                &model
+                    .sessions
+                    .iter()
+                    .find(|row| row.id == child)
+                    .expect("own row")
+                    .projection
+            ),
+            1
+        );
+        assert_eq!(
+            count(&model.viewed_chip().expect("viewed child").transcript),
+            1
+        );
+        if historical {
+            assert_eq!(
+                model
+                    .sessions
+                    .iter()
+                    .find(|row| row.id == child)
+                    .expect("row")
+                    .meter_epoch
+                    .selection_epoch,
+                Some(5)
+            );
+        }
+    }
+}
+
+#[test]
+fn sol16_inherited_or_legacy_current_clamp_is_disclosed_once_from_metadata() {
+    let (mut model, mut driver) = astra_child_setup();
+    let child = session_id("astra-child-session");
+    let mut row = listed_summary(&child, "q-oauth", "shared-model", 8192);
+    row.head_seq = 0;
+    let metadata = row.metadata.as_mut().expect("metadata");
+    metadata.selection_epoch = Some(0);
+    metadata.max_tokens_source = Some(
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { requested: 50_000 },
+    );
+    metadata.budget_clamp_notice_epoch = None;
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    for _ in 0..2 {
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![row.clone()],
+                next_cursor: None,
+            },
+        );
+    }
+    let notes=model.viewed_chip().expect("child").transcript.entries().iter().filter(|entry|matches!(entry,
+        haider_tui::projection::TranscriptEntry::Note {text,..} if text.contains("using 8192 per response."))).count();
+    assert_eq!(
+        notes, 1,
+        "metadata rereads must not multiply inherited/legacy warning"
+    );
+    for (w, h) in [(118, 36), (80, 24)] {
+        assert!(
+            draw(&model, w, h)
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("using 8192 per response.")
+        );
+    }
+}
+
+#[test]
+fn sol16_epochless_account_snapshot_cannot_restore_pin_after_explicit_rebind() {
+    for (alias, pin) in [
+        (None, None),
+        (Some("old-served"), None),
+        (None, Some("old-pin")),
+        (Some("old-served"), Some("old-pin")),
+    ] {
+        let (mut model, mut driver) = two_attached_sessions();
+        let session = session_id("s-meter-a");
+        let mut old = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        old.head_seq = 0;
+        let metadata = old.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = None;
+        metadata.route_reset_epoch = None;
+        metadata.account_alias = pin.map(str::to_owned);
+        metadata.resolved_route_seen = true;
+        metadata.resolved_route_alias = alias.map(str::to_owned);
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![old.clone()],
+                next_cursor: None,
+            },
+        );
+        assert_eq!(
+            model.attached_account_label(),
+            if pin.is_some() {
+                "old-pin (pinned)"
+            } else {
+                alias.unwrap_or("unbound")
+            }
+        );
+        deliver(
+            &mut driver,
+            &mut model,
+            &session,
+            1,
+            haider_protocol::session::SessionProviderRebound {
+                selection_epoch: Some(1),
+                rebind_id: "epochless-reset".into(),
+                provider: "anthropic-oauth".into(),
+                base_url: Some("http://127.0.0.1:8099".into()),
+                account: None,
+            }
+            .to_payload_value()
+            .expect("rebind"),
+        );
+        old.head_seq = 1;
+        let budget_metadata = old.metadata.as_mut().expect("budget metadata");
+        budget_metadata.max_tokens = 8192;
+        budget_metadata.max_tokens_source = Some(
+            haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                requested: 50_000,
+            },
+        );
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![old.clone()],
+                next_cursor: None,
+            },
+        );
+        let row = model
+            .sessions
+            .iter()
+            .find(|row| row.id == session)
+            .expect("row");
+        assert_eq!(
+            row.account_alias, None,
+            "an old epochless pin must not return"
+        );
+        assert_eq!(row.resolved_route_alias, None);
+        assert!(!row.resolved_route_seen);
+        assert_eq!(row.route_reset_epoch, Some(1));
+        assert!(model.projection.entries().iter().any(|entry| matches!(entry,
+            haider_tui::projection::TranscriptEntry::Note {text,..} if text.contains("using 8192 per response."))),
+            "rejecting weak account provenance must not hide an admitted budget clamp");
+        let mut actual = old;
+        actual.head_seq = 2;
+        let metadata = actual.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(1);
+        metadata.route_reset_epoch = Some(1);
+        metadata.account_alias = None;
+        metadata.provider_base_url = Some("http://127.0.0.1:8099".into());
+        metadata.resolved_route_seen = true;
+        metadata.resolved_route_alias = Some("new-served".into());
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![actual],
+                next_cursor: None,
+            },
+        );
+        assert_eq!(model.attached_account_label(), "new-served");
+        for (w, h) in [(118, 36), (80, 24)] {
+            let frame = draw(&model, w, h).join("\n");
+            assert!(frame.contains("new-served"));
+            assert!(
+                !frame
+                    .lines()
+                    .take(3)
+                    .any(|line| line.contains("old-pin") || line.contains("old-served"))
+            );
+        }
+    }
+}
+
+#[test]
+fn sol16_frozen_create_receipt_never_supplies_current_account_provenance() {
+    for old_pin in [None, Some("old-provider-pin")] {
+        for served in [None, Some("actual-current-account")] {
+            let (mut model, mut driver) = live_session(true);
+            let session = session_id("replayed-create");
+            let mut receipt =
+                listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000)
+                    .metadata
+                    .expect("receipt metadata");
+            receipt.selection_epoch = Some(0);
+            receipt.route_reset_epoch = Some(0);
+            receipt.account_alias = old_pin.map(str::to_owned);
+            let reply = || LiveReply::Created {
+                command_id: haider_rpc::CommandId::new("replayed-create-command"),
+                session: session.clone(),
+                worker_generation: 7,
+                cwd: receipt.cwd.clone(),
+                model: receipt.model.clone(),
+                metadata: Some(receipt.clone()),
+            };
+            let commands = driver.apply(&mut model, reply());
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| matches!(command, LiveCommand::ListAt { .. }))
+            );
+            assert_eq!(model.attached_account_label(), "unknown/not recorded");
+            for (width, height) in [(118, 36), (80, 24)] {
+                let header = draw(&model, width, height)[..3].join("\n");
+                assert!(header.contains("unknown/not recorded"), "{header}");
+                assert!(!header.contains("old-provider-pin"), "{header}");
+                assert!(!header.contains("(default)"), "{header}");
+            }
+            // Another client served/rebound it after the frozen receipt.
+            let mut current = listed_summary(&session, "openai-oauth", "gpt-6-sol", 50_000);
+            current.head_seq = 5;
+            let metadata = current.metadata.as_mut().expect("current metadata");
+            metadata.selection_epoch = Some(2);
+            metadata.route_reset_epoch = Some(1);
+            metadata.resolved_route_seen = true;
+            metadata.resolved_route_alias = served.map(str::to_owned);
+            driver.apply(
+                &mut model,
+                LiveReply::Listed {
+                    sessions: vec![current],
+                    next_cursor: None,
+                },
+            );
+            let expected = served.unwrap_or("unbound");
+            assert_eq!(model.attached_account_label(), expected);
+            driver.apply(&mut model, reply());
+            assert_eq!(
+                model.attached_account_label(),
+                expected,
+                "a repeated old receipt cannot erase a known serving route"
+            );
+            assert_eq!(
+                model.meter_epoch.pair,
+                Some(("openai-oauth".into(), "gpt-6-sol".into()))
+            );
+        }
+    }
+}
+
+#[test]
+fn sol16_failed_coalesced_route_read_keeps_original_and_newer_targets() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    let b = session_id("s-meter-b");
+    for session in [&a, &b] {
+        deliver(
+            &mut driver,
+            &mut model,
+            session,
+            1,
+            haider_protocol::session::ModelSelected {
+                selection_epoch: Some(0),
+                provider: "anthropic-oauth".into(),
+                model: "claude-opus-5-5".into(),
+                route_only: false,
+                cleared_account_pin: None,
+                cleared_provider_endpoint: None,
+                output_budget_clamp: None,
+            }
+            .to_payload_value()
+            .expect("route fact"),
+        );
+    }
+    let retry = driver.apply(&mut model, LiveReply::ListFailed);
+    assert!(
+        retry
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ListAt { cursor: None, .. }))
+    );
+    // A same-epoch no-op is already covered by the retried original read.
+    // Forgetting A's started epoch would schedule a redundant second read.
+    deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        2,
+        haider_protocol::session::ModelSelected {
+            selection_epoch: Some(0),
+            provider: "anthropic-oauth".into(),
+            model: "claude-opus-5-5".into(),
+            route_only: false,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
+        }
+        .to_payload_value()
+        .expect("no-op fact"),
+    );
+    let mut page_b = listed_summary(&b, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    page_b
+        .metadata
+        .as_mut()
+        .expect("B metadata")
+        .selection_epoch = Some(0);
+    let next = driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![page_b],
+            next_cursor: Some("page-a".into()),
+        },
+    );
+    assert!(next.iter().any(|command| matches!(command, LiveCommand::ListAt { cursor: Some(cursor), .. } if cursor == "page-a")),
+        "a failed original target must not disappear when a newer target also dirtied the read");
+    let mut page_a = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    let metadata = page_a.metadata.as_mut().expect("A metadata");
+    metadata.selection_epoch = Some(0);
+    metadata.resolved_route_seen = true;
+    metadata.resolved_route_alias = Some("served-a".into());
+    let done = driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![page_a],
+            next_cursor: None,
+        },
+    );
+    assert!(
+        !done
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ListAt { cursor: None, .. })),
+        "a same-epoch no-op must remain covered by the original coalesced read"
+    );
+    assert_eq!(model.attached_account_label(), "served-a");
+    assert_eq!(model.meter_epoch.output_budget, Some(30_000));
+}
+
+#[test]
+fn sol16_legacy_reread_cannot_inherit_an_earlier_fresh_default_forecast() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let session = session_id("s-meter-a");
+    let mut fresh = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+    fresh
+        .metadata
+        .as_mut()
+        .expect("fresh metadata")
+        .selection_epoch = Some(0);
+    fresh
+        .metadata
+        .as_mut()
+        .expect("fresh metadata")
+        .route_reset_epoch = Some(0);
+    assert_eq!(model.attached_account_label(), "anthropic-oauth (default)");
+    let mut weak = fresh.clone();
+    weak.metadata
+        .as_mut()
+        .expect("legacy metadata")
+        .route_reset_epoch = None;
+    weak.metadata
+        .as_mut()
+        .expect("legacy metadata")
+        .selection_epoch = None;
+    let mut missing = weak.clone();
+    missing.metadata = None;
+    missing.provider = Some("anthropic-oauth".into());
+    missing.last_model = Some("claude-opus-5-5".into());
+    for unknown in [weak, missing] {
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![unknown],
+                next_cursor: None,
+            },
+        );
+        assert_eq!(model.attached_account_label(), "unknown/not recorded");
+        for (width, height) in [(118, 36), (80, 24)] {
+            let header = draw(&model, width, height)[..3].join("\n");
+            assert!(header.contains("unknown/not recorded"), "{header}");
+            assert!(!header.contains("(default)"), "{header}");
+        }
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![fresh.clone()],
+                next_cursor: None,
+            },
+        );
+        assert_eq!(
+            model.attached_account_label(),
+            "anthropic-oauth (default)",
+            "a current unserved route can restore its labelled forecast"
+        );
+        assert_eq!(model.meter_epoch.output_budget, Some(30_000));
+    }
+
+    fresh.head_seq = 1;
+    fresh
+        .metadata
+        .as_mut()
+        .expect("current metadata")
+        .selection_epoch = Some(1);
+    fresh
+        .metadata
+        .as_mut()
+        .expect("current metadata")
+        .route_reset_epoch = Some(1);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![fresh.clone()],
+            next_cursor: None,
+        },
+    );
+    let expected = "anthropic-oauth (default)";
+    assert_eq!(model.attached_account_label(), expected);
+    let mut old = fresh.clone();
+    old.head_seq = 0;
+    old.metadata.as_mut().expect("old metadata").selection_epoch = Some(0);
+    old.metadata
+        .as_mut()
+        .expect("old metadata")
+        .route_reset_epoch = None;
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![old.clone()],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(
+        model.attached_account_label(),
+        expected,
+        "an explicitly older legacy read must be ignored"
+    );
+    old.metadata = None;
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![old],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(
+        model.attached_account_label(),
+        expected,
+        "an older summary watermark must be ignored"
+    );
+    let mut current_legacy = fresh;
+    current_legacy
+        .metadata
+        .as_mut()
+        .expect("current legacy metadata")
+        .route_reset_epoch = None;
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![current_legacy],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+}
+
+#[test]
+fn sol16_older_unserved_snapshot_cannot_undo_a_recorded_route_at_the_same_epoch() {
+    for alias in [None, Some("actual-serving-account")] {
+        for old_marker in [None, Some(0)] {
+            let (mut model, mut driver) = two_attached_sessions();
+            let session = session_id("s-meter-a");
+            let mut old = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+            old.metadata.as_mut().expect("old metadata").selection_epoch = Some(0);
+            old.metadata
+                .as_mut()
+                .expect("old metadata")
+                .route_reset_epoch = old_marker;
+            let mut served = old.clone();
+            served.head_seq = 2;
+            let metadata = served.metadata.as_mut().expect("served metadata");
+            metadata.route_reset_epoch = Some(0);
+            metadata.resolved_route_seen = true;
+            metadata.resolved_route_alias = alias.map(str::to_owned);
+            driver.apply(
+                &mut model,
+                LiveReply::Listed {
+                    sessions: vec![served.clone()],
+                    next_cursor: None,
+                },
+            );
+            let expected = alias.unwrap_or("unbound");
+            assert_eq!(model.attached_account_label(), expected);
+            let mut previous_default = oauth_descriptor("anthropic-oauth");
+            previous_default.active = false;
+            let mut today = oauth_descriptor("anthropic-oauth");
+            today.alias = CredentialAlias::new("today-only-default");
+            driver.apply(
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![previous_default, today],
+                    revision: Some(2),
+                    sources: Vec::new(),
+                },
+            );
+            // No replayed run/count/footprint is needed to protect real truth.
+            driver.apply(
+                &mut model,
+                LiveReply::Listed {
+                    sessions: vec![old],
+                    next_cursor: None,
+                },
+            );
+            assert_eq!(model.attached_account_label(), expected);
+            for (width, height) in [(118, 36), (80, 24)] {
+                let header = draw(&model, width, height)[..3].join("\n");
+                assert!(header.contains(expected), "{header}");
+                assert!(!header.contains("today-only-default"), "{header}");
+            }
+            // A hidden A→B→A change ends that route despite matching tuples.
+            served.head_seq = 2;
+            let metadata = served.metadata.as_mut().expect("reset metadata");
+            metadata.selection_epoch = Some(2);
+            metadata.route_reset_epoch = Some(2);
+            metadata.resolved_route_seen = false;
+            metadata.resolved_route_alias = None;
+            driver.apply(
+                &mut model,
+                LiveReply::Listed {
+                    sessions: vec![served],
+                    next_cursor: None,
+                },
+            );
+            let row = model
+                .sessions
+                .iter()
+                .find(|row| row.id == session)
+                .expect("session");
+            assert!(!row.resolved_route_seen);
+            assert!(row.resolved_route_alias.is_none());
+            assert_eq!(
+                model.attached_account_label(),
+                "today-only-default (default)"
+            );
+        }
+    }
+}
+
+#[test]
+fn sol16_child_selection_advances_during_first_view_metadata_read() {
+    let (mut model, mut driver) = astra_child_setup();
+    let child = session_id("astra-child-session");
+    let parent = model.context_meter();
+    model.sessions.retain(|row| row.id != child);
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    assert!(
+        driver
+            .sync_selection(&model)
+            .iter()
+            .any(|c| matches!(c, LiveCommand::ListAt { .. }))
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: child.clone(),
+            attachment: attachment_of(&child),
+            worker_generation: 7,
+            replay_through_seq: 0,
+            launch_origin: None,
+        },
+    );
+    let commands = deliver(
+        &mut driver,
+        &mut model,
+        &child,
+        1,
+        haider_protocol::session::ModelSelected {
+            selection_epoch: Some(1),
+            provider: "q-oauth".into(),
+            model: "big-model".into(),
+            route_only: false,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
+        }
+        .to_payload_value()
+        .expect("external child selection"),
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, LiveCommand::ListAt { .. })),
+        "in-flight read is coalesced"
+    );
+    assert!(
+        model
+            .surface_composer_identity(100)
+            .expect("composer")
+            .contains("big-model")
+    );
+    let mut stale = listed_summary(&child, "q-oauth", "shared-model", 50_000);
+    stale.head_seq = 0;
+    stale.metadata.as_mut().expect("metadata").selection_epoch = Some(0);
+    let followup = driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![stale],
+            next_cursor: None,
+        },
+    );
+    assert!(
+        followup
+            .iter()
+            .any(|c| matches!(c, LiveCommand::ListAt { .. })),
+        "external change survives the old first-view read: {followup:?}"
+    );
+    assert!(
+        model
+            .surface_composer_identity(100)
+            .expect("composer")
+            .contains("big-model")
+    );
+    let mut current = listed_summary(&child, "q-oauth", "big-model", 90_000);
+    current.head_seq = 1;
+    current.footprint_tokens = Some(64_000);
+    current.footprint_truth = Some(ContextFootprintTruth::Exact);
+    let metadata = current.metadata.as_mut().expect("metadata");
+    metadata.selection_epoch = Some(1);
+    metadata.max_tokens_source = Some(
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { requested: 90_000 },
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![current],
+            next_cursor: None,
+        },
+    );
+    let meter = model.viewed_context_meter().expect("current child meter");
+    assert_eq!(meter.window, Some(1_000_000));
+    assert_eq!(meter.auto_compact_at, Some(850_000));
+    assert_eq!(
+        model.context_meter(),
+        parent,
+        "child reads cannot change the root"
+    );
+}
+
+#[test]
+fn sol16_epochless_historical_child_clamps_preserve_independent_notices() {
+    let (mut model, mut driver) = astra_child_setup();
+    let child = session_id("astra-child-session");
+    let mut current = listed_summary(&child, "q-oauth", "big-model", 90_000);
+    current.head_seq = 3;
+    current.footprint_tokens = Some(64_000);
+    current.footprint_truth = Some(ContextFootprintTruth::Exact);
+    current.metadata.as_mut().expect("metadata").selection_epoch = Some(3);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![current],
+            next_cursor: None,
+        },
+    );
+    model.subtree_collapsed = false;
+    model.handle_hit(haider_tui::app::Hit::ChipRow("astra-kid".into()));
+    let before = model.viewed_context_meter();
+    let root = model.context_meter();
+    let clamped = budget(8_192, 50_000, true);
+    let notice = clamped.clamped.as_ref().expect("clamp").notice();
+    for _ in 0..2 {
+        model.apply_session_model_selected_at(
+            &child,
+            "q-oauth",
+            "shared-model",
+            Some(&clamped),
+            None,
+        );
+    }
+    let notices: Vec<_> = model
+        .viewed_chip()
+        .expect("child")
+        .transcript
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            haider_tui::projection::TranscriptEntry::Note {
+                text,
+                selection_notice_epoch,
+            } if text.contains(&notice) => Some(*selection_notice_epoch),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        vec![None, None],
+        "unknown commits are independent, not epoch zero echoes"
+    );
+    assert_eq!(
+        model.viewed_context_meter(),
+        before,
+        "historical notices cannot roll back the child's selection"
+    );
+    assert_eq!(model.context_meter(), root);
+    for (width, height) in [(118, 36), (80, 24)] {
+        assert!(
+            draw(&model, width, height).join(" ").contains("50000"),
+            "the historical clamp is visible at {width}"
+        );
+    }
+}
+
+#[test]
+fn sol16_current_route_fact_ends_forecast_above_the_local_journal_sequence() {
+    for actual in [None, Some("actually-served")] {
+        let (mut model, mut driver) = two_attached_sessions();
+        let session = session_id("s-meter-a");
+        let mut fresh = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        // A prompt fork inherits the parent's current selection, even when
+        // its copied prefix and locally applied cursor are below that epoch.
+        fresh.head_seq = 1;
+        fresh.forked_from = Some(haider_protocol::session_fork::SessionForkProvenance {
+            session_id: session_id("source-with-selection-20"),
+            seq: 2,
+        });
+        let metadata = fresh.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(20);
+        metadata.route_reset_epoch = Some(20);
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![fresh.clone()],
+                next_cursor: None,
+            },
+        );
+        assert!(model.attached_account_label().ends_with("(default)"));
+        let fact = |epoch| {
+            haider_protocol::session::ModelSelected {
+                selection_epoch: Some(epoch),
+                provider: "anthropic-oauth".into(),
+                model: "claude-opus-5-5".into(),
+                route_only: true,
+                cleared_account_pin: None,
+                cleared_provider_endpoint: None,
+                output_budget_clamp: None,
+            }
+            .to_payload_value()
+            .expect("route fact")
+        };
+        deliver(&mut driver, &mut model, &session, 1, fact(19));
+        assert!(
+            model.attached_account_label().ends_with("(default)"),
+            "older route facts cannot poison an unserved reset"
+        );
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![fresh.clone()],
+                next_cursor: None,
+            },
+        );
+        deliver(&mut driver, &mut model, &session, 2, fact(20));
+        assert_eq!(
+            model.attached_account_label(),
+            "unknown/not recorded",
+            "the current route is awaiting account truth"
+        );
+        driver.apply(&mut model, LiveReply::ListFailed);
+        let mut changed = oauth_descriptor("anthropic-oauth");
+        changed.alias = CredentialAlias::new("new-global-default");
+        driver.apply(
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![changed],
+                revision: Some(9),
+                sources: vec![],
+            },
+        );
+        for (width, height) in [(118, 36), (80, 24)] {
+            assert!(
+                !draw(&model, width, height)[..3]
+                    .join(" ")
+                    .contains("new-global-default")
+            );
+        }
+        // Even an unserved snapshot from before the same-epoch route commit
+        // cannot restore its default forecast while that read is retried.
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![fresh.clone()],
+                next_cursor: None,
+            },
+        );
+        assert_eq!(model.attached_account_label(), "unknown/not recorded");
+        let metadata = fresh.metadata.as_mut().expect("metadata");
+        metadata.resolved_route_seen = true;
+        metadata.resolved_route_alias = actual.map(str::to_owned);
+        fresh.head_seq = 2;
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![fresh],
+                next_cursor: None,
+            },
+        );
+        assert_eq!(model.attached_account_label(), actual.unwrap_or("unbound"));
+    }
+}
+
+#[test]
+fn sol16_socket_boundaries_expire_forecasts_but_preserve_recorded_accounts() {
+    for (seen, actual) in [(false, None), (true, None), (true, Some("actually-served"))] {
+        let (mut model, mut driver) = two_attached_sessions();
+        let session = session_id("s-meter-a");
+        let mut current = listed_summary(&session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        current.head_seq = 0;
+        let metadata = current.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(0);
+        metadata.route_reset_epoch = Some(0);
+        metadata.resolved_route_seen = seen;
+        metadata.resolved_route_alias = actual.map(str::to_owned);
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![current.clone()],
+                next_cursor: None,
+            },
+        );
+        let before = model.context_meter();
+        driver.apply(
+            &mut model,
+            LiveReply::Disconnected {
+                reason: "synthetic disconnect".into(),
+            },
+        );
+        let mut changed = oauth_descriptor("anthropic-oauth");
+        changed.alias = CredentialAlias::new("new-global-default");
+        driver.apply(
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![changed],
+                revision: Some(8),
+                sources: vec![],
+            },
+        );
+        let expected = if seen {
+            actual.unwrap_or("unbound")
+        } else {
+            "unknown/not recorded"
+        };
+        assert_eq!(model.attached_account_label(), expected);
+        driver.apply(&mut model, LiveReply::Reconnected);
+        assert_eq!(
+            model.attached_account_label(),
+            expected,
+            "reconnect waits for current unserved provenance"
+        );
+        assert_eq!(
+            model.context_meter(),
+            before,
+            "connection boundaries do not change budget or footprint truth"
+        );
+        for (width, height) in [(118, 36), (80, 24)] {
+            assert!(
+                !draw(&model, width, height)[..3]
+                    .join(" ")
+                    .contains("new-global-default")
+            );
+        }
+        driver.apply(
+            &mut model,
+            LiveReply::Listed {
+                sessions: vec![current],
+                next_cursor: None,
+            },
+        );
+        if seen {
+            assert_eq!(model.attached_account_label(), expected);
+        } else {
+            assert_eq!(
+                model.attached_account_label(),
+                "new-global-default (default)",
+                "a current read restores a genuine future default"
+            );
+        }
+    }
 }

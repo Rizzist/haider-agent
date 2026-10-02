@@ -4178,6 +4178,7 @@ fn session_select_model_output_budget_fields_are_golden() {
                 }),
             }),
             cleared_account_pin: Some("bed-b".into()),
+            cleared_provider_endpoint: None,
         },
     };
     let encoded = serde_json::to_string(&response).expect("encode budget response");
@@ -4228,6 +4229,7 @@ fn session_select_model_pair_request_and_response_are_golden() {
             worker_generation: 7,
             output_budget: None,
             cleared_account_pin: None,
+            cleared_provider_endpoint: None,
         },
     };
     let encoded = serde_json::to_string(&response).expect("encode selection response");

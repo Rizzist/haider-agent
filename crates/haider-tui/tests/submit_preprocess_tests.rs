@@ -180,14 +180,14 @@ fn say_guards_then_submits_a_voice_turn() {
     submit(&mut model, "/say hello there");
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· busy — voice turn queues once idle"
+        TranscriptEntry::Note { text, .. } if text == "· busy — voice turn queues once idle"
     )));
     model.turn_active = false;
     // Empty words.
     submit(&mut model, "/say");
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· /say <words> — what should I hear?"
+        TranscriptEntry::Note { text, .. } if text == "· /say <words> — what should I hear?"
     )));
     // Valid: ◉ row + heard note + a voice-tagged request.
     submit(&mut model, "/say walk the tree");
@@ -197,7 +197,7 @@ fn say_guards_then_submits_a_voice_turn() {
     )));
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "◉ heard · whisper-large-v3"
+        TranscriptEntry::Note { text, .. } if text == "◉ heard · whisper-large-v3"
     )));
     assert!(model.requests.iter().any(|request| matches!(
         request,
@@ -209,7 +209,7 @@ fn say_guards_then_submits_a_voice_turn() {
     submit(&mut model, "/say hi");
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· enable voice first with /voice"
+        TranscriptEntry::Note { text, .. } if text == "· enable voice first with /voice"
     )));
     assert!(model.requests.is_empty());
 }
@@ -222,7 +222,7 @@ fn queue_command_switches_modes_with_the_sim_notes() {
     submit(&mut model, "/queue");
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· mid-turn input mode is steer (safe boundary) — /queue steer|subturn|turn"
     )));
     submit(&mut model, "/queue subturn");
@@ -230,7 +230,7 @@ fn queue_command_switches_modes_with_the_sim_notes() {
     assert!(model.subturn_mode);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· mid-turn input → SUBTURN — held for the next tool call, then injected before execution"
     )));
     submit(&mut model, "/queue turn");
@@ -238,7 +238,7 @@ fn queue_command_switches_modes_with_the_sim_notes() {
     assert!(!model.subturn_mode);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· mid-turn input → QUEUE — held until the turn ends, then consumed without idling"
     )));
     submit(&mut model, "/queue steer");
@@ -246,7 +246,7 @@ fn queue_command_switches_modes_with_the_sim_notes() {
     assert!(!model.subturn_mode);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· mid-turn input → STEER — delivered at the next safe boundary"
     )));
 }
@@ -435,7 +435,7 @@ fn voice_card_is_verbatim_and_answers_apply() {
     assert!(!model.voice.duplex);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· voice enabled · deepgram-nova-3 → elevenlabs · hold-to-talk under the input, or /say <words>"
     )));
     // Status bar follows: first words of stt→tts.
@@ -451,7 +451,7 @@ fn voice_card_is_verbatim_and_answers_apply() {
     assert!(model.voice.duplex);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· voice enabled · gpt-realtime native duplex · hold-to-talk under the input, or /say <words>"
     )));
     let rows = draw(&model, 118, 34);
@@ -466,7 +466,7 @@ fn voice_card_is_verbatim_and_answers_apply() {
     assert!(!model.voice.enabled);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· voice disabled"
+        TranscriptEntry::Note { text, .. } if text == "· voice disabled"
     )));
     let rows = draw(&model, 118, 34);
     assert!(
@@ -480,7 +480,7 @@ fn voice_card_is_verbatim_and_answers_apply() {
     echo_answer(&mut model);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· voice stays off"
+        TranscriptEntry::Note { text, .. } if text == "· voice stays off"
     )));
 }
 
@@ -553,7 +553,7 @@ fn tools_card_is_verbatim_and_registers_with_dispatch_notes() {
     echo_answer(&mut model);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· custom tool registered · dispatch = fire-and-forget — the turn continues the instant it dispatches"
     )));
     submit(&mut model, "/tools");
@@ -561,7 +561,7 @@ fn tools_card_is_verbatim_and_registers_with_dispatch_notes() {
     echo_answer(&mut model);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· tools card closed"
+        TranscriptEntry::Note { text, .. } if text == "· tools card closed"
     )));
 }
 
@@ -625,7 +625,7 @@ fn steer_is_default_and_lands_the_row_with_the_note() {
     ));
     assert!(matches!(
         &entries[entries.len() - 1],
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· steered — delivered at the next safe boundary of the current turn"
     ));
     assert!(

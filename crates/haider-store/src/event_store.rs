@@ -16,6 +16,8 @@
 //!   open while the exclusive profile lock is held, fencing actor identities
 //!   across process restarts even when the wall clock repeats.
 
+mod create_receipt_compat;
+
 use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
@@ -1124,6 +1126,8 @@ pub struct SelectedModel {
     /// Explicit pin removed because this selection changed providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleared_account_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_provider_endpoint: Option<String>,
 }
 
 /// Result of the atomic metadata-update/event/receipt transaction.
@@ -5060,9 +5064,9 @@ impl Store {
         Ok(Some(metadata))
     }
 
-    /// Advance only this session's meter epoch when an unpinned route starts
-    /// using a different resolved account. The route remains mutable for
-    /// rotation, fallback, and active-account switches.
+    /// Record this session's serving route. The first route keeps the request
+    /// selection epoch; account rotation advances it. Both produce a durable
+    /// route-only fact without changing the selected model or output budget.
     pub fn commit_resolved_route(
         &self,
         session_id: &SessionId,
@@ -5072,6 +5076,28 @@ impl Store {
         resolved_alias: Option<&str>,
         device_id: &DeviceId,
     ) -> StoreResult<u64> {
+        self.commit_resolved_route_fact(
+            session_id,
+            expected_provider,
+            expected_model,
+            expected_epoch,
+            resolved_alias,
+            device_id,
+        )
+        .map(|(epoch, _)| epoch)
+    }
+
+    /// Return committed route facts for the session actor to publish in order.
+    /// A stale captured selection cannot change metadata or append a fact.
+    pub fn commit_resolved_route_fact(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &DeviceId,
+    ) -> StoreResult<(u64, Vec<RawEnvelope>)> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -5083,11 +5109,29 @@ impl Store {
         {
             // A selection committed after this request captured metadata.
             // Its request keeps the old epoch and cannot acquire the new one.
-            return Ok(expected_epoch);
+            return Ok((expected_epoch, Vec::new()));
         }
         let current = metadata
             .selection_epoch
             .unwrap_or(latest_seq_in_connection(&transaction, session_id)?);
+        let first_route = !metadata.resolved_route_seen;
+        let unreported_clamp = match (
+            metadata.budget_clamp_notice_epoch,
+            metadata.max_tokens_source,
+        ) {
+            (
+                None,
+                Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                    requested,
+                }),
+            ) if requested > metadata.max_tokens => {
+                Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                    requested,
+                    max_output_tokens: metadata.max_tokens,
+                })
+            }
+            _ => None,
+        };
         let changed = metadata.resolved_route_seen
             && metadata.resolved_route_alias.as_deref() != resolved_alias;
         let epoch = if changed {
@@ -5101,7 +5145,11 @@ impl Store {
         if !metadata.resolved_route_seen
             || metadata.selection_epoch != Some(epoch)
             || metadata.resolved_route_alias.as_deref() != resolved_alias
+            || unreported_clamp.is_some()
         {
+            if unreported_clamp.is_some() {
+                metadata.budget_clamp_notice_epoch = Some(epoch);
+            }
             metadata.selection_epoch = Some(epoch);
             metadata.resolved_route_alias = resolved_alias.map(str::to_owned);
             metadata.resolved_route_seen = true;
@@ -5117,9 +5165,16 @@ impl Store {
                 )
                 .map_err(map_sqlite_error)?;
         }
-        if changed {
-            let mut envelopes = vec![unstamped_raw_command_envelope(
-                EventId::new(format!("route-selection-{}-{epoch}", session_id.as_str())),
+        let mut envelopes = Vec::new();
+        if first_route || changed || unreported_clamp.is_some() {
+            let fact_seq = latest_seq_in_connection(&transaction, session_id)?
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+            envelopes = vec![unstamped_raw_command_envelope(
+                EventId::new(format!(
+                    "route-selection-{}-{epoch}-{fact_seq}",
+                    session_id.as_str()
+                )),
                 session_id,
                 None,
                 None,
@@ -5131,6 +5186,8 @@ impl Store {
                     model: metadata.model.clone(),
                     route_only: true,
                     cleared_account_pin: None,
+                    cleared_provider_endpoint: None,
+                    output_budget_clamp: unreported_clamp,
                 }
                 .to_payload_value()
                 .map_err(|error| store_error(ErrorCode::StoreCorrupt, error.to_string(), false))?,
@@ -5139,7 +5196,7 @@ impl Store {
             append_transaction_envelopes(&transaction, session_id, now_ms()?, &mut envelopes)?;
         }
         transaction.commit().map_err(map_sqlite_error)?;
-        Ok(epoch)
+        Ok((epoch, envelopes))
     }
 
     /// Monotonically persists conversation-level savings after the matching
@@ -8760,6 +8817,8 @@ impl Store {
         }
         let metadata = SessionMetadataV1 {
             selection_epoch: Some(0),
+            route_reset_epoch: Some(0),
+            budget_clamp_notice_epoch: None,
             resolved_route_alias: None,
             resolved_route_seen: false,
             provider_base_url: inherited_route
@@ -9276,6 +9335,7 @@ impl Store {
             decode_session_metadata(command.source_session_id, &source_metadata_json)?
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
+        metadata.budget_clamp_notice_epoch = None;
         // Explicit account and endpoint choices are part of the copied
         // session configuration. Unpinned parents still follow the mutable
         // provider default because their account_alias is already None.
@@ -10008,6 +10068,9 @@ impl Store {
         } else {
             None
         };
+        let cleared_provider_endpoint = (metadata.provider != command.provider)
+            .then(|| metadata.provider_base_url.clone())
+            .flatten();
         if metadata.provider != command.provider {
             // Accounts and route overrides belong to their selected
             // provider. A cross-provider model choice cannot carry either
@@ -10017,6 +10080,7 @@ impl Store {
             metadata.provider_rebind_id = None;
             metadata.resolved_route_alias = None;
             metadata.resolved_route_seen = false;
+            metadata.route_reset_epoch = Some(selection_epoch);
         }
         if let Some(alias) = &command.account_alias {
             metadata.account_alias = Some(alias.clone());
@@ -10027,6 +10091,7 @@ impl Store {
         if let Some(budget) = command.output_budget {
             metadata.max_tokens = budget.max_tokens;
             metadata.max_tokens_source = Some(budget.source);
+            metadata.budget_clamp_notice_epoch = budget.clamped.map(|_| selection_epoch);
         }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
@@ -10067,6 +10132,8 @@ impl Store {
                 model: command.model.clone(),
                 route_only: false,
                 cleared_account_pin: cleared_account_pin.clone(),
+                cleared_provider_endpoint: cleared_provider_endpoint.clone(),
+                output_budget_clamp: command.output_budget.and_then(|budget| budget.clamped),
             }
             .to_payload_value()
             .map_err(|error| {
@@ -10087,6 +10154,7 @@ impl Store {
             worker_generation: self.worker_generation,
             output_budget: command.output_budget,
             cleared_account_pin,
+            cleared_provider_endpoint,
         };
         finalize_command_receipt(
             &transaction,
@@ -11192,6 +11260,13 @@ impl Store {
                 false,
             ));
         };
+        let previous_route = (selection.method == "session.provider.rebind").then(|| {
+            (
+                metadata.provider.clone(),
+                metadata.provider_base_url.clone(),
+                metadata.account_alias.clone(),
+            )
+        });
         mutate(&mut metadata);
         if selection.method == "session.provider.rebind" {
             let epoch = latest_seq_in_connection(&transaction, selection.session_id)?
@@ -11199,6 +11274,16 @@ impl Store {
                 .checked_add(1)
                 .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
             metadata.selection_epoch = Some(epoch);
+            if previous_route
+                .as_ref()
+                .is_some_and(|(provider, endpoint, account)| {
+                    provider != &metadata.provider
+                        || endpoint != &metadata.provider_base_url
+                        || account != &metadata.account_alias
+                })
+            {
+                metadata.route_reset_epoch = Some(epoch);
+            }
             fact_payload["selection_epoch"] = serde_json::Value::from(epoch);
         }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
@@ -15177,8 +15262,17 @@ fn lookup_session_create_receipt(
     else {
         return Ok(None);
     };
-    if method != "session.create" || stored_digest != request_digest || stored_json != request_json
-    {
+    let same_request = stored_digest == request_digest && stored_json == request_json;
+    let compatible_legacy = method == "session.create"
+        && !same_request
+        && state == "committed"
+        && create_receipt_compat::legacy_delegated_create_matches(
+            connection,
+            &stored_json,
+            request_json,
+            response_json.as_deref(),
+        )?;
+    if method != "session.create" || (!same_request && !compatible_legacy) {
         return Err(store_error(
             ErrorCode::InvalidArgument,
             "command id was already used with a different method or semantic request body",

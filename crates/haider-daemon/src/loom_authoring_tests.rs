@@ -87,6 +87,8 @@ async fn response(sink: &CapturingSink, request_id: &str) -> ResponseBody {
 fn metadata() -> SessionMetadataV1 {
     SessionMetadataV1 {
         selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
         resolved_route_alias: None,
         resolved_route_seen: false,
         launch_origin: None,

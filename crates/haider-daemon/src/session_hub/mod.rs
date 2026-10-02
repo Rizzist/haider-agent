@@ -1842,6 +1842,14 @@ enum ActorCommand {
         command: CheckpointCommitCommand,
         completed: oneshot::Sender<Result<CheckpointCommitOutcome, HaiderError>>,
     },
+    ResolvedRoute {
+        provider: String,
+        model: String,
+        epoch: u64,
+        alias: Option<String>,
+        device_id: DeviceId,
+        completed: oneshot::Sender<Result<u64, HaiderError>>,
+    },
     SelectModel {
         command: SessionSelectModelCommand,
         completed: oneshot::Sender<Result<SessionSelectModelOutcome, HaiderError>>,
@@ -8452,18 +8460,27 @@ impl HubStoreHandle {
         metadata: &haider_protocol::session::SessionMetadataV1,
         alias: Option<&str>,
     ) -> Result<u64, HaiderError> {
-        self.hub
-            .inner
-            .store
-            .commit_resolved_route(
-                &self.session_id,
-                &metadata.provider,
-                &metadata.model,
-                metadata.selection_epoch.unwrap_or(0),
-                alias,
-                &self.hub.inner.device_id,
-            )
+        let actor = self
+            .hub
+            .actor_for(self.session_id.clone())
             .await
+            .map_err(hub_error_as_store)?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::ResolvedRoute {
+                provider: metadata.provider.clone(),
+                model: metadata.model.clone(),
+                epoch: metadata.selection_epoch.unwrap_or(0),
+                alias: alias.map(str::to_owned),
+                device_id: self.hub.inner.device_id.clone(),
+                completed,
+            })
+            .await
+            .map_err(|_| hub_error_as_store(SessionHubError::Closed))?;
+        response
+            .await
+            .map_err(|_| hub_error_as_store(SessionHubError::Closed))?
     }
 
     /// Installs this lease's harness. The receiver cannot name another

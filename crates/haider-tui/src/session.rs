@@ -97,8 +97,16 @@ pub struct SessionState {
     /// typed metadata. The global active account is only its initial default.
     pub account_alias: Option<String>,
     pub account_provider: Option<String>,
+    /// Endpoint and epoch belong to the same cached account coordinates.
+    pub account_base_url: Option<String>,
+    pub account_metadata_epoch: Option<u64>,
+    pub route_reset_epoch: Option<u64>,
     pub resolved_route_alias: Option<String>,
     pub resolved_route_seen: bool,
+    /// A known fresh routing selection can display a future default until a
+    /// request starts. Missing route provenance on old history is insufficient.
+    pub account_default_epoch: Option<u64>,
+    pub account_request_epoch: Option<u64>,
     pub projection: SessionProjection,
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
@@ -203,6 +211,33 @@ pub struct SummaryCounts {
 }
 
 impl SessionState {
+    /// A committed provider change invalidates every cached route coordinate.
+    /// Leaving an old alias here would revive it on A→B→A before the List.
+    pub(crate) fn reset_account_route(&mut self, provider: &str, epoch: Option<u64>) {
+        self.account_alias = None;
+        self.account_provider = Some(provider.to_owned());
+        self.account_base_url = None;
+        self.account_metadata_epoch = epoch;
+        self.resolved_route_alias = None;
+        self.resolved_route_seen = false;
+        self.route_reset_epoch = epoch;
+        self.account_default_epoch = epoch;
+    }
+
+    /// A route fact proves a request was served even before its RunState.
+    /// A newer route epoch invalidates the old account until its List arrives;
+    /// same-epoch metadata may already contain the actual served account.
+    pub(crate) fn observe_route_commit(&mut self, epoch: Option<u64>, previous: Option<u64>) {
+        if epoch != previous {
+            self.account_alias = None;
+            self.account_metadata_epoch = None;
+            self.resolved_route_alias = None;
+            self.resolved_route_seen = false;
+        }
+        self.account_request_epoch = epoch;
+        self.account_default_epoch = None;
+    }
+
     /// A neutral scratch slot — what the model's live fields hold when no
     /// session is attached, and what a checked-out slot holds meanwhile.
     #[must_use]
@@ -220,8 +255,13 @@ impl SessionState {
             meter_epoch: crate::context_meter::MeterEpoch::default(),
             account_alias: None,
             account_provider: None,
+            account_base_url: None,
+            account_metadata_epoch: None,
+            route_reset_epoch: None,
             resolved_route_alias: None,
             resolved_route_seen: false,
+            account_default_epoch: None,
+            account_request_epoch: None,
             projection: SessionProjection::new(),
             prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),

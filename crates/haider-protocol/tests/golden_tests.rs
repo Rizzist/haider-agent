@@ -387,6 +387,7 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert!(!encoded.contains("provider_base_url"));
     assert!(!encoded.contains("provider_rebind_id"));
     assert!(!encoded.contains("selection_epoch"));
+    assert!(!encoded.contains("route_reset_epoch"));
     assert!(!encoded.contains("fast"));
     assert!(!encoded.contains("cache_policy"));
     assert!(!encoded.contains("interaction_mode"));
@@ -401,12 +402,15 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert_eq!(encoded["fast"], true);
     let versioned = SessionMetadataV1 {
         selection_epoch: Some(42),
+        route_reset_epoch: Some(0),
+        budget_clamp_notice_epoch: None,
         resolved_route_alias: None,
         resolved_route_seen: false,
         ..tuned.clone()
     };
     let versioned_json = serde_json::to_value(&versioned).expect("versioned metadata encode");
     assert_eq!(versioned_json["selection_epoch"], 42);
+    assert_eq!(versioned_json["route_reset_epoch"], 0);
     assert_eq!(
         serde_json::from_value::<SessionMetadataV1>(versioned_json).expect("decode versioned"),
         versioned

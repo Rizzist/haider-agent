@@ -76,7 +76,11 @@ pub enum TranscriptEntry {
     Item(ItemBlock),
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
     /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
-    Note { text: String },
+    Note {
+        text: String,
+        /// Stable identity for a selection warning echoed by reply and journal.
+        selection_notice_epoch: Option<u64>,
+    },
     /// A daemon-enforced provider capability refusal. This is deliberately
     /// neither a failed run nor a generic note: the model can adapt and the
     /// turn remains healthy.
@@ -867,6 +871,7 @@ impl SessionProjection {
                             };
                             self.entries.push(TranscriptEntry::Note {
                                 text: format!("permission {result} · {}", menu.title),
+                                selection_notice_epoch: None,
                             });
                         }
                     }
@@ -1887,7 +1892,24 @@ impl SessionProjection {
     /// interrupt, mid-turn input echoes. Never sourced from envelopes.
     pub fn push_note(&mut self, text: String) {
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::Note { text });
+        self.entries.push(TranscriptEntry::Note {
+            text,
+            selection_notice_epoch: None,
+        });
+    }
+
+    /// Store a selection warning in the transcript itself. The journal and
+    /// RPC reply can arrive in either order without creating duplicate notes.
+    pub fn push_selection_notice(&mut self, epoch: Option<u64>, text: String) {
+        if epoch.is_some() && self.entries.iter().any(|entry| matches!(entry,
+            TranscriptEntry::Note { selection_notice_epoch, .. } if *selection_notice_epoch == epoch)) {
+            return;
+        }
+        self.render_revision = self.render_revision.wrapping_add(1);
+        self.entries.push(TranscriptEntry::Note {
+            text,
+            selection_notice_epoch: epoch,
+        });
     }
 
     /// Append one peer-message block from daemon event truth.

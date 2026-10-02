@@ -788,7 +788,7 @@ async fn generic_turn_plays_end_to_end_with_the_delayed_title_note() {
     // The 1.5 s auto-title note landed with the sim's FULL text.
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· session titled — “Hello world” (background micro-call · never enters the prompt)"
     )));
     // The meter is Usage-authoritative and matches the driver's counters.
@@ -829,7 +829,7 @@ async fn crash_menu_errored_arm_holds_then_idles_without_compaction() {
     );
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· run → errored · terminal state is honest — nothing was retried"
     )));
     assert!(
@@ -890,7 +890,7 @@ async fn queued_input_consumes_at_turn_end_without_passing_through_idle() {
     assert!(model.msg_queue.is_empty(), "queue drained");
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· turn ended with queued input — consuming it directly, no idle"
     )));
     // The queued turn's user row carries DeliveryMode::Queue — its
@@ -903,7 +903,7 @@ async fn queued_input_consumes_at_turn_end_without_passing_through_idle() {
         .position(|entry| {
             matches!(
                 entry,
-                TranscriptEntry::Note { text }
+                TranscriptEntry::Note { text, .. }
                     if text == "· turn ended with queued input — consuming it directly, no idle"
             )
         })
@@ -941,7 +941,7 @@ async fn auto_compaction_fires_at_85_percent_and_drops_the_meter_to_6_percent() 
     assert!(saw_compacting, "the compacting badge showed");
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· context at 85% — compacting (dead branches first, live path last)"
     )));
     let (before, after) = model
@@ -1040,7 +1040,7 @@ async fn talk_hold_fires_the_canned_phrase_through_the_voice_path() {
     )));
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "◉ heard · whisper-large-v3"
+        TranscriptEntry::Note { text, .. } if text == "◉ heard · whisper-large-v3"
     )));
     // Agent rows of the voice turn are spoken; the tag clears after.
     assert!(model.projection.entries().iter().any(|entry| matches!(

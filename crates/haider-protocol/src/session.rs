@@ -228,6 +228,14 @@ pub struct SessionMetadataV1 {
     /// Zero is the initial binding before a selection fact is committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_epoch: Option<u64>,
+    /// Sequence at which this route was created or explicitly reset. Absence
+    /// on legacy metadata does not prove that the session was never served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_reset_epoch: Option<u64>,
+    /// Epoch whose durable selection fact records the current budget clamp.
+    /// Missing legacy/inherited notices can be published on first route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_clamp_notice_epoch: Option<u64>,
     /// Last account route actually resolved for a turn. This is not an
     /// account pin: unpinned sessions continue to follow the active account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -362,6 +370,31 @@ pub struct ModelSelected {
     /// Explicit account pin cleared by this cross-provider selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleared_account_pin: Option<String>,
+    /// Explicit endpoint override cleared by a cross-provider selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_provider_endpoint: Option<String>,
+    /// User budget reduced by this selection, retained for external clients
+    /// and replay even after a later selection restores the requested value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget_clamp: Option<crate::output_budget::OutputBudgetClampV1>,
+}
+
+/// Shared disclosure for choices automatically cleared by a model pick.
+#[must_use]
+pub fn model_selection_clear_notice(
+    account: Option<&str>,
+    endpoint: Option<&str>,
+    provider: &str,
+) -> Option<String> {
+    let choices = match (account, endpoint) {
+        (Some(alias), Some(url)) => format!("account pin {alias} cleared; endpoint {url} cleared"),
+        (Some(alias), None) => format!("account pin {alias} cleared"),
+        (None, Some(url)) => format!("endpoint {url} cleared"),
+        (None, None) => return None,
+    };
+    Some(format!(
+        "{choices} — {provider} uses its active account and default endpoint"
+    ))
 }
 
 /// Additive replay fact emitted atomically with a committed live-session
@@ -560,6 +593,14 @@ impl SessionProviderRebound {
     pub fn apply_to_metadata(&self, metadata: &mut SessionMetadataV1) {
         if let Some(epoch) = self.selection_epoch {
             metadata.selection_epoch = Some(epoch);
+        }
+        if metadata.provider != self.provider
+            || metadata.provider_base_url != self.base_url
+            || metadata.account_alias != self.account
+        {
+            metadata.resolved_route_alias = None;
+            metadata.resolved_route_seen = false;
+            metadata.route_reset_epoch = self.selection_epoch;
         }
         metadata.provider_rebind_id = Some(self.rebind_id.clone());
         metadata.provider.clone_from(&self.provider);

@@ -4648,6 +4648,8 @@ fn model_selected_envelope(
         model: model.into(),
         route_only: false,
         cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     }
     .to_payload_value()
     .expect("model selection serializes");

@@ -6494,12 +6494,12 @@ fn render_session(
         ));
     }
     let account = model.attached_account_label();
-    let has_account_truth = model
+    let has_session_row = model
         .active_session
         .as_ref()
         .and_then(|session| model.sessions.iter().find(|row| &row.id == session))
-        .is_some_and(|row| row.account_provider.is_some());
-    let route_identity = if model.mode.fabricates_locally() || !has_account_truth {
+        .is_some();
+    let route_identity = if model.mode.fabricates_locally() || !has_session_row {
         format!(
             " · branch {} · {}",
             model.active_branch_name(),
@@ -11760,7 +11760,7 @@ fn render_aura(
                 theme,
                 transcript_area.width,
             ),
-            TranscriptEntry::Note { text } => {
+            TranscriptEntry::Note { text, .. } => {
                 lines.push(Line::from(vec![
                     Span::raw("   "),
                     Span::styled(text.as_str(), theme.dim_style()),
@@ -15351,7 +15351,7 @@ fn transcript_lines<'a>(
             receipt,
             ..
         } => peer_entry_lines(lines, sender, sender_kind, text, *receipt, theme, width),
-        TranscriptEntry::Note { text } => {
+        TranscriptEntry::Note { text, .. } => {
             // Sim NoteRow (tui.js:4572-4577): dim, indented off the margin.
             lines.push(Line::from(vec![
                 Span::raw("   "),

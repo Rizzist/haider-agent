@@ -1210,6 +1210,51 @@ for endpoint validation and error codes.
 An absent summary pin remains unknown as request-account identity. It never
 licenses deriving an account from `account.list` defaults or active aliases.
 
+A cross-provider `session.select_model` automatically clears the previous
+provider's explicit account pin and endpoint override. The receipt and
+`model_selected` fact disclose these choices in additive `cleared_account_pin`
+and `cleared_provider_endpoint` fields. CLI config mutations include visible
+`selection_notices` in JSON and print the same notices to stderr. Historical
+notices remain part of their owning session's transcript even when newer
+selection metadata has already arrived.
+
+`model_selected.output_budget_clamp` retains a typed user-budget clamp for
+external clients and replay. `budget_clamp_notice_epoch` identifies the current
+clamp fact in metadata; omitted legacy/inherited notices can be disclosed from
+the current budget and published once on route resolution. The TUI stores
+warning identity in its owning transcript so a reply and journal echo do not
+duplicate it.
+
+A first resolved account route emits a route-only `model_selected` fact without
+advancing the request's selection epoch. Session headers use the recorded route;
+legacy served history without that provenance displays `unknown/not recorded`.
+The additive `SessionMetadataV1.route_reset_epoch` records creation or an
+explicit route reset. Only a known, unserved route may show a labelled default
+forecast; missing legacy provenance never establishes that condition.
+An accepted provider change invalidates cached account coordinates immediately.
+A route-only fact ends the default forecast before run history arrives, and a
+newer route epoch invalidates the old account while its metadata read is pending.
+A rebind preserves known served provenance when provider, account and endpoint
+are unchanged. Viewed child sessions subscribe to their own selection facts
+independently of the root.
+
+Account provenance from `session.create` is a frozen receipt snapshot, including
+idempotent replays. The TUI binds the returned model and budget immediately and
+reads current session metadata before displaying an account choice. A failed
+coalesced metadata read retries both its original targets and any newly dirty
+targets.
+
+Delegated-create receipts from the pre-inheritance schema remain replayable
+when the unchanged request's inherited choices match the parent's durable
+configuration at the original child creation. New-schema receipts retain strict
+request equivalence, including inherited route values.
+
+Delegated-create digests include the canonical output-budget source so a changed
+requested value is distinct even when the effective cap stays equal. Legacy
+ten/thirteen-key receipt enrichment accepts that source only when it matches the
+original child response (with the existing legacy-default classification); the
+child and original receipt remain unchanged.
+
 ### 9.3 Observe/read/attach optionals
 
 | Field | Absence meaning |

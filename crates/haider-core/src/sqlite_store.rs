@@ -365,6 +365,28 @@ impl SqliteStoreHandle {
         resolved_alias: Option<&str>,
         device_id: &haider_protocol::ids::DeviceId,
     ) -> Result<u64, HaiderError> {
+        self.commit_resolved_route_fact(
+            session_id,
+            expected_provider,
+            expected_model,
+            expected_epoch,
+            resolved_alias,
+            device_id,
+        )
+        .await
+        .map(|(epoch, _)| epoch)
+    }
+
+    /// Commit route provenance and return only durable facts for publication.
+    pub async fn commit_resolved_route_fact(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &haider_protocol::ids::DeviceId,
+    ) -> Result<(u64, Vec<haider_protocol::envelope::RawEnvelope>), HaiderError> {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         let expected_provider = expected_provider.to_owned();
@@ -373,7 +395,7 @@ impl SqliteStoreHandle {
         let device_id = device_id.clone();
         run_blocking(move || {
             owner.with_store(|store| {
-                store.commit_resolved_route(
+                store.commit_resolved_route_fact(
                     &session_id,
                     &expected_provider,
                     &expected_model,

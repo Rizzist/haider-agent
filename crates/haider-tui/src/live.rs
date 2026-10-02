@@ -2208,6 +2208,7 @@ pub struct LiveDriver {
     meter_list_pending: bool,
     meter_list_started: HashMap<SessionId, u64>,
     meter_list_dirty: HashMap<SessionId, u64>,
+    meter_list_retry_at: Option<std::time::Instant>,
     /// Round 4: monotone connection epoch — bumped on every Disconnected.
     /// Reads that must not cross a reconnect (loom.list) carry it out and
     /// their replies echo it back; a mismatch installs nothing.
@@ -2517,6 +2518,7 @@ impl LiveDriver {
             meter_list_pending: false,
             meter_list_started: HashMap::new(),
             meter_list_dirty: HashMap::new(),
+            meter_list_retry_at: None,
             connection_epoch: 0,
             input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
@@ -2831,10 +2833,83 @@ impl LiveDriver {
     /// also what makes a SECOND terminal see the same session's contiguous
     /// events (§6.4) — its launcher row is cold until it is chosen.
     pub fn sync_selection(&mut self, model: &AppModel) -> Vec<LiveCommand> {
-        let Some(active) = model.active_session.clone() else {
+        let mut commands = Vec::new();
+        if let Some(active) = model.active_session.as_ref() {
+            commands.extend(self.ensure_attached(model, active));
+        }
+        if let Some(viewed) = model.selection_surface_session()
+            && model.active_session.as_ref() != Some(&viewed)
+        {
+            let attach = self.ensure_attached(model, &viewed);
+            let newly_attached = attach.iter().any(|command| {
+                matches!(command,
+                LiveCommand::Attach { session, .. } | LiveCommand::AttachWithOrigin { session, .. }
+                    if session == &viewed)
+            });
+            commands.extend(attach);
+            if newly_attached {
+                let epoch = model
+                    .sessions
+                    .iter()
+                    .find(|row| row.id == viewed)
+                    .and_then(|row| row.meter_epoch.selection_epoch)
+                    .unwrap_or(0);
+                commands.extend(self.refresh_selection_metadata(&viewed, epoch, true));
+            }
+        }
+        if self.connected
+            && !self.meter_list_pending
+            && self
+                .meter_list_retry_at
+                .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            self.meter_list_retry_at = None;
+            self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
+            self.meter_list_pending = true;
+            commands.push(LiveCommand::ListAt {
+                cursor: None,
+                epoch: self.connection_epoch,
+            });
+        }
+        commands
+    }
+
+    /// Coalesce current metadata reads while retaining targets that change
+    /// during an in-flight page. Route facts can advance without an epoch.
+    fn refresh_selection_metadata(
+        &mut self,
+        session: &SessionId,
+        epoch: u64,
+        force_dirty: bool,
+    ) -> Vec<LiveCommand> {
+        if !self.connected {
             return Vec::new();
-        };
-        self.ensure_attached(model, &active)
+        }
+        if self.meter_list_pending {
+            if force_dirty
+                || self
+                    .meter_list_started
+                    .get(session)
+                    .is_none_or(|started| epoch > *started)
+            {
+                self.meter_list_dirty
+                    .entry(session.clone())
+                    .and_modify(|dirty| *dirty = (*dirty).max(epoch))
+                    .or_insert(epoch);
+            }
+            return Vec::new();
+        }
+        self.meter_list_pending = true;
+        self.meter_list_retry_at = None;
+        self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
+        self.meter_list_started
+            .entry(session.clone())
+            .and_modify(|started| *started = (*started).max(epoch))
+            .or_insert(epoch);
+        vec![LiveCommand::ListAt {
+            cursor: None,
+            epoch: self.connection_epoch,
+        }]
     }
 
     /// THE ONE PLACE AN `Attach` IS EMITTED, evicting the coldest EVICTABLE
@@ -2969,7 +3044,9 @@ impl LiveDriver {
         let active = model.active_session.clone();
         let mut fallback = None;
         for candidate in &self.lru {
-            if Some(candidate) == active.as_ref() {
+            if Some(candidate) == active.as_ref()
+                || model.selection_surface_session().as_ref() == Some(candidate)
+            {
                 continue;
             }
             if is_hot(model, candidate) {
@@ -3499,6 +3576,7 @@ impl LiveDriver {
             } => {
                 if next_cursor.is_none() {
                     self.meter_list_pending = false;
+                    self.meter_list_retry_at = None;
                 }
                 for summary in sessions {
                     if self
@@ -3519,23 +3597,43 @@ impl LiveDriver {
                         })
                         .map(workspace_display_path);
                     model.upsert_live_session(&summary.session_id);
-                    if let Some(metadata) = summary.metadata.as_ref() {
-                        // The list's head is the snapshot watermark. A
-                        // selection cannot be committed beyond that head.
-                        if metadata
-                            .selection_epoch
-                            .is_none_or(|epoch| epoch <= summary.head_seq)
+                    if summary.metadata.is_none()
+                        && let Some(row) = model
+                            .sessions
+                            .iter_mut()
+                            .find(|row| row.id == summary.session_id)
+                    {
+                        let current = if model.active_session.as_ref() == Some(&summary.session_id)
                         {
-                            model.note_session_metadata_at(
-                                &summary.session_id,
-                                &metadata.provider,
-                                &metadata.model,
-                                metadata.max_tokens,
-                                metadata.selection_epoch,
-                                metadata.max_tokens_source,
-                            );
-                            model.note_session_account(&summary.session_id, metadata);
+                            model.meter_epoch.selection_epoch
+                        } else {
+                            row.meter_epoch.selection_epoch
+                        };
+                        if current
+                            .max(row.route_reset_epoch)
+                            .max(row.account_request_epoch)
+                            .max(row.account_metadata_epoch)
+                            .is_none_or(|epoch| summary.head_seq >= epoch)
+                        {
+                            row.account_default_epoch = None;
                         }
+                    }
+                    if let Some(metadata) = summary.metadata.as_ref() {
+                        // Forks copy the source's current configuration, but
+                        // only their selected history prefix. Its selection
+                        // epoch can exceed the child's local journal head.
+                        // Epoch and pair admission order the configuration;
+                        // the summary watermark orders the history counts.
+                        model.note_session_metadata_at(
+                            &summary.session_id,
+                            &metadata.provider,
+                            &metadata.model,
+                            metadata.max_tokens,
+                            metadata.selection_epoch,
+                            metadata.max_tokens_source,
+                        );
+                        model.note_session_account(&summary.session_id, metadata);
+                        model.note_session_budget_clamp(&summary.session_id, metadata);
                         self.workspace_paths
                             .insert(summary.session_id.clone(), metadata.cwd.clone());
                         if metadata.workspace_allocation.is_some() {
@@ -3634,18 +3732,27 @@ impl LiveDriver {
             }
             LiveReply::ListFailed => {
                 self.meter_list_pending = false;
-                self.meter_list_started.clear();
-                if self.connected && !self.meter_list_dirty.is_empty() {
-                    self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
-                    self.meter_list_pending = true;
-                    vec![LiveCommand::ListAt {
-                        cursor: None,
-                        epoch: self.connection_epoch,
-                    }]
-                } else {
-                    self.meter_list_dirty.clear();
-                    Vec::new()
+                let newer_dirty = !self.meter_list_dirty.is_empty();
+                for (session, epoch) in std::mem::take(&mut self.meter_list_started) {
+                    self.meter_list_dirty
+                        .entry(session)
+                        .and_modify(|dirty| *dirty = (*dirty).max(epoch))
+                        .or_insert(epoch);
                 }
+                if self.connected && !self.meter_list_dirty.is_empty() {
+                    if newer_dirty {
+                        self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
+                        self.meter_list_pending = true;
+                        self.meter_list_retry_at = None;
+                        return vec![LiveCommand::ListAt {
+                            cursor: None,
+                            epoch: self.connection_epoch,
+                        }];
+                    }
+                    self.meter_list_retry_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                }
+                Vec::new()
             }
             LiveReply::Attached {
                 session,
@@ -3798,7 +3905,7 @@ impl LiveDriver {
                         metadata.selection_epoch,
                         metadata.max_tokens_source,
                     );
-                    model.note_session_account(&session, metadata);
+                    model.note_session_budget_clamp(&session, metadata);
                 }
                 if let Some(row) = model.sessions.iter_mut().find(|row| row.id == session) {
                     // The ROW shows the display form; `cwd` is the absolute
@@ -3807,7 +3914,7 @@ impl LiveDriver {
                     row.workspace_cwd = Some(cwd.clone());
                     row.model_short = model_name;
                 }
-                let commands = self.ensure_attached(model, &session);
+                let mut commands = self.ensure_attached(model, &session);
                 model.open_session(&session);
                 model.session_dir = cwd_display;
                 model.session_workspace_cwd = Some(cwd);
@@ -3817,8 +3924,13 @@ impl LiveDriver {
                 // a submit from a connection with no control attachment to
                 // that session, and issuing both in one batch races.
                 if let Some(text) = self.creating.remove(&command_id) {
-                    self.pending_first_turn.insert(session, text);
+                    self.pending_first_turn.insert(session.clone(), text);
                 }
+                // Create replies are frozen R2 receipts, including retries
+                // after another client has served or rebound the session.
+                // Bind their pair/budget, but read current account provenance.
+                let epoch = model.meter_epoch.selection_epoch.unwrap_or(0);
+                commands.extend(self.refresh_selection_metadata(&session, epoch, true));
                 model.dirty = true;
                 commands
             }
@@ -5937,10 +6049,16 @@ impl LiveDriver {
                 Vec::new()
             }
             LiveReply::Disconnected { reason } => {
+                // The session may be served elsewhere while disconnected.
+                // Keep recorded accounts, but expire its unserved forecast.
+                for row in &mut model.sessions {
+                    row.account_default_epoch = None;
+                }
                 self.connected = false;
                 self.meter_list_pending = false;
                 self.meter_list_started.clear();
                 self.meter_list_dirty.clear();
+                self.meter_list_retry_at = None;
                 self.binding_worker_generation = None;
                 self.attaching.clear();
                 // Review round 2: the Loom registry snapshot is CONNECTION
@@ -6060,6 +6178,9 @@ impl LiveDriver {
                 }
             }
             LiveReply::Reconnected => {
+                for row in &mut model.sessions {
+                    row.account_default_epoch = None;
+                }
                 self.connected = true;
                 model.flash = None;
                 model.supervisor_diagnostic = None;
@@ -6665,19 +6786,69 @@ impl LiveDriver {
         // only an APPLIED envelope can have moved the tree.
         if applied {
             let mut commands = self.fleet_event_chase(model, session);
-            // The first resolved route updates metadata without a journal
-            // fact or epoch change. Refresh it once the first turn settles so
-            // the attached header can show the session's actual account.
-            let first_route_settled = model.active_session.as_ref() == Some(session)
-                && model
-                    .sessions
-                    .iter()
-                    .find(|row| &row.id == session)
-                    .is_some_and(|row| !row.resolved_route_seen)
+            if envelope.payload.decode_event().is_ok_and(|payload| {
+                matches!(
+                    payload,
+                    haider_protocol::EventPayload::RunState(
+                        haider_protocol::state::RunState::Queued
+                            | haider_protocol::state::RunState::Thinking
+                    )
+                )
+            }) && let Some(row) = model.sessions.iter_mut().find(|row| &row.id == session)
+            {
+                let current = if model.active_session.as_ref() == Some(session) {
+                    model.meter_epoch.selection_epoch
+                } else {
+                    row.meter_epoch.selection_epoch
+                };
+                if row
+                    .route_reset_epoch
+                    .or(current)
+                    .is_none_or(|reset| envelope.seq >= reset)
+                {
+                    row.account_request_epoch = current;
+                    row.account_default_epoch = None;
+                }
+            }
+
+            // Older daemons write the first route without publishing a fact.
+            // Refresh terminal sessions even while parked; current daemons
+            // also trigger this read at the first route-only fact.
+            let first_route_settled = model
+                .sessions
+                .iter()
+                .find(|row| &row.id == session)
+                .is_some_and(|row| !row.resolved_route_seen)
                 && envelope.payload.decode_event().is_ok_and(|payload| {
                     matches!(payload,
                         haider_protocol::EventPayload::RunState(state) if state.is_terminal())
                 });
+            let route_selection =
+                haider_protocol::session::ModelSelected::from_payload_value(&envelope.payload);
+            let route_fact = route_selection
+                .as_ref()
+                .is_some_and(|selected| selected.route_only);
+            if route_fact
+                && let Some(row) = model.sessions.iter_mut().find(|row| &row.id == session)
+            {
+                let current = if model.active_session.as_ref() == Some(session) {
+                    model.meter_epoch.selection_epoch
+                } else {
+                    row.meter_epoch.selection_epoch
+                };
+                if current.is_some()
+                    && route_selection
+                        .as_ref()
+                        .and_then(|selected| selected.selection_epoch)
+                        == current
+                {
+                    // Forks can inherit an epoch above their own journal seq.
+                    // A current route fact proves use independently of counts,
+                    // replay ordering, or the following metadata read.
+                    row.account_request_epoch = current;
+                    row.account_default_epoch = None;
+                }
+            }
             if (model_fact || first_route_settled) && self.connected {
                 let selection_epoch = if model.active_session.as_ref() == Some(session) {
                     model.meter_epoch.selection_epoch
@@ -6689,25 +6860,11 @@ impl LiveDriver {
                         .and_then(|row| row.meter_epoch.selection_epoch)
                 }
                 .unwrap_or(envelope.seq);
-                if self.meter_list_pending {
-                    if first_route_settled
-                        || self
-                            .meter_list_started
-                            .get(session)
-                            .is_none_or(|started| selection_epoch > *started)
-                    {
-                        self.meter_list_dirty
-                            .insert(session.clone(), selection_epoch);
-                    }
-                } else {
-                    self.meter_list_pending = true;
-                    self.meter_list_started
-                        .insert(session.clone(), selection_epoch);
-                    commands.push(LiveCommand::ListAt {
-                        cursor: None,
-                        epoch: self.connection_epoch,
-                    });
-                }
+                commands.extend(self.refresh_selection_metadata(
+                    session,
+                    selection_epoch,
+                    first_route_settled || route_fact,
+                ));
             }
             // The graph strip's event-cadence chase: keep the reduction
             // current while a graph is unfinished, and catch every graph
@@ -6777,6 +6934,29 @@ impl LiveDriver {
             haider_protocol::session::SessionConfigEventPayload::ModelSelected(_)
                 | haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(_)
         );
+        if let haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) =
+            &payload
+            && !selected.route_only
+            && let Some(notice) = haider_protocol::session::model_selection_clear_notice(
+                selected.cleared_account_pin.as_deref(),
+                selected.cleared_provider_endpoint.as_deref(),
+                &selected.provider,
+            )
+        {
+            model.record_selection_notice(session, format!("· {notice}"));
+        }
+        if let haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) =
+            &payload
+            && let Some(clamp) = selected.output_budget_clamp
+        {
+            model.record_budget_clamp_notice(
+                session,
+                selected.selection_epoch.or(Some(envelope.seq)),
+                &selected.provider,
+                &selected.model,
+                &clamp,
+            );
+        }
         if model.active_session.as_ref() != Some(session) {
             // 973-context-meter-fixes B1: a PARKED session's model facts
             // bind its own meter epoch (never the identity on screen).
@@ -6796,22 +6976,15 @@ impl LiveDriver {
                             &selected.model,
                             selected.selection_epoch.or(Some(envelope.seq)),
                         );
-                        if let Some(alias) = selected.cleared_account_pin.as_deref() {
-                            model.note_parked_account_pin_cleared(
-                                session,
-                                alias,
-                                &selected.provider,
-                            );
-                        }
                     }
                 }
                 haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(
                     rebound,
-                ) => model.note_parked_provider_rebound_at(
-                    session,
-                    &rebound.provider,
-                    rebound.selection_epoch.or(Some(envelope.seq)),
-                ),
+                ) => {
+                    let epoch = rebound.selection_epoch.or(Some(envelope.seq));
+                    model.note_parked_provider_rebound_at(session, &rebound.provider, epoch);
+                    model.note_session_rebound_account_at(session, &rebound, epoch);
+                }
                 _ => {}
             }
             return model_fact;
@@ -6849,12 +7022,21 @@ impl LiveDriver {
                 let selected_epoch = selected.selection_epoch.or(Some(envelope.seq));
                 let pair = (selected.provider.clone(), selected.model.clone());
                 let route_only = selected.route_only;
+                let previous_epoch = model.meter_epoch.selection_epoch;
                 let same_pair = model.meter_epoch.pair.as_ref() == Some(&pair);
                 let budget = (route_only && same_pair).then_some(model.meter_epoch.output_budget).flatten();
                 let user_budget = (route_only && same_pair).then_some(model.meter_epoch.user_budget);
                 if !model.meter_epoch.admit(pair,
                     selected_epoch, budget, user_budget) {
                     return false;
+                }
+                if model.identity.provider != selected.provider
+                    && let Some(row) = model.sessions.iter_mut().find(|row| &row.id == session)
+                {
+                    row.reset_account_route(&selected.provider, selected_epoch);
+                }
+                if route_only && let Some(row) = model.sessions.iter_mut().find(|row| &row.id == session) {
+                    row.observe_route_commit(selected_epoch, previous_epoch);
                 }
                 if model.identity.model_short != selected.model
                     || model.identity.provider != selected.provider
@@ -6868,12 +7050,6 @@ impl LiveDriver {
                         "⇄ model → {} · {}",
                         selected.model, selected.provider
                     ));
-                    if let Some(alias) = selected.cleared_account_pin.as_deref() {
-                        model.projection.push_note(format!(
-                            "· account pin {alias} cleared — {} uses its active account",
-                            selected.provider
-                        ));
-                    }
                 }
                 model.dirty = true;
             }
@@ -6885,6 +7061,8 @@ impl LiveDriver {
                     rebound.selection_epoch.or(Some(envelope.seq)), None, None) {
                     return false;
                 }
+                model.note_session_rebound_account_at(session, &rebound,
+                    rebound.selection_epoch.or(Some(envelope.seq)));
                 if model.identity.provider != rebound.provider {
                     model.identity.provider = rebound.provider;
                     model.refresh_context_window();
@@ -7619,6 +7797,7 @@ impl LiveDriver {
                 self.meter_list_pending = false;
                 self.meter_list_started.clear();
                 self.meter_list_dirty.clear();
+                self.meter_list_retry_at = None;
                 vec![LiveCommand::Reconnect]
             }
             // The request's `after_seq` is the reducer's own last fully

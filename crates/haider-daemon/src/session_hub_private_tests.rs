@@ -6184,6 +6184,8 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
         model: "model-b".into(),
         route_only: false,
         cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     }
     .to_payload_value()
     .expect("fact serializes");

@@ -957,3 +957,110 @@ fn agent_spawn_provider_without_published_default_retains_native_rejection() {
     assert!(rejected["result"].is_null());
     profile.stop();
 }
+
+/// Covers the real RPC response -> CLI JSON/stderr notice path. An endpoint
+/// alone must disclose its clear, and a combined clear names both choices.
+#[test]
+fn session_config_clear_notices_survive_rpc_and_cli_projection() {
+    let fixture = Profile::new(report_script("synthetic session notice"));
+    std::fs::write(fixture.profile.join("accounts.json"), json!([
+        {"alias":"bed-synthetic","provider":"bedrock","auth_method":"api_key","identity":"synthetic-bed",
+         "status":{"status":"ok"},"active":true},
+        {"alias":"ant-synthetic","provider":"anthropic","auth_method":"api_key","identity":"synthetic-ant",
+         "status":{"status":"ok"},"active":true}
+    ]).to_string()).expect("synthetic descriptors only");
+    let spawned = fixture.spawn();
+    fixture.wait(&spawned, 0);
+    let session = field(&spawned, "child_session_id");
+    for pin in [false, true] {
+        // Move to a known pair before installing this provider's override.
+        let output = fixture.run(&[
+            "session",
+            session,
+            "config",
+            "--model",
+            "bedrock/anthropic.claude-opus-5",
+            "--max-output-tokens",
+            "100000",
+            "--confirm-epoch",
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut args = vec![
+            "session",
+            "provider",
+            "rebind",
+            "--session",
+            session,
+            "--provider",
+            "bedrock",
+            "--base-url",
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        ];
+        if pin {
+            args.extend(["--account", "bed-synthetic"]);
+        }
+        let output = fixture.run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = fixture.run(&[
+            "session",
+            session,
+            "config",
+            "--model",
+            "anthropic/claude-haiku-4-5",
+            "--confirm-epoch",
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+        assert_eq!(
+            document["cleared_provider_endpoint"],
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+        );
+        let notice = document["selection_notices"][0]
+            .as_str()
+            .expect("visible notice in JSON");
+        assert!(
+            notice.contains("endpoint https://bedrock-mantle.us-east-1.api.aws/anthropic"),
+            "{document}"
+        );
+        if pin {
+            assert!(notice.contains("account pin bed-synthetic"));
+        }
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(notice),
+            "stderr must match the typed RPC disclosure"
+        );
+        let clamp = document["selection_notices"][1]
+            .as_str()
+            .expect("clamp notice in JSON");
+        assert!(
+            clamp.contains("Output budget 100000") && clamp.contains("using 64000"),
+            "{document}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(clamp));
+        assert_eq!(document["max_tokens"], 64000);
+        assert_eq!(document["max_tokens_source"], "user_set");
+        let read = fixture.run(&["session", session, "config", "--json"]);
+        assert!(read.status.success());
+        assert!(read.stderr.is_empty());
+        let read: Value = serde_json::from_slice(&read.stdout).expect("read JSON");
+        assert!(
+            read.get("selection_notices").is_none(),
+            "no stale/spurious notices on reads"
+        );
+    }
+    fixture.stop();
+}

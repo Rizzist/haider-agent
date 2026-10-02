@@ -162,7 +162,7 @@ fn note_texts(model: &AppModel) -> Vec<String> {
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptEntry::Note { text } => Some(text.clone()),
+            TranscriptEntry::Note { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect()
@@ -470,7 +470,7 @@ fn timeline_order_spawned_messaged_report() {
     let messaged = entries
         .iter()
         .position(
-            |entry| matches!(entry, TranscriptEntry::Note { text } if text.contains("→ messaged")),
+            |entry| matches!(entry, TranscriptEntry::Note { text, .. } if text.contains("→ messaged")),
         )
         .expect("messaged marker");
     let report = entries

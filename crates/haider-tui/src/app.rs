@@ -2015,7 +2015,7 @@ impl ChipModel {
             crate::projection::TranscriptEntry::Peer { sender, text, .. } => {
                 format!("peer {sender}: {text}")
             }
-            crate::projection::TranscriptEntry::Note { text } => text.clone(),
+            crate::projection::TranscriptEntry::Note { text, .. } => text.clone(),
             crate::projection::TranscriptEntry::Refusal {
                 provider,
                 tool,
@@ -6602,6 +6602,16 @@ impl AppModel {
         let from = self.screen;
         let from_key = self.surface_key();
         self.screen = to;
+        if to == Screen::Subagent {
+            if !self.mode.fabricates_locally()
+                && let Some(child) = self.selection_surface_session()
+            {
+                // Attach/replay needs the child's own cursor even before
+                // session.list has introduced its row.
+                self.upsert_live_session(&child);
+            }
+            self.restore_child_session_notes();
+        }
         if self.surface_key() == from_key {
             return;
         }
@@ -7247,7 +7257,7 @@ impl AppModel {
         let mut text = String::new();
         match entry {
             crate::projection::TranscriptEntry::User { text: value, .. }
-            | crate::projection::TranscriptEntry::Note { text: value }
+            | crate::projection::TranscriptEntry::Note { text: value, .. }
             | crate::projection::TranscriptEntry::Error { text: value, .. } => text.push_str(value),
             crate::projection::TranscriptEntry::Peer {
                 sender,
@@ -21120,10 +21130,23 @@ impl AppModel {
                 haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { .. }
             )
         });
+        let previous_provider = if self.active_session.as_ref() == Some(session) {
+            self.meter_epoch.pair.as_ref().map(|pair| pair.0.as_str())
+        } else {
+            self.sessions
+                .iter()
+                .find(|row| &row.id == session)
+                .and_then(|row| row.meter_epoch.pair.as_ref())
+                .map(|pair| pair.0.as_str())
+        };
+        let new_route = previous_provider.is_some_and(|old| old != provider);
         let viewed_child = self.screen == Screen::Subagent
             && self.selection_surface_session().as_ref() == Some(session);
         if viewed_child && !self.sessions.iter().any(|row| &row.id == session) {
             self.upsert_live_session(session);
+        }
+        if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
+            self.record_budget_clamp_notice(session, selection_epoch, provider, model, &clamp);
         }
         let admitted = if self.active_session.as_ref() == Some(session) {
             let admitted = self
@@ -21148,6 +21171,9 @@ impl AppModel {
         if !admitted {
             return;
         }
+        if new_route && let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) {
+            row.reset_account_route(provider, selection_epoch);
+        }
         if viewed_child {
             self.launcher_identity.provider = provider.to_owned();
             self.launcher_identity.model_short = model.to_owned();
@@ -21159,13 +21185,10 @@ impl AppModel {
             self.pending_cache_change = None;
             self.flash = Some(format!("· model → {model} · {provider}"));
         }
-        if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
-            if self.active_session.as_ref() == Some(session) {
-                self.apply_output_budget_clamp(&clamp);
-            } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session)
-            {
-                entry.projection.push_note(format!("· {}", clamp.notice()));
-            }
+        if let Some(clamp) = output_budget.and_then(|budget| budget.clamped)
+            && self.selection_surface_session().as_ref() == Some(session)
+        {
+            self.apply_output_budget_clamp(&clamp);
         }
     }
 
@@ -21200,11 +21223,19 @@ impl AppModel {
         let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
             return;
         };
+        let new_provider = entry
+            .meter_epoch
+            .pair
+            .as_ref()
+            .is_some_and(|pair| pair.0 != provider);
         if !entry
             .meter_epoch
             .admit((provider.to_owned(), model.to_owned()), epoch, None, None)
         {
             return;
+        }
+        if new_provider {
+            entry.reset_account_route(provider, epoch);
         }
         entry.model_short = model.to_owned();
         entry
@@ -21219,11 +21250,113 @@ impl AppModel {
         alias: &str,
         provider: &str,
     ) {
-        if let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) {
-            row.projection.push_note(format!(
-                "· account pin {alias} cleared — {provider} uses its active account"
-            ));
-            self.dirty = true;
+        if let Some(notice) =
+            haider_protocol::session::model_selection_clear_notice(Some(alias), None, provider)
+        {
+            self.record_selection_notice(session, format!("· {notice}"));
+        }
+    }
+
+    /// Local selection feedback follows the owning session in both the root
+    /// projection and the child transcript rendered by the recursive tree.
+    pub fn record_selection_notice(&mut self, session: &SessionId, text: String) {
+        self.record_selection_note(session, None, text);
+    }
+
+    pub(crate) fn record_budget_clamp_notice(
+        &mut self,
+        session: &SessionId,
+        epoch: Option<u64>,
+        provider: &str,
+        model: &str,
+        clamp: &haider_protocol::output_budget::OutputBudgetClampV1,
+    ) {
+        // An omitted epoch identifies no particular commit. Independent
+        // legacy notifications must not collide with one another or epoch zero.
+        self.record_selection_note(
+            session,
+            epoch,
+            format!("· {provider}/{model} · {}", clamp.notice()),
+        );
+    }
+
+    fn record_selection_note(&mut self, session: &SessionId, epoch: Option<u64>, text: String) {
+        fn children(chips: &mut [ChipModel], session: &SessionId, epoch: Option<u64>, text: &str) {
+            for chip in chips {
+                if chip.child_session.as_deref() == Some(session.as_str()) {
+                    chip.transcript
+                        .push_selection_notice(epoch, text.to_owned());
+                }
+                children(&mut chip.children, session, epoch, text);
+            }
+        }
+        if self.active_session.as_ref() == Some(session) {
+            self.projection.push_selection_notice(epoch, text.clone());
+        }
+        children(&mut self.chips, session, epoch, &text);
+        for row in &mut self.sessions {
+            if &row.id == session && self.active_session.as_ref() != Some(session) {
+                row.projection.push_selection_notice(epoch, text.clone());
+            }
+            children(&mut row.chips, session, epoch, &text);
+        }
+        self.dirty = true;
+    }
+
+    /// A rebuilt tree entry still owns notices received while it was absent.
+    /// Count occurrences so repeated identical selections remain distinct.
+    fn restore_child_session_notes(&mut self) {
+        let Some(chip) = self.viewed_chip() else {
+            return;
+        };
+        let agent = chip.agent.clone();
+        let Some(session) = chip.child_session.as_deref() else {
+            return;
+        };
+        let notices = self
+            .sessions
+            .iter()
+            .find(|row| row.id.as_str() == session)
+            .map(|row| {
+                row.projection
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| {
+                        if let crate::projection::TranscriptEntry::Note {
+                            text,
+                            selection_notice_epoch,
+                        } = entry
+                        {
+                            Some((text.clone(), *selection_notice_epoch))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(chip) = find_chip_mut(&mut self.chips, &agent) else {
+            return;
+        };
+        let mut existing = std::collections::HashMap::<(String, Option<u64>), usize>::new();
+        for entry in chip.transcript.entries() {
+            if let crate::projection::TranscriptEntry::Note {
+                text,
+                selection_notice_epoch,
+            } = entry
+            {
+                *existing
+                    .entry((text.clone(), *selection_notice_epoch))
+                    .or_default() += 1;
+            }
+        }
+        let mut occurrences = std::collections::HashMap::<(String, Option<u64>), usize>::new();
+        for (text, epoch) in notices {
+            let count = occurrences.entry((text.clone(), epoch)).or_default();
+            *count += 1;
+            if existing.get(&(text.clone(), epoch)).copied().unwrap_or(0) < *count {
+                chip.transcript.push_selection_notice(epoch, text);
+            }
         }
     }
 
@@ -21243,7 +21376,9 @@ impl AppModel {
         let same_pair = row.meter_epoch.pair.as_ref() == Some(&pair);
         let budget = same_pair.then_some(row.meter_epoch.output_budget).flatten();
         let user_budget = same_pair.then_some(row.meter_epoch.user_budget);
+        let previous_epoch = row.meter_epoch.selection_epoch;
         if row.meter_epoch.admit(pair, epoch, budget, user_budget) {
+            row.observe_route_commit(epoch, previous_epoch);
             self.dirty = true;
         }
     }
@@ -21263,12 +21398,84 @@ impl AppModel {
         let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
             return;
         };
-        if let Some((_, model)) = entry.meter_epoch.pair.clone() {
-            entry
+        if let Some((previous, model)) = entry.meter_epoch.pair.clone()
+            && entry
                 .meter_epoch
-                .admit((provider.to_owned(), model), epoch, None, None);
+                .admit((provider.to_owned(), model), epoch, None, None)
+        {
+            if previous != provider {
+                entry.reset_account_route(provider, epoch);
+            }
             self.dirty = true;
         }
+    }
+
+    /// Apply route coordinates only after this rebind's epoch was admitted.
+    /// A no-op preserves known served provenance and cannot make legacy
+    /// missing provenance eligible for today's global default.
+    pub(crate) fn note_session_rebound_account_at(
+        &mut self,
+        session: &SessionId,
+        rebound: &haider_protocol::session::SessionProviderRebound,
+        epoch: Option<u64>,
+    ) {
+        let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) else {
+            return;
+        };
+        let meter = if self.active_session.as_ref() == Some(session) {
+            &self.meter_epoch
+        } else {
+            &row.meter_epoch
+        };
+        if meter.selection_epoch != epoch
+            || meter
+                .pair
+                .as_ref()
+                .is_none_or(|pair| pair.0 != rebound.provider)
+        {
+            return;
+        }
+        // Budget/model epochs can advance without changing route choices.
+        // Provider resets and unresolved route commits invalidate an older
+        // snapshot's coordinates, so it cannot prove a later rebind is fresh.
+        let required_epoch = row.route_reset_epoch.max(
+            (!row.resolved_route_seen)
+                .then_some(row.account_request_epoch)
+                .flatten(),
+        );
+        let coordinates_known = row.account_provider.is_some()
+            && match (row.account_metadata_epoch, required_epoch) {
+                (Some(snapshot), Some(required)) => snapshot >= required,
+                (None, Some(0)) => true,
+                (None, Some(_)) => false,
+                (_, None) => true,
+            };
+        let changed = coordinates_known.then(|| {
+            row.account_provider.as_deref() != Some(rebound.provider.as_str())
+                || row.account_base_url != rebound.base_url
+                || row.account_alias != rebound.account
+        });
+        let cached_change = row
+            .account_provider
+            .as_deref()
+            .is_some_and(|provider| provider != rebound.provider)
+            || row.account_alias != rebound.account
+            || (row.route_reset_epoch == epoch && row.account_default_epoch == epoch);
+        if changed == Some(true) || (changed.is_none() && cached_change) {
+            row.reset_account_route(&rebound.provider, epoch);
+        } else if changed.is_none() {
+            // An absent snapshot cannot prove that the route stayed the same.
+            row.resolved_route_alias = None;
+            row.resolved_route_seen = false;
+            row.account_default_epoch = None;
+        } else if row.account_default_epoch.is_some() {
+            row.account_default_epoch = epoch;
+        }
+        row.account_alias.clone_from(&rebound.account);
+        row.account_provider = Some(rebound.provider.clone());
+        row.account_base_url.clone_from(&rebound.base_url);
+        row.account_metadata_epoch = epoch;
+        self.dirty = true;
     }
 
     /// The daemon's typed session metadata (`session.list`) for `session`:
@@ -21335,7 +21542,7 @@ impl AppModel {
             return self.identity.account.clone();
         };
         let Some(row) = self.sessions.iter().find(|row| &row.id == session) else {
-            return "unknown".to_owned();
+            return "unknown/not recorded".to_owned();
         };
         if row.account_provider.as_deref() == Some(self.identity.provider.as_str()) {
             if let Some(alias) = row.account_alias.as_deref() {
@@ -21347,6 +21554,29 @@ impl AppModel {
                     .clone()
                     .unwrap_or_else(|| "unbound".to_owned());
             }
+        }
+        // A default describes only a future first request. Running requests
+        // and recorded history need route provenance, including older daemons
+        // that supplied usage but never recorded their resolved account.
+        let projection = &self.projection;
+        let footprint = projection
+            .latest_footprint()
+            .or_else(|| row.latest_context_footprint());
+        let prior_epoch = footprint.is_some_and(|fp| {
+            matches!(
+                (fp.selection_epoch, row.route_reset_epoch),
+                (Some(served), Some(current)) if served < current
+            )
+        });
+        if self.meter_epoch.selection_epoch.is_none()
+            || row.account_default_epoch != self.meter_epoch.selection_epoch
+            || projection.is_turn_active()
+            || (!prior_epoch
+                && (projection.context_tokens() > 0
+                    || projection.user_row_count() > 0
+                    || row.turns() > 0))
+        {
+            return "unknown/not recorded".to_owned();
         }
         self.accounts
             .rows
@@ -21369,18 +21599,115 @@ impl AppModel {
             } else {
                 &row.meter_epoch
             };
-            if epoch.pair.as_ref() != Some(&(metadata.provider.clone(), metadata.model.clone()))
-                || matches!((epoch.selection_epoch, metadata.selection_epoch),
-                    (Some(current), Some(incoming)) if incoming < current)
+            let same_pair =
+                epoch.pair.as_ref() == Some(&(metadata.provider.clone(), metadata.model.clone()));
+            let older_epoch = matches!((epoch.selection_epoch, metadata.selection_epoch),
+                (Some(current), Some(incoming)) if incoming < current);
+            if same_pair
+                && !older_epoch
+                && metadata.route_reset_epoch.is_none()
+                && !metadata.resolved_route_seen
             {
+                // Unknown current provenance cannot inherit an earlier
+                // forecast; an explicitly stale reply cannot revoke one.
+                row.account_default_epoch = None;
+                self.dirty = true;
+            }
+            // An epochless snapshot cannot overwrite a known later route
+            // reset/commit. It may have been read before the explicit change.
+            let unversioned_route_is_stale = metadata.selection_epoch.is_none()
+                && row
+                    .route_reset_epoch
+                    .max(row.account_request_epoch)
+                    .max(row.account_metadata_epoch)
+                    .is_some_and(|route| route > 0);
+            if unversioned_route_is_stale || !same_pair || older_epoch {
                 return;
             }
+            let same_route_reset = match metadata.route_reset_epoch {
+                Some(reset) => row
+                    .route_reset_epoch
+                    .or(row.account_metadata_epoch)
+                    .is_some_and(|recorded| reset <= recorded),
+                None => {
+                    metadata.selection_epoch.is_none()
+                        || metadata.selection_epoch == row.account_metadata_epoch
+                }
+            };
+            // First-route truth is monotonic within an unchanged route. A
+            // read from before that first commit has the same selection epoch
+            // and cannot erase a later recorded named or null serving route.
+            let retain_recorded_route = row.resolved_route_seen
+                && !metadata.resolved_route_seen
+                && same_route_reset
+                && row.account_provider.as_deref() == Some(metadata.provider.as_str())
+                && row.account_alias == metadata.account_alias
+                && row.account_base_url == metadata.provider_base_url;
             row.account_alias.clone_from(&metadata.account_alias);
             row.account_provider = Some(metadata.provider.clone());
-            row.resolved_route_alias
-                .clone_from(&metadata.resolved_route_alias);
-            row.resolved_route_seen = metadata.resolved_route_seen;
+            row.account_base_url.clone_from(&metadata.provider_base_url);
+            row.account_metadata_epoch = metadata.selection_epoch;
+            if !retain_recorded_route {
+                row.resolved_route_alias
+                    .clone_from(&metadata.resolved_route_alias);
+                row.resolved_route_seen = metadata.resolved_route_seen;
+            }
+            if let Some(reset) = metadata.route_reset_epoch {
+                row.route_reset_epoch = Some(reset);
+                row.account_default_epoch = (!row.resolved_route_seen
+                    && row
+                        .account_request_epoch
+                        .is_none_or(|request| request < reset))
+                .then_some(epoch.selection_epoch)
+                .flatten();
+            }
             self.dirty = true;
+        }
+    }
+
+    /// Disclose a current legacy/inherited clamp only when this metadata's
+    /// pair and effective budget were admitted. Account snapshot provenance
+    /// has an independent fence and cannot suppress a valid budget warning.
+    pub(crate) fn note_session_budget_clamp(
+        &mut self,
+        session: &SessionId,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) {
+        let epoch = if self.active_session.as_ref() == Some(session) {
+            &self.meter_epoch
+        } else if let Some(row) = self.sessions.iter().find(|row| &row.id == session) {
+            &row.meter_epoch
+        } else {
+            return;
+        };
+        if epoch.pair.as_ref() != Some(&(metadata.provider.clone(), metadata.model.clone()))
+            || epoch.output_budget != Some(metadata.max_tokens)
+            || matches!((epoch.selection_epoch, metadata.selection_epoch),
+                (Some(current), Some(incoming)) if incoming < current)
+        {
+            return;
+        }
+        if metadata.budget_clamp_notice_epoch.is_none()
+            && let Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                requested,
+            }) = metadata.max_tokens_source
+            && requested > metadata.max_tokens
+        {
+            self.record_budget_clamp_notice(
+                session,
+                // Re-reading the same legacy metadata is a state read,
+                // distinct from an epochless selection notification.
+                metadata
+                    .selection_epoch
+                    .or(epoch.selection_epoch)
+                    .or(Some(0)),
+                &metadata.provider,
+                &metadata.model,
+                &haider_protocol::output_budget::OutputBudgetClampV1 {
+                    requested,
+                    max_output_tokens: metadata.max_tokens,
+                },
+            );
         }
     }
 

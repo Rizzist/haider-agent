@@ -86,6 +86,10 @@ pub(crate) struct SessionConfigDocument {
     account_alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cleared_account_pin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared_provider_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    selection_notices: Vec<String>,
     agent_type: Option<String>,
     context_window: Option<u64>,
     workspace_cwd: String,
@@ -357,6 +361,8 @@ async fn execute(
     }
     let mut result = document(digest, &providers)?;
     result.cleared_account_pin = effects.cleared_account_pin;
+    result.cleared_provider_endpoint = effects.cleared_provider_endpoint;
+    result.selection_notices = effects.selection_notices;
     Ok(result)
 }
 
@@ -364,6 +370,8 @@ async fn execute(
 struct MutationEffects {
     applied: Vec<&'static str>,
     cleared_account_pin: Option<String>,
+    cleared_provider_endpoint: Option<String>,
+    selection_notices: Vec<String>,
 }
 
 async fn apply_mutations(
@@ -400,23 +408,33 @@ async fn apply_mutations(
             .await
             .map_err(ConfigError::Client)?;
         if let ResponseBody::SessionSelectModel {
-            cleared_account_pin: Some(alias),
+            cleared_account_pin,
+            cleared_provider_endpoint,
             provider,
+            output_budget,
             ..
         } = &response
         {
-            effects.cleared_account_pin = Some(alias.clone());
-            eprintln!(
-                "haider session config: account pin {alias} cleared: the session now uses the {provider} default account"
-            );
-        }
-        if let ResponseBody::SessionSelectModel {
-            output_budget: Some(budget),
-            ..
-        } = &response
-            && let Some(clamp) = budget.clamped
-        {
-            eprintln!("haider session config: {}", clamp.notice());
+            effects.cleared_account_pin.clone_from(cleared_account_pin);
+            effects
+                .cleared_provider_endpoint
+                .clone_from(cleared_provider_endpoint);
+            if let Some(notice) = haider_protocol::session::model_selection_clear_notice(
+                cleared_account_pin.as_deref(),
+                cleared_provider_endpoint.as_deref(),
+                provider,
+            ) {
+                eprintln!("haider session config: {notice}");
+                effects.selection_notices.push(notice);
+            }
+            if let Some(clamp) = output_budget
+                .as_ref()
+                .and_then(|budget| budget.clamped.as_ref())
+            {
+                let notice = clamp.notice();
+                eprintln!("haider session config: {notice}");
+                effects.selection_notices.push(notice);
+            }
         }
         *worker_generation = selected_generation(
             response,
@@ -712,6 +730,8 @@ pub(crate) fn document(
         fast: metadata.fast,
         account_alias: metadata.account_alias,
         cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        selection_notices: Vec::new(),
         agent_type: metadata.agent_type,
         context_window,
         workspace_cwd: metadata.cwd,

@@ -737,6 +737,8 @@ fn deliver_model_fact(
         model: slug.to_owned(),
         route_only: false,
         cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     };
     deliver(
         driver,
@@ -1351,6 +1353,8 @@ fn listed_summary(
 ) -> haider_rpc::SessionSummary {
     let metadata = haider_protocol::session::SessionMetadataV1 {
         selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
         resolved_route_alias: None,
         resolved_route_seen: false,
         launch_origin: None,

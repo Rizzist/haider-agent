@@ -370,7 +370,7 @@ async fn a_dead_sessions_auto_title_never_lands_on_its_replacement() {
     assert!(
         !model.projection.entries().iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Note { text } if text.contains(&ghost)
+            TranscriptEntry::Note { text, .. } if text.contains(&ghost)
         )),
         "…and its `· session titled` note must not enter the replacement's transcript"
     );

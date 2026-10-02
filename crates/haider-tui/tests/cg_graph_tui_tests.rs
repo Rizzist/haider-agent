@@ -227,7 +227,7 @@ fn m2c_finalization_deferred_surfaces_a_bounded_note() {
         .entries()
         .iter()
         .find_map(|entry| match entry {
-            TranscriptEntry::Note { text } => Some(text.as_str()),
+            TranscriptEntry::Note { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .expect("a deferral note");
@@ -408,7 +408,7 @@ fn graph_facts_render_quiet_transcript_notes() {
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptEntry::Note { text } => Some(text.as_str()),
+            TranscriptEntry::Note { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
