@@ -122,6 +122,9 @@ async fn removed_custom_account_can_be_readded_to_its_retained_profile() {
         ResponseBody::AccountList {
             descriptors: Vec::new(),
             revision: Some(9),
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+            sources: Vec::new(),
             availability: Some(SnapshotAvailabilityWire::Available),
         },
         ResponseBody::VaultStage {
@@ -156,11 +159,24 @@ async fn removed_custom_account_can_be_readded_to_its_retained_profile() {
 
 #[tokio::test]
 async fn add_never_replaces_an_existing_account_or_builtin_or_no_auth_profile() {
-    for active in [true, false] {
+    for (active, status) in [
+        (true, CredentialStatus::Ok),
+        (false, CredentialStatus::Ok),
+        (true, CredentialStatus::Expired),
+        (false, CredentialStatus::Revoked),
+        (true, CredentialStatus::Limited { until_ms: 99 }),
+        (
+            false,
+            CredentialStatus::NeedsAttention {
+                reason: haider_protocol::credential::CredentialAttentionReason::SourceUnreadable,
+            },
+        ),
+    ] {
         let mut retained = provider();
         retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
         let mut account = descriptor();
         account.active = active;
+        account.status = status;
         let client = FakeClient::new([
             ResponseBody::ProviderList {
                 providers: vec![retained],
@@ -170,6 +186,9 @@ async fn add_never_replaces_an_existing_account_or_builtin_or_no_auth_profile() 
             ResponseBody::AccountList {
                 descriptors: vec![account],
                 revision: Some(9),
+                provider_active: Vec::new(),
+                provider_defaults: Vec::new(),
+                sources: Vec::new(),
                 availability: Some(SnapshotAvailabilityWire::Available),
             },
         ]);
@@ -184,6 +203,8 @@ async fn add_never_replaces_an_existing_account_or_builtin_or_no_auth_profile() 
         if no_auth {
             retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
             retained.auth_methods.clear();
+        } else {
+            retained.catalog = haider_rpc::ProviderCatalogKindWire::Authenticated;
         }
         let client = FakeClient::new([ResponseBody::ProviderList {
             providers: vec![retained],
@@ -211,6 +232,9 @@ async fn readd_requires_an_available_account_snapshot() {
         ResponseBody::AccountList {
             descriptors: Vec::new(),
             revision: Some(9),
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+            sources: Vec::new(),
             availability: Some(SnapshotAvailabilityWire::Unknown),
         },
     ]);
