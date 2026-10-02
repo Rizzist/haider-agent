@@ -36,7 +36,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthStr;
 
 mod tuivirt_common;
-use tuivirt_common::{assert_same_frame, check_golden, draw, session_id, session_model};
+use tuivirt_common::{assert_same_frame, check_golden, draw, session_id};
 
 const T0: u64 = 1_800_000_000_000;
 
@@ -230,6 +230,14 @@ fn class_of(name: &str) -> EffectClass {
 /// Four subagents doing different things (the chip panel stays expanded
 /// under the five-node fleet collapse): Amina read → edit (edit open),
 /// Bilal on the web, Kawthar orchestrating her own child Dawud (reading).
+fn session_model() -> AppModel {
+    let mut model = tuivirt_common::session_model();
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SESSION_ACTIVITY_V1.to_owned());
+    model
+}
+
 fn busy_session() -> Fixture {
     let mut fixture = Fixture {
         model: session_model(),
@@ -688,4 +696,192 @@ fn a_spoofed_tool_name_never_shows_an_icon() {
         !bilal.contains('\u{1F5A5}') && !bilal.contains('\u{1F4F1}'),
         "{bilal}"
     );
+}
+
+#[test]
+fn activity_surfaces_require_the_granted_token_even_with_local_or_snapshot_facts() {
+    let mut fixture = busy_fleet();
+    let snapshot = fixture.model.fleet.snapshot.clone().expect("snapshot");
+    for features in [vec![], vec![haider_rpc::FEATURE_SESSION_FLEET_IDENTITY_V1]] {
+        fixture.model.daemon_features = features.into_iter().map(str::to_owned).collect();
+        for agent in [AMINA, KAWTHAR, DAWUD, SUMAYYA] {
+            let node = haider_tui::fleet::find_node(&snapshot, agent).expect("node");
+            assert_eq!(
+                fixture.model.chip_activity(chip(&fixture.model, agent)),
+                None
+            );
+            assert_eq!(fixture.model.node_activity(node), None);
+            assert!(fixture.model.node_activities(node).is_empty());
+        }
+        for display in [ActivityDisplay::Emoji, ActivityDisplay::Text] {
+            fixture.model.activity_display = display;
+            let frame = draw(&fixture.model, 118, 36);
+            for kind in ActivityKind::ALL {
+                assert!(!frame.contains(kind.emoji()) && !frame.contains(kind.text_label()));
+            }
+        }
+    }
+    fixture
+        .model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SESSION_ACTIVITY_V1.to_owned());
+    let node = haider_tui::fleet::find_node(&snapshot, AMINA).expect("node");
+    assert_eq!(fixture.model.node_activity(node), Some(ActivityKind::Edit));
+    assert!(
+        fixture
+            .model
+            .node_activities(node)
+            .contains(&ActivityKind::Read)
+    );
+}
+
+fn routed_activity<'a>(
+    model: &'a AppModel,
+    session: &haider_protocol::ids::SessionId,
+    background: bool,
+    parked: bool,
+) -> &'a haider_protocol::activity::ActivityTracker {
+    let (branches, chips) = if background {
+        let slot = model
+            .sessions
+            .iter()
+            .find(|slot| &slot.id == session)
+            .expect("slot");
+        (&slot.branch_state, &slot.chips)
+    } else {
+        (&model.branch_state, &model.chips)
+    };
+    let chips = if parked {
+        &branches
+            .view(&haider_protocol::ids::BranchId::new("activity-branch"))
+            .expect("branch")
+            .chips
+    } else {
+        chips
+    };
+    &haider_tui::app::find_chip(chips, AMINA)
+        .expect("chip")
+        .activity
+}
+
+#[test]
+fn raw_activity_provenance_survives_attached_background_and_parked_routes() {
+    use haider_protocol::branch::{BranchCreated, BranchDescriptor};
+    use haider_protocol::ids::{BranchId, NodeId, RunId, SessionId};
+    use haider_protocol::state::RunState;
+    for background in [false, true] {
+        for parked in [false, true] {
+            for terminal in [false, true] {
+                let mut live = session_model();
+                let mut replay = session_model();
+                let session = if background {
+                    SessionId::new("activity-background")
+                } else {
+                    session_id()
+                };
+                if background {
+                    live.upsert_live_session(&session);
+                    replay.upsert_live_session(&session);
+                }
+                let mut events = Vec::new();
+                if parked {
+                    let created = BranchCreated {
+                        branch: BranchDescriptor {
+                            branch_id: BranchId::new("activity-branch"),
+                            name: "activity".into(),
+                            source_branch_id: None,
+                            fork_node_id: NodeId::new("activity-node"),
+                            fork_seq: 0,
+                            created_seq: 1,
+                            created_at_ms: T0,
+                            head_node_id: NodeId::new("activity-node"),
+                            head_seq: 0,
+                        },
+                    };
+                    let mut envelope = raw(1, None, T0, &EventPayload::IdleDecayed);
+                    envelope.payload = created.to_payload_value().expect("branch").into();
+                    events.push(envelope);
+                }
+                events.push(raw(
+                    events.len() as u64 + 1,
+                    None,
+                    T0,
+                    &EventPayload::AgentSpawned(manifest(AMINA, "Amina", "read", None)),
+                ));
+                let mut accepted = raw(
+                    events.len() as u64 + 1,
+                    Some(AMINA),
+                    T0 + 1,
+                    &EventPayload::RunState(RunState::RunningTool),
+                );
+                accepted.run_id = Some(RunId::new("agent-run"));
+                let mut value: serde_json::Value = accepted.payload.into();
+                value["activity_kind"] = serde_json::json!("read");
+                value["activity_call_id"] = serde_json::json!("accepted-read");
+                accepted.payload = value.into();
+                events.push(accepted);
+                if terminal {
+                    let mut done = raw(
+                        events.len() as u64 + 1,
+                        Some(AMINA),
+                        T0 + 2,
+                        &EventPayload::RunState(RunState::Done),
+                    );
+                    done.run_id = Some(RunId::new("agent-run"));
+                    events.push(done);
+                }
+                let before_shell = events.len();
+                for payload in [
+                    EventPayload::RunState(RunState::RunningTool),
+                    EventPayload::Item(ItemEvent::Started {
+                        item_id: ItemId::new("operator"),
+                        item: TurnItem::CommandExecution {
+                            call_id: "operator".into(),
+                            command: "echo operator".into(),
+                            status: ToolStatus::InProgress,
+                            exit_code: None,
+                        },
+                    }),
+                    EventPayload::RunState(RunState::Done),
+                ] {
+                    let mut envelope = raw(events.len() as u64 + 1, Some(AMINA), T0 + 3, &payload);
+                    envelope.run_id = Some(RunId::new("operator-run"));
+                    events.push(envelope);
+                }
+                let mut before = None;
+                for (index, mut envelope) in events.into_iter().enumerate() {
+                    envelope.session_id = session.clone();
+                    if parked && index != 0 {
+                        envelope.branch_id = Some(BranchId::new("activity-branch"));
+                    }
+                    assert_eq!(
+                        live.route_raw(&envelope),
+                        haider_tui::projection::RawOutcome::Applied
+                    );
+                    let bytes = serde_json::to_vec(&envelope).expect("journal");
+                    assert_eq!(
+                        replay.route_raw(&serde_json::from_slice(&bytes).expect("replay")),
+                        haider_tui::projection::RawOutcome::Applied
+                    );
+                    if index + 1 == before_shell {
+                        let tracker = routed_activity(&live, &session, background, parked);
+                        assert_eq!(
+                            tracker.current(T0 + 3, false),
+                            (!terminal).then_some(ActivityKind::Read)
+                        );
+                        before = Some(tracker.state());
+                    }
+                }
+                for model in [&live, &replay] {
+                    let tracker = routed_activity(model, &session, background, parked);
+                    assert_eq!(
+                        tracker.state(),
+                        before.clone().expect("prior state"),
+                        "background={background} parked={parked} terminal={terminal}"
+                    );
+                    assert!(!tracker.used().contains(&ActivityKind::Run));
+                }
+            }
+        }
+    }
 }

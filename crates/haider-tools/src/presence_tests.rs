@@ -755,65 +755,71 @@ fn opus_gate6_repro_steady_new_actor_relabels_during_a_fast_burst() {
 
 #[test]
 fn steady_relabel_preserves_first_pending_instant_at_fast_cadences() {
-    for cadence_ms in [10_u64, 100, 149] {
-        let mut machine = PresenceMachine::<String>::default();
-        let now = Instant::now();
-        machine
-            .begin_action_as(
-                key("amina"),
-                PresenceSurface::Screen,
-                PresenceMark::Click,
-                None,
-                now,
-                Some(PresenceActor {
-                    name: "Amina".into(),
-                    emoji: false,
-                }),
-            )
-            .expect("initial action");
-        let first_b = now + Duration::from_millis(cadence_ms);
-        let boundary = first_b + Duration::from_millis(150);
-        let mut at = first_b;
-        while at < boundary {
+    for surface in [
+        PresenceSurface::Screen,
+        PresenceSurface::Phone,
+        PresenceSurface::Browser,
+    ] {
+        for cadence_ms in [10_u64, 100, 149] {
+            let mut machine = PresenceMachine::<String>::default();
+            let now = Instant::now();
             machine
                 .begin_action_as(
-                    key("bilal"),
-                    PresenceSurface::Screen,
+                    key("amina"),
+                    surface,
                     PresenceMark::Click,
                     None,
-                    at,
+                    now,
                     Some(PresenceActor {
-                        name: "Bilal".into(),
+                        name: "Amina".into(),
                         emoji: false,
                     }),
                 )
-                .expect("steady actor");
-            at += Duration::from_millis(cadence_ms);
+                .expect("initial action");
+            let first_b = now + Duration::from_millis(cadence_ms);
+            let boundary = first_b + Duration::from_millis(150);
+            let mut at = first_b;
+            while at < boundary {
+                machine
+                    .begin_action_as(
+                        key("bilal"),
+                        surface,
+                        PresenceMark::Click,
+                        None,
+                        at,
+                        Some(PresenceActor {
+                            name: "Bilal".into(),
+                            emoji: false,
+                        }),
+                    )
+                    .expect("steady actor");
+                at += Duration::from_millis(cadence_ms);
+            }
+            assert!(
+                show(&machine.tick(first_b + Duration::from_millis(149))).is_none(),
+                "{cadence_ms} ms early"
+            );
+            if at == boundary {
+                machine
+                    .begin_action_as(
+                        key("bilal"),
+                        surface,
+                        PresenceMark::Click,
+                        None,
+                        at,
+                        Some(PresenceActor {
+                            name: "Bilal".into(),
+                            emoji: false,
+                        }),
+                    )
+                    .expect("action on threshold");
+            }
+            assert_eq!(
+                show(&machine.tick(boundary)).as_deref(),
+                Some(surface.actor_label("Bilal", false).as_str()),
+                "{cadence_ms} ms exact boundary"
+            );
         }
-        assert!(
-            show(&machine.tick(first_b + Duration::from_millis(149))).is_none(),
-            "{cadence_ms} ms early"
-        );
-        if at == boundary {
-            machine
-                .begin_action_as(
-                    key("bilal"),
-                    PresenceSurface::Screen,
-                    PresenceMark::Click,
-                    None,
-                    at,
-                    Some(PresenceActor {
-                        name: "Bilal".into(),
-                        emoji: false,
-                    }),
-                )
-                .expect("action on threshold");
-        }
-        assert_eq!(
-            show(&machine.tick(boundary)).as_deref(),
-            Some("Bilal is using your screen"),
-            "{cadence_ms} ms exact boundary"
-        );
     }
 }
 

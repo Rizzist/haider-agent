@@ -7185,6 +7185,9 @@ impl AppModel {
         chip: &ChipModel,
         known_live_children: bool,
     ) -> Option<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return None;
+        }
         use crate::script::ChipDisplayState as S;
         if chip.closed || matches!(chip.display_state(), S::Done | S::Error) {
             return None;
@@ -7217,6 +7220,9 @@ impl AppModel {
         &self,
         node: &haider_rpc::FleetNodeWire,
     ) -> Option<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return None;
+        }
         use haider_rpc::FleetAgentStateWire as F;
         if matches!(node.state, F::Done | F::Failed | F::Cancelled) {
             return None;
@@ -7254,6 +7260,9 @@ impl AppModel {
         &self,
         node: &haider_rpc::FleetNodeWire,
     ) -> Vec<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return Vec::new();
+        }
         let mut used = node.activities.clone();
         if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
             used.extend(chip.activity.used());
@@ -18070,12 +18079,7 @@ impl AppModel {
                                 ));
                             }
                             if admission == Admission::Apply {
-                                self.route_admitted(
-                                    &payload,
-                                    envelope.branch_id.as_ref(),
-                                    envelope.agent_id.as_ref(),
-                                    envelope.committed_at_ms,
-                                );
+                                self.route_admitted(&payload, envelope);
                             }
                         }
                         // S3/W-A/L3: additive agent, task, and workflow graph
@@ -18120,13 +18124,8 @@ impl AppModel {
     /// branch-stamped envelope they land session-global), then branch
     /// (outer), then agent. `SessionState::route_admitted` is the
     /// background twin.
-    fn route_admitted(
-        &mut self,
-        payload: &EventPayload,
-        branch: Option<&haider_protocol::ids::BranchId>,
-        agent: Option<&haider_protocol::ids::AgentId>,
-        at_ms: u64,
-    ) {
+    fn route_admitted(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let branch = envelope.branch_id.as_ref();
         use crate::branch::BranchScope;
         if let EventPayload::Usage(usage) = payload {
             self.cache_usage.note(usage);
@@ -18148,17 +18147,17 @@ impl AppModel {
                 // aggregate never lands in a chip transcript.
                 self.handle_envelope(payload);
             }
-            BranchScope::Active => self.absorb_scoped(payload, agent, at_ms),
+            BranchScope::Active => self.absorb_scoped(payload, envelope),
             BranchScope::ParkedMain => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.parked_main_mut() {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::ParkedNamed(id) => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.view_mut(&id) {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::Orphan => self.branch_state.count_orphan(),
@@ -18462,12 +18461,9 @@ impl AppModel {
 
     /// The attached path's scope router — the same [`crate::session::classify`]
     /// decision the background path takes, applied to the live fields.
-    fn absorb_scoped(
-        &mut self,
-        payload: &EventPayload,
-        agent: Option<&haider_protocol::ids::AgentId>,
-        at_ms: u64,
-    ) {
+    fn absorb_scoped(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let agent = envelope.agent_id.as_ref();
+        let at_ms = envelope.committed_at_ms;
         use crate::session::Destination;
         match crate::session::classify(&mut self.projection, &self.chips, payload, agent) {
             Destination::Agent => {
@@ -18475,7 +18471,7 @@ impl AppModel {
             }
             Destination::Chip(target) => {
                 if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
-                    crate::session::chip_apply(chip, payload, at_ms);
+                    crate::session::chip_apply(chip, payload, envelope);
                 }
             }
             Destination::Session => {

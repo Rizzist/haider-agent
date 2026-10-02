@@ -468,15 +468,13 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             commands.push(PresenceCommand::Show { surface, label });
         } else if self.labels.get(&surface) == Some(&label) {
             self.pending_labels.remove(&surface);
-        } else {
-            if self
-                .pending_labels
-                .get(&surface)
-                .map(|(pending, _)| pending)
-                != Some(&label)
-            {
-                self.pending_labels.insert(surface, (label, now));
-            }
+        } else if self
+            .pending_labels
+            .get(&surface)
+            .map(|(pending, _)| pending)
+            != Some(&label)
+        {
+            self.pending_labels.insert(surface, (label, now));
         }
         let seq = self.next_seq;
         self.next_seq = if seq >= CONCEAL_ACK_SEQ_START - 1 {

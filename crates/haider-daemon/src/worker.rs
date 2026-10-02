@@ -21044,6 +21044,42 @@ fn live_activity_respects_lockdown_and_backend_availability() {
         live_activity_for_route("unknown", Some(&allowed), true),
         None
     );
+    for name in [
+        "web_search",
+        "session_transcript",
+        "list_models",
+        "peer_list",
+    ] {
+        let only_this = vec![name.to_owned()];
+        assert!(
+            live_activity_for_route(name, Some(&only_this), true).is_some(),
+            "{name} positive control"
+        );
+        assert_eq!(
+            live_activity_for_route(name, Some(&[]), true),
+            None,
+            "empty lockdown {name}"
+        );
+        assert_eq!(
+            live_activity_for_route(name, None, false).is_none(),
+            name == "web_search",
+            "only search requires that backend"
+        );
+    }
+    for name in [
+        "Web_Search",
+        " web_search",
+        "web_search ",
+        "",
+        "computer",
+        "fs_write",
+    ] {
+        assert_eq!(
+            live_activity_for_route(name, None, true),
+            None,
+            "not an effectless live route: {name:?}"
+        );
+    }
 }
 
 #[async_trait]

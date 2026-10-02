@@ -825,6 +825,23 @@ classes. Operator checkpoint undo/redo/rollback now journal the typed
 historical `fs_write` class. Neither operator shell `CommandExecution` nor a
 checkpoint restore counts as agent activity. Old user-shell journals are
 excluded by the typed item kind and the typed `user_typed` authorization
-source on their `process_exec` effect; old checkpoint journals are excluded after
-their typed `checkpoint_recorded` fact identifies the transaction during
-replay. Agent-authored typed tool calls and effects retain their activity.
+source on their `process_exec` effect. The typed `CommandExecution` admission
+also identifies its operator run, preserving the preceding agent terminal
+state across shell run states and recovery instead of reviving an older icon.
+This uses existing journal provenance and introduces no additional wire field.
+An untyped `running_tool` fact alone cannot revive a terminal activity icon;
+the accepted typed dispatch or activity metadata opens the next agent tool.
+Old checkpoint journals are excluded after
+their typed `checkpoint_recorded` fact identifies the contiguous, same-run
+and same-effect atomic transaction during replay. This restores the preceding
+activity state without erasing prior or intervening agent work; tool-origin
+checkpoints remain agent edits. Agent-authored typed tool calls and effects
+retain their activity. Overlay relabels retain the first pending timestamp for
+an unchanged actor label, so a steady actor faster than the 150 ms debounce
+still gets named on the next presence tick.
+
+The TUI requires the granted activity token for chip, fleet and history
+badges, including inferred orchestration. Its attached, background and
+parked-branch reducers preserve raw envelope provenance and effectless
+running-tool metadata, so operator run states obey the same rules as the
+daemon. Demo mode continues to use its locally fabricated typed activity.

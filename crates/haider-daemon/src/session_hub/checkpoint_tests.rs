@@ -74,5 +74,16 @@ fn checkpoint_command_effect_batch_keeps_outcome_before_checkpoint() {
                 .expect("checkpoint decodes"),
             EventPayload::CheckpointRecorded(_)
         ));
+        let mut live = haider_protocol::activity::ActivityTracker::new();
+        let mut replay = haider_protocol::activity::ActivityTracker::new();
+        for envelope in envelopes {
+            live.observe_raw(&envelope);
+            let persisted = serde_json::to_vec(&envelope).expect("journal bytes");
+            replay.observe_raw(&serde_json::from_slice(&persisted).expect("restart journal"));
+            assert!(live.used().is_empty(), "{origin:?} live history");
+            assert!(replay.used().is_empty(), "{origin:?} replay history");
+            assert_eq!(live.current(0, false), None, "{origin:?} live icon");
+            assert_eq!(replay.current(0, false), None, "{origin:?} replay icon");
+        }
     }
 }

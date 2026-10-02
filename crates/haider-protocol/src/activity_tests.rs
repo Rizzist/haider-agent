@@ -486,6 +486,7 @@ fn registered_effectless_dispatch_is_live_until_settlement() {
         payload: payload.into(),
     };
     let mut tracker = ActivityTracker::new();
+    tracker.set_terminal(true);
     tracker.observe_raw(&envelope);
     assert_eq!(tracker.current(101, false), Some(ActivityKind::Web));
     assert!(
@@ -576,7 +577,12 @@ fn registered_effectless_dispatch_is_live_until_settlement() {
         .expect("old run state serializes")
         .into();
     let mut replay = ActivityTracker::new();
+    replay.set_terminal(true);
     replay.observe_raw(&old_journal);
+    assert!(
+        replay.state().terminal,
+        "untyped RunningTool keeps a terminal icon closed"
+    );
     assert!(
         replay.is_empty(),
         "old journals cannot invent live activity"
@@ -844,57 +850,97 @@ fn old_checkpoint_journals_replay_without_operator_edit_history() {
             },
             payload: serde_json::to_value(payload).expect("payload").into(),
         };
-        let mut tracker = ActivityTracker::new();
-        for (seq, payload) in [
-            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
-                effect: effect.clone(),
-                class: EffectClass::FsWrite,
-                summary: "old checkpoint".into(),
-                args_digest: "digest".into(),
-                workspace_revision: None,
-            })),
-            EventPayload::Effect(EffectPhase::Authorized {
-                effect: effect.clone(),
-                verdict: AuthorizationVerdict::Allow,
-            }),
-            EventPayload::Effect(EffectPhase::Dispatched {
-                effect: effect.clone(),
-            }),
-            EventPayload::Effect(EffectPhase::Outcome {
-                effect: effect.clone(),
-                outcome: EffectOutcome::Ok,
-                freshness: None,
-                workspace_mutation: None,
-            }),
-            EventPayload::CheckpointRecorded(CheckpointRecorded {
-                checkpoint_id: CheckpointId::new("old-checkpoint"),
-                session_id: SessionId::new("child"),
-                branch_id: None,
-                run_id: run.clone(),
-                effect_id: effect.clone(),
-                call_id: "operator".into(),
-                seq: 5,
-                workspace_revision: None,
-                kind: CheckpointKind::Write,
-                origin,
-                source_checkpoint_id: None,
-                paths: Vec::new(),
-                post_digest: "digest".into(),
-                recorded_at_ms: 1_005,
-                redacted_content: false,
-            }),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            tracker.observe_raw(&envelope(seq as u64 + 1, payload));
-        }
-        if origin == CheckpointOrigin::Tool {
-            assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
-            assert_eq!(tracker.current(1_005, false), Some(ActivityKind::Edit));
-        } else {
-            assert!(tracker.used().is_empty(), "{origin:?}");
-            assert_eq!(tracker.current(1_005, false), None, "{origin:?}");
+        for (prior_edit, intervening_work) in [(false, false), (true, false), (false, true)] {
+            let mut tracker = ActivityTracker::new();
+            if prior_edit {
+                start(&mut tracker, "prior-agent", "fs_write", 500);
+                finish(&mut tracker, "prior-agent", "fs_write", 501);
+                tracker.observe(&EventPayload::RunState(RunState::Done), 502);
+            }
+            for (seq, payload) in [
+                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                    effect: effect.clone(),
+                    class: EffectClass::FsWrite,
+                    summary: "old checkpoint".into(),
+                    args_digest: "digest".into(),
+                    workspace_revision: None,
+                })),
+                EventPayload::Effect(EffectPhase::Authorized {
+                    effect: effect.clone(),
+                    verdict: AuthorizationVerdict::Allow,
+                }),
+                EventPayload::Effect(EffectPhase::Dispatched {
+                    effect: effect.clone(),
+                }),
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect: effect.clone(),
+                    outcome: EffectOutcome::Ok,
+                    freshness: None,
+                    workspace_mutation: None,
+                }),
+                EventPayload::CheckpointRecorded(CheckpointRecorded {
+                    checkpoint_id: CheckpointId::new("old-checkpoint"),
+                    session_id: SessionId::new("child"),
+                    branch_id: None,
+                    run_id: run.clone(),
+                    effect_id: effect.clone(),
+                    call_id: "operator".into(),
+                    seq: 5,
+                    workspace_revision: None,
+                    kind: CheckpointKind::Write,
+                    origin,
+                    source_checkpoint_id: None,
+                    paths: Vec::new(),
+                    post_digest: "digest".into(),
+                    recorded_at_ms: 1_005,
+                    redacted_content: false,
+                }),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if intervening_work && seq == 4 {
+                    let mut agent =
+                        tool_item("new-agent", "process_exec", ToolStatus::Completed, true);
+                    if let EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::ToolCall { activity, .. },
+                        ..
+                    }) = &mut agent
+                    {
+                        *activity = Some(ActivityKind::Run);
+                    }
+                    tracker.observe_raw(&envelope(5, agent));
+                }
+                tracker.observe_raw(&envelope(
+                    seq as u64 + 1 + u64::from(intervening_work && seq == 4),
+                    payload,
+                ));
+            }
+            if intervening_work {
+                assert_eq!(tracker.used(), vec![ActivityKind::Edit, ActivityKind::Run]);
+                assert_eq!(
+                    tracker.state().latest.map(|touch| touch.kind),
+                    Some(ActivityKind::Run)
+                );
+            } else if origin == CheckpointOrigin::Tool {
+                assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
+                assert_eq!(tracker.current(1_005, false), Some(ActivityKind::Edit));
+            } else if prior_edit {
+                assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
+                assert_eq!(
+                    tracker.state().touched[0].at_ms,
+                    501,
+                    "operator restore cannot refresh prior agent edits"
+                );
+                assert_eq!(
+                    tracker.current(1_005, false),
+                    None,
+                    "operator restore cannot revive a terminal agent's icon"
+                );
+            } else {
+                assert!(tracker.used().is_empty(), "{origin:?}");
+                assert_eq!(tracker.current(1_005, false), None, "{origin:?}");
+            }
         }
     }
 }
@@ -959,4 +1005,113 @@ fn an_outstanding_child_keeps_the_parent_orchestrating_until_it_reports() {
         tracker.current(much_later + ACTIVITY_LINGER_MS + 1, false),
         None
     );
+}
+
+#[test]
+fn operator_shell_run_states_preserve_prior_agent_activity_live_and_after_restart() {
+    use crate::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use crate::ids::{DeviceId, EventId, RunId, SessionId};
+    for agent in [None, Some(AgentId::new("child-agent"))] {
+        for terminal in [false, true] {
+            let mut tracker = ActivityTracker::new();
+            start(&mut tracker, "prior-agent", "fs_write", 500);
+            finish(&mut tracker, "prior-agent", "fs_write", 501);
+            if terminal {
+                tracker.observe(&EventPayload::RunState(RunState::Done), 502);
+            }
+            let before = tracker.state();
+            let mut replay = tracker.clone();
+            let raw = |seq, payload: EventPayload| EventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: EventId::new(format!("shell-origin-{seq}")),
+                seq,
+                session_id: SessionId::new("child-session"),
+                branch_id: None,
+                run_id: Some(RunId::new("operator-shell-run")),
+                agent_id: agent.clone(),
+                device_id: DeviceId::new("device"),
+                authority_epoch: 0,
+                worker_generation: 1,
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 1_000 + seq,
+                render: RenderTargets {
+                    ui: true,
+                    durable: true,
+                    prompt: PromptRender::Omit,
+                },
+                payload: serde_json::to_value(payload).expect("shell fact").into(),
+            };
+            // The real admission is one atomic store transaction: RunningTool,
+            // then the typed CommandExecution started row and origin extension.
+            let admission = [
+                raw(1, EventPayload::RunState(RunState::RunningTool)),
+                raw(
+                    2,
+                    EventPayload::Item(ItemEvent::Started {
+                        item_id: ItemId::new("operator-shell"),
+                        item: TurnItem::CommandExecution {
+                            call_id: "operator-shell".into(),
+                            command: "echo operator".into(),
+                            status: ToolStatus::InProgress,
+                            exit_code: None,
+                        },
+                    }),
+                ),
+            ];
+            for envelope in &admission {
+                tracker.observe_raw(envelope);
+                let persisted = serde_json::to_vec(envelope).expect("admission journal bytes");
+                replay
+                    .observe_raw(&serde_json::from_slice(&persisted).expect("replayed admission"));
+                assert_eq!(tracker.state(), before, "each operator admission frame");
+                assert_eq!(replay.state(), before, "each replayed admission frame");
+            }
+            assert_eq!(
+                tracker.state(),
+                before,
+                "typed operator admission cannot revive prior activity"
+            );
+            assert_eq!(replay.state(), before);
+            for (index, payload) in [
+                intent("shell", "process_exec"),
+                authorized(
+                    "shell",
+                    AuthorizationVerdict::PreAuthorized {
+                        source: AuthorizationSource::UserTyped,
+                    },
+                ),
+                dispatched("shell"),
+                EventPayload::RunState(RunState::EffectOutcomeUnknown),
+                EventPayload::RunState(RunState::Cancelling),
+                EventPayload::RunState(RunState::Cancelled),
+                EventPayload::RunState(RunState::Errored),
+                EventPayload::RunState(RunState::Done),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let envelope = raw(index as u64 + 3, payload);
+                tracker.observe_raw(&envelope);
+                let persisted = serde_json::to_vec(&envelope).expect("journal bytes");
+                replay.observe_raw(&serde_json::from_slice(&persisted).expect("restart journal"));
+                assert_eq!(tracker.state(), before);
+                assert_eq!(replay.state(), before);
+            }
+            let mut unscoped = raw(19, EventPayload::RunState(RunState::Done));
+            unscoped.run_id = None;
+            let mut unscoped_tracker = tracker.clone();
+            unscoped_tracker.observe_raw(&unscoped);
+            assert!(
+                unscoped_tracker.state().terminal,
+                "unscoped agent facts cannot inherit a prior operator origin"
+            );
+            // A later agent run retains the normal lifecycle behavior.
+            let mut next = raw(20, EventPayload::RunState(RunState::Thinking));
+            next.run_id = Some(RunId::new("next-agent-run"));
+            tracker.observe_raw(&next);
+            assert!(!tracker.state().terminal);
+            assert_eq!(tracker.current(1_020, false), Some(ActivityKind::Edit));
+        }
+    }
 }

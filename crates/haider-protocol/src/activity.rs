@@ -10,7 +10,7 @@
 //!   is `Dispatched` (authorized, crossing the dispatch boundary) and closed
 //!   at its `Outcome`; effectless registered routes open through typed
 //!   metadata on the accepted `RunningTool` state and close at settlement;
-//! * completed activity: a `ToolCall` / `CommandExecution` item whose status
+//! * completed activity: a `ToolCall` item whose status
 //!   is `completed` and whose activity came from a registered route or
 //!   closed provider adapter, plus the daemon-authored
 //!   `FileChange` / `ChildSpawn` items;
@@ -387,13 +387,27 @@ pub struct ActivityTracker {
     /// Pre-973 checkpoint commands wrote an FsWrite effect before the typed
     /// CheckpointRecorded fact in the same transaction. Keep one bounded
     /// pre-effect state so replay can remove only that operator action.
-    legacy_checkpoint: Option<(
-        String,
-        String,
-        Option<u64>,
-        Option<(ActivityKind, u64)>,
-        bool,
-    )>,
+    legacy_checkpoint: Option<LegacyCheckpointActivity>,
+    /// One session has one foreground run. Keep its typed operator provenance
+    /// so shell run states cannot revive or settle an agent's activity.
+    raw_run: Option<ActivityRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityRun {
+    id: String,
+    terminal_before: bool,
+    operator: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyCheckpointActivity {
+    run_id: String,
+    effect_id: String,
+    last_seq: u64,
+    edit_touch: Option<u64>,
+    latest: Option<(ActivityKind, u64)>,
+    terminal: bool,
 }
 
 impl ActivityTracker {
@@ -531,7 +545,9 @@ impl ActivityTracker {
                     self.open_tools.clear();
                     self.pending.clear();
                     self.children.clear();
-                } else {
+                } else if !matches!(state, crate::state::RunState::RunningTool) {
+                    // Both agent tools and operator shells enter RunningTool.
+                    // Only accepted typed activity may revive a terminal icon.
                     self.terminal = false;
                 }
             }
@@ -546,6 +562,26 @@ impl ActivityTracker {
             .payload
             .get("type")
             .and_then(serde_json::Value::as_str);
+        // Historical operator restores are a contiguous five-fact atomic
+        // batch. A later checkpoint must never erase intervening agent work.
+        if let Some(saved) = self.legacy_checkpoint.as_mut() {
+            let same_run = envelope
+                .run_id
+                .as_ref()
+                .is_some_and(|run| run.as_str() == saved.run_id);
+            let follows = saved.last_seq.checked_add(1) == Some(envelope.seq);
+            let same_effect = kind == Some("effect")
+                && envelope
+                    .payload
+                    .get("effect")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(saved.effect_id.as_str());
+            if same_run && follows && (same_effect || kind == Some("checkpoint_recorded")) {
+                saved.last_seq = envelope.seq;
+            } else {
+                self.legacy_checkpoint = None;
+            }
+        }
         if kind == Some("checkpoint_recorded") {
             if let Ok(EventPayload::CheckpointRecorded(checkpoint)) =
                 envelope.payload.decode_event()
@@ -558,23 +594,30 @@ impl ActivityTracker {
                 && self
                     .legacy_checkpoint
                     .as_ref()
-                    .is_some_and(|(run, effect, _, _, _)| {
-                        envelope
-                            .run_id
-                            .as_ref()
-                            .is_some_and(|id| id.as_str() == run)
-                            && checkpoint.effect_id.as_str() == effect
-                    })
-                && let Some((_, _, edit_touch, latest, terminal)) = self.legacy_checkpoint.take()
+                    .is_some_and(|saved| checkpoint.effect_id.as_str() == saved.effect_id)
+                && let Some(saved) = self.legacy_checkpoint.take()
             {
-                self.last_touch[usize::from(ActivityKind::Edit.rank())] = edit_touch;
-                self.latest = latest;
-                self.terminal = terminal;
+                self.last_touch[usize::from(ActivityKind::Edit.rank())] = saved.edit_touch;
+                self.latest = saved.latest;
+                self.terminal = saved.terminal;
             }
+            self.legacy_checkpoint = None;
             return;
         }
         if !matches!(kind, Some("item" | "run_state" | "effect")) {
             return;
+        }
+        if let Some(run) = envelope.run_id.as_ref()
+            && self
+                .raw_run
+                .as_ref()
+                .is_none_or(|held| held.id != run.as_str())
+        {
+            self.raw_run = Some(ActivityRun {
+                id: run.as_str().to_owned(),
+                terminal_before: self.terminal,
+                operator: false,
+            });
         }
         if kind == Some("effect")
             && envelope.agent_id.is_none()
@@ -595,13 +638,14 @@ impl ActivityTracker {
                 .get("effect")
                 .and_then(serde_json::Value::as_str)
         {
-            self.legacy_checkpoint = Some((
-                run.as_str().to_owned(),
-                effect.to_owned(),
-                self.last_touch[usize::from(ActivityKind::Edit.rank())],
-                self.latest,
-                self.terminal,
-            ));
+            self.legacy_checkpoint = Some(LegacyCheckpointActivity {
+                run_id: run.as_str().to_owned(),
+                effect_id: effect.to_owned(),
+                last_seq: envelope.seq,
+                edit_touch: self.last_touch[usize::from(ActivityKind::Edit.rank())],
+                latest: self.latest,
+                terminal: self.terminal,
+            });
         }
         if kind == Some("item") {
             let item_kind = envelope
@@ -623,6 +667,44 @@ impl ActivityTracker {
             }
         }
         if let Ok(payload) = envelope.payload.decode_event() {
+            let operator = matches!(
+                &payload,
+                EventPayload::Item(
+                    ItemEvent::Started {
+                        item: TurnItem::CommandExecution { .. },
+                        ..
+                    } | ItemEvent::Completed {
+                        item: TurnItem::CommandExecution { .. },
+                        ..
+                    }
+                ) | EventPayload::Effect(EffectPhase::Authorized {
+                    verdict: AuthorizationVerdict::PreAuthorized {
+                        source: crate::effect::AuthorizationSource::UserTyped
+                    },
+                    ..
+                })
+            );
+            if operator
+                && let Some(run) = self.raw_run.as_mut()
+                && envelope
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == run.id)
+            {
+                run.operator = true;
+                self.terminal = run.terminal_before;
+            }
+            if matches!(payload, EventPayload::RunState(_))
+                && self.raw_run.as_ref().is_some_and(|run| {
+                    run.operator
+                        && envelope
+                            .run_id
+                            .as_ref()
+                            .is_some_and(|id| id.as_str() == run.id)
+                })
+            {
+                return;
+            }
             self.observe(&payload, envelope.committed_at_ms);
             if kind == Some("run_state")
                 && envelope
@@ -643,6 +725,7 @@ impl ActivityTracker {
                 && !call_id.is_empty()
                 && activity != ActivityKind::Unknown
             {
+                self.terminal = false;
                 self.open_tools.retain(|(open, _)| open != call_id);
                 if self.open_tools.len() >= ACTIVITY_MAX_IN_FLIGHT {
                     self.open_tools.remove(0);
