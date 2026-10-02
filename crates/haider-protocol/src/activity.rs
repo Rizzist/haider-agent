@@ -620,7 +620,6 @@ impl ActivityTracker {
             });
         }
         if kind == Some("effect")
-            && envelope.agent_id.is_none()
             && envelope
                 .payload
                 .get("phase")

@@ -833,7 +833,8 @@ An untyped `running_tool` fact alone cannot revive a terminal activity icon;
 the accepted typed dispatch or activity metadata opens the next agent tool.
 Old checkpoint journals are excluded after
 their typed `checkpoint_recorded` fact identifies the contiguous, same-run
-and same-effect atomic transaction during replay. This restores the preceding
+and same-effect atomic transaction during replay, with or without child-agent
+attribution. This restores the preceding
 activity state without erasing prior or intervening agent work; tool-origin
 checkpoints remain agent edits. Agent-authored typed tool calls and effects
 retain their activity. Overlay relabels retain the first pending timestamp for

@@ -821,125 +821,127 @@ fn old_checkpoint_journals_replay_without_operator_edit_history() {
     use crate::checkpoint::{CheckpointKind, CheckpointOrigin, CheckpointRecorded};
     use crate::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
     use crate::ids::{CheckpointId, DeviceId, EventId, RunId, SessionId};
-    for origin in [
-        CheckpointOrigin::Undo,
-        CheckpointOrigin::Redo,
-        CheckpointOrigin::RollbackTurn,
-        CheckpointOrigin::Tool,
-    ] {
-        let run = RunId::new("old-operator-run");
-        let effect = EffectId::new("old-operator-effect");
-        let envelope = |seq: u64, payload: EventPayload| EventEnvelope {
-            schema_version: SCHEMA_VERSION,
-            event_id: EventId::new(format!("old-checkpoint-{seq}")),
-            seq,
-            session_id: SessionId::new("child"),
-            branch_id: None,
-            run_id: Some(run.clone()),
-            agent_id: None,
-            device_id: DeviceId::new("device"),
-            authority_epoch: 0,
-            worker_generation: 1,
-            causation_id: None,
-            correlation_id: None,
-            committed_at_ms: 1_000 + seq,
-            render: RenderTargets {
-                ui: false,
-                durable: true,
-                prompt: PromptRender::Omit,
-            },
-            payload: serde_json::to_value(payload).expect("payload").into(),
-        };
-        for (prior_edit, intervening_work) in [(false, false), (true, false), (false, true)] {
-            let mut tracker = ActivityTracker::new();
-            if prior_edit {
-                start(&mut tracker, "prior-agent", "fs_write", 500);
-                finish(&mut tracker, "prior-agent", "fs_write", 501);
-                tracker.observe(&EventPayload::RunState(RunState::Done), 502);
-            }
-            for (seq, payload) in [
-                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
-                    effect: effect.clone(),
-                    class: EffectClass::FsWrite,
-                    summary: "old checkpoint".into(),
-                    args_digest: "digest".into(),
-                    workspace_revision: None,
-                })),
-                EventPayload::Effect(EffectPhase::Authorized {
-                    effect: effect.clone(),
-                    verdict: AuthorizationVerdict::Allow,
-                }),
-                EventPayload::Effect(EffectPhase::Dispatched {
-                    effect: effect.clone(),
-                }),
-                EventPayload::Effect(EffectPhase::Outcome {
-                    effect: effect.clone(),
-                    outcome: EffectOutcome::Ok,
-                    freshness: None,
-                    workspace_mutation: None,
-                }),
-                EventPayload::CheckpointRecorded(CheckpointRecorded {
-                    checkpoint_id: CheckpointId::new("old-checkpoint"),
-                    session_id: SessionId::new("child"),
-                    branch_id: None,
-                    run_id: run.clone(),
-                    effect_id: effect.clone(),
-                    call_id: "operator".into(),
-                    seq: 5,
-                    workspace_revision: None,
-                    kind: CheckpointKind::Write,
-                    origin,
-                    source_checkpoint_id: None,
-                    paths: Vec::new(),
-                    post_digest: "digest".into(),
-                    recorded_at_ms: 1_005,
-                    redacted_content: false,
-                }),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if intervening_work && seq == 4 {
-                    let mut agent =
-                        tool_item("new-agent", "process_exec", ToolStatus::Completed, true);
-                    if let EventPayload::Item(ItemEvent::Completed {
-                        item: TurnItem::ToolCall { activity, .. },
-                        ..
-                    }) = &mut agent
-                    {
-                        *activity = Some(ActivityKind::Run);
-                    }
-                    tracker.observe_raw(&envelope(5, agent));
+    for agent_id in [None, Some(AgentId::new("child-agent"))] {
+        for origin in [
+            CheckpointOrigin::Undo,
+            CheckpointOrigin::Redo,
+            CheckpointOrigin::RollbackTurn,
+            CheckpointOrigin::Tool,
+        ] {
+            let run = RunId::new("old-operator-run");
+            let effect = EffectId::new("old-operator-effect");
+            let envelope = |seq: u64, payload: EventPayload| EventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: EventId::new(format!("old-checkpoint-{seq}")),
+                seq,
+                session_id: SessionId::new("child"),
+                branch_id: None,
+                run_id: Some(run.clone()),
+                agent_id: agent_id.clone(),
+                device_id: DeviceId::new("device"),
+                authority_epoch: 0,
+                worker_generation: 1,
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 1_000 + seq,
+                render: RenderTargets {
+                    ui: false,
+                    durable: true,
+                    prompt: PromptRender::Omit,
+                },
+                payload: serde_json::to_value(payload).expect("payload").into(),
+            };
+            for (prior_edit, intervening_work) in [(false, false), (true, false), (false, true)] {
+                let mut tracker = ActivityTracker::new();
+                if prior_edit {
+                    start(&mut tracker, "prior-agent", "fs_write", 500);
+                    finish(&mut tracker, "prior-agent", "fs_write", 501);
+                    tracker.observe(&EventPayload::RunState(RunState::Done), 502);
                 }
-                tracker.observe_raw(&envelope(
-                    seq as u64 + 1 + u64::from(intervening_work && seq == 4),
-                    payload,
-                ));
-            }
-            if intervening_work {
-                assert_eq!(tracker.used(), vec![ActivityKind::Edit, ActivityKind::Run]);
-                assert_eq!(
-                    tracker.state().latest.map(|touch| touch.kind),
-                    Some(ActivityKind::Run)
-                );
-            } else if origin == CheckpointOrigin::Tool {
-                assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
-                assert_eq!(tracker.current(1_005, false), Some(ActivityKind::Edit));
-            } else if prior_edit {
-                assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
-                assert_eq!(
-                    tracker.state().touched[0].at_ms,
-                    501,
-                    "operator restore cannot refresh prior agent edits"
-                );
-                assert_eq!(
-                    tracker.current(1_005, false),
-                    None,
-                    "operator restore cannot revive a terminal agent's icon"
-                );
-            } else {
-                assert!(tracker.used().is_empty(), "{origin:?}");
-                assert_eq!(tracker.current(1_005, false), None, "{origin:?}");
+                for (seq, payload) in [
+                    EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                        effect: effect.clone(),
+                        class: EffectClass::FsWrite,
+                        summary: "old checkpoint".into(),
+                        args_digest: "digest".into(),
+                        workspace_revision: None,
+                    })),
+                    EventPayload::Effect(EffectPhase::Authorized {
+                        effect: effect.clone(),
+                        verdict: AuthorizationVerdict::Allow,
+                    }),
+                    EventPayload::Effect(EffectPhase::Dispatched {
+                        effect: effect.clone(),
+                    }),
+                    EventPayload::Effect(EffectPhase::Outcome {
+                        effect: effect.clone(),
+                        outcome: EffectOutcome::Ok,
+                        freshness: None,
+                        workspace_mutation: None,
+                    }),
+                    EventPayload::CheckpointRecorded(CheckpointRecorded {
+                        checkpoint_id: CheckpointId::new("old-checkpoint"),
+                        session_id: SessionId::new("child"),
+                        branch_id: None,
+                        run_id: run.clone(),
+                        effect_id: effect.clone(),
+                        call_id: "operator".into(),
+                        seq: 5,
+                        workspace_revision: None,
+                        kind: CheckpointKind::Write,
+                        origin,
+                        source_checkpoint_id: None,
+                        paths: Vec::new(),
+                        post_digest: "digest".into(),
+                        recorded_at_ms: 1_005,
+                        redacted_content: false,
+                    }),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if intervening_work && seq == 4 {
+                        let mut agent =
+                            tool_item("new-agent", "process_exec", ToolStatus::Completed, true);
+                        if let EventPayload::Item(ItemEvent::Completed {
+                            item: TurnItem::ToolCall { activity, .. },
+                            ..
+                        }) = &mut agent
+                        {
+                            *activity = Some(ActivityKind::Run);
+                        }
+                        tracker.observe_raw(&envelope(5, agent));
+                    }
+                    tracker.observe_raw(&envelope(
+                        seq as u64 + 1 + u64::from(intervening_work && seq == 4),
+                        payload,
+                    ));
+                }
+                if intervening_work {
+                    assert_eq!(tracker.used(), vec![ActivityKind::Edit, ActivityKind::Run]);
+                    assert_eq!(
+                        tracker.state().latest.map(|touch| touch.kind),
+                        Some(ActivityKind::Run)
+                    );
+                } else if origin == CheckpointOrigin::Tool {
+                    assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
+                    assert_eq!(tracker.current(1_005, false), Some(ActivityKind::Edit));
+                } else if prior_edit {
+                    assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
+                    assert_eq!(
+                        tracker.state().touched[0].at_ms,
+                        501,
+                        "operator restore cannot refresh prior agent edits"
+                    );
+                    assert_eq!(
+                        tracker.current(1_005, false),
+                        None,
+                        "operator restore cannot revive a terminal agent's icon"
+                    );
+                } else {
+                    assert!(tracker.used().is_empty(), "{origin:?}");
+                    assert_eq!(tracker.current(1_005, false), None, "{origin:?}");
+                }
             }
         }
     }
