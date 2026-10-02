@@ -3093,6 +3093,7 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
 
     let mut events = Vec::new();
     let mut response_boundaries = Vec::new();
+    let mut serving_routes = Vec::new();
     let mut accepted = None;
     loop {
         match client.next().await {
@@ -3107,10 +3108,16 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
             } => accepted = Some((run_id, accepted_seq)),
             WireFrame::Event { envelope, .. } => {
                 let seq = envelope.seq;
-                // The auto-title and first-response boundary are documented
+                // Auto-title, serving-route and first-response boundaries are
                 // additive facts outside the closed core EventPayload union.
                 // Keep them in cursor order and strictly validate the fence.
                 let response_boundary = response_boundary_fact(&envelope);
+                let serving_route =
+                    haider_protocol::session::ModelSelected::from_payload_value(&envelope.payload)
+                        .is_some_and(|fact| fact.route_only);
+                if serving_route {
+                    serving_routes.push(envelope.clone());
+                }
                 if response_boundary {
                     response_boundaries.push(envelope.clone());
                 }
@@ -3123,7 +3130,7 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
                                 haider_protocol::session::SessionConfigEventPayload::session_renamed_from_value(
                                     &envelope.payload
                                 )
-                                .is_some() || response_boundary,
+                                .is_some() || response_boundary || serving_route,
                                 "only the named additive session-config/response facts may be non-core: {:?}",
                                 envelope.payload
                             );
@@ -3146,6 +3153,19 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         1,
         "one first-response fence per turn"
     );
+    assert_eq!(
+        serving_routes.len(),
+        1,
+        "one durable serving-route fact per first request"
+    );
+    let serving_route =
+        haider_protocol::session::ModelSelected::from_payload_value(&serving_routes[0].payload)
+            .expect("typed serving route");
+    assert_eq!(serving_route.provider, "fake");
+    assert_eq!(serving_route.model, "fake-v1");
+    assert_eq!(serving_route.selection_epoch, Some(0));
+    assert!(accepted_seq < serving_routes[0].seq);
+    assert!(serving_routes[0].seq < response_boundaries[0].seq);
     assert_eq!(fake.requests().len(), 1);
     assert_eq!(
         inspections.load(Ordering::SeqCst),

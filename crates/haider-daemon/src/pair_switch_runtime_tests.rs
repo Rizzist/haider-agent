@@ -1324,9 +1324,17 @@ async fn invalid_request_never_engages_the_fallback_chain() {
         .await
         .expect("journal")
         .into_iter()
-        .filter(|event| ModelSelected::from_payload_value(&event.payload).is_some())
-        .count();
-    assert_eq!(model_facts, 0);
+        .filter_map(|event| ModelSelected::from_payload_value(&event.payload))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_facts.iter().filter(|fact| !fact.route_only).count(),
+        0
+    );
+    assert_eq!(
+        model_facts.iter().filter(|fact| fact.route_only).count(),
+        1,
+        "first request publishes one serving-route fact"
+    );
     world.shutdown().await;
 }
 
@@ -1396,9 +1404,18 @@ async fn pair_switch_is_receipted_and_next_turn_resolves_the_new_provider() {
         .await
         .expect("read journal")
         .into_iter()
-        .filter(|event| ModelSelected::from_payload_value(&event.payload).is_some())
-        .count();
-    assert_eq!(facts, 1, "replay must not append a second fact");
+        .filter_map(|event| ModelSelected::from_payload_value(&event.payload))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts.iter().filter(|fact| !fact.route_only).count(),
+        1,
+        "replay must not append a second model selection"
+    );
+    assert_eq!(
+        facts.iter().filter(|fact| fact.route_only).count(),
+        1,
+        "first request publishes one serving-route fact"
+    );
 
     // …and the durable metadata is the new pair.
     let metadata = world
@@ -1740,9 +1757,18 @@ async fn stale_generation_select_is_refused_and_mutates_nothing() {
         .await
         .expect("read journal")
         .into_iter()
-        .filter(|event| ModelSelected::from_payload_value(&event.payload).is_some())
-        .count();
-    assert_eq!(facts, 0, "a refused selection must not append a fact");
+        .filter_map(|event| ModelSelected::from_payload_value(&event.payload))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts.iter().filter(|fact| !fact.route_only).count(),
+        0,
+        "a refused selection must not append a model selection"
+    );
+    assert_eq!(
+        facts.iter().filter(|fact| fact.route_only).count(),
+        1,
+        "first request publishes one serving-route fact"
+    );
     let metadata = world
         .store
         .session_metadata(&world.session_id)

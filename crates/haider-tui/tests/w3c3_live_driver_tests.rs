@@ -736,11 +736,17 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
     );
     assert_eq!(
         after,
-        vec![LiveCommand::Attach {
-            session: sid(1),
-            after_seq: 0
-        }],
-        "the create response asks for the ATTACHMENT and nothing else"
+        vec![
+            LiveCommand::Attach {
+                session: sid(1),
+                after_seq: 0
+            },
+            LiveCommand::ListAt {
+                cursor: None,
+                epoch: 0
+            }
+        ],
+        "the create response attaches and reads current metadata; it cannot submit yet"
     );
     assert!(
         !after
