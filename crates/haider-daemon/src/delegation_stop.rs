@@ -391,6 +391,12 @@ impl DelegationHandle {
         if targets.is_empty() {
             return Ok(());
         }
+        // Runs already cancelling are stop targets too. Retain them if the
+        // convergence bound expires before their session guard drops.
+        let fences = self.hub.inner_monitor().stop_fences().clone();
+        for (session_id, run_id) in targets {
+            fences.mark_run_stopped(session_id, run_id);
+        }
         let started = tokio::time::Instant::now();
         let mut resubmitted = HashSet::<RunId>::new();
         loop {

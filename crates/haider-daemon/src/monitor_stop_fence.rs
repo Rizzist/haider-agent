@@ -12,7 +12,7 @@
 //!   the monitor service's mutation lock, which every listing also takes, so
 //!   a registration either commits before the stop's listing (and is removed
 //!   by it) or observes the fence.
-//! * A run a stop moved to cancelling is remembered as stopped for as long
+//! * A cancelling run targeted by a stop is remembered as stopped for as long
 //!   as it is not observed terminal, so a slow-to-settle run cannot register
 //!   a monitor after the stop's fence is released.
 
@@ -61,7 +61,7 @@ impl MonitorStopFences {
         })
     }
 
-    /// Remembers a run a stop moved to cancelling.
+    /// Remembers a cancelling run targeted by a stop.
     pub(crate) fn mark_run_stopped(&self, session: &SessionId, run: &RunId) {
         self.with(|state| {
             state.stopped_runs.insert((session.clone(), run.clone()));

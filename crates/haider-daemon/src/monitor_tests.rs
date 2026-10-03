@@ -2766,3 +2766,274 @@ async fn completed_monitor_commands_reap_redirected_descendants() {
         assert!(!root.path().join("after-close").exists());
     }
 }
+
+// These fixtures keep a run deterministically Cancelling with a held worker
+// lease and no worker manager. Awaiting the real stop-convergence bound,
+// rather than racing a sleeping worker, exposes retention after guard release.
+#[tokio::test]
+#[cfg(unix)]
+async fn stopped_run_that_was_already_cancelling_is_retained_after_cancel_all() {
+    assert_already_cancelling_stop_retention("all").await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stopped_run_that_was_already_cancelling_is_retained_after_run_stop() {
+    assert_already_cancelling_stop_retention("run").await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stopped_run_that_was_already_cancelling_is_retained_after_stop_subagents() {
+    assert_already_cancelling_stop_retention("subagents").await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stopped_run_that_was_already_cancelling_is_retained_after_named_cancel() {
+    assert_already_cancelling_stop_retention("named").await;
+}
+
+#[cfg(unix)]
+async fn assert_already_cancelling_stop_retention(scope: &str) {
+    use haider_core::{DelegationRecord, DelegationState, TurnCancelCommand};
+    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+    use haider_protocol::ids::{AgentId, ItemId, LeaseId};
+
+    let label = format!("already-cancelling-{scope}");
+    let world = MonitorWorld::new(&label).await;
+    let parent = SessionId::new(format!("{label}-parent"));
+    let parent_run = RunId::new(format!("{label}-parent-run"));
+    world
+        .hub
+        .create_internal_session(SessionCreateCommand {
+            command_id: format!("{label}-create-parent"),
+            request_digest: format!("{label}-create-parent-digest"),
+            request_json: serde_json::json!({"session":parent}).to_string(),
+            session_id: parent.clone(),
+            cwd: world._root.path().to_string_lossy().into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new(format!("{label}-parent-created")),
+            device_id: world.hub.device_id(),
+        })
+        .await
+        .expect("create parent session");
+    world
+        .hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: format!("{label}-accept-parent"),
+            request_digest: format!("{label}-accept-parent-digest"),
+            request_json: serde_json::json!({"turn":parent_run}).to_string(),
+            session_id: parent.clone(),
+            worker_generation: world.hub.worker_generation(),
+            run_id: parent_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "parent work".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new(format!("{label}-parent-queued")),
+            user_event_id: EventId::new(format!("{label}-parent-user")),
+            active_event_id: EventId::new(format!("{label}-parent-active")),
+            device_id: world.hub.device_id(),
+        })
+        .await
+        .expect("accept parent run");
+    let stopped_run = if scope == "named" {
+        world
+            .lease
+            .append(&mut [monitor_envelope(
+                &world.session,
+                Some(&world.run),
+                None,
+                None,
+                &format!("{label}-primary-done"),
+                world.hub.device_id(),
+                world.hub.worker_generation(),
+                serde_json::to_value(EventPayload::RunState(RunState::Done)).unwrap(),
+            )])
+            .await
+            .expect("terminal primary run");
+        let later = RunId::new(format!("{label}-later-run"));
+        world
+            .hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: format!("{label}-accept-later"),
+                request_digest: format!("{label}-accept-later-digest"),
+                request_json: serde_json::json!({"turn":later}).to_string(),
+                session_id: world.session.clone(),
+                worker_generation: world.hub.worker_generation(),
+                run_id: later.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: "later child work".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+                queued_event_id: EventId::new(format!("{label}-later-queued")),
+                user_event_id: EventId::new(format!("{label}-later-user")),
+                active_event_id: EventId::new(format!("{label}-later-active")),
+                device_id: world.hub.device_id(),
+            })
+            .await
+            .expect("accept later run");
+        later
+    } else {
+        world.run.clone()
+    };
+    world
+        .lease
+        .append(&mut [monitor_envelope(
+            &world.session,
+            Some(&stopped_run),
+            None,
+            None,
+            &format!("{label}-already-cancelling"),
+            world.hub.device_id(),
+            world.hub.worker_generation(),
+            serde_json::to_value(EventPayload::RunState(RunState::Cancelling)).unwrap(),
+        )])
+        .await
+        .expect("prior cancellation intent");
+    let agent = AgentId::new(format!("{label}-agent"));
+    let record = DelegationRecord {
+        agent_id: agent.clone(),
+        child_session_id: world.session.clone(),
+        child_run_id: world.run.clone(),
+        parent_session_id: parent.clone(),
+        parent_run_id: parent_run.clone(),
+        parent_branch_id: None,
+        call_id: format!("{label}-spawn"),
+        tool_item_id: ItemId::new(format!("{label}-spawn-item")),
+        parent_agent_id: None,
+        root_session_id: parent.clone(),
+        depth: 1,
+        task: label.clone(),
+        prompt: "keep cancelling until the stop bound".into(),
+        manifest: AgentManifest {
+            agent,
+            role: AgentRole::Subagent,
+            task: label.clone(),
+            callsign: None,
+            model_profile: "fake-model".into(),
+            grant: Grant {
+                tools: Vec::new(),
+                effect_ceiling: Vec::new(),
+            },
+            budget_tokens: None,
+            placement: Placement::Local,
+            lease: LeaseId::new(format!("{label}-lease")),
+            fencing_epoch: world.hub.worker_generation(),
+            attempt: 0,
+            parent: None,
+            coordinates: None,
+            cli_scope: None,
+        },
+        state: DelegationState::Spawned,
+        report: None,
+    };
+    world
+        .hub
+        .create_delegation(record.clone())
+        .await
+        .expect("record child");
+    let coordinator = crate::delegation::DelegationHandle::new(world.hub.clone());
+    if scope == "named" {
+        let request_json =
+            serde_json::json!({"session_id":world.session,"run_id":world.run,"reason":"manual"})
+                .to_string();
+        coordinator
+            .cancel_single_subagent(
+                &record,
+                TurnCancelCommand {
+                    command_id: format!("{label}-cancel-primary"),
+                    request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                    request_json,
+                    session_id: world.session.clone(),
+                    worker_generation: world.hub.worker_generation(),
+                    run_id: world.run.clone(),
+                    cancelling_event_id: EventId::new(format!("{label}-primary-cancelling")),
+                    device_id: world.hub.device_id(),
+                },
+                &label,
+            )
+            .await
+            .expect("named cancellation");
+        timeout(Duration::from_secs(30), async {
+            while world
+                .hub
+                .inner_monitor()
+                .stop_fences()
+                .session_fenced(&world.session)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("named convergence releases its guard");
+    } else {
+        let root = if scope == "all" {
+            crate::delegation::SubagentTreeRoot::Session(parent.clone())
+        } else {
+            crate::delegation::SubagentTreeRoot::Run {
+                session_id: parent.clone(),
+                run_id: parent_run,
+            }
+        };
+        let stopped = timeout(
+            Duration::from_secs(30),
+            coordinator.stop_subagent_tree(root, &label),
+        )
+        .await
+        .expect("tree convergence bound")
+        .expect("tree stop");
+        assert_eq!(stopped.sessions, 1);
+        assert_eq!(
+            stopped.still_running, 1,
+            "the existing cancellation is still pending"
+        );
+    }
+    let fences = world.hub.inner_monitor().stop_fences().clone();
+    assert!(
+        !fences.session_fenced(&world.session),
+        "stop guard must have dropped"
+    );
+    assert!(!fences.session_fenced(&parent), "root is never fenced");
+    let mut coordinates = world.coordinates("after-existing-cancellation-bound");
+    coordinates.run_id = stopped_run;
+    let result = world
+        .hub
+        .execute_monitor_tool(
+            &world.lease,
+            coordinates,
+            MonitorRequest::Register {
+                source: MonitorSource::Sms,
+                filter: None,
+                action: MonitorAction {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: MonitorOccurrence::Every,
+                lifetime: MonitorLifetime::Session,
+            },
+        )
+        .await
+        .expect("late monitor registration result");
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Rejected,
+        "{scope}: already cancelling run escaped retention: {}",
+        result.preview
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result.preview).unwrap()["status"],
+        "subagent_stopping",
+        "{scope}: {result:?}"
+    );
+}
