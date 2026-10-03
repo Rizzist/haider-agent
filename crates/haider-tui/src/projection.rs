@@ -2641,8 +2641,18 @@ impl SessionProjection {
         self.permission_instance
     }
 
-    /// Number of unresolved decisions, including cards covered by a later
-    /// question. This count is independent of which card currently paints.
+    /// Stable pending identities for snapshot persistence.
+    pub(crate) fn pending_menu_ids(&self) -> Vec<haider_protocol::ids::MenuId> {
+        let mut ids: Vec<_> = self.pending_menus.iter().cloned().collect();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
+    }
+
+    pub(crate) fn restore_pending_menu_ids(&mut self, ids: Vec<haider_protocol::ids::MenuId>) {
+        self.pending_menus.extend(ids);
+    }
+
+    /// Unresolved decisions, including cards covered by a later question.
     #[must_use]
     pub fn pending_menu_count(&self) -> usize {
         self.pending_menus.len()

@@ -376,7 +376,7 @@ fn focus_navigation_and_focus_loss_retire_a_press_without_an_owner_change() {
     }
 }
 
-pub(super) fn decision(id: &str) -> haider_protocol::menu::Menu {
+pub(crate) fn decision(id: &str) -> haider_protocol::menu::Menu {
     use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
     Menu {
         id: haider_protocol::ids::MenuId::new(id),
@@ -448,7 +448,17 @@ fn down_enter_requires_fresh_confirmation_and_flashes() {
     );
     loop_present(&mut m);
     assert!(!owner_needs_presentation(&m));
-    assert_eq!(paced(&mut m, vec![k(KeyCode::Enter)]), vec![true]);
+    // Deliberate confirmation also waits for the shared new-card dwell.
+    let stamp = m.painted_stamp();
+    assert!(dispatch_queued_input(
+        &mut m,
+        &[],
+        QueuedInput {
+            event: k(KeyCode::Enter),
+            presented: stamp,
+            received_at: Instant::now() + AppModel::DECISION_DWELL,
+        }
+    ));
     assert_eq!(m.outbox.len(), 1);
 }
 
@@ -822,7 +832,13 @@ fn startup_typing_is_preserved_but_unpresented_pointer_and_decision_inputs_are_r
             .as_deref()
             .is_some_and(|flash| flash.contains("Input changed"))
     );
-    let deliberate = stamped_input(&frame, k(KeyCode::Enter), Instant::now(), false, None);
+    let deliberate = stamped_input(
+        &frame,
+        k(KeyCode::Enter),
+        Instant::now() + AppModel::DECISION_DWELL,
+        false,
+        None,
+    );
     assert!(dispatch_queued_input(&mut m, &[], deliberate));
     assert_eq!(m.outbox.len(), 1);
 }
@@ -1006,9 +1022,15 @@ fn startup_free_text_question_requires_a_presented_target() {
         assert!(m.outbox.is_empty());
         assert!(m.flash.as_deref().unwrap().contains("Input changed"));
 
-        // The same event is accepted once its question was actually shown.
+        // The same event is accepted after presentation and its commit dwell.
         let confirms = matches!(&event, Event::Key(key) if key.code == KeyCode::Enter);
-        let fresh = stamped_input(&frames, event, Instant::now(), false, initial.as_ref());
+        let fresh = stamped_input(
+            &frames,
+            event,
+            Instant::now() + AppModel::DECISION_DWELL,
+            false,
+            initial.as_ref(),
+        );
         assert!(dispatch_queued_input(&mut m, &[], fresh));
         if confirms {
             assert_eq!(m.outbox.len(), 1);

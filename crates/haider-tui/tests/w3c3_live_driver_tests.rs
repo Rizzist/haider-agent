@@ -1695,6 +1695,84 @@ fn an_answer_for_a_menu_this_connection_never_saw_open_is_not_invented() {
     );
 }
 
+#[test]
+fn optionless_live_answers_keep_empty_keys_and_choice_index_fallback() {
+    for session_n in [0, 1] {
+        for kind in [MenuKind::Question, MenuKind::File, MenuKind::Choice] {
+            for explicit in [false, true] {
+                let mut model = live_model();
+                let mut driver = LiveDriver::new("optionless-answer");
+                attach_all(&mut driver, &mut model, 2);
+                model.open_session(&sid(0));
+                let choices = kind == MenuKind::Choice;
+                let mut menu = card("answer", MenuScope::Session);
+                menu.kind = kind.clone();
+                if choices {
+                    menu.options[0].key = if explicit { "explicit" } else { "0" }.into();
+                } else {
+                    menu.options.clear();
+                }
+                driver.apply(
+                    &mut model,
+                    LiveReply::Event {
+                        attachment: attachment(session_n),
+                        session: sid(session_n),
+                        envelope: Box::new(envelope(
+                            &sid(session_n),
+                            1,
+                            &EventPayload::MenuOpened(menu),
+                        )),
+                    },
+                );
+                let pending = OutboundAnswer {
+                    origin: model.ui_generation(),
+                    branch: None,
+                    answer: MenuAnswer {
+                        menu: MenuId::new("answer"),
+                        option_key: explicit.then(|| "explicit".into()),
+                        option_index: 0,
+                        value: Some("synthetic answer".into()),
+                        via: AnswerVia::Tui,
+                    },
+                };
+                model.outbox.push(pending.clone());
+                let commands = driver.drain_answers(&mut model);
+                let LiveCommand::Answer {
+                    session,
+                    request_seq,
+                    worker_generation,
+                    option_key,
+                    option_index,
+                    input,
+                    ..
+                } = commands.first().expect("committed answer")
+                else {
+                    panic!("expected answer")
+                };
+                assert_eq!(*session, sid(session_n));
+                assert_eq!((*request_seq, *worker_generation, *option_index), (1, 9, 0));
+                let expected = if explicit {
+                    "explicit"
+                } else if choices {
+                    "0"
+                } else {
+                    ""
+                };
+                assert_eq!(option_key, expected, "{kind:?} explicit={explicit}");
+                assert!(
+                    matches!(input, Some(haider_rpc::MenuInput::Text { text }) if text == "synthetic answer")
+                );
+                model.outbox.push(pending);
+                let retry = driver.drain_answers(&mut model);
+                assert_eq!(
+                    commands.first().and_then(LiveCommand::command_id),
+                    retry.first().and_then(LiveCommand::command_id)
+                );
+            }
+        }
+    }
+}
+
 // ---- cold sessions ----------------------------------------------------
 
 #[test]
@@ -1964,4 +2042,97 @@ fn session_seen_acknowledgement_debounces_per_view_window() {
         matches!(renewed.first(), Some(LiveCommand::Seen { .. })),
         "a later read re-acknowledges, got {renewed:?}"
     );
+}
+
+#[test]
+fn real_driver_reattach_retains_every_pending_card_and_closes_each_once() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("synthetic-pending");
+    attach_all(&mut driver, &mut model, 2);
+    model.open_session(&sid(0));
+    for (n, count) in [(0, 3), (1, 2)] {
+        for index in 0..count {
+            driver.apply(
+                &mut model,
+                LiveReply::Event {
+                    attachment: attachment(n),
+                    session: sid(n),
+                    envelope: Box::new(envelope(
+                        &sid(n),
+                        index as u64 + 1,
+                        &EventPayload::MenuOpened(card(
+                            &format!("pending-{n}-{index}"),
+                            MenuScope::Session,
+                        )),
+                    )),
+                },
+            );
+        }
+    }
+    assert_eq!(model.inbox_counts().asks, 5);
+    driver.apply(
+        &mut model,
+        LiveReply::Disconnected {
+            reason: "synthetic reconnect".into(),
+        },
+    );
+    assert_eq!(model.inbox_counts().asks, 5);
+    let commands = driver.apply(&mut model, LiveReply::Reconnected);
+    for (n, seq) in [(0, 3), (1, 2)] {
+        assert!(commands.contains(&LiveCommand::Attach {
+            session: sid(n),
+            after_seq: seq
+        }));
+        driver.apply(
+            &mut model,
+            LiveReply::Attached {
+                session: sid(n),
+                attachment: attachment(n + 50),
+                worker_generation: 7,
+                replay_through_seq: seq,
+                launch_origin: None,
+            },
+        );
+        // Redelivery after reattachment cannot inflate the count.
+        driver.apply(
+            &mut model,
+            LiveReply::Event {
+                attachment: attachment(n + 50),
+                session: sid(n),
+                envelope: Box::new(envelope(
+                    &sid(n),
+                    seq,
+                    &EventPayload::MenuOpened(card(
+                        &format!("pending-{n}-{}", seq - 1),
+                        MenuScope::Session,
+                    )),
+                )),
+            },
+        );
+        assert_eq!(model.inbox_counts().asks, 5);
+    }
+    let mut remaining = 5;
+    for (n, count) in [(0, 3), (1, 2)] {
+        model.open_session(&sid(n));
+        assert_eq!(model.inbox_counts().asks, remaining);
+        for index in 0..count {
+            driver.apply(
+                &mut model,
+                LiveReply::Event {
+                    attachment: attachment(n + 50),
+                    session: sid(n),
+                    envelope: Box::new(envelope(
+                        &sid(n),
+                        (count + index + 1) as u64,
+                        &EventPayload::MenuClosed {
+                            menu: MenuId::new(format!("pending-{n}-{index}")),
+                            reason: MenuCloseReason::Cancelled,
+                        },
+                    )),
+                },
+            );
+            remaining -= 1;
+            assert_eq!(model.inbox_counts().asks, remaining);
+        }
+    }
 }

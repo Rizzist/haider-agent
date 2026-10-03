@@ -2133,6 +2133,9 @@ pub struct MenuCoordinates {
     /// Minted at the FIRST answer attempt and reused on every retry, so a
     /// resend after a lost response resolves the same menu once.
     command_id: Option<CommandId>,
+    /// Whether the committed opening has choices. Option-less answers use
+    /// an empty wire key; choice menus retain the ordinal fallback.
+    has_options: bool,
 }
 
 /// A live session row the launcher knows about but is not attached to.
@@ -3084,8 +3087,20 @@ impl LiveDriver {
 
     /// Reduce one inbound fact, mutating the model, and return the RPCs the
     /// shell must now issue.
-    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
+        let before = model.input_rows();
+        let commands = self.apply_reply(model, reply);
+        // A replaced neighbor or changed binding is an outside change even
+        // when the selected row still has the same identity. Unchanged and
+        // irrelevant bootstrap replies do not retire type-ahead.
+        if before != model.input_rows() {
+            model.invalidate_queued_input();
+        }
+        commands
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_reply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
         match reply {
             LiveReply::SurfaceWatching {
                 session,
@@ -6596,6 +6611,7 @@ impl LiveDriver {
                         request_seq: envelope.seq,
                         worker_generation: envelope.worker_generation,
                         command_id: None,
+                        has_options: !menu.options.is_empty(),
                     },
                 );
             }
@@ -7933,10 +7949,11 @@ impl LiveDriver {
     fn answer_command(&mut self, pending: &OutboundAnswer) -> Option<LiveCommand> {
         let menu = pending.answer.menu.clone();
         let coordinates = self.menus.get(&menu)?;
-        let (session, request_seq, worker_generation) = (
+        let (session, request_seq, worker_generation, has_options) = (
             coordinates.session.clone(),
             coordinates.request_seq,
             coordinates.worker_generation,
+            coordinates.has_options,
         );
         let command_id = match &coordinates.command_id {
             Some(existing) => existing.clone(),
@@ -7954,11 +7971,13 @@ impl LiveDriver {
             menu,
             request_seq,
             worker_generation,
-            option_key: pending
-                .answer
-                .option_key
-                .clone()
-                .unwrap_or_else(|| pending.answer.option_index.to_string()),
+            option_key: pending.answer.option_key.clone().unwrap_or_else(|| {
+                if has_options {
+                    pending.answer.option_index.to_string()
+                } else {
+                    String::new()
+                }
+            }),
             option_index: pending.answer.option_index,
             input: pending
                 .answer

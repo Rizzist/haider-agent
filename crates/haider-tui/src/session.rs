@@ -709,6 +709,44 @@ pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, at_ms: u64) {
     // S4: every child-attributed envelope advances this chip's event
     // clock (the frozen-final measure's far end) before the payload lands.
     chip.note_event_at(at_ms);
+    match payload {
+        EventPayload::MenuOpened(menu) => {
+            chip.question = Some(crate::app::ChipQuestion {
+                recovery: matches!(
+                    menu.kind,
+                    haider_protocol::menu::MenuKind::ErrorRecovery { .. }
+                ),
+                text: menu.title.clone(),
+                options: menu
+                    .options
+                    .iter()
+                    .map(|option| option.label.clone())
+                    .collect(),
+                resolved: false,
+            });
+        }
+        EventPayload::MenuAnswered(answer)
+            if chip
+                .transcript
+                .open_menu()
+                .is_some_and(|menu| menu.id == answer.menu) =>
+        {
+            if let Some(question) = &mut chip.question {
+                question.resolved = true;
+            }
+        }
+        EventPayload::MenuClosed { menu, .. }
+            if chip
+                .transcript
+                .open_menu()
+                .is_some_and(|open| open.id == *menu) =>
+        {
+            if let Some(question) = &mut chip.question {
+                question.resolved = true;
+            }
+        }
+        _ => {}
+    }
     if let EventPayload::UserMessage {
         text, attachments, ..
     } = payload

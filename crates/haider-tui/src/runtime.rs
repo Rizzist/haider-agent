@@ -39,15 +39,16 @@ struct QueuedInput {
 }
 
 type PresentedFrame = Mutex<std::collections::VecDeque<((PresentedInput, u64), Instant)>>;
+const INPUT_FRAME_HISTORY: usize = 128;
 
-/// Only an accepted queued dispatch may extend this chain. The expected
-/// stamp includes the paint epoch, so an outside transition (even away and
-/// back to the same owner) breaks it.
+/// Retain every frame produced by accepted queued input. The expected stamp
+/// includes the paint epoch; outside changes retire the whole history, even
+/// when they return to the same owner.
 #[derive(Clone, Debug)]
 pub(crate) struct InputRebase {
-    source: Option<(PresentedInput, u64)>,
+    sources: std::collections::VecDeque<Option<(PresentedInput, u64)>>,
     expected: Option<(PresentedInput, u64)>,
-    pointer_stable: bool,
+    pointer_sources: std::collections::VecDeque<Option<(PresentedInput, u64)>>,
 }
 
 fn input_stamp(frame: &PresentedFrame, received_at: Instant) -> Option<(PresentedInput, u64)> {
@@ -65,15 +66,14 @@ fn dispatch_queued_input(
     input: QueuedInput,
 ) -> bool {
     let current = model.painted_stamp();
-    let rebased = model
-        .input_rebase
-        .as_ref()
-        .is_some_and(|chain| chain.source == input.presented && chain.expected == current);
+    let rebased = model.input_rebase.as_ref().is_some_and(|chain| {
+        chain.expected == current
+            && (input.presented == current || chain.sources.contains(&input.presented))
+    });
     let pointer_rebased = rebased
-        && model
-            .input_rebase
-            .as_ref()
-            .is_some_and(|chain| chain.pointer_stable);
+        && model.input_rebase.as_ref().is_some_and(|chain| {
+            input.presented == current || chain.pointer_sources.contains(&input.presented)
+        });
     if matches!(
         &input.event,
         Event::Key(_) | Event::Paste(_) | Event::Mouse(_)
@@ -85,9 +85,7 @@ fn dispatch_queued_input(
         if matches!(&input.event, Event::Mouse(_)) {
             model.clear_mouse_press();
         }
-        model.flash = Some("· Input changed: please try again".to_owned());
-        model.input_refused = true;
-        model.dirty = true;
+        refuse_stale_input(model, &input);
         return false;
     }
     // Navigation is lossless, but a decision may only confirm the option
@@ -113,26 +111,23 @@ fn dispatch_queued_input(
         dispatch_input(model, hits, input.event);
         return true;
     }
-    let source = if rebased {
+    let pointer_before = model.pointer_input_owner();
+    let (mut sources, mut pointer_sources) = if rebased {
         model
             .input_rebase
-            .as_ref()
-            .and_then(|chain| chain.source.clone())
+            .take()
+            .map(|chain| (chain.sources, chain.pointer_sources))
+            .unwrap_or_default()
     } else {
-        input.presented.clone()
+        let sources = std::collections::VecDeque::from([input.presented.clone()]);
+        (sources.clone(), sources)
     };
-    let pointer_before = model.pointer_input_owner();
-    let pointer_stable = !rebased
-        || model
-            .input_rebase
-            .as_ref()
-            .is_some_and(|chain| chain.pointer_stable);
-    if matches!(&input.event, Event::Mouse(_)) {
-        dispatch_input_at(model, hits, input.event, input.received_at);
-    } else {
-        dispatch_input(model, hits, input.event);
+    dispatch_input_at(model, hits, input.event, input.received_at);
+    // A transition retires only older pointer frames. A later read stamped
+    // by the new surface may still rebase across its own stable frames.
+    if pointer_before != model.pointer_input_owner() {
+        pointer_sources.clear();
     }
-    let pointer_stable = pointer_stable && pointer_before == model.pointer_input_owner();
     let next = model.presented_input();
     let expected = current.map(|(owner, epoch)| {
         let epoch = if owner == next {
@@ -142,12 +137,69 @@ fn dispatch_queued_input(
         };
         (next, epoch)
     });
+    // A reader may wait behind a long retained cohort after stamping an
+    // intermediate frame. Its channel bound does not bound this history.
+    // Only an outside change ends the self-produced frame chain.
+    if sources.back() != Some(&expected) {
+        sources.push_back(expected.clone());
+    }
+    if pointer_sources.back() != Some(&expected) {
+        pointer_sources.push_back(expected.clone());
+    }
     model.input_rebase = Some(InputRebase {
-        source,
+        sources,
         expected,
-        pointer_stable,
+        pointer_sources,
     });
     true
+}
+
+/// Motion and wheel reports have no action for the user to retry.
+fn refuse_stale_input(model: &mut AppModel, input: &QueuedInput) {
+    let event = &input.event;
+    let now = input.received_at;
+    if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
+        return;
+    }
+    if matches!(event, Event::Mouse(mouse) if matches!(mouse.kind,
+        MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::ScrollUp |
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight))
+    {
+        return;
+    }
+    // Outside events can retire the reader's stamp before or after the
+    // successor paints. Its commits still deserve the same dwell feedback;
+    // identity-aware readiness never borrows the predecessor's mature clock.
+    // This changes only the explanation, never the stale-input refusal.
+    // Unstamped startup input predates presentation, even if the card is
+    // painted by dispatch time. It cannot carry a fresh-card confirmation.
+    let stamped = input.presented.is_some();
+    let message = if stamped {
+        match event {
+            Event::Key(key)
+                if model.decision_key_commits(key) && !model.decision_key_commit_ready(now) =>
+            {
+                "· New request — press again"
+            }
+            Event::Mouse(mouse)
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                ) && (model.input_owner().confirms_decision()
+                    || model.free_text_question_owner().is_some()
+                    || model.input_owner() == crate::app::InputOwner::AccountsReplace)
+                    && !model.pointer_commit_ready(now) =>
+            {
+                "· New surface: click again to confirm"
+            }
+            _ => "· Input changed: please try again",
+        }
+    } else {
+        "· Input changed: please try again"
+    };
+    model.flash = Some(message.to_owned());
+    model.input_refused = true;
+    model.dirty = true;
 }
 
 fn owner_needs_presentation(model: &AppModel) -> bool {
@@ -364,11 +416,19 @@ fn probe_terminal_theme(timeout: Duration) -> Option<termbg::Theme> {
     // All retained events precede this instant and the first paint. Keeping
     // that boundary prevents a startup pointer report becoming a fresh click.
     let received_at = Instant::now();
-    STARTUP_INPUT
+    retain_startup_input(&STARTUP_INPUT, retained, received_at);
+    result.ok().flatten()
+}
+
+fn retain_startup_input(
+    queue: &Mutex<std::collections::VecDeque<(Event, Instant)>>,
+    retained: Vec<Event>,
+    received_at: Instant,
+) {
+    queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .extend(retained.into_iter().map(|event| (event, received_at)));
-    result.ok().flatten()
 }
 
 fn query_terminal_theme(
@@ -1123,6 +1183,7 @@ pub async fn run_demo(
             },
             tagged = envelope_rx.recv(), if stream_open => match tagged {
                 Some((generation, event)) => {
+                    model.invalidate_queued_input();
                     driver.consume(&mut model, generation, event);
                 }
                 None => {
@@ -1415,13 +1476,24 @@ pub fn dispatch_input_at(
         if matches!(&event, Event::Mouse(_)) {
             model.clear_mouse_press();
         }
-        model.flash = Some("· Input changed: please try again".to_owned());
-        model.input_refused = true;
-        model.dirty = true;
+        refuse_stale_input(
+            model,
+            &QueuedInput {
+                event,
+                presented: None,
+                received_at: now,
+            },
+        );
         return;
     }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
+            if model.decision_key_commits(&key) && !model.decision_key_commit_ready(now) {
+                model.flash = Some("· New request — press again".to_owned());
+                model.input_refused = true;
+                model.dirty = true;
+                return;
+            }
             model.handle_at(AppEvent::Key(key), now);
         }
         // TUI6.3 fix 2: the paste is wrapped at RECEIPT — the zeroizing
@@ -1429,6 +1501,7 @@ pub fn dispatch_input_at(
         // on drop and Debug-prints redacted.
         Event::Paste(text) => model.handle(AppEvent::Paste(crate::app::Pasted::new(text))),
         Event::Resize(cols, rows) => {
+            model.invalidate_queued_input();
             // TUI6.1 fix 1 (reflow-before-input): the next frame's wrap
             // budget is a pure function of the NEW width, so apply it
             // here — before any queued key can walk the previous width's
@@ -3481,7 +3554,7 @@ fn present_frame(
     {
         frames.push_back((stamp, completed_at));
         // More than the 64 queued reports plus the reader and active dispatch.
-        if frames.len() > 128 {
+        if frames.len() > INPUT_FRAME_HISTORY {
             frames.pop_front();
         }
     }
@@ -4488,6 +4561,7 @@ pub async fn run_live(
                         "talk supervisor stopped unexpectedly after bounded recovery",
                     ));
                 };
+                model.invalidate_queued_input();
                 model.handle_talk(event);
             }
             update_event = updates.events.recv(), if update_events_open => {
@@ -4662,8 +4736,12 @@ mod runtime_presentation_tests;
 
 #[cfg(test)]
 #[path = "input_typeahead_tests.rs"]
-mod input_typeahead_tests;
+pub(crate) mod input_typeahead_tests;
 
 #[cfg(test)]
 #[path = "runtime_pointer_tests.rs"]
 mod runtime_pointer_tests;
+
+#[cfg(test)]
+#[path = "input_split_dwell_tests.rs"]
+mod input_split_dwell_tests;

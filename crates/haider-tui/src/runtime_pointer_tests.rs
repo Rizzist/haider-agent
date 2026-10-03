@@ -4,7 +4,7 @@ use super::*;
 use crate::app::{Screen, ThemePicker};
 use ratatui::crossterm::event::KeyEvent;
 
-fn question_chip(agent: &str, id: &str) -> crate::app::ChipModel {
+pub(super) fn question_chip(agent: &str, id: &str) -> crate::app::ChipModel {
     use crate::app::{ChipModel, ChipQuestion};
     use crate::script::{ChipDisplayState, ChipSeed};
     let mut chip = ChipModel::from_seed(ChipSeed {

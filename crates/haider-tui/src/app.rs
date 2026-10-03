@@ -1725,6 +1725,19 @@ impl UsageState {
     }
 }
 
+/// Numeric quick picks and explicit one-letter option keys share routing
+/// with the dwell gate. Labels never invent an unadvertised shortcut.
+fn menu_shortcut_index(menu: &Menu, c: char) -> Option<usize> {
+    if ('1'..='9').contains(&c) {
+        let index = c as usize - '1' as usize;
+        return (index < menu.options.len()).then_some(index);
+    }
+    menu.options.iter().position(|option| {
+        let mut chars = option.key.chars();
+        chars.next().is_some_and(|key| key.eq_ignore_ascii_case(&c)) && chars.next().is_none()
+    })
+}
+
 /// A chip's pending question (the amber `?` / recovery `⌁`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChipQuestion {
@@ -4232,6 +4245,19 @@ pub struct SessionCacheRates {
     pub reread_basis_points: Option<u32>,
 }
 
+/// Dynamic input rows, including unselected rows which queued navigation
+/// may reach. Compare only at outside replies, never on cadence redraws.
+#[derive(PartialEq, Eq)]
+pub(crate) enum InputRows {
+    Models(Vec<ModelPickerRow>),
+    Sessions(Vec<SessionBrowserRow>),
+    Inbox(Vec<InboxRow>),
+    Efforts(Vec<EffortPickerRow>),
+    Ssh(Vec<haider_rpc::SshProfileWire>),
+    Palette(Vec<PaletteItem>),
+    Mentions(Vec<String>),
+}
+
 /// One rendered row of the `/resume` browser — roster truth only, no
 /// journal replay (the 936 attention fields are exactly what this needs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5993,6 +6019,9 @@ pub struct AppModel {
     composer_replacement_epoch: u64,
     pub(crate) pointer_presentation:
         std::cell::RefCell<Option<(PresentedInput, std::time::Instant)>>,
+    /// A visible answer card keeps its age across local completion edits.
+    pub(crate) text_question_presentation:
+        std::cell::RefCell<Option<(PresentedInput, std::time::Instant)>>,
     /// TUI5 item 5 — a left button went down INSIDE the composer text: the
     /// drag (if any) is a COMPOSER selection, never the transcript's
     /// screen-space drag (region disambiguation by drag START). Transient
@@ -6334,6 +6363,7 @@ impl Default for AppModel {
             input_refused: false,
             composer_replacement_epoch: 0,
             pointer_presentation: std::cell::RefCell::new(None),
+            text_question_presentation: std::cell::RefCell::new(None),
             composer_drag: false,
             should_quit: false,
             dirty: true,
@@ -7713,6 +7743,9 @@ impl AppModel {
 
     /// Deterministic clock seam for rapid Esc backtracking laws.
     pub fn handle_at(&mut self, event: AppEvent, now: std::time::Instant) {
+        if matches!(&event, AppEvent::Envelope(_)) {
+            self.invalidate_queued_input();
+        }
         let previous_owner = self.presented_input();
         let focus_move = matches!(
             &event,
@@ -7742,13 +7775,7 @@ impl AppModel {
                 // Clipboard paste is the one shortcut interpreted before
                 // text-field dispatch. Its result still re-enters the
                 // owner's zeroizing Paste route.
-                if matches!(key.code, KeyCode::Char('v' | 'V'))
-                    && (key.modifiers == KeyModifiers::CONTROL
-                        || key.modifiers == KeyModifiers::SUPER
-                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-                        || key.modifiers == (KeyModifiers::SUPER | KeyModifiers::SHIFT))
-                    && self.screen != Screen::Loom
-                {
+                if self.clipboard_paste_key(&key) {
                     self.request_clipboard_paste();
                     return;
                 }
@@ -9227,10 +9254,10 @@ impl AppModel {
                 self.scroll_back.set(0);
                 return;
             }
-            if self
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some())
-            {
+            if self.viewed_chip().is_some_and(|chip| {
+                chip.question_menu()
+                    .is_some_and(|menu| !menu.options.is_empty())
+            }) {
                 self.handle_chip_menu_key(key.code);
                 return;
             }
@@ -10145,10 +10172,10 @@ impl AppModel {
                 InputOwner::Composer(Screen::Session)
             }
             Screen::Subagent => {
-                if self
-                    .viewed_chip()
-                    .is_some_and(|chip| chip.question_menu().is_some())
-                {
+                if self.viewed_chip().is_some_and(|chip| {
+                    chip.question_menu()
+                        .is_some_and(|menu| !menu.options.is_empty())
+                }) {
                     InputOwner::SubagentQuestion
                 } else if self.effort_picker.is_some() {
                     InputOwner::EffortPicker
@@ -10278,6 +10305,24 @@ impl AppModel {
                     .open_menu()
                     .filter(|menu| menu.options.is_empty())
                     .map(|menu| format!("answer:{}:{}", menu.id, self.projection.menu_instance()));
+                match (answer, self.composer_popup_identity()) {
+                    (Some(answer), Some(popup)) => Some(format!("{answer}:{popup}")),
+                    (answer, popup) => answer.or(popup),
+                }
+            }
+            InputOwner::Composer(Screen::Subagent) => {
+                let answer = self.viewed_chip().and_then(|chip| {
+                    chip.question_menu()
+                        .filter(|menu| menu.options.is_empty())
+                        .map(|menu| {
+                            format!(
+                                "answer:{}:{}:{}",
+                                chip.agent,
+                                menu.id,
+                                chip.transcript.menu_instance()
+                            )
+                        })
+                });
                 match (answer, self.composer_popup_identity()) {
                     (Some(answer), Some(popup)) => Some(format!("{answer}:{popup}")),
                     (answer, popup) => answer.or(popup),
@@ -10499,6 +10544,35 @@ impl AppModel {
         }
     }
 
+    pub(crate) fn input_rows(&self) -> Option<InputRows> {
+        Some(match self.input_owner() {
+            InputOwner::ModelPicker => InputRows::Models(self.model_picker_rows()),
+            InputOwner::Screen(Screen::Sessions) => {
+                InputRows::Sessions(self.session_browser_rows())
+            }
+            InputOwner::Inbox => InputRows::Inbox(self.inbox_rows()),
+            InputOwner::EffortPicker => InputRows::Efforts(self.effort_picker_rows()),
+            InputOwner::SshList => InputRows::Ssh(self.ssh_profiles.clone()),
+            InputOwner::Composer(_) if self.palette_open() => {
+                InputRows::Palette(self.palette_items())
+            }
+            InputOwner::Composer(_) => {
+                InputRows::Mentions(self.mention_completion.as_ref()?.candidates.clone())
+            }
+            _ => return None,
+        })
+    }
+
+    /// Outside content cannot lend any queue-produced frame its authority.
+    pub(crate) fn invalidate_queued_input(&mut self) {
+        self.input_rebase = None;
+        // Retire reader/pointer stamps while preserving the last painted
+        // owner: raw input still must refuse an unpainted replacement.
+        self.painted_epoch
+            .set(self.painted_epoch.get().wrapping_add(1));
+        self.dirty = true;
+    }
+
     pub(crate) fn record_painted_input(&self) {
         self.record_painted_input_at(std::time::Instant::now());
     }
@@ -10513,12 +10587,49 @@ impl AppModel {
         {
             *pointer = Some((pointer_owner, now));
         }
+        let mut question = self.text_question_presentation.borrow_mut();
+        match self.free_text_question_owner() {
+            Some(owner) => {
+                if question.as_ref().is_none_or(|(prior, _)| prior != &owner) {
+                    *question = Some((owner, now));
+                }
+            }
+            None => *question = None,
+        }
         let mut painted = self.painted_input.borrow_mut();
         if painted.as_ref() != Some(&next) {
             self.painted_epoch
                 .set(self.painted_epoch.get().wrapping_add(1));
         }
         *painted = Some(next);
+    }
+
+    /// Stable identity of the visible free-text decision, independent of
+    /// its completion popup or answer edits. Covers retire this identity.
+    pub(crate) fn free_text_question_owner(&self) -> Option<PresentedInput> {
+        let owner = self.input_owner();
+        let (origin, projection, menu) = match owner {
+            InputOwner::Composer(Screen::Session) => {
+                ("session", &self.projection, self.projection.open_menu()?)
+            }
+            InputOwner::Composer(Screen::Subagent) => {
+                let chip = self.viewed_chip()?;
+                (chip.agent.as_str(), &chip.transcript, chip.question_menu()?)
+            }
+            _ => return None,
+        };
+        if !menu.options.is_empty() {
+            return None;
+        }
+        Some(PresentedInput {
+            owner,
+            surface: self.ui_generation(),
+            instance: Some(format!(
+                "answer:{origin}:{}:{}",
+                menu.id,
+                projection.menu_instance()
+            )),
+        })
     }
 
     fn decision_identity(&self) -> Option<String> {
@@ -10572,17 +10683,19 @@ impl AppModel {
                     .as_ref()
                     .map(|form| format!("{:?}", form.original)),
                 InputOwner::Composer(_) => {
-                    if self.palette_open() {
-                        Some("palette".into())
+                    let answer = self
+                        .free_text_question_owner()
+                        .and_then(|owner| owner.instance);
+                    let popup = if self.palette_open() {
+                        Some("palette")
                     } else if self.mention_completion.is_some() {
-                        Some("mentions".into())
+                        Some("mentions")
                     } else {
-                        self.projection
-                            .open_menu()
-                            .filter(|menu| menu.options.is_empty())
-                            .map(|menu| {
-                                format!("answer:{}:{}", menu.id, self.projection.menu_instance())
-                            })
+                        None
+                    };
+                    match (answer, popup) {
+                        (Some(answer), Some(popup)) => Some(format!("{answer}:{popup}")),
+                        (answer, popup) => answer.or_else(|| popup.map(str::to_owned)),
                     }
                 }
                 InputOwner::ToolDetail
@@ -10611,12 +10724,110 @@ impl AppModel {
         }
     }
 
+    /// All committing devices share the same new/restored-card dwell.
+    pub(crate) const DECISION_DWELL: std::time::Duration = std::time::Duration::from_millis(400);
+
+    fn clipboard_paste_key(&self, key: &KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('v' | 'V'))
+            && [
+                KeyModifiers::CONTROL,
+                KeyModifiers::SUPER,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            ]
+            .contains(&key.modifiers)
+            && self.screen != Screen::Loom
+    }
+
+    pub(crate) fn decision_key_commits(&self, key: &KeyEvent) -> bool {
+        // Modified Ctrl+Enter reaches the inline replacement confirmation
+        // before handle_key's control-chord return. Bare Ctrl+Enter is swallowed
+        // by the earlier non-composer gate; other menus never commit Ctrl chords.
+        let replace_enter = self.input_owner() == InputOwner::AccountsReplace
+            && key.code == KeyCode::Enter
+            && key.modifiers != KeyModifiers::CONTROL;
+        if (key.modifiers.contains(KeyModifiers::CONTROL) && !replace_enter)
+            || self.clipboard_paste_key(key)
+        {
+            return false;
+        }
+        // The review document reserves these letters for hunk navigation,
+        // before its ordinary menu shortcuts see the key.
+        if self.screen == Screen::Session
+            && matches!(key.code, KeyCode::Char('n' | 'p' | '[' | ']'))
+            && self
+                .projection
+                .open_menu()
+                .is_some_and(|menu| !menu.options.is_empty() && menu_file_review(menu).is_some())
+        {
+            return false;
+        }
+        if matches!(self.input_owner(), InputOwner::Composer(_))
+            && key.code == KeyCode::Enter
+            && (key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                || self
+                    .mention_completion
+                    .as_ref()
+                    .is_some_and(|completion| !completion.candidates.is_empty())
+                || self.palette_open())
+        {
+            return false;
+        }
+        let menu = match self.input_owner() {
+            InputOwner::AccountsReplace => return key.code == KeyCode::Enter,
+            InputOwner::SessionMenu
+            | InputOwner::SpendCard
+            | InputOwner::PlanDoc
+            | InputOwner::FileReviewDoc => {
+                if self.projection.permission_card().is_some()
+                    && matches!(
+                        key.code,
+                        KeyCode::Enter | KeyCode::Char('r' | 'R' | 'o' | 'O')
+                    )
+                {
+                    return true;
+                }
+                self.projection.open_menu()
+            }
+            InputOwner::SubagentQuestion | InputOwner::Composer(Screen::Subagent) => {
+                self.viewed_chip().and_then(ChipModel::question_menu)
+            }
+            InputOwner::Composer(Screen::Session) => self
+                .projection
+                .open_menu()
+                .filter(|menu| menu.options.is_empty()),
+            _ => None,
+        };
+        menu.is_some_and(|menu| match key.code {
+            KeyCode::Enter => true,
+            KeyCode::Char(c) if !menu.options.is_empty() => menu_shortcut_index(menu, c).is_some(),
+            _ => false,
+        })
+    }
+
+    pub(crate) fn decision_key_commit_ready(&self, now: std::time::Instant) -> bool {
+        if let Some(owner) = self.free_text_question_owner() {
+            self.text_question_presentation
+                .borrow()
+                .as_ref()
+                .is_some_and(|(presented, shown)| {
+                    *presented == owner
+                        && now.saturating_duration_since(*shown) >= Self::DECISION_DWELL
+                })
+        } else {
+            self.pointer_commit_ready(now)
+        }
+    }
+
     pub(crate) fn pointer_commit_ready(&self, now: std::time::Instant) -> bool {
         self.pointer_presentation
             .borrow()
             .as_ref()
-            .is_some_and(|(_, shown)| {
-                now.saturating_duration_since(*shown) >= std::time::Duration::from_millis(400)
+            .is_some_and(|(presented, shown)| {
+                *presented == self.pointer_input_owner()
+                    && now.saturating_duration_since(*shown) >= Self::DECISION_DWELL
             })
     }
 
@@ -10977,10 +11188,12 @@ impl AppModel {
         // free-text ask — the composer text IS the answer (value rides
         // the wire's input; empty key + index 0 satisfy the option-less
         // validation arm).
-        if self.screen == Screen::Session
-            && let Some(menu) = self.projection.open_menu()
-            && menu.options.is_empty()
-        {
+        let question = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        if let Some(menu) = question.filter(|menu| menu.options.is_empty()) {
             let answer = MenuAnswer {
                 menu: menu.id.clone(),
                 option_key: None,
@@ -15132,9 +15345,15 @@ impl AppModel {
     #[must_use]
     pub fn inbox_counts(&self) -> InboxCounts {
         let mut counts = InboxCounts::default();
+        let mut counted_sessions = std::collections::HashSet::new();
         for row in self.inbox_rows() {
             match row.kind {
-                InboxKind::Ask => counts.asks += 1,
+                InboxKind::Ask => {
+                    counts.asks += 1;
+                    if let InboxTarget::Session(session) = row.target {
+                        counted_sessions.insert(session);
+                    }
+                }
                 InboxKind::Agent => counts.agents += 1,
                 InboxKind::StalledTask => counts.stalled += 1,
                 InboxKind::Unseen => counts.unseen += 1,
@@ -15150,6 +15369,30 @@ impl AppModel {
             .projection
             .pending_menu_count()
             .saturating_sub(usize::from(current_counted));
+        // Roster rows count a session once; its cached projection can have
+        // more pending decisions. The active slot and child-session mirrors
+        // have their own counting authorities.
+        for entry in &self.sessions {
+            if self.active_session.as_ref() == Some(&entry.id)
+                || self.session_kinds.get(&entry.id) == Some(&haider_rpc::SessionKindWire::Subagent)
+            {
+                continue;
+            }
+            let cached_seq = entry.projection.last_applied().unwrap_or(0);
+            if self.session_attention.contains_key(&entry.id)
+                && self
+                    .session_cache_rates
+                    .get(&entry.id)
+                    .is_some_and(|summary| summary.head_seq > cached_seq)
+            {
+                // Until replay catches up, the newer daemon roster wins.
+                continue;
+            }
+            counts.asks += entry
+                .projection
+                .pending_menu_count()
+                .saturating_sub(usize::from(counted_sessions.contains(&entry.id)));
+        }
         counts
     }
 
@@ -16232,16 +16475,15 @@ impl AppModel {
         };
         let option_count = menu.options.len();
         match code {
-            KeyCode::Up if option_count > 0 => {
+            KeyCode::Up | KeyCode::BackTab if option_count > 0 => {
                 self.menu_selection =
                     (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
             }
-            KeyCode::Down if option_count > 0 => {
+            KeyCode::Down | KeyCode::Tab if option_count > 0 => {
                 self.menu_selection = (self.menu_selection + 1) % option_count;
             }
-            KeyCode::Char(c @ '1'..='9') => {
-                let index = (c as usize) - ('1' as usize);
-                if index < option_count {
+            KeyCode::Char(c) => {
+                if let Some(index) = menu_shortcut_index(&menu, c) {
                     self.menu_selection = index;
                     self.answer_chip_menu(&menu);
                 }
@@ -18541,16 +18783,15 @@ impl AppModel {
         }
         match code {
             // Selection wraps around (sim, tui.js:2441-2449).
-            KeyCode::Up if option_count > 0 => {
+            KeyCode::Up | KeyCode::BackTab if option_count > 0 => {
                 self.menu_selection =
                     (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
             }
-            KeyCode::Down if option_count > 0 => {
+            KeyCode::Down | KeyCode::Tab if option_count > 0 => {
                 self.menu_selection = (self.menu_selection + 1) % option_count;
             }
-            KeyCode::Char(c @ '1'..='9') => {
-                let index = (c as usize) - ('1' as usize);
-                if index < option_count {
+            KeyCode::Char(c) => {
+                if let Some(index) = menu_shortcut_index(menu, c) {
                     self.menu_selection = index;
                     self.submit_menu_answer();
                 }
@@ -18696,6 +18937,24 @@ impl AppModel {
         };
         match outcome {
             RawOutcome::Applied => {
+                // A wheel may acknowledge already-presented activity. Its
+                // nonvisual journal echo is not an outside input change.
+                // The daemon sets render.ui even on this bookkeeping fact;
+                // the typed payload, rather than that flag, identifies it.
+                // Agent/background facts and real content keep the barrier.
+                let seen_ack = self.active_session.as_ref() == Some(&envelope.session_id)
+                    && envelope.branch_id.is_none()
+                    && envelope.run_id.is_none()
+                    && envelope.agent_id.is_none()
+                    && matches!(
+                        envelope
+                            .payload
+                            .decode::<haider_protocol::session::SessionConfigEventPayload>(),
+                        Ok(haider_protocol::session::SessionConfigEventPayload::SessionSeen { .. })
+                    );
+                if !seen_ack {
+                    self.invalidate_queued_input();
+                }
                 self.dirty = true;
                 // A journal diagnostic describes a former connection. It
                 // cannot establish compatibility of this Hello/Welcome pair.
@@ -18712,7 +18971,7 @@ impl AppModel {
                     .get("type")
                     .and_then(|value| value.as_str())
                     != Some("session_launch_origin_selected");
-                if moves_attention {
+                if moves_attention && !seen_ack {
                     self.note_session_activity_at(&envelope.session_id, envelope.committed_at_ms);
                 }
                 // M10: a BACKGROUND session's terminal/park transition also
@@ -19245,6 +19504,11 @@ impl AppModel {
                 crate::session::apply_agent_payload(&mut self.chips, payload, at_ms);
             }
             Destination::Chip(target) => {
+                if matches!(payload, EventPayload::MenuOpened(_))
+                    && self.view_path.last() == Some(&target)
+                {
+                    self.menu_selection = 0;
+                }
                 if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
                     crate::session::chip_apply(chip, payload, at_ms);
                 }

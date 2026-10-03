@@ -7713,31 +7713,7 @@ fn render_session(
             }
         }
     } else if let Some(ask) = ask_menu.filter(|_| composer_area.height > ask_rows) {
-        let ask_area = Rect {
-            x: composer_area.x,
-            y: composer_area.y,
-            width: composer_area.width,
-            height: ask_rows.min(composer_area.height),
-        };
-        let mut ask_lines = vec![Line::from(vec![
-            Span::styled("? ", theme.warn_style()),
-            Span::styled(ask.title.clone(), theme.warn_style()),
-        ])];
-        for line in &ask.body {
-            ask_lines.push(Line::styled(line.clone(), theme.text_style()));
-        }
-        ask_lines.push(Line::styled(
-            "type your answer below · ⏎ answers · esc interrupts",
-            theme.dim_style(),
-        ));
-        frame.render_widget(Paragraph::new(ask_lines), ask_area);
-        let shifted = Rect {
-            x: composer_area.x,
-            y: composer_area.y + ask_area.height,
-            width: composer_area.width,
-            height: composer_area.height - ask_area.height,
-        };
-        render_composer(model, theme, frame, rule_area, shifted, hits);
+        render_question_composer(model, theme, frame, rule_area, composer_area, hits, ask);
     } else if effort_picker_showing(model) {
         render_effort_picker(model, theme, frame, rule_area, composer_area, hits);
     } else if theme_picker_showing(model) {
@@ -11318,10 +11294,50 @@ fn render_fleet(
     }
 }
 
-/// The subagent view (§2.10): breadcrumb head, the chip's OWN transcript,
-/// the shared SubTree map, and a composer that steers THIS chip — its
-/// question card replaces the composer, but the parent is never blocked
-/// (esc always walks back).
+/// The shared answer line for session and child free-text questions.
+#[allow(clippy::too_many_arguments)]
+fn render_question_composer(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    rule_area: Rect,
+    composer_area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+    ask: &haider_protocol::menu::Menu,
+) {
+    let ask_rows = u16::try_from(2 + ask.body.len()).unwrap_or(u16::MAX);
+    let ask_area = Rect {
+        x: composer_area.x,
+        y: composer_area.y,
+        width: composer_area.width,
+        height: ask_rows.min(composer_area.height),
+    };
+    let mut ask_lines = vec![Line::from(vec![
+        Span::styled("? ", theme.warn_style()),
+        Span::styled(ask.title.clone(), theme.warn_style()),
+    ])];
+    for line in &ask.body {
+        ask_lines.push(Line::styled(line.clone(), theme.text_style()));
+    }
+    ask_lines.push(Line::styled(
+        if model.screen == Screen::Subagent {
+            "type your answer below · ⏎ answers · esc back to session"
+        } else {
+            "type your answer below · ⏎ answers · esc interrupts"
+        },
+        theme.dim_style(),
+    ));
+    frame.render_widget(Paragraph::new(ask_lines), ask_area);
+    let shifted = Rect {
+        x: composer_area.x,
+        y: composer_area.y + ask_area.height,
+        width: composer_area.width,
+        height: composer_area.height - ask_area.height,
+    };
+    render_composer(model, theme, frame, rule_area, shifted, hits);
+}
+
+/// The child transcript, subtree and decision or steering composer.
 fn render_subagent(
     model: &AppModel,
     theme: &Theme,
@@ -11345,8 +11361,13 @@ fn render_subagent(
     } else {
         chip.question_menu()
     };
+    let ask_menu = menu.filter(|menu| menu.options.is_empty());
+    let menu = menu.filter(|menu| !menu.options.is_empty());
+    let ask_rows = ask_menu.map_or(0, |menu| {
+        u16::try_from(2 + menu.body.len()).unwrap_or(u16::MAX)
+    });
     let needed_input = menu.map_or_else(
-        || composer_height(model, area.width),
+        || composer_height(model, area.width).saturating_add(ask_rows),
         |m| {
             u16::try_from(
                 1 + wrapped_menu_body(m, area.width, model.clock_ms).len() + m.options.len() + 1,
@@ -11770,6 +11791,8 @@ fn render_subagent(
                 ));
             }
         }
+    } else if let Some(ask) = ask_menu.filter(|_| composer_area.height > ask_rows) {
+        render_question_composer(model, theme, frame, rule_area, composer_area, hits, ask);
     } else if effort_picker_showing(model) {
         render_effort_picker(model, theme, frame, rule_area, composer_area, hits);
     } else if theme_picker_showing(model) {
