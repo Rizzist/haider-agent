@@ -206,10 +206,17 @@ fn unknown_or_wrong_run_intent_cannot_commit_workspace_mutation() {
                 .append(&mut [intent])
                 .expect("raw intent is retained without guessing its class");
             let head = store.latest_seq(&session).expect("head");
+            // Keep the run valid when testing unknown authority so the two
+            // rejection paths cannot mask one another.
+            let outcome_run = if unknown_class {
+                run.clone()
+            } else {
+                RunId::new("wrong-run")
+            };
             let mut outcome = [envelope(
                 &store,
                 &session,
-                &RunId::new("wrong-run"),
+                &outcome_run,
                 "strict-outcome",
                 EventPayload::Effect(EffectPhase::Outcome {
                     effect: effect.clone(),
