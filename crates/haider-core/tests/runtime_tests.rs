@@ -8616,6 +8616,9 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
 #[path = "support/request_budget_laws.rs"]
 mod request_budget_laws;
 
+#[path = "support/loop_guard_screen_digits.rs"]
+mod loop_guard_screen_digits;
+
 struct AppliedFailureDispatcher {
     calls: AtomicUsize,
     effects: Vec<haider_protocol::tool::ToolFileEffect>,
@@ -8655,6 +8658,7 @@ async fn toolshape_fatal_applied_effects_are_journaled_once_before_errored_and_r
             path: "before.txt".into(),
             absolute_path: "/workspace/before.txt".into(),
             bytes: 14,
+            edit_spans: Vec::new(),
         },
         ToolFileEffect {
             kind: ToolFileEffectKind::Create,
@@ -8662,6 +8666,7 @@ async fn toolshape_fatal_applied_effects_are_journaled_once_before_errored_and_r
             path: "after.txt".into(),
             absolute_path: "/workspace/after.txt".into(),
             bytes: 14,
+            edit_spans: Vec::new(),
         },
     ];
     let dispatcher = Arc::new(AppliedFailureDispatcher {

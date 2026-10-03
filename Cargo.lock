@@ -1823,6 +1823,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "unicode-properties",
  "zeroize",
 ]
 
@@ -2039,8 +2040,11 @@ dependencies = [
  "image",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-core-video",
  "objc2-foundation",
+ "objc2-quartz-core",
  "regex",
  "regex-syntax",
  "rustix 1.1.4",
@@ -2066,6 +2070,7 @@ dependencies = [
  "haider-provider",
  "haider-rpc",
  "haider-stt",
+ "haider-tools",
  "image",
  "ratatui",
  "ratatui-image",
@@ -3199,6 +3204,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-video"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d425caf1df73233f29fd8a5c3e5edbc30d2d4307870f802d18f00d83dc5141a6"
+dependencies = [
+ "bitflags 2.13.1",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+]
+
+[[package]]
 name = "objc2-encode"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3224,6 +3240,16 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-quartz-core"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

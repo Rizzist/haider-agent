@@ -1,0 +1,49 @@
+# tuivirt golden · toolview_rows_dark · 80x24
+00|[ ← main ]     ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v<VERSION> · ~/dev/enterprise-suite  |
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×5; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×3; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/BOLD×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2
+01|            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · @unknown                    |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×20
+02|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+03|      4 + | 2 | 973-request-budget | implement | ⏳ |                           |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(36, 48, 39)/NONE×44; Reset/Reset/NONE×1; Rgb(212, 212, 212)/Rgb(36, 48, 39)/NONE×29
+04|      … +3 lines (⌃O to expand)                                                 |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×31; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×49
+05|  ● Edit(state/970-STATUS.md)                                                   |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×51
+06|    ⎿ Added 2 lines, removed 1 line                                             |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×16; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×5; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×45
+07|      41   ## Stage                                                             |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×13; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×61
+08|      42 - planning (not started; 972 release chain first)                      |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(58, 36, 34)/NONE×74
+09|      42 + RE-SCOPED by owner 2026-09-23                                        |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(36, 48, 39)/NONE×74
+10|      43 + implementation under way                                             |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(36, 48, 39)/NONE×74
+11|      … +1 line (⌃O to expand)                                                  |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×50
+12|  Read 3 files                                                                  |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×66
+13|  ● Bash(cat >> experience-log.jsonl <<'EOF' …)                                 |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×39; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×33
+14|    ⎿ 42 experience-log.jsonl                                                   |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×29; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×51
+15|  ● Bash(cargo test -p haider-tui --locked) · 8s                                |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×32
+16|    ⎿ Exit code 101 · running 1636 tests                                        |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×13; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×40
+17|  ● Write                                                                       |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×5; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×71
+18|    ⎿ Error writing file · Invalid tool call — tool call `toolu_01` ended with …|
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×74
+19|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+20|───────────────────────────────────────────────────────────────────── fable-5 ──|
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×69; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2
+21|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text     |
+   ~ Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/BOLD×2; Rgb(15, 15, 15)/Rgb(217, 181, 68)/NONE×1; Rgb(139, 148, 158)/Rgb(26, 26, 26)/NONE×70; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×5
+22|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+23| [ IDLE ]  request cap 64 (tranche 32)  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main   |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×9

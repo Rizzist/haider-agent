@@ -39,6 +39,8 @@ arboard = { workspace = true, optional = true }
 
 [dev-dependencies]
 haider-provider = { path = "../haider-provider" }
+# 973-tui-toolview: the edit-span law runs the REAL edit application.
+haider-tools = { path = "../haider-tools" }
 zeroize.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -722,13 +722,11 @@ struct ContinuationProgress {
     repeated_calls: RepeatStreak,
     /// Same (tool, arguments), any result.
     repeated_actions: RepeatStreak,
-    /// Last outcome fingerprint per (tool, arguments) fingerprint, so a
-    /// screen observation can be compared with the previous identical call.
+    /// Last successful reading per (tool, arguments) fingerprint, so a screen
+    /// observation can be compared with the previous identical observation.
     last_outcome: HashMap<blake3::Hash, blake3::Hash>,
-    /// The latest computer/mobile screen observation repeated the previous
-    /// identical observation (or produced no reading): the screen is not
-    /// changing, so screen steps count toward the action guard again.
-    ui_screen_stale: bool,
+    /// Navigation can be exempt only after a successful changed observation.
+    ui_screen_changed: bool,
 }
 
 /// One consecutive-repeat streak and its steer state.
@@ -831,9 +829,9 @@ impl ContinuationProgress {
     }
 
     /// One completed call: `args` is the canonical argument form and
-    /// `outcome` the normalized result parts. `ui` is set only for a typed
-    /// computer/mobile screen step (`continuation_fingerprint::ui_step`),
-    /// with whether the result carried a reading (an image for screenshots).
+    /// `outcome` the normalized result parts. `ui` is set only for a trusted,
+    /// successful typed computer/mobile screen step, with whether the result
+    /// carried a reading (an image for screenshots).
     ///
     /// Screen steps are exempt from the action-level guard while the screen
     /// changes: an observation whose outcome differs from the previous
@@ -854,16 +852,19 @@ impl ContinuationProgress {
             Self::fingerprint(b"action", &[kind, name.as_bytes(), args.as_bytes()]);
         let outcome_fingerprint = Self::fingerprint(b"outcome", outcome);
         let action = self.seen.insert(action_fingerprint);
-        let previous = self
-            .last_outcome
-            .insert(action_fingerprint, outcome_fingerprint);
         let screen_step_exempt = match ui {
             Some((UiStep::Observe { .. }, reading)) => {
+                let previous = if reading {
+                    self.last_outcome
+                        .insert(action_fingerprint, outcome_fingerprint)
+                } else {
+                    None
+                };
                 let changed = reading && previous != Some(outcome_fingerprint);
-                self.ui_screen_stale = !changed;
+                self.ui_screen_changed = changed;
                 changed
             }
-            Some((UiStep::Navigate, _)) => !self.ui_screen_stale,
+            Some((UiStep::Navigate, _)) => self.ui_screen_changed,
             None => false,
         };
         if !screen_step_exempt {
@@ -904,11 +905,17 @@ impl ContinuationProgress {
                 if let Some(Block::ToolResult {
                     preview,
                     truncated,
+                    completion_status,
                     images,
                     ..
                 }) = result.tool_result_for(call_id)
                 {
-                    let ui = crate::continuation_fingerprint::ui_step(name, args).map(|step| {
+                    let typed_ui = crate::continuation_fingerprint::ui_step(name, args);
+                    let succeeded = completion_status.is_some_and(|status| status.is_completed());
+                    if typed_ui.is_some() && !succeeded {
+                        self.ui_screen_changed = false;
+                    }
+                    let ui = typed_ui.filter(|_| succeeded).map(|step| {
                         let reading = match step {
                             crate::continuation_fingerprint::UiStep::Observe {
                                 screenshot: true,
@@ -918,13 +925,39 @@ impl ContinuationProgress {
                         (step, reading)
                     });
                     let args = crate::continuation_fingerprint::arguments(args);
-                    let preview = crate::continuation_fingerprint::result(preview);
-                    let images = serde_json::to_string(images).unwrap_or_default();
+                    // Only a completed observation with a reading can prove
+                    // a new numeric screen. Navigation and missing screenshots
+                    // use the ordinary digit mask.
+                    let screen_reading = matches!(
+                        ui,
+                        Some((
+                            crate::continuation_fingerprint::UiStep::Observe { .. },
+                            true
+                        ))
+                    );
+                    let preview = if screen_reading {
+                        crate::continuation_fingerprint::screen_result(preview)
+                    } else {
+                        crate::continuation_fingerprint::result(preview)
+                    };
+                    // A failed screen receipt may still carry image references,
+                    // but those references cannot establish screen progress.
+                    let images = if typed_ui.is_some() && !succeeded {
+                        "[]".to_owned()
+                    } else {
+                        serde_json::to_string(images).unwrap_or_default()
+                    };
+                    let status = format!("{completion_status:?}");
                     self.observe_call(
                         b"local_tool_result",
                         name,
                         &args,
-                        &[preview.as_bytes(), &[*truncated as u8], images.as_bytes()],
+                        &[
+                            preview.as_bytes(),
+                            &[*truncated as u8],
+                            images.as_bytes(),
+                            status.as_bytes(),
+                        ],
                         ui,
                     );
                 }
@@ -1310,6 +1343,51 @@ mod continuation_progress_tests {
             ("provider_repeat", 10),
         ] {
             assert_eq!(simulate(case(kind)), stopped(attempts), "{kind}");
+        }
+    }
+
+    /// Astra final-review B2: a pause_turn/max_tokens counter written in
+    /// ASCII, Arabic-Indic or Persian digits is no fresh text; identifier
+    /// digits (`v٢x`, `abc_١`) still name something new.
+    #[test]
+    fn unicode_decimal_counters_in_continuations_stop() {
+        for zero in [0x30_u32, 0x660, 0x6f0, 0x966] {
+            for finish in [FinishReason::PauseTurn, FinishReason::MaxTokens] {
+                let mut rounds: Vec<_> = (1..=100_u32)
+                    .map(|n| {
+                        let digits: String = n
+                            .to_string()
+                            .chars()
+                            .map(|ch| char::from_u32(zero + ch.to_digit(10).unwrap()).unwrap())
+                            .collect();
+                        text(
+                            format!("Retrying the same operation (attempt {digits})."),
+                            finish,
+                        )
+                    })
+                    .collect();
+                rounds.push(text("UNREACHABLE".into(), FinishReason::EndTurn));
+                assert_eq!(simulate(rounds), stopped(10), "U+{zero:04X} {finish:?}");
+            }
+            // Identifier digits keep going (each is new assistant text).
+            let digit = |n: u32| char::from_u32(zero + n).unwrap();
+            let mut rounds: Vec<_> = (0..10_u32)
+                .map(|n| {
+                    text(
+                        format!("Wrote v{}x and abc_{}", digit(n), digit(9 - n)),
+                        FinishReason::PauseTurn,
+                    )
+                })
+                .collect();
+            rounds.push(text("DONE".into(), FinishReason::EndTurn));
+            assert_eq!(
+                simulate(rounds),
+                Outcome::Completed {
+                    attempts: 11,
+                    suspected: 0
+                },
+                "U+{zero:04X}"
+            );
         }
     }
 
@@ -1756,6 +1834,26 @@ mod continuation_progress_tests {
         image: Option<String>,
         n: usize,
     ) {
+        tool_call_receipt(
+            progress,
+            tool,
+            args,
+            preview,
+            image,
+            ToolResultStatus::Completed,
+            n,
+        );
+    }
+
+    fn tool_call_receipt(
+        progress: &mut ContinuationProgress,
+        tool: &str,
+        args: serde_json::Value,
+        preview: &str,
+        image: Option<String>,
+        status: ToolResultStatus,
+        n: usize,
+    ) {
         let call_id = format!("ui-{n}");
         let block = Block::ToolCall {
             call_id: call_id.clone(),
@@ -1775,8 +1873,8 @@ mod continuation_progress_tests {
             .unwrap_or_default();
         progress.observe_local_tools(
             &[block],
-            &[Message::tool_result_with_images(
-                call_id, preview, false, images,
+            &[Message::tool_result_with_receipt(
+                call_id, preview, false, images, status,
             )],
         );
     }
@@ -1787,6 +1885,194 @@ mod continuation_progress_tests {
 
     fn screenshot_args() -> serde_json::Value {
         serde_json::json!({"action": "screenshot"})
+    }
+
+    #[test]
+    fn unsuccessful_screen_receipts_keep_the_ordinary_result_bound() {
+        for status in [
+            ToolResultStatus::Failed,
+            ToolResultStatus::Rejected,
+            ToolResultStatus::Conflict,
+            ToolResultStatus::Cancelled,
+            ToolResultStatus::Unknown,
+        ] {
+            for (tool, args, image) in [
+                ("mobile", serde_json::json!({"action": "a11y_tree"}), false),
+                (
+                    "mobile",
+                    serde_json::json!({"action": "inspect", "element_id": "row"}),
+                    false,
+                ),
+                (
+                    "computer",
+                    serde_json::json!({"action": "inspect", "x": 1, "y": 1}),
+                    false,
+                ),
+                ("mobile", screenshot_args(), false),
+                ("mobile", screenshot_args(), true),
+                ("computer", screenshot_args(), true),
+                ("mobile", swipe_args(), false),
+                (
+                    "computer",
+                    serde_json::json!({"action": "left_click", "x": 1, "y": 1}),
+                    false,
+                ),
+            ] {
+                let (stop, steers) = drive(240, |progress, request| {
+                    tool_call_receipt(
+                        progress,
+                        tool,
+                        args.clone(),
+                        &format!("Backend unavailable (attempt {request})"),
+                        image.then(|| format!("failed-frame-{request}")),
+                        status,
+                        request,
+                    );
+                });
+                assert!(
+                    matches!(stop, Some((62, LoopLimitV1::RepeatedToolCalls { .. }))),
+                    "{status:?} {tool} {args} image={image}: {stop:?}"
+                );
+                assert_eq!(steers.len(), 1, "{status:?} {tool} {args}");
+            }
+        }
+        // A completed screenshot without a reading and a legacy result with
+        // no receipt status cannot claim screen progress either.
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                screenshot_args(),
+                &format!("capture {request}"),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        let (stop, steers) = drive(240, |progress, request| {
+            let call_id = format!("legacy-{request}");
+            progress.observe_local_tools(
+                &[Block::ToolCall {
+                    call_id: call_id.clone(),
+                    name: "mobile".into(),
+                    args: serde_json::json!({"action": "a11y_tree"}),
+                }],
+                &[Message::tool_result(
+                    call_id,
+                    format!("row {request}"),
+                    false,
+                )],
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+    }
+
+    #[test]
+    fn navigation_needs_a_successful_changed_observation_first() {
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                swipe_args(),
+                &format!("page {request}"),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                swipe_args(),
+                &format!("page {}", letter_tag(request)),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        // A failed reading cannot activate navigation's exemption, even if
+        // its preview changes on every call.
+        let (stop, steers) = drive(240, |progress, request| {
+            if request == 1 {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    serde_json::json!({"action": "a11y_tree"}),
+                    "page 1",
+                    None,
+                    ToolResultStatus::Failed,
+                    request,
+                );
+            } else {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    swipe_args(),
+                    &format!("page {}", letter_tag(request)),
+                    None,
+                    ToolResultStatus::Completed,
+                    request,
+                );
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((203, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        // A prior valid observation does not excuse a later failed action.
+        let (stop, steers) = drive(240, |progress, request| {
+            if request == 1 {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    serde_json::json!({"action": "a11y_tree"}),
+                    "page 1",
+                    None,
+                    ToolResultStatus::Completed,
+                    request,
+                );
+            } else {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    swipe_args(),
+                    &format!("failed attempt {request}"),
+                    None,
+                    ToolResultStatus::Failed,
+                    request,
+                );
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((63, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
     }
 
     /// Runs `calls` one per provider request; returns the first terminal
@@ -1887,7 +2173,8 @@ mod continuation_progress_tests {
         );
         assert_eq!(steers.len(), 1);
         assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
-        // Swipe + identical screenshot: both repeat, so the stop comes sooner.
+        // Swipe + identical screenshot: both repeat after the two distinct
+        // call fingerprints are established.
         let (stop, _) = drive(600, |progress, request| {
             if request % 2 == 1 {
                 tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
@@ -1902,16 +2189,179 @@ mod continuation_progress_tests {
                 );
             }
         });
-        assert!(matches!(
+        // Swipe and screenshot establish two distinct fingerprints. The 62nd
+        // completed call makes 60 repeats, so the limit precedes request 63.
+        assert_eq!(
             stop,
             Some((
-                _,
+                63,
                 LoopLimitV1::RepeatedToolCalls {
                     repeated_calls: 60,
-                    ..
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
                 }
             ))
-        ));
+        );
+    }
+
+    fn a11y_tree_args() -> serde_json::Value {
+        serde_json::json!({"action": "a11y_tree"})
+    }
+
+    /// The daemon's typed `MobileOutput::A11yTree` preview for one list row
+    /// whose visible text is `text` (stable id, resource id and bounds, as
+    /// `mobile_transport` derives node ids from resource id + index).
+    fn numeric_tree(text: &str) -> String {
+        use haider_protocol::mobile::{A11yNode, MobileOutput, Point4};
+        let output = MobileOutput::A11yTree(vec![A11yNode {
+            id: "row1".into(),
+            text: Some(text.into()),
+            content_desc: None,
+            class: "android.widget.TextView".into(),
+            resource_id: Some("example:id/row".into()),
+            bounds: Point4 {
+                left: 0,
+                top: 100,
+                right: 100,
+                bottom: 150,
+            },
+        }]);
+        serde_json::to_string(&output).unwrap()
+    }
+
+    /// Astra final-review B1: swipe + accessibility-tree paging through rows
+    /// that differ only by numbers (IDs, prices, dates) is productive: no
+    /// steer and no stop from either the action or the result-level guard.
+    #[test]
+    fn mobile_numeric_a11y_tree_paging_300_pages_completes() {
+        assert_eq!(
+            crate::continuation_fingerprint::ui_step("mobile", &a11y_tree_args()),
+            Some(crate::continuation_fingerprint::UiStep::Observe { screenshot: false })
+        );
+        let renders: [fn(usize) -> String; 3] = [
+            |page| (100_000 + page).to_string(),
+            |page| format!("${}.{:02}", 10 + page, page % 100),
+            |page| format!("2026-09-{:02} 12:{:02} #{page}", 1 + page % 28, page % 60),
+        ];
+        for render in renders {
+            let (stop, steers) = drive(600, |progress, request| {
+                let page = request.div_ceil(2);
+                if request % 2 == 1 {
+                    tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+                } else {
+                    tool_call(
+                        progress,
+                        "mobile",
+                        a11y_tree_args(),
+                        &numeric_tree(&render(page)),
+                        None,
+                        request,
+                    );
+                }
+            });
+            assert_eq!(stop, None);
+            assert!(steers.is_empty(), "{steers:?}");
+        }
+    }
+
+    /// A truly identical numeric tree (stuck at the end of the list) still
+    /// repeats: steered before request 32, stopped before request 62. An
+    /// alternating swipe/tree loop first establishes two distinct calls.
+    #[test]
+    fn identical_numeric_a11y_tree_still_stops_at_61() {
+        let tree = numeric_tree("100042");
+        let (stop, steers) = drive(600, |progress, request| {
+            tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
+        });
+        assert_eq!(
+            stop,
+            Some((
+                62,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        let (stop, _) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
+            }
+        });
+        // Swipe and tree establish two distinct call fingerprints. The 62nd
+        // completed call makes 60 repeats, so the limit precedes request 63.
+        assert_eq!(
+            stop,
+            Some((
+                63,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+    }
+
+    /// Ordinary text-tool numeric polling keeps the accepted digit mask: an
+    /// identical call whose result changes only by free-standing numbers is
+    /// no progress, even when the text is the same JSON a tree would carry.
+    #[test]
+    fn ordinary_text_numeric_polling_is_still_masked() {
+        for (tool, args) in [
+            ("fs_read", serde_json::json!({"path": "status.txt"})),
+            (
+                "process_exec",
+                serde_json::json!({"command": "cat rows.json"}),
+            ),
+            (
+                "process_exec",
+                serde_json::json!({"action": "a11y_tree", "command": "cat rows.json"}),
+            ),
+            ("mobile_screenshot", a11y_tree_args()),
+        ] {
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    args.clone(),
+                    &format!("Completed files: {request}"),
+                    None,
+                    request,
+                );
+            });
+            assert_eq!(
+                stop,
+                Some((
+                    62,
+                    LoopLimitV1::RepeatedToolCalls {
+                        repeated_calls: 60,
+                        suspect_after: 30,
+                        stop_after_suspected: 30,
+                    }
+                )),
+                "{tool}"
+            );
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    args.clone(),
+                    &numeric_tree(&(100_000 + request).to_string()),
+                    None,
+                    request,
+                );
+            });
+            assert!(
+                matches!(stop, Some((62, LoopLimitV1::RepeatedToolCalls { .. }))),
+                "{tool}: {stop:?}"
+            );
+        }
     }
 
     /// A screen-step exemption needs the typed tool identity: the same
@@ -5287,11 +5737,12 @@ impl HarnessActor {
                             });
                             if let Some(result) = tool.result.as_ref() {
                                 let projection = model_tool_result_projection(&tool.name, result);
-                                tool_results.push(Message::tool_result_with_images(
+                                tool_results.push(Message::tool_result_with_receipt(
                                     tool.call_id.clone(),
                                     projection.preview,
                                     projection.truncated,
                                     result.images.clone(),
+                                    result.status,
                                 ));
                             }
                         }
@@ -10544,7 +10995,13 @@ impl HarnessActor {
         self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
             .await?;
         tools.remove(index);
-        Ok(Message::tool_result(call_id, result.preview, false))
+        Ok(Message::tool_result_with_receipt(
+            call_id,
+            result.preview,
+            false,
+            result.images,
+            result.status,
+        ))
     }
 
     /// Closes the matching tool item for a provider `ToolCallEnd`.
@@ -10634,11 +11091,15 @@ impl HarnessActor {
             self.commit_tool_result_and_completion(run_id, &tools[index], &result)
                 .await?;
             tools.remove(index);
-            return Ok(CompletedTool::Continue(Some(Message::tool_result(
-                call_id,
-                result.preview,
-                false,
-            ))));
+            return Ok(CompletedTool::Continue(Some(
+                Message::tool_result_with_receipt(
+                    call_id,
+                    result.preview,
+                    false,
+                    result.images,
+                    result.status,
+                ),
+            )));
         }
         if tools[index].name == "task_outcome" {
             return self
@@ -10730,11 +11191,12 @@ impl HarnessActor {
             let projection = model_tool_result_projection(&tools[index].name, &result);
             tools.remove(index);
             return Ok(CompletedTool::Continue(Some(
-                Message::tool_result_with_images(
+                Message::tool_result_with_receipt(
                     call_id,
                     projection.preview,
                     projection.truncated,
                     result.images,
+                    result.status,
                 ),
             )));
         }
@@ -11230,11 +11692,12 @@ impl HarnessActor {
         self.commit_tool_result_and_completion(run_id, &tools[index], &result)
             .await?;
         tools.remove(index);
-        Ok(Message::tool_result_with_images(
+        Ok(Message::tool_result_with_receipt(
             call_id,
             result.preview,
             result.truncated,
             result.images,
+            result.status,
         ))
     }
 
@@ -11665,11 +12128,12 @@ impl HarnessActor {
             .await?;
         let projection = model_tool_result_projection(&tools[index].name, &result);
         tools.remove(index);
-        Ok(Message::tool_result_with_images(
+        Ok(Message::tool_result_with_receipt(
             call_id,
             projection.preview,
             projection.truncated,
             result.images,
+            result.status,
         ))
     }
 
@@ -12267,10 +12731,12 @@ impl HarnessActor {
                 .acknowledge_deferred(&pending.ticket)
                 .await
                 .map_err(DriveError::Store)?;
-            results.push(Message::tool_result(
+            results.push(Message::tool_result_with_receipt(
                 pending.call_id,
                 projection.preview,
                 projection.truncated,
+                result.images,
+                result.status,
             ));
             deferred.remove(0);
         }

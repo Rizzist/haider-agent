@@ -156,7 +156,15 @@ pub(super) fn legacy_delegated_create_matches(
             rebound.apply_to_metadata(&mut metadata);
         } else if let Some(selected) = ModelSelected::from_payload_value(&event.payload) {
             if metadata.provider != selected.provider {
-                metadata.account_alias = None;
+                // The ten-key receipt was written before route inheritance.
+                // All events before its child's Created cutoff therefore use
+                // the old daemon rule (v0.0.972 / 8ffc5866): creation pins
+                // survive a provider pick; rebind pins do not. Events record
+                // a payload schema version, not the writing daemon version.
+                // Newer receipt schemas never enter this reconstruction.
+                if metadata.provider_rebind_id.is_some() {
+                    metadata.account_alias = None;
+                }
                 metadata.provider_base_url = None;
                 metadata.provider_rebind_id = None;
             }

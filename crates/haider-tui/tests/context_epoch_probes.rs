@@ -1449,13 +1449,13 @@ fn launcher_create_reply_binds_pair_budget_and_waits_for_current_account_truth()
     );
     assert_eq!(model.context_meter().window, Some(1_000_000));
     assert_eq!(model.context_meter().auto_compact_at, Some(850_000));
-    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    assert_eq!(model.attached_account_label(), "unknown");
     for width in [80, 118] {
         let header = draw(&model, width, if width == 80 { 24 } else { 36 });
         let expected = if width == 80 {
-            "@unknown/not recorded"
+            "@unknown"
         } else {
-            "account unknown/not recorded"
+            "account unknown"
         };
         assert!(
             header[..3].iter().any(|line| line.contains(expected)),
@@ -2425,9 +2425,12 @@ fn astra_failed_metadata_read_releases_the_refresh_latch() {
         next + 1,
         fact("eq-mid", next + 1),
     );
-    eprintln!("refresh after failed list: {second:?}");
+    assert!(second.is_empty(), "new facts coalesce during backoff");
+    driver.set_now(driver.next_deadline().expect("failed read must retry"));
+    let retried = driver.sync_selection(&model);
+    eprintln!("refresh after failed list: {retried:?}");
     assert!(
-        second
+        retried
             .iter()
             .any(|c| matches!(c, LiveCommand::ListAt { .. }))
     );
@@ -2440,7 +2443,17 @@ fn newer_selection_dirty_during_a_failed_list_gets_one_followup() {
     deliver_model_fact(&mut driver, &mut model, &s, next, "eq-oauth", "eq-small");
     deliver_model_fact(&mut driver, &mut model, &s, next + 1, "eq-oauth", "eq-mid");
     let list_epoch = driver.connection_epoch();
-    let follow = driver.apply(&mut model, LiveReply::ListFailedAt { epoch: list_epoch });
+    assert!(
+        driver
+            .apply(&mut model, LiveReply::ListFailedAt { epoch: list_epoch })
+            .is_empty()
+    );
+    driver.set_now(
+        driver
+            .next_deadline()
+            .expect("coalesced failed read retries"),
+    );
+    let follow = driver.sync_selection(&model);
     assert_eq!(
         follow
             .iter()
@@ -2471,7 +2484,13 @@ fn newer_selection_dirty_during_a_failed_list_gets_one_followup() {
         .expect("fact"),
     );
     assert!(
-        later
+        later.is_empty(),
+        "newer facts cannot bypass the failed read delay"
+    );
+    driver.set_now(driver.next_deadline().expect("second failed read retries"));
+    let follow = driver.sync_selection(&model);
+    assert!(
+        follow
             .iter()
             .any(|command| matches!(command, LiveCommand::ListAt { .. }))
     );
@@ -4525,7 +4544,7 @@ fn sol16_running_and_legacy_session_headers_never_attribute_the_global_default()
             sources: vec![],
         },
     );
-    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    assert_eq!(model.attached_account_label(), "unknown");
     for (w, h) in [(118, 36), (80, 24)] {
         assert!(!draw(&model, w, h)[..3].join("\n").contains("new-default"));
     }
@@ -4551,7 +4570,7 @@ fn sol16_running_and_legacy_session_headers_never_attribute_the_global_default()
             next_cursor: None,
         },
     );
-    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    assert_eq!(model.attached_account_label(), "unknown");
     let mut legacy = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", 30_000);
     legacy.metadata = None;
     legacy.turn_count = Some(2);
@@ -4600,7 +4619,7 @@ fn sol16_failed_first_route_read_is_retried_without_another_fact() {
             .any(|c| matches!(c, LiveCommand::ListAt { .. }))
     );
     driver.apply(&mut model, LiveReply::ListFailed);
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    driver.set_now(driver.next_deadline().expect("retry deadline"));
     assert!(
         driver
             .sync_selection(&model)
@@ -4678,7 +4697,7 @@ fn sol16_running_first_request_after_provider_reset_rejects_a_new_default() {
             next_cursor: None,
         },
     );
-    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    assert_eq!(model.attached_account_label(), "unknown");
     for (w, h) in [(118, 36), (80, 24)] {
         assert!(
             !draw(&model, w, h)[..3]
@@ -4743,7 +4762,7 @@ fn sol16_cold_unserved_route_keeps_its_forecast_through_older_run_replay() {
             next_cursor: None,
         },
     );
-    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    assert_eq!(model.attached_account_label(), "unknown");
 }
 
 #[test]
@@ -4772,7 +4791,7 @@ fn sol16_cold_legacy_without_route_provenance_never_uses_a_zero_epoch_as_freshne
             },
         );
         model.open_session(&id);
-        assert_eq!(model.attached_account_label(), "unknown/not recorded");
+        assert_eq!(model.attached_account_label(), "unknown");
         for (w, h) in [(118, 36), (80, 24)] {
             let header = draw(&model, w, h)[..3].join("\n");
             assert!(header.contains("unknown"), "{header}");
@@ -5297,11 +5316,7 @@ fn sol16_rebind_behind_served_metadata_preserves_actual_route_and_legacy_noop_st
         );
         assert_eq!(
             model.attached_account_label(),
-            if legacy {
-                "unknown/not recorded"
-            } else {
-                "actually-served"
-            }
+            if legacy { "unknown" } else { "actually-served" }
         );
     }
 }
@@ -5352,7 +5367,7 @@ fn sol16_first_route_fact_before_run_history_disables_default_forecast() {
     );
     assert_eq!(
         model.attached_account_label(),
-        "unknown/not recorded",
+        "unknown",
         "stale unseen metadata cannot revive the forecast"
     );
     let metadata = summary.metadata.as_mut().expect("metadata");
@@ -5424,7 +5439,7 @@ fn sol16_rotation_waits_for_actual_account_and_same_epoch_metadata_wins() {
             if metadata_first {
                 "promoted-actual (pinned)"
             } else {
-                "unknown/not recorded"
+                "unknown"
             }
         );
         summary.head_seq = 1;
@@ -5491,7 +5506,7 @@ fn sol16_noop_rebind_after_unread_route_cannot_borrow_old_metadata_or_erase_budg
         assert_eq!(
             model.attached_account_label(),
             if route_commit {
-                "unknown/not recorded"
+                "unknown"
             } else {
                 "actually-served"
             }
@@ -5782,10 +5797,10 @@ fn sol16_frozen_create_receipt_never_supplies_current_account_provenance() {
                     .iter()
                     .any(|command| matches!(command, LiveCommand::ListAt { .. }))
             );
-            assert_eq!(model.attached_account_label(), "unknown/not recorded");
+            assert_eq!(model.attached_account_label(), "unknown");
             for (width, height) in [(118, 36), (80, 24)] {
                 let header = draw(&model, width, height)[..3].join("\n");
-                assert!(header.contains("unknown/not recorded"), "{header}");
+                assert!(header.contains("unknown"), "{header}");
                 assert!(!header.contains("old-provider-pin"), "{header}");
                 assert!(!header.contains("(default)"), "{header}");
             }
@@ -5844,7 +5859,9 @@ fn sol16_failed_coalesced_route_read_keeps_original_and_newer_targets() {
             .expect("route fact"),
         );
     }
-    let retry = driver.apply(&mut model, LiveReply::ListFailed);
+    assert!(driver.apply(&mut model, LiveReply::ListFailed).is_empty());
+    driver.set_now(driver.next_deadline().expect("coalesced retry deadline"));
+    let retry = driver.sync_selection(&model);
     assert!(
         retry
             .iter()
@@ -5943,10 +5960,10 @@ fn sol16_legacy_reread_cannot_inherit_an_earlier_fresh_default_forecast() {
                 next_cursor: None,
             },
         );
-        assert_eq!(model.attached_account_label(), "unknown/not recorded");
+        assert_eq!(model.attached_account_label(), "unknown");
         for (width, height) in [(118, 36), (80, 24)] {
             let header = draw(&model, width, height)[..3].join("\n");
-            assert!(header.contains("unknown/not recorded"), "{header}");
+            assert!(header.contains("unknown"), "{header}");
             assert!(!header.contains("(default)"), "{header}");
         }
         driver.apply(
@@ -6029,7 +6046,7 @@ fn sol16_legacy_reread_cannot_inherit_an_earlier_fresh_default_forecast() {
             next_cursor: None,
         },
     );
-    assert_eq!(model.attached_account_label(), "unknown/not recorded");
+    assert_eq!(model.attached_account_label(), "unknown");
 }
 
 #[test]
@@ -6331,7 +6348,7 @@ fn sol16_current_route_fact_ends_forecast_above_the_local_journal_sequence() {
         deliver(&mut driver, &mut model, &session, 2, fact(20));
         assert_eq!(
             model.attached_account_label(),
-            "unknown/not recorded",
+            "unknown",
             "the current route is awaiting account truth"
         );
         driver.apply(&mut model, LiveReply::ListFailed);
@@ -6361,7 +6378,7 @@ fn sol16_current_route_fact_ends_forecast_above_the_local_journal_sequence() {
                 next_cursor: None,
             },
         );
-        assert_eq!(model.attached_account_label(), "unknown/not recorded");
+        assert_eq!(model.attached_account_label(), "unknown");
         let metadata = fresh.metadata.as_mut().expect("metadata");
         metadata.resolved_route_seen = true;
         metadata.resolved_route_alias = actual.map(str::to_owned);
@@ -6416,7 +6433,7 @@ fn sol16_socket_boundaries_expire_forecasts_but_preserve_recorded_accounts() {
         let expected = if seen {
             actual.unwrap_or("unbound")
         } else {
-            "unknown/not recorded"
+            "unknown"
         };
         assert_eq!(model.attached_account_label(), expected);
         driver.apply(&mut model, LiveReply::Reconnected);
@@ -6453,5 +6470,245 @@ fn sol16_socket_boundaries_expire_forecasts_but_preserve_recorded_accounts() {
                 "a current read restores a genuine future default"
             );
         }
+    }
+}
+
+#[test]
+fn sol18_route_read_backoff_is_exponential_capped_and_facts_do_not_bypass_it() {
+    use std::time::{Duration, Instant};
+    let (mut model, mut driver) = two_attached_sessions();
+    let a = session_id("s-meter-a");
+    let b = session_id("s-meter-b");
+    let mut now = Instant::now();
+    driver.set_now(now);
+    let fact = |selection_epoch, route_only| {
+        haider_protocol::session::ModelSelected {
+            selection_epoch: Some(selection_epoch),
+            provider: "anthropic-oauth".into(),
+            model: "claude-opus-5-5".into(),
+            route_only,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
+        }
+        .to_payload_value()
+        .expect("route fact")
+    };
+    let has_list = |commands: &[LiveCommand]| {
+        commands
+            .iter()
+            .any(|c| matches!(c, LiveCommand::ListAt { cursor: None, .. }))
+    };
+    assert!(has_list(&deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        1,
+        fact(0, true)
+    )));
+    for (i, delay) in [250, 500, 1000, 2000, 4000, 8000, 8000, 8000]
+        .into_iter()
+        .enumerate()
+    {
+        // A failure on a later page obeys the same policy as the first page.
+        if i == 2 {
+            let commands = driver.apply(
+                &mut model,
+                LiveReply::Listed {
+                    sessions: Vec::new(),
+                    next_cursor: Some("next-page".into()),
+                },
+            );
+            assert!(commands.iter().any(|c| matches!(
+                c,
+                LiveCommand::ListAt {
+                    cursor: Some(_),
+                    ..
+                }
+            )));
+        }
+        assert!(driver.apply(&mut model, LiveReply::ListFailed).is_empty());
+        let deadline = driver
+            .next_deadline()
+            .expect("quiet loop must wake for retry");
+        assert_eq!(deadline, now + Duration::from_millis(delay));
+        assert!(
+            !has_list(&driver.sync_selection(&model)),
+            "immediate retry at attempt {i}"
+        );
+        // New same-epoch facts for another target coalesce without defeating
+        // the outage throttle, even when they arrive just before the deadline.
+        assert!(!has_list(&deliver(
+            &mut driver,
+            &mut model,
+            &b,
+            (i + 1) as u64,
+            fact(0, true)
+        )));
+        driver.set_now(deadline - Duration::from_nanos(1));
+        assert!(!has_list(&driver.sync_selection(&model)));
+        now = deadline;
+        driver.set_now(now);
+        assert!(
+            has_list(&driver.sync_selection(&model)),
+            "due retry at attempt {i}"
+        );
+        assert!(
+            !has_list(&driver.sync_selection(&model)),
+            "one request in flight"
+        );
+    }
+    // A completed success clears the failure streak. Both coalesced targets
+    // report the route epoch being read; a later model pick starts at 250ms.
+    let summaries = [(&a, 1), (&b, 8)].map(|(session, head_seq)| {
+        let mut summary = listed_summary(session, "anthropic-oauth", "claude-opus-5-5", 30_000);
+        summary.head_seq = head_seq;
+        let metadata = summary.metadata.as_mut().expect("metadata");
+        metadata.selection_epoch = Some(0);
+        metadata.resolved_route_seen = true;
+        summary
+    });
+    let commands = driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: summaries.into(),
+            next_cursor: None,
+        },
+    );
+    assert!(!has_list(&commands), "coalesced targets completed together");
+    assert!(has_list(&deliver(
+        &mut driver,
+        &mut model,
+        &a,
+        2,
+        fact(2, false)
+    )));
+    driver.apply(&mut model, LiveReply::ListFailed);
+    assert_eq!(
+        driver.next_deadline(),
+        Some(now + Duration::from_millis(250))
+    );
+}
+
+#[test]
+fn sol18_route_read_backoff_resets_at_connection_boundaries_and_ignores_stale_failure() {
+    use std::time::{Duration, Instant};
+    for explicit in [false, true] {
+        let (mut model, mut driver) = two_attached_sessions();
+        let a = session_id("s-meter-a");
+        let now = Instant::now();
+        driver.set_now(now);
+        deliver(
+            &mut driver,
+            &mut model,
+            &a,
+            1,
+            haider_protocol::session::ModelSelected {
+                selection_epoch: Some(0),
+                provider: "anthropic-oauth".into(),
+                model: "claude-opus-5-5".into(),
+                route_only: true,
+                cleared_account_pin: None,
+                cleared_provider_endpoint: None,
+                output_budget_clamp: None,
+            }
+            .to_payload_value()
+            .expect("route"),
+        );
+        driver.apply(&mut model, LiveReply::ListFailed);
+        let due = driver.next_deadline().expect("retry");
+        driver.set_now(due);
+        driver.sync_selection(&model);
+        driver.apply(&mut model, LiveReply::ListFailed);
+        assert_eq!(
+            driver.next_deadline(),
+            Some(due + Duration::from_millis(500))
+        );
+        if explicit {
+            driver.handle_request(&mut model, haider_tui::app::AppRequest::Reconnect);
+        } else {
+            driver.apply(
+                &mut model,
+                LiveReply::Disconnected {
+                    reason: "test".into(),
+                },
+            );
+        }
+        // Old retry and old socket's failures cannot re-arm this generation.
+        assert!(driver.next_deadline().is_none());
+        assert!(
+            driver
+                .apply(&mut model, LiveReply::ListFailedAt { epoch: 0 })
+                .is_empty()
+        );
+        assert!(driver.next_deadline().is_none());
+        driver.apply(&mut model, LiveReply::Reconnected);
+        driver.apply(
+            &mut model,
+            LiveReply::Attached {
+                launch_origin: None,
+                attachment: attachment_of(&a),
+                session: a.clone(),
+                worker_generation: 7,
+                replay_through_seq: 1,
+            },
+        );
+        deliver(
+            &mut driver,
+            &mut model,
+            &a,
+            2,
+            haider_protocol::session::ModelSelected {
+                selection_epoch: Some(0),
+                provider: "anthropic-oauth".into(),
+                model: "claude-opus-5-5".into(),
+                route_only: true,
+                cleared_account_pin: None,
+                cleared_provider_endpoint: None,
+                output_budget_clamp: None,
+            }
+            .to_payload_value()
+            .expect("new connection route"),
+        );
+        driver.apply(
+            &mut model,
+            LiveReply::ListFailedAt {
+                epoch: driver.connection_epoch(),
+            },
+        );
+        let fresh_deadline = Some(due + Duration::from_millis(250));
+        assert_eq!(driver.next_deadline(), fresh_deadline);
+        driver.apply(&mut model, LiveReply::ListFailedAt { epoch: 0 });
+        assert_eq!(
+            driver.next_deadline(),
+            fresh_deadline,
+            "stale failure cannot extend current backoff"
+        );
+    }
+}
+
+#[test]
+fn sol18_unknown_account_label_fits_with_a_moderate_title_at_both_widths() {
+    let (mut model, _driver) = two_attached_sessions();
+    model.session_name = Some("meter upgrade check".into());
+    model.session_head = ("c4b9".into(), "".into());
+    model.meter_epoch.selection_epoch = None;
+    assert_eq!(model.attached_account_label(), "unknown");
+    for (width, height) in [(80, 24), (118, 36)] {
+        let frame = draw(&model, width, height);
+        assert!(
+            frame[1].contains("meter upgrade check ▸ c4b9"),
+            "{width}: {}",
+            frame[1]
+        );
+        assert!(
+            frame[1].contains(if width == 80 {
+                "@unknown"
+            } else {
+                "account unknown"
+            }),
+            "{width}: {}",
+            frame[1]
+        );
     }
 }

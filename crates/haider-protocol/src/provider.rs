@@ -212,6 +212,10 @@ pub enum Block {
         call_id: String,
         preview: String,
         truncated: bool,
+        /// Trusted completion status from the tool receipt. Missing status in
+        /// older provider messages cannot establish a successful observation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_status: Option<crate::tool::ToolResultStatus>,
         /// CAS-backed images attached to this exact tool result. Provider
         /// adapters shape them without moving bytes into the durable message.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

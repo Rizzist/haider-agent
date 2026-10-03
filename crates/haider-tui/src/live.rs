@@ -2061,6 +2061,8 @@ struct Pending {
 
 const BUSY_MAX_ATTEMPTS: u8 = 3;
 const BUSY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const METER_LIST_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(250);
+const METER_LIST_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// The driver's OAuth add flight (W5e-1). One at a time — the card is total
 /// over the accounts screen. Poll cadence bounded by [`OAUTH_POLL_INTERVAL`].
@@ -2209,6 +2211,7 @@ pub struct LiveDriver {
     meter_list_started: HashMap<SessionId, u64>,
     meter_list_dirty: HashMap<SessionId, u64>,
     meter_list_retry_at: Option<std::time::Instant>,
+    meter_list_retry_delay: std::time::Duration,
     /// Round 4: monotone connection epoch — bumped on every Disconnected.
     /// Reads that must not cross a reconnect (loom.list) carry it out and
     /// their replies echo it back; a mismatch installs nothing.
@@ -2519,6 +2522,7 @@ impl LiveDriver {
             meter_list_started: HashMap::new(),
             meter_list_dirty: HashMap::new(),
             meter_list_retry_at: None,
+            meter_list_retry_delay: METER_LIST_RETRY_INITIAL,
             connection_epoch: 0,
             input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
@@ -2859,9 +2863,7 @@ impl LiveDriver {
         }
         if self.connected
             && !self.meter_list_pending
-            && self
-                .meter_list_retry_at
-                .is_some_and(|at| std::time::Instant::now() >= at)
+            && self.meter_list_retry_at.is_some_and(|at| self.now >= at)
         {
             self.meter_list_retry_at = None;
             self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
@@ -2885,7 +2887,9 @@ impl LiveDriver {
         if !self.connected {
             return Vec::new();
         }
-        if self.meter_list_pending {
+        // Facts received during a failed read's backoff join the pending
+        // targets; they cannot turn a persistent outage into a tight loop.
+        if self.meter_list_pending || self.meter_list_retry_at.is_some() {
             if force_dirty
                 || self
                     .meter_list_started
@@ -3577,6 +3581,7 @@ impl LiveDriver {
                 if next_cursor.is_none() {
                     self.meter_list_pending = false;
                     self.meter_list_retry_at = None;
+                    self.meter_list_retry_delay = METER_LIST_RETRY_INITIAL;
                 }
                 for summary in sessions {
                     if self
@@ -3732,7 +3737,6 @@ impl LiveDriver {
             }
             LiveReply::ListFailed => {
                 self.meter_list_pending = false;
-                let newer_dirty = !self.meter_list_dirty.is_empty();
                 for (session, epoch) in std::mem::take(&mut self.meter_list_started) {
                     self.meter_list_dirty
                         .entry(session)
@@ -3740,17 +3744,9 @@ impl LiveDriver {
                         .or_insert(epoch);
                 }
                 if self.connected && !self.meter_list_dirty.is_empty() {
-                    if newer_dirty {
-                        self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
-                        self.meter_list_pending = true;
-                        self.meter_list_retry_at = None;
-                        return vec![LiveCommand::ListAt {
-                            cursor: None,
-                            epoch: self.connection_epoch,
-                        }];
-                    }
-                    self.meter_list_retry_at =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                    self.meter_list_retry_at = Some(self.now + self.meter_list_retry_delay);
+                    self.meter_list_retry_delay =
+                        (self.meter_list_retry_delay * 2).min(METER_LIST_RETRY_MAX);
                 }
                 Vec::new()
             }
@@ -6059,6 +6055,7 @@ impl LiveDriver {
                 self.meter_list_started.clear();
                 self.meter_list_dirty.clear();
                 self.meter_list_retry_at = None;
+                self.meter_list_retry_delay = METER_LIST_RETRY_INITIAL;
                 self.binding_worker_generation = None;
                 self.attaching.clear();
                 // Review round 2: the Loom registry snapshot is CONNECTION
@@ -6418,6 +6415,10 @@ impl LiveDriver {
             .workspace_probe_last
             .filter(|_| self.workspace_probe_due)
             .map(|last| last + WORKSPACE_PROBE_INTERVAL);
+        let existing = match (existing, self.meter_list_retry_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         match (existing, probe) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -7798,6 +7799,7 @@ impl LiveDriver {
                 self.meter_list_started.clear();
                 self.meter_list_dirty.clear();
                 self.meter_list_retry_at = None;
+                self.meter_list_retry_delay = METER_LIST_RETRY_INITIAL;
                 vec![LiveCommand::Reconnect]
             }
             // The request's `after_seq` is the reducer's own last fully

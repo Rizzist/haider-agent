@@ -1,74 +1,74 @@
 # tuivirt golden · collapse_tools_verbose · 120x40
 00|[ ← main ]     ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v<VERSION> · ~/dev/enterprise-suite              [ ◉ voice · whisper→openai ]|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×5; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×3; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/BOLD×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×14; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×24; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2
-01|            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · branch main · account unknown/not recorded · test-lion-box          |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×61; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×10
+01|            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · branch main · account unknown · test-lion-box                       |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×48; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×23
 02|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×120
-03|                                                                                                                        |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×120
-04| ❯ run the gate and report                                                                                              |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×23; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×94
-05|                                                                                                                        |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×120
-06| ■ haider                                                                                                               |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×111
-07| ▏ Running the gate now — I will report the verdict.                                                                    |
+03| ▏ Running the gate now — I will report the verdict.                                                                    |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×117
-08|  ✓ verify(wave-971 candidate) · 3 lines · 8s                                                                           |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×35; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×75
-09|    SHIP — wave-971 candidate clears every gate                                                                         |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×39; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×73
-10|    clippy: 0 warnings                                                                                                  |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×10; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×98
-11|    test result: ok. 5166 passed; 0 failed                                                                              |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×13; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×3; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×3; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×78
-12|  $ cargo fmt --all --check · exit 0 · 2 lines · 1s                                                                     |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×23; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×69
-13|    Resuming agent a830387                                                                                              |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×94
-14|    cargo fmt --all --check finished                                                                                    |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×32; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×84
-15|  $ cargo clippy -p haider-tui -- -D warnings · exit 0 · 2 lines · 2s                                                   |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×41; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×51
-16|    Resuming agent a830387                                                                                              |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×94
-17|    cargo clippy -p haider-tui -- -D warnings finished                                                                  |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×66
-18|  $ cargo test -p haider-tui --locked · exit 0 · 2 lines · 3s                                                           |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×33; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×59
-19|    Resuming agent a830387                                                                                              |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×94
-20|    cargo test -p haider-tui --locked finished                                                                          |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×42; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-21|  ✓ grep("todos_collapsed" *.rs) · 12 lines · 400ms                                                                     |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×43; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×69
-22|    src/render.rs:5740:            if model.todos_collapsed {                                                           |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×38; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×59
-23|    src/render.rs:6336: let arrow = …                                                                                   |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×83
-24|    src/app.rs:5254:    pub todos_collapsed: bool,                                                                      |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×70
-25|    ERROR one match could not be read                                                                                   |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×5; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×83
-26|    warning: 2 files skipped                                                                                            |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×92
-27|    src/app.rs:5709: todos_collapsed: false,                                                                            |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×76
-28|    src/app.rs:16876: self.todos_collapsed = false;                                                                     |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×17; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×69
-29|    src/session.rs:127: pub todos_collapsed: bool,                                                                      |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×27; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×70
-30|    src/render.rs:6368: if !model.todos_collapsed {                                                                     |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×69
-31|    src/render.rs:6389: if !model.todos_collapsed {                                                                     |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×69
-32|    └ ⋯ 2 more rows · ⇟/⇞ page · ⏎ show all                                                                             |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×13; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×77
-33|  ◐ Monitor(Astra 971-tui-collapse verification (re-armed)) · running… 3s                                               |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×47
-34|                                                                                                                        |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×120
+04|  ● verify(wave-971 candidate) · 8s                                                                                     |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×85
+05|    ⎿ 3 lines of output                                                                                                 |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×23; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×97
+06|      SHIP — wave-971 candidate clears every gate                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×39; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×71
+07|      clippy: 0 warnings                                                                                                |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×10; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×96
+08|      test result: ok. 5166 passed; 0 failed                                                                            |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×13; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×3; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×3; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×76
+09|  ● Bash(cargo fmt --all --check) · 1s                                                                                  |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×82
+10|    ⎿ 2 lines of output                                                                                                 |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×23; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×97
+11|      Resuming agent a830387                                                                                            |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×92
+12|      cargo fmt --all --check finished                                                                                  |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×32; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×82
+13|  ● Bash(cargo clippy -p haider-tui -- -D warnings) · 2s                                                                |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×48; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×64
+14|    ⎿ 2 lines of output                                                                                                 |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×23; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×97
+15|      Resuming agent a830387                                                                                            |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×92
+16|      cargo clippy -p haider-tui -- -D warnings finished                                                                |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×64
+17|  ● Bash(cargo test -p haider-tui --locked) · 3s                                                                        |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×72
+18|    ⎿ 2 lines of output                                                                                                 |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×23; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×97
+19|      Resuming agent a830387                                                                                            |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×92
+20|      cargo test -p haider-tui --locked finished                                                                        |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×42; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×72
+21|  ● Search("todos_collapsed" *.rs)                                                                                      |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×86
+22|    ⎿ 12 lines of output                                                                                                |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×96
+23|      src/render.rs:5740:            if model.todos_collapsed {                                                         |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×38; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×57
+24|      src/render.rs:6336: let arrow = …                                                                                 |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×81
+25|      src/app.rs:5254:    pub todos_collapsed: bool,                                                                    |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×68
+26|      ERROR one match could not be read                                                                                 |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×5; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×81
+27|      warning: 2 files skipped                                                                                          |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×90
+28|      src/app.rs:5709: todos_collapsed: false,                                                                          |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
+29|      src/app.rs:16876: self.todos_collapsed = false;                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×17; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×67
+30|      src/session.rs:127: pub todos_collapsed: bool,                                                                    |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×27; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×68
+31|      src/render.rs:6368: if !model.todos_collapsed {                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×67
+32|      src/render.rs:6389: if !model.todos_collapsed {                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×67
+33|    ⎿ ⋯ 2 more rows · ⇟/⇞ page · ⏎ show all                                                                             |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×19; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×77
+34|  ◐ Monitor(Astra 971-tui-collapse verification (re-armed)) · running… 3s                                               |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×47
 35|                                                                                                                        |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×120
 36|───────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|

@@ -677,3 +677,156 @@ fn upgrade_budget_source_enrichment_preserves_legacy_default_classification() {
         "an explicit fixed budget changes the legacy derived source"
     );
 }
+
+/// Rebuild old picks with the old metadata rule, including creation pins that
+/// have never been rebound. On provider changes, the current writer clears both.
+#[test]
+fn upgrade_cross_provider_pick_reconstructs_historical_creation_and_rebind_pins() {
+    use haider_store::SessionSelectModelCommand;
+    for (variant, picks) in [
+        (
+            "same-provider",
+            &[("bedrock", "anthropic.claude-haiku-4-5")][..],
+        ),
+        ("cross-provider", &[("anthropic", "claude-sonnet-5")][..]),
+        (
+            "provider-a-b-a",
+            &[
+                ("anthropic", "claude-sonnet-5"),
+                ("bedrock", "anthropic.claude-opus-5"),
+            ][..],
+        ),
+    ] {
+        for rebind in [false, true] {
+            let root = tempfile::tempdir().expect("store");
+            let store = Store::open(root.path()).expect("open");
+            let parent = create_command("old-pick-parent", &json!({"parent":true}));
+            store
+                .create_session_with_configuration(
+                    &parent,
+                    SessionInteractionModeV1::Interactive,
+                    Some("bed-b".into()),
+                )
+                .expect("creation pin");
+            if rebind {
+                store
+                    .rebind_session_provider(&SessionProviderRebindCommand {
+                        command_id: "old-rebind".into(),
+                        request_digest: "old-rebind".into(),
+                        request_json: "{}".into(),
+                        session_id: parent.session_id.clone(),
+                        worker_generation: store.worker_generation(),
+                        provider: "bedrock".into(),
+                        base_url: Some("http://127.0.0.1:8010".into()),
+                        account: Some("bed-b".into()),
+                        event_id: EventId::new("old-rebind-event"),
+                        device_id: DeviceId::new("test"),
+                    })
+                    .expect("rebind pin and endpoint");
+            }
+            for (index, &(provider, model)) in picks.iter().enumerate() {
+                store
+                    .select_session_model(&SessionSelectModelCommand {
+                        command_id: format!("old-pick-{index}"),
+                        request_digest: format!("old-pick-{index}"),
+                        request_json: "{}".into(),
+                        session_id: parent.session_id.clone(),
+                        worker_generation: store.worker_generation(),
+                        provider: provider.into(),
+                        model: model.into(),
+                        expected_pair: None,
+                        account_alias: None,
+                        output_budget: None,
+                        event_id: EventId::new(format!("old-pick-event-{index}")),
+                        device_id: DeviceId::new("test"),
+                    })
+                    .expect("model pick");
+            }
+            // The journal contains the same pick, but the pre-upgrade writer kept
+            // a creation pin without a rebind id. Restore that historical fixture.
+            drop(store);
+            if !rebind {
+                rusqlite::Connection::open(root.path().join("store.sqlite"))
+                .expect("historical fixture")
+                .execute(
+                    "UPDATE sessions SET meta_json = json_set(meta_json, '$.account_alias', 'bed-b') WHERE id = ?1",
+                    [parent.session_id.as_str()],
+                )
+                .expect("old writer metadata");
+            }
+            let store = Store::open(root.path()).expect("old writer reopened");
+            let metadata = store
+                .session_metadata(&parent.session_id)
+                .expect("parent")
+                .expect("typed");
+            let same_provider = variant == "same-provider";
+            let pin_kept = !rebind || same_provider;
+            assert_eq!(
+                metadata.account_alias.as_deref(),
+                pin_kept.then_some("bed-b")
+            );
+            assert_eq!(
+                metadata.provider_base_url.as_deref(),
+                (rebind && same_provider).then_some("http://127.0.0.1:8010")
+            );
+            assert_eq!(
+                metadata.provider_rebind_id.as_deref(),
+                (rebind && same_provider).then_some("old-rebind")
+            );
+            let mut old = old_body();
+            old["provider"] = json!(metadata.provider);
+            old["model"] = json!(metadata.model);
+            let mut child = create_command("old-pick-child", &old);
+            child.provider = metadata.provider.clone();
+            child.model = metadata.model.clone();
+            store
+                .create_session(&child)
+                .expect("legacy child before establishment");
+            let journal = store.journal_replay(&child.session_id).expect("journal");
+            let mut new = old;
+            new["max_tokens_source"] = Value::Null;
+            new["inheritance_parent_session_id"] = json!(parent.session_id);
+            new["inherited_account_alias"] = json!(metadata.account_alias);
+            new["inherited_provider_base_url"] = json!(metadata.provider_base_url);
+            new["inherited_provider_rebind_id"] = json!(metadata.provider_rebind_id);
+            assert_eq!(new.as_object().expect("body").len(), 15);
+            drop(store);
+            let store = Store::open(root.path()).expect("upgrade restart");
+            assert!(
+                replay(&store, &child.command_id, &new)
+                    .expect("unchanged replay")
+                    .is_some()
+            );
+            assert_eq!(
+                store
+                    .journal_replay(&child.session_id)
+                    .expect("unchanged journal"),
+                journal
+            );
+            for (key, value) in [
+                ("model", json!("claude-haiku-4-5")),
+                ("max_tokens", json!(8192)),
+                (
+                    "inherited_account_alias",
+                    if pin_kept {
+                        Value::Null
+                    } else {
+                        json!("bed-b")
+                    },
+                ),
+                (
+                    "inherited_provider_base_url",
+                    json!("http://127.0.0.1:9009"),
+                ),
+                ("inherited_provider_rebind_id", json!("changed-route")),
+            ] {
+                let mut changed = new.clone();
+                changed[key] = value;
+                assert!(
+                    replay(&store, &child.command_id, &changed).is_err(),
+                    "{variant}, rebind={rebind}: changed {key}"
+                );
+            }
+        }
+    }
+}
