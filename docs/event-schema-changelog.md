@@ -71,6 +71,25 @@ alternation), and follows the daemon's `HAIDER_ACTIVITY_ICONS`
 then `NO_COLOR` (it is a shared daemon surface, so a single TUI's `/icons`
 choice does not apply to it).
 
+**Effect-class downgrade policy:** `checkpoint_restore` journals operator undo,
+redo and rollback with workspace mutation provenance; `provider_transport`
+journals provider recovery without agent activity. Wire peers that did not
+request `session_activity_v1` still receive the historical `fs_write` and
+`network`/`provider-request` classes through the connection adapter. The
+policy below concerns a daemon reading a newer journal directly. These are
+additive class values, but `EffectClass` is an authority enum and intentionally has no
+`serde(other)`: a pre-973 typed decoder returns a serde data error (`unknown
+variant`) for either class. It must not reinterpret them as filesystem or
+network authority. Older `RawEnvelope` readers retain the complete JSON, so
+listing/exporting the journal is lossless. A store operation requiring the
+unknown intent's typed mutation provenance refuses it with `invalid_argument`
+(missing durable mutation-class intent); it does not commit a guessed intent
+or mutate the journal. Downgrade is therefore a raw-read fallback, not a
+promise that older daemons can execute operations against newer checkpoint
+provenance. Keep the journal and use a daemon that recognizes these classes
+for checkpoint/workflow operations. The frozen pre-lane decoder regression
+covers both new values and unchanged existing classes.
+
 **Release note (CLI behaviour change):** `haider agent list` without
 `--json` now prints a human fleet tree (state glyph, activity glyph, name,
 task, metrics) instead of pretty-printed JSON. Scripts must use `--json`,

@@ -87,3 +87,204 @@ fn checkpoint_command_effect_batch_keeps_outcome_before_checkpoint() {
         }
     }
 }
+
+#[cfg(unix)]
+#[derive(Default)]
+struct CheckpointSink(std::sync::Mutex<Vec<WireFrame>>);
+#[cfg(unix)]
+impl FrameSink for CheckpointSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        self.0.lock().expect("checkpoint frames").push(frame);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn commit_checkpoint_through_store(origin: CheckpointOrigin) {
+    use crate::checkpoint_test_support::seed_checkpoint_change;
+    use haider_core::{SqliteStoreHandle, StoreHandle};
+    // All three commands start from a durable agent mutation, including CAS
+    // preimage and revision. Reopening exercises recovery rather than an
+    // envelope-only simulation. Android uses the same fixture and RPC door.
+    let old = b"synthetic preimage".as_slice();
+    let new = b"synthetic postimage".as_slice();
+    for (before_bytes, after_bytes) in
+        [(None, Some(new)), (Some(old), None), (Some(old), Some(new))]
+    {
+        let root = tempfile::tempdir().expect("checkpoint profile");
+        #[cfg(feature = "android-standalone")]
+        let workspace =
+            tempfile::tempdir_in(crate::android_workspace::test_root()).expect("Android workspace");
+        #[cfg(not(feature = "android-standalone"))]
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = seed_checkpoint_change(
+            root.path(),
+            workspace.path(),
+            "default",
+            "deleted.txt",
+            before_bytes,
+            after_bytes,
+        )
+        .await;
+        let store = SqliteStoreHandle::open(root.path())
+            .await
+            .expect("reopen store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let sink = Arc::new(CheckpointSink::default());
+        let connection = hub
+            .open_connection(
+                BTreeSet::from([
+                    haider_rpc::Capability::View,
+                    haider_rpc::Capability::Control,
+                ]),
+                sink.clone(),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("control connection");
+        connection
+            .request(
+                RequestId::new("attach"),
+                serde_json::from_value(serde_json::json!({
+                    "method":"session.attach", "session_id":session, "after_seq":0, "mode":"control"
+                }))
+                .expect("attach request"),
+            )
+            .await
+            .expect("attach");
+        assert!(sink.0.lock().expect("frames").iter().any(|f| matches!(
+            f,
+            WireFrame::Response {
+                body: ResponseBody::SessionAttach { .. },
+                ..
+            }
+        )));
+        let before = store.read(&session, 0, 100).await.expect("seed journal");
+        let mut tracker = haider_protocol::activity::ActivityTracker::new();
+        for envelope in &before {
+            tracker.observe_raw(envelope);
+        }
+        let prior = tracker.state();
+        assert_eq!(
+            tracker.used(),
+            vec![haider_protocol::activity::ActivityKind::Edit]
+        );
+        let target = workspace.path().join("deleted.txt");
+        assert_eq!(std::fs::read(&target).ok().as_deref(), after_bytes);
+        let commands = if origin == CheckpointOrigin::Redo {
+            vec![CheckpointOrigin::Undo, origin]
+        } else {
+            vec![origin]
+        };
+        for action in commands {
+            let method = match action {
+                CheckpointOrigin::Undo => "checkpoint.undo",
+                CheckpointOrigin::Redo => "checkpoint.redo",
+                CheckpointOrigin::RollbackTurn => "checkpoint.rollback_turn",
+                CheckpointOrigin::Tool => unreachable!(),
+            };
+            let mut body = serde_json::json!({"method":method, "command_id":method,
+            "session_id":session, "worker_generation":store.worker_generation()});
+            if action == CheckpointOrigin::RollbackTurn {
+                body["run_id"] = "seed-run-default".into();
+            } else {
+                body["target"] = "last".into();
+            }
+            let request: RequestBody = serde_json::from_value(body).expect("checkpoint request");
+            let head = store.latest_seq(&session).await.expect("head");
+            for attempt in 0..2 {
+                let id = RequestId::new(format!("{method}-{attempt}"));
+                connection
+                    .request(id.clone(), request.clone())
+                    .await
+                    .expect("checkpoint RPC");
+                let frames = sink.0.lock().expect("frames");
+                let response = frames
+                    .iter()
+                    .find_map(|f| match f {
+                        WireFrame::Response { request_id, body } if request_id == &id => Some(body),
+                        _ => None,
+                    })
+                    .expect("checkpoint response");
+                assert!(
+                    matches!(
+                        (action, response),
+                        (CheckpointOrigin::Undo, ResponseBody::CheckpointUndo { .. })
+                            | (CheckpointOrigin::Redo, ResponseBody::CheckpointRedo { .. })
+                            | (
+                                CheckpointOrigin::RollbackTurn,
+                                ResponseBody::CheckpointRollbackTurn { .. }
+                            )
+                    ),
+                    "{response:?}"
+                );
+            }
+            assert_eq!(
+                store.latest_seq(&session).await.expect("committed head"),
+                head + 5,
+                "receipt replay cannot restore twice or append twice"
+            );
+            let expected = if action == CheckpointOrigin::Redo {
+                after_bytes
+            } else {
+                before_bytes
+            };
+            assert_eq!(
+                std::fs::read(&target).ok().as_deref(),
+                expected,
+                "{action:?} file restoration"
+            );
+            let committed = store
+                .read(&session, head, 100)
+                .await
+                .expect("restore journal");
+            assert_eq!(committed.len(), 5);
+            assert!(matches!(
+                committed[0].payload.decode_event().expect("typed intent"),
+                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                    class: EffectClass::CheckpointRestore,
+                    ..
+                }))
+            ));
+            assert!(
+                matches!(committed[4].payload.decode_event().expect("checkpoint receipt"),
+            EventPayload::CheckpointRecorded(ref c) if c.origin == action && c.workspace_revision.is_some())
+            );
+            for envelope in &committed {
+                tracker.observe_raw(envelope);
+            }
+            assert_eq!(
+                tracker.state(),
+                prior,
+                "operator restore leaves agent activity and history unchanged"
+            );
+            let mut replay = haider_protocol::activity::ActivityTracker::new();
+            for envelope in store.read(&session, 0, 100).await.expect("full journal") {
+                replay.observe_raw(&envelope);
+            }
+            assert_eq!(
+                replay.state(),
+                prior,
+                "restart projection preserves agent history"
+            );
+        }
+        connection.close().await.expect("close connection");
+        hub.shutdown().await.expect("shutdown hub");
+        store.close().await.expect("close store");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn checkpoint_undo_commits_restore_and_receipt_through_real_store() {
+    commit_checkpoint_through_store(CheckpointOrigin::Undo).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn checkpoint_redo_commits_restore_and_receipt_through_real_store() {
+    commit_checkpoint_through_store(CheckpointOrigin::Redo).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn checkpoint_rollback_turn_commits_restore_and_receipt_through_real_store() {
+    commit_checkpoint_through_store(CheckpointOrigin::RollbackTurn).await;
+}

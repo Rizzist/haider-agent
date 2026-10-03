@@ -591,34 +591,59 @@ fn registered_effectless_dispatch_is_live_until_settlement() {
 
 #[test]
 fn gate_v4_provider_transport_recovery_has_no_agent_activity() {
-    let effect = EffectId::new("provider-admission-run-1");
-    let mut tracker = ActivityTracker::new();
-    for phase in [
-        EffectPhase::Intent(EffectIntent {
-            effect: effect.clone(),
-            class: EffectClass::ProviderTransport,
-            summary: "provider request admitted before restart".into(),
-            args_digest: "sha256:0".into(),
-            workspace_revision: None,
-        }),
-        EffectPhase::Authorized {
-            effect: effect.clone(),
-            verdict: AuthorizationVerdict::Allow,
+    for class in [
+        EffectClass::ProviderTransport,
+        EffectClass::Network {
+            host: "provider-request".into(),
         },
-        EffectPhase::Dispatched {
-            effect: effect.clone(),
-        },
-        EffectPhase::Outcome {
-            effect,
-            outcome: EffectOutcome::Unknown,
-            freshness: None,
-            workspace_mutation: None,
+        EffectClass::Network {
+            host: "example.test".into(),
         },
     ] {
-        tracker.observe(&EventPayload::Effect(phase), 5_000);
+        let expected =
+            matches!(&class, EffectClass::Network { host } if host != "provider-request");
+        let effect = EffectId::new("provider-admission-run-1");
+        let mut tracker = ActivityTracker::new();
+        let mut replay = ActivityTracker::new();
+        for (seq, phase) in [
+            EffectPhase::Intent(EffectIntent {
+                effect: effect.clone(),
+                class,
+                summary: "provider request admitted before restart".into(),
+                args_digest: "sha256:0".into(),
+                workspace_revision: None,
+            }),
+            EffectPhase::Authorized {
+                effect: effect.clone(),
+                verdict: AuthorizationVerdict::Allow,
+            },
+            EffectPhase::Dispatched {
+                effect: effect.clone(),
+            },
+            EffectPhase::Outcome {
+                effect,
+                outcome: EffectOutcome::Unknown,
+                freshness: None,
+                workspace_mutation: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let payload = EventPayload::Effect(phase);
+            tracker.observe(&payload, 5_000);
+            let raw = serde_json::json!({"schema_version":1, "event_id":format!("recovery-{seq}"),
+            "seq":seq+1, "session_id":"recovery", "run_id":"recovered-run", "device_id":"device",
+            "authority_epoch":0, "worker_generation":1, "committed_at_ms":5000,
+            "render":{"ui":false,"durable":true,"prompt":"omit"},"payload":payload});
+            replay.observe_raw(&serde_json::from_value(raw).expect("persisted recovery envelope"));
+        }
+        let activity = expected.then_some(ActivityKind::Web);
+        assert_eq!(tracker.current(5_000, false), activity);
+        assert_eq!(replay.current(5_000, false), activity);
+        assert_eq!(tracker.used(), activity.into_iter().collect::<Vec<_>>());
+        assert_eq!(replay.used(), tracker.used());
     }
-    assert_eq!(tracker.current(5_000, false), None);
-    assert!(tracker.used().is_empty());
 }
 
 #[test]
@@ -830,28 +855,40 @@ fn old_checkpoint_journals_replay_without_operator_edit_history() {
         ] {
             let run = RunId::new("old-operator-run");
             let effect = EffectId::new("old-operator-effect");
-            let envelope = |seq: u64, payload: EventPayload| EventEnvelope {
-                schema_version: SCHEMA_VERSION,
-                event_id: EventId::new(format!("old-checkpoint-{seq}")),
-                seq,
-                session_id: SessionId::new("child"),
-                branch_id: None,
-                run_id: Some(run.clone()),
-                agent_id: agent_id.clone(),
-                device_id: DeviceId::new("device"),
-                authority_epoch: 0,
-                worker_generation: 1,
-                causation_id: None,
-                correlation_id: None,
-                committed_at_ms: 1_000 + seq,
-                render: RenderTargets {
-                    ui: false,
-                    durable: true,
-                    prompt: PromptRender::Omit,
-                },
-                payload: serde_json::to_value(payload).expect("payload").into(),
+            let envelope = |seq: u64, mut payload: EventPayload| {
+                if let EventPayload::CheckpointRecorded(checkpoint) = &mut payload {
+                    checkpoint.seq = seq;
+                    checkpoint.recorded_at_ms = 1_000 + seq;
+                }
+                EventEnvelope {
+                    schema_version: SCHEMA_VERSION,
+                    event_id: EventId::new(format!("old-checkpoint-{seq}")),
+                    seq,
+                    session_id: SessionId::new("child"),
+                    branch_id: None,
+                    run_id: Some(run.clone()),
+                    agent_id: agent_id.clone(),
+                    device_id: DeviceId::new("device"),
+                    authority_epoch: 0,
+                    worker_generation: 1,
+                    causation_id: None,
+                    correlation_id: None,
+                    committed_at_ms: 1_000 + seq,
+                    render: RenderTargets {
+                        ui: false,
+                        durable: true,
+                        prompt: PromptRender::Omit,
+                    },
+                    payload: serde_json::to_value(payload).expect("payload").into(),
+                }
             };
-            for (prior_edit, intervening_work) in [(false, false), (true, false), (false, true)] {
+            for (prior_edit, intervening_work, unobserved_gap) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (false, false, true),
+                (true, false, true),
+            ] {
                 let mut tracker = ActivityTracker::new();
                 if prior_edit {
                     start(&mut tracker, "prior-agent", "fs_write", 500);
@@ -913,7 +950,9 @@ fn old_checkpoint_journals_replay_without_operator_edit_history() {
                         tracker.observe_raw(&envelope(5, agent));
                     }
                     tracker.observe_raw(&envelope(
-                        seq as u64 + 1 + u64::from(intervening_work && seq == 4),
+                        seq as u64
+                            + 1
+                            + u64::from((intervening_work || unobserved_gap) && seq == 4),
                         payload,
                     ));
                 }
@@ -923,7 +962,7 @@ fn old_checkpoint_journals_replay_without_operator_edit_history() {
                         tracker.state().latest.map(|touch| touch.kind),
                         Some(ActivityKind::Run)
                     );
-                } else if origin == CheckpointOrigin::Tool {
+                } else if origin == CheckpointOrigin::Tool || unobserved_gap {
                     assert_eq!(tracker.used(), vec![ActivityKind::Edit]);
                     assert_eq!(tracker.current(1_005, false), Some(ActivityKind::Edit));
                 } else if prior_edit {
