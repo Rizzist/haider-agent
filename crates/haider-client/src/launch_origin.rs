@@ -132,13 +132,33 @@ pub fn workspace_relative_display(path: &Path, root: &Path) -> Option<String> {
         if exposes_account(&parsed_path, &parsed_root) {
             return None;
         }
+        // An interior symlink can leave a narrow workspace even though its
+        // requested spelling remains below that root. Keep the lexical label
+        // only when the resolved identity is safe to shorten as well.
+        let lookup = canonicalize_masking_prefix(path);
+        if lookup.denied {
+            return None;
+        }
+        if let Some(resolved) = lookup.resolved {
+            let resolved_path = DisplayPath::parse(&resolved);
+            let resolved_root = canonicalize_existing_prefix(root)
+                .map(|root| DisplayPath::parse(&root))
+                .unwrap_or_else(|| DisplayPath::parse(root));
+            if resolved_path
+                .canonical_relative_to(&resolved_root)
+                .is_none()
+                || exposes_account(&resolved_path, &resolved_root)
+            {
+                return None;
+            }
+        }
         relative
     } else {
         // Canonical spellings cover host aliases such as /tmp -> /private/tmp.
         // A failure to resolve either side keeps the original projected label.
         let path = DisplayPath::parse(&canonicalize_existing_prefix(path)?);
         let root = DisplayPath::parse(&canonicalize_existing_prefix(root)?);
-        let relative = path.relative_to(&root)?;
+        let relative = path.canonical_relative_to(&root)?;
         if exposes_account(&path, &root) {
             return None;
         }
@@ -320,11 +340,22 @@ fn sanitize_with_canonicalizers(
     if !parsed.absolute {
         return bounded(OriginPathKind::Absolute, escape_display(&parsed.render()));
     }
-    let canonical_path = if parsed.absolute && !parsed.had_parent {
+    let canonical_path = if parsed.absolute {
         canonicalize(path).map(|p| DisplayPath::parse(&p))
     } else {
         None
     };
+    let lookup = if canonical_path.is_none() && parsed.absolute {
+        Some(canonicalize_for_mask(path))
+    } else {
+        None
+    };
+    let fallback_path = lookup
+        .as_ref()
+        .and_then(|lookup| lookup.resolved.as_ref())
+        .map(|path| DisplayPath::parse(path));
+    let masking_path = canonical_path.as_ref().or(fallback_path.as_ref());
+    let denied = lookup.as_ref().is_some_and(|lookup| lookup.denied);
     let mut best: Option<(usize, String)> = None;
     for home in homes
         .iter()
@@ -346,17 +377,71 @@ fn sanitize_with_canonicalizers(
         // but it must not turn a different account into ~/Users/<name>/....
         let redirected_root = !usable_home(home);
         let home_parsed = DisplayPath::parse(home);
+        let own_profile_account = |source: &DisplayPath, index: usize| {
+            homes.get(1).is_some_and(|profile| {
+                let canonical_profile = canonicalize(profile);
+                let profile = DisplayPath::parse(canonical_profile.as_deref().unwrap_or(profile));
+                let profile_name = profile
+                    .account_index()
+                    .and_then(|index| profile.parts.get(index))
+                    .or_else(|| profile.parts.last());
+                source.parts.get(index).zip(profile_name).is_some_and(
+                    |(path_name, profile_name)| {
+                        if source.is_wsl_share() || profile.is_wsl_share() {
+                            path_name == profile_name
+                        } else if masking_path.is_some() || canonical_profile.is_some() {
+                            if source.canonical_account_identity(
+                                index,
+                                &profile,
+                                &directory_identity,
+                            ) == Some(false)
+                            {
+                                return false;
+                            }
+                            if source.windows || profile.windows {
+                                path_name.eq_ignore_ascii_case(profile_name)
+                            } else {
+                                path_name == profile_name
+                            }
+                        } else {
+                            source.component_eq(path_name, profile_name)
+                        }
+                    },
+                )
+            })
+        };
         let relative = parsed
             .relative_to(&home_parsed)
-            .map(|relative| (relative, &parsed, home_parsed.parts.len()))
+            .and_then(|relative| {
+                if denied {
+                    return None;
+                }
+                let Some(source) = masking_path else {
+                    return Some((relative, &parsed, home_parsed.parts.len()));
+                };
+                let resolved_home = canonicalize(home)
+                    .map(|home| DisplayPath::parse(&home))
+                    .unwrap_or_else(|| DisplayPath::parse(home));
+                let resolved_relative = source.canonical_relative_to(&resolved_home)?;
+                // A redirected drive may resolve to an account namespace at
+                // a different depth. Validate and mask that actual remainder.
+                if source
+                    .account_index()
+                    .filter(|index| *index < source.parts.len())
+                    .is_some_and(|index| index >= resolved_home.parts.len())
+                {
+                    return Some((resolved_relative, source, resolved_home.parts.len()));
+                }
+                Some((relative, &parsed, home_parsed.parts.len()))
+            })
             .or_else(|| {
-                if !parsed.absolute || parsed.had_parent {
+                if !parsed.absolute {
                     return None;
                 }
                 let canonical_home = canonicalize(home).map(|p| DisplayPath::parse(&p))?;
                 let source = canonical_path.as_ref()?;
                 Some((
-                    source.relative_to(&canonical_home)?,
+                    source.canonical_relative_to(&canonical_home)?,
                     source,
                     canonical_home.parts.len(),
                 ))
@@ -367,17 +452,7 @@ fn sanitize_with_canonicalizers(
                 .filter(|index| *index < source.parts.len())
                 && index >= home_depth
             {
-                let own_profile_account = homes.get(1).is_some_and(|profile| {
-                    let profile = DisplayPath::parse(profile);
-                    let profile_name = profile
-                        .account_index()
-                        .and_then(|index| profile.parts.get(index))
-                        .or_else(|| profile.parts.last());
-                    source.parts.get(index).zip(profile_name).is_some_and(
-                        |(path_name, profile_name)| source.component_eq(path_name, profile_name),
-                    )
-                });
-                if !redirected_root || !own_profile_account {
+                if !redirected_root || !own_profile_account(source, index) {
                     continue;
                 }
                 relative[index - home_depth] = "<user>".to_owned();
@@ -396,22 +471,22 @@ fn sanitize_with_canonicalizers(
     if let Some((_, display)) = best {
         return bounded(OriginPathKind::HomeRelative, escape_display(&display));
     }
-    let (masking_path, denied) = if let Some(canonical_path) = canonical_path {
-        (Some(canonical_path), false)
-    } else if parsed.absolute && !parsed.had_parent {
-        let lookup = canonicalize_for_mask(path);
-        (
-            lookup
-                .resolved
-                .map(|resolved| DisplayPath::parse(&resolved)),
-            lookup.denied,
-        )
-    } else {
-        (None, false)
-    };
-    if let Some(masked) = parsed
-        .mask_other_user()
-        .or_else(|| masking_path.as_ref().and_then(DisplayPath::mask_other_user))
+    // Keep harmless requested case spelling when resolution only normalized
+    // case or the macOS /private prefix. A changed identity (including '..') must
+    // supply the label, since the lexical remainder can contain its account.
+    let mask_source = masking_path.filter(|source| {
+        let source_display = source.render();
+        let requested_display = parsed.render();
+        let equivalent = source_display.eq_ignore_ascii_case(&requested_display)
+            || (cfg!(target_os = "macos")
+                && source_display
+                    .strip_prefix("/private")
+                    .is_some_and(|path| path.eq_ignore_ascii_case(&requested_display)));
+        parsed.had_parent || !equivalent
+    });
+    if let Some(masked) = mask_source
+        .and_then(DisplayPath::mask_other_user)
+        .or_else(|| parsed.mask_other_user())
     {
         return bounded(OriginPathKind::Redacted, escape_display(&masked));
     }
@@ -425,18 +500,58 @@ fn sanitize_with_canonicalizers(
 /// ENOTDIR, EIO, and symlink loops decline canonical identity; lexical
 /// masking still applies.
 fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
-    canonicalize_existing_prefix_with(path, &Path::canonicalize)
+    canonicalize_existing_prefix_with(path, &Path::canonicalize, cfg!(windows))
 }
 
 /// A denied descendant may still have an accessible symlink/firmlink
 /// ancestor. Use that ancestor only to find a maskable account root.
 fn canonicalize_masking_prefix(path: &Path) -> MaskPath {
-    canonicalize_masking_prefix_with(path, &Path::canonicalize)
+    canonicalize_masking_prefix_with(path, &Path::canonicalize, cfg!(windows))
+}
+
+// An unseen Win32 dot/space parent alias cannot be appended to an existing
+// prefix: its identity depends on the directory preceding the traversal.
+fn missing_parent_component(name: &std::ffi::OsStr, windows: bool) -> bool {
+    let spelling = name.to_string_lossy();
+    windows
+        && spelling.chars().all(|ch| ch == '.' || ch == ' ')
+        && spelling.chars().filter(|ch| *ch == '.').count() >= 2
+}
+
+// The unresolved suffix still has the naming rules of the REQUESTED path.
+// In an ordinary Win32 path, a missing `alice.` is an alias for `alice`;
+// appending it verbatim would invent a conflicting canonical account name.
+// Namespace spellings retain their literal suffix, as do POSIX filenames.
+fn append_missing_path(
+    requested: &Path,
+    mut canonical: PathBuf,
+    missing: &[&std::ffi::OsStr],
+    windows: bool,
+) -> Option<PathBuf> {
+    let win32_names = windows && {
+        let spelling = requested.to_string_lossy().replace('\\', "/");
+        !["//?/", "//./", "/??/"]
+            .iter()
+            .any(|prefix| spelling.starts_with(prefix))
+    };
+    for name in missing.iter().rev() {
+        if win32_names && let Some(spelling) = name.to_str() {
+            let spelling = spelling.trim_end_matches(['.', ' ']);
+            if spelling.is_empty() {
+                return None;
+            }
+            canonical.push(spelling);
+        } else {
+            canonical.push(name);
+        }
+    }
+    Some(canonical)
 }
 
 fn canonicalize_masking_prefix_with(
     path: &Path,
     canonicalize: &impl Fn(&Path) -> std::io::Result<PathBuf>,
+    windows: bool,
 ) -> MaskPath {
     if !path.is_absolute() {
         return MaskPath {
@@ -449,10 +564,9 @@ fn canonicalize_masking_prefix_with(
     let mut denied = false;
     loop {
         match canonicalize(existing) {
-            Ok(mut canonical) => {
-                canonical.extend(unseen.iter().rev());
+            Ok(canonical) => {
                 return MaskPath {
-                    resolved: Some(canonical),
+                    resolved: append_missing_path(path, canonical, &unseen, windows),
                     denied,
                 };
             }
@@ -469,6 +583,12 @@ fn canonicalize_masking_prefix_with(
                         denied,
                     };
                 };
+                if missing_parent_component(name, windows) {
+                    return MaskPath {
+                        resolved: None,
+                        denied,
+                    };
+                }
                 unseen.push(name);
                 let Some(parent) = existing.parent() else {
                     return MaskPath {
@@ -491,6 +611,7 @@ fn canonicalize_masking_prefix_with(
 fn canonicalize_existing_prefix_with(
     path: &Path,
     canonicalize: &impl Fn(&Path) -> std::io::Result<PathBuf>,
+    windows: bool,
 ) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
@@ -499,12 +620,15 @@ fn canonicalize_existing_prefix_with(
     let mut missing = Vec::new();
     loop {
         match canonicalize(existing) {
-            Ok(mut canonical) => {
-                canonical.extend(missing.iter().rev());
-                return Some(canonical);
+            Ok(canonical) => {
+                return append_missing_path(path, canonical, &missing, windows);
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                missing.push(existing.file_name()?);
+                let name = existing.file_name()?;
+                if missing_parent_component(name, windows) {
+                    return None;
+                }
+                missing.push(name);
                 existing = existing.parent()?;
             }
             Err(_) => return None,
@@ -527,12 +651,34 @@ fn bounded(
 
 #[derive(Debug)]
 struct DisplayPath {
+    raw: PathBuf,
     root: String,
     parts: Vec<String>,
     absolute: bool,
     windows: bool,
     had_parent: bool,
     unresolved_parent: bool,
+}
+
+fn directory_identity(left: &Path, right: &Path) -> Option<bool> {
+    if !left.is_absolute() || !right.is_absolute() {
+        return None;
+    }
+    if left.metadata().is_ok_and(|metadata| !metadata.is_dir())
+        || right.metadata().is_ok_and(|metadata| !metadata.is_dir())
+    {
+        return Some(false);
+    }
+    match same_file::is_same_file(left, right) {
+        Ok(same) => Some(same),
+        Err(_)
+            if matches!(left.try_exists(), Ok(false))
+                && matches!(right.try_exists(), Ok(false)) =>
+        {
+            None
+        }
+        Err(_) => Some(false),
+    }
 }
 
 impl DisplayPath {
@@ -817,6 +963,7 @@ impl DisplayPath {
             unresolved_parent = true;
         }
         Self {
+            raw: path.to_owned(),
             root,
             parts,
             absolute,
@@ -827,19 +974,82 @@ impl DisplayPath {
     }
 
     fn relative_to(&self, home: &Self) -> Option<Vec<String>> {
+        self.relative_to_with(home, true)
+    }
+
+    // Canonical names are actual directory names: an extended Windows path
+    // can identify a literal trailing dot or space, rather than a Win32 alias.
+    fn canonical_relative_to(&self, home: &Self) -> Option<Vec<String>> {
+        self.canonical_relative_to_with_identity(home, &directory_identity)
+    }
+
+    fn canonical_relative_to_with_identity(
+        &self,
+        home: &Self,
+        identity: &impl Fn(&Path, &Path) -> Option<bool>,
+    ) -> Option<Vec<String>> {
+        let relative = self.relative_to_with(home, false)?;
+        // Windows directories can opt into case-sensitive names. A folded
+        // prefix alone cannot establish containment when both names exist.
+        // Query the original paths, never a reconstructed display label.
+        let prefix = self.raw.ancestors().nth(relative.len())?;
+        if prefix != home.raw && identity(prefix, &home.raw) == Some(false) {
+            return None;
+        }
+        Some(relative)
+    }
+
+    fn canonical_account_identity(
+        &self,
+        index: usize,
+        profile: &Self,
+        identity: &impl Fn(&Path, &Path) -> Option<bool>,
+    ) -> Option<bool> {
+        let profile_index = profile
+            .account_index()
+            .or_else(|| profile.parts.len().checked_sub(1))?;
+        let account = self
+            .raw
+            .ancestors()
+            .nth(self.parts.len().checked_sub(index + 1)?)?;
+        let profile_account = profile
+            .raw
+            .ancestors()
+            .nth(profile.parts.len().checked_sub(profile_index + 1)?)?;
+        // Different redirected roots retain their profile-name policy. Only
+        // equivalent canonical prefixes can denote a case-sensitive sibling.
+        let same_prefix =
+            Self::parse(account).relative_to_with(&Self::parse(profile_account), false)?;
+        if !same_prefix.is_empty() || account == profile_account {
+            return None;
+        }
+        identity(account, profile_account)
+    }
+
+    fn relative_to_with(&self, home: &Self, trim_win32: bool) -> Option<Vec<String>> {
         if !self.absolute || !home.absolute || self.parts.len() < home.parts.len() {
             return None;
         }
         let equal = |a: &str, b: &str| {
             if self.windows || home.windows {
-                a.trim_end_matches(['.', ' '])
-                    .eq_ignore_ascii_case(b.trim_end_matches(['.', ' ']))
+                if trim_win32 {
+                    a.trim_end_matches(['.', ' '])
+                        .eq_ignore_ascii_case(b.trim_end_matches(['.', ' ']))
+                } else {
+                    a.eq_ignore_ascii_case(b)
+                }
             } else {
                 a == b
             }
         };
         if !equal(&self.root, &home.root)
-            || !self.parts.iter().zip(&home.parts).all(|(a, b)| equal(a, b))
+            || !self.parts.iter().zip(&home.parts).all(|(a, b)| {
+                if self.is_wsl_share() || home.is_wsl_share() {
+                    a == b
+                } else {
+                    equal(a, b)
+                }
+            })
         {
             return None;
         }

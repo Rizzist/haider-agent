@@ -54,8 +54,8 @@ fn workspace_notice_is_visible_and_not_counted_unknown() {
     assert!(model.projection.entries().iter().any(|entry| {
         matches!(
             entry,
-            haider_tui::projection::TranscriptEntry::Note { text }
-                if text.contains("workspace unavailable") && text.contains("/gone")
+            haider_tui::projection::TranscriptEntry::Workspace { event }
+                if haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("workspace unavailable") && haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("/gone")
         )
     }));
 
@@ -85,8 +85,8 @@ fn workspace_event_note_masks_path_without_changing_event_truth() {
     assert!(model.projection.entries().iter().any(|entry| {
         matches!(
             entry,
-            haider_tui::projection::TranscriptEntry::Note { text }
-                if text.contains("/Users/<user>/project") && !text.contains("/Users/bob")
+            haider_tui::projection::TranscriptEntry::Workspace { event }
+                if haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("/Users/<user>/project") && !haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("/Users/bob")
         )
     }));
     model
@@ -100,8 +100,8 @@ fn workspace_event_note_masks_path_without_changing_event_truth() {
     assert!(model.projection.entries().iter().any(|entry| {
         matches!(
             entry,
-            haider_tui::projection::TranscriptEntry::Note { text }
-                if text.contains("⇄ workspace → /Users/<user>/next")
+            haider_tui::projection::TranscriptEntry::Workspace { event }
+                if haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("⇄ workspace → /Users/<user>/next")
         )
     }));
 }

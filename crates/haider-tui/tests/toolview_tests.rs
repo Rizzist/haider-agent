@@ -410,6 +410,55 @@ fn absolute_search_patterns_use_the_account_projection() {
 
 #[cfg(unix)]
 #[test]
+fn escaped_absolute_glob_roots_share_the_account_and_home_projection() {
+    let context = PathContext {
+        workspace: Some("/opt/work".into()),
+        homes: vec!["/Users/alice".into()],
+    };
+    for (pattern, expected) in [
+        (r"/U\sers/bob/**", "/Users/<user>/**"),
+        (r"\/Users/bob/**", "/Users/<user>/**"),
+        (r"\/U\sers/bob/**", "/Users/<user>/**"),
+        (r#"'\/Users/o\'brien/**'"#, "'/Users/<user>/**'"),
+        (r"/h\ome/carol/**", "/home/<user>/**"),
+        (r"/Users/b\ob/**", "/Users/<user>/**"),
+        (r"/U\sers/al\ice/a ~b/**", "~/a ~b/**"),
+        (r"\/U\sers/al\ice/a ~b/**", "~/a ~b/**"),
+        (
+            r"{/U\sers/bob/**,/h\ome/carol/**}",
+            "{/Users/<user>/**,/home/<user>/**}",
+        ),
+        (r"**/U\sers/bob/**", r"**/U\sers/bob/**"),
+        (r"/opt/u\sers/bob/**", r"/opt/u\u{005c}sers/bob/**"),
+        (r"/U\sers/bob/f\?o/**", r"/Users/<user>/f\?o/**"),
+        (r"/U\sers/bob/café\?名/**", r"/Users/<user>/café\?名/**"),
+        (
+            r"/Volumes/Café\, 2024/U\sers/bob/**",
+            r"/Volumes/Café\, 2024/Users/<user>/**",
+        ),
+        (
+            r#"/Volumes/Say "hi"/Users/o\'brien/**"#,
+            r#"/Volumes/Say "hi"/Users/<user>/**"#,
+        ),
+        (r"/U\sers/al\ice/Bob\'s notes/**", r"~/Bob\'s notes/**"),
+        (r"/U\sers/al\ice", "~"),
+        (r"C:\Users\bob\**", "C:/Users/<user>/**"),
+    ] {
+        let args = json!({"pattern":pattern});
+        assert_eq!(
+            tv::header_args("glob", &args, &context),
+            format!("\"{expected}\""),
+            "{pattern}"
+        );
+        assert_eq!(
+            args["pattern"], pattern,
+            "raw tool argument must remain unchanged"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn workspace_alias_to_multiuser_root_keeps_the_account_mask() {
     use std::os::unix::fs::symlink;
     let ancestor = if cfg!(target_os = "macos") {
@@ -428,6 +477,58 @@ fn workspace_alias_to_multiuser_root_keeps_the_account_mask() {
     assert_eq!(
         context.shorten(&path.to_string_lossy()),
         format!("{ancestor}/<user>/private")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interior_workspace_alias_to_accounts_keeps_the_mask_in_all_headers() {
+    use std::os::unix::fs::symlink;
+    let ancestor = if cfg!(target_os = "macos") {
+        "/Users"
+    } else {
+        "/home"
+    };
+    let temp = tempfile::tempdir().expect("workspace");
+    let alias = temp.path().join("accounts");
+    symlink(ancestor, &alias).expect("account alias");
+    let paths = [
+        alias.join("display-fixture-other-account/missing/file.rs"),
+        alias
+            .join("..")
+            .join(ancestor.trim_start_matches('/'))
+            .join("display-fixture-other-account/missing/file.rs"),
+    ];
+    for homes in [vec![], vec![temp.path().to_path_buf()]] {
+        let context = PathContext {
+            workspace: Some(temp.path().display().to_string()),
+            homes,
+        };
+        let expected = format!("{ancestor}/<user>/missing/file.rs");
+        for path in &paths {
+            assert_eq!(context.shorten(&path.to_string_lossy()), expected);
+            assert_eq!(
+                tv::header_args("fs_read", &json!({"path":path}), &context),
+                expected
+            );
+            assert_eq!(
+                tv::header_args("fs_glob", &json!({"pattern":path}), &context),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+    // An alias that stays inside the workspace keeps the requested readable spelling.
+    let real = temp.path().join("real");
+    std::fs::create_dir(&real).expect("real directory");
+    let internal = temp.path().join("internal");
+    symlink(&real, &internal).expect("internal alias");
+    let context = PathContext {
+        workspace: Some(temp.path().display().to_string()),
+        homes: vec![],
+    };
+    assert_eq!(
+        context.shorten(&internal.join("file.rs").to_string_lossy()),
+        "internal/file.rs"
     );
 }
 
@@ -1275,7 +1376,7 @@ fn syntax_prefixed_glob_branches_use_the_shared_projection() {
         ),
         (
             "/Users/bob/** /home/carol/**",
-            "/Users/<user>/** /home/<user>/**",
+            "/Users/<user>/** /home/carol/**",
         ),
         (
             "!C:/Documents and Settings/bob/**",
@@ -1357,4 +1458,267 @@ fn expanded_broad_workspace_roots_never_restore_the_account() {
             "{workspace} {path}"
         );
     }
+}
+
+fn assert_pattern_routes(pattern: &str, expected: &str, context: &PathContext) {
+    use haider_protocol::{
+        EventPayload,
+        ids::ItemId,
+        item::{ItemEvent, ToolStatus, TurnItem},
+    };
+    use haider_tui::{plain::render_plain_with_context, projection::SessionProjection};
+    for (name, args, search) in [
+        ("fs_search", json!({"query":"needle", "glob":pattern}), true),
+        (
+            "fs_search",
+            json!({"query":"needle", "include":pattern}),
+            true,
+        ),
+        ("glob", json!({"pattern":pattern}), false),
+        ("fs_glob", json!({"query":pattern}), false),
+    ] {
+        let summary = if search {
+            format!("\"needle\" {expected}")
+        } else {
+            expected.to_owned()
+        };
+        let compact = tv::one_line(expected);
+        let header = if search {
+            format!("\"needle\" {compact}")
+        } else {
+            format!("\"{compact}\"")
+        };
+        assert_eq!(
+            tv::header_args(name, &args, context),
+            header,
+            "{name} {pattern}"
+        );
+        let mut projection = SessionProjection::new();
+        projection.apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("pattern-parity"),
+            item: TurnItem::ToolCall {
+                call_id: "pattern-parity".into(),
+                name: name.into(),
+                args,
+                status: ToolStatus::InProgress,
+            },
+        }));
+        let plain = render_plain_with_context(&projection, 0, None, context);
+        assert_eq!(
+            plain.lines().next(),
+            Some(format!("⚒ {name} ◐ · {summary} · status running").as_str()),
+            "{pattern}"
+        );
+    }
+}
+
+#[test]
+fn unenclosed_punctuation_and_whitespace_belong_to_the_whole_absolute_pattern() {
+    let context = PathContext {
+        workspace: Some("/opt/w".into()),
+        homes: vec!["/Users/alice".into(), "C:/Users/alice".into()],
+    };
+    for (pattern, expected) in [
+        (
+            "/Volumes/Bob's Passport/Users/carol/src/**",
+            "/Volumes/Bob's Passport/Users/<user>/src/**",
+        ),
+        (r"C:\Users\o'brien\src\**", "C:/Users/<user>/src/**"),
+        (
+            r"\\srv\a,b\Users\carol\src\**",
+            "//srv/a,b/Users/<user>/src/**",
+        ),
+        (
+            "/Volumes/Backup, 2024/Users/carol/**",
+            "/Volumes/Backup, 2024/Users/<user>/**",
+        ),
+        (
+            r"\\?\Volume{abc}\a,b\Users\carol\**",
+            "//device/Volume{abc}/a,b/Users/<user>/**",
+        ),
+        ("/Users/al}ice/**", "/Users/<user>/**"),
+        (r"C:\Users\carol)x\**", "C:/Users/<user>/**"),
+        (
+            "/Volumes/A|B/Users/carol/**",
+            "/Volumes/A|B/Users/<user>/**",
+        ),
+        (
+            r#"/Volumes/Say "hi"/Users/carol/**"#,
+            r#"/Volumes/Say "hi"/Users/<user>/**"#,
+        ),
+        (r"\\.\C:\Users\o'brien\**", "C:/Users/<user>/**"),
+        (r"\??\C:\Users\o'brien\**", "C:/Users/<user>/**"),
+        (
+            r"\\?\UNC\srv\a|b\Users\carol\**",
+            "//srv/a|b/Users/<user>/**",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\Mup\srv\a,b\Users\carol\**",
+            "//device/GLOBALROOT/Device/Mup/srv/a,b/Users/<user>/**",
+        ),
+        (
+            "C:/Documents and Settings/o'brien/**",
+            "C:/Documents and Settings/<user>/**",
+        ),
+        ("C:/msys64/home/o'brien/**", "C:/msys64/home/<user>/**"),
+        ("C:/Users/alice/a ~b/x/**", "~/a ~b/x/**"),
+        ("C:/Users/alice/Bob's notes/**", "~/Bob's notes/**"),
+        ("C:/Users/alice/a,b/x/**", "~/a,b/x/**"),
+        ("C:/Users/alice/x (1)/**", "~/x (1)/**"),
+        ("/opt/w/a,b/x/**", "a,b/x/**"),
+        ("/opt/w/src/x (1)/**", "src/x (1)/**"),
+        ("C:/Program Files (x86)/**", "C:/Program Files (x86)/**"),
+    ] {
+        assert_eq!(context.shorten(pattern), expected, "whole path: {pattern}");
+        for prefix in ["", "!", "!!", " ", "! "] {
+            assert_pattern_routes(
+                &format!("{prefix}{pattern}"),
+                &format!("{prefix}{expected}"),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn a_branch_ends_only_at_its_own_enclosing_syntax() {
+    let context = PathContext {
+        workspace: Some("/opt/w".into()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for (pattern, expected) in [
+        (
+            "{/Volumes/Bob's Passport/Users/carol/**,/tmp/**}",
+            "{/Volumes/Bob's Passport/Users/<user>/**,/tmp/**}",
+        ),
+        ("{/Users/al)ice/**,/tmp/**}", "{/Users/<user>/**,/tmp/**}"),
+        (
+            "{/Volumes/Backup (old/Users/carol/**,/home/bob/**}",
+            "{/Volumes/Backup (old/Users/<user>/**,/home/<user>/**}",
+        ),
+        (
+            "@(/Volumes/Backup (old/Users/carol/**|/home/bob/**)",
+            "@(/Volumes/Backup (old/Users/<user>/**|/home/<user>/**)",
+        ),
+        (
+            "{/Users/bob/@(src|lib)/**,/home/carol/**}",
+            "{/Users/<user>/@(src|lib)/**,/home/<user>/**}",
+        ),
+        (
+            "@(/Volumes/Backup, 2024/Users/carol/**|/tmp/**)",
+            "@(/Volumes/Backup, 2024/Users/<user>/**|/tmp/**)",
+        ),
+        ("@(/Users/al}ice/**|/tmp/**)", "@(/Users/<user>/**|/tmp/**)"),
+        (
+            "\"/Volumes/Bob's Passport/Users/carol/**\"",
+            "\"/Volumes/Bob's Passport/Users/<user>/**\"",
+        ),
+        (
+            "'/Volumes/Backup, 2024/Users/carol/**'",
+            "'/Volumes/Backup, 2024/Users/<user>/**'",
+        ),
+        (
+            "{C:/Users/alice/a ~b/x/**,/tmp/**}",
+            "{~/a ~b/x/**,/tmp/**}",
+        ),
+        (
+            "{!/Users/bob,{/home/carol,src}}/**",
+            "{!/Users/<user>,{/home/<user>,src}}/**",
+        ),
+        (
+            "@({/Users/bob,/home/carol}|/tmp)/**",
+            "@({/Users/<user>,/home/<user>}|/tmp)/**",
+        ),
+        (
+            "{/Users/{bob,carol}/**,/tmp/**}",
+            "{/Users/<user>/**,/tmp/**}",
+        ),
+        ("src/{/Users/bob,lib}/**", "src/{/Users/bob,lib}/**"),
+        ("src/~bob/**", "src/~bob/**"),
+        (
+            "'/Users/bob/**' /home/carol/**",
+            "'/Users/<user>/**' /home/<user>/**",
+        ),
+        ("'/Users/bob/**' ~carol/**", "'/Users/<user>/**' ~<user>/**"),
+        (
+            "{/Users/bob,/tmp} /home/carol/**",
+            "{/Users/<user>,/tmp} /home/<user>/**",
+        ),
+        (
+            "@(/Users/bob|/tmp) /home/carol/**",
+            "@(/Users/<user>|/tmp) /home/<user>/**",
+        ),
+        ("src,/Users/bob/**", "src,/Users/bob/**"),
+        ("/opt/w/a ~bob/x/**", "a ~bob/x/**"),
+    ] {
+        assert_pattern_routes(pattern, expected, &context);
+    }
+}
+
+#[test]
+fn posix_pattern_routes_match_the_whole_path_projection() {
+    let context = PathContext {
+        workspace: Some("/opt/w".into()),
+        homes: vec!["/Users/alice".into()],
+    };
+    for tail in [
+        "a ~b/x/**",
+        "Bob's notes/**",
+        "Library/Application Support/Code/**",
+        "Developer/my app (v2)/**/*.{rs,toml}",
+    ] {
+        let pattern = format!("/Users/alice/{tail}");
+        // Whether this platform accepts a POSIX home is a separate policy.
+        // Every route must keep the whole-path label and its literal tail.
+        let expected = context.shorten(&pattern);
+        assert!(expected.ends_with(tail), "{expected}");
+        assert_pattern_routes(&pattern, &expected, &context);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_rooted_patterns_use_the_whole_account_projection() {
+    let context = PathContext {
+        workspace: Some("C:/repo".into()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for pattern in [
+        r"\Users\o'brien\**",
+        r"\Users\carol)x\**",
+        r"\Users\al}ice\**",
+        r#"\Users\say "hi"\**"#,
+    ] {
+        assert_eq!(context.shorten(pattern), "/Users/<user>/**");
+        assert_pattern_routes(pattern, "/Users/<user>/**", &context);
+    }
+    assert_pattern_routes(r"src\Users\bob\**", r"src\Users\bob\**", &context);
+}
+
+#[cfg(unix)]
+#[test]
+fn escaped_posix_delimiters_do_not_close_a_pattern_branch() {
+    let context = PathContext {
+        workspace: None,
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for (pattern, expected) in [
+        (r"'/Users/o\'brien/**'", "'/Users/<user>/**'"),
+        (r"'~o\'brien/**'", "'~<user>/**'"),
+        (
+            r#""/Volumes/Say \"hi\"/Users/carol/**""#,
+            r#""/Volumes/Say \"hi\"/Users/<user>/**""#,
+        ),
+        (
+            r"{/Volumes/Backup\, 2024/Users/carol/**,/tmp/**}",
+            r"{/Volumes/Backup\, 2024/Users/<user>/**,/tmp/**}",
+        ),
+        (
+            r"@(/Volumes/A\|B/Users/carol/**|/tmp/**)",
+            r"@(/Volumes/A\|B/Users/<user>/**|/tmp/**)",
+        ),
+    ] {
+        assert_pattern_routes(pattern, expected, &context);
+    }
+    assert_pattern_routes(r"'C:\Users\bob\'", "'C:/Users/<user>'", &context);
 }

@@ -412,6 +412,9 @@ pub enum EntryDto {
     Note {
         text: String,
     },
+    Workspace {
+        event: haider_protocol::workspace::WorkspaceEventPayload,
+    },
     Shell {
         cmd: String,
         out: String,
@@ -607,6 +610,9 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             spoken: block.spoken,
         },
         TranscriptEntry::Note { text } => EntryDto::Note { text: text.clone() },
+        TranscriptEntry::Workspace { event } => EntryDto::Workspace {
+            event: event.clone(),
+        },
         TranscriptEntry::Refusal {
             provider,
             tool,
@@ -730,7 +736,7 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
                 entry.head_ros = Some(claimed.ros);
             }
         }
-        entry.dir = crate::live::workspace_display_path(&s.dir);
+        entry.dir = model.display_path(&s.dir);
         entry.model_short = s.model_short;
         entry.device = s.device;
         entry.ago = s.ago;
@@ -760,7 +766,7 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
     vfs.extend(dto.vfs);
     model.vfs = vfs;
     if !dto.launcher_dir.is_empty() {
-        model.launcher_dir = crate::live::workspace_display_path(&dto.launcher_dir);
+        model.launcher_dir = model.display_path(&dto.launcher_dir);
         // The no-session scratch dir mirrors the launcher's (fresh_session
         // law) — per-session dirs rode in with their sessions above.
         model.session_dir = model.launcher_dir.clone();
@@ -887,6 +893,7 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             })
         }
         EntryDto::Note { text } => TranscriptEntry::Note { text },
+        EntryDto::Workspace { event } => TranscriptEntry::Workspace { event },
         EntryDto::Shell { cmd, out } => TranscriptEntry::Shell { cmd, out },
     }
 }

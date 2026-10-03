@@ -206,6 +206,10 @@ fn render_plain_impl_with_status(
                 out.push_str(text);
                 out.push('\n');
             }
+            TranscriptEntry::Workspace { event } => {
+                out.push_str(&crate::toolview::workspace_event_text(event, paths));
+                out.push('\n');
+            }
             TranscriptEntry::Refusal {
                 provider,
                 tool,
@@ -290,7 +294,7 @@ fn render_plain_impl_with_status(
         {
             out.push_str(&format!(
                 "  file review: {} · +{} -{} · {} hunk(s){}\n",
-                review.path,
+                paths.shorten(&review.path),
                 review.added,
                 review.removed,
                 review.hunks.len(),
@@ -698,10 +702,7 @@ fn render_item(out: &mut String, block: &ItemBlock, paths: &crate::toolview::Pat
             added,
             removed,
         } => {
-            out.push_str(&format!(
-                "± {} +{added} -{removed}\n",
-                crate::live::workspace_display_path(path)
-            ));
+            out.push_str(&format!("± {} +{added} -{removed}\n", paths.shorten(path)));
         }
         TurnItem::ChildSpawn { agent } => {
             out.push_str(&format!("◉ subagent {} spawned\n", agent.as_str()));
@@ -747,7 +748,9 @@ fn render_item(out: &mut String, block: &ItemBlock, paths: &crate::toolview::Pat
             {
                 out.push_str(&note.summary());
                 out.push('\n');
-            } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
+            } else if let Some((_, label)) =
+                crate::projection::image_created_fact_with_context(kind, data, paths)
+            {
                 out.push_str(&label);
                 out.push('\n');
             } else if let Some(transition) =

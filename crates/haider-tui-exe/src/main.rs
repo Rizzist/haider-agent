@@ -697,7 +697,7 @@ fn apply_interactive_workspace(
     // The SAME producer the live driver uses for renewed allocations
     // (sanitised, home-relative, `/`-normalised, identical fallback), so the
     // first and every later preview spell a path identically everywhere.
-    let display = haider_tui::live::workspace_display_path(&model.cwd);
+    let display = model.display_path(&model.cwd);
     model.pending_workspace_display = model
         .pending_workspace_allocation
         .as_ref()

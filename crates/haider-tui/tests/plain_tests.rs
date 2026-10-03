@@ -8,6 +8,56 @@ use haider_tui::mock::demo_script;
 use haider_tui::plain::{render_plain, status_glyph, status_line, status_word};
 use haider_tui::projection::SessionProjection;
 
+#[cfg(unix)]
+#[test]
+fn file_change_through_an_interior_workspace_account_alias_is_masked() {
+    use haider_tui::app::AppModel;
+    use haider_tui::runtime::run_demo_plain;
+    use std::os::unix::fs::symlink;
+    let accounts = if cfg!(target_os = "macos") {
+        "/Users"
+    } else {
+        "/home"
+    };
+    let temp = tempfile::tempdir().expect("workspace");
+    let alias = temp.path().join("accounts");
+    symlink(accounts, &alias).expect("account alias");
+    let mut model = AppModel::new();
+    model.cwd = temp.path().display().to_string();
+    model.session_workspace_cwd = Some(model.cwd.clone());
+    model.display_homes = vec![temp.path().to_path_buf()];
+    for (index, path) in [
+        alias.join("display-fixture-other-account/missing/file.rs"),
+        alias
+            .join("..")
+            .join(accounts.trim_start_matches('/'))
+            .join("display-fixture-other-account/missing/file.rs"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        model
+            .projection
+            .apply(&EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!("alias-file-change-{index}")),
+                item: TurnItem::FileChange {
+                    path: path.display().to_string(),
+                    added: 1,
+                    removed: 0,
+                },
+            }));
+    }
+    let output = run_demo_plain(model);
+    assert!(
+        output.contains(&format!("± {accounts}/<user>/missing/file.rs +1 -0")),
+        "{output}"
+    );
+    assert!(
+        !output.contains("display-fixture-other-account"),
+        "{output}"
+    );
+}
+
 #[test]
 fn demo_script_renders_the_full_plain_story() {
     let mut projection = SessionProjection::new();
@@ -459,6 +509,84 @@ fn plain_pattern_scope_uses_session_context() {
                 .lines()
                 .any(|line| line.starts_with(&format!("⚒ {name} ◐ · {expected}"))),
             "{name} {expected}: {plain}"
+        );
+    }
+}
+
+#[test]
+fn file_changes_use_session_workspace_and_home_in_plain_rows() {
+    use haider_tui::{app::AppModel, runtime::run_demo_plain};
+    for (workspace, home, path, expected) in [
+        (
+            "/opt/project",
+            "/Users/alice",
+            "/opt/project/src/lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            "/Users/alice/project",
+            "/Users/alice",
+            "/Users/alice/project/src/lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            "C:/Users/alice/project",
+            "C:/Users/alice",
+            "C:/Users/alice/notes.md",
+            "~/notes.md",
+        ),
+        (
+            "/Users/alice/project",
+            "/Users/alice",
+            "/Users/carol/notes.md",
+            "/Users/<user>/notes.md",
+        ),
+        (
+            "C:/Users/alice/project",
+            "C:/Users/alice",
+            r"c:\USERS\ALICE\PROJECT\src\lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            r"\\srv\share\project",
+            "C:/Users/alice",
+            r"\\?\UNC\SRV\SHARE\project\src\lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            r"\\.\C:\project",
+            "C:/Users/alice",
+            r"\\?\C:\project\src\lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            "/Users",
+            "/Users/alice",
+            "/Users/carol/src/lib.rs",
+            "/Users/<user>/src/lib.rs",
+        ),
+        ("/opt/project", "/Users/alice", "src/lib.rs", "src/lib.rs"),
+    ] {
+        let mut model = AppModel::new();
+        model.cwd = workspace.into();
+        model.session_workspace_cwd = Some(workspace.into());
+        model.display_homes = vec![home.into()];
+        assert_eq!(model.tool_path_context().shorten(path), expected);
+        model
+            .projection
+            .apply(&EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("file-change-context"),
+                item: TurnItem::FileChange {
+                    path: path.into(),
+                    added: 1,
+                    removed: 0,
+                },
+            }));
+        let plain = run_demo_plain(model);
+        assert_eq!(
+            plain.lines().find(|line| line.starts_with("± ")),
+            Some(format!("± {expected} +1 -0").as_str()),
+            "{workspace}: {path}"
         );
     }
 }

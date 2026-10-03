@@ -3,7 +3,6 @@
 
 use std::path::Path;
 
-#[cfg(unix)]
 use super::{MaskPath, sanitize_with_canonicalizers};
 use super::{
     ORIGIN_DISPLAY_MAX_BYTES, OriginPathKind, OriginSanitizeError, SanitizedOriginPath,
@@ -422,7 +421,7 @@ fn ancestor_walk_continues_only_for_not_found() {
         }
     };
     assert_eq!(
-        canonicalize_existing_prefix_with(path, &canonicalize),
+        canonicalize_existing_prefix_with(path, &canonicalize, cfg!(windows)),
         Some(resolved.to_path_buf())
     );
     for kind in [
@@ -431,7 +430,7 @@ fn ancestor_walk_continues_only_for_not_found() {
         ErrorKind::Other,
     ] {
         assert_eq!(
-            canonicalize_existing_prefix_with(path, &|_| Err(Error::from(kind))),
+            canonicalize_existing_prefix_with(path, &|_| Err(Error::from(kind)), cfg!(windows)),
             None,
             "{kind:?}"
         );
@@ -454,12 +453,19 @@ fn ancestor_walk_continues_only_for_not_found() {
             Err(Error::from(ErrorKind::PermissionDenied))
         }
     };
-    assert_eq!(canonicalize_existing_prefix_with(path, &denied_child), None);
-    let mask_walk = canonicalize_masking_prefix_with(path, &denied_child);
+    assert_eq!(
+        canonicalize_existing_prefix_with(path, &denied_child, cfg!(windows)),
+        None
+    );
+    let mask_walk = canonicalize_masking_prefix_with(path, &denied_child, cfg!(windows));
     assert_eq!(mask_walk.resolved, Some(resolved.to_path_buf()));
     assert!(mask_walk.denied);
     assert_eq!(
-        canonicalize_existing_prefix_with(Path::new("relative/path"), &|_| panic!("relative walk")),
+        canonicalize_existing_prefix_with(
+            Path::new("relative/path"),
+            &|_| panic!("relative walk"),
+            cfg!(windows)
+        ),
         None
     );
 }
@@ -470,13 +476,17 @@ fn inaccessible_alias_uses_only_its_resolved_ancestor_for_masking() {
     use std::io::{Error, ErrorKind};
     let path = Path::new("/tmp/alias/bob/private/x");
     let resolved = sanitize_with_canonicalizers(Some(path), &[], &|_| None, &|candidate| {
-        canonicalize_masking_prefix_with(candidate, &|probe| {
-            if probe == Path::new("/tmp/alias") {
-                Ok(Path::new("/Users").to_path_buf())
-            } else {
-                Err(Error::from(ErrorKind::PermissionDenied))
-            }
-        })
+        canonicalize_masking_prefix_with(
+            candidate,
+            &|probe| {
+                if probe == Path::new("/tmp/alias") {
+                    Ok(Path::new("/Users").to_path_buf())
+                } else {
+                    Err(Error::from(ErrorKind::PermissionDenied))
+                }
+            },
+            cfg!(windows),
+        )
     })
     .unwrap();
     assert_eq!(resolved.kind, OriginPathKind::Redacted);
@@ -549,6 +559,319 @@ fn symlink_loop_does_not_prevent_lexical_own_home_display() {
     let value = sanitize_origin_path(Some(&temp.path().join("loop/x")), Some(temp.path())).unwrap();
     assert_eq!(value.kind, OriginPathKind::HomeRelative);
     assert_eq!(value.display.as_deref(), Some("~/loop/x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn interior_account_alias_cannot_be_shortened_as_own_home_or_workspace() {
+    use std::os::unix::fs::symlink;
+    let accounts = if cfg!(target_os = "macos") {
+        "/Users"
+    } else {
+        "/home"
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let alias = temp.path().join("accounts");
+    symlink(accounts, &alias).unwrap();
+    for path in [
+        alias.join("display-fixture-other-account/missing/file.rs"),
+        alias
+            .join("..")
+            .join(accounts.trim_start_matches('/'))
+            .join("display-fixture-other-account/missing/file.rs"),
+    ] {
+        let result = sanitize_origin_path(Some(&path), Some(temp.path())).unwrap();
+        assert_eq!(result.kind, OriginPathKind::Redacted, "{path:?}");
+        assert_eq!(
+            result.display,
+            Some(format!("{accounts}/<user>/missing/file.rs")),
+            "{path:?}"
+        );
+        assert_eq!(super::workspace_relative_display(&path, temp.path()), None);
+    }
+}
+
+#[test]
+fn redirected_home_alias_uses_the_canonical_account_remainder() {
+    let home = Path::new("H:/");
+    let profile = Path::new("C:/Users/alice");
+    for (account, kind, expected) in [
+        ("alice", OriginPathKind::HomeRelative, "~/<user>/private"),
+        (
+            "bob",
+            OriginPathKind::Redacted,
+            "//srv/Users/<user>/private",
+        ),
+    ] {
+        let path = home.join(format!("account-alias/{account}/private"));
+        let resolved = Path::new("//srv/Users").join(format!("{account}/private"));
+        let result = sanitize_with_canonicalizers(
+            Some(&path),
+            &[home, profile],
+            &|candidate| {
+                if candidate == path {
+                    Some(resolved.clone())
+                } else if candidate == home {
+                    Some(Path::new("//srv/Users").to_path_buf())
+                } else {
+                    None
+                }
+            },
+            &|_| MaskPath {
+                resolved: None,
+                denied: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.kind, kind, "{account}");
+        assert_eq!(result.display.as_deref(), Some(expected), "{account}");
+    }
+}
+
+#[test]
+fn canonical_windows_account_names_are_not_win32_aliases() {
+    let home = Path::new("C:/Users/alice");
+    for account in ["alice.", "alice "] {
+        let path = home.join(format!("project/account-alias/{account}/private"));
+        let resolved = Path::new("C:/Users").join(format!("{account}/private"));
+        let result = sanitize_with_canonicalizers(
+            Some(&path),
+            &[home],
+            &|candidate| {
+                if candidate == path {
+                    Some(resolved.clone())
+                } else if candidate == home {
+                    Some(home.to_path_buf())
+                } else {
+                    None
+                }
+            },
+            &|_| MaskPath {
+                resolved: None,
+                denied: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.kind, OriginPathKind::Redacted, "{account:?}");
+        assert_eq!(result.display.as_deref(), Some("C:/Users/<user>/private"));
+    }
+    // Ordinary requested Win32 spelling remains an alias for the own home
+    // when there is no conflicting canonical identity.
+    assert_eq!(
+        super::display_path_with_homes(Path::new("C:/Users/alice./file.rs"), &[home.to_path_buf()]),
+        "~/file.rs"
+    );
+}
+
+#[test]
+fn wsl_account_case_does_not_supply_an_own_home_identity() {
+    let home = Path::new("//wsl$/Ubuntu/home/alice");
+    for (account, expected) in [
+        ("alice", "~/notes"),
+        ("ALICE", "//WSL$/Ubuntu/home/<user>/notes"),
+    ] {
+        let path = Path::new("//WSL$/Ubuntu/home").join(account).join("notes");
+        let projection =
+            sanitize_with_canonicalizers(Some(&path), &[home], &|_| None, &|_| MaskPath {
+                resolved: None,
+                denied: false,
+            })
+            .unwrap();
+        assert_eq!(projection.display.as_deref(), Some(expected));
+    }
+    // An interior alias to the case-distinct account must not restore that
+    // account name through the requested own-home remainder.
+    let path = home.join("project/alias/ALICE/notes");
+    let other = Path::new("//wsl$/Ubuntu/home/ALICE/notes");
+    let projection = sanitize_with_canonicalizers(
+        Some(&path),
+        &[home],
+        &|candidate| {
+            if candidate == path {
+                Some(other.to_path_buf())
+            } else if candidate == home {
+                Some(home.to_path_buf())
+            } else {
+                None
+            }
+        },
+        &|_| MaskPath {
+            resolved: None,
+            denied: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(projection.kind, OriginPathKind::Redacted);
+    assert_eq!(
+        projection.display.as_deref(),
+        Some("//wsl$/Ubuntu/home/<user>/notes")
+    );
+    assert_eq!(
+        super::display_path_with_homes(
+            Path::new("c:/USERS/ALICE/notes"),
+            &["C:/Users/alice".into()]
+        ),
+        "~/notes"
+    );
+}
+
+#[test]
+fn redirected_wsl_home_keeps_case_distinct_accounts_separate() {
+    let home = Path::new("H:/");
+    let profile = Path::new("C:/Users/alice");
+    for (account, expected) in [
+        ("alice", "~/<user>/notes"),
+        ("ALICE", "//wsl.localhost/Ubuntu/home/<user>/notes"),
+    ] {
+        let path = home.join("account-alias").join(account).join("notes");
+        let root = Path::new("//wsl.localhost/Ubuntu/home");
+        let resolved = root.join(account).join("notes");
+        let projection = sanitize_with_canonicalizers(
+            Some(&path),
+            &[home, profile],
+            &|candidate| {
+                if candidate == path {
+                    Some(resolved.clone())
+                } else if candidate == home {
+                    Some(root.to_path_buf())
+                } else {
+                    None
+                }
+            },
+            &|_| MaskPath {
+                resolved: None,
+                denied: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(projection.display.as_deref(), Some(expected));
+    }
+}
+
+#[test]
+fn missing_windows_suffix_uses_requested_namespace_naming() {
+    use std::io::{Error, ErrorKind};
+    let ordinary = std::env::temp_dir().join("winpath-prefix-fixture");
+    let namespace = Path::new("//?/C:/Users");
+    for (root, windows, expected) in [
+        (ordinary.as_path(), true, Path::new("C:/Users/alice/notes")),
+        (
+            ordinary.as_path(),
+            false,
+            Path::new("C:/Users/alice. /notes. "),
+        ),
+        (namespace, true, Path::new("C:/Users/alice. /notes. ")),
+    ] {
+        let path = root.join("alice. ").join("notes. ");
+        let resolve = |candidate: &Path| {
+            if candidate == root {
+                Ok(Path::new("C:/Users").to_path_buf())
+            } else {
+                Err(Error::from(ErrorKind::NotFound))
+            }
+        };
+        assert_eq!(
+            super::canonicalize_existing_prefix_with(&path, &resolve, windows).as_deref(),
+            Some(expected)
+        );
+        let masked = super::canonicalize_masking_prefix_with(&path, &resolve, windows);
+        assert!(!masked.denied);
+        assert_eq!(masked.resolved.as_deref(), Some(expected));
+        if windows {
+            let raw = if root == namespace {
+                Path::new("//?/C:/Users/alice. /notes. ")
+            } else {
+                Path::new("C:/Users/alice. /notes. ")
+            };
+            let home = Path::new("C:/Users/alice");
+            let projection = sanitize_with_canonicalizers(
+                Some(raw),
+                &[home],
+                &|candidate| {
+                    if candidate == raw {
+                        Some(expected.to_path_buf())
+                    } else if candidate == home {
+                        Some(home.to_path_buf())
+                    } else {
+                        None
+                    }
+                },
+                &|_| MaskPath {
+                    resolved: None,
+                    denied: false,
+                },
+            )
+            .unwrap();
+            let wanted = if root == namespace {
+                "C:/Users/<user>/notes. "
+            } else {
+                "~/notes. "
+            };
+            assert_eq!(projection.display.as_deref(), Some(wanted));
+        }
+    }
+    // A missing current-directory alias supplies no new directory identity.
+    let path = ordinary.join(" . ").join("notes");
+    let resolve = |candidate: &Path| {
+        if candidate == ordinary {
+            Ok(ordinary.clone())
+        } else {
+            Err(Error::from(ErrorKind::NotFound))
+        }
+    };
+    assert!(super::canonicalize_existing_prefix_with(&path, &resolve, true).is_none());
+    assert!(
+        super::canonicalize_masking_prefix_with(&path, &resolve, true)
+            .resolved
+            .is_none()
+    );
+}
+
+#[test]
+fn missing_windows_parent_alias_cannot_supply_a_canonical_identity() {
+    use std::io::{Error, ErrorKind};
+    // The resolver is injected; the host-native root only supplies portable
+    // Path traversal. Win32 component semantics are selected explicitly.
+    let root = std::env::temp_dir();
+    for component in [".. ", "...", " . . "] {
+        let path = root.join("missing").join(component).join("Users/bob/leaf");
+        let resolve = |candidate: &Path| {
+            if candidate == root {
+                Ok(root.join("canonical"))
+            } else {
+                Err(Error::from(ErrorKind::NotFound))
+            }
+        };
+        assert_eq!(
+            canonicalize_existing_prefix_with(&path, &resolve, true),
+            None,
+            "{component}"
+        );
+        assert_eq!(
+            canonicalize_masking_prefix_with(&path, &resolve, true).resolved,
+            None,
+            "{component}"
+        );
+        // POSIX permits these literal directory names; they remain a tail.
+        assert!(
+            canonicalize_existing_prefix_with(&path, &resolve, false).is_some(),
+            "{component}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn denied_interior_account_alias_keeps_the_resolved_account_mask() {
+    let home = Path::new("C:/Users/alice");
+    let path = home.join("accounts/bob/private");
+    let result = sanitize_with_canonicalizers(Some(&path), &[home], &|_| None, &|_| MaskPath {
+        resolved: Some(Path::new("D:/Users/bob/private").to_path_buf()),
+        denied: true,
+    })
+    .unwrap();
+    assert_eq!(result.kind, OriginPathKind::Redacted);
+    assert_eq!(result.display.as_deref(), Some("D:/Users/<user>/private"));
 }
 
 #[cfg(unix)]
@@ -1157,4 +1480,88 @@ fn dot_device_namespace_is_not_a_traversal_component() {
             None
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn forward_dot_device_namespace_keeps_windows_workspace_labels() {
+    for (root, path) in [
+        ("//./C:/w", "//./C:/w/src/x.rs"),
+        ("//./C:/w", r"c:\W\src\x.rs"),
+        (r"C:\w", "//./c:/W/src/x.rs"),
+        ("//./UNC/srv/share/w", r"\\srv\share\w\src\x.rs"),
+        (
+            "//./GLOBALROOT/Device/HarddiskVolume3/Users/alice/project",
+            "//./GLOBALROOT/Device/HarddiskVolume3/Users/alice/project/src/x.rs",
+        ),
+    ] {
+        assert_eq!(
+            super::workspace_relative_display(Path::new(path), Path::new(root)).as_deref(),
+            Some("src/x.rs"),
+            "{root} {path}"
+        );
+    }
+    for path in [
+        "//./C:/w/../Users/bob/x",
+        "//./C:/w/sub/.. /x",
+        "//./C:/w/./x",
+    ] {
+        assert_eq!(
+            super::workspace_relative_display(Path::new(path), Path::new("//./C:/w")),
+            None,
+            "the namespace dot is allowed, actual traversal is not: {path}"
+        );
+    }
+}
+
+#[test]
+fn canonical_case_alias_requires_matching_directory_identity() -> std::io::Result<()> {
+    let source = super::DisplayPath::parse(Path::new("//srv/Users/ALICE/private"));
+    let home = super::DisplayPath::parse(Path::new("//srv/Users/alice"));
+    let identity = |left: &Path, right: &Path| {
+        assert_eq!(left, Path::new("//srv/Users/ALICE"));
+        assert_eq!(right, Path::new("//srv/Users/alice"));
+        Some(false)
+    };
+    assert_eq!(
+        source.canonical_relative_to_with_identity(&home, &identity),
+        None
+    );
+    assert_eq!(
+        source.canonical_account_identity(0, &home, &identity),
+        Some(false)
+    );
+    let other_drive = super::DisplayPath::parse(Path::new("C:/Users/alice"));
+    assert_eq!(
+        source.canonical_account_identity(0, &other_drive, &|_, _| panic!("unrelated roots")),
+        None
+    );
+    for same in [Some(true), None] {
+        assert_eq!(
+            source.canonical_relative_to_with_identity(&home, &|_, _| same),
+            Some(vec!["private".to_owned()])
+        );
+    }
+    let temp = tempfile::tempdir()?;
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir(&first)?;
+    std::fs::create_dir(&second)?;
+    let file = temp.path().join("file");
+    std::fs::write(&file, b"fixture")?;
+    assert_eq!(super::directory_identity(&file, &file), Some(false));
+    assert_eq!(super::directory_identity(&first, &first), Some(true));
+    assert_eq!(super::directory_identity(&first, &second), Some(false));
+    assert_eq!(
+        super::directory_identity(&first, &temp.path().join("missing")),
+        Some(false)
+    );
+    assert_eq!(
+        super::directory_identity(
+            &temp.path().join("missing"),
+            &temp.path().join("also-missing")
+        ),
+        None
+    );
+    Ok(())
 }

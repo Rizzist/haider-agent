@@ -2177,7 +2177,7 @@ impl DemoDriver {
             AppRequest::RevealPath { path } => {
                 model.flash = Some(format!(
                     "· reveal (demo): {}",
-                    crate::live::workspace_display_path(&path)
+                    model.display_path(&path)
                 ));
                 model.dirty = true;
             }
@@ -4145,7 +4145,7 @@ pub async fn run_live(
                     if crate::browser::reveal_path(&path).is_err() {
                         model.flash = Some(format!(
                             "· couldn't reveal image — {}",
-                            crate::live::workspace_display_path(&path)
+                            model.display_path(&path)
                         ));
                         model.dirty = true;
                     }

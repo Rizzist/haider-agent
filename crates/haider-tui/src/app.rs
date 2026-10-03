@@ -1997,6 +1997,14 @@ impl ChipModel {
                 format!("peer {sender}: {text}")
             }
             crate::projection::TranscriptEntry::Note { text } => text.clone(),
+            crate::projection::TranscriptEntry::Workspace { event } => match event {
+                haider_protocol::workspace::WorkspaceEventPayload::WorkspaceUnavailable(_) => {
+                    "workspace unavailable".to_owned()
+                }
+                haider_protocol::workspace::WorkspaceEventPayload::WorkspaceSelected(_) => {
+                    "workspace selected".to_owned()
+                }
+            },
             crate::projection::TranscriptEntry::Refusal {
                 provider,
                 tool,
@@ -2236,12 +2244,18 @@ fn monitor_interval(interval_ms: u64) -> String {
 /// daemon's summary wins when present.
 #[must_use]
 pub fn monitor_source_summary(monitor: &haider_rpc::MonitorRegistrationWire) -> String {
+    monitor_source_summary_with_context(monitor, &crate::toolview::PathContext::process_homes())
+}
+
+/// Session-owned monitor rows share the home snapshot of the other rows.
+#[must_use]
+pub fn monitor_source_summary_with_context(
+    monitor: &haider_rpc::MonitorRegistrationWire,
+    paths: &crate::toolview::PathContext,
+) -> String {
     use haider_rpc::MonitorSourceWire as S;
     if let S::File { path } = &monitor.source {
-        return format!(
-            "file {}",
-            monitor_excerpt(&crate::live::workspace_display_path(path))
-        );
+        return format!("file {}", monitor_excerpt(&paths.shorten(path)));
     }
     if !monitor.source_summary.trim().is_empty() {
         return monitor_excerpt(&monitor.source_summary);
@@ -2249,10 +2263,7 @@ pub fn monitor_source_summary(monitor: &haider_rpc::MonitorRegistrationWire) -> 
     match &monitor.source {
         S::Sms => "sms".to_owned(),
         S::Process { command, .. } => format!("process {}", monitor_excerpt(command)),
-        S::File { path } => format!(
-            "file {}",
-            monitor_excerpt(&crate::live::workspace_display_path(path))
-        ),
+        S::File { path } => format!("file {}", monitor_excerpt(&paths.shorten(path))),
         S::Poll {
             command,
             interval_ms,
@@ -7314,7 +7325,7 @@ impl AppModel {
         }
     }
 
-    fn transcript_search_text(entry: &crate::projection::TranscriptEntry) -> String {
+    fn transcript_search_text(&self, entry: &crate::projection::TranscriptEntry) -> String {
         use haider_protocol::item::TurnItem;
         use std::fmt::Write as _;
 
@@ -7326,6 +7337,12 @@ impl AppModel {
             crate::projection::TranscriptEntry::User { text: value, .. }
             | crate::projection::TranscriptEntry::Note { text: value }
             | crate::projection::TranscriptEntry::Error { text: value, .. } => text.push_str(value),
+            crate::projection::TranscriptEntry::Workspace { event } => {
+                text.push_str(&crate::toolview::workspace_event_text(
+                    event,
+                    &self.tool_path_context(),
+                ));
+            }
             crate::projection::TranscriptEntry::Peer {
                 sender,
                 text: value,
@@ -7381,11 +7398,11 @@ impl AppModel {
     }
 
     fn refresh_transcript_search(&mut self) {
-        let Some(search) = self.transcript_search.as_mut() else {
+        let Some(search) = self.transcript_search.as_ref() else {
             return;
         };
         let needle = search.query.to_lowercase();
-        search.matches = if needle.is_empty() {
+        let matches = if needle.is_empty() {
             Vec::new()
         } else {
             self.projection
@@ -7393,13 +7410,17 @@ impl AppModel {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
-                    Self::transcript_search_text(entry)
+                    self.transcript_search_text(entry)
                         .to_lowercase()
                         .contains(&needle)
                         .then_some(index)
                 })
                 .collect()
         };
+        let Some(search) = self.transcript_search.as_mut() else {
+            return;
+        };
+        search.matches = matches;
         search.selected = search.selected.min(search.matches.len().saturating_sub(1));
         *self.search_jump.borrow_mut() = search.matches.get(search.selected).copied();
     }
@@ -8445,7 +8466,7 @@ impl AppModel {
             let retry_after = self.projection.run_errored() || self.projection.retrying().is_some();
             self.flash = Some(format!(
                 "· /retry — re-root to {}",
-                crate::live::workspace_display_path(&path)
+                self.display_path(&path)
             ));
             self.retry_inflight = true;
             self.requests.push(AppRequest::WorkspaceSet {
@@ -16559,7 +16580,7 @@ impl AppModel {
                 kind: RowKind::Shell,
                 kind_label: RowKind::Shell.label().to_owned(),
                 name: if shell.title.trim().is_empty() {
-                    crate::live::workspace_display_path(&shell.cwd_or_host)
+                    self.display_path(&shell.cwd_or_host)
                 } else {
                     shell.title.clone()
                 },
@@ -16573,7 +16594,7 @@ impl AppModel {
             rows.push(Row {
                 kind: RowKind::Monitor,
                 kind_label: RowKind::Monitor.label().to_owned(),
-                name: monitor_source_summary(monitor),
+                name: monitor_source_summary_with_context(monitor, &self.tool_path_context()),
                 activity: monitor
                     .last_event
                     .as_ref()
@@ -16782,6 +16803,13 @@ impl AppModel {
             workspace,
             homes: self.display_homes.clone(),
         }
+    }
+
+    /// Session-owned path labels use the same home snapshot as tool rows.
+    /// Roots and notices keep their full label rather than becoming `.`.
+    #[must_use]
+    pub fn display_path(&self, path: &str) -> String {
+        crate::live::workspace_display_path_with_homes(path, &self.display_homes)
     }
 
     /// Open the full-detail view of one tool row of the VIEWED transcript.
@@ -19335,10 +19363,11 @@ impl AppModel {
             }
         }
         if let Some(workspace) = &summary.workspace_cwd {
+            let display = self.display_path(workspace);
             if self.active_session.as_ref() == Some(&summary.session_id) {
                 if self.session_workspace_cwd.as_ref() != Some(workspace) {
                     self.session_workspace_cwd = Some(workspace.clone());
-                    self.session_dir = crate::live::workspace_display_path(workspace);
+                    self.session_dir = display.clone();
                     self.dirty = true;
                 }
             } else if let Some(entry) = self
@@ -19348,7 +19377,7 @@ impl AppModel {
                 && entry.workspace_cwd.as_ref() != Some(workspace)
             {
                 entry.workspace_cwd = Some(workspace.clone());
-                entry.dir = crate::live::workspace_display_path(workspace);
+                entry.dir = display;
                 self.dirty = true;
             }
         }

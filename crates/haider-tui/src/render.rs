@@ -1260,7 +1260,7 @@ fn image_reveal_hits(
         let TurnItem::Extension { kind, data } = &block.item else {
             continue;
         };
-        let Some((image, _)) = crate::projection::image_created_fact(kind, data) else {
+        let Some(image) = crate::projection::image_created(kind, data) else {
             continue;
         };
         let start = prefix_rows.saturating_add(cache.row_start(projection, index));
@@ -7092,6 +7092,7 @@ fn render_session(
         let max_scroll = render_file_review_document(
             review,
             selected,
+            &model.tool_path_context(),
             theme,
             frame,
             transcript_area,
@@ -12073,6 +12074,15 @@ fn render_aura(
                     Span::styled(text.as_str(), theme.dim_style()),
                 ]));
             }
+            TranscriptEntry::Workspace { event } => {
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        crate::toolview::workspace_event_text(event, &model.tool_path_context()),
+                        theme.dim_style(),
+                    ),
+                ]));
+            }
             TranscriptEntry::Refusal {
                 provider,
                 tool,
@@ -12633,6 +12643,7 @@ fn render_plan_document(
 fn render_file_review_document(
     review: &haider_protocol::file_review::FileReview,
     hunk_index: usize,
+    paths: &crate::toolview::PathContext,
     theme: &Theme,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -12652,7 +12663,7 @@ fn render_file_review_document(
         Span::raw(" "),
         Span::styled(format!("◇ {operation} "), theme.gold_style()),
         Span::styled("· ", theme.dim_style()),
-        Span::styled(review.path.clone(), theme.bright_style()),
+        Span::styled(paths.shorten(&review.path), theme.bright_style()),
         Span::styled(
             format!(
                 " · +{} -{} · hunk {}/{}{}",
@@ -13675,10 +13686,7 @@ fn render_composer(
                     "  "
                 };
                 Line::styled(
-                    format!(
-                        " {marker}@{}",
-                        crate::live::workspace_display_path(candidate)
-                    ),
+                    format!(" {marker}@{}", model.display_path(candidate)),
                     if index == completion.selected {
                         theme.menu_style()
                     } else {
@@ -13853,7 +13861,11 @@ fn talk_wave_spans(model: &AppModel, theme: &Theme) -> Vec<Span<'static>> {
 
 /// T2 — the `/talk` setup card's band lines. Handed STATES, never the
 /// key: the key field renders a capped mask length (the login-card law).
-fn talk_setup_lines(card: &crate::talk::TalkSetupCard, theme: &Theme) -> Vec<Line<'static>> {
+fn talk_setup_lines(
+    model: &AppModel,
+    card: &crate::talk::TalkSetupCard,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     use crate::talk::{KeyStage, RuntimeRowState, SetupStage, WhisperRowState};
     const MASK_CAP: usize = 32;
     let mut lines = Vec::new();
@@ -13923,10 +13935,9 @@ fn talk_setup_lines(card: &crate::talk::TalkSetupCard, theme: &Theme) -> Vec<Lin
                 let runtime_selected = card.selection == card.whisper.len();
                 let (runtime_text, runtime_style) = match &card.runtime {
                     RuntimeRowState::Unknown => ("checking…".to_owned(), theme.dim_style()),
-                    RuntimeRowState::Found(path) => (
-                        format!("✓ {}", crate::live::workspace_display_path(path)),
-                        theme.ok_style(),
-                    ),
+                    RuntimeRowState::Found(path) => {
+                        (format!("✓ {}", model.display_path(path)), theme.ok_style())
+                    }
                     RuntimeRowState::Missing(hint) => (
                         format!("✗ missing — ⏎ install · {hint}"),
                         theme.warn_style(),
@@ -14178,7 +14189,7 @@ fn composer_lines<'a>(
     // windows, no talk chip (its key field is a secret surface, exactly
     // the login card's reasoning).
     if let Some(card) = model.talk_setup.as_ref() {
-        let mut lines = talk_setup_lines(card, theme);
+        let mut lines = talk_setup_lines(model, card, theme);
         lines.truncate(usize::from(allocated).max(1));
         return (lines, None, Vec::new());
     }
@@ -14735,10 +14746,7 @@ fn render_shells_overlay(
                 Span::styled(format!("{marker} {kind} · {status} · "), theme.dim_style()),
                 Span::styled(shell.title.clone(), theme.text_style()),
                 Span::styled(
-                    format!(
-                        " · {}  ",
-                        crate::live::workspace_display_path(&shell.cwd_or_host)
-                    ),
+                    format!(" · {}  ", model.display_path(&shell.cwd_or_host)),
                     theme.dim_style(),
                 ),
                 Span::styled("[close]", theme.maroon_style()),
@@ -15087,7 +15095,10 @@ fn render_monitors_overlay(
             let state = model.monitor_row_state(monitor);
             let chip = crate::app::monitor_state_chip(state);
             let head = format!(" {marker} {} · ", monitor.monitor_id);
-            let source = crate::app::monitor_source_summary(monitor);
+            let source = crate::app::monitor_source_summary_with_context(
+                monitor,
+                &model.tool_path_context(),
+            );
             let mut spans = vec![
                 Span::styled(head.clone(), theme.dim_style()),
                 Span::styled(source.clone(), theme.text_style()),
@@ -15673,6 +15684,15 @@ fn transcript_lines<'a>(
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 Span::styled(text.as_str(), theme.dim_style()),
+            ]));
+        }
+        TranscriptEntry::Workspace { event } => {
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    crate::toolview::workspace_event_text(event, ctx.paths),
+                    theme.dim_style(),
+                ),
             ]));
         }
         TranscriptEntry::Refusal {
@@ -17135,7 +17155,9 @@ fn item_lines<'a>(
                     format!("  {}", note.summary()),
                     theme.gold_style(),
                 ));
-            } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
+            } else if let Some((_, label)) =
+                crate::projection::image_created_fact_with_context(kind, data, ctx.paths)
+            {
                 let suffix = label.strip_prefix("🖼 image").unwrap_or(&label);
                 lines.push(Line::from(vec![
                     Span::raw("  "),

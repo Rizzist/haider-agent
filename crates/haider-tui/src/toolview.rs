@@ -182,6 +182,28 @@ impl PathContext {
     }
 }
 
+/// Workspace receipts name the root with session homes, never relative to
+/// the workspace that the receipt just selected or declared unavailable.
+#[must_use]
+pub fn workspace_event_text(
+    event: &haider_protocol::workspace::WorkspaceEventPayload,
+    paths: &PathContext,
+) -> String {
+    use haider_protocol::workspace::WorkspaceEventPayload;
+    let display = |path: &str| crate::live::workspace_display_path_with_homes(path, &paths.homes);
+    match event {
+        WorkspaceEventPayload::WorkspaceUnavailable(unavailable) => format!(
+            "⚠ workspace unavailable — {} · {} ({})",
+            display(&unavailable.path),
+            unavailable.reason.as_str(),
+            unavailable.detail
+        ),
+        WorkspaceEventPayload::WorkspaceSelected(selected) => {
+            format!("⇄ workspace → {}", display(&selected.path))
+        }
+    }
+}
+
 /// One display line from arbitrary text: the first non-blank line with its
 /// whitespace runs collapsed, and ` …` when more non-blank lines follow — a
 /// heredoc never spills its body onto a header.
@@ -215,6 +237,8 @@ pub fn project_absolute_pattern(pattern: &str) -> String {
 fn is_absolute_pattern(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     pattern.starts_with('/')
+        || !cfg!(windows) && pattern.starts_with(r"\/")
+        || cfg!(windows) && pattern.starts_with('\\')
         || pattern.starts_with(r"\\")
         || pattern.starts_with(r"\??\")
         || (bytes.get(1) == Some(&b':') && matches!(bytes.get(2).copied(), Some(b'/' | b'\\')))
@@ -236,38 +260,32 @@ pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> 
     {
         return pattern.to_owned();
     }
-    // Glob expressions can place an absolute branch after negation, spaces
-    // or brace syntax. Project each such branch while retaining the syntax.
+    // Only syntax opened BEFORE a path can end that path. At top level,
+    // punctuation and whitespace belong to the whole absolute pattern.
     // A slash inside a relative pattern is not a branch boundary.
     let mut output = String::new();
     let mut rest = pattern;
     let mut boundary = true;
+    let mut enclosing = Vec::new();
+    let mut closed_expression = false;
     while !rest.is_empty() {
         if boundary && (is_absolute_pattern(rest) || rest.starts_with('~')) {
-            // Nested braces belong to this path (including volume GUIDs
-            // and account alternatives); only an outer separator ends it.
-            let mut depth = 0_u32;
-            let end = rest
-                .char_indices()
-                .find_map(|(index, ch)| {
-                    match ch {
-                        '{' | '(' => depth += 1,
-                        '}' | ')' if depth > 0 => depth -= 1,
-                        ',' | '}' | ')' | '|' | '\'' | '"' if depth == 0 => return Some(index),
-                        _ if ch.is_whitespace() && depth == 0 => {
-                            let next = rest[index..].trim_start();
-                            if is_absolute_pattern(next) || next.starts_with('~') {
-                                return Some(index);
-                            }
-                        }
-                        _ => {}
-                    }
-                    None
-                })
-                .unwrap_or(rest.len());
+            let end = pattern_branch_end(rest, enclosing.last().copied());
             let branch = &rest[..end];
             if let Some(user) = branch.strip_prefix('~') {
-                let name_end = user.find(['/', '\\']).unwrap_or(user.len());
+                let quote = enclosing
+                    .last()
+                    .copied()
+                    .filter(|ch| matches!(ch, '\'' | '"'));
+                let name_end = user
+                    .char_indices()
+                    .find_map(|(index, ch)| {
+                        let quoted_escape = !cfg!(windows)
+                            && ch == '\\'
+                            && quote.is_some_and(|quote| user[index + 1..].starts_with(quote));
+                        (matches!(ch, '/' | '\\') && !quoted_escape).then_some(index)
+                    })
+                    .unwrap_or(user.len());
                 if name_end > 0 {
                     output.push_str("~<user>");
                     output.push_str(&user[name_end..]);
@@ -275,22 +293,216 @@ pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> 
                     output.push_str(branch);
                 }
             } else {
-                output.push_str(&paths.shorten(branch));
+                output.push_str(&project_absolute_pattern_branch(branch, paths));
             }
             rest = &rest[end..];
             boundary = false;
+            closed_expression = false;
+        } else if boundary
+            && ["@(", "!(", "?(", "+(", "*("]
+                .iter()
+                .any(|syntax| rest.starts_with(syntax))
+        {
+            output.push_str(&rest[..2]);
+            rest = &rest[2..];
+            enclosing.push('(');
+            closed_expression = false;
         } else {
             let Some(ch) = rest.chars().next() else {
                 break;
             };
             output.push(ch);
             rest = &rest[ch.len_utf8()..];
-            boundary = ch.is_whitespace()
-                || matches!(ch, '{' | '(' | ',' | '|' | '\'' | '"')
-                || ch == '!' && boundary;
+            match ch {
+                '\'' | '"' if enclosing.last() == Some(&ch) => {
+                    enclosing.pop();
+                    boundary = false;
+                    closed_expression = enclosing.is_empty();
+                }
+                '{' | '\'' | '"' if boundary => {
+                    enclosing.push(ch);
+                    closed_expression = false;
+                }
+                '}' if enclosing.last() == Some(&'{') => {
+                    enclosing.pop();
+                    boundary = false;
+                    closed_expression = enclosing.is_empty();
+                }
+                ')' if enclosing.last() == Some(&'(') => {
+                    enclosing.pop();
+                    boundary = false;
+                    closed_expression = enclosing.is_empty();
+                }
+                ',' if enclosing.last() == Some(&'{') => {
+                    boundary = true;
+                    closed_expression = false;
+                }
+                '|' if enclosing.last() == Some(&'(') => {
+                    boundary = true;
+                    closed_expression = false;
+                }
+                '!' if boundary => {}
+                _ if ch.is_whitespace()
+                    && (boundary || closed_expression && enclosing.is_empty()) =>
+                {
+                    boundary = true;
+                }
+                _ => {
+                    boundary = false;
+                    closed_expression = false;
+                }
+            }
         }
     }
     output
+}
+
+fn project_absolute_pattern_branch(pattern: &str, paths: &PathContext) -> String {
+    // The filesystem glob matcher decodes backslash escapes. An escaped
+    // account parent or home spelling must not bypass the same projection.
+    // Drive/device/UNC patterns retain their Windows separator grammar.
+    if !cfg!(windows)
+        && (pattern.starts_with('/') || pattern.starts_with(r"\/"))
+        && !pattern.starts_with("//")
+        && pattern.contains('\\')
+    {
+        let mut decoded = String::with_capacity(pattern.len());
+        let mut escapes = Vec::new();
+        let mut chars = pattern.chars();
+        while let Some(ch) = chars.next() {
+            let literal = if ch == '\\' {
+                chars.next().unwrap_or(ch)
+            } else {
+                ch
+            };
+            if ch == '\\'
+                && matches!(
+                    literal,
+                    '\'' | '"'
+                        | ','
+                        | '|'
+                        | '{'
+                        | '}'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '*'
+                        | '?'
+                        | '!'
+                        | '+'
+                        | '@'
+                        | ' '
+                        | '\\'
+                )
+            {
+                escapes.push(decoded.len());
+            }
+            decoded.push(literal);
+        }
+        let display = paths.shorten(&decoded);
+        if display != decoded {
+            return preserve_pattern_escapes(&decoded, &display, &escapes);
+        }
+    }
+    paths.shorten(pattern)
+}
+
+// Shortening changes the root or account component. Preserve delimiter
+// escapes only in the unchanged prefix and tail, never in the masked name.
+fn preserve_pattern_escapes(decoded: &str, display: &str, escapes: &[usize]) -> String {
+    if display.starts_with('<') {
+        return display.to_owned();
+    }
+    let prefix: usize = decoded
+        .chars()
+        .zip(display.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum();
+    let mut suffix = 0;
+    for ((input_at, input), (output_at, output)) in decoded
+        .char_indices()
+        .rev()
+        .zip(display.char_indices().rev())
+    {
+        if input != output || input_at < prefix || output_at < prefix {
+            break;
+        }
+        suffix += input.len_utf8();
+    }
+    let mut restored = escapes
+        .iter()
+        .filter_map(|at| {
+            if *at < prefix {
+                Some(*at)
+            } else if *at >= decoded.len() - suffix {
+                Some(display.len() - (decoded.len() - *at))
+            } else {
+                None
+            }
+        })
+        .peekable();
+    let mut output = String::with_capacity(display.len() + escapes.len());
+    for (index, ch) in display.char_indices() {
+        if restored.peek() == Some(&index) {
+            output.push('\\');
+            restored.next();
+        }
+        output.push(ch);
+    }
+    output
+}
+
+fn pattern_branch_end(pattern: &str, enclosing: Option<char>) -> usize {
+    let Some(enclosing) = enclosing else {
+        return pattern.len();
+    };
+    // Braces within a path include volume GUIDs and account alternatives.
+    // They cannot close the expression that encloses the branch.
+    let mut nested = Vec::new();
+    // POSIX glob syntax can escape a delimiter. Windows backslashes are
+    // path separators, including one immediately before a closing quote.
+    let escapes = !cfg!(windows)
+        && (pattern.starts_with('/') || pattern.starts_with(r"\/") || pattern.starts_with('~'))
+        && !pattern.starts_with("//");
+    let mut escaped = false;
+    for (index, ch) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if escapes && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(enclosing, '\'' | '"') {
+            if ch == enclosing {
+                return index;
+            }
+        } else {
+            match ch {
+                ',' | '}' if nested.is_empty() && enclosing == '{' => return index,
+                '|' | ')' if nested.is_empty() && enclosing == '(' => return index,
+                '{' => nested.push(ch),
+                '(' if pattern[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| matches!(ch, '@' | '!' | '?' | '+' | '*')) =>
+                {
+                    nested.push(ch);
+                }
+                '}' if nested.last() == Some(&'{') => {
+                    nested.pop();
+                }
+                ')' if nested.last() == Some(&'(') => {
+                    nested.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    pattern.len()
 }
 
 /// The FULL command a shell-ish call ran: `command`/`cmd`, or an `argv`
@@ -352,7 +564,7 @@ pub fn header_args(name: &str, args: &serde_json::Value, paths: &PathContext) ->
             }
             if let Some(glob) = glob {
                 text.push(' ');
-                text.push_str(&glob);
+                text.push_str(&one_line(&glob));
             }
             text
         }

@@ -3365,7 +3365,7 @@ impl LiveDriver {
                                 .as_ref()
                                 .map(|metadata| metadata.cwd.as_str())
                         })
-                        .map(workspace_display_path);
+                        .map(|path| model.display_path(path));
                     if let Some(metadata) = summary.metadata.as_ref() {
                         self.workspace_paths
                             .insert(summary.session_id.clone(), metadata.cwd.clone());
@@ -3552,7 +3552,7 @@ impl LiveDriver {
                 cwd,
                 model: model_name,
             } => {
-                let cwd_display = workspace_display_path(&cwd);
+                let cwd_display = model.display_path(&cwd);
                 self.binding_worker_generation = Some(worker_generation);
                 self.retire(&command_id);
                 self.generations.insert(session.clone(), worker_generation);
@@ -3971,11 +3971,11 @@ impl LiveDriver {
                     },
                 );
                 if model.active_session.as_ref() == Some(&session) {
-                    model.session_dir = workspace_display_path(&path);
+                    model.session_dir = model.display_path(&path);
                     model.session_workspace_cwd = Some(path.clone());
                     model.flash = Some(format!(
                         "· workspace re-rooted → {}",
-                        workspace_display_path(&path)
+                        model.display_path(&path)
                     ));
                     model.dirty = true;
                 }
@@ -6710,8 +6710,7 @@ impl LiveDriver {
                     {
                         Ok(next) => {
                             model.cwd = next.leaf.clone();
-                            model.pending_workspace_display =
-                                Some(workspace_display_path(&next.leaf));
+                            model.pending_workspace_display = Some(model.display_path(&next.leaf));
                             model.pending_workspace_allocation = Some(next);
                         }
                         Err(_) => {
@@ -7915,7 +7914,7 @@ pub fn workspace_display_path(path: &str) -> String {
     haider_client::launch_origin::display_path(std::path::Path::new(path))
 }
 
-/// Same projection with injected home candidates for executable tests.
+/// Same projection with an explicit session or launcher home snapshot.
 #[must_use]
 pub fn workspace_display_path_with_homes(path: &str, homes: &[std::path::PathBuf]) -> String {
     haider_client::launch_origin::display_path_with_homes(std::path::Path::new(path), homes)
