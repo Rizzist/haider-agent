@@ -2795,6 +2795,19 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
         registry.clear_discovered_models(provider);
         registry.models_unsupported(provider, "server returned 404 for /models".into());
         assert_policy(true);
+        if !offline {
+            let summary = registry.summary(provider, &|_| true).expect("unverified");
+            assert_eq!(
+                summary.inventory_authority,
+                haider_rpc::ModelInventoryAuthorityWire::Advisory
+            );
+            assert!(
+                summary
+                    .availability_reason
+                    .expect("reason")
+                    .contains("configured (unverified)")
+            );
+        }
         for (model, age, selectable) in [
             ("deployment", u64::MAX, true),
             ("deployment", 1, true),
@@ -2965,4 +2978,55 @@ fn unsupported_discovery_survives_restart_and_uncertainty_only_for_its_owner() {
             .expect("negative")
             .model_is_selectable("deployment")
     );
+}
+
+#[test]
+fn unsupported_adapters_accept_explicit_models_without_fabricating_inventory() {
+    for provider in [OPENAI_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME] {
+        let profile = builtin_or_unknown(provider, "unused");
+        assert!(catalog_source_for_profile(&profile).is_none());
+        let registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            vec![profile],
+            model_source([]),
+        )
+        .expect("registry");
+        let summary = registry.summary(provider, &|_| true).expect("healthy");
+        assert!(summary.models.is_empty());
+        assert!(summary.model_details.is_empty());
+        assert!(summary.default_model.is_none());
+        assert_eq!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::Configured
+        );
+        assert_eq!(
+            summary.inventory_authority,
+            haider_rpc::ModelInventoryAuthorityWire::Advisory
+        );
+        assert!(summary.model_is_selectable("synthetic-explicit-model"));
+        assert!(
+            summary
+                .availability_reason
+                .as_deref()
+                .expect("reason")
+                .contains("configured (unverified)")
+        );
+        assert!(
+            crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                .validate_selection_with_status(provider, None, "synthetic-explicit-model")
+                .is_ok()
+        );
+        assert!(
+            !registry
+                .summary(provider, &|_| false)
+                .expect("credential negative")
+                .model_is_selectable("synthetic-explicit-model")
+        );
+        assert!(
+            registry
+                .validate_default_model(provider, "synthetic-explicit-model")
+                .is_err(),
+            "an explicit passthrough must not fabricate a picker/default row"
+        );
+    }
 }

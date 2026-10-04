@@ -1483,8 +1483,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         has_credential: &dyn Fn(&str) -> bool,
     ) -> ProviderSummaryWire {
         let inventory = self.model_source.inventory(&profile.provider_id);
-        let inventory = if !profile.configured_models.is_empty()
-            && !offline_inventory(profile)
+        let inventory = if !offline_inventory(profile)
             && !haider_provider::has_subscription_static_catalog(&profile.provider_id)
             && catalog_source_for_profile(profile).is_none()
             && matches!(
@@ -1509,6 +1508,9 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                     | ProviderInventory::Rejected { .. }
             );
         let configured_catalog = configured_catalog_fallback(profile, &inventory);
+        let unverified_catalog = matches!(inventory, ProviderInventory::Unsupported { .. })
+            && !offline_catalog
+            && !haider_provider::has_subscription_static_catalog(&profile.provider_id);
         let mut rows = if offline_catalog || configured_catalog {
             configured_rows(profile)
         } else {
@@ -1532,7 +1534,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 && haider_provider::has_subscription_static_catalog(&profile.provider_id))
         {
             haider_rpc::ModelInventoryWire::Static
-        } else if configured_catalog {
+        } else if configured_catalog || unverified_catalog {
             haider_rpc::ModelInventoryWire::Configured
         } else {
             inventory.provenance()
@@ -1555,8 +1557,11 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             summary.availability = ProviderAvailabilityWire::Unavailable;
             summary.availability_reason = Some(inventory.provenance().description().to_owned());
         }
-        if configured_catalog {
-            if profile.enabled && profile.api_family != ProviderApiFamilyWire::Unknown {
+        if configured_catalog || unverified_catalog {
+            if profile.enabled
+                && profile.api_family != ProviderApiFamilyWire::Unknown
+                && profile.provenance != ProviderProvenance::Unknown
+            {
                 summary.availability_reason = Some(match &inventory {
                     ProviderInventory::Unsupported { reason } => {
                         format!("configured (unverified): {reason}")
@@ -1908,7 +1913,9 @@ fn provider_summary(
     );
     let available = profile.enabled
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
-        && !discovered_models.is_empty()
+        && profile.provenance != ProviderProvenance::Unknown
+        && (!discovered_models.is_empty()
+            || matches!(inventory, haider_rpc::ModelInventoryWire::Configured))
         && seeded_ready
         && (profile.auth_requirement == ProviderAuthRequirementWire::None || credentialed)
         && !configured_unavailable
@@ -1976,6 +1983,15 @@ fn provider_summary(
             }
         })
     };
+    let inventory_authority = if matches!(inventory, haider_rpc::ModelInventoryWire::Configured) {
+        haider_rpc::ModelInventoryAuthorityWire::Advisory
+    } else {
+        match profile.provenance {
+            ProviderProvenance::BuiltIn => haider_rpc::ModelInventoryAuthorityWire::Authoritative,
+            ProviderProvenance::Custom => haider_rpc::ModelInventoryAuthorityWire::Advisory,
+            ProviderProvenance::Unknown => haider_rpc::ModelInventoryAuthorityWire::Unknown,
+        }
+    };
     ProviderSummaryWire {
         catalog_scope: None,
         configured_models: profile.configured_models.clone(),
@@ -2011,11 +2027,7 @@ fn provider_summary(
                 haider_rpc::ProviderCatalogKindWire::Adapter
             }
         },
-        inventory_authority: match profile.provenance {
-            ProviderProvenance::BuiltIn => haider_rpc::ModelInventoryAuthorityWire::Authoritative,
-            ProviderProvenance::Custom => haider_rpc::ModelInventoryAuthorityWire::Advisory,
-            ProviderProvenance::Unknown => haider_rpc::ModelInventoryAuthorityWire::Unknown,
-        },
+        inventory_authority,
         auth_methods,
         availability: if available {
             ProviderAvailabilityWire::Available

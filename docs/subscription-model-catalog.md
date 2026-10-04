@@ -137,7 +137,9 @@ successful list remains usable after its 15-minute freshness window, and later
 503 or timeout results keep it selectable. A first failed fetch does not clear
 the unavailable-until-fetched state. HTTP 404/405
 or a typed unsupported listing shows **configured (unverified)**. Adapter kinds
-without a discovery API have that same label immediately. That unverified
+without a discovery API have that same label immediately. They accept explicit
+models without manufacturing picker rows or defaults. Configured-unverified
+inventory is advisory for every provider kind. That unverified
 inventory remains excluded from automatic failover and promotion. Maintained
 offline and OAuth catalogs retain their permanent rows with healthy credentials.
 
