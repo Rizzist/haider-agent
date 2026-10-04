@@ -832,31 +832,38 @@ fn missing_windows_parent_alias_cannot_supply_a_canonical_identity() {
     use std::io::{Error, ErrorKind};
     // The resolver is injected; the host-native root only supplies portable
     // Path traversal. Win32 component semantics are selected explicitly.
-    let root = std::env::temp_dir();
-    for component in [".. ", "...", " . . "] {
-        let path = root.join("missing").join(component).join("Users/bob/leaf");
-        let resolve = |candidate: &Path| {
-            if candidate == root {
-                Ok(root.join("canonical"))
-            } else {
-                Err(Error::from(ErrorKind::NotFound))
-            }
-        };
-        assert_eq!(
-            canonicalize_existing_prefix_with(&path, &resolve, true),
-            None,
-            "{component}"
-        );
-        assert_eq!(
-            canonicalize_masking_prefix_with(&path, &resolve, true).resolved,
-            None,
-            "{component}"
-        );
-        // POSIX permits these literal directory names; they remain a tail.
-        assert!(
-            canonicalize_existing_prefix_with(&path, &resolve, false).is_some(),
-            "{component}"
-        );
+    // Namespace suffixes preserve literal names instead of using Win32
+    // trimming. The parent-alias guard must also protect those requests.
+    for root in [
+        std::env::temp_dir(),
+        Path::new("//?/C:/Users").to_path_buf(),
+        Path::new("//./C:/Users").to_path_buf(),
+    ] {
+        for component in [".. ", "...", " . . "] {
+            let path = root.join("missing").join(component).join("Users/bob/leaf");
+            let resolve = |candidate: &Path| {
+                if candidate == root {
+                    Ok(root.join("canonical"))
+                } else {
+                    Err(Error::from(ErrorKind::NotFound))
+                }
+            };
+            assert_eq!(
+                canonicalize_existing_prefix_with(&path, &resolve, true),
+                None,
+                "{component}"
+            );
+            assert_eq!(
+                canonicalize_masking_prefix_with(&path, &resolve, true).resolved,
+                None,
+                "{component}"
+            );
+            // POSIX permits these literal directory names; they remain a tail.
+            assert!(
+                canonicalize_existing_prefix_with(&path, &resolve, false).is_some(),
+                "{component}"
+            );
+        }
     }
 }
 
