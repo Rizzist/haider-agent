@@ -16222,7 +16222,7 @@ async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_va
                 },
                 inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
                 catalog: haider_rpc::ProviderCatalogKindWire::Authenticated,
-                ..keyless_summary("gemini", GEMINI_API_BASE_URL)
+                ..keyless_summary("gemini", haider_provider::GEMINI_API_BASE_URL)
             },
         ],
     );
