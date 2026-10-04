@@ -57,7 +57,10 @@ fn model_source(
     for (provider, models) in entries {
         source.replace(
             provider.to_owned(),
-            ProviderInventory::Configured { models },
+            ProviderInventory::Fetched {
+                models,
+                fetched_at_ms: u64::MAX,
+            },
         );
     }
     source
@@ -562,7 +565,7 @@ fn gemini_is_a_builtin_generate_content_api_key_provider() {
     )
     .expect("Gemini registry");
     let summary = registry
-        .summary(GEMINI_PROVIDER_NAME, &|_| false)
+        .summary(GEMINI_PROVIDER_NAME, &|_| true)
         .expect("Gemini summary");
     assert_eq!(
         summary.api_family,
@@ -572,6 +575,12 @@ fn gemini_is_a_builtin_generate_content_api_key_provider() {
     assert_eq!(summary.auth_methods, vec![AuthMethod::ApiKey]);
     assert_eq!(summary.models, vec!["gemini-2.5-flash"]);
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+    assert!(
+        !registry
+            .summary(GEMINI_PROVIDER_NAME, &|_| false)
+            .expect("missing credential")
+            .model_is_selectable("gemini-2.5-flash")
+    );
     assert_eq!(
         summary.inventory_authority,
         haider_rpc::ModelInventoryAuthorityWire::Authoritative
@@ -630,6 +639,14 @@ fn google_antigravity_registers_as_an_acp_agent_with_no_endpoint_and_no_seeded_m
         "nothing is offered until the authenticated agent publishes a catalog"
     );
 
+    assert_eq!(
+        registry
+            .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| true)
+            .expect("healthy but unfetched")
+            .availability,
+        ProviderAvailabilityWire::Unavailable
+    );
+
     // Once discovery publishes the agent's catalog, every reasoning variant
     // survives as its own row and the provider lights up.
     let discovered = model_source([(
@@ -650,7 +667,7 @@ fn google_antigravity_registers_as_an_acp_agent_with_no_endpoint_and_no_seeded_m
     )
     .expect("Antigravity registry with a catalog");
     let summary = registry
-        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| false)
+        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| true)
         .expect("Antigravity summary with a catalog");
     assert_eq!(
         summary.models,
@@ -727,7 +744,7 @@ fn admitting_the_supervised_agent_leaves_the_api_key_gemini_provider_unchanged()
     )
     .expect("both Google lanes register side by side");
     let gemini_summary = registry
-        .summary(GEMINI_PROVIDER_NAME, &|_| false)
+        .summary(GEMINI_PROVIDER_NAME, &|_| true)
         .expect("Gemini summary");
     assert_eq!(
         gemini_summary.api_family,
@@ -744,7 +761,7 @@ fn admitting_the_supervised_agent_leaves_the_api_key_gemini_provider_unchanged()
         ProviderAvailabilityWire::Available
     );
     let antigravity_summary = registry
-        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| false)
+        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| true)
         .expect("Antigravity summary");
     assert_eq!(antigravity_summary.models, vec!["gemini-3.8-flash-high"]);
     assert_ne!(gemini_summary.models, antigravity_summary.models);
@@ -1067,7 +1084,7 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
     let registry = ProviderRegistry::new(store, Vec::new(), source).expect("registry");
 
     let summary = registry
-        .summaries(&|_| false)
+        .summaries(&|_| true)
         .into_iter()
         .next()
         .expect("summary");
@@ -1079,6 +1096,11 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
     );
     assert_eq!(summary.default_model.as_deref(), Some("frontier-a"));
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+    let unavailable = registry
+        .summary("custom", &|_| false)
+        .expect("credential negative");
+    assert_eq!(unavailable.models, summary.models);
+    assert!(!unavailable.model_is_selectable("frontier-a"));
 }
 
 /// A custom OpenAI-compatible model id is endpoint vocabulary, while the
@@ -2160,7 +2182,13 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
         stale.availability,
         haider_rpc::ProviderAvailabilityWire::Available
     );
-    assert_eq!(stale.availability_reason, None);
+    assert!(
+        stale
+            .availability_reason
+            .as_deref()
+            .expect("visible uncertainty")
+            .contains("temporary outage")
+    );
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
@@ -2602,6 +2630,7 @@ fn removable_provider_profile_for_catalog_test() -> ProviderProfileV1 {
     profile.base_url = Some("http://127.0.0.1:19373/v1".into());
     profile.auth_requirement = ProviderAuthRequirementWire::None;
     profile.configured_models.clear();
+    profile.enabled = true;
     profile
 }
 

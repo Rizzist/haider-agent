@@ -331,3 +331,51 @@ fn catalog_selection_policy_is_shared_across_provider_kinds_and_uncertainty() {
         );
     }
 }
+
+#[test]
+fn static_catalog_does_not_admit_unfetched_extra_deployments() {
+    let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider":"synthetic", "api_family":"openai_chat_completions", "models":["known-static"],
+        "model_details":[{"name":"known-static","source":"static"}],
+        "static_models":["known-static"], "configured_models":["deployment"],
+        "auth_methods":["api_key"], "availability":"available", "enabled":true,
+        "inventory_authority":"authoritative"
+    }))
+    .expect("summary");
+    // Assign the typed inventory so this regression also pins policy rather
+    // than relying on an unrelated JSON representation.
+    summary.inventory = haider_rpc::ModelInventoryWire::Static;
+    assert!(summary.model_is_selectable("known-static"));
+    assert!(!summary.model_is_selectable("deployment"));
+    summary.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "synthetic 503".into(),
+    };
+    summary.availability_reason = Some("synthetic 503 — static catalog available".into());
+    assert!(summary.model_is_selectable("known-static"));
+    assert!(!summary.model_is_selectable("deployment"));
+    assert!(
+        summary
+            .selection_reason(Some("deployment"))
+            .expect("reason")
+            .contains("503")
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "refresh due".into(),
+    };
+    assert!(
+        summary.model_is_selectable("deployment"),
+        "prior successful listing is uncertainty"
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+    summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    assert!(
+        summary.model_is_selectable("deployment"),
+        "unsupported discovery is selectable"
+    );
+    summary.availability = ProviderAvailabilityWire::Unavailable;
+    assert!(
+        !summary.model_is_selectable("known-static"),
+        "credential rejection still wins"
+    );
+}

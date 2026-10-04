@@ -318,25 +318,14 @@ async fn explicit_model_checks_resolved_credential_before_adapter_construction()
         if let Ok(adapter) = &result {
             exercise_provider_round(adapter, &metadata.model).await;
         }
-        if kind == "advisory" {
-            assert!(
-                result.is_ok(),
-                "ordinary explicit custom passthrough is preserved"
-            );
-            assert_eq!(provider.requests().len(), 1);
-        } else {
-            let error = result.err().expect("cannot borrow B's eligibility for A");
-            assert_eq!(error.code, ErrorCode::ProviderError);
-            assert!(error.retryable);
-            assert!(provider.requests().is_empty());
-        }
+        let error = result.err().expect("cannot borrow B's eligibility for A");
+        assert_eq!(error.code, ErrorCode::ProviderError);
+        assert!(error.retryable);
+        assert!(provider.requests().is_empty());
         let fresh = factory.resolve_for_turn(&metadata).await;
         exercise_admitted_turn(&fresh).await;
         assert!(fresh.is_ok(), "matching resolved credential remains usable");
-        assert_eq!(
-            provider.requests().len(),
-            if kind == "advisory" { 2 } else { 1 }
-        );
+        assert_eq!(provider.requests().len(), 1);
         // Spelling the already-current effective origin explicitly does not
         // create a different credential or invalidate its discovery result.
         let mut same_route = metadata;
@@ -344,10 +333,7 @@ async fn explicit_model_checks_resolved_credential_before_adapter_construction()
         let routed = factory.resolve_for_turn(&same_route).await;
         exercise_admitted_turn(&routed).await;
         assert!(routed.is_ok(), "same effective origin remains available");
-        assert_eq!(
-            provider.requests().len(),
-            if kind == "advisory" { 3 } else { 2 }
-        );
+        assert_eq!(provider.requests().len(), 2);
     }
 }
 

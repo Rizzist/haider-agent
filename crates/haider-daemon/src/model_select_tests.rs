@@ -872,8 +872,8 @@ fn configured_azure_selection_reports_discovery_reason_and_accepts_unsupported_l
     assert!(
         authority(&[], vec![azure])
             .validate_selection("azure", None, "my-deployment")
-            .is_ok(),
-        "ordinary advisory compatible servers keep their passthrough rule"
+            .is_err(),
+        "all configured providers require the same discovery evidence"
     );
 }
 
@@ -985,11 +985,25 @@ fn selection_scope_follows_the_session_route_instead_of_borrowing_the_active_acc
             "provider_base_url": if route == "endpoint" { "http://127.0.0.1:23457/v1" } else { "http://127.0.0.1:23456/v1" },
             "account_alias": if route == "account" { "other" } else { "work" },
         })).expect("typed session metadata");
-        let selected =
+        let mut selected =
             authority(&["custom"], vec![profile]).scoped_to_session_route(&current, "custom");
+        if retired {
+            assert!(
+                matches!(
+                    selected.validate_selection_with_status("custom", None, "my-deployment"),
+                    Err(SelectionRefusal::ProviderUnavailable { .. })
+                ),
+                "a new route cannot borrow the previous route listing"
+            );
+            // Unsupported discovery on this route is independent positive
+            // evidence for configured passthrough, without A's fetched data.
+            selected.summaries[0].availability = ProviderAvailabilityWire::Available;
+            selected.summaries[0].availability_reason =
+                Some("configured (unverified): server returned 405 for /models".into());
+        }
         let resolved = selected
             .validate_selection_with_status("custom", None, "my-deployment")
-            .expect("explicit declaration remains usable");
+            .expect("matching list or route-owned unsupported evidence");
         if retired {
             assert!(!selected.catalog_key_is_current("custom", "synthetic-account-A"));
             assert_eq!(resolved.context_window, None);

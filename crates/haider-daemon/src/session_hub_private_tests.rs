@@ -2389,6 +2389,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     };
     let mut provider = provider_summary("fake");
     provider.models = vec!["fake-v1".into()];
+    provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     provider.default_model = Some("fake-v1".into());
     let active_other = haider_protocol::credential::CredentialDescriptor {
         incarnation: 0,
@@ -2400,6 +2401,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     };
     let mut other_provider = provider_summary("other");
     other_provider.models = vec!["other-v1".into()];
+    other_provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     other_provider.default_model = Some("other-v1".into());
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
@@ -2498,6 +2500,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
     let vault: Arc<dyn haider_accounts::Vault> = Arc::new(haider_accounts::MemoryVault::default());
     let mut provider = provider_summary("fake");
     provider.models = vec!["fake-v1".into()];
+    provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     provider.default_model = Some("fake-v1".into());
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,

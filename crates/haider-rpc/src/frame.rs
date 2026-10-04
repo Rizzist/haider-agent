@@ -1591,7 +1591,13 @@ impl ProviderSummaryWire {
     pub fn selection_availability(&self, model: Option<&str>) -> ProviderAvailabilityWire {
         if !self.enabled
             || model.is_some_and(|model| {
-                matches!(self.inventory, ModelInventoryWire::Fetched { .. })
+                (matches!(self.inventory, ModelInventoryWire::Fetched { .. })
+                    || (matches!(
+                        self.inventory,
+                        ModelInventoryWire::Static | ModelInventoryWire::Unavailable { .. }
+                    ) && self.inventory_authority
+                        == ModelInventoryAuthorityWire::Authoritative
+                        && self.has_static_models()))
                     && self.configured_models.iter().any(|name| name == model)
                     && !self.models.iter().any(|name| name == model)
             })
@@ -1610,14 +1616,20 @@ impl ProviderSummaryWire {
         if self.availability == ProviderAvailabilityWire::Available
             && self.selection_availability(model) == ProviderAvailabilityWire::Unavailable
         {
-            return Some("deployment is absent from the latest model list".into());
+            return Some(
+                if matches!(self.inventory, ModelInventoryWire::Fetched { .. }) {
+                    "deployment is absent from the latest model list".into()
+                } else {
+                    self.availability_reason.clone().unwrap_or_else(|| {
+                        "model list not fetched for this deployment — fetch models".into()
+                    })
+                },
+            );
         }
         self.availability_reason
             .clone()
             .or_else(|| match &self.inventory {
-                ModelInventoryWire::Stale { reason, .. } if !self.has_static_models() => {
-                    Some(format!("{reason} — refresh due"))
-                }
+                ModelInventoryWire::Stale { reason, .. } => Some(format!("{reason} — refresh due")),
                 _ => None,
             })
     }

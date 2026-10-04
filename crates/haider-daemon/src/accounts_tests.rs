@@ -2675,7 +2675,15 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
         else {
             panic!("out-of-scope profile `{provider}` must not resolve keyless");
         };
-        assert_eq!(error.code, ErrorCode::CredentialMissing, "{provider}");
+        assert_eq!(
+            error.code,
+            if provider == "ollama-off" {
+                ErrorCode::ProviderError
+            } else {
+                ErrorCode::CredentialMissing
+            },
+            "{provider}"
+        );
     }
 }
 
@@ -7239,6 +7247,13 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let endpoint_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let providers = ProviderRegistry::new(
+        Box::new(TestProviderStore::default()) as Box<dyn ProviderRegistryStoreLike>,
+        Vec::new(),
+        model_source.clone(),
+    )
+    .expect("synthetic provider registry");
     let mut actor = start_account_actor(AccountActorConfig {
         store: store.clone(),
         accounts,
@@ -7249,7 +7264,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "provider-mutations".into(),
         default_model: "unused".into(),
-        providers: test_provider_registry(),
+        providers,
         provider_endpoint_validator: Arc::new(CanonicalEndpointValidator {
             calls: Arc::clone(&endpoint_calls),
         }),
@@ -7284,7 +7299,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
                 provider: "custom".into(),
                 api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
                 origin: Some("https://models.example.invalid/".into()),
-                auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+                auth_requirement: Some(ProviderAuthRequirementWire::None),
                 enabled: true,
                 trust: Some(haider_rpc::ProviderTrustWire::Full),
                 models: vec!["model-a".into(), "model-b".into()],
@@ -7318,6 +7333,28 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
     }
     assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
 
+    model_source.replace(
+        "custom".into(),
+        ProviderInventory::Fetched {
+            models: ["model-a", "model-b"]
+                .into_iter()
+                .map(|slug| DiscoveredModel {
+                    slug: slug.into(),
+                    display_name: slug.into(),
+                    context_window: None,
+                    max_output_tokens: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    use_responses_lite: None,
+                    extensions: None,
+                })
+                .collect(),
+            fetched_at_ms: u64::MAX,
+        },
+    );
     let set_default = |command_id: &str, request_id: &str, model: &str, expected_revision| {
         AccountCommand::SetDefaultModel(Box::new(SetDefaultModelJob {
             command_id: command_id.into(),
@@ -7383,6 +7420,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
     ));
     assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
 
+    model_source.remove("custom");
     commands
         .send(set_default(
             "set-custom-default-b",
@@ -16171,10 +16209,22 @@ async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_va
     let management = ManagementSnapshot::new(
         1,
         vec![supervised.clone(), gemini.clone()],
-        vec![antigravity_summary(
-            &["gemini-3.8-flash-high"],
-            Some("gemini-3.8-flash-high"),
-        )],
+        vec![
+            antigravity_summary(&["gemini-3.8-flash-high"], Some("gemini-3.8-flash-high")),
+            ProviderSummaryWire {
+                provider: GEMINI_PROVIDER_NAME.into(),
+                api_family: ProviderApiFamilyWire::GeminiGenerateContent,
+                auth_methods: vec![AuthMethod::ApiKey],
+                models: vec!["gemini-2.5-flash".into()],
+                default_model: Some("gemini-2.5-flash".into()),
+                inventory: haider_rpc::ModelInventoryWire::Fetched {
+                    fetched_at_ms: u64::MAX,
+                },
+                inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
+                catalog: haider_rpc::ProviderCatalogKindWire::Authenticated,
+                ..keyless_summary("gemini", GEMINI_API_BASE_URL)
+            },
+        ],
     );
     let factory = AccountsProviderFactory::new_with_management(
         Arc::new(StdMutex::new(vec![supervised.clone(), gemini.clone()])),

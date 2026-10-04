@@ -1485,6 +1485,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         let inventory = self.model_source.inventory(&profile.provider_id);
         let inventory = if !offline_inventory(profile)
             && !haider_provider::has_subscription_static_catalog(&profile.provider_id)
+            && matches!(
+                profile.api_family,
+                ProviderApiFamilyWire::OpenAiResponses
+                    | ProviderApiFamilyWire::OpenAiChatCompletions
+                    | ProviderApiFamilyWire::AnthropicMessages
+            )
             && catalog_source_for_profile(profile).is_none()
             && matches!(
                 inventory,
@@ -1508,9 +1514,8 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                     | ProviderInventory::Rejected { .. }
             );
         let configured_catalog = configured_catalog_fallback(profile, &inventory);
-        let unverified_catalog = matches!(inventory, ProviderInventory::Unsupported { .. })
-            && !offline_catalog
-            && !haider_provider::has_subscription_static_catalog(&profile.provider_id);
+        let unverified_catalog =
+            matches!(inventory, ProviderInventory::Unsupported { .. }) && !offline_catalog;
         let mut rows = if offline_catalog || configured_catalog {
             configured_rows(profile)
         } else {
@@ -1518,7 +1523,10 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         };
         // A stale list cannot rule out an explicit deployment. Preserve the
         // fetched metadata and add only missing configuration-owned rows.
-        if matches!(inventory, ProviderInventory::Stale { .. }) {
+        if matches!(
+            inventory,
+            ProviderInventory::Stale { .. } | ProviderInventory::Unsupported { .. }
+        ) {
             for row in configured_rows(profile) {
                 if !rows.iter().any(|known| known.model.slug == row.model.slug) {
                     rows.push(row);
@@ -1956,9 +1964,12 @@ fn provider_summary(
     };
     let availability_reason = if available {
         match &inventory {
-            haider_rpc::ModelInventoryWire::Stale { reason, .. } if !seeded => {
+            haider_rpc::ModelInventoryWire::Stale { reason, .. } => {
                 Some(format!("{reason} — refreshing in background"))
             }
+            haider_rpc::ModelInventoryWire::Unavailable { reason } if static_subscription => Some(
+                format!("{reason} — static catalog available; retry model-list fetch"),
+            ),
             _ => None,
         }
     } else {
