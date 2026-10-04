@@ -676,9 +676,9 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     }
 
     /// Projects every profile into its wire summary. `has_credential`
-    /// answers "does at least one account exist for this provider" — the
-    /// G4b seeded-inventory availability rule consults it (decision 6), so
-    /// every caller must state its account truth explicitly.
+    /// answers whether the active account has a usable credential. Every
+    /// caller must state that account health explicitly; catalog freshness
+    /// supplies separate availability evidence.
     pub(crate) fn summaries(
         &self,
         has_credential: &dyn Fn(&str) -> bool,
@@ -1689,7 +1689,7 @@ fn provider_summary(
     profile: &ProviderProfileV1,
     model_details: Vec<ModelDetailWire>,
     offline_catalog: bool,
-    configured_fallback: bool,
+    configured_unavailable: bool,
     credentialed: bool,
     inventory: haider_rpc::ModelInventoryWire,
 ) -> ProviderSummaryWire {
@@ -1725,7 +1725,7 @@ fn provider_summary(
         && !discovered_models.is_empty()
         && seeded_ready
         && (profile.auth_requirement == ProviderAuthRequirementWire::None || credentialed)
-        && !configured_fallback
+        && !configured_unavailable
         && (inventory_is_current || static_subscription);
     let default_model = if matches!(profile.provenance, ProviderProvenance::Custom)
         && matches!(
