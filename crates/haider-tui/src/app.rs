@@ -12193,6 +12193,7 @@ impl AppModel {
     /// resolution every surface renders.
     #[must_use]
     pub fn context_meter(&self) -> crate::context_meter::ContextMeter {
+        let identity = self.display_identity();
         // A snapshot's window may stand in for an undeclared one only while
         // the catalog has no row for the current model (not yet loaded, or
         // a model outside it). When the catalog lists the model without a
@@ -12203,15 +12204,16 @@ impl AppModel {
         let snapshot_predates_model = self.meter_snapshot_before_switch.is_some()
             && self.projection.latest_footprint() == self.meter_snapshot_before_switch.as_ref();
         let snapshot_window_allowed = self.mode.fabricates_locally()
-            || !(snapshot_predates_model
-                || !self.current_catalog_matches_session_route()
-                || self
-                    .providers
-                    .model_listed(&self.identity.provider, &self.identity.model_short));
+            || (!identity.model_short.is_empty()
+                && !(snapshot_predates_model
+                    || !self.current_catalog_matches_session_route()
+                    || self
+                        .providers
+                        .model_listed(&identity.provider, &identity.model_short)));
         crate::context_meter::ContextMeter::resolve(
             self.projection.latest_footprint(),
             self.projection.context_tokens(),
-            self.identity.context_window,
+            identity.context_window,
             snapshot_window_allowed,
             |window| {
                 crate::context_meter::derived_reserved_output(

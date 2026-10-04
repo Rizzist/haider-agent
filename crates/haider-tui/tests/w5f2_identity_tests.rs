@@ -707,6 +707,7 @@ fn private_choice_before_first_accounts_reply_is_not_stamped_as_replacement_owne
     );
     assert!(model.identity.model_short.is_empty());
     assert_eq!(model.identity.context_window, 0);
+    assert_eq!(model.context_meter().window, None);
     assert!(
         !model
             .model_picker_rows()
@@ -1731,8 +1732,10 @@ fn restored_private_preference_is_hidden_until_live_owner_is_proven() {
             scope_known,
         };
         model.restore_last_model_pick(&pick);
+        model.identity.context_window = 123_456;
         assert!(model.display_identity().model_short.is_empty());
         assert_eq!(model.display_identity().context_window, 0);
+        assert_eq!(model.context_meter().window, None);
         assert_eq!(model.composer_identity(118), None);
         let mut driver = LiveDriver::new("restored-owner");
         pass(
