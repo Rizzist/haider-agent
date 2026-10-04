@@ -7333,28 +7333,26 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
     }
     assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
 
-    model_source.replace(
-        "custom".into(),
-        ProviderInventory::Fetched {
-            models: ["model-a", "model-b"]
-                .into_iter()
-                .map(|slug| DiscoveredModel {
-                    slug: slug.into(),
-                    display_name: slug.into(),
-                    context_window: None,
-                    max_output_tokens: None,
-                    description: None,
-                    default_effort: None,
-                    supported_efforts: Vec::new(),
-                    visible: true,
-                    priority: None,
-                    use_responses_lite: None,
-                    extensions: None,
-                })
-                .collect(),
-            fetched_at_ms: u64::MAX,
-        },
-    );
+    let fetched_models = |slugs: &[&str]| ProviderInventory::Fetched {
+        models: slugs
+            .iter()
+            .map(|slug| DiscoveredModel {
+                slug: (*slug).into(),
+                display_name: (*slug).into(),
+                context_window: None,
+                max_output_tokens: None,
+                description: None,
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: None,
+                use_responses_lite: None,
+                extensions: None,
+            })
+            .collect(),
+        fetched_at_ms: u64::MAX,
+    };
+    model_source.replace("custom".into(), fetched_models(&["model-a", "model-b"]));
     let set_default = |command_id: &str, request_id: &str, model: &str, expected_revision| {
         AccountCommand::SetDefaultModel(Box::new(SetDefaultModelJob {
             command_id: command_id.into(),
@@ -7387,6 +7385,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         }
     ));
 
+    model_source.replace("custom".into(), fetched_models(&["model-a"]));
     commands
         .send(configure(
             "configure-custom-models",
@@ -7420,7 +7419,6 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
     ));
     assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
 
-    model_source.remove("custom");
     commands
         .send(set_default(
             "set-custom-default-b",
@@ -7491,7 +7489,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
     assert_eq!(
         custom.models,
         vec!["model-a".to_owned()],
-        "management publishes the complete explicitly confirmed custom inventory"
+        "management publishes the complete current synthetic catalog"
     );
     assert_eq!(custom.default_model.as_deref(), Some("model-a"));
     drop(view);
