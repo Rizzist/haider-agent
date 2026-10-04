@@ -29,6 +29,9 @@ pins its spec; native worker pickup pins the selection under the selection
 fence. The equally hidden `run_worker_pickup_v1` marks pickup before provider resolution, so a
 rebind during startup can see the active run. Rebind, recovery and delegated
 children reduce the pin together with later pair-switch and rebind facts.
+The optional `provider_route` field retains the explicit rebind id, endpoint
+and account alias at that boundary, including when an older run is migrated
+after its rebind. It contains no credentials; older extension readers ignore it.
 
 ### v0.0.973 — provider-request budgets become opt-in
 

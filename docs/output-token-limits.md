@@ -75,6 +75,9 @@ Each run records its pinned provider, model, budget and source in a durable
 native turns pin the current selection under the selection lock at worker
 pickup. A selection committed while a native turn is still queued therefore
 applies to that turn. Selections after pickup apply to the next turn.
+An explicit endpoint/account route is retained in the pin as well. Recovery
+of an older native run uses its reconstructed started pair, then writes the
+pin under the same lock so later selections cannot replace its pair or route.
 Provider rebind, child inheritance and recovery read this same run record,
 including subsequent automatic pair switches and explicit rebind facts.
 

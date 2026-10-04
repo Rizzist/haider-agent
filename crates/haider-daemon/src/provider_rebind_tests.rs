@@ -508,6 +508,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                         provider: "fake".into(),
                         model: model.into(),
                         max_tokens: 6000,
+                        provider_route: None,
                         source:
                             haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
                                 requested: 6000,
@@ -635,6 +636,15 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
         })
         .await
         .expect("durable cross-provider route");
+        if !headless {
+            hub.select_session_model(select_native(
+                "native-after-rebind",
+                "pending-next-turn-model",
+                7000,
+            ))
+            .await
+            .expect("ordinary selection after rebind is for the next turn");
+        }
         drop(lease);
         let provider = Arc::new(haider_provider::FakeProvider::new(vec![
             haider_provider::FakeStep::EmitText {
@@ -728,6 +738,30 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
             requests[0].max_tokens,
             if native_pickup { 6000 } else { 8192 }
         );
+        // Recovery writes a migration pin after the old rebind. Its route
+        // must remain available when that earlier fact is outside the pin's
+        // reduction boundary and the session now selects another pair.
+        let recovered_pair = hub
+            .run_output_pair(&session_id, &run_id)
+            .await
+            .expect("recovered run record")
+            .expect("migration pin");
+        assert!(recovered_pair.durably_pinned);
+        let mut next_turn = hub
+            .session_metadata(&session_id)
+            .await
+            .expect("next-turn metadata")
+            .expect("typed session");
+        recovered_pair.restore_route(&mut next_turn);
+        assert_eq!(
+            next_turn.provider_rebind_id.as_deref(),
+            Some("rebind-recovery")
+        );
+        assert_eq!(
+            next_turn.provider_base_url.as_deref(),
+            Some("http://127.0.0.1:31702/v1")
+        );
+        assert_eq!(next_turn.account_alias.as_deref(), Some("fake-b-account"));
         if native_pickup {
             assert_eq!(
                 calls[0].max_tokens_source,

@@ -411,7 +411,7 @@ impl PairSwitchWorld {
     }
 
     async fn await_done(&self, run_id: &RunId) {
-        timeout(Duration::from_secs(10), async {
+        let settled = timeout(Duration::from_secs(10), async {
             loop {
                 let events = self
                     .store
@@ -426,11 +426,21 @@ impl PairSwitchWorld {
                 }) {
                     break;
                 }
+                if let Some(event) = events.iter().find(|event| event.run_id.as_ref() == Some(run_id) && event.payload.decode_event().is_ok_and(|payload| matches!(payload, EventPayload::RunState(ref state) if state.is_terminal()))) {
+                    panic!("run terminated before Done: {event:?}; journal={events:?}");
+                }
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("run reaches Done");
+        .await;
+        if settled.is_err() {
+            let events = self
+                .store
+                .read(&self.session_id, 0, 1024)
+                .await
+                .expect("timeout journal");
+            panic!("run reaches Done: {settled:?}; journal={events:?}");
+        }
     }
 
     async fn await_run_state(&self, run_id: &RunId, expected: RunState) {
@@ -673,6 +683,158 @@ async fn native_pickup_pin_is_visible_before_the_first_provider_request() {
             assert_native_pickup_pair(model_change, provider_change, true, 6000).await;
         }
     }
+    for headless in [false, true] {
+        assert_prebound_route_survives_next_turn_selection(headless).await;
+    }
+}
+
+async fn assert_prebound_route_survives_next_turn_selection(headless: bool) {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "done".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let world = PairSwitchWorld::boot(
+        "prebound-route",
+        provider.clone(),
+        Arc::new(FakeProvider::new(Vec::new())),
+    )
+    .await;
+    let mut selected = world.select_command("prebound-budget");
+    selected.provider = "fake-a".into();
+    selected.model = "model-a".into();
+    selected.output_budget = Some(SessionOutputBudgetV1 {
+        max_tokens: 20000,
+        source: SessionOutputBudgetSourceV1::UserSet { requested: 20000 },
+        clamped: None,
+    });
+    selected.request_json = serde_json::json!({
+        "session_id":world.session_id, "worker_generation":world.store.worker_generation(),
+        "provider":"fake-a", "model":"model-a", "max_tokens":20000,
+    })
+    .to_string();
+    selected.request_digest = blake3::hash(selected.request_json.as_bytes())
+        .to_hex()
+        .to_string();
+    world
+        .hub
+        .select_session_model(selected)
+        .await
+        .expect("initial budget");
+    world
+        .hub
+        .rebind_session_provider(haider_store::SessionProviderRebindCommand {
+            command_id: "prebound-route".into(),
+            request_digest: "prebound-route-digest".into(),
+            request_json: "{}".into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            provider: "fake-a".into(),
+            base_url: Some("http://127.0.0.1:31701/v1".into()),
+            account: Some("fake-a-account".into()),
+            max_tokens: 20000,
+            max_tokens_source: SessionOutputBudgetSourceV1::UserSet { requested: 20000 },
+            clamped: None,
+            active_output_budget: None,
+            event_id: EventId::new("prebound-route-event"),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("explicit route before admission");
+    let request = if headless {
+        serde_json::json!({"headless": {
+            "provider":"fake-a", "model":"model-a", "max_output_tokens":20000,
+            "fast":false, "permission_overrides":{}, "budget":{},
+        }})
+    } else {
+        serde_json::json!({})
+    };
+    let run_id = RunId::new("prebound-run");
+    let accepted = world
+        .hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "prebound-admit".into(),
+            request_digest: "prebound-admit-digest".into(),
+            request_json: request.to_string(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            run_id: run_id.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "report".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("prebound-queued"),
+            user_event_id: EventId::new("prebound-user"),
+            active_event_id: EventId::new("prebound-active"),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("admit native or headless run");
+    world
+        .manager
+        .handle()
+        .submit(accepted)
+        .await
+        .expect("pickup");
+    world.await_done(&run_id).await;
+    assert_eq!(provider.requests()[0].max_tokens, 20000);
+    let mut selected = world.select_command("prebound-next-turn");
+    selected.output_budget = Some(SessionOutputBudgetV1 {
+        max_tokens: 6000,
+        source: SessionOutputBudgetSourceV1::UserSet { requested: 6000 },
+        clamped: None,
+    });
+    selected.request_json = serde_json::json!({
+        "session_id":world.session_id, "worker_generation":world.store.worker_generation(),
+        "provider":"fake-b", "model":"model-b", "max_tokens":6000,
+    })
+    .to_string();
+    selected.request_digest = blake3::hash(selected.request_json.as_bytes())
+        .to_hex()
+        .to_string();
+    world
+        .hub
+        .select_session_model(selected)
+        .await
+        .expect("next-turn selection");
+    let mut next_turn = world
+        .hub
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed metadata");
+    assert_eq!(next_turn.provider_rebind_id, None);
+    let pinned = world
+        .hub
+        .run_output_pair(&world.session_id, &run_id)
+        .await
+        .expect("run record")
+        .expect("pinned pair");
+    assert!(pinned.durably_pinned);
+    assert_eq!(
+        (
+            pinned.provider.as_str(),
+            pinned.model.as_str(),
+            pinned.max_tokens
+        ),
+        ("fake-a", "model-a", 20000)
+    );
+    pinned.restore_route(&mut next_turn);
+    assert_eq!(
+        next_turn.provider_rebind_id.as_deref(),
+        Some("prebound-route")
+    );
+    assert_eq!(
+        next_turn.provider_base_url.as_deref(),
+        Some("http://127.0.0.1:31701/v1")
+    );
+    assert_eq!(next_turn.account_alias.as_deref(), Some("fake-a-account"));
+    world.shutdown().await;
 }
 
 #[tokio::test]

@@ -10,6 +10,26 @@ pub struct RunOutputPairPinnedV1 {
     pub model: String,
     pub max_tokens: u64,
     pub source: crate::output_budget::SessionOutputBudgetSourceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route: Option<RunOutputProviderRouteV1>,
+}
+
+/// An explicit endpoint/account binding retained with a run's pinned pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOutputProviderRouteV1 {
+    pub rebind_id: String,
+    pub base_url: Option<String>,
+    pub account: Option<String>,
+}
+
+impl RunOutputProviderRouteV1 {
+    pub fn capture(metadata: &SessionMetadataV1) -> Option<Self> {
+        metadata.provider_rebind_id.as_ref().map(|rebind_id| Self {
+            rebind_id: rebind_id.clone(),
+            base_url: metadata.provider_base_url.clone(),
+            account: metadata.account_alias.clone(),
+        })
+    }
 }
 
 impl RunOutputPairPinnedV1 {

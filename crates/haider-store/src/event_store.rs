@@ -12242,6 +12242,11 @@ impl Store {
                     provider: spec.provider.clone(),
                     model: spec.model.clone(),
                     max_tokens: spec.max_output_tokens,
+                    provider_route: if metadata.provider == spec.provider {
+                        haider_protocol::session::RunOutputProviderRouteV1::capture(&metadata)
+                    } else {
+                        None
+                    },
                     source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
                         metadata.max_tokens_source,
                         spec.max_output_tokens,

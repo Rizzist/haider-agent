@@ -299,30 +299,35 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             .get("fast")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let active_pair = self
+            .store
+            .hub()
+            .run_output_pair(self.store.session_id(), &self.run_id)
+            .await?
+            .filter(|pair| pair.model == current_model);
+        // The durable run route survives ordinary selections for the next
+        // turn, including selections that clear the session's rebind id.
+        if let Some(pair) = active_pair.as_ref() {
+            pair.restore_route(&mut metadata);
+            metadata.provider.clone_from(&pair.provider);
+        }
         if metadata.provider_rebind_id.is_none()
             || previous.provider_rebind_id == metadata.provider_rebind_id
         {
             self.seen_revision.store(revision, Ordering::Release);
             return Ok(None);
         }
-        let recorded_active = self
-            .store
-            .hub()
-            .run_output_pair(self.store.session_id(), &self.run_id)
-            .await?
-            .filter(|pair| pair.model == current_model)
-            .map(|pair| {
-                pair.restore_route(&mut metadata);
-                metadata.provider = pair.provider;
-                haider_protocol::output_budget::SessionOutputBudgetV1 {
+        let recorded_active =
+            active_pair.map(
+                |pair| haider_protocol::output_budget::SessionOutputBudgetV1 {
                     max_tokens: pair.max_tokens,
                     source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
                         pair.source,
                         pair.max_tokens,
                     ),
                     clamped: None,
-                }
-            });
+                },
+            );
         if let Some(budget) = recorded_active {
             metadata.max_tokens = budget.max_tokens;
             metadata.max_tokens_source = Some(budget.source);

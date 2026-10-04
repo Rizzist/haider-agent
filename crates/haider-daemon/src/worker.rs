@@ -8683,38 +8683,42 @@ async fn start_turn(
             .lock_workflow_selection(lease.session_id())
             .await;
         let mut fresh = fresh_turn_metadata(lease).await?;
-        if let Some(pair) = lease
+        let recorded_pair = lease
             .hub()
             .run_output_pair(lease.session_id(), &accepted.run_id)
-            .await?
-            .filter(|pair| pair.durably_pinned)
+            .await?;
+        let needs_pin = recorded_pair
+            .as_ref()
+            .is_none_or(|pair| !pair.durably_pinned);
+        // An already-started legacy native run also owns its reconstructed
+        // pair. A native turn that is still queued has no legacy start boundary.
+        if let Some(pair) = recorded_pair
+            .as_ref()
+            .filter(|pair| pair.durably_pinned || headless.is_none())
         {
             pair.restore_route(&mut fresh);
-            fresh.provider = pair.provider;
-            fresh.model = pair.model;
+            fresh.provider.clone_from(&pair.provider);
+            fresh.model.clone_from(&pair.model);
             fresh.max_tokens = pair.max_tokens;
             fresh.max_tokens_source = pair.source;
-        } else {
-            if let Some(context) = headless.as_ref() {
-                if let Some(legacy) = lease
-                    .hub()
-                    .run_output_pair(lease.session_id(), &accepted.run_id)
-                    .await?
-                {
-                    fresh.max_tokens_source = legacy.source;
-                }
-                provider_rebind::pin_headless_turn_metadata(
-                    &mut fresh,
-                    &context.spec,
-                    lease,
-                    &accepted.run_id,
-                )
-                .await?;
+        } else if let Some(context) = headless.as_ref() {
+            if let Some(legacy) = recorded_pair.as_ref() {
+                fresh.max_tokens_source = legacy.source;
             }
+            provider_rebind::pin_headless_turn_metadata(
+                &mut fresh,
+                &context.spec,
+                lease,
+                &accepted.run_id,
+            )
+            .await?;
+        }
+        if needs_pin {
             let pin = haider_protocol::session::RunOutputPairPinnedV1 {
                 provider: fresh.provider.clone(),
                 model: fresh.model.clone(),
                 max_tokens: fresh.max_tokens,
+                provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(&fresh),
                 source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
                     fresh.max_tokens_source,
                     fresh.max_tokens,

@@ -926,7 +926,7 @@ pub(crate) struct ActiveRunOutputPairSnapshot {
     pub model: String,
     pub max_tokens: u64,
     pub source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
-    rebound_route: Option<Box<haider_protocol::session::SessionProviderRebound>>,
+    rebound_route: Option<haider_protocol::session::RunOutputProviderRouteV1>,
 }
 
 impl ActiveRunOutputPairSnapshot {
@@ -6837,7 +6837,7 @@ impl SessionHub {
                                 model: pin.model,
                                 max_tokens: pin.max_tokens,
                                 source: Some(pin.source),
-                                rebound_route: None,
+                                rebound_route: pin.provider_route,
                             });
                     } else if kind == "run_worker_pickup_v1" {
                         started.entry(run_id.clone()).or_insert(event.seq);
@@ -6922,6 +6922,11 @@ impl SessionHub {
                     provider,
                     model,
                 } => {
+                    if pinned_at.get(&run_id).is_none_or(|pin| *pin >= seq)
+                        || terminal_at.get(&run_id).is_some_and(|end| *end < seq)
+                    {
+                        continue;
+                    }
                     if let Some(pair) = pairs.get_mut(&run_id) {
                         if pair.provider != provider {
                             pair.rebound_route = None;
@@ -6938,7 +6943,12 @@ impl SessionHub {
                             continue;
                         }
                         pair.provider.clone_from(&rebound.provider);
-                        pair.rebound_route = Some(rebound.clone());
+                        pair.rebound_route =
+                            Some(haider_protocol::session::RunOutputProviderRouteV1 {
+                                rebind_id: rebound.rebind_id.clone(),
+                                base_url: rebound.base_url.clone(),
+                                account: rebound.account.clone(),
+                            });
                         if let Some(active) = rebound
                             .active_output_budget
                             .as_ref()
