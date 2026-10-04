@@ -18337,7 +18337,7 @@ fn daemon_turn_and_new_session_admission_agree_across_configured_provider_kinds(
 }
 
 #[test]
-fn catalog_rejection_scope_covers_the_complete_attempt_identity() {
+fn catalog_evidence_scope_covers_the_complete_attempt_identity() {
     let providers = test_provider_registry();
     let descriptor = CredentialDescriptor {
         incarnation: 7,
@@ -18360,12 +18360,12 @@ fn catalog_rejection_scope_covers_the_complete_attempt_identity() {
         &providers,
     )
     .expect("producer");
-    let key = catalog_rejection_scope(&producer);
-    assert_eq!(catalog_rejection_scope(&producer.clone()), key);
+    let key = catalog_evidence_scope(&producer);
+    assert_eq!(catalog_evidence_scope(&producer.clone()), key);
     let mut rotated = descriptor.clone();
     rotated.credential_digest = Some("synthetic-rotated-digest".into());
     assert_eq!(
-        catalog_rejection_scope(
+        catalog_evidence_scope(
             &catalog_producer_for_account(
                 "profile",
                 OPENAI_PROVIDER_NAME,
@@ -18405,7 +18405,7 @@ fn catalog_rejection_scope_covers_the_complete_attempt_identity() {
     other.cache_key = ProviderModelCacheKey::public("other");
     variants.push(other);
     for other in variants {
-        assert_ne!(catalog_rejection_scope(&other), key, "{other:?}");
+        assert_ne!(catalog_evidence_scope(&other), key, "{other:?}");
     }
 }
 
@@ -18435,7 +18435,7 @@ async fn startup_restores_catalog_rejection_only_for_the_exact_producer() {
     providers
         .record_catalog_rejection(
             "work",
-            &catalog_rejection_scope(&producer),
+            &catalog_evidence_scope(&producer),
             "synthetic authentication failed".into(),
         )
         .expect("persist evidence");

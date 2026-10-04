@@ -2644,9 +2644,9 @@ fn configured_availability_retains_stale_success_and_rejects_negative_evidence()
         };
         assert_policy(false);
         source.unavailable("work", "server returned 503 for /models".into());
-        assert_policy(true);
+        assert_policy(false);
         source.unavailable("work", "model catalog discovery timed out".into());
-        assert_policy(true);
+        assert_policy(false);
         registry.clear_discovered_models("work");
         assert_policy(false);
         source.replace(
@@ -2769,7 +2769,7 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
         };
         assert_policy(offline);
         source.unavailable(provider, "server returned 503 for /models".into());
-        assert_policy(true);
+        assert_policy(offline);
         let uncertainty = registry.summary(provider, &|_| true).expect("503");
         if offline {
             assert_eq!(
@@ -2836,7 +2836,7 @@ fn catalog_rejection_survives_restart_and_uncertainty_only_for_its_owner() {
     let reloaded = ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("restart");
     assert!(
         !reloaded
-            .restore_catalog_rejection("work", "owner-B")
+            .restore_catalog_evidence("work", "owner-B")
             .expect("other owner")
     );
     reloaded.models_unsupported("work", "server returned 404 for /models".into());
@@ -2848,7 +2848,7 @@ fn catalog_rejection_survives_restart_and_uncertainty_only_for_its_owner() {
     );
     assert!(
         reloaded
-            .restore_catalog_rejection("work", "owner-A")
+            .restore_catalog_evidence("work", "owner-A")
             .expect("owner")
     );
     for unsupported in [false, true] {
@@ -2865,7 +2865,7 @@ fn catalog_rejection_survives_restart_and_uncertainty_only_for_its_owner() {
         );
     }
     reloaded
-        .clear_catalog_rejection("owner-A")
+        .clear_catalog_evidence("owner-A")
         .expect("positive evidence retires rejection");
     reloaded.replace_discovered_models(
         "work".into(),
@@ -2882,7 +2882,7 @@ fn catalog_rejection_survives_restart_and_uncertainty_only_for_its_owner() {
         ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("restart recovered");
     assert!(
         !restarted
-            .restore_catalog_rejection("work", "owner-A")
+            .restore_catalog_evidence("work", "owner-A")
             .expect("cleared")
     );
     let document: serde_json::Value = serde_json::from_slice(
@@ -2890,7 +2890,68 @@ fn catalog_rejection_survives_restart_and_uncertainty_only_for_its_owner() {
     )
     .expect("json");
     assert!(
-        document.get("catalog_rejections").is_none(),
+        document.get("catalog_evidence").is_none(),
         "empty additive field is omitted"
+    );
+}
+
+#[test]
+fn unsupported_discovery_survives_restart_and_uncertainty_only_for_its_owner() {
+    let dir = tempfile::tempdir().expect("profile");
+    let mut profile = removable_provider_profile_for_catalog_test();
+    profile.configured_models = vec!["deployment".into()];
+    profile.default_model = Some("deployment".into());
+    let store = JsonProviderRegistryStore::new(dir.path());
+    store.save(&[profile]).expect("profile");
+    let registry =
+        ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("registry");
+    registry
+        .record_catalog_unsupported("work", "owner-A", "server returned 404 for /models".into())
+        .expect("unsupported");
+    let restarted = ProviderRegistry::new(store, vec![], model_source([])).expect("restart");
+    assert!(
+        !restarted
+            .restore_catalog_evidence("work", "owner-B")
+            .expect("B")
+    );
+    restarted.models_unavailable("work", "server returned 503 for /models".into());
+    assert!(
+        !restarted
+            .summary("work", &|_| true)
+            .expect("B")
+            .model_is_selectable("deployment")
+    );
+    assert!(
+        restarted
+            .restore_catalog_evidence("work", "owner-A")
+            .expect("A")
+    );
+    for reason in ["server returned 503 for /models", "synthetic timeout"] {
+        restarted.models_unavailable("work", reason.into());
+        let summary = restarted.summary("work", &|_| true).expect("A");
+        assert!(summary.model_is_selectable("deployment"));
+        assert!(
+            summary
+                .availability_reason
+                .expect("reason")
+                .contains("configured (unverified)")
+        );
+    }
+    restarted
+        .record_catalog_rejection("work", "owner-A", "synthetic auth failure".into())
+        .expect("rejection");
+    restarted
+        .record_catalog_unsupported("work", "owner-A", "server returned 405 for /models".into())
+        .expect("later uncertainty");
+    assert!(
+        restarted
+            .restore_catalog_evidence("work", "owner-A")
+            .expect("restore negative")
+    );
+    assert!(
+        !restarted
+            .summary("work", &|_| true)
+            .expect("negative")
+            .model_is_selectable("deployment")
     );
 }

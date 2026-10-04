@@ -242,8 +242,9 @@ and `configured_deployments_are_selectable_only_after_success_or_unsupported_dis
 The newer ruling supersedes the transient-failure policy in the September 30
 update. Definite negative evidence is unavailable; uncertainty is selectable
 with a visible reason, for every configured provider. A supported required list
-that has never been attempted remains unavailable, including Azure. A previous
-successful list remains usable when stale, and 503/timeouts remain selectable.
+that has never been fetched remains unavailable, including Azure. A previous
+successful list remains usable when stale or after 503/timeouts. A first failed
+fetch does not override the unavailable-until-fetched state.
 404/405 or typed unsupported discovery still shows `configured (unverified)`
 and stays excluded from failover and promotion. Staleness schedules background
 refresh with bounded backoff and never refuses existing sessions. Daemon

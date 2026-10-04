@@ -127,14 +127,15 @@ reconciles and requeues once the source is readable. Source enrollment, scans
 and reconciliation publish account and provider views together.
 
 Configured deployments share one availability policy across every provider kind.
-Before the first model-list attempt, a provider that requires supported discovery
+Before the first successful model list, a provider that requires supported discovery
 is Unavailable; this includes Azure. Definite negative evidence also makes a
 selection Unavailable: credential/authentication failure, a deployment absent
 from a successful fresh list, or a disabled/removed provider.
 
 Uncertainty keeps configured rows selectable with a visible reason. A previous
-successful list remains usable after its 15-minute freshness window, and 503 or
-timeout results remain selectable even on a first attempted fetch. HTTP 404/405
+successful list remains usable after its 15-minute freshness window, and later
+503 or timeout results keep it selectable. A first failed fetch does not clear
+the unavailable-until-fetched state. HTTP 404/405
 or a typed unsupported listing shows **configured (unverified)**. That unverified
 inventory remains excluded from automatic failover and promotion. Maintained
 offline and OAuth catalogs retain their permanent rows with healthy credentials.
@@ -143,6 +144,9 @@ Staleness schedules background refresh with bounded backoff; it never blocks
 new sessions or turns of existing sessions. The daemon's admission, CLI, TUI
 picker and summaries use `ProviderSummaryWire::selection_availability` and its
 shared reason projection. A fresh empty list does not authorize configured rows.
+Producer-scoped authentication rejection and unsupported-discovery evidence
+survive restart in an additive optional `catalog_evidence` map. A different
+producer cannot inherit it, and a fresh successful list clears it.
 A stale list preserves fetched metadata and may show missing explicit configured
 rows without borrowing metadata from another inventory.
 

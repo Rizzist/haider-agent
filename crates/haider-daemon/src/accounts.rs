@@ -3383,8 +3383,8 @@ async fn finish_provider_models_refresh(
         providers,
         completed,
     } = context;
-    let rejection_scope = catalog_producer(profile_id, &provider, accounts, providers)
-        .map(|producer| catalog_rejection_scope(&producer));
+    let evidence_scope = catalog_producer(profile_id, &provider, accounts, providers)
+        .map(|producer| catalog_evidence_scope(&producer));
     let failure_reason = match &result {
         ProviderModelsRefreshResult::Discovery(Ok(_))
         | ProviderModelsRefreshResult::Discovery(Err(CatalogError::NotModified)) => None,
@@ -3396,7 +3396,21 @@ async fn finish_provider_models_refresh(
             &result,
             ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unsupported { .. }))
         ) {
-            providers.models_unsupported(&provider, reason);
+            if let Some(scope) = evidence_scope.as_deref() {
+                if let Err(error) = providers.record_catalog_unsupported(&provider, scope, reason) {
+                    publish_inventory_states(store, management, accounts, providers).await;
+                    respond_model_refresh_error(
+                        completed,
+                        ERROR_CODE_PROVIDER_ERROR,
+                        &error.message,
+                        error.retryable,
+                        None,
+                    );
+                    return;
+                }
+            } else {
+                providers.models_unsupported(&provider, reason);
+            }
         } else if matches!(
             &result,
             ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unauthorized))
@@ -3409,7 +3423,7 @@ async fn finish_provider_models_refresh(
             // Retire durable positive evidence too: a restart cannot resurrect
             // a listing whose credential was explicitly rejected.
             let _ = store.delete_provider_models(cache_key.clone().into()).await;
-            if let Some(scope) = rejection_scope.as_deref() {
+            if let Some(scope) = evidence_scope.as_deref() {
                 if let Err(error) = providers.record_catalog_rejection(&provider, scope, reason) {
                     publish_inventory_states(store, management, accounts, providers).await;
                     respond_model_refresh_error(
@@ -3468,8 +3482,8 @@ async fn finish_provider_models_refresh(
             };
             // Commit fresh positive evidence before retiring its durable negative
             // marker. A failed cache write or interrupted clear remains fenced.
-            if let Some(scope) = rejection_scope.as_deref()
-                && let Err(error) = providers.clear_catalog_rejection(scope)
+            if let Some(scope) = evidence_scope.as_deref()
+                && let Err(error) = providers.clear_catalog_evidence(scope)
             {
                 respond_model_refresh_error(
                     completed,
@@ -3545,8 +3559,8 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
-            if let Some(scope) = rejection_scope.as_deref()
-                && let Err(error) = providers.clear_catalog_rejection(scope)
+            if let Some(scope) = evidence_scope.as_deref()
+                && let Err(error) = providers.clear_catalog_evidence(scope)
             {
                 respond_model_refresh_error(
                     completed,
@@ -3816,7 +3830,7 @@ pub(crate) struct CatalogProducer {
     cache_key: ProviderModelCacheKey,
 }
 
-fn catalog_rejection_scope(producer: &CatalogProducer) -> String {
+fn catalog_evidence_scope(producer: &CatalogProducer) -> String {
     let identity = serde_json::json!({
         "v": 1,
         "profile": &producer.profile,
@@ -14249,10 +14263,8 @@ impl AccountsRuntime {
                 if let Some(producer) =
                     catalog_producer(profile_id, &provider, &accounts, &providers)
                 {
-                    providers.restore_catalog_rejection(
-                        &provider,
-                        &catalog_rejection_scope(&producer),
-                    )?;
+                    providers
+                        .restore_catalog_evidence(&provider, &catalog_evidence_scope(&producer))?;
                 }
             }
         }
