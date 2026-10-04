@@ -1099,8 +1099,8 @@ impl DeviceDiscoverySnapshot {
 /// fallbacks require an active account whose credential is valid: `Ok`, or
 /// `Limited` (a temporary quota window is not a broken credential, and the
 /// rotation ladder may still serve the turn). Expired, revoked and
-/// attention-needing credentials are not ready. The older offline catalogs
-/// retain their descriptor-presence rule. Catalog fetch health is separate.
+/// attention-needing credentials are not ready for any provider. Catalog
+/// fetch health is separate.
 pub(crate) fn provider_credential_ready_for_summary<'a>(
     accounts: &'a AccountStore<Box<dyn StoreLike>>,
 ) -> impl Fn(&str) -> bool + 'a {

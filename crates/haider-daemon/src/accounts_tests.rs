@@ -341,7 +341,7 @@ pub(super) fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
 }
 
 #[test]
-fn subscription_availability_tracks_active_credential_health() {
+fn provider_availability_tracks_active_credential_health() {
     let mut accounts = memory_accounts();
     let alias = CredentialAlias::new("subscription-health");
     accounts
@@ -396,6 +396,33 @@ fn subscription_availability_tracks_active_credential_health() {
         !provider_credential_ready_for_summary(&accounts)(BEDROCK_PROVIDER_NAME),
         "expired credentials are definite negative evidence for every configured provider"
     );
+    for (alias, provider) in [
+        (alias, ANTHROPIC_OAUTH_PROVIDER_NAME),
+        (
+            CredentialAlias::new("offline-descriptor"),
+            BEDROCK_PROVIDER_NAME,
+        ),
+    ] {
+        for (status, selectable) in [
+            (CredentialStatus::Ok, true),
+            (CredentialStatus::Limited { until_ms: u64::MAX }, true),
+            (CredentialStatus::Expired, false),
+            (CredentialStatus::Revoked, false),
+            (
+                CredentialStatus::NeedsAttention {
+                    reason: haider_protocol::credential::CredentialAttentionReason::SourceGone,
+                },
+                false,
+            ),
+        ] {
+            accounts.set_status(&alias, status).expect("set health");
+            assert_eq!(
+                provider_credential_ready_for_summary(&accounts)(provider),
+                selectable,
+                "credential health policy for {provider}"
+            );
+        }
+    }
 }
 
 #[test]
