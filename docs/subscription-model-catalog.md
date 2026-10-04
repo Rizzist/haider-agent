@@ -126,15 +126,32 @@ source removal retires the incarnation. A discovery aborted by source rotation
 reconciles and requeues once the source is readable. Source enrollment, scans
 and reconciliation publish account and provider views together.
 
-Configured Azure deployments are visible but Unavailable until a model-list
-fetch succeeds. An explicitly unsupported listing (HTTP 404/405 or a typed
-not-supported response) makes configured rows selectable as **configured
-(unverified)**, with the specific reason retained. They remain excluded from
-automatic failover and promotion. Authentication failures, 5xx and timeouts
-keep them Unavailable with the actual failure reason and a fetch/retry action.
-The daemon and TUI share these selection rules; configured rows are never a
-fallback for a successful empty list. Other compatible endpoints retain their
-existing advisory model-selection behavior.
+Configured deployments share one availability policy across every provider kind.
+Before the first model-list attempt, a provider that requires supported discovery
+is Unavailable; this includes Azure. Definite negative evidence also makes a
+selection Unavailable: credential/authentication failure, a deployment absent
+from a successful fresh list, or a disabled/removed provider.
+
+Uncertainty keeps configured rows selectable with a visible reason. A previous
+successful list remains usable after its 15-minute freshness window, and 503 or
+timeout results remain selectable even on a first attempted fetch. HTTP 404/405
+or a typed unsupported listing shows **configured (unverified)**. That unverified
+inventory remains excluded from automatic failover and promotion. Maintained
+offline and OAuth catalogs retain their permanent rows with healthy credentials.
+
+Staleness schedules background refresh with bounded backoff; it never blocks
+new sessions or turns of existing sessions. The daemon's admission, CLI, TUI
+picker and summaries use `ProviderSummaryWire::selection_availability` and its
+shared reason projection. A fresh empty list does not authorize configured rows.
+A stale list preserves fetched metadata and may show missing explicit configured
+rows without borrowing metadata from another inventory.
+
+The running TUI refreshes management state during idle. Retiring a catalog
+producer clears every current identity projection, including the launcher and
+session headers, composer, account label and context meter. A restored private
+model preference stays hidden until live snapshots prove its owner. Startup may
+adopt a legacy chosen default only after loading the active producer's matching
+inventory; summary filtering independently rejects foreign defaults.
 
 Route edits preserve a session selection's original catalog key. Changing the
 provider, account override, or endpoint does not turn fetched model settings

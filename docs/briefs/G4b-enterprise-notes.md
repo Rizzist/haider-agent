@@ -235,3 +235,18 @@ excluded from automatic failover and promotion. Transient 5xx/timeouts stay
 Unavailable with their specific reason and can be retried. The daemon and
 TUI accept and refuse the same rows. See `docs/subscription-model-catalog.md`
 and `configured_deployments_are_selectable_only_after_success_or_unsupported_discovery`.
+
+
+## Availability ruling update (2026-10-04)
+
+The newer ruling supersedes the transient-failure policy in the September 30
+update. Definite negative evidence is unavailable; uncertainty is selectable
+with a visible reason, for every configured provider. A supported required list
+that has never been attempted remains unavailable, including Azure. A previous
+successful list remains usable when stale, and 503/timeouts remain selectable.
+404/405 or typed unsupported discovery still shows `configured (unverified)`
+and stays excluded from failover and promotion. Staleness schedules background
+refresh with bounded backoff and never refuses existing sessions. Daemon
+admission, the TUI picker, CLI and summaries share the wire availability API.
+See `docs/subscription-model-catalog.md` and
+`configured_availability_retains_stale_success_and_rejects_negative_evidence`.
