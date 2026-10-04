@@ -722,13 +722,11 @@ struct ContinuationProgress {
     repeated_calls: RepeatStreak,
     /// Same (tool, arguments), any result.
     repeated_actions: RepeatStreak,
-    /// Last outcome fingerprint per (tool, arguments) fingerprint, so a
-    /// screen observation can be compared with the previous identical call.
+    /// Last successful reading per (tool, arguments) fingerprint, so a screen
+    /// observation can be compared with the previous identical observation.
     last_outcome: HashMap<blake3::Hash, blake3::Hash>,
-    /// The latest computer/mobile screen observation repeated the previous
-    /// identical observation (or produced no reading): the screen is not
-    /// changing, so screen steps count toward the action guard again.
-    ui_screen_stale: bool,
+    /// Navigation can be exempt only after a successful changed observation.
+    ui_screen_changed: bool,
 }
 
 /// One consecutive-repeat streak and its steer state.
@@ -831,9 +829,9 @@ impl ContinuationProgress {
     }
 
     /// One completed call: `args` is the canonical argument form and
-    /// `outcome` the normalized result parts. `ui` is set only for a typed
-    /// computer/mobile screen step (`continuation_fingerprint::ui_step`),
-    /// with whether the result carried a reading (an image for screenshots).
+    /// `outcome` the normalized result parts. `ui` is set only for a trusted,
+    /// successful typed computer/mobile screen step, with whether the result
+    /// carried a reading (an image for screenshots).
     ///
     /// Screen steps are exempt from the action-level guard while the screen
     /// changes: an observation whose outcome differs from the previous
@@ -854,16 +852,19 @@ impl ContinuationProgress {
             Self::fingerprint(b"action", &[kind, name.as_bytes(), args.as_bytes()]);
         let outcome_fingerprint = Self::fingerprint(b"outcome", outcome);
         let action = self.seen.insert(action_fingerprint);
-        let previous = self
-            .last_outcome
-            .insert(action_fingerprint, outcome_fingerprint);
         let screen_step_exempt = match ui {
             Some((UiStep::Observe { .. }, reading)) => {
+                let previous = if reading {
+                    self.last_outcome
+                        .insert(action_fingerprint, outcome_fingerprint)
+                } else {
+                    None
+                };
                 let changed = reading && previous != Some(outcome_fingerprint);
-                self.ui_screen_stale = !changed;
+                self.ui_screen_changed = changed;
                 changed
             }
-            Some((UiStep::Navigate, _)) => !self.ui_screen_stale,
+            Some((UiStep::Navigate, _)) => self.ui_screen_changed,
             None => false,
         };
         if !screen_step_exempt {
@@ -904,11 +905,17 @@ impl ContinuationProgress {
                 if let Some(Block::ToolResult {
                     preview,
                     truncated,
+                    completion_status,
                     images,
                     ..
                 }) = result.tool_result_for(call_id)
                 {
-                    let ui = crate::continuation_fingerprint::ui_step(name, args).map(|step| {
+                    let typed_ui = crate::continuation_fingerprint::ui_step(name, args);
+                    let succeeded = completion_status.is_some_and(|status| status.is_completed());
+                    if typed_ui.is_some() && !succeeded {
+                        self.ui_screen_changed = false;
+                    }
+                    let ui = typed_ui.filter(|_| succeeded).map(|step| {
                         let reading = match step {
                             crate::continuation_fingerprint::UiStep::Observe {
                                 screenshot: true,
@@ -918,13 +925,39 @@ impl ContinuationProgress {
                         (step, reading)
                     });
                     let args = crate::continuation_fingerprint::arguments(args);
-                    let preview = crate::continuation_fingerprint::result(preview);
-                    let images = serde_json::to_string(images).unwrap_or_default();
+                    // Only a completed observation with a reading can prove
+                    // a new numeric screen. Navigation and missing screenshots
+                    // use the ordinary digit mask.
+                    let screen_reading = matches!(
+                        ui,
+                        Some((
+                            crate::continuation_fingerprint::UiStep::Observe { .. },
+                            true
+                        ))
+                    );
+                    let preview = if screen_reading {
+                        crate::continuation_fingerprint::screen_result(preview)
+                    } else {
+                        crate::continuation_fingerprint::result(preview)
+                    };
+                    // A failed screen receipt may still carry image references,
+                    // but those references cannot establish screen progress.
+                    let images = if typed_ui.is_some() && !succeeded {
+                        "[]".to_owned()
+                    } else {
+                        serde_json::to_string(images).unwrap_or_default()
+                    };
+                    let status = format!("{completion_status:?}");
                     self.observe_call(
                         b"local_tool_result",
                         name,
                         &args,
-                        &[preview.as_bytes(), &[*truncated as u8], images.as_bytes()],
+                        &[
+                            preview.as_bytes(),
+                            &[*truncated as u8],
+                            images.as_bytes(),
+                            status.as_bytes(),
+                        ],
                         ui,
                     );
                 }
@@ -1310,6 +1343,51 @@ mod continuation_progress_tests {
             ("provider_repeat", 10),
         ] {
             assert_eq!(simulate(case(kind)), stopped(attempts), "{kind}");
+        }
+    }
+
+    /// Astra final-review B2: a pause_turn/max_tokens counter written in
+    /// ASCII, Arabic-Indic or Persian digits is no fresh text; identifier
+    /// digits (`v٢x`, `abc_١`) still name something new.
+    #[test]
+    fn unicode_decimal_counters_in_continuations_stop() {
+        for zero in [0x30_u32, 0x660, 0x6f0, 0x966] {
+            for finish in [FinishReason::PauseTurn, FinishReason::MaxTokens] {
+                let mut rounds: Vec<_> = (1..=100_u32)
+                    .map(|n| {
+                        let digits: String = n
+                            .to_string()
+                            .chars()
+                            .map(|ch| char::from_u32(zero + ch.to_digit(10).unwrap()).unwrap())
+                            .collect();
+                        text(
+                            format!("Retrying the same operation (attempt {digits})."),
+                            finish,
+                        )
+                    })
+                    .collect();
+                rounds.push(text("UNREACHABLE".into(), FinishReason::EndTurn));
+                assert_eq!(simulate(rounds), stopped(10), "U+{zero:04X} {finish:?}");
+            }
+            // Identifier digits keep going (each is new assistant text).
+            let digit = |n: u32| char::from_u32(zero + n).unwrap();
+            let mut rounds: Vec<_> = (0..10_u32)
+                .map(|n| {
+                    text(
+                        format!("Wrote v{}x and abc_{}", digit(n), digit(9 - n)),
+                        FinishReason::PauseTurn,
+                    )
+                })
+                .collect();
+            rounds.push(text("DONE".into(), FinishReason::EndTurn));
+            assert_eq!(
+                simulate(rounds),
+                Outcome::Completed {
+                    attempts: 11,
+                    suspected: 0
+                },
+                "U+{zero:04X}"
+            );
         }
     }
 
@@ -1756,6 +1834,26 @@ mod continuation_progress_tests {
         image: Option<String>,
         n: usize,
     ) {
+        tool_call_receipt(
+            progress,
+            tool,
+            args,
+            preview,
+            image,
+            ToolResultStatus::Completed,
+            n,
+        );
+    }
+
+    fn tool_call_receipt(
+        progress: &mut ContinuationProgress,
+        tool: &str,
+        args: serde_json::Value,
+        preview: &str,
+        image: Option<String>,
+        status: ToolResultStatus,
+        n: usize,
+    ) {
         let call_id = format!("ui-{n}");
         let block = Block::ToolCall {
             call_id: call_id.clone(),
@@ -1775,8 +1873,8 @@ mod continuation_progress_tests {
             .unwrap_or_default();
         progress.observe_local_tools(
             &[block],
-            &[Message::tool_result_with_images(
-                call_id, preview, false, images,
+            &[Message::tool_result_with_receipt(
+                call_id, preview, false, images, status,
             )],
         );
     }
@@ -1787,6 +1885,194 @@ mod continuation_progress_tests {
 
     fn screenshot_args() -> serde_json::Value {
         serde_json::json!({"action": "screenshot"})
+    }
+
+    #[test]
+    fn unsuccessful_screen_receipts_keep_the_ordinary_result_bound() {
+        for status in [
+            ToolResultStatus::Failed,
+            ToolResultStatus::Rejected,
+            ToolResultStatus::Conflict,
+            ToolResultStatus::Cancelled,
+            ToolResultStatus::Unknown,
+        ] {
+            for (tool, args, image) in [
+                ("mobile", serde_json::json!({"action": "a11y_tree"}), false),
+                (
+                    "mobile",
+                    serde_json::json!({"action": "inspect", "element_id": "row"}),
+                    false,
+                ),
+                (
+                    "computer",
+                    serde_json::json!({"action": "inspect", "x": 1, "y": 1}),
+                    false,
+                ),
+                ("mobile", screenshot_args(), false),
+                ("mobile", screenshot_args(), true),
+                ("computer", screenshot_args(), true),
+                ("mobile", swipe_args(), false),
+                (
+                    "computer",
+                    serde_json::json!({"action": "left_click", "x": 1, "y": 1}),
+                    false,
+                ),
+            ] {
+                let (stop, steers) = drive(240, |progress, request| {
+                    tool_call_receipt(
+                        progress,
+                        tool,
+                        args.clone(),
+                        &format!("Backend unavailable (attempt {request})"),
+                        image.then(|| format!("failed-frame-{request}")),
+                        status,
+                        request,
+                    );
+                });
+                assert!(
+                    matches!(stop, Some((62, LoopLimitV1::RepeatedToolCalls { .. }))),
+                    "{status:?} {tool} {args} image={image}: {stop:?}"
+                );
+                assert_eq!(steers.len(), 1, "{status:?} {tool} {args}");
+            }
+        }
+        // A completed screenshot without a reading and a legacy result with
+        // no receipt status cannot claim screen progress either.
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                screenshot_args(),
+                &format!("capture {request}"),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        let (stop, steers) = drive(240, |progress, request| {
+            let call_id = format!("legacy-{request}");
+            progress.observe_local_tools(
+                &[Block::ToolCall {
+                    call_id: call_id.clone(),
+                    name: "mobile".into(),
+                    args: serde_json::json!({"action": "a11y_tree"}),
+                }],
+                &[Message::tool_result(
+                    call_id,
+                    format!("row {request}"),
+                    false,
+                )],
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+    }
+
+    #[test]
+    fn navigation_needs_a_successful_changed_observation_first() {
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                swipe_args(),
+                &format!("page {request}"),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((62, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        let (stop, steers) = drive(240, |progress, request| {
+            tool_call_receipt(
+                progress,
+                "mobile",
+                swipe_args(),
+                &format!("page {}", letter_tag(request)),
+                None,
+                ToolResultStatus::Completed,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        // A failed reading cannot activate navigation's exemption, even if
+        // its preview changes on every call.
+        let (stop, steers) = drive(240, |progress, request| {
+            if request == 1 {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    serde_json::json!({"action": "a11y_tree"}),
+                    "page 1",
+                    None,
+                    ToolResultStatus::Failed,
+                    request,
+                );
+            } else {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    swipe_args(),
+                    &format!("page {}", letter_tag(request)),
+                    None,
+                    ToolResultStatus::Completed,
+                    request,
+                );
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((203, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
+
+        // A prior valid observation does not excuse a later failed action.
+        let (stop, steers) = drive(240, |progress, request| {
+            if request == 1 {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    serde_json::json!({"action": "a11y_tree"}),
+                    "page 1",
+                    None,
+                    ToolResultStatus::Completed,
+                    request,
+                );
+            } else {
+                tool_call_receipt(
+                    progress,
+                    "mobile",
+                    swipe_args(),
+                    &format!("failed attempt {request}"),
+                    None,
+                    ToolResultStatus::Failed,
+                    request,
+                );
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((63, LoopLimitV1::RepeatedToolCalls { .. }))
+        ));
+        assert_eq!(steers.len(), 1);
     }
 
     /// Runs `calls` one per provider request; returns the first terminal
@@ -1887,7 +2173,8 @@ mod continuation_progress_tests {
         );
         assert_eq!(steers.len(), 1);
         assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
-        // Swipe + identical screenshot: both repeat, so the stop comes sooner.
+        // Swipe + identical screenshot: both repeat after the two distinct
+        // call fingerprints are established.
         let (stop, _) = drive(600, |progress, request| {
             if request % 2 == 1 {
                 tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
@@ -1902,16 +2189,179 @@ mod continuation_progress_tests {
                 );
             }
         });
-        assert!(matches!(
+        // Swipe and screenshot establish two distinct fingerprints. The 62nd
+        // completed call makes 60 repeats, so the limit precedes request 63.
+        assert_eq!(
             stop,
             Some((
-                _,
+                63,
                 LoopLimitV1::RepeatedToolCalls {
                     repeated_calls: 60,
-                    ..
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
                 }
             ))
-        ));
+        );
+    }
+
+    fn a11y_tree_args() -> serde_json::Value {
+        serde_json::json!({"action": "a11y_tree"})
+    }
+
+    /// The daemon's typed `MobileOutput::A11yTree` preview for one list row
+    /// whose visible text is `text` (stable id, resource id and bounds, as
+    /// `mobile_transport` derives node ids from resource id + index).
+    fn numeric_tree(text: &str) -> String {
+        use haider_protocol::mobile::{A11yNode, MobileOutput, Point4};
+        let output = MobileOutput::A11yTree(vec![A11yNode {
+            id: "row1".into(),
+            text: Some(text.into()),
+            content_desc: None,
+            class: "android.widget.TextView".into(),
+            resource_id: Some("example:id/row".into()),
+            bounds: Point4 {
+                left: 0,
+                top: 100,
+                right: 100,
+                bottom: 150,
+            },
+        }]);
+        serde_json::to_string(&output).unwrap()
+    }
+
+    /// Astra final-review B1: swipe + accessibility-tree paging through rows
+    /// that differ only by numbers (IDs, prices, dates) is productive: no
+    /// steer and no stop from either the action or the result-level guard.
+    #[test]
+    fn mobile_numeric_a11y_tree_paging_300_pages_completes() {
+        assert_eq!(
+            crate::continuation_fingerprint::ui_step("mobile", &a11y_tree_args()),
+            Some(crate::continuation_fingerprint::UiStep::Observe { screenshot: false })
+        );
+        let renders: [fn(usize) -> String; 3] = [
+            |page| (100_000 + page).to_string(),
+            |page| format!("${}.{:02}", 10 + page, page % 100),
+            |page| format!("2026-09-{:02} 12:{:02} #{page}", 1 + page % 28, page % 60),
+        ];
+        for render in renders {
+            let (stop, steers) = drive(600, |progress, request| {
+                let page = request.div_ceil(2);
+                if request % 2 == 1 {
+                    tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+                } else {
+                    tool_call(
+                        progress,
+                        "mobile",
+                        a11y_tree_args(),
+                        &numeric_tree(&render(page)),
+                        None,
+                        request,
+                    );
+                }
+            });
+            assert_eq!(stop, None);
+            assert!(steers.is_empty(), "{steers:?}");
+        }
+    }
+
+    /// A truly identical numeric tree (stuck at the end of the list) still
+    /// repeats: steered before request 32, stopped before request 62. An
+    /// alternating swipe/tree loop first establishes two distinct calls.
+    #[test]
+    fn identical_numeric_a11y_tree_still_stops_at_61() {
+        let tree = numeric_tree("100042");
+        let (stop, steers) = drive(600, |progress, request| {
+            tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
+        });
+        assert_eq!(
+            stop,
+            Some((
+                62,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        let (stop, _) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(progress, "mobile", a11y_tree_args(), &tree, None, request);
+            }
+        });
+        // Swipe and tree establish two distinct call fingerprints. The 62nd
+        // completed call makes 60 repeats, so the limit precedes request 63.
+        assert_eq!(
+            stop,
+            Some((
+                63,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+    }
+
+    /// Ordinary text-tool numeric polling keeps the accepted digit mask: an
+    /// identical call whose result changes only by free-standing numbers is
+    /// no progress, even when the text is the same JSON a tree would carry.
+    #[test]
+    fn ordinary_text_numeric_polling_is_still_masked() {
+        for (tool, args) in [
+            ("fs_read", serde_json::json!({"path": "status.txt"})),
+            (
+                "process_exec",
+                serde_json::json!({"command": "cat rows.json"}),
+            ),
+            (
+                "process_exec",
+                serde_json::json!({"action": "a11y_tree", "command": "cat rows.json"}),
+            ),
+            ("mobile_screenshot", a11y_tree_args()),
+        ] {
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    args.clone(),
+                    &format!("Completed files: {request}"),
+                    None,
+                    request,
+                );
+            });
+            assert_eq!(
+                stop,
+                Some((
+                    62,
+                    LoopLimitV1::RepeatedToolCalls {
+                        repeated_calls: 60,
+                        suspect_after: 30,
+                        stop_after_suspected: 30,
+                    }
+                )),
+                "{tool}"
+            );
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    args.clone(),
+                    &numeric_tree(&(100_000 + request).to_string()),
+                    None,
+                    request,
+                );
+            });
+            assert!(
+                matches!(stop, Some((62, LoopLimitV1::RepeatedToolCalls { .. }))),
+                "{tool}: {stop:?}"
+            );
+        }
     }
 
     /// A screen-step exemption needs the typed tool identity: the same
@@ -2255,6 +2705,8 @@ pub struct HarnessConfig {
     /// workflows enable this bit so actor-owned tools cannot bypass a dynamic
     /// dispatcher grant merely by naming an unadvertised tool.
     pub enforce_advertised_tool_ceiling: bool,
+    /// Strip provider prose from durable failures for restricted providers.
+    pub provider_lockdown: bool,
     /// Local equivalents advertised after one exact provider-hosted-tool
     /// rejection. Empty means this provider has no safe fallback pack.
     pub provider_tool_fallback_tools: Vec<ToolDefinition>,
@@ -2463,6 +2915,7 @@ impl HarnessConfig {
             tool_exposure: None,
             tool_pack_digest: None,
             enforce_advertised_tool_ceiling: false,
+            provider_lockdown: false,
             provider_tool_fallback_tools: Vec::new(),
             shared_provider_tool_fallback_tools: None,
             provider_tool_fallback_digest: None,
@@ -4207,6 +4660,10 @@ pub struct HarnessActor {
     /// when providers interleave item kinds.
     pending_item_delta: Option<PendingItemDelta>,
     pending_item_delta_deadline: Option<tokio::time::Instant>,
+    /// What the latest provider request carried (model id, tool-call ids):
+    /// the only values a provider error template may echo in its
+    /// `{model}` / `{tool_call_id}` slots.
+    provider_slot_evidence: haider_provider::ProviderSlotEvidence,
 }
 
 /// See [`HarnessActor::plan`].
@@ -4292,6 +4749,7 @@ impl HarnessActor {
                 next_node: 0,
                 next_menu: 0,
                 tree_head_initialized: false,
+                provider_slot_evidence: haider_provider::ProviderSlotEvidence::default(),
                 tree_head: None,
                 deferred_commands: VecDeque::new(),
                 pending_nudges: Vec::new(),
@@ -5266,11 +5724,12 @@ impl HarnessActor {
                             });
                             if let Some(result) = tool.result.as_ref() {
                                 let projection = model_tool_result_projection(&tool.name, result);
-                                tool_results.push(Message::tool_result_with_images(
+                                tool_results.push(Message::tool_result_with_receipt(
                                     tool.call_id.clone(),
                                     projection.preview,
                                     projection.truncated,
                                     result.images.clone(),
+                                    result.status,
                                 ));
                             }
                         }
@@ -5805,6 +6264,8 @@ impl HarnessActor {
                 cache_metadata: Some(cache_metadata.clone()),
                 tool_result_image_projection: request_image_projection,
             };
+            self.provider_slot_evidence =
+                haider_provider::ProviderSlotEvidence::from_request(&provider_request);
             let projected_input_tokens =
                 estimate_if_budget_guarded(self.config.provider_budget_guard.as_deref(), || {
                     estimate_provider_request_input_tokens(
@@ -6410,6 +6871,13 @@ impl HarnessActor {
                 if opened.is_err() {
                     drop(provider_budget_permit.take());
                 }
+                // Corroborate template slots with what this request carried
+                // before any consumer (output-limit retry, recovery card,
+                // RunFailed) reads the error.
+                let opened = opened.map_err(|mut error| {
+                    error.corroborate_slots(&self.provider_slot_evidence);
+                    error
+                });
                 match opened {
                     Ok(stream) => {
                         if let (Some(trace), Some(started)) =
@@ -6889,11 +7357,16 @@ impl HarnessActor {
                         )
                         .await;
                 }
-                let next = next.unwrap_or_else(|| {
-                    Err(provider_stream_interrupted(
-                        "provider stream closed before a finish event",
-                    ))
-                });
+                let next = next
+                    .unwrap_or_else(|| {
+                        Err(provider_stream_interrupted(
+                            "provider stream closed before a finish event",
+                        ))
+                    })
+                    .map_err(|mut error| {
+                        error.corroborate_slots(&self.provider_slot_evidence);
+                        error
+                    });
                 let event = match next {
                     Ok(event) => {
                         if !first_provider_event_seen {
@@ -7202,7 +7675,11 @@ impl HarnessActor {
                                 .await;
                         }
                         if message.as_ref().is_some_and(|partial| !partial.is_empty()) {
-                            let presentation = stream_interruption_presentation(&error);
+                            let mut presentation = stream_interruption_presentation(&error);
+                            apply_provider_detail_lockdown(
+                                self.config.provider_lockdown,
+                                &mut presentation,
+                            );
                             let (source_item, partial) = match self
                                 .complete_incomplete_message(
                                     &run_id,
@@ -9976,21 +10453,24 @@ impl HarnessActor {
             .retry_after_ms
             .is_some_and(|delay| delay > MAX_PROVIDER_RETRY_AFTER_MS)
         {
-            let capped = ProviderError {
-                kind: error.kind,
-                message: format!(
+            let mut capped = ProviderError::new(
+                error.kind,
+                format!(
                     "provider retry-after {}ms exceeds the {}ms respect cap",
                     error.retry_after_ms.unwrap_or_default(),
                     MAX_PROVIDER_RETRY_AFTER_MS
                 ),
-                retryable: true,
-                retry_after_ms: error.retry_after_ms,
-                opened_within_ms: error.opened_within_ms,
-                budget_ms: error.budget_ms,
-                timeout_reason: error.timeout_reason,
-                idle_timeout: error.idle_timeout.clone(),
-                presentation: error.presentation.clone(),
-            };
+            )
+            .with_presentation(error.presentation.clone());
+            capped.retryable = true;
+            capped.retry_after_ms = error.retry_after_ms;
+            capped.opened_within_ms = error.opened_within_ms;
+            capped.budget_ms = error.budget_ms;
+            capped.timeout_reason = error.timeout_reason;
+            capped.idle_timeout.clone_from(&error.idle_timeout);
+            capped
+                .provider_raw_detail
+                .clone_from(&error.provider_raw_detail);
             return Err(DriveError::Provider(capped));
         }
         let reason = match error.kind {
@@ -10496,7 +10976,13 @@ impl HarnessActor {
         self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
             .await?;
         tools.remove(index);
-        Ok(Message::tool_result(call_id, result.preview, false))
+        Ok(Message::tool_result_with_receipt(
+            call_id,
+            result.preview,
+            false,
+            result.images,
+            result.status,
+        ))
     }
 
     /// Closes the matching tool item for a provider `ToolCallEnd`.
@@ -10586,11 +11072,15 @@ impl HarnessActor {
             self.commit_tool_result_and_completion(run_id, &tools[index], &result)
                 .await?;
             tools.remove(index);
-            return Ok(CompletedTool::Continue(Some(Message::tool_result(
-                call_id,
-                result.preview,
-                false,
-            ))));
+            return Ok(CompletedTool::Continue(Some(
+                Message::tool_result_with_receipt(
+                    call_id,
+                    result.preview,
+                    false,
+                    result.images,
+                    result.status,
+                ),
+            )));
         }
         if tools[index].name == "task_outcome" {
             return self
@@ -10682,11 +11172,12 @@ impl HarnessActor {
             let projection = model_tool_result_projection(&tools[index].name, &result);
             tools.remove(index);
             return Ok(CompletedTool::Continue(Some(
-                Message::tool_result_with_images(
+                Message::tool_result_with_receipt(
                     call_id,
                     projection.preview,
                     projection.truncated,
                     result.images,
+                    result.status,
                 ),
             )));
         }
@@ -11182,11 +11673,12 @@ impl HarnessActor {
         self.commit_tool_result_and_completion(run_id, &tools[index], &result)
             .await?;
         tools.remove(index);
-        Ok(Message::tool_result_with_images(
+        Ok(Message::tool_result_with_receipt(
             call_id,
             result.preview,
             result.truncated,
             result.images,
+            result.status,
         ))
     }
 
@@ -11617,11 +12109,12 @@ impl HarnessActor {
             .await?;
         let projection = model_tool_result_projection(&tools[index].name, &result);
         tools.remove(index);
-        Ok(Message::tool_result_with_images(
+        Ok(Message::tool_result_with_receipt(
             call_id,
             projection.preview,
             projection.truncated,
             result.images,
+            result.status,
         ))
     }
 
@@ -12219,10 +12712,12 @@ impl HarnessActor {
                 .acknowledge_deferred(&pending.ticket)
                 .await
                 .map_err(DriveError::Store)?;
-            results.push(Message::tool_result(
+            results.push(Message::tool_result_with_receipt(
                 pending.call_id,
                 projection.preview,
                 projection.truncated,
+                result.images,
+                result.status,
             ));
             deferred.remove(0);
         }
@@ -12694,6 +13189,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
+        provider_error.corroborate_slots(&self.provider_slot_evidence);
         if let Some(error) = self.latched_terminal_failure().await {
             return self
                 .errored_outcome_with_items(run_id, message, reasoning, tools, error)
@@ -12723,6 +13219,14 @@ impl HarnessActor {
             }
         }
         specialize_provider_presentation(&self.config.usage_scope.auth_scope, &mut provider_error);
+        if self.config.provider_lockdown {
+            // Lockdown shows templates only: no owner-local raw text.
+            provider_error.provider_raw_detail = None;
+        }
+        apply_provider_detail_lockdown(
+            self.config.provider_lockdown,
+            &mut provider_error.presentation,
+        );
         if let Some(card) = recovery_card_kind(&provider_error.presentation) {
             let menu = recovery_menu(
                 self.next_menu_id(),
@@ -12741,14 +13245,14 @@ impl HarnessActor {
                 return errored_outcome(error);
             }
         }
-        self.errored_outcome_with_items(
-            run_id,
-            message,
-            reasoning,
-            tools,
-            provider_error_to_haider(provider_error),
-        )
-        .await
+        // Gate again AFTER the conversion: nothing in the mapped failure may
+        // carry owner-local text on a lockdown turn.
+        let mut mapped = provider_error_to_haider(provider_error);
+        if let Some(presentation) = mapped.presentation.as_mut() {
+            apply_provider_detail_lockdown(self.config.provider_lockdown, presentation);
+        }
+        self.errored_outcome_with_items(run_id, message, reasoning, tools, mapped)
+            .await
     }
 
     async fn drive_error_outcome_with_items(
@@ -12828,7 +13332,10 @@ impl HarnessActor {
 
     /// Commits `Errored` (best effort) and reports the original error.
     async fn errored_state_outcome(&mut self, run_id: &RunId, error: HaiderError) -> TurnOutcome {
-        let error = self.latched_terminal_failure().await.unwrap_or(error);
+        let mut error = self.latched_terminal_failure().await.unwrap_or(error);
+        if let Some(presentation) = error.presentation.as_mut() {
+            apply_provider_detail_lockdown(self.config.provider_lockdown, presentation);
+        }
         if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);
         }
@@ -15027,7 +15534,14 @@ fn delegated_child_wait_timed_out(error: &HaiderError) -> bool {
             == Some("delegated_child_wait_timeout")
 }
 
-fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
+/// The single publication boundary from a provider failure to a durable
+/// `HaiderError`: the message is [`ProviderError::public_message`] (template
+/// or Haider-authored text only), the presentation carries the adapter's
+/// safe detail, and unknown provider text survives only in the owner-local
+/// `provider_raw_detail`. Every provider failure that can reach `RunFailed`
+/// (turn drive, context summarization, AI Loom drafting) uses this.
+pub fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
+    let local_raw = provider_error.local_message_detail();
     let code = if provider_error.timeout_reason == Some(ProviderTimeoutReason::IdleTimeout) {
         ErrorCode::IdleTimeout
     } else if provider_error.presentation.subcode.as_str() == "provider-timeout" {
@@ -15035,7 +15549,11 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
     } else {
         ErrorCode::ProviderError
     };
-    let mut error = HaiderError::new(code, provider_error.to_string(), provider_error.retryable);
+    let mut error = HaiderError::new(
+        code,
+        provider_error.public_message(),
+        provider_error.retryable,
+    );
     error.details = Some(serde_json::json!({
         "provider_error_kind": format!("{:?}", provider_error.kind),
         "retry_after_ms": provider_error.retry_after_ms,
@@ -15049,9 +15567,15 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
             .as_mut()
             .and_then(serde_json::Value::as_object_mut)
     {
-        details.insert("idle_timeout".into(), serde_json::json!(idle));
+        // The durable idle-timeout extension serializes the preceding cause;
+        // it carries only public messages.
+        details.insert("idle_timeout".into(), serde_json::json!(idle.shareable()));
     }
-    error.presentation = Some(provider_error.presentation);
+    error.presentation = Some(
+        provider_error
+            .presentation
+            .with_provider_raw_detail(local_raw.as_deref()),
+    );
     error
 }
 
@@ -15094,6 +15618,52 @@ fn run_state_is_provider_retry(run_state: Option<&RunState>) -> bool {
                 }
         )
     )
+}
+
+/// Every core path that publishes a provider presentation uses this gate.
+/// Lockdown shows provider templates only: `detail` is already a known
+/// template rendering or the default explanation plus "details withheld",
+/// and the owner-local raw provider text is removed.
+fn apply_provider_detail_lockdown(lockdown: bool, presentation: &mut ErrorPresentation) {
+    if lockdown {
+        presentation.strip_local_only();
+    }
+}
+
+#[cfg(test)]
+mod provider_detail_lockdown_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn one_gate_keeps_templates_and_drops_local_raw_under_lockdown() {
+        let presentation = || {
+            ErrorPresentation::new(
+                "permission-denied",
+                "Provider access denied",
+                "The active account is not allowed to make this request. · details withheld",
+                ErrorScope::Account,
+                [ErrorAction::SwitchAccount],
+            )
+            .with_provider_raw_detail(Some("Denied for organization quillmere."))
+        };
+        let mut locked = presentation();
+        apply_provider_detail_lockdown(true, &mut locked);
+        assert!(locked.provider_raw_detail.is_none());
+        assert!(locked.detail.ends_with("details withheld"));
+        assert!(
+            !serde_json::to_string(&locked)
+                .expect("json")
+                .contains("quillmere")
+        );
+        let mut open = presentation();
+        apply_provider_detail_lockdown(false, &mut open);
+        assert_eq!(
+            open.provider_raw_detail.as_deref(),
+            Some("Denied for organization quillmere.")
+        );
+    }
 }
 
 fn specialize_provider_presentation(auth_scope: &str, error: &mut ProviderError) {
@@ -15240,6 +15810,9 @@ fn copy_provider_metadata(target: &mut ErrorPresentation, source: &ErrorPresenta
     target
         .provider_request_id
         .clone_from(&source.provider_request_id);
+    target
+        .provider_error_type
+        .clone_from(&source.provider_error_type);
     target.retry_after_ms = source.retry_after_ms;
     target.reset_at_ms = source.reset_at_ms;
     target.opened_within_ms = source.opened_within_ms;
@@ -15254,6 +15827,7 @@ fn recovery_card_kind(presentation: &ErrorPresentation) -> Option<ErrorRecoveryC
         "account-deleted" | "account-unavailable" => Some(ErrorRecoveryCardKind::AccountDeleted),
         "rate-limited" => Some(ErrorRecoveryCardKind::RateLimit),
         "quota-exhausted" => Some(ErrorRecoveryCardKind::QuotaExhausted),
+        "permission-denied" => Some(ErrorRecoveryCardKind::Generic),
         "keychain-relink-required" => Some(ErrorRecoveryCardKind::KeychainRelink),
         _ => None,
     }
@@ -15265,18 +15839,24 @@ fn recovery_menu(
     source_run: &RunId,
     source_item: Option<ItemId>,
     card: ErrorRecoveryCardKind,
-    presentation: ErrorPresentation,
+    mut presentation: ErrorPresentation,
     provider: Option<String>,
     account: Option<CredentialAlias>,
     blocking: bool,
 ) -> Menu {
+    // Menus are answered by hooks and projected to every client; they carry
+    // no owner-local provider text.
+    presentation.strip_local_only();
     let mut body = vec![presentation.detail.clone()];
     let title = presentation.title.clone();
     if let Some(status) = presentation.provider_http_status {
-        body.push(format!("Provider HTTP status: {status}"));
+        body.push(format!("HTTP {status}"));
     }
     if let Some(request_id) = &presentation.provider_request_id {
-        body.push(format!("Request ID: {request_id}"));
+        body.push(format!("Request id: {request_id}"));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        body.push(format!("Provider error type: {error_type}"));
     }
     if let Some(retry_after_ms) = presentation.retry_after_ms {
         let seconds = retry_after_ms.div_ceil(1_000);
@@ -17505,6 +18085,64 @@ mod cu1_actor_tests {
         let presentation = error.presentation.expect("provider presentation");
         assert_eq!(presentation.opened_within_ms, Some(60_000));
         assert_eq!(presentation.budget_ms, Some(60_000));
+    }
+
+    #[test]
+    fn provider_message_is_scrubbed_before_run_failed_journaling() {
+        let private = "robin.verify2@synthetic.example";
+        let provider_error =
+            haider_provider::acp::client::AcpError::Rpc(haider_provider::acp::wire::JsonRpcError {
+                code: -32000,
+                message: format!("Permission denied for {private}"),
+                data: None,
+            })
+            .into_provider_error(&format!("agent stderr: account {private}"));
+        let error = provider_error_to_haider(provider_error);
+        let payload = EventPayload::RunFailed {
+            code: error.code,
+            message: sanitized_failure_message(&error.message),
+            retryable: error.retryable,
+            presentation: Some(presentation_for_haider_error(&error)),
+        };
+        // The owner's local journal keeps the unknown text only in the
+        // local-only field; every shareable projection strips it.
+        let EventPayload::RunFailed {
+            message,
+            presentation: Some(presentation),
+            ..
+        } = &payload
+        else {
+            panic!("run failure payload");
+        };
+        assert!(!message.contains(private), "{message}");
+        assert!(!presentation.detail.contains(private));
+        assert!(
+            presentation
+                .provider_raw_detail
+                .as_deref()
+                .is_some_and(|raw| raw.contains("Agent stderr tail"))
+        );
+        let mut shareable = serde_json::to_value(&payload).expect("serialize run failure");
+        haider_protocol::error::strip_local_only_fields(&mut shareable);
+        assert!(!shareable.to_string().contains(private), "{shareable}");
+    }
+
+    #[test]
+    fn untrusted_frame_message_is_public_only_through_templates() {
+        let provider_error = ProviderError::new(
+            haider_provider::ProviderErrorKind::MalformedFrame,
+            "Anthropic SSE `quillmere` data is not valid JSON",
+        )
+        .with_untrusted_message();
+        let error = provider_error_to_haider(provider_error);
+        assert!(!error.message.contains("quillmere"), "{}", error.message);
+        let presentation = error.presentation.expect("presentation");
+        assert!(!presentation.detail.contains("quillmere"));
+        assert!(
+            presentation
+                .provider_raw_detail
+                .is_some_and(|raw| raw.contains("quillmere"))
+        );
     }
 
     #[tokio::test]

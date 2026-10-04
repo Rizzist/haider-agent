@@ -329,7 +329,7 @@ fn the_subline_is_the_first_meaningful_result_line() {
     )
     .expect("a meaningful line exists");
     let text = tf::segments_text(&segments);
-    assert!(text.starts_with("    └ "), "{text}");
+    assert!(text.starts_with("    ⎿ "), "{text}");
     assert!(
         text.contains("SHIP — the candidate clears every gate"),
         "{text}"
@@ -696,16 +696,16 @@ fn an_expanded_row_is_bounded_and_offers_show_all() {
 fn the_bounded_affordance_names_what_it_hides_and_how_to_walk_it() {
     assert_eq!(
         tf::segments_text(&tf::show_all_segments(0, 1)),
-        "    └ ⋯ 1 more row · ⇟/⇞ page · ⏎ show all"
+        "    ⎿ ⋯ 1 more row · ⇟/⇞ page · ⏎ show all"
     );
     assert_eq!(
         tf::segments_text(&tf::show_all_segments(4, 6)),
-        "    └ ⋯ 10 more rows (4 above) · ⇟/⇞ page · ⏎ show all",
+        "    ⎿ ⋯ 10 more rows (4 above) · ⇟/⇞ page · ⏎ show all",
         "a scrolled window says what it has already passed (verify 1, F2)"
     );
     assert_eq!(
         tf::segments_text(&tf::show_all_segments(9, 0)),
-        "    └ ⋯ 9 more rows (9 above) · ⏎ show all",
+        "    ⎿ ⋯ 9 more rows (9 above) · ⏎ show all",
         "at the bottom there is nothing below to page to"
     );
 }
@@ -1306,7 +1306,8 @@ fn only_an_uneventful_success_folds() {
         haider_tui::render::foldable_runs(&model.projection, &model.toolfold).is_empty(),
         "a failure is never spoken for by a fold row"
     );
-    assert!(transcript_has(&model, "· exit 1"));
+    // 973-tui-toolview: the exit code rides the `⎿` result line now.
+    assert!(transcript_has(&model, "⎿ Exit code 1"));
 
     // So does a joined terminal REASON (E8's recovered in-flight retry).
     let mut model = session_model();
@@ -1359,7 +1360,7 @@ fn a_tail_cut_at_the_front_never_speaks_with_a_mid_line_fragment() {
     assert_eq!(
         tf::subline_segments_from("ine 0051 — cut\nline 0052 — whole\n", true, 0)
             .map(|segments| tf::segments_text(&segments)),
-        Some("    └ line 0052 — whole".to_owned()),
+        Some("    ⎿ line 0052 — whole".to_owned()),
         "the 8 KiB cap opens the tail mid-line; the elbow skips that fragment"
     );
     assert_eq!(

@@ -82,6 +82,21 @@ class EmbeddedTranscriptTest {
         assertTrue(fallback.errorRetryable)
     }
 
+    @Test fun providerFailureShowsOnlyTheAllowlistedDiagnosticFields() {
+        val payload = obj("type" to "run_failed", "code" to "provider_error", "retryable" to false,
+            "message" to "private raw body",
+            "presentation" to obj("title" to "Provider denied the request",
+                "detail" to "The active account is not allowed to make this request. · details withheld",
+                "provider_error_type" to "permission_error",
+                "provider_http_status" to 403,
+                "provider_request_id" to "req_fixture-403",
+                "unreviewed" to "private additive field"))
+        val display = TranscriptCache.displayProjection(obj("render" to obj("ui" to true), "payload" to payload))
+        assertFalse(display.toString().contains("private"))
+        val message = RpcUiMapping.messages(listOf(TranscriptCache.Entry(1, display))).single()
+        assertEquals("Provider denied the request · The active account is not allowed to make this request. · details withheld · Provider error type: permission_error · HTTP 403 · Request id: req_fixture-403 · provider_error", message.error)
+    }
+
     @Test fun aHistoryNodeWithoutItsOriginalItemStillSuppliesText() {
         val payload = obj("type" to "node_committed", "kind" to obj("kind" to "assistant_commit", "text" to "Retained reply"))
         val display = TranscriptCache.displayProjection(obj("render" to obj("ui" to true), "payload" to payload))

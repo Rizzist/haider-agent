@@ -497,12 +497,17 @@ fn edits_appends_and_completions_never_render_stale_rows() {
             item: tool(ToolStatus::InProgress),
         }),
     );
+    // 973-tui-toolview: the row reads `Fetch(url)`; a live row wears the
+    // spinner, a settled one the `●` bullet.
     let running = draw(&model, width, height);
     let row = running
-        .row_containing("web_fetch")
+        .row_containing("Fetch(https://example.invalid/)")
         .expect("the running tool row");
     assert!(
-        !running.rows[row].contains('✓'),
+        !running.rows[row].contains('●')
+            && haider_tui::toolfold::SPINNER
+                .iter()
+                .any(|frame| running.rows[row].contains(frame)),
         "not done yet: {:?}",
         running.rows[row]
     );
@@ -515,10 +520,10 @@ fn edits_appends_and_completions_never_render_stale_rows() {
     );
     let done = draw(&model, width, height);
     let row = done
-        .row_containing("web_fetch")
+        .row_containing("Fetch(https://example.invalid/)")
         .expect("the completed tool row");
     assert!(
-        done.rows[row].contains('✓'),
+        done.rows[row].contains('●'),
         "completed glyph: {:?}",
         done.rows[row]
     );

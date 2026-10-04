@@ -130,6 +130,17 @@ impl RawPayload {
         }
     }
 
+    /// Removes owner-local-only fields (see
+    /// [`crate::error::strip_local_only_fields`]) and returns the first
+    /// removed provider raw detail. Reply leaves are untouched.
+    pub fn strip_local_only_fields(&mut self) -> Option<String> {
+        let skeleton = match self {
+            Self::Json(value) => value,
+            Self::Reply(reply) => &mut reply.skeleton,
+        };
+        crate::error::strip_local_only_fields(skeleton)
+    }
+
     /// Converts a locally-produced typed payload without copying reply bytes.
     pub fn from_event(mut payload: EventPayload) -> Result<Self, serde_json::Error> {
         let reply = reply_leaf_mut(&mut payload).map(|(text, path)| {

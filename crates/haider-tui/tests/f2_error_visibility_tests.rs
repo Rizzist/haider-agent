@@ -377,7 +377,8 @@ fn a_rejected_submit_lands_in_the_session_view() {
     );
 }
 
-/// PIN: a failed tool row wears the ✗ glyph in the session view.
+/// PIN: a failed tool row is marked in the session view — since
+/// 973-tui-toolview, a red `●` header over a red `⎿ Error editing file`.
 #[test]
 fn failed_tool_rows_wear_the_error_glyph() {
     let mut model = live_session();
@@ -393,9 +394,10 @@ fn failed_tool_rows_wear_the_error_glyph() {
             },
         }),
     ));
+    let text = draw_text(&model);
     assert!(
-        draw_text(&model).contains("✗ fs_edit"),
-        "the failed tool is marked in the view"
+        text.contains("● Edit(x.rs)") && text.contains("⎿ Error editing file"),
+        "the failed tool is marked in the view: {text}"
     );
 }
 
@@ -505,10 +507,13 @@ fn a_failed_tool_call_renders_exactly_one_row() {
         })
         .expect("the tool row carries its failure reason");
     assert!(reason.contains("ENOENT"), "{reason}");
-    assert!(
-        draw_text(&model).contains("✗ process_exec"),
-        "one visible failed row"
+    let text = draw_text(&model);
+    assert_eq!(
+        text.matches("⎿ Command failed").count(),
+        1,
+        "one visible failed row: {text}"
     );
+    assert!(text.contains("● Bash(cargo test)"), "{text}");
 }
 
 /// A failure with NO owning tool-call row keeps its standalone line —

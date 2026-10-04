@@ -19,9 +19,10 @@
 //! screen; it is posted with low urgency so the desktop retires the popup
 //! into its notification list quickly, where Stop stays available.
 
+use super::overlay_linux_logic::{LinuxPopupState, confirm_close};
 use super::{
-    LinuxNotificationPlan, PresenceCommand, PresenceEvent, PresenceMark, encode_event,
-    parse_command_line,
+    LinuxNotificationPlan, LinuxStopRouter, PresenceCommand, PresenceEvent, PresenceMark,
+    encode_event, parse_command_line,
 };
 use futures_util::StreamExt as _;
 use std::collections::HashMap;
@@ -33,8 +34,6 @@ use zbus::zvariant::Value;
 const DESTINATION: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
 const INTERFACE: &str = "org.freedesktop.Notifications";
-/// Action key of the Stop button (see `LinuxNotificationPlan::actions`).
-const STOP_ACTION: &str = "stop";
 /// Body updates are rate-limited so a burst of actions does not spam the bus.
 const UPDATE_INTERVAL: Duration = Duration::from_millis(800);
 
@@ -68,13 +67,13 @@ struct Notifier {
     id: u32,
     label: String,
     last_update: Option<Instant>,
-    last_body: String,
     plan: LinuxNotificationPlan,
 }
 
 impl Notifier {
-    async fn notify(&mut self, body: &str) {
-        self.last_body = body.to_owned();
+    /// Posts (or replaces) the notification and records its id with the
+    /// Stop router of the active generation.
+    async fn notify(&mut self, body: &str, router: &mut LinuxStopRouter) {
         let body = self.plan.body(body);
         let body = body.as_str();
         let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
@@ -102,7 +101,10 @@ impl Notifier {
             )
             .await;
         match reply.and_then(|reply| reply.body().deserialize::<u32>()) {
-            Ok(id) => self.id = id,
+            Ok(id) => {
+                self.id = id;
+                router.posted(id);
+            }
             Err(error) => emit(&PresenceEvent::Error {
                 message: format!("desktop notification failed: {error}"),
             }),
@@ -110,12 +112,13 @@ impl Notifier {
         self.last_update = Some(Instant::now());
     }
 
-    async fn close(&mut self) {
+    /// Closes the current notification. Its id stays live in the router
+    /// until `Hide`: a Stop already queued on the bus still counts.
+    async fn close(&mut self) -> Result<(), String> {
         if self.id == 0 {
-            return;
+            return Ok(());
         }
-        let _ = self
-            .connection
+        self.connection
             .call_method(
                 Some(DESTINATION),
                 PATH,
@@ -123,8 +126,10 @@ impl Notifier {
                 "CloseNotification",
                 &(self.id,),
             )
-            .await;
+            .await
+            .map_err(|error| format!("desktop notification close failed: {error}"))?;
         self.id = 0;
+        Ok(())
     }
 }
 
@@ -198,11 +203,10 @@ async fn run_async() -> i32 {
         id: 0,
         label: "Haider is controlling this screen".into(),
         last_update: None,
-        last_body: String::new(),
         plan,
     };
-    let mut visible = false;
-    let mut stopping = false;
+    let mut router = LinuxStopRouter::default();
+    let mut popup = LinuxPopupState::default();
     loop {
         tokio::select! {
             line = lines.recv() => {
@@ -211,38 +215,45 @@ async fn run_async() -> i32 {
                     Some(Ok(command)) => match command {
                         PresenceCommand::Show { label, .. } => {
                             notifier.label = label;
-                            visible = true;
-                            stopping = false;
+                            router.show();
                             let body = notifier.plan.intro_body();
-                            notifier.notify(body).await;
+                            if popup.show(body) {
+                                notifier.notify(body, &mut router).await;
+                            }
                         }
                         PresenceCommand::Pointer { seq, mark, point, .. } => {
                             emit(&PresenceEvent::Ack { seq });
                             let due = notifier.last_update.is_none_or(|last| last.elapsed() >= UPDATE_INTERVAL);
-                            if visible && due && mark != PresenceMark::Observe {
+                            if router.is_active() && mark != PresenceMark::Observe {
                                 let body = point.map_or_else(
                                     || format!("Last action: {}", mark.caption()),
                                     |point| format!("Last action: {} at ({:.0}, {:.0})", mark.caption(), point.x, point.y),
                                 );
-                                notifier.notify(&body).await;
+                                if popup.pointer(&body, due) {
+                                    notifier.notify(&body, &mut router).await;
+                                }
                             }
                         }
-                        PresenceCommand::Stopping { .. } => stopping = true,
+                        PresenceCommand::Stopping { .. } => router.stopping(),
                         PresenceCommand::Hide { .. } => {
-                            visible = false;
-                            notifier.close().await;
+                            router.hide();
+                            popup.hide();
+                            let _ = notifier.close().await;
                         }
                         // The popup is an ordinary window: close it around a
                         // model-facing capture, then post it again.
                         PresenceCommand::Conceal { seq, .. } => {
-                            notifier.close().await;
+                            popup.conceal();
+                            if let Err(message) = confirm_close(notifier.close(), Duration::from_millis(300)).await {
+                                emit(&PresenceEvent::ConcealFailed { seq, message });
+                                continue;
+                            }
                             tokio::time::sleep(CONCEAL_SETTLE).await;
                             emit(&PresenceEvent::Ack { seq });
                         }
                         PresenceCommand::Reveal { .. } => {
-                            if visible && !stopping {
-                                let body = notifier.last_body.clone();
-                                notifier.notify(&body).await;
+                            if let Some(body) = popup.reveal(router.is_active(), router.is_stopping()) {
+                                notifier.notify(&body, &mut router).await;
                             }
                         }
                     },
@@ -262,18 +273,20 @@ async fn run_async() -> i32 {
                     actions = None;
                     continue;
                 };
+                // Any notification of the active generation — including
+                // one closed for a capture whose Stop was already queued.
                 if let Ok((id, key)) = signal.body().deserialize::<(u32, String)>()
-                    && id == notifier.id
-                    && key == STOP_ACTION
-                    && visible
-                    && !stopping
+                    && router.on_action(id, &key)
                 {
-                    stopping = true;
                     emit(&PresenceEvent::Stop);
                 }
             }
         }
     }
-    notifier.close().await;
+    let _ = notifier.close().await;
     0
 }
+
+#[cfg(test)]
+#[path = "overlay_linux_dbus_tests.rs"]
+mod dbus_tests;
