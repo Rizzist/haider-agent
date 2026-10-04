@@ -1047,6 +1047,9 @@ fn omit_event_activity(envelope: &mut haider_protocol::envelope::RawEnvelope) {
         Some("effect")
             if payload.get("phase").and_then(serde_json::Value::as_str) == Some("intent") =>
         {
+            if let Some(fields) = payload.as_object_mut() {
+                fields.remove("effect_origin");
+            }
             // Recovery used a Network effect before this lane. Keep the
             // historical bytes for peers without the activity capability.
             if let Some(class) = payload

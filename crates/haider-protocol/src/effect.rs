@@ -74,6 +74,7 @@ pub enum EffectClass {
 
 /// Journaled BEFORE dispatch — the durable pre-image of every side effect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "JournalEffectIntent", into = "JournalEffectIntent")]
 pub struct EffectIntent {
     pub effect: EffectId,
     pub class: EffectClass,
@@ -84,6 +85,80 @@ pub struct EffectIntent {
     pub args_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_revision: Option<WorkspaceRevision>,
+}
+
+/// Keep authority typed in memory while using only released class values on
+/// disk. The 0.0.972 intent decoder ignores this additive origin field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EffectOrigin {
+    CheckpointRestore,
+    ProviderTransport,
+}
+
+#[derive(Serialize, Deserialize)]
+struct JournalEffectIntent {
+    effect: EffectId,
+    class: EffectClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect_origin: Option<EffectOrigin>,
+    summary: String,
+    args_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_revision: Option<WorkspaceRevision>,
+}
+
+impl From<EffectIntent> for JournalEffectIntent {
+    fn from(intent: EffectIntent) -> Self {
+        let (class, effect_origin) = match intent.class {
+            EffectClass::CheckpointRestore => {
+                (EffectClass::FsWrite, Some(EffectOrigin::CheckpointRestore))
+            }
+            EffectClass::ProviderTransport => (
+                EffectClass::Network {
+                    host: "provider-request".into(),
+                },
+                Some(EffectOrigin::ProviderTransport),
+            ),
+            class => (class, None),
+        };
+        Self {
+            effect: intent.effect,
+            class,
+            effect_origin,
+            summary: intent.summary,
+            args_digest: intent.args_digest,
+            workspace_revision: intent.workspace_revision,
+        }
+    }
+}
+
+impl TryFrom<JournalEffectIntent> for EffectIntent {
+    type Error = &'static str;
+
+    fn try_from(intent: JournalEffectIntent) -> Result<Self, Self::Error> {
+        // Prefer explicit provenance, never a tool name or human summary.
+        // Reject a mismatched carrier rather than guessing mutation authority.
+        let class = match (intent.effect_origin, intent.class) {
+            (Some(EffectOrigin::CheckpointRestore), EffectClass::FsWrite) => {
+                EffectClass::CheckpointRestore
+            }
+            (Some(EffectOrigin::ProviderTransport), EffectClass::Network { host })
+                if host == "provider-request" =>
+            {
+                EffectClass::ProviderTransport
+            }
+            (Some(_), _) => return Err("effect origin does not match its released class carrier"),
+            (None, class) => class,
+        };
+        Ok(Self {
+            effect: intent.effect,
+            class,
+            summary: intent.summary,
+            args_digest: intent.args_digest,
+            workspace_revision: intent.workspace_revision,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

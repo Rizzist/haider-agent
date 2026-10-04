@@ -228,10 +228,6 @@ fun SettingsScreen(
                 }
             }
 
-            // 973-activity-icons: the phone's own on/off for subagent
-            // activity icons (stored locally, default on).
-            ActivityIconsCard()
-
             SectionLabel(R.string.settings_section_permissions)
             // Rows, not paragraphs: title, one-line status, chevron. The
             // explanation and the action live on the row's detail sheet
@@ -281,6 +277,9 @@ fun SettingsScreen(
                 onClick = { detail = PermissionDetail.Battery },
             )
 
+            // Display preferences follow permission standing so all existing
+            // permission rows retain their original position in the viewport.
+            ActivityIconsCard()
         }
 
         detail?.let { open ->

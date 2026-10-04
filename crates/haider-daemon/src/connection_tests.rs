@@ -3425,6 +3425,14 @@ fn activity_peer_classes_preserve_historical_bytes_on_every_envelope_path() {
             serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"checkpoint_restore"}, "summary":"undo", "args_digest":"digest"}),
             serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"fs_write"}, "summary":"undo", "args_digest":"digest"}),
         ),
+        (
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"network", "host":"provider-request"}, "effect_origin":"provider_transport", "summary":"recovery", "args_digest":"digest"}),
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"network", "host":"provider-request"}, "summary":"recovery", "args_digest":"digest"}),
+        ),
+        (
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"fs_write"}, "effect_origin":"checkpoint_restore", "summary":"undo", "args_digest":"digest"}),
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"fs_write"}, "summary":"undo", "args_digest":"digest"}),
+        ),
         // Negative control: activity-like keys inside model arguments are data.
         (
             serde_json::json!({"type":"item", "event":"completed", "item_id":"i", "item":{"item":"tool_call", "call_id":"c", "name":"custom", "args":{"activity":"keep", "activity_kind":"keep"}, "status":"completed"}}),

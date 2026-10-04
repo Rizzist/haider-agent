@@ -71,24 +71,26 @@ alternation), and follows the daemon's `HAIDER_ACTIVITY_ICONS`
 then `NO_COLOR` (it is a shared daemon surface, so a single TUI's `/icons`
 choice does not apply to it).
 
-**Effect-class downgrade policy:** `checkpoint_restore` journals operator undo,
-redo and rollback with workspace mutation provenance; `provider_transport`
-journals provider recovery without agent activity. Wire peers that did not
-request `session_activity_v1` still receive the historical `fs_write` and
-`network`/`provider-request` classes through the connection adapter. The
-policy below concerns a daemon reading a newer journal directly. These are
-additive class values, but `EffectClass` is an authority enum and intentionally has no
-`serde(other)`: a pre-973 typed decoder returns a serde data error (`unknown
-variant`) for either class. It must not reinterpret them as filesystem or
-network authority. Older `RawEnvelope` readers retain the complete JSON, so
-listing/exporting the journal is lossless. A store operation requiring the
-unknown intent's typed mutation provenance refuses it with `invalid_argument`
-(missing durable mutation-class intent); it does not commit a guessed intent
-or mutate the journal. Downgrade is therefore a raw-read fallback, not a
-promise that older daemons can execute operations against newer checkpoint
-provenance. Keep the journal and use a daemon that recognizes these classes
-for checkpoint/workflow operations. The frozen pre-lane decoder regression
-covers both new values and unchanged existing classes.
+**Effect-class downgrade policy:** operator undo, redo and rollback retain
+`CheckpointRestore` provenance in memory; provider recovery retains
+`ProviderTransport` provenance. New journal writes use only released 0.0.972
+class values: `fs_write` plus additive `effect_origin: "checkpoint_restore"`,
+or `network { host: "provider-request" }` plus
+`effect_origin: "provider_transport"`. The released intent structs ignore
+unknown fields, so a 0.0.972 daemon can start, list and operate on the profile
+without an unknown-enum startup error. It treats restores as ordinary file
+effects and provider recovery as historical transport bookkeeping. Its typed
+projections may omit the additive origin; raw journal records retain it.
+On re-upgrade the current reader prefers the typed additive origin, validates
+its carrier, and restores the distinct mutation admission, graph provenance
+and activity semantics. Ordinary file/network effects have no origin field
+and keep their exact historical shape; names and summaries never supply
+origin. Current readers also accept direct class values written by earlier
+lane candidates, but normalize all new writes to the released carriers.
+Peers without `session_activity_v1` receive the historical intent with the
+origin removed. The frozen enum and complete old-intent decoder tests pin
+both compatible writes and strict rejection of direct new enum values;
+real wave-base daemon probes cover startup, operations and re-upgrade.
 
 **Release note (CLI behaviour change):** `haider agent list` without
 `--json` now prints a human fleet tree (state glyph, activity glyph, name,
@@ -839,9 +841,9 @@ fleet identity but without activity keep model/provider identity, while all
 activity fields in events, history, observation, lists, roster and recursive
 fleet are omitted. The internal `provider_transport` effect is presented as
 the historical `network { host: "provider-request" }` shape to both older peer
-classes. Operator checkpoint undo/redo/rollback now journal the typed
-`checkpoint_restore` effect class; to older peers it is presented as the
-historical `fs_write` class. Neither operator shell `CommandExecution` nor a
+classes. Operator checkpoint undo/redo/rollback journal the historical `fs_write`
+class with additive `effect_origin: "checkpoint_restore"`; the current
+reader restores the typed class, and older peers omit the origin. Neither operator shell `CommandExecution` nor a
 checkpoint restore counts as agent activity. Old user-shell journals are
 excluded by the typed item kind and the typed `user_typed` authorization
 source on their `process_exec` effect. The typed `CommandExecution` admission
