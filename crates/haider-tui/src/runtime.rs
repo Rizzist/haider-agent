@@ -3913,6 +3913,10 @@ pub async fn run_live(
     // `TalkPhase::Listening`), so an idle terminal takes ZERO extra
     // wakeups — the same efficiency-rider law the guarded `frame_tick`
     // already follows.
+    // Catalog and account mutations from other clients must retire identity
+    // chrome even when the terminal is idle. One bounded pair per interval.
+    let mut management_tick = tokio::time::interval(Duration::from_secs(1));
+    management_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut talk_tick = tokio::time::interval(Duration::from_millis(TALK_ANIM_MS));
     talk_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
@@ -4066,6 +4070,9 @@ pub async fn run_live(
                     }
                     None => update_events_open = false,
                 }
+            }
+            _ = management_tick.tick(), if link_replies_open && !update_in_progress => {
+                pending.extend(driver.refresh_management());
             }
             _ = anim_tick.tick(), if model.animated() => {
                 model.anim_phase = model.anim_phase.wrapping_add(1);

@@ -385,6 +385,8 @@ fn provider_view(
         provider.default_model = None;
         provider.availability = ProviderAvailabilityWire::Unavailable;
     }
+    provider.availability = provider.selection_availability(None);
+    provider.availability_reason = provider.selection_reason(None);
     let auth_state = auth_state(&provider, descriptors);
     let has_credential = descriptors
         .iter()

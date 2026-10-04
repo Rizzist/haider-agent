@@ -1786,6 +1786,10 @@ async fn run_account_actor(
     let _source_watcher = (!crate::android_policy::enabled())
         .then(|| CredentialSourceWatcher::new(&source_registry, source_event_tx.clone()));
     let _source_event_tx = source_event_tx;
+    let mut catalog_refresh_tick = tokio::time::interval(Duration::from_secs(5));
+    catalog_refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    catalog_refresh_tick.tick().await;
+    let mut catalog_retry = HashMap::<String, (Instant, Duration)>::new();
     let mut draining = false;
     if backfill_oauth_identities(&mut accounts, vault.as_ref()).await {
         refresh_resolver_snapshot(&snapshot, &accounts);
@@ -1895,6 +1899,24 @@ async fn run_account_actor(
                     }
                     None => {}
                 }
+                continue;
+            }
+            _ = catalog_refresh_tick.tick(), if !draining => {
+                let now = Instant::now();
+                for summary in catalog_summaries(&accounts, &providers) {
+                    if !summary.enabled || !matches!(summary.inventory, haider_rpc::ModelInventoryWire::Stale { .. }) {
+                        catalog_retry.remove(&summary.provider);
+                        continue;
+                    }
+                    if !refreshing_providers.contains(&summary.provider)
+                        && catalog_retry.get(&summary.provider).is_none_or(|(due, _)| now >= *due) {
+                        let delay = catalog_retry.get(&summary.provider)
+                            .map_or(Duration::from_secs(5), |(_, delay)| (*delay * 2).min(Duration::from_secs(300)));
+                        catalog_retry.insert(summary.provider.clone(), (now + delay, delay));
+                        pending_catalog_discoveries.enqueue(summary.provider);
+                    }
+                }
+                publish_inventory_states(&store, management.as_ref(), &accounts, &providers).await;
                 continue;
             }
             _ = source_reconcile.tick(), if !draining && !crate::android_policy::enabled() => AccountCommand::ReconcileSources,
@@ -3372,6 +3394,14 @@ async fn finish_provider_models_refresh(
             ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unsupported { .. }))
         ) {
             providers.models_unsupported(&provider, reason);
+        } else if matches!(
+            &result,
+            ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unauthorized | CatalogError::Empty))
+        ) || matches!(&result, ProviderModelsRefreshResult::Credential(error) if !error.retryable) {
+            // Retire durable positive evidence too: a restart cannot resurrect
+            // a listing whose credential was explicitly rejected.
+            let _ = store.delete_provider_models(cache_key.clone().into()).await;
+            providers.models_rejected(&provider, reason);
         } else {
             providers.models_unavailable(&provider, reason);
         }
@@ -3744,10 +3774,29 @@ fn catalog_producer(
     accounts: &AccountStore<Box<dyn StoreLike>>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Option<CatalogProducer> {
-    let (source, auth) = catalog_source(provider, providers)?;
+    let (_, auth) = catalog_source(provider, providers)?;
     let descriptor = match auth {
         ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::OAuth => {
             Some(accounts.active_for_provider(provider)?)
+        }
+        ProviderAuthRequirementWire::None => None,
+        _ => return None,
+    };
+    catalog_producer_for_account(profile, provider, descriptor, providers)
+}
+
+/// A discovery attempt names its account explicitly. Publication remains
+/// gated by `refresh_completion_is_current`, including for inactive accounts.
+fn catalog_producer_for_account(
+    profile: &str,
+    provider: &str,
+    descriptor: Option<&CredentialDescriptor>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<CatalogProducer> {
+    let (source, auth) = catalog_source(provider, providers)?;
+    let descriptor = match auth {
+        ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::OAuth => {
+            Some(descriptor.filter(|row| row.provider == provider)?)
         }
         ProviderAuthRequirementWire::None => None,
         _ => return None,
@@ -5721,14 +5770,14 @@ async fn handle_set_default_model(
         }
     }
     if let Some(summary) = catalog_summary(&identity.provider, accounts, providers)
-        .filter(crate::model_select::configured_deployment_is_unavailable)
+        .filter(|summary| !summary.model_is_selectable(&identity.model))
     {
         respond_management_error(
             &job.route,
             &HaiderError::new(
                 ErrorCode::ProviderError,
                 summary
-                    .availability_reason
+                    .selection_reason(Some(&identity.model))
                     .unwrap_or_else(|| "configured deployment requires a model-list fetch".into()),
                 true,
             ),
@@ -10977,10 +11026,7 @@ impl AccountsProviderFactory {
 
     fn inventory_requires_current_producer(profile: &ProviderSummaryWire) -> bool {
         profile.catalog_scope.is_some()
-            && (profile
-                .endpoint
-                .as_deref()
-                .is_some_and(haider_provider::azure_openai_origin)
+            && (!profile.configured_models.is_empty()
                 || (matches!(
                     profile.catalog,
                     haider_rpc::ProviderCatalogKindWire::Public
@@ -11037,6 +11083,9 @@ impl AccountsProviderFactory {
         let profile = summaries
             .iter()
             .find(|summary| summary.provider == metadata.provider);
+        if self.management.is_some() && profile.is_none() {
+            return Err(HaiderError::new(ErrorCode::ProviderError, "provider was removed", false));
+        }
         // Even an explicitly configured model can borrow fetched eligibility:
         // Azure requires a successful or unsupported listing, and authoritative
         // inventories require membership. Account and inventory snapshots are
@@ -11073,13 +11122,12 @@ impl AccountsProviderFactory {
 
         if let Some(summary) = summaries.iter().find(|summary| {
             summary.provider == metadata.provider
-                && crate::model_select::configured_deployment_is_unavailable(summary)
+                && !summary.model_is_selectable(&metadata.model)
         }) {
             return Err(HaiderError::new(
                 ErrorCode::ProviderError,
                 summary
-                    .availability_reason
-                    .clone()
+                    .selection_reason(Some(&metadata.model))
                     .unwrap_or_else(|| "configured deployment requires a model-list fetch".into()),
                 true,
             ));
@@ -14091,16 +14139,6 @@ impl AccountsRuntime {
             providers.sort();
             providers
         };
-        for provider in providers
-            .summaries(&|_| false)
-            .into_iter()
-            .map(|row| row.provider)
-        {
-            if catalog_source(&provider, &providers).is_some() {
-                let key = catalog_selection_scope(&provider, &accounts, &providers);
-                providers.reconcile_catalog_scope(&provider, key)?;
-            }
-        }
         if !schema_bootstrapped_from_zero {
             let provider_ids = providers
                 .summaries(&|_| false)
@@ -14130,6 +14168,16 @@ impl AccountsRuntime {
                         },
                     );
                 }
+            }
+        }
+        for provider in providers
+            .summaries(&|_| false)
+            .into_iter()
+            .map(|row| row.provider)
+        {
+            if catalog_source(&provider, &providers).is_some() {
+                let key = catalog_selection_scope(&provider, &accounts, &providers);
+                providers.reconcile_startup_catalog_scope(&provider, key)?;
             }
         }
         prune_catalog_cache(store, &accounts, &providers).await;

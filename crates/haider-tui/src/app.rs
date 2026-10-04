@@ -12272,13 +12272,40 @@ impl AppModel {
     /// reasoning [· fast]` — NO alias, right-aligned on the band's top
     /// border by the renderer.
     ///
+    /// Saved catalog picks are preferences, not current display identity,
+    /// until the live snapshots prove their producer is still current.
+    #[must_use]
+    pub fn display_identity(&self) -> std::borrow::Cow<'_, IdentityLine> {
+        let awaiting_owner = self.mode == RuntimeMode::Live
+            && (self.restored_model_catalog_pending
+                || self.identity_catalog_key.as_ref().is_some_and(|key| {
+                    !self.providers.providers.iter().any(|summary| {
+                        summary.provider == self.identity.provider
+                            && summary.catalog_scope.as_ref().is_some_and(|scope| &scope.key == key)
+                    })
+                }));
+        if awaiting_owner {
+            let mut identity = self.identity.clone();
+            identity.model_short.clear();
+            identity.context_window = 0;
+            identity.account.clear();
+            std::borrow::Cow::Owned(identity)
+        } else {
+            std::borrow::Cow::Borrowed(&self.identity)
+        }
+    }
+
     /// WIDTH-DEGRADATION LAW: segments drop WHOLE, never truncated
     /// mid-word — the reasoning segment (its fast marker riding it)
     /// drops first, then the auth label, then the whole line; the model
     /// name is all-or-nothing.
     #[must_use]
     pub fn composer_identity(&self, budget: usize) -> Option<String> {
-        let model = self.identity.model_short.as_str();
+        let identity = self.display_identity();
+        let model = identity.model_short.as_str();
+        if model.is_empty() {
+            return None;
+        }
         let auth = self.identity_auth_label();
         // G3 (LE7): the tuning segment exists when EITHER knob is set —
         // explicit effort, the fast marker riding it, or fast alone.
@@ -20945,8 +20972,7 @@ impl AppModel {
                 haider_rpc::ProviderAvailabilityWire::Available
             );
             let reason = summary
-                .availability_reason
-                .clone()
+                .selection_reason(None)
                 .or_else(|| (!available).then(|| "provider unavailable".to_owned()));
             let inventory_age_ms = now_ms
                 .zip(summary.inventory.fetched_at_ms())
@@ -21016,6 +21042,7 @@ impl AppModel {
                 continue;
             }
             for model in &summary.models {
+                let available = summary.model_is_selectable(model);
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
                     providers: vec![summary.provider.clone()],
@@ -21044,7 +21071,7 @@ impl AppModel {
                         .and_then(|detail| detail.source),
                     inventory_age_ms,
                     available,
-                    reason: reason.clone(),
+                    reason: summary.selection_reason(Some(model)).or_else(|| reason.clone()),
                     is_default: summary.default_model.as_deref() == Some(model),
                     is_current: self.identity.provider == summary.provider
                         && self.identity.model_short == *model,

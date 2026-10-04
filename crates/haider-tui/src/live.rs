@@ -2146,6 +2146,9 @@ pub struct LiveDriver {
     /// Reads that must not cross a reconnect (loom.list) carry it out and
     /// their replies echo it back; a mismatch installs nothing.
     connection_epoch: u64,
+    management_refresh_started: Option<std::time::Instant>,
+    management_refresh_accounts: bool,
+    management_refresh_providers: bool,
     /// Bidirectional volatile composer state. Session fences reset on a new
     /// socket; the process-local publish counter stays monotonic.
     input_mirror: InputMirrorState,
@@ -2449,6 +2452,9 @@ impl LiveDriver {
     pub fn new(instance: impl Into<String>) -> Self {
         Self {
             connection_epoch: 0,
+            management_refresh_started: None,
+            management_refresh_accounts: false,
+            management_refresh_providers: false,
             input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
             routes: HashMap::new(),
@@ -2633,6 +2639,24 @@ impl LiveDriver {
             LiveCommand::AccountList,
             LiveCommand::ProviderList,
         ]
+    }
+
+    /// Poll external management changes with at most one outstanding pair.
+    /// The read deadline permits recovery when an old peer drops a reply.
+    pub fn refresh_management(&mut self) -> Vec<LiveCommand> {
+        if !self.connected || self.management_refresh_started.is_some_and(|started| started.elapsed() < std::time::Duration::from_secs(30)) {
+            return Vec::new();
+        }
+        self.management_refresh_started = Some(std::time::Instant::now());
+        self.management_refresh_accounts = true;
+        self.management_refresh_providers = true;
+        vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+    }
+
+    fn management_refresh_complete(&mut self) {
+        if !self.management_refresh_accounts && !self.management_refresh_providers {
+            self.management_refresh_started = None;
+        }
     }
 
     // ---------------------------------------------------------- commands --
@@ -4497,6 +4521,8 @@ impl LiveDriver {
                 revision,
                 sources,
             } => {
+                self.management_refresh_accounts = false;
+                self.management_refresh_complete();
                 let previous_scopes = model
                     .accounts
                     .rows
@@ -4637,6 +4663,8 @@ impl LiveDriver {
                 providers,
                 revision,
             } => {
+                self.management_refresh_providers = false;
+                self.management_refresh_complete();
                 if model.providers.apply_snapshot(providers, revision) {
                     // The provider snapshot may complete the bootstrap the
                     // account snapshot started (either order works).
@@ -5707,6 +5735,7 @@ impl LiveDriver {
                 Vec::new()
             }
             LiveReply::Disconnected { reason } => {
+                self.management_refresh_started = None;
                 self.connected = false;
                 self.binding_worker_generation = None;
                 self.attaching.clear();

@@ -423,6 +423,10 @@ pub(crate) enum ProviderInventory {
     Unsupported {
         reason: String,
     },
+    /// Credential rejection is negative evidence even for a static catalog.
+    Rejected {
+        reason: String,
+    },
     /// Test fixtures state their provenance explicitly without inventing a fetch time.
     #[cfg(test)]
     Configured {
@@ -436,7 +440,7 @@ impl ProviderInventory {
             Self::Fetched { models, .. } | Self::Stale { models, .. } => Some(models.clone()),
             #[cfg(test)]
             Self::Configured { models } => Some(models.clone()),
-            Self::NeverFetched | Self::Unavailable { .. } | Self::Unsupported { .. } => None,
+            Self::NeverFetched | Self::Unavailable { .. } | Self::Unsupported { .. } | Self::Rejected { .. } => None,
         }
     }
 
@@ -455,7 +459,7 @@ impl ProviderInventory {
                 fetched_at_ms: *fetched_at_ms,
                 reason: reason.clone(),
             },
-            Self::Unavailable { reason } | Self::Unsupported { reason } => {
+            Self::Unavailable { reason } | Self::Unsupported { reason } | Self::Rejected { reason } => {
                 ModelInventoryWire::Unavailable {
                     reason: reason.clone(),
                 }
@@ -525,6 +529,7 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let inventory = match inventories.remove(provider).unwrap_or_default() {
+            rejected @ ProviderInventory::Rejected { .. } => rejected,
             ProviderInventory::Fetched {
                 models,
                 fetched_at_ms,
@@ -690,6 +695,10 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .map(|profile| self.summary_profile(profile, has_credential))
     }
 
+    pub(crate) fn models_rejected(&self, provider: &str, reason: String) {
+        self.model_source.replace(provider.to_owned(), ProviderInventory::Rejected { reason });
+    }
+
     pub(crate) fn replace_discovered_models(
         &self,
         provider: String,
@@ -723,8 +732,43 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         if self.profiles[index].catalog_selection_key == key {
             return Ok(());
         }
+        self.reconcile_catalog_scope_inner(index, key, false)
+    }
+
+    /// Only startup may adopt a pre-scope selection, and only from inventory
+    /// hydrated using the active producer's durable cache key.
+    pub(crate) fn reconcile_startup_catalog_scope(
+        &mut self,
+        provider: &str,
+        key: Option<String>,
+    ) -> Result<(), HaiderError> {
+        let Some(index) = self.profiles.iter().position(|row| row.provider_id == provider) else {
+            return Ok(());
+        };
+        if self.profiles[index].catalog_selection_key == key {
+            return Ok(());
+        }
+        self.reconcile_catalog_scope_inner(index, key, true)
+    }
+
+    fn reconcile_catalog_scope_inner(
+        &mut self,
+        index: usize,
+        key: Option<String>,
+        adopt_legacy: bool,
+    ) -> Result<(), HaiderError> {
+        let provider = self.profiles[index].provider_id.clone();
+        let legacy_models = if adopt_legacy
+            && key.is_some()
+            && self.profiles[index].catalog_selection_key.is_none()
+        {
+            self.discovered_slugs(&provider)
+        } else {
+            Vec::new()
+        };
         let profile = &mut self.profiles[index];
-        let permanent = permanent_catalog_slugs(profile);
+        let mut permanent = permanent_catalog_slugs(profile);
+        permanent.extend(legacy_models);
         if profile
             .default_model
             .as_ref()
@@ -753,10 +797,10 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         if self
             .resilience
             .promotion_models
-            .get(provider)
+            .get(&provider)
             .is_some_and(|model| !permanent.contains(model))
         {
-            self.resilience.promotion_models.remove(provider);
+            self.resilience.promotion_models.remove(&provider);
         }
         self.store.save(&self.profiles)
     }
@@ -766,6 +810,9 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     }
 
     pub(crate) fn models_unsupported(&self, provider: &str, reason: String) {
+        if matches!(self.model_source.inventory(provider), ProviderInventory::Rejected { .. }) {
+            return;
+        }
         self.model_source.replace(
             provider.to_owned(),
             ProviderInventory::Unsupported { reason },
@@ -1275,31 +1322,10 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     /// Selection accepts fetched rows, offline rows, or an explicit custom
     /// model list while discovery has not produced usable inventory.
     fn selectable_slugs(&self, provider: &str) -> Vec<String> {
-        let inventory = self.model_source.inventory(provider);
-        if let Some(profile) = self.get(provider) {
-            if configured_catalog_fallback(profile, &inventory) {
-                return if matches!(inventory, ProviderInventory::Unsupported { .. })
-                    || !profile
-                        .base_url
-                        .as_deref()
-                        .is_some_and(haider_provider::azure_openai_origin)
-                {
-                    configured_rows(profile)
-                        .into_iter()
-                        .map(|row| row.model.slug)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-            }
-            if offline_inventory(profile) {
-                return configured_rows(profile)
-                    .into_iter()
-                    .map(|row| row.model.slug)
-                    .collect();
-            }
-        }
-        self.discovered_slugs(provider)
+        let Some(summary) = self.summary(provider, &|_| true) else {
+            return Vec::new();
+        };
+        summary.models.iter().filter(|model| summary.model_is_selectable(model)).cloned().collect()
     }
 
     fn discovered_details(&self, provider: &str) -> Vec<DiscoveredModel> {
@@ -1320,11 +1346,20 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         // An empty remote result never falls back to configured rows.
         let offline_catalog = never_fetched && offline_inventory(profile);
         let configured_catalog = configured_catalog_fallback(profile, &inventory);
-        let rows = if offline_catalog || configured_catalog {
+        let mut rows = if offline_catalog || configured_catalog {
             configured_rows(profile)
         } else {
             merged_catalog_rows(&profile.provider_id, inventory.models().as_deref())
         };
+        // A stale list cannot rule out an explicit deployment. Preserve the
+        // fetched metadata and add only missing configuration-owned rows.
+        if matches!(inventory, ProviderInventory::Stale { .. }) {
+            for row in configured_rows(profile) {
+                if !rows.iter().any(|known| known.model.slug == row.model.slug) {
+                    rows.push(row);
+                }
+            }
+        }
         let model_details = rows
             .into_iter()
             .map(|row| model_detail_wire(&profile.provider_id, row.model, row.source))
@@ -1343,29 +1378,35 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             profile,
             model_details,
             offline_catalog,
-            configured_catalog && !matches!(inventory, ProviderInventory::Unsupported { .. }),
+            configured_catalog && matches!(inventory, ProviderInventory::NeverFetched | ProviderInventory::Rejected { .. }),
             has_credential(&profile.provider_id),
             inventory_wire,
         );
+        if matches!(inventory, ProviderInventory::Rejected { .. }) {
+            summary.availability = ProviderAvailabilityWire::Unavailable;
+            summary.availability_reason = Some(inventory.provenance().description().to_owned());
+        }
         if configured_catalog {
             summary.availability_reason = Some(match &inventory {
                 ProviderInventory::Unsupported { reason } => {
                     format!("configured (unverified): {reason}")
                 }
                 ProviderInventory::Unavailable { reason }
+                | ProviderInventory::Rejected { reason }
                 | ProviderInventory::Stale { reason, .. } => {
                     format!("{reason} — retry model-list fetch")
                 }
                 _ => "model list not fetched — fetch models before selecting".to_owned(),
             });
-            if matches!(inventory, ProviderInventory::Unsupported { .. })
-                && profile.auth_requirement != ProviderAuthRequirementWire::None
+            if profile.auth_requirement != ProviderAuthRequirementWire::None
                 && !has_credential(&profile.provider_id)
             {
                 summary.availability = ProviderAvailabilityWire::Unavailable;
                 summary.availability_reason = Some("provider has no credential".to_owned());
             }
         }
+        summary.availability = summary.selection_availability(None);
+        summary.availability_reason = summary.selection_reason(None);
         summary
     }
 }
@@ -1377,7 +1418,7 @@ fn configured_catalog_fallback(profile: &ProviderProfileV1, inventory: &Provider
             inventory,
             ProviderInventory::NeverFetched
                 | ProviderInventory::Unavailable { .. }
-                | ProviderInventory::Stale { .. }
+                | ProviderInventory::Rejected { .. }
                 | ProviderInventory::Unsupported { .. }
         )
 }
@@ -1645,11 +1686,15 @@ fn provider_summary(
         haider_rpc::ModelInventoryWire::Static
             | haider_rpc::ModelInventoryWire::Configured
             | haider_rpc::ModelInventoryWire::Fetched { .. }
+            | haider_rpc::ModelInventoryWire::Stale { .. }
     );
     let available = profile.enabled
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
         && !discovered_models.is_empty()
         && seeded_ready
+        && (profile.configured_models.is_empty()
+            || profile.auth_requirement == ProviderAuthRequirementWire::None
+            || credentialed)
         && !configured_fallback
         && (inventory_is_current || static_subscription);
     let default_model = if matches!(profile.provenance, ProviderProvenance::Custom)
@@ -1686,7 +1731,12 @@ fn provider_summary(
                 .flatten()
             })
     };
-    let availability_reason = (!available).then(|| {
+    let availability_reason = if available {
+        match &inventory {
+            haider_rpc::ModelInventoryWire::Stale { reason, .. } if !seeded => Some(format!("{reason} — refreshing in background")),
+            _ => None,
+        }
+    } else { Some({
         if matches!(profile.provenance, ProviderProvenance::Unknown) {
             "provider adapter is not registered".to_owned()
         } else if !profile.enabled {
@@ -1704,7 +1754,7 @@ fn provider_summary(
         } else {
             "provider model inventory is unavailable".to_owned()
         }
-    });
+    }) };
     ProviderSummaryWire {
         catalog_scope: None,
         configured_models: profile.configured_models.clone(),

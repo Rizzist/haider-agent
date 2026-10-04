@@ -2208,6 +2208,15 @@ async fn undeclared_catalog_windows_still_yield_a_daemon_compaction_threshold() 
 /// failure: an unusable target resolves or the valid larger target disappears.
 #[tokio::test]
 async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_provider_lane() {
+    check_compaction_promotion_policy(false).await;
+}
+
+#[tokio::test]
+async fn configured_unverified_is_excluded_from_compaction_promotion() {
+    check_compaction_promotion_policy(true).await;
+}
+
+async fn check_compaction_promotion_policy(unverified: bool) {
     let provider = "promotion-fixture";
     let alias = CredentialAlias::new("promotion-fixture-key");
     let summary = ProviderSummaryWire {
@@ -2257,6 +2266,12 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         enabled: true,
         trust: haider_rpc::ProviderTrustWire::Full,
     };
+    let mut summary = summary;
+    if unverified {
+        summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+        summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+        summary.availability_reason = Some("configured (unverified): server returned 404 for /models".into());
+    }
     let metadata = haider_protocol::session::SessionMetadataV1 {
         launch_origin: None,
         workspace_allocation: None,
@@ -2331,8 +2346,12 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         .clone()
         .with_resilience(resilience("model-large"))
         .resolve_compaction_promotion(&metadata)
-        .await
-        .expect("signed larger promotion");
+        .await;
+    if unverified {
+        assert!(promoted.is_none(), "configured (unverified) must never be promoted automatically");
+        return;
+    }
+    let promoted = promoted.expect("signed larger promotion");
     assert_eq!(promoted.provider_name, provider);
     assert_eq!(promoted.model, "model-large");
     assert_eq!(promoted.context_window, Some(128_000));
@@ -17498,7 +17517,7 @@ fn persisted_configured_deployment_turns_share_the_selection_availability_rule()
         ),
         (
             "server returned 503 for /models — retry model-list fetch",
-            false,
+            true,
         ),
         (
             "configured (unverified): server returned 404 for /models",
@@ -17528,8 +17547,8 @@ fn persisted_configured_deployment_turns_share_the_selection_availability_rule()
     summary.availability = ProviderAvailabilityWire::Unavailable;
     management.publish(3, Vec::new(), vec![summary]);
     assert!(
-        factory.admit_persisted_model(&metadata).is_ok(),
-        "ordinary compatible endpoints retain advisory passthrough"
+        factory.admit_persisted_model(&metadata).is_err(),
+        "configured deployments share availability across origins"
     );
 }
 
@@ -17897,6 +17916,172 @@ async fn api_key_login_fences_reads_until_commit_or_rollback() {
                     store.close().await.expect("close store");
                 }
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn configured_unverified_is_excluded_from_automatic_failover() {
+    use haider_core::ProviderAttemptResolver as _;
+    let (mut resolver, current) = fallback_chain_resolver_fixture();
+    let mut summary = keyless_summary(OPENAI_PROVIDER_NAME, "https://synthetic.openai.azure.com/openai/v1");
+    summary.models = vec!["gpt-test".into()];
+    summary.configured_models = vec!["gpt-test".into()];
+    summary.default_model = Some("gpt-test".into());
+    summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+    summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    summary.availability = ProviderAvailabilityWire::Available;
+    summary.availability_reason = Some("configured (unverified): server returned 404 for /models".into());
+    let management = ManagementSnapshot::new(0, Vec::new(), vec![summary.clone()]);
+    resolver.factory.management = Some(management.clone());
+    let quota = ProviderError::new(ProviderErrorKind::QuotaExhausted, "synthetic quota");
+    assert!(matches!(resolver.resolve_fallback(&current, &quota).await.expect("decision"), haider_core::ProviderAttemptDecision::Stop));
+    summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: u64::MAX };
+    management.publish(1, Vec::new(), vec![summary]);
+    assert!(matches!(resolver.resolve_fallback(&current, &quota).await.expect("positive control"), haider_core::ProviderAttemptDecision::Switch(_)));
+}
+
+#[tokio::test]
+async fn startup_reconciles_legacy_defaults_against_only_active_hydrated_inventory() {
+    for (default, expected) in [("a-private-beta", Some("a-private-beta")), ("foreign-private", None)] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        // The first store open bootstraps schema zero; a real upgrade is a reopen.
+        store.close().await.expect("close seed");
+        let store = open_store(dir.path()).await;
+        let mut profile = removable_provider_profile("work");
+        profile.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+        profile.auth_requirement = ProviderAuthRequirementWire::None;
+        profile.base_url = Some("http://127.0.0.1:19373/v1".into());
+        profile.configured_models.clear();
+        profile.default_model = Some(default.into());
+        profile.catalog_selection_key = None;
+        JsonProviderRegistryStore::new(dir.path()).save(&[profile.clone()]).expect("legacy file");
+        let providers = ProviderRegistry::new(JsonProviderRegistryStore::new(dir.path()), vec![], Arc::new(CachedProviderModelSource::default())).expect("registry");
+        let accounts = memory_accounts();
+        let key = active_catalog_cache_key("work", &accounts, &providers).expect("anonymous producer");
+        let models = ["a-private-alpha", "a-private-beta"].map(|slug| DiscoveredModel {
+            slug: slug.into(), display_name: slug.into(), context_window: None, max_output_tokens: None,
+            description: None, default_effort: None, supported_efforts: vec![], visible: true,
+            priority: None, use_responses_lite: None, extensions: None,
+        });
+        store.put_provider_models(key.into(), serde_json::to_string(&models).expect("models"), None, 1).await.expect("seed active cache");
+        let mut runtime = AccountsRuntime::initialize(&store, &AccountsDependencies { vault: VaultProvision::Unsupported, ..AccountsDependencies::default() }, dir.path(), "startup-legacy", "startup-legacy", "unused", &std::collections::BTreeSet::new(), true).await.expect("startup");
+        let persisted = JsonProviderRegistryStore::new(dir.path()).load().expect("persisted");
+        let persisted = persisted.iter().find(|row| row.provider_id == "work").expect("work");
+        assert_eq!(persisted.default_model.as_deref(), expected, "startup must persist ownership even when summary alone would hide a foreign default");
+        assert!(persisted.catalog_selection_key.is_some());
+        runtime.actor.take().expect("actor").shutdown().await;
+        store.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn stale_catalog_refreshes_in_background_without_refusing_existing_admission() {
+    struct UncertainCatalog(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl ProviderModelDiscoverer for UncertainCatalog {
+        async fn discover(&self, _source: CatalogSource, _access: Option<&str>, _etag: Option<&str>) -> Result<DiscoveredCatalog, CatalogError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(CatalogError::Transport { reason:"synthetic timeout / 503".into() })
+        }
+    }
+    for origin in ["https://synthetic.openai.azure.com/openai/v1", "http://127.0.0.1:19373/v1"] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let source = Arc::new(CachedProviderModelSource::default());
+        let mut profile = removable_provider_profile("work");
+        profile.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+        profile.auth_requirement = ProviderAuthRequirementWire::None;
+        profile.base_url = Some(origin.into());
+        profile.configured_models = vec!["deployment".into()];
+        profile.default_model = Some("deployment".into());
+        let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+        let providers = ProviderRegistry::new(provider_store, vec![profile], source.clone()).expect("registry");
+        providers.replace_discovered_models("work".into(), vec![DiscoveredModel {
+            slug:"deployment".into(), display_name:"deployment".into(), context_window:Some(123_456), max_output_tokens:None,
+            description:None, default_effort:None, supported_efforts:vec![], visible:true, priority:None,
+            use_responses_lite:None, extensions:None,
+        }], 1);
+        let accounts = memory_accounts();
+        let snapshot = Arc::new(StdMutex::new(Vec::new()));
+        let management = ManagementSnapshot::new(0, Vec::new(), catalog_summaries(&accounts, &providers));
+        let factory = AccountsProviderFactory::new_with_management(snapshot.clone(), management.clone(), VaultProvision::Unsupported, Arc::new(ProductionAccountBuilder::default()));
+        let metadata = enterprise_metadata("work", "deployment");
+        assert!(factory.admit_persisted_model(&metadata).is_ok(), "old successful list admits existing sessions");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
+        let (force_stop, forced) = watch::channel(false);
+        let actor = spawn_account_actor(AccountActorConfig {
+            store:store.clone(), accounts, vault:Arc::new(MemoryVault::default()), validator:Arc::new(ProviderCredentialValidator),
+            snapshot, management:Some(management.clone()), device_discovery:DeviceDiscoverySnapshot::new(false),
+            profile_id:"stale-background".into(), default_model:"unused".into(), providers,
+            provider_endpoint_validator:Arc::new(ProductionProviderEndpointValidator), reserved_aliases:HashSet::new(),
+            refresh_fences:RefreshFenceRegistry::default(), source_registry:empty_source_registry(), source_snapshot:empty_source_snapshot(),
+        }, commands, receiver, force_stop, forced, None, Arc::new(UncertainCatalog(calls.clone())), Arc::new(UnreachableGcloud), Arc::new(StrictNoNativeCredentialStore));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let view = management.read().expect("view");
+                if calls.load(Ordering::SeqCst) > 0 && view.providers.iter().any(|row| row.availability_reason.as_deref().is_some_and(|reason| reason.contains("synthetic timeout"))) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("automatic refresh observed without an admission request");
+        assert!(factory.admit_persisted_model(&metadata).is_ok(), "refresh uncertainty admits the existing session");
+        let summary = management.read().expect("view").providers.into_iter().find(|row| row.provider == "work").expect("work");
+        assert!(crate::model_select::ModelSelectionAuthority::new(None, vec![summary]).validate_selection_with_status("work", None, "deployment").is_ok(), "new session is admitted too");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "backoff bounds repeated stale refreshes");
+        actor.shutdown().await;
+        store.close().await.expect("close");
+    }
+}
+
+#[test]
+fn explicit_discovery_attempt_owner_can_only_publish_when_active() {
+    let mut accounts = memory_accounts();
+    for alias in ["A", "B"] {
+        accounts.add(CredentialDescriptor {
+            incarnation:0, credential_digest:Some(format!("synthetic-{alias}")), alias:CredentialAlias::new(alias),
+            provider:OPENAI_PROVIDER_NAME.into(), base_url:None, auth_method:AuthMethod::ApiKey,
+            identity:alias.into(), status:CredentialStatus::Ok, active:alias == "A", label:None,
+            account_identity:None, created_at_ms:None,
+        }).expect("account");
+    }
+    let providers = test_provider_registry();
+    let a = catalog_producer_for_account("profile", OPENAI_PROVIDER_NAME, accounts.get(&CredentialAlias::new("A")), &providers).expect("A producer");
+    let b = catalog_producer_for_account("profile", OPENAI_PROVIDER_NAME, accounts.get(&CredentialAlias::new("B")), &providers).expect("B producer");
+    assert_ne!(a, b);
+    assert!(refresh_completion_is_current(&a, "profile", &accounts, &providers));
+    assert!(!refresh_completion_is_current(&b, "profile", &accounts, &providers));
+    assert!(!refresh_completion_is_current(&a, "different-profile", &accounts, &providers));
+}
+
+#[test]
+fn daemon_turn_and_new_session_admission_agree_across_configured_provider_kinds() {
+    for catalog in [haider_rpc::ProviderCatalogKindWire::Custom, haider_rpc::ProviderCatalogKindWire::Public,
+        haider_rpc::ProviderCatalogKindWire::Authenticated, haider_rpc::ProviderCatalogKindWire::Offline,
+        haider_rpc::ProviderCatalogKindWire::Adapter] {
+        for (inventory, available) in [
+            (haider_rpc::ModelInventoryWire::Configured, false),
+            (haider_rpc::ModelInventoryWire::Configured, true),
+            (haider_rpc::ModelInventoryWire::Stale { fetched_at_ms:1, reason:"synthetic timeout / 503".into() }, true),
+            (haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms:u64::MAX }, true),
+        ] {
+            let mut summary = keyless_summary("synthetic", "http://127.0.0.1:19373/v1");
+            summary.catalog = catalog;
+            summary.models = vec!["deployment".into()];
+            summary.configured_models = vec!["deployment".into()];
+            summary.inventory = inventory.clone();
+            summary.availability = if available { ProviderAvailabilityWire::Available } else { ProviderAvailabilityWire::Unavailable };
+            summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+            let management = ManagementSnapshot::new(0, Vec::new(), vec![summary.clone()]);
+            let factory = AccountsProviderFactory::new_with_management(Arc::new(StdMutex::new(Vec::new())), management.clone(), VaultProvision::Unsupported, Arc::new(ProductionAccountBuilder::default()));
+            let metadata = enterprise_metadata("synthetic", "deployment");
+            assert_eq!(factory.admit_persisted_model(&metadata).is_ok(), available, "{catalog:?} {inventory:?}");
+            assert_eq!(crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                .validate_selection_with_status("synthetic", None, "deployment").is_ok(), available);
+            management.publish(1, Vec::new(), Vec::new());
+            assert!(factory.admit_persisted_model(&metadata).is_err(), "provider removal is definitive for {catalog:?}");
         }
     }
 }

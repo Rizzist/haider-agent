@@ -1576,6 +1576,44 @@ pub struct ProviderSummaryWire {
 }
 
 impl ProviderSummaryWire {
+    /// Shared admission policy for every consumer of a catalog projection.
+    /// Stale successful inventory remains selectable; a fresh list that omits
+    /// an explicitly configured deployment is definite negative evidence.
+    #[must_use]
+    pub fn model_is_selectable(&self, model: &str) -> bool {
+        self.selection_availability(Some(model)) == ProviderAvailabilityWire::Available
+    }
+
+    /// One availability decision for admission, pickers and summary clients.
+    /// The producer supplies credential/discovery evidence in `availability`;
+    /// consumers must also respect enablement and fresh negative membership.
+    #[must_use]
+    pub fn selection_availability(&self, model: Option<&str>) -> ProviderAvailabilityWire {
+        if !self.enabled || model.is_some_and(|model| {
+            matches!(self.inventory, ModelInventoryWire::Fetched { .. })
+                && self.configured_models.iter().any(|name| name == model)
+                && !self.models.iter().any(|name| name == model)
+        }) {
+            ProviderAvailabilityWire::Unavailable
+        } else {
+            self.availability
+        }
+    }
+
+    #[must_use]
+    pub fn selection_reason(&self, model: Option<&str>) -> Option<String> {
+        if self.availability == ProviderAvailabilityWire::Available
+            && self.selection_availability(model) == ProviderAvailabilityWire::Unavailable
+        {
+            return Some("deployment is absent from the latest model list".into());
+        }
+        self.availability_reason.clone().or_else(|| match &self.inventory {
+            ModelInventoryWire::Stale { reason, .. } if !self.has_static_models() =>
+                Some(format!("{reason} — refresh due")),
+            _ => None,
+        })
+    }
+
     /// Private discovery belongs to the published route, including anonymous
     /// endpoints. An explicit model name does not transfer its metadata.
     #[must_use]

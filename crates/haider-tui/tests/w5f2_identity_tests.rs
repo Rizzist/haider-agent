@@ -1621,3 +1621,68 @@ fn provider_rebound_retires_owned_selection_without_erasing_explicit_configurati
         }
     }
 }
+
+#[test]
+fn idle_management_refresh_is_bounded_and_retires_header_without_input() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("idle-refresh");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 1;
+    pass(&mut driver, &mut model, LiveReply::Accounts { descriptors: vec![account.clone()], revision: Some(1), sources: vec![] });
+    pass(&mut driver, &mut model, LiveReply::Providers { providers: vec![private_summary(1, "a-private")], revision: 1 });
+    assert_eq!(model.identity.model_short, "a-private");
+    assert_eq!(driver.refresh_management(), vec![LiveCommand::AccountList, LiveCommand::ProviderList]);
+    assert!(driver.refresh_management().is_empty());
+    account.incarnation = 2;
+    pass(&mut driver, &mut model, LiveReply::Accounts { descriptors: vec![account], revision: Some(2), sources: vec![] });
+    assert!(model.identity.model_short.is_empty());
+    assert_eq!(model.identity.context_window, 0);
+    assert!(driver.refresh_management().is_empty());
+    pass(&mut driver, &mut model, LiveReply::Providers { providers: vec![], revision: 2 });
+    assert_eq!(driver.refresh_management().len(), 2);
+}
+
+#[test]
+fn picker_and_daemon_share_configured_availability_for_every_provider_kind() {
+    for catalog in [haider_rpc::ProviderCatalogKindWire::Custom, haider_rpc::ProviderCatalogKindWire::Public,
+        haider_rpc::ProviderCatalogKindWire::Authenticated, haider_rpc::ProviderCatalogKindWire::Offline,
+        haider_rpc::ProviderCatalogKindWire::Adapter] {
+        for inventory in [haider_rpc::ModelInventoryWire::Configured,
+            haider_rpc::ModelInventoryWire::Stale { fetched_at_ms:1, reason:"server returned 503 for /models".into() },
+            haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: u64::MAX }] {
+            for availability in [haider_rpc::ProviderAvailabilityWire::Available, haider_rpc::ProviderAvailabilityWire::Unavailable] {
+                let mut model = live_model();
+                let mut summary = provider_summary("custom", &["deployment"], "deployment");
+                summary.catalog = catalog;
+                summary.configured_models = vec!["deployment".into()];
+                summary.inventory = inventory.clone();
+                summary.availability = availability;
+                let expected = summary.model_is_selectable("deployment");
+                model.providers.apply_snapshot(vec![summary], 1);
+                let row = model.model_picker_rows().into_iter().find(|row| row.model == "deployment").expect("configured row");
+                assert_eq!(row.available, expected, "{catalog:?} {inventory:?} {availability:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn restored_private_preference_is_hidden_until_live_owner_is_proven() {
+    for scope_known in [false, true] {
+        let mut model = live_model();
+        let pick = haider_tui::settings::LastModelPick {
+            provider:"custom".into(), model:"a-private".into(),
+            catalog_key:scope_known.then(|| "synthetic-producer-1".into()), scope_known,
+        };
+        model.restore_last_model_pick(&pick);
+        assert!(model.display_identity().model_short.is_empty());
+        assert_eq!(model.display_identity().context_window, 0);
+        assert_eq!(model.composer_identity(118), None);
+        let mut driver = LiveDriver::new("restored-owner");
+        pass(&mut driver, &mut model, LiveReply::Providers { providers:vec![private_summary(2, "b-private")], revision:2 });
+        assert!(!model.display_identity().model_short.contains("a-private"));
+        let mut account = oauth_descriptor("custom", "work", true); account.incarnation = 2;
+        pass(&mut driver, &mut model, LiveReply::Accounts { descriptors:vec![account], revision:Some(2), sources:vec![] });
+        assert_eq!(model.display_identity().model_short, "b-private");
+    }
+}

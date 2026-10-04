@@ -2238,9 +2238,12 @@ fn configured_deployments_are_selectable_only_after_success_or_unsupported_disco
     ] {
         if unsupported {
             registry.models_unsupported("azure-test", reason.into());
+        } else if reason.contains("authentication") {
+            registry.models_rejected("azure-test", reason.into());
         } else {
             registry.models_unavailable("azure-test", reason.into());
         }
+        let selectable = !reason.contains("authentication");
         let summary = registry.summary("azure-test", &|_| true).expect("summary");
         assert_eq!(summary.models, ["my-deployment"]);
         let authority =
@@ -2249,19 +2252,19 @@ fn configured_deployments_are_selectable_only_after_success_or_unsupported_disco
             authority
                 .validate_selection_with_status("azure-test", None, "my-deployment")
                 .is_ok(),
-            unsupported,
+            selectable,
             "session and picker selection must agree: {reason}"
         );
         assert_eq!(
             summary.availability == ProviderAvailabilityWire::Available,
-            unsupported,
+            selectable,
             "{reason}"
         );
         assert_eq!(
             registry
                 .validate_default_model("azure-test", "my-deployment")
                 .is_ok(),
-            unsupported,
+            selectable,
             "selection agrees with summary"
         );
         assert!(
@@ -2304,7 +2307,7 @@ fn configured_deployments_are_selectable_only_after_success_or_unsupported_disco
     let failed = registry
         .summary("azure-test", &|_| true)
         .expect("failed after success");
-    assert_eq!(failed.availability, ProviderAvailabilityWire::Unavailable);
+    assert_eq!(failed.availability, ProviderAvailabilityWire::Available);
     assert!(
         failed
             .availability_reason
@@ -2315,12 +2318,12 @@ fn configured_deployments_are_selectable_only_after_success_or_unsupported_disco
     assert!(
         registry
             .validate_default_model("azure-test", "my-deployment")
-            .is_err()
+            .is_ok()
     );
     assert!(
         crate::model_select::ModelSelectionAuthority::new(None, vec![failed])
             .validate_selection_with_status("azure-test", None, "my-deployment")
-            .is_err()
+            .is_ok()
     );
 }
 
@@ -2556,5 +2559,80 @@ fn discovery_recovery_does_not_promote_fetched_slugs_into_configured_deployments
                 .default_model
                 .is_none()
         );
+    }
+}
+
+#[test]
+fn summary_rejects_foreign_default_without_startup_reconciliation() {
+    let mut profile = removable_provider_profile_for_catalog_test();
+    profile.default_model = Some("a-private-beta".into());
+    let source = model_source([]);
+    source.replace("work".into(), ProviderInventory::Fetched {
+        models: vec![discovered("b-current", true, None)], fetched_at_ms: u64::MAX,
+    });
+    let registry = ProviderRegistry::new(MemoryProviderStore::default(), vec![profile], source).expect("registry");
+    assert_eq!(registry.get("work").expect("profile").default_model.as_deref(), Some("a-private-beta"));
+    assert_eq!(registry.summary("work", &|_| true).expect("summary").default_model.as_deref(), Some("b-current"));
+}
+
+fn removable_provider_profile_for_catalog_test() -> ProviderProfileV1 {
+    let mut profile = builtin_or_unknown("work", "unused");
+    profile.provenance = ProviderProvenance::Custom;
+    profile.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+    profile.base_url = Some("http://127.0.0.1:19373/v1".into());
+    profile.auth_requirement = ProviderAuthRequirementWire::None;
+    profile.configured_models.clear();
+    profile
+}
+
+#[test]
+fn configured_availability_retains_stale_success_and_rejects_negative_evidence() {
+    for origin in ["https://synthetic.openai.azure.com/openai/v1", "http://127.0.0.1:19373/v1"] {
+        let mut profile = removable_provider_profile_for_catalog_test();
+        profile.base_url = Some(origin.into());
+        profile.configured_models = vec!["deployment".into()];
+        profile.default_model = Some("deployment".into());
+        let source = model_source([]);
+        let registry = ProviderRegistry::new(MemoryProviderStore::default(), vec![profile], source.clone()).expect("registry");
+        let assert_policy = |expected| {
+            let summary = registry.summary("work", &|_| true).expect("summary");
+            assert_eq!(summary.model_is_selectable("deployment"), expected, "{origin}: {summary:?}");
+            assert_eq!(registry.validate_default_model("work", "deployment").is_ok(), expected);
+            assert_eq!(crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                .validate_selection_with_status("work", None, "deployment").is_ok(), expected);
+        };
+        assert_policy(false);
+        source.unavailable("work", "server returned 503 for /models".into());
+        assert_policy(true);
+        source.unavailable("work", "model catalog discovery timed out".into());
+        assert_policy(true);
+        registry.clear_discovered_models("work");
+        assert_policy(false);
+        source.replace("work".into(), ProviderInventory::Fetched {
+            models: vec![discovered("deployment", true, None)], fetched_at_ms: 1,
+        });
+        assert_policy(true);
+        assert!(registry.summary("work", &|_| true).expect("stale").availability_reason.expect("visible reason").contains("refresh"));
+        source.unavailable("work", "server returned 503 for /models".into());
+        assert_policy(true);
+        source.unavailable("work", "model catalog discovery timed out".into());
+        assert_policy(true);
+        registry.models_rejected("work", "model catalog authentication failed".into());
+        assert_policy(false);
+        source.unavailable("work", "later timeout is not proof the credential recovered".into());
+        assert_policy(false);
+        registry.models_unsupported("work", "later unsupported listing is not an auth success".into());
+        assert_policy(false);
+        source.replace("work".into(), ProviderInventory::Fetched {
+            models: vec![discovered("other", true, None)], fetched_at_ms: u64::MAX,
+        });
+        assert_policy(false);
+        source.replace("work".into(), ProviderInventory::Fetched {
+            models: vec![discovered("other", true, None)], fetched_at_ms: 1,
+        });
+        assert_policy(true);
+        assert!(registry.summary("work", &|_| true).expect("stale row").models.contains(&"deployment".into()));
+        registry.models_unsupported("work", "server returned 405 for /models".into());
+        assert_policy(true);
     }
 }

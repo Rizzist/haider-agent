@@ -2124,7 +2124,7 @@ fn render_launcher(
     .areas(band.content);
 
     let sanctum = SanctumLine::new(model.sanctum_tier);
-    let identity = &model.identity;
+    let identity = model.display_identity();
     // ---- The header band: the session header's typography without the
     // back chip. Line 1: mark · bold GOLD product · dim version/moniker ·
     // BRIGHT device (the owner's header contract: wordmark, version,
@@ -6010,10 +6010,14 @@ fn render_model_picker(
     }
     let top_level = picker.provider_stage.is_none();
     let rows = model.model_picker_filtered(&picker.query);
+    let selected_reason = picker.error.as_ref().or_else(|| rows.get(picker.selection).and_then(|row| row.reason.as_ref()));
+    let note_height = selected_reason.map_or(1, |reason| {
+        u16::try_from(wrap_plain(reason, (area.width as usize).saturating_sub(4).max(1)).len()).unwrap_or(3).clamp(1, 3)
+    });
     let [title_area, search_area, note_area, list_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(note_height),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
@@ -6063,11 +6067,10 @@ fn render_model_picker(
         );
     } else if let Some(reason) = rows
         .get(picker.selection)
-        .filter(|row| row.available)
         .and_then(|row| row.reason.as_ref())
     {
         frame.render_widget(
-            Paragraph::new(Line::styled(format!("   {reason}"), theme.dim_style())),
+            Paragraph::new(Line::styled(format!("   {reason}"), theme.dim_style())).wrap(Wrap { trim: false }),
             note_area,
         );
     } else {
@@ -6231,7 +6234,12 @@ fn render_model_picker(
         // Refusal truth is mandatory row grammar; aggregate diagnostics are
         // optional detail and must never displace it at bounded widths.
         if let Some(reason) = row.reason.as_ref() {
-            spans.push(Span::styled(format!("  {reason}"), theme.faint_style()));
+            let label = if area.width <= 80 && reason.starts_with("model list not fetched") {
+                "fetch models"
+            } else {
+                reason.as_str()
+            };
+            spans.push(Span::styled(format!("  {label}"), theme.faint_style()));
         }
         if is_top_api_group(row) {
             spans.push(Span::styled(
@@ -6721,7 +6729,7 @@ fn render_session(
     // product · dim version · dir / dim session line with a GOLD head
     // callsign (`.headcs`).
     let sanctum = SanctumLine::new(model.sanctum_tier);
-    let identity = &model.identity;
+    let identity = model.display_identity();
     // The header shows the session's slug NAME (sim `session.name`); the
     // auto-title blurb lives in the `· session titled` note only.
     let title = model.display_name();
@@ -7817,7 +7825,7 @@ fn render_token_panel(
     area: Rect,
     input_top: u16,
 ) {
-    let identity = &model.identity;
+    let identity = model.display_identity();
     // 973-context-meter: every row resolves through the ONE meter, so the
     // panel, the status line and the mirror can never disagree; the main
     // row's detail defines each number (prompt incl. cached, reply,
@@ -13085,7 +13093,7 @@ fn render_effort_picker(
         .collect();
     let mut body = vec![format!(
         "{} · {} — validated by the daemon against this pair's ladder",
-        model.identity.model_short, model.identity.provider
+        model.display_identity().model_short, model.identity.provider
     )];
     if let Some(error) = &picker.error {
         body.push(format!("✗ {error}"));

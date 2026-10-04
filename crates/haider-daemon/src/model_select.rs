@@ -279,16 +279,6 @@ impl SelectionRefusal {
     }
 }
 
-/// Configured Azure deployments share the picker admission rule. A list
-/// fetch or an explicitly unsupported listing must establish selectability.
-pub(crate) fn configured_deployment_is_unavailable(summary: &ProviderSummaryWire) -> bool {
-    summary
-        .endpoint
-        .as_deref()
-        .is_some_and(haider_provider::azure_openai_origin)
-        && summary.availability != ProviderAvailabilityWire::Available
-}
-
 impl ModelSelectionAuthority {
     pub(crate) fn new(
         creatable: Option<BTreeSet<String>>,
@@ -583,10 +573,10 @@ impl ModelSelectionAuthority {
             .summaries
             .iter()
             .find(|summary| summary.provider == provider);
-        if summary.is_some_and(configured_deployment_is_unavailable) {
+        if summary.is_some_and(|summary| !summary.model_is_selectable(requested_model)) {
             return Err(SelectionRefusal::ProviderUnavailable {
                 provider: provider.to_owned(),
-                reason: summary.and_then(|row| row.availability_reason.clone()),
+                reason: summary.and_then(|row| row.selection_reason(Some(requested_model))),
             });
         }
         // Staying on the current provider is not a create; only a row on a
