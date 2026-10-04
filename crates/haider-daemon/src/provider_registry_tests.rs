@@ -2715,7 +2715,9 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
         "work",
         HAIDER_CODE_PROVIDER_NAME,
         DEEPSEEK_PROVIDER_NAME,
+        GEMINI_PROVIDER_NAME,
         ANTHROPIC_PROVIDER_NAME,
+        OPENAI_PROVIDER_NAME,
         BEDROCK_PROVIDER_NAME,
     ] {
         let profile = if provider == "work" {
@@ -2724,6 +2726,7 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
             builtin_or_unknown(provider, "unused")
         };
         let offline = offline_inventory(&profile);
+        let unsupported = catalog_source_for_profile(&profile).is_none();
         let requires_credential = profile.auth_requirement != ProviderAuthRequirementWire::None;
         let source = model_source([]);
         let mut registry = ProviderRegistry::new(
@@ -2767,9 +2770,9 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
                 "new-session policy for {provider}"
             );
         };
-        assert_policy(offline);
+        assert_policy(offline || unsupported);
         source.unavailable(provider, "server returned 503 for /models".into());
-        assert_policy(offline);
+        assert_policy(offline || unsupported);
         let uncertainty = registry.summary(provider, &|_| true).expect("503");
         if offline {
             assert_eq!(
@@ -2778,6 +2781,14 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
             );
         } else {
             assert!(uncertainty.selection_reason(None).is_some());
+            if unsupported {
+                assert!(
+                    uncertainty
+                        .availability_reason
+                        .expect("reason")
+                        .contains("configured (unverified)")
+                );
+            }
         }
         registry.models_rejected(provider, "synthetic credential rejection".into());
         assert_policy(false);

@@ -1483,6 +1483,20 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         has_credential: &dyn Fn(&str) -> bool,
     ) -> ProviderSummaryWire {
         let inventory = self.model_source.inventory(&profile.provider_id);
+        let inventory = if !profile.configured_models.is_empty()
+            && !offline_inventory(profile)
+            && !haider_provider::has_subscription_static_catalog(&profile.provider_id)
+            && catalog_source_for_profile(profile).is_none()
+            && matches!(
+                inventory,
+                ProviderInventory::NeverFetched | ProviderInventory::Unavailable { .. }
+            ) {
+            ProviderInventory::Unsupported {
+                reason: "this provider adapter does not support model discovery".into(),
+            }
+        } else {
+            inventory
+        };
         let never_fetched = matches!(inventory, ProviderInventory::NeverFetched);
         // Offline catalogs are authoritative without a network request.
         // An empty remote result never falls back to configured rows.
@@ -1567,6 +1581,50 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         summary.availability = summary.selection_availability(None);
         summary.availability_reason = summary.selection_reason(None);
         summary
+    }
+}
+
+/// One transport definition for discovery attempts and availability. Adapter
+/// profiles without a supported listing surface are configured-unverified.
+pub(crate) fn catalog_source_for_profile(
+    profile: &ProviderProfileV1,
+) -> Option<(haider_provider::CatalogSource, ProviderAuthRequirementWire)> {
+    use haider_provider::CatalogSource;
+    let provider = profile.provider_id.as_str();
+    match haider_provider::provider_catalog_definition(provider) {
+        haider_provider::ProviderCatalogDefinition::Public { source } => {
+            Some((source, ProviderAuthRequirementWire::None))
+        }
+        haider_provider::ProviderCatalogDefinition::Authenticated { source } => {
+            Some((source, profile.auth_requirement))
+        }
+        haider_provider::ProviderCatalogDefinition::Offline { .. } => None,
+        haider_provider::ProviderCatalogDefinition::Adapter => {
+            if profile.provenance != ProviderProvenance::Custom
+                || !matches!(
+                    profile.api_family,
+                    ProviderApiFamilyWire::OpenAiChatCompletions
+                        | ProviderApiFamilyWire::AnthropicMessages
+                )
+                || !matches!(
+                    profile.auth_requirement,
+                    ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::None
+                )
+            {
+                return None;
+            }
+            let origin = profile.base_url.clone()?;
+            let source = match profile.api_family {
+                ProviderApiFamilyWire::OpenAiChatCompletions => {
+                    CatalogSource::OpenAiCompatible { origin }
+                }
+                ProviderApiFamilyWire::AnthropicMessages => {
+                    CatalogSource::AnthropicCompatible { origin }
+                }
+                _ => return None,
+            };
+            Some((source, profile.auth_requirement))
+        }
     }
 }
 

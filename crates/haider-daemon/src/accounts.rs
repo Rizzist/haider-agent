@@ -3768,42 +3768,9 @@ fn catalog_source(
     provider: &str,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Option<(CatalogSource, ProviderAuthRequirementWire)> {
-    match haider_provider::provider_catalog_definition(provider) {
-        haider_provider::ProviderCatalogDefinition::Public { source } => {
-            Some((source, ProviderAuthRequirementWire::None))
-        }
-        haider_provider::ProviderCatalogDefinition::Authenticated { source } => {
-            Some((source, providers.get(provider)?.auth_requirement))
-        }
-        haider_provider::ProviderCatalogDefinition::Offline { .. } => None,
-        haider_provider::ProviderCatalogDefinition::Adapter => {
-            let profile = providers.get(provider)?;
-            if profile.provenance != ProviderProvenance::Custom
-                || !matches!(
-                    profile.api_family,
-                    ProviderApiFamilyWire::OpenAiChatCompletions
-                        | ProviderApiFamilyWire::AnthropicMessages
-                )
-                || !matches!(
-                    profile.auth_requirement,
-                    ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::None
-                )
-            {
-                return None;
-            }
-            let origin = profile.base_url.clone()?;
-            let source = match profile.api_family {
-                ProviderApiFamilyWire::OpenAiChatCompletions => {
-                    CatalogSource::OpenAiCompatible { origin }
-                }
-                ProviderApiFamilyWire::AnthropicMessages => {
-                    CatalogSource::AnthropicCompatible { origin }
-                }
-                _ => return None,
-            };
-            Some((source, profile.auth_requirement))
-        }
-    }
+    providers
+        .get(provider)
+        .and_then(crate::provider_registry::catalog_source_for_profile)
 }
 
 /// The single daemon-side rule mapping a provider's catalog authentication
