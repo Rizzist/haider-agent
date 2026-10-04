@@ -1360,7 +1360,14 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         let never_fetched = matches!(inventory, ProviderInventory::NeverFetched);
         // Offline catalogs are authoritative without a network request.
         // An empty remote result never falls back to configured rows.
-        let offline_catalog = never_fetched && offline_inventory(profile);
+        let offline_catalog = offline_inventory(profile)
+            && matches!(
+                inventory,
+                ProviderInventory::NeverFetched
+                    | ProviderInventory::Unavailable { .. }
+                    | ProviderInventory::Unsupported { .. }
+                    | ProviderInventory::Rejected { .. }
+            );
         let configured_catalog = configured_catalog_fallback(profile, &inventory);
         let mut rows = if offline_catalog || configured_catalog {
             configured_rows(profile)
@@ -1436,8 +1443,9 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
 }
 
 fn configured_catalog_fallback(profile: &ProviderProfileV1, inventory: &ProviderInventory) -> bool {
-    matches!(profile.provenance, ProviderProvenance::Custom)
-        && !profile.configured_models.is_empty()
+    !profile.configured_models.is_empty()
+        && !offline_inventory(profile)
+        && !haider_provider::has_subscription_static_catalog(&profile.provider_id)
         && matches!(
             inventory,
             ProviderInventory::NeverFetched
@@ -1716,9 +1724,7 @@ fn provider_summary(
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
         && !discovered_models.is_empty()
         && seeded_ready
-        && (profile.configured_models.is_empty()
-            || profile.auth_requirement == ProviderAuthRequirementWire::None
-            || credentialed)
+        && (profile.auth_requirement == ProviderAuthRequirementWire::None || credentialed)
         && !configured_fallback
         && (inventory_is_current || static_subscription);
     let default_model = if matches!(profile.provenance, ProviderProvenance::Custom)
@@ -1772,10 +1778,7 @@ fn provider_summary(
                 "provider API family is unavailable".to_owned()
             } else if seeded && profile.base_url.is_none() {
                 "provider endpoint is not configured".to_owned()
-            } else if !credentialed
-                && (seeded
-                    || (!profile.configured_models.is_empty()
-                        && profile.auth_requirement != ProviderAuthRequirementWire::None))
+            } else if !credentialed && profile.auth_requirement != ProviderAuthRequirementWire::None
             {
                 "provider has no credential".to_owned()
             } else if let haider_rpc::ModelInventoryWire::Stale { reason, .. }

@@ -2707,3 +2707,109 @@ fn configured_availability_retains_stale_success_and_rejects_negative_evidence()
         assert_policy(true);
     }
 }
+
+#[test]
+fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
+    for provider in [
+        "work",
+        HAIDER_CODE_PROVIDER_NAME,
+        DEEPSEEK_PROVIDER_NAME,
+        ANTHROPIC_PROVIDER_NAME,
+        BEDROCK_PROVIDER_NAME,
+    ] {
+        let profile = if provider == "work" {
+            removable_provider_profile_for_catalog_test()
+        } else {
+            builtin_or_unknown(provider, "unused")
+        };
+        let offline = offline_inventory(&profile);
+        let requires_credential = profile.auth_requirement != ProviderAuthRequirementWire::None;
+        let source = model_source([]);
+        let mut registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            vec![profile],
+            source.clone(),
+        )
+        .expect("registry");
+        // Configure through the production path after startup's deliberate
+        // cleanup of legacy release-owned fetched catalog rows.
+        registry
+            .configure_with_inventory(
+                ProviderConfigureInput {
+                    provider: provider.into(),
+                    api_family: None,
+                    origin: None,
+                    auth_requirement: None,
+                    enabled: true,
+                    models: vec!["deployment".into()],
+                    default_model: Some("deployment".into()),
+                    response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
+                    trust: None,
+                },
+                &["deployment".into()],
+            )
+            .expect("explicit configuration");
+        let assert_policy = |expected| {
+            let summary = registry.summary(provider, &|_| true).expect("summary");
+            assert_eq!(
+                summary.model_is_selectable("deployment"),
+                expected,
+                "{provider}: {summary:?}"
+            );
+            assert_eq!(
+                crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                    .validate_selection_with_status(provider, None, "deployment")
+                    .is_ok(),
+                expected,
+                "new-session policy for {provider}"
+            );
+        };
+        assert_policy(offline);
+        source.unavailable(provider, "server returned 503 for /models".into());
+        assert_policy(true);
+        assert!(
+            registry
+                .summary(provider, &|_| true)
+                .expect("503")
+                .selection_reason(None)
+                .is_some()
+        );
+        registry.models_rejected(provider, "synthetic credential rejection".into());
+        assert_policy(false);
+        registry.clear_discovered_models(provider);
+        registry.models_unsupported(provider, "server returned 404 for /models".into());
+        assert_policy(true);
+        for (model, age, selectable) in [
+            ("deployment", u64::MAX, true),
+            ("deployment", 1, true),
+            ("other", u64::MAX, false),
+            ("other", 1, true),
+        ] {
+            source.replace(
+                provider.into(),
+                ProviderInventory::Fetched {
+                    models: vec![discovered(model, true, None)],
+                    fetched_at_ms: age,
+                },
+            );
+            assert_policy(selectable);
+        }
+        source.replace(
+            provider.into(),
+            ProviderInventory::Fetched {
+                models: vec![discovered("deployment", true, None)],
+                fetched_at_ms: u64::MAX,
+            },
+        );
+        assert_eq!(
+            registry
+                .summary(provider, &|_| false)
+                .expect("no credential")
+                .model_is_selectable("deployment"),
+            !requires_credential,
+            "credential failure policy for {provider}"
+        );
+    }
+}
