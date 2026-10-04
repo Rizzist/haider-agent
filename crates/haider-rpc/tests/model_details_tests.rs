@@ -325,5 +325,9 @@ fn catalog_selection_policy_is_shared_across_provider_kinds_and_uncertainty() {
         summary.availability = ProviderAvailabilityWire::Available;
         summary.enabled = false;
         assert!(!summary.model_is_selectable("listed"));
+        assert_eq!(
+            summary.selection_reason(Some("listed")).as_deref(),
+            Some("provider is disabled")
+        );
     }
 }

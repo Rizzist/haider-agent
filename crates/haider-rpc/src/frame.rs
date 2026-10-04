@@ -1604,6 +1604,9 @@ impl ProviderSummaryWire {
 
     #[must_use]
     pub fn selection_reason(&self, model: Option<&str>) -> Option<String> {
+        if !self.enabled {
+            return Some("provider is disabled".into());
+        }
         if self.availability == ProviderAvailabilityWire::Available
             && self.selection_availability(model) == ProviderAvailabilityWire::Unavailable
         {
