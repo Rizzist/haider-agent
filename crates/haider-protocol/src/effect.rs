@@ -120,7 +120,23 @@ impl From<EffectIntent> for JournalEffectIntent {
                 },
                 Some(EffectOrigin::ProviderTransport),
             ),
-            class => (class, None),
+            // Keep this exhaustive: adding an internal class must require a
+            // deliberate released-decoder-compatible write representation.
+            class @ (EffectClass::FsRead
+            | EffectClass::FsWrite
+            | EffectClass::ProcessExec
+            | EffectClass::RemoteExecution
+            | EffectClass::Network { .. }
+            | EffectClass::GitOp
+            | EffectClass::AgentSpawn
+            | EffectClass::PeerMessage
+            | EffectClass::CredentialAccess
+            | EffectClass::GuiAct
+            | EffectClass::ScreenObserve
+            | EffectClass::ScreenControl
+            | EffectClass::MobileObserve
+            | EffectClass::MobileControl
+            | EffectClass::ReadSms) => (class, None),
         };
         Self {
             effect: intent.effect,
