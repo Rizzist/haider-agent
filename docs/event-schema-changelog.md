@@ -87,6 +87,10 @@ and activity semantics. Ordinary file/network effects have no origin field
 and keep their exact historical shape; names and summaries never supply
 origin. Current readers also accept direct class values written by earlier
 lane candidates, but normalize all new writes to the released carriers.
+Those unreleased experimental records remain immutable: a profile already
+containing direct new enum values still needs the current daemon. This fix
+protects released 0.0.972 journals upgraded to the new writer; it does not
+make pre-fix experimental profiles downgrade-safe by rewriting history.
 Peers without `session_activity_v1` receive the historical intent with the
 origin removed. The frozen enum and complete old-intent decoder tests pin
 both compatible writes and strict rejection of direct new enum values;
