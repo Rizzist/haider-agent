@@ -85,7 +85,10 @@ On re-upgrade the current reader prefers the typed additive origin, validates
 its carrier, and restores the distinct mutation admission, graph provenance
 and activity semantics. Ordinary file/network effects have no origin field
 and keep their exact historical shape; names and summaries never supply
-origin. Current readers also accept direct class values written by earlier
+origin. Unknown future origin values retain the released carrier's meaning;
+they never gain restore or transport authority through aliases or text.
+Known origins with mismatched carriers are rejected. Current readers also
+accept direct class values written by earlier
 lane candidates, but normalize all new writes to the released carriers.
 Those unreleased experimental records remain immutable: a profile already
 containing direct new enum values still needs the current daemon. This fix

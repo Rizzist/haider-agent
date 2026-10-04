@@ -94,6 +94,10 @@ pub struct EffectIntent {
 enum EffectOrigin {
     CheckpointRestore,
     ProviderTransport,
+    // A later writer may add an origin while retaining a released carrier.
+    // Older readers keep that carrier's meaning instead of bricking replay.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,8 +168,8 @@ impl TryFrom<JournalEffectIntent> for EffectIntent {
             {
                 EffectClass::ProviderTransport
             }
+            (None | Some(EffectOrigin::Unknown), class) => class,
             (Some(_), _) => return Err("effect origin does not match its released class carrier"),
-            (None, class) => class,
         };
         Ok(Self {
             effect: intent.effect,

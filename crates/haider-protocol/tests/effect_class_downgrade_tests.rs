@@ -57,6 +57,31 @@ fn intent(class: EffectClass) -> EffectIntent {
     }
 }
 
+fn released_classes() -> [EffectClass; 16] {
+    [
+        EffectClass::FsRead,
+        EffectClass::FsWrite,
+        EffectClass::ProcessExec,
+        EffectClass::RemoteExecution,
+        EffectClass::Network {
+            host: "provider-request".into(),
+        },
+        EffectClass::Network {
+            host: "example.invalid".into(),
+        },
+        EffectClass::GitOp,
+        EffectClass::AgentSpawn,
+        EffectClass::PeerMessage,
+        EffectClass::CredentialAccess,
+        EffectClass::GuiAct,
+        EffectClass::ScreenObserve,
+        EffectClass::ScreenControl,
+        EffectClass::MobileObserve,
+        EffectClass::MobileControl,
+        EffectClass::ReadSms,
+    ]
+}
+
 #[test]
 fn old_decoder_accepts_new_intents_and_current_reader_restores_origin() {
     for (class, carrier, origin) in [
@@ -126,28 +151,7 @@ fn frozen_enum_rejects_direct_new_variants_but_all_released_classes_are_unchange
         )
         .expect("released reader");
     }
-    for class in [
-        EffectClass::FsRead,
-        EffectClass::FsWrite,
-        EffectClass::ProcessExec,
-        EffectClass::RemoteExecution,
-        EffectClass::Network {
-            host: "provider-request".into(),
-        },
-        EffectClass::Network {
-            host: "example.invalid".into(),
-        },
-        EffectClass::GitOp,
-        EffectClass::AgentSpawn,
-        EffectClass::PeerMessage,
-        EffectClass::CredentialAccess,
-        EffectClass::GuiAct,
-        EffectClass::ScreenObserve,
-        EffectClass::ScreenControl,
-        EffectClass::MobileObserve,
-        EffectClass::MobileControl,
-        EffectClass::ReadSms,
-    ] {
+    for class in released_classes() {
         let current = intent(class.clone());
         let value = serde_json::to_value(&current).expect("old intent");
         assert!(value.get("effect_origin").is_none());
@@ -164,7 +168,7 @@ fn frozen_enum_rejects_direct_new_variants_but_all_released_classes_are_unchange
 }
 
 #[test]
-fn origin_is_typed_and_requires_its_matching_carrier() {
+fn known_origins_require_matching_carriers_and_unknown_origins_never_gain_authority() {
     for (class, origin) in [
         (EffectClass::FsRead, "checkpoint_restore"),
         (EffectClass::ProcessExec, "checkpoint_restore"),
@@ -175,9 +179,6 @@ fn origin_is_typed_and_requires_its_matching_carrier() {
             },
             "provider_transport",
         ),
-        (EffectClass::FsWrite, "future_restore_authority"),
-        (EffectClass::FsWrite, "CheckpointRestore"),
-        (EffectClass::FsWrite, " checkpoint_restore"),
     ] {
         let mut value = serde_json::to_value(intent(class)).expect("fixture");
         value["effect_origin"] = serde_json::json!(origin);
@@ -185,5 +186,31 @@ fn origin_is_typed_and_requires_its_matching_carrier() {
             serde_json::from_value::<EffectIntent>(value).is_err(),
             "origin={origin}"
         );
+    }
+    // Unknown origins do not confer restore authority. Retaining the released
+    // carrier also lets this reader survive a later writer's additive origin.
+    for origin in [
+        "future_restore_authority",
+        "CheckpointRestore",
+        " checkpoint_restore",
+        "checkpoint_restore ",
+        "provider-transport",
+        "",
+    ] {
+        for class in released_classes() {
+            let mut value = serde_json::to_value(intent(class.clone())).expect("fixture");
+            value["effect_origin"] = serde_json::json!(origin);
+            let read: EffectIntent =
+                serde_json::from_value(value.clone()).expect("unknown origin is additive");
+            assert_eq!(read.class, class, "origin={origin}");
+            serde_json::from_value::<LegacyEffectIntent>(value.clone()).expect("released reader");
+            let bytes = rmp_serde::to_vec_named(&value).expect("unknown origin msgpack");
+            assert_eq!(
+                rmp_serde::from_slice::<EffectIntent>(&bytes)
+                    .expect("unknown msgpack origin is additive")
+                    .class,
+                class
+            );
+        }
     }
 }
