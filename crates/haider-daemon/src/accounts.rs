@@ -3392,24 +3392,15 @@ async fn finish_provider_models_refresh(
         ProviderModelsRefreshResult::Credential(error) => Some(error.message.clone()),
     };
     if let Some(reason) = failure_reason {
-        if matches!(
+        let evidence_result = if matches!(
             &result,
             ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unsupported { .. }))
         ) {
             if let Some(scope) = evidence_scope.as_deref() {
-                if let Err(error) = providers.record_catalog_unsupported(&provider, scope, reason) {
-                    publish_inventory_states(store, management, accounts, providers).await;
-                    respond_model_refresh_error(
-                        completed,
-                        ERROR_CODE_PROVIDER_ERROR,
-                        &error.message,
-                        error.retryable,
-                        None,
-                    );
-                    return;
-                }
+                providers.record_catalog_unsupported(&provider, scope, reason)
             } else {
                 providers.models_unsupported(&provider, reason);
+                Ok(())
             }
         } else if matches!(
             &result,
@@ -3424,24 +3415,26 @@ async fn finish_provider_models_refresh(
             // a listing whose credential was explicitly rejected.
             let _ = store.delete_provider_models(cache_key.clone().into()).await;
             if let Some(scope) = evidence_scope.as_deref() {
-                if let Err(error) = providers.record_catalog_rejection(&provider, scope, reason) {
-                    publish_inventory_states(store, management, accounts, providers).await;
-                    respond_model_refresh_error(
-                        completed,
-                        ERROR_CODE_PROVIDER_ERROR,
-                        &error.message,
-                        error.retryable,
-                        None,
-                    );
-                    return;
-                }
+                providers.record_catalog_rejection(&provider, scope, reason)
             } else {
                 providers.models_rejected(&provider, reason);
+                Ok(())
             }
         } else {
             providers.models_unavailable(&provider, reason);
-        }
+            Ok(())
+        };
         publish_inventory_states(store, management, accounts, providers).await;
+        if let Err(error) = evidence_result {
+            respond_model_refresh_error(
+                completed,
+                ERROR_CODE_PROVIDER_ERROR,
+                &error.message,
+                error.retryable,
+                None,
+            );
+            return;
+        }
     }
     match result {
         ProviderModelsRefreshResult::Discovery(Ok(catalog)) => {
