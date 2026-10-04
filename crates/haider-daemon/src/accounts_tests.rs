@@ -18229,9 +18229,9 @@ fn explicit_discovery_attempt_owner_can_only_publish_when_active() {
                 incarnation: 0,
                 credential_digest: Some(format!("synthetic-{alias}")),
                 alias: CredentialAlias::new(alias),
-                provider: OPENAI_PROVIDER_NAME.into(),
+                provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
                 base_url: None,
-                auth_method: AuthMethod::ApiKey,
+                auth_method: AuthMethod::OAuth,
                 identity: alias.into(),
                 status: CredentialStatus::Ok,
                 active: alias == "A",
@@ -18244,14 +18244,14 @@ fn explicit_discovery_attempt_owner_can_only_publish_when_active() {
     let providers = test_provider_registry();
     let a = catalog_producer_for_account(
         "profile",
-        OPENAI_PROVIDER_NAME,
+        OPENAI_OAUTH_PROVIDER_NAME,
         accounts.get(&CredentialAlias::new("A")),
         &providers,
     )
     .expect("A producer");
     let b = catalog_producer_for_account(
         "profile",
-        OPENAI_PROVIDER_NAME,
+        OPENAI_OAUTH_PROVIDER_NAME,
         accounts.get(&CredentialAlias::new("B")),
         &providers,
     )
@@ -18343,9 +18343,9 @@ fn catalog_evidence_scope_covers_the_complete_attempt_identity() {
         incarnation: 7,
         credential_digest: Some("synthetic-digest".into()),
         alias: CredentialAlias::new("A"),
-        provider: OPENAI_PROVIDER_NAME.into(),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
         base_url: None,
-        auth_method: AuthMethod::ApiKey,
+        auth_method: AuthMethod::OAuth,
         identity: "synthetic-A".into(),
         status: CredentialStatus::Ok,
         active: true,
@@ -18355,7 +18355,7 @@ fn catalog_evidence_scope_covers_the_complete_attempt_identity() {
     };
     let producer = catalog_producer_for_account(
         "profile",
-        OPENAI_PROVIDER_NAME,
+        OPENAI_OAUTH_PROVIDER_NAME,
         Some(&descriptor),
         &providers,
     )
@@ -18368,7 +18368,7 @@ fn catalog_evidence_scope_covers_the_complete_attempt_identity() {
         catalog_evidence_scope(
             &catalog_producer_for_account(
                 "profile",
-                OPENAI_PROVIDER_NAME,
+                OPENAI_OAUTH_PROVIDER_NAME,
                 Some(&rotated),
                 &providers,
             )
