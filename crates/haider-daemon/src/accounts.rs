@@ -1105,15 +1105,13 @@ pub(crate) fn provider_credential_ready_for_summary<'a>(
     accounts: &'a AccountStore<Box<dyn StoreLike>>,
 ) -> impl Fn(&str) -> bool + 'a {
     move |provider| {
-        let subscription = haider_provider::has_subscription_static_catalog(provider);
         accounts.list().iter().any(|descriptor| {
             descriptor.provider == provider
-                && (!subscription
-                    || (descriptor.active
-                        && matches!(
-                            &descriptor.status,
-                            CredentialStatus::Ok | CredentialStatus::Limited { .. }
-                        )))
+                && descriptor.active
+                && matches!(
+                    &descriptor.status,
+                    CredentialStatus::Ok | CredentialStatus::Limited { .. }
+                )
         })
     }
 }

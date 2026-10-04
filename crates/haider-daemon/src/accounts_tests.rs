@@ -392,9 +392,10 @@ fn subscription_availability_tracks_active_credential_health() {
             created_at_ms: None,
         })
         .expect("add offline fixture");
-    assert!(provider_credential_ready_for_summary(&accounts)(
-        BEDROCK_PROVIDER_NAME
-    ));
+    assert!(
+        !provider_credential_ready_for_summary(&accounts)(BEDROCK_PROVIDER_NAME),
+        "expired credentials are definite negative evidence for every configured provider"
+    );
 }
 
 #[test]
