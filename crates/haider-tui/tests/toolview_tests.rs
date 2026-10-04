@@ -162,6 +162,26 @@ fn workspace_root_cannot_shorten_away_another_account_mask() {
         "C:/Users/<user>/private"
     );
     assert_eq!(windows.shorten("C:/Users/alice/private"), "~/private");
+
+    // A registered home can live outside the standard Users/home layouts.
+    // A broad workspace must keep its home label instead of exposing the
+    // registered profile components as a workspace-relative path.
+    for (workspace, home) in [
+        ("D:/", "D:/Profiles/team/display-fixture-owner"),
+        ("C:/", "C:/storage/team/display-fixture-owner"),
+    ] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec![home.into()],
+        };
+        let path = format!("{home}/notes.txt");
+        assert_eq!(context.shorten(&path), "~/notes.txt", "{workspace}");
+        assert_eq!(
+            tv::header_args("fs_read", &json!({"path": path}), &context),
+            "~/notes.txt",
+            "{workspace}"
+        );
+    }
 }
 
 #[test]
@@ -477,6 +497,21 @@ fn workspace_alias_to_multiuser_root_keeps_the_account_mask() {
     assert_eq!(
         context.shorten(&path.to_string_lossy()),
         format!("{ancestor}/<user>/private")
+    );
+
+    let registered_home = temp.path().join("display-fixture-profile");
+    std::fs::create_dir(&registered_home).expect("registered home");
+    let filesystem_alias = temp.path().join("filesystem-root");
+    symlink("/", &filesystem_alias).expect("filesystem root alias");
+    let context = PathContext {
+        workspace: Some(filesystem_alias.display().to_string()),
+        homes: vec![registered_home.clone()],
+    };
+    let path = registered_home.join("notes.txt");
+    assert_eq!(context.shorten(&path.to_string_lossy()), "~/notes.txt");
+    assert_eq!(
+        tv::header_args("fs_read", &json!({"path": path}), &context),
+        "~/notes.txt"
     );
 }
 

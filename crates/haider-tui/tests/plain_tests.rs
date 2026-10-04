@@ -590,3 +590,68 @@ fn file_changes_use_session_workspace_and_home_in_plain_rows() {
         );
     }
 }
+
+#[test]
+fn generic_argument_summaries_project_every_path_key_and_preserve_literals() {
+    use haider_tui::toolfold::{arg_summary, arg_summary_with_context};
+    use haider_tui::toolview::PathContext;
+    use serde_json::json;
+
+    let paths = PathContext {
+        workspace: Some("C:/Users/summary-fixture-alice/project".into()),
+        homes: vec!["C:/Users/summary-fixture-alice".into()],
+    };
+    for key in [
+        "path",
+        "file_path",
+        "file",
+        "cwd",
+        "root",
+        "directory",
+        "workspace",
+    ] {
+        for (path, expected) in [
+            (
+                "C:/Users/summary-fixture-bob/repo/value",
+                "C:/Users/<user>/repo/value",
+            ),
+            (
+                "C:/Users/summary-fixture-alice/project/src/O'Brien, draft.rs",
+                "src/O'Brien, draft.rs",
+            ),
+            ("C:/Users/summary-fixture-alice/a ~b/x", "~/a ~b/x"),
+            (
+                r"C:\Users\display-fixture-o'brien\src\x",
+                "C:/Users/<user>/src/x",
+            ),
+            ("src/Users/bob/a ~b.rs", "src/Users/bob/a ~b.rs"),
+            (
+                "D:/data/Backup, 2024/a ~b.rs",
+                "D:/data/Backup, 2024/a ~b.rs",
+            ),
+        ] {
+            assert_eq!(
+                arg_summary_with_context(&json!({key: path}), &paths),
+                expected,
+                "{key}: {path}"
+            );
+        }
+        for (path, expected) in [
+            (
+                "C:/Users/summary-fixture-bob/repo/value",
+                "C:/Users/<user>/repo/value",
+            ),
+            (
+                r"C:\Users\display-fixture-o'brien\src\x",
+                "C:/Users/<user>/src/x",
+            ),
+            ("src/Users/bob/a ~b.rs", "src/Users/bob/a ~b.rs"),
+            (
+                "D:/data/Backup, 2024/a ~b.rs",
+                "D:/data/Backup, 2024/a ~b.rs",
+            ),
+        ] {
+            assert_eq!(arg_summary(&json!({key: path})), expected, "{key}: {path}");
+        }
+    }
+}
