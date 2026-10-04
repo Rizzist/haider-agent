@@ -1387,18 +1387,22 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             summary.availability_reason = Some(inventory.provenance().description().to_owned());
         }
         if configured_catalog {
+            if profile.enabled && profile.api_family != ProviderApiFamilyWire::Unknown {
             summary.availability_reason = Some(match &inventory {
                 ProviderInventory::Unsupported { reason } => {
                     format!("configured (unverified): {reason}")
                 }
+                ProviderInventory::Rejected { reason } => reason.clone(),
                 ProviderInventory::Unavailable { reason }
-                | ProviderInventory::Rejected { reason }
                 | ProviderInventory::Stale { reason, .. } => {
                     format!("{reason} — retry model-list fetch")
                 }
                 _ => "model list not fetched — fetch models before selecting".to_owned(),
             });
-            if profile.auth_requirement != ProviderAuthRequirementWire::None
+            }
+            if profile.enabled
+                && profile.api_family != ProviderApiFamilyWire::Unknown
+                && profile.auth_requirement != ProviderAuthRequirementWire::None
                 && !has_credential(&profile.provider_id)
             {
                 summary.availability = ProviderAvailabilityWire::Unavailable;
@@ -1745,7 +1749,7 @@ fn provider_summary(
             "provider API family is unavailable".to_owned()
         } else if seeded && profile.base_url.is_none() {
             "provider endpoint is not configured".to_owned()
-        } else if seeded && !credentialed {
+        } else if !credentialed && (seeded || (!profile.configured_models.is_empty() && profile.auth_requirement != ProviderAuthRequirementWire::None)) {
             "provider has no credential".to_owned()
         } else if let haider_rpc::ModelInventoryWire::Stale { reason, .. }
         | haider_rpc::ModelInventoryWire::Unavailable { reason } = &inventory

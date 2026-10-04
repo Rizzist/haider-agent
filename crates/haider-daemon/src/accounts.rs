@@ -3396,8 +3396,10 @@ async fn finish_provider_models_refresh(
             providers.models_unsupported(&provider, reason);
         } else if matches!(
             &result,
-            ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unauthorized | CatalogError::Empty))
-        ) || matches!(&result, ProviderModelsRefreshResult::Credential(error) if !error.retryable) {
+            ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unauthorized))
+        ) || (matches!(&result, ProviderModelsRefreshResult::Discovery(Err(CatalogError::Empty)))
+            && !haider_provider::has_subscription_static_catalog(&provider))
+            || matches!(&result, ProviderModelsRefreshResult::Credential(error) if !error.retryable) {
             // Retire durable positive evidence too: a restart cannot resurrect
             // a listing whose credential was explicitly rejected.
             let _ = store.delete_provider_models(cache_key.clone().into()).await;
@@ -11087,7 +11089,7 @@ impl AccountsProviderFactory {
             return Err(HaiderError::new(ErrorCode::ProviderError, "provider was removed", false));
         }
         // Even an explicitly configured model can borrow fetched eligibility:
-        // Azure requires a successful or unsupported listing, and authoritative
+        // Configured providers share discovery availability, and authoritative
         // inventories require membership. Account and inventory snapshots are
         // published separately, so fence that eligibility against the actual
         // credential and route before using either snapshot's result.
