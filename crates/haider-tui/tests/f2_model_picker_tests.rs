@@ -1278,11 +1278,19 @@ fn refused_pick_keeps_its_specific_reason_and_provider_visible_after_roster_refr
 #[test]
 fn never_fetched_deployment_reason_is_complete_at_both_picker_sizes() {
     let mut model = seeded_launcher();
-    add_api_provider(&mut model, ApiProviderFixture {
-        provider:"azure-deploy", model:"my-gpt-deployment", available:false,
-        reason:Some("model list not fetched — fetch models before selecting"), context_window:None,
-        fetched_at_ms:None, lockdown:false, is_default:true,
-    });
+    add_api_provider(
+        &mut model,
+        ApiProviderFixture {
+            provider: "azure-deploy",
+            model: "my-gpt-deployment",
+            available: false,
+            reason: Some("model list not fetched — fetch models before selecting"),
+            context_window: None,
+            fetched_at_ms: None,
+            lockdown: false,
+            is_default: true,
+        },
+    );
     run_slash(&mut model, "/model my-gpt");
     for (width, height) in [(118, 36), (80, 24)] {
         let text = draw_rows(&model, width, height).join("\n");

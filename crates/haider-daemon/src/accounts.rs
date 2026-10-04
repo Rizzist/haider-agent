@@ -3397,9 +3397,12 @@ async fn finish_provider_models_refresh(
         } else if matches!(
             &result,
             ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unauthorized))
-        ) || (matches!(&result, ProviderModelsRefreshResult::Discovery(Err(CatalogError::Empty)))
-            && !haider_provider::has_subscription_static_catalog(&provider))
-            || matches!(&result, ProviderModelsRefreshResult::Credential(error) if !error.retryable) {
+        ) || (matches!(
+            &result,
+            ProviderModelsRefreshResult::Discovery(Err(CatalogError::Empty))
+        ) && !haider_provider::has_subscription_static_catalog(&provider))
+            || matches!(&result, ProviderModelsRefreshResult::Credential(error) if !error.retryable)
+        {
             // Retire durable positive evidence too: a restart cannot resurrect
             // a listing whose credential was explicitly rejected.
             let _ = store.delete_provider_models(cache_key.clone().into()).await;
@@ -11086,7 +11089,11 @@ impl AccountsProviderFactory {
             .iter()
             .find(|summary| summary.provider == metadata.provider);
         if self.management.is_some() && profile.is_none() {
-            return Err(HaiderError::new(ErrorCode::ProviderError, "provider was removed", false));
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "provider was removed",
+                false,
+            ));
         }
         // Even an explicitly configured model can borrow fetched eligibility:
         // Configured providers share discovery availability, and authoritative
@@ -11123,8 +11130,7 @@ impl AccountsProviderFactory {
         }
 
         if let Some(summary) = summaries.iter().find(|summary| {
-            summary.provider == metadata.provider
-                && !summary.model_is_selectable(&metadata.model)
+            summary.provider == metadata.provider && !summary.model_is_selectable(&metadata.model)
         }) {
             return Err(HaiderError::new(
                 ErrorCode::ProviderError,

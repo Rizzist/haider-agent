@@ -6010,9 +6010,14 @@ fn render_model_picker(
     }
     let top_level = picker.provider_stage.is_none();
     let rows = model.model_picker_filtered(&picker.query);
-    let selected_reason = picker.error.as_ref().or_else(|| rows.get(picker.selection).and_then(|row| row.reason.as_ref()));
+    let selected_reason = picker.error.as_ref().or_else(|| {
+        rows.get(picker.selection)
+            .and_then(|row| row.reason.as_ref())
+    });
     let note_height = selected_reason.map_or(1, |reason| {
-        u16::try_from(wrap_plain(reason, (area.width as usize).saturating_sub(4).max(1)).len()).unwrap_or(3).clamp(1, 3)
+        u16::try_from(wrap_plain(reason, (area.width as usize).saturating_sub(4).max(1)).len())
+            .unwrap_or(3)
+            .clamp(1, 3)
     });
     let [title_area, search_area, note_area, list_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
@@ -6070,7 +6075,8 @@ fn render_model_picker(
         .and_then(|row| row.reason.as_ref())
     {
         frame.render_widget(
-            Paragraph::new(Line::styled(format!("   {reason}"), theme.dim_style())).wrap(Wrap { trim: false }),
+            Paragraph::new(Line::styled(format!("   {reason}"), theme.dim_style()))
+                .wrap(Wrap { trim: false }),
             note_area,
         );
     } else {
@@ -13093,7 +13099,8 @@ fn render_effort_picker(
         .collect();
     let mut body = vec![format!(
         "{} · {} — validated by the daemon against this pair's ladder",
-        model.display_identity().model_short, model.identity.provider
+        model.display_identity().model_short,
+        model.identity.provider
     )];
     if let Some(error) = &picker.error {
         body.push(format!("✗ {error}"));

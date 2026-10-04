@@ -297,14 +297,29 @@ fn catalog_selection_policy_is_shared_across_provider_kinds_and_uncertainty() {
             "provider":"synthetic", "api_family":"openai_chat_completions", "models":["listed"],
             "configured_models":["deployment"], "auth_methods":[], "availability":"available",
             "enabled":true, "catalog":catalog
-        })).expect("summary");
-        summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: u64::MAX };
+        }))
+        .expect("summary");
+        summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+            fetched_at_ms: u64::MAX,
+        };
         assert!(summary.model_is_selectable("listed"));
-        assert!(!summary.model_is_selectable("deployment"), "fresh negative membership: {catalog}");
-        summary.inventory = haider_rpc::ModelInventoryWire::Stale { fetched_at_ms: 1, reason:"catalog refresh due".into() };
-        assert!(summary.model_is_selectable("deployment"), "staleness is uncertainty: {catalog}");
+        assert!(
+            !summary.model_is_selectable("deployment"),
+            "fresh negative membership: {catalog}"
+        );
+        summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+            fetched_at_ms: 1,
+            reason: "catalog refresh due".into(),
+        };
+        assert!(
+            summary.model_is_selectable("deployment"),
+            "staleness is uncertainty: {catalog}"
+        );
         summary.inventory = haider_rpc::ModelInventoryWire::Configured;
-        assert!(summary.model_is_selectable("deployment"), "unsupported or transient configured fallback: {catalog}");
+        assert!(
+            summary.model_is_selectable("deployment"),
+            "unsupported or transient configured fallback: {catalog}"
+        );
         summary.availability = ProviderAvailabilityWire::Unavailable;
         assert!(!summary.model_is_selectable("deployment"));
         summary.availability = ProviderAvailabilityWire::Available;

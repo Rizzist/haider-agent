@@ -1589,11 +1589,13 @@ impl ProviderSummaryWire {
     /// consumers must also respect enablement and fresh negative membership.
     #[must_use]
     pub fn selection_availability(&self, model: Option<&str>) -> ProviderAvailabilityWire {
-        if !self.enabled || model.is_some_and(|model| {
-            matches!(self.inventory, ModelInventoryWire::Fetched { .. })
-                && self.configured_models.iter().any(|name| name == model)
-                && !self.models.iter().any(|name| name == model)
-        }) {
+        if !self.enabled
+            || model.is_some_and(|model| {
+                matches!(self.inventory, ModelInventoryWire::Fetched { .. })
+                    && self.configured_models.iter().any(|name| name == model)
+                    && !self.models.iter().any(|name| name == model)
+            })
+        {
             ProviderAvailabilityWire::Unavailable
         } else {
             self.availability
@@ -1607,11 +1609,14 @@ impl ProviderSummaryWire {
         {
             return Some("deployment is absent from the latest model list".into());
         }
-        self.availability_reason.clone().or_else(|| match &self.inventory {
-            ModelInventoryWire::Stale { reason, .. } if !self.has_static_models() =>
-                Some(format!("{reason} — refresh due")),
-            _ => None,
-        })
+        self.availability_reason
+            .clone()
+            .or_else(|| match &self.inventory {
+                ModelInventoryWire::Stale { reason, .. } if !self.has_static_models() => {
+                    Some(format!("{reason} — refresh due"))
+                }
+                _ => None,
+            })
     }
 
     /// Private discovery belongs to the published route, including anonymous

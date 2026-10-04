@@ -2567,12 +2567,31 @@ fn summary_rejects_foreign_default_without_startup_reconciliation() {
     let mut profile = removable_provider_profile_for_catalog_test();
     profile.default_model = Some("a-private-beta".into());
     let source = model_source([]);
-    source.replace("work".into(), ProviderInventory::Fetched {
-        models: vec![discovered("b-current", true, None)], fetched_at_ms: u64::MAX,
-    });
-    let registry = ProviderRegistry::new(MemoryProviderStore::default(), vec![profile], source).expect("registry");
-    assert_eq!(registry.get("work").expect("profile").default_model.as_deref(), Some("a-private-beta"));
-    assert_eq!(registry.summary("work", &|_| true).expect("summary").default_model.as_deref(), Some("b-current"));
+    source.replace(
+        "work".into(),
+        ProviderInventory::Fetched {
+            models: vec![discovered("b-current", true, None)],
+            fetched_at_ms: u64::MAX,
+        },
+    );
+    let registry = ProviderRegistry::new(MemoryProviderStore::default(), vec![profile], source)
+        .expect("registry");
+    assert_eq!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .as_deref(),
+        Some("a-private-beta")
+    );
+    assert_eq!(
+        registry
+            .summary("work", &|_| true)
+            .expect("summary")
+            .default_model
+            .as_deref(),
+        Some("b-current")
+    );
 }
 
 fn removable_provider_profile_for_catalog_test() -> ProviderProfileV1 {
@@ -2587,19 +2606,40 @@ fn removable_provider_profile_for_catalog_test() -> ProviderProfileV1 {
 
 #[test]
 fn configured_availability_retains_stale_success_and_rejects_negative_evidence() {
-    for origin in ["https://synthetic.openai.azure.com/openai/v1", "http://127.0.0.1:19373/v1"] {
+    for origin in [
+        "https://synthetic.openai.azure.com/openai/v1",
+        "http://127.0.0.1:19373/v1",
+    ] {
         let mut profile = removable_provider_profile_for_catalog_test();
         profile.base_url = Some(origin.into());
         profile.configured_models = vec!["deployment".into()];
         profile.default_model = Some("deployment".into());
         let source = model_source([]);
-        let registry = ProviderRegistry::new(MemoryProviderStore::default(), vec![profile], source.clone()).expect("registry");
+        let registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            vec![profile],
+            source.clone(),
+        )
+        .expect("registry");
         let assert_policy = |expected| {
             let summary = registry.summary("work", &|_| true).expect("summary");
-            assert_eq!(summary.model_is_selectable("deployment"), expected, "{origin}: {summary:?}");
-            assert_eq!(registry.validate_default_model("work", "deployment").is_ok(), expected);
-            assert_eq!(crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
-                .validate_selection_with_status("work", None, "deployment").is_ok(), expected);
+            assert_eq!(
+                summary.model_is_selectable("deployment"),
+                expected,
+                "{origin}: {summary:?}"
+            );
+            assert_eq!(
+                registry
+                    .validate_default_model("work", "deployment")
+                    .is_ok(),
+                expected
+            );
+            assert_eq!(
+                crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                    .validate_selection_with_status("work", None, "deployment")
+                    .is_ok(),
+                expected
+            );
         };
         assert_policy(false);
         source.unavailable("work", "server returned 503 for /models".into());
@@ -2608,30 +2648,61 @@ fn configured_availability_retains_stale_success_and_rejects_negative_evidence()
         assert_policy(true);
         registry.clear_discovered_models("work");
         assert_policy(false);
-        source.replace("work".into(), ProviderInventory::Fetched {
-            models: vec![discovered("deployment", true, None)], fetched_at_ms: 1,
-        });
+        source.replace(
+            "work".into(),
+            ProviderInventory::Fetched {
+                models: vec![discovered("deployment", true, None)],
+                fetched_at_ms: 1,
+            },
+        );
         assert_policy(true);
-        assert!(registry.summary("work", &|_| true).expect("stale").availability_reason.expect("visible reason").contains("refresh"));
+        assert!(
+            registry
+                .summary("work", &|_| true)
+                .expect("stale")
+                .availability_reason
+                .expect("visible reason")
+                .contains("refresh")
+        );
         source.unavailable("work", "server returned 503 for /models".into());
         assert_policy(true);
         source.unavailable("work", "model catalog discovery timed out".into());
         assert_policy(true);
         registry.models_rejected("work", "model catalog authentication failed".into());
         assert_policy(false);
-        source.unavailable("work", "later timeout is not proof the credential recovered".into());
+        source.unavailable(
+            "work",
+            "later timeout is not proof the credential recovered".into(),
+        );
         assert_policy(false);
-        registry.models_unsupported("work", "later unsupported listing is not an auth success".into());
+        registry.models_unsupported(
+            "work",
+            "later unsupported listing is not an auth success".into(),
+        );
         assert_policy(false);
-        source.replace("work".into(), ProviderInventory::Fetched {
-            models: vec![discovered("other", true, None)], fetched_at_ms: u64::MAX,
-        });
+        source.replace(
+            "work".into(),
+            ProviderInventory::Fetched {
+                models: vec![discovered("other", true, None)],
+                fetched_at_ms: u64::MAX,
+            },
+        );
         assert_policy(false);
-        source.replace("work".into(), ProviderInventory::Fetched {
-            models: vec![discovered("other", true, None)], fetched_at_ms: 1,
-        });
+        source.replace(
+            "work".into(),
+            ProviderInventory::Fetched {
+                models: vec![discovered("other", true, None)],
+                fetched_at_ms: 1,
+            },
+        );
         assert_policy(true);
-        assert!(registry.summary("work", &|_| true).expect("stale row").models.contains(&"deployment".into()));
+        assert!(
+            registry
+                .summary("work", &|_| true)
+                .expect("stale row")
+                .models
+                .contains(&"deployment".into())
+        );
         registry.models_unsupported("work", "server returned 405 for /models".into());
         assert_policy(true);
     }

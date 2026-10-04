@@ -12281,7 +12281,10 @@ impl AppModel {
                 || self.identity_catalog_key.as_ref().is_some_and(|key| {
                     !self.providers.providers.iter().any(|summary| {
                         summary.provider == self.identity.provider
-                            && summary.catalog_scope.as_ref().is_some_and(|scope| &scope.key == key)
+                            && summary
+                                .catalog_scope
+                                .as_ref()
+                                .is_some_and(|scope| &scope.key == key)
                     })
                 }));
         if awaiting_owner {
@@ -21071,7 +21074,9 @@ impl AppModel {
                         .and_then(|detail| detail.source),
                     inventory_age_ms,
                     available,
-                    reason: summary.selection_reason(Some(model)).or_else(|| reason.clone()),
+                    reason: summary
+                        .selection_reason(Some(model))
+                        .or_else(|| reason.clone()),
                     is_default: summary.default_model.as_deref() == Some(model),
                     is_current: self.identity.provider == summary.provider
                         && self.identity.model_short == *model,

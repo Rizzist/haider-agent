@@ -2644,7 +2644,11 @@ impl LiveDriver {
     /// Poll external management changes with at most one outstanding pair.
     /// The read deadline permits recovery when an old peer drops a reply.
     pub fn refresh_management(&mut self) -> Vec<LiveCommand> {
-        if !self.connected || self.management_refresh_started.is_some_and(|started| started.elapsed() < std::time::Duration::from_secs(30)) {
+        if !self.connected
+            || self
+                .management_refresh_started
+                .is_some_and(|started| started.elapsed() < std::time::Duration::from_secs(30))
+        {
             return Vec::new();
         }
         self.management_refresh_started = Some(std::time::Instant::now());

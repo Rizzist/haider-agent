@@ -440,7 +440,10 @@ impl ProviderInventory {
             Self::Fetched { models, .. } | Self::Stale { models, .. } => Some(models.clone()),
             #[cfg(test)]
             Self::Configured { models } => Some(models.clone()),
-            Self::NeverFetched | Self::Unavailable { .. } | Self::Unsupported { .. } | Self::Rejected { .. } => None,
+            Self::NeverFetched
+            | Self::Unavailable { .. }
+            | Self::Unsupported { .. }
+            | Self::Rejected { .. } => None,
         }
     }
 
@@ -459,11 +462,11 @@ impl ProviderInventory {
                 fetched_at_ms: *fetched_at_ms,
                 reason: reason.clone(),
             },
-            Self::Unavailable { reason } | Self::Unsupported { reason } | Self::Rejected { reason } => {
-                ModelInventoryWire::Unavailable {
-                    reason: reason.clone(),
-                }
-            }
+            Self::Unavailable { reason }
+            | Self::Unsupported { reason }
+            | Self::Rejected { reason } => ModelInventoryWire::Unavailable {
+                reason: reason.clone(),
+            },
             #[cfg(test)]
             Self::Configured { .. } => ModelInventoryWire::Configured,
         }
@@ -696,7 +699,8 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     }
 
     pub(crate) fn models_rejected(&self, provider: &str, reason: String) {
-        self.model_source.replace(provider.to_owned(), ProviderInventory::Rejected { reason });
+        self.model_source
+            .replace(provider.to_owned(), ProviderInventory::Rejected { reason });
     }
 
     pub(crate) fn replace_discovered_models(
@@ -742,7 +746,11 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         provider: &str,
         key: Option<String>,
     ) -> Result<(), HaiderError> {
-        let Some(index) = self.profiles.iter().position(|row| row.provider_id == provider) else {
+        let Some(index) = self
+            .profiles
+            .iter()
+            .position(|row| row.provider_id == provider)
+        else {
             return Ok(());
         };
         if self.profiles[index].catalog_selection_key == key {
@@ -810,7 +818,10 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     }
 
     pub(crate) fn models_unsupported(&self, provider: &str, reason: String) {
-        if matches!(self.model_source.inventory(provider), ProviderInventory::Rejected { .. }) {
+        if matches!(
+            self.model_source.inventory(provider),
+            ProviderInventory::Rejected { .. }
+        ) {
             return;
         }
         self.model_source.replace(
@@ -1325,7 +1336,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         let Some(summary) = self.summary(provider, &|_| true) else {
             return Vec::new();
         };
-        summary.models.iter().filter(|model| summary.model_is_selectable(model)).cloned().collect()
+        summary
+            .models
+            .iter()
+            .filter(|model| summary.model_is_selectable(model))
+            .cloned()
+            .collect()
     }
 
     fn discovered_details(&self, provider: &str) -> Vec<DiscoveredModel> {
@@ -1378,7 +1394,11 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             profile,
             model_details,
             offline_catalog,
-            configured_catalog && matches!(inventory, ProviderInventory::NeverFetched | ProviderInventory::Rejected { .. }),
+            configured_catalog
+                && matches!(
+                    inventory,
+                    ProviderInventory::NeverFetched | ProviderInventory::Rejected { .. }
+                ),
             has_credential(&profile.provider_id),
             inventory_wire,
         );
@@ -1388,17 +1408,17 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         }
         if configured_catalog {
             if profile.enabled && profile.api_family != ProviderApiFamilyWire::Unknown {
-            summary.availability_reason = Some(match &inventory {
-                ProviderInventory::Unsupported { reason } => {
-                    format!("configured (unverified): {reason}")
-                }
-                ProviderInventory::Rejected { reason } => reason.clone(),
-                ProviderInventory::Unavailable { reason }
-                | ProviderInventory::Stale { reason, .. } => {
-                    format!("{reason} — retry model-list fetch")
-                }
-                _ => "model list not fetched — fetch models before selecting".to_owned(),
-            });
+                summary.availability_reason = Some(match &inventory {
+                    ProviderInventory::Unsupported { reason } => {
+                        format!("configured (unverified): {reason}")
+                    }
+                    ProviderInventory::Rejected { reason } => reason.clone(),
+                    ProviderInventory::Unavailable { reason }
+                    | ProviderInventory::Stale { reason, .. } => {
+                        format!("{reason} — retry model-list fetch")
+                    }
+                    _ => "model list not fetched — fetch models before selecting".to_owned(),
+                });
             }
             if profile.enabled
                 && profile.api_family != ProviderApiFamilyWire::Unknown
@@ -1737,28 +1757,36 @@ fn provider_summary(
     };
     let availability_reason = if available {
         match &inventory {
-            haider_rpc::ModelInventoryWire::Stale { reason, .. } if !seeded => Some(format!("{reason} — refreshing in background")),
+            haider_rpc::ModelInventoryWire::Stale { reason, .. } if !seeded => {
+                Some(format!("{reason} — refreshing in background"))
+            }
             _ => None,
         }
-    } else { Some({
-        if matches!(profile.provenance, ProviderProvenance::Unknown) {
-            "provider adapter is not registered".to_owned()
-        } else if !profile.enabled {
-            "provider is disabled".to_owned()
-        } else if matches!(profile.api_family, ProviderApiFamilyWire::Unknown) {
-            "provider API family is unavailable".to_owned()
-        } else if seeded && profile.base_url.is_none() {
-            "provider endpoint is not configured".to_owned()
-        } else if !credentialed && (seeded || (!profile.configured_models.is_empty() && profile.auth_requirement != ProviderAuthRequirementWire::None)) {
-            "provider has no credential".to_owned()
-        } else if let haider_rpc::ModelInventoryWire::Stale { reason, .. }
-        | haider_rpc::ModelInventoryWire::Unavailable { reason } = &inventory
-        {
-            reason.clone()
-        } else {
-            "provider model inventory is unavailable".to_owned()
-        }
-    }) };
+    } else {
+        Some({
+            if matches!(profile.provenance, ProviderProvenance::Unknown) {
+                "provider adapter is not registered".to_owned()
+            } else if !profile.enabled {
+                "provider is disabled".to_owned()
+            } else if matches!(profile.api_family, ProviderApiFamilyWire::Unknown) {
+                "provider API family is unavailable".to_owned()
+            } else if seeded && profile.base_url.is_none() {
+                "provider endpoint is not configured".to_owned()
+            } else if !credentialed
+                && (seeded
+                    || (!profile.configured_models.is_empty()
+                        && profile.auth_requirement != ProviderAuthRequirementWire::None))
+            {
+                "provider has no credential".to_owned()
+            } else if let haider_rpc::ModelInventoryWire::Stale { reason, .. }
+            | haider_rpc::ModelInventoryWire::Unavailable { reason } = &inventory
+            {
+                reason.clone()
+            } else {
+                "provider model inventory is unavailable".to_owned()
+            }
+        })
+    };
     ProviderSummaryWire {
         catalog_scope: None,
         configured_models: profile.configured_models.clone(),
