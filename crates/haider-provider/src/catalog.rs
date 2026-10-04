@@ -491,6 +491,16 @@ pub async fn discover_models_with_resolver(
                 format!("model catalog request failed: {error}")
             },
         })?;
+    read_catalog_response(source, response, access_token).await
+}
+
+/// Classifies and parses the bounded response for every discovery transport.
+/// Fixed-origin and compatible adapters share the same availability evidence.
+pub(super) async fn read_catalog_response(
+    source: CatalogSource,
+    response: reqwest::Response,
+    access_token: Option<&str>,
+) -> Result<DiscoveredCatalog, CatalogError> {
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Err(CatalogError::NotModified);
     }
@@ -519,23 +529,24 @@ pub async fn discover_models_with_resolver(
                 ),
             });
         }
-        if compatible_listing {
-            let reason = format!("server returned {status} for /models");
-            if matches!(status, 404 | 405) {
-                return Err(CatalogError::Unsupported { reason });
-            }
-            if status >= 500 {
-                return Err(CatalogError::Transport { reason });
-            }
-            // Some compatible services return a typed not-supported error
-            // instead of 404/405. Read it through the same body bound below.
-        } else {
+        let reason = format!("server returned {status} for /models");
+        if matches!(status, 404 | 405) {
+            return Err(CatalogError::Unsupported { reason });
+        }
+        if status >= 500 {
+            return Err(CatalogError::Transport { reason });
+        }
+        if !compatible_listing && status == 403 {
+            // Subscription model-list permission failures retain the
+            // informational classification used by maintained static rows.
             return Err(CatalogError::Unavailable {
                 reason: format!(
                     "provider does not serve a model list to this credential ({status})"
                 ),
             });
         }
+        // A typed not-supported answer is valid for every catalog source.
+        // Read it through the same body bound below.
     }
     let response_etag = response
         .headers()
@@ -571,31 +582,29 @@ pub async fn discover_models_with_resolver(
             }
         }
     })?;
-    if compatible_listing {
-        let code = [value.pointer("/error/code"), value.pointer("/error/type")]
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::trim)
-            .find(|code| {
-                [
-                    "OperationNotSupported",
-                    "NotSupported",
-                    "not_supported",
-                    "unsupported_operation",
-                    "not_implemented",
-                ]
-                .iter()
-                .any(|known| code.eq_ignore_ascii_case(known))
-            });
-        if let Some(code) = code {
-            return Err(CatalogError::Unsupported {
-                reason: format!(
-                    "server returned {} for /models: {code}",
-                    response_status.as_u16()
-                ),
-            });
-        }
+    let code = [value.pointer("/error/code"), value.pointer("/error/type")]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .find(|code| {
+            [
+                "OperationNotSupported",
+                "NotSupported",
+                "not_supported",
+                "unsupported_operation",
+                "not_implemented",
+            ]
+            .iter()
+            .any(|known| code.eq_ignore_ascii_case(known))
+        });
+    if let Some(code) = code {
+        return Err(CatalogError::Unsupported {
+            reason: format!(
+                "server returned {} for /models: {code}",
+                response_status.as_u16()
+            ),
+        });
     }
     if !response_status.is_success() {
         return Err(CatalogError::Unavailable {
