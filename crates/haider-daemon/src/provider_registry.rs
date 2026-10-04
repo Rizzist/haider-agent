@@ -1,6 +1,6 @@
 //! Durable provider-profile registry owned by the account/provider actor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -192,6 +192,16 @@ pub(crate) struct ProviderRegistryDocumentV1 {
     providers: Vec<ProviderProfileV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fallback_chain: Vec<String>,
+    /// Scoped negative discovery evidence survives restart. Older daemons
+    /// ignore this additive field; no persisted inventory enum is extended.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    catalog_rejections: BTreeMap<String, CatalogRejectionV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CatalogRejectionV1 {
+    provider: String,
+    reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -207,6 +217,7 @@ impl ProviderRegistryFileV1 {
             Self::Legacy(providers) => ProviderRegistryDocumentV1 {
                 providers,
                 fallback_chain: Vec::new(),
+                catalog_rejections: BTreeMap::new(),
             },
             Self::Document(document) => document,
         }
@@ -219,11 +230,19 @@ pub(crate) trait ProviderRegistryStoreLike: Send + Sync {
         self.load().map(|providers| ProviderRegistryDocumentV1 {
             providers,
             fallback_chain: Vec::new(),
+            catalog_rejections: BTreeMap::new(),
         })
     }
     fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError>;
     fn save_bootstrap(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
         self.save(profiles)
+    }
+    fn set_catalog_rejection(
+        &self,
+        _scope: &str,
+        _rejection: Option<CatalogRejectionV1>,
+    ) -> Result<(), HaiderError> {
+        Ok(())
     }
 }
 
@@ -266,15 +285,6 @@ impl JsonProviderRegistryStore {
         profiles: &[ProviderProfileV1],
         policy: haider_platform::SyncPolicy,
     ) -> Result<(), HaiderError> {
-        let parent = self.path.parent().ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                "provider registry path has no parent directory",
-                false,
-            )
-        })?;
-        fs::create_dir_all(parent)
-            .map_err(|error| file_error("create parent directory for", &self.path, error))?;
         // Provider management mutates only the provider rows. Preserve the
         // profile-level resilience configuration across every such write.
         let previous = self.read_document()?;
@@ -308,11 +318,32 @@ impl JsonProviderRegistryStore {
                 }
             })
             .collect();
+        let mut catalog_rejections = previous.catalog_rejections;
+        catalog_rejections.retain(|_, rejection| {
+            profiles
+                .iter()
+                .any(|profile| profile.provider_id == rejection.provider)
+        });
         let document = ProviderRegistryDocumentV1 {
             providers: profiles.to_vec(),
             fallback_chain,
+            catalog_rejections,
         };
-        let mut bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
+        self.write_document(&document, policy)
+    }
+
+    fn write_document(
+        &self,
+        document: &ProviderRegistryDocumentV1,
+        policy: haider_platform::SyncPolicy,
+    ) -> Result<(), HaiderError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| invalid("provider registry path has no parent directory"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| file_error("create parent directory for", &self.path, error))?;
+        let mut bytes = serde_json::to_vec_pretty(document).map_err(|error| {
             HaiderError::new(
                 ErrorCode::Internal,
                 format!("could not serialize provider registry: {error}"),
@@ -365,6 +396,20 @@ impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
         // through `save`, whose policy remains Full.
         self.save_with_policy(profiles, haider_platform::SyncPolicy::Plain)
     }
+
+    fn set_catalog_rejection(
+        &self,
+        scope: &str,
+        rejection: Option<CatalogRejectionV1>,
+    ) -> Result<(), HaiderError> {
+        let mut document = self.read_document()?;
+        if let Some(rejection) = rejection {
+            document.catalog_rejections.insert(scope.into(), rejection);
+        } else if document.catalog_rejections.remove(scope).is_none() {
+            return Ok(());
+        }
+        self.write_document(&document, haider_platform::SyncPolicy::Full)
+    }
 }
 
 impl ProviderRegistryStoreLike for Arc<dyn ProviderRegistryStoreLike> {
@@ -383,6 +428,13 @@ impl ProviderRegistryStoreLike for Arc<dyn ProviderRegistryStoreLike> {
     fn save_bootstrap(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
         self.as_ref().save_bootstrap(profiles)
     }
+    fn set_catalog_rejection(
+        &self,
+        scope: &str,
+        rejection: Option<CatalogRejectionV1>,
+    ) -> Result<(), HaiderError> {
+        self.as_ref().set_catalog_rejection(scope, rejection)
+    }
 }
 
 impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
@@ -400,6 +452,13 @@ impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
 
     fn save_bootstrap(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
         self.as_ref().save_bootstrap(profiles)
+    }
+    fn set_catalog_rejection(
+        &self,
+        scope: &str,
+        rejection: Option<CatalogRejectionV1>,
+    ) -> Result<(), HaiderError> {
+        self.as_ref().set_catalog_rejection(scope, rejection)
     }
 }
 
@@ -701,6 +760,43 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     pub(crate) fn models_rejected(&self, provider: &str, reason: String) {
         self.model_source
             .replace(provider.to_owned(), ProviderInventory::Rejected { reason });
+    }
+
+    pub(crate) fn record_catalog_rejection(
+        &self,
+        provider: &str,
+        scope: &str,
+        reason: String,
+    ) -> Result<(), HaiderError> {
+        self.models_rejected(provider, reason.clone());
+        self.store.set_catalog_rejection(
+            scope,
+            Some(CatalogRejectionV1 {
+                provider: provider.into(),
+                reason,
+            }),
+        )
+    }
+
+    pub(crate) fn restore_catalog_rejection(
+        &self,
+        provider: &str,
+        scope: &str,
+    ) -> Result<bool, HaiderError> {
+        let document = self.store.load_document()?;
+        let Some(rejection) = document
+            .catalog_rejections
+            .get(scope)
+            .filter(|row| row.provider == provider)
+        else {
+            return Ok(false);
+        };
+        self.models_rejected(provider, rejection.reason.clone());
+        Ok(true)
+    }
+
+    pub(crate) fn clear_catalog_rejection(&self, scope: &str) -> Result<(), HaiderError> {
+        self.store.set_catalog_rejection(scope, None)
     }
 
     pub(crate) fn replace_discovered_models(

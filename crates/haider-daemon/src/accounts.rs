@@ -2532,6 +2532,7 @@ async fn run_account_actor(
                 reconcile_catalog_selection_scope(&provider, &accounts, &mut providers);
                 finish_provider_models_refresh(
                     ProviderModelsRefreshContext {
+                        profile_id: &profile_id,
                         store: &store,
                         accounts: &accounts,
                         management: management.as_ref(),
@@ -3359,6 +3360,7 @@ fn catalog_refresh_etag(
 }
 
 struct ProviderModelsRefreshContext<'a> {
+    profile_id: &'a str,
     store: &'a SqliteStoreHandle,
     accounts: &'a AccountStore<Box<dyn StoreLike>>,
     management: Option<&'a ManagementSnapshot>,
@@ -3374,12 +3376,15 @@ async fn finish_provider_models_refresh(
     result: ProviderModelsRefreshResult,
 ) {
     let ProviderModelsRefreshContext {
+        profile_id,
         store,
         accounts,
         management,
         providers,
         completed,
     } = context;
+    let rejection_scope = catalog_producer(profile_id, &provider, accounts, providers)
+        .map(|producer| catalog_rejection_scope(&producer));
     let failure_reason = match &result {
         ProviderModelsRefreshResult::Discovery(Ok(_))
         | ProviderModelsRefreshResult::Discovery(Err(CatalogError::NotModified)) => None,
@@ -3404,7 +3409,21 @@ async fn finish_provider_models_refresh(
             // Retire durable positive evidence too: a restart cannot resurrect
             // a listing whose credential was explicitly rejected.
             let _ = store.delete_provider_models(cache_key.clone().into()).await;
-            providers.models_rejected(&provider, reason);
+            if let Some(scope) = rejection_scope.as_deref() {
+                if let Err(error) = providers.record_catalog_rejection(&provider, scope, reason) {
+                    publish_inventory_states(store, management, accounts, providers).await;
+                    respond_model_refresh_error(
+                        completed,
+                        ERROR_CODE_PROVIDER_ERROR,
+                        &error.message,
+                        error.retryable,
+                        None,
+                    );
+                    return;
+                }
+            } else {
+                providers.models_rejected(&provider, reason);
+            }
         } else {
             providers.models_unavailable(&provider, reason);
         }
@@ -3447,6 +3466,20 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
+            // Commit fresh positive evidence before retiring its durable negative
+            // marker. A failed cache write or interrupted clear remains fenced.
+            if let Some(scope) = rejection_scope.as_deref()
+                && let Err(error) = providers.clear_catalog_rejection(scope)
+            {
+                respond_model_refresh_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+                return;
+            }
             providers.replace_discovered_models(provider.clone(), catalog.models, fetched_at_ms);
             let summaries = catalog_summaries(accounts, providers);
             let Some(summary) = summaries
@@ -3512,6 +3545,18 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
+            if let Some(scope) = rejection_scope.as_deref()
+                && let Err(error) = providers.clear_catalog_rejection(scope)
+            {
+                respond_model_refresh_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+                return;
+            }
             providers.replace_discovered_models(provider.clone(), models, fetched_at_ms);
             let revision = match store.management_revision().await {
                 Ok(revision) => revision,
@@ -3769,6 +3814,23 @@ pub(crate) struct CatalogProducer {
     alias: Option<CredentialAlias>,
     incarnation: Option<u64>,
     cache_key: ProviderModelCacheKey,
+}
+
+fn catalog_rejection_scope(producer: &CatalogProducer) -> String {
+    let identity = serde_json::json!({
+        "v": 1,
+        "profile": &producer.profile,
+        "provider": &producer.provider,
+        "source": format!("{:?}", producer.source),
+        "origin": &producer.origin,
+        "auth": producer.auth,
+        "alias": &producer.alias,
+        "incarnation": producer.incarnation,
+        "cache_key": String::from(producer.cache_key.clone()),
+    });
+    blake3::hash(identity.to_string().as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 fn catalog_producer(
@@ -14184,6 +14246,14 @@ impl AccountsRuntime {
             if catalog_source(&provider, &providers).is_some() {
                 let key = catalog_selection_scope(&provider, &accounts, &providers);
                 providers.reconcile_startup_catalog_scope(&provider, key)?;
+                if let Some(producer) =
+                    catalog_producer(profile_id, &provider, &accounts, &providers)
+                {
+                    providers.restore_catalog_rejection(
+                        &provider,
+                        &catalog_rejection_scope(&producer),
+                    )?;
+                }
             }
         }
         prune_catalog_cache(store, &accounts, &providers).await;

@@ -17063,6 +17063,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
     };
     finish_provider_models_refresh(
         ProviderModelsRefreshContext {
+            profile_id: "refresh-owner-test",
             store: &store,
             accounts: &accounts,
             management: None,
@@ -18012,8 +18013,10 @@ async fn startup_reconciles_legacy_defaults_against_only_active_hydrated_invento
         JsonProviderRegistryStore::new(dir.path())
             .save(&[profile.clone()])
             .expect("legacy file");
+        let provider_store: Box<dyn ProviderRegistryStoreLike> =
+            Box::new(JsonProviderRegistryStore::new(dir.path()));
         let providers = ProviderRegistry::new(
-            JsonProviderRegistryStore::new(dir.path()),
+            provider_store,
             vec![],
             Arc::new(CachedProviderModelSource::default()),
         )
@@ -18331,4 +18334,143 @@ fn daemon_turn_and_new_session_admission_agree_across_configured_provider_kinds(
             );
         }
     }
+}
+
+#[test]
+fn catalog_rejection_scope_covers_the_complete_attempt_identity() {
+    let providers = test_provider_registry();
+    let descriptor = CredentialDescriptor {
+        incarnation: 7,
+        credential_digest: Some("synthetic-digest".into()),
+        alias: CredentialAlias::new("A"),
+        provider: OPENAI_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "synthetic-A".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let producer = catalog_producer_for_account(
+        "profile",
+        OPENAI_PROVIDER_NAME,
+        Some(&descriptor),
+        &providers,
+    )
+    .expect("producer");
+    let key = catalog_rejection_scope(&producer);
+    assert_eq!(catalog_rejection_scope(&producer.clone()), key);
+    let mut rotated = descriptor.clone();
+    rotated.credential_digest = Some("synthetic-rotated-digest".into());
+    assert_eq!(
+        catalog_rejection_scope(
+            &catalog_producer_for_account(
+                "profile",
+                OPENAI_PROVIDER_NAME,
+                Some(&rotated),
+                &providers,
+            )
+            .expect("same identity")
+        ),
+        key,
+        "token rotation keeps the inventory owner; a positive list clears the rejection"
+    );
+    let mut variants = Vec::new();
+    let mut other = producer.clone();
+    other.profile = "other-profile".into();
+    variants.push(other);
+    let mut other = producer.clone();
+    other.provider = "other-provider".into();
+    variants.push(other);
+    let mut other = producer.clone();
+    other.alias = Some(CredentialAlias::new("B"));
+    variants.push(other);
+    let mut other = producer.clone();
+    other.incarnation = Some(8);
+    variants.push(other);
+    let mut other = producer.clone();
+    other.origin = Some("http://127.0.0.1:19374/v1".into());
+    variants.push(other);
+    let mut other = producer.clone();
+    other.auth = ProviderAuthRequirementWire::None;
+    variants.push(other);
+    let mut other = producer.clone();
+    other.source = CatalogSource::OpenAiCompatible {
+        origin: "http://127.0.0.1:19375/v1".into(),
+    };
+    variants.push(other);
+    let mut other = producer.clone();
+    other.cache_key = ProviderModelCacheKey::public("other");
+    variants.push(other);
+    for other in variants {
+        assert_ne!(catalog_rejection_scope(&other), key, "{other:?}");
+    }
+}
+
+#[tokio::test]
+async fn startup_restores_catalog_rejection_only_for_the_exact_producer() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    store.close().await.expect("close schema bootstrap");
+    let store = open_store(dir.path()).await;
+    let mut profile = removable_provider_profile("work");
+    profile.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+    profile.auth_requirement = ProviderAuthRequirementWire::None;
+    profile.base_url = Some("http://127.0.0.1:19373/v1".into());
+    profile.configured_models = vec!["deployment".into()];
+    profile.default_model = Some("deployment".into());
+    let json_store = JsonProviderRegistryStore::new(dir.path());
+    json_store.save(&[profile]).expect("profile");
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(json_store);
+    let providers = ProviderRegistry::new(
+        provider_store,
+        vec![],
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("registry");
+    let producer =
+        catalog_producer("owner", "work", &memory_accounts(), &providers).expect("producer");
+    providers
+        .record_catalog_rejection(
+            "work",
+            &catalog_rejection_scope(&producer),
+            "synthetic authentication failed".into(),
+        )
+        .expect("persist evidence");
+    for (profile_id, expected) in [("other-owner", false), ("owner", true)] {
+        let mut runtime = AccountsRuntime::initialize(
+            &store,
+            &AccountsDependencies {
+                vault: VaultProvision::Unsupported,
+                ..AccountsDependencies::default()
+            },
+            dir.path(),
+            profile_id,
+            profile_id,
+            "unused",
+            &std::collections::BTreeSet::new(),
+            true,
+        )
+        .await
+        .expect("startup");
+        let summary = runtime
+            .facade
+            .management
+            .read()
+            .expect("view")
+            .providers
+            .into_iter()
+            .find(|row| row.provider == "work")
+            .expect("work");
+        assert_eq!(
+            summary.availability_reason.as_deref() == Some("synthetic authentication failed"),
+            expected,
+            "startup must restore only the exact producer: {summary:?}"
+        );
+        assert!(!summary.model_is_selectable("deployment"));
+        runtime.actor.take().expect("actor").shutdown().await;
+    }
+    store.close().await.expect("close");
 }

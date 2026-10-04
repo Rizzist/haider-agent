@@ -2470,6 +2470,7 @@ fn retired_catalog_failover_models_are_removed_from_the_durable_document() {
         serde_json::to_vec(&ProviderRegistryDocumentV1 {
             providers: vec![profile],
             fallback_chain: vec!["work/a-private".into()],
+            ..ProviderRegistryDocumentV1::default()
         })
         .expect("document"),
     )
@@ -2814,4 +2815,82 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
             "credential failure policy for {provider}"
         );
     }
+}
+
+#[test]
+fn catalog_rejection_survives_restart_and_uncertainty_only_for_its_owner() {
+    let dir = tempfile::tempdir().expect("profile");
+    let mut profile = removable_provider_profile_for_catalog_test();
+    profile.configured_models = vec!["deployment".into()];
+    profile.default_model = Some("deployment".into());
+    let store = JsonProviderRegistryStore::new(dir.path());
+    store.save(&[profile.clone()]).expect("profile");
+    let registry =
+        ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("registry");
+    registry
+        .record_catalog_rejection("work", "owner-A", "synthetic authentication failed".into())
+        .expect("negative evidence");
+    store
+        .save(&[profile])
+        .expect("management save preserves evidence");
+    let reloaded = ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("restart");
+    assert!(
+        !reloaded
+            .restore_catalog_rejection("work", "owner-B")
+            .expect("other owner")
+    );
+    reloaded.models_unsupported("work", "server returned 404 for /models".into());
+    assert!(
+        reloaded
+            .summary("work", &|_| true)
+            .expect("B")
+            .model_is_selectable("deployment")
+    );
+    assert!(
+        reloaded
+            .restore_catalog_rejection("work", "owner-A")
+            .expect("owner")
+    );
+    for unsupported in [false, true] {
+        if unsupported {
+            reloaded.models_unsupported("work", "server returned 405 for /models".into());
+        } else {
+            reloaded.models_unavailable("work", "synthetic timeout / 503".into());
+        }
+        assert!(
+            !reloaded
+                .summary("work", &|_| true)
+                .expect("A")
+                .model_is_selectable("deployment")
+        );
+    }
+    reloaded
+        .clear_catalog_rejection("owner-A")
+        .expect("positive evidence retires rejection");
+    reloaded.replace_discovered_models(
+        "work".into(),
+        vec![discovered("deployment", true, None)],
+        u64::MAX,
+    );
+    assert!(
+        reloaded
+            .summary("work", &|_| true)
+            .expect("recovered")
+            .model_is_selectable("deployment")
+    );
+    let restarted =
+        ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("restart recovered");
+    assert!(
+        !restarted
+            .restore_catalog_rejection("work", "owner-A")
+            .expect("cleared")
+    );
+    let document: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join(PROVIDERS_FILE_NAME)).expect("document"),
+    )
+    .expect("json");
+    assert!(
+        document.get("catalog_rejections").is_none(),
+        "empty additive field is omitted"
+    );
 }
