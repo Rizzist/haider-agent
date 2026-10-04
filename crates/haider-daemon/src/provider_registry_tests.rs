@@ -2769,13 +2769,15 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
         assert_policy(offline);
         source.unavailable(provider, "server returned 503 for /models".into());
         assert_policy(true);
-        assert!(
-            registry
-                .summary(provider, &|_| true)
-                .expect("503")
-                .selection_reason(None)
-                .is_some()
-        );
+        let uncertainty = registry.summary(provider, &|_| true).expect("503");
+        if offline {
+            assert_eq!(
+                uncertainty.inventory,
+                haider_rpc::ModelInventoryWire::Static
+            );
+        } else {
+            assert!(uncertainty.selection_reason(None).is_some());
+        }
         registry.models_rejected(provider, "synthetic credential rejection".into());
         assert_policy(false);
         registry.clear_discovered_models(provider);
