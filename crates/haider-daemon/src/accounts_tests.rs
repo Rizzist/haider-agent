@@ -18474,3 +18474,62 @@ async fn startup_restores_catalog_rejection_only_for_the_exact_producer() {
     }
     store.close().await.expect("close");
 }
+
+#[tokio::test]
+async fn refresh_completion_restores_reactivated_owner_rejection_before_uncertainty() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut profile = removable_provider_profile("work");
+    profile.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+    profile.auth_requirement = ProviderAuthRequirementWire::None;
+    profile.base_url = Some("http://127.0.0.1:19373/v1".into());
+    profile.configured_models = vec!["deployment".into()];
+    profile.default_model = Some("deployment".into());
+    let json_store = JsonProviderRegistryStore::new(dir.path());
+    json_store.save(&[profile]).expect("profile");
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(json_store);
+    let providers = ProviderRegistry::new(
+        provider_store,
+        vec![],
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("registry");
+    let accounts = memory_accounts();
+    let producer = catalog_producer("owner", "work", &accounts, &providers).expect("producer");
+    let scope = catalog_evidence_scope(&producer);
+    providers
+        .record_catalog_rejection("work", &scope, "synthetic authentication failed".into())
+        .expect("rejected");
+    for result in [
+        CatalogError::Transport {
+            reason: "synthetic timeout / 503".into(),
+        },
+        CatalogError::Unsupported {
+            reason: "server returned 404 for /models".into(),
+        },
+    ] {
+        providers.clear_discovered_models("work");
+        finish_provider_models_refresh(
+            ProviderModelsRefreshContext {
+                profile_id: "owner",
+                store: &store,
+                accounts: &accounts,
+                management: None,
+                providers: &providers,
+                completed: &ProviderModelsRefreshCompletion::Automatic,
+            },
+            "work".into(),
+            producer.cache_key.clone(),
+            None,
+            ProviderModelsRefreshResult::Discovery(Err(result)),
+        )
+        .await;
+        let summary = providers.summary("work", &|_| true).expect("summary");
+        assert!(!summary.model_is_selectable("deployment"));
+        assert_eq!(
+            summary.availability_reason.as_deref(),
+            Some("synthetic authentication failed")
+        );
+    }
+    store.close().await.expect("close");
+}

@@ -3385,6 +3385,21 @@ async fn finish_provider_models_refresh(
     } = context;
     let evidence_scope = catalog_producer(profile_id, &provider, accounts, providers)
         .map(|producer| catalog_evidence_scope(&producer));
+    // Account selection can retire the live slot. Restore this exact owner's
+    // evidence before uncertainty is applied, so reactivation cannot turn a
+    // known rejection into configured-unverified availability.
+    if let Some(scope) = evidence_scope.as_deref()
+        && let Err(error) = providers.restore_catalog_evidence(&provider, scope)
+    {
+        respond_model_refresh_error(
+            completed,
+            ERROR_CODE_PROVIDER_ERROR,
+            &error.message,
+            error.retryable,
+            None,
+        );
+        return;
+    }
     let failure_reason = match &result {
         ProviderModelsRefreshResult::Discovery(Ok(_))
         | ProviderModelsRefreshResult::Discovery(Err(CatalogError::NotModified)) => None,
