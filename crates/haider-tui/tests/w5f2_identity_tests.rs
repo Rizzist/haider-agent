@@ -1761,3 +1761,78 @@ fn restored_private_preference_is_hidden_until_live_owner_is_proven() {
         assert_eq!(model.display_identity().model_short, "b-private");
     }
 }
+
+#[test]
+fn retired_private_session_identity_clears_account_and_window_in_either_reply_order() {
+    for attached in [false, true] {
+        for accounts_first in [false, true] {
+            let mut model = live_model();
+            let mut driver = LiveDriver::new("retired-session-owner");
+            let mut a = oauth_descriptor("custom", "work", true);
+            a.incarnation = 1;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![a],
+                    revision: Some(1),
+                    sources: vec![],
+                },
+            );
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Providers {
+                    providers: vec![private_summary(1, "a-private")],
+                    revision: 1,
+                },
+            );
+            model.apply_model_selected("custom", "a-private");
+            assert_eq!(model.identity.account, "work");
+            if attached {
+                model.active_session =
+                    Some(haider_protocol::ids::SessionId::new("synthetic-session"));
+                model.screen = haider_tui::app::Screen::Session;
+            }
+            let mut b = oauth_descriptor("custom", "replacement", true);
+            b.incarnation = 2;
+            let mut inventory = private_summary(2, "b-private");
+            inventory
+                .catalog_scope
+                .as_mut()
+                .expect("scope")
+                .account_alias = Some("replacement".into());
+            inventory.models.clear();
+            inventory.model_details.clear();
+            inventory.default_model = None;
+            inventory.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+                reason: "synthetic 503".into(),
+            };
+            inventory.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+            let accounts = LiveReply::Accounts {
+                descriptors: vec![b],
+                revision: Some(2),
+                sources: vec![],
+            };
+            let providers = LiveReply::Providers {
+                providers: vec![inventory],
+                revision: 2,
+            };
+            let replies = if accounts_first {
+                [accounts, providers]
+            } else {
+                [providers, accounts]
+            };
+            for reply in replies {
+                pass(&mut driver, &mut model, reply);
+            }
+            assert!(model.display_identity().model_short.is_empty());
+            assert_ne!(model.display_identity().account, "work");
+            assert_eq!(model.context_meter().window, None);
+            assert_eq!(model.composer_identity(118), None);
+            for width in [118, 80] {
+                assert!(haider_tui::render::status_left_string(&model, width).contains("unknown"));
+            }
+        }
+    }
+}

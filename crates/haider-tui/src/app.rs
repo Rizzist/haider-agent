@@ -12531,6 +12531,7 @@ impl AppModel {
                 }
                 self.identity.model_short.clear();
                 self.identity.context_window = 0;
+                self.identity.account.clear();
                 self.identity_pinned = self.active_session.is_some();
             }
             if self.accounts.revision.is_some() {
