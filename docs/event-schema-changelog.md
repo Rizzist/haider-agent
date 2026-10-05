@@ -77,9 +77,10 @@ choice does not apply to it).
 class values: `fs_write` plus additive `effect_origin: "checkpoint_restore"`,
 or `network { host: "provider-request" }` plus
 `effect_origin: "provider_transport"`. The released intent structs ignore
-unknown fields, so a 0.0.972 daemon can start, list and operate on the profile
-without an unknown-enum startup error. It treats restores as ordinary file
-effects and provider recovery as historical transport bookkeeping. Its typed
+unknown fields. The previous wave-base daemon at the same database schema
+version can start, list and operate on the profile without an unknown-enum
+startup error. It treats restores as ordinary file effects and provider
+recovery as historical transport bookkeeping. Its typed
 projections may omit the additive origin; raw journal records retain it.
 On re-upgrade the current reader prefers the typed additive origin, validates
 its carrier, and restores the distinct mutation admission, graph provenance
@@ -92,8 +93,12 @@ accept direct class values written by earlier
 lane candidates, but normalize all new writes to the released carriers.
 Those unreleased experimental records remain immutable: a profile already
 containing direct new enum values still needs the current daemon. This fix
-protects released 0.0.972 journals upgraded to the new writer; it does not
-make pre-fix experimental profiles downgrade-safe by rewriting history.
+protects journals upgraded to the new writer from strict effect-enum
+decoding failures; it does not make pre-fix experimental profiles
+downgrade-safe by rewriting history. Database schema downgrade policy is
+separate: released 0.0.972 uses schema 31 and refuses a newer schema 33
+profile. The real downgrade probes use the schema-33 wave base; compatible
+effect records do not bypass the released daemon's schema-version check.
 Peers without `session_activity_v1` receive the historical intent with the
 origin removed. The frozen enum and complete old-intent decoder tests pin
 both compatible writes and strict rejection of direct new enum values;
