@@ -44,9 +44,12 @@ pub(crate) struct ModelSelectionAuthority {
     /// not installed (startup edge) and no cross-provider row is creatable.
     creatable: Option<BTreeSet<String>>,
     /// Management-snapshot provider summaries (inventory + availability).
-    /// Empty when no account facade is installed: every inventory is then
-    /// unknown and selection stays honest rather than guessing.
+    /// Absent registry authority leaves inventory unknown. An installed
+    /// registry with no row is proof that the provider is unavailable.
     summaries: Vec<ProviderSummaryWire>,
+    /// An installed management registry distinguishes a removed provider
+    /// from a factory-only caller with no registry authority.
+    provider_registry_installed: bool,
 }
 
 /// One admitted explicit selection plus its honest relationship to the
@@ -280,14 +283,34 @@ impl SelectionRefusal {
 }
 
 impl ModelSelectionAuthority {
+    /// `None` means no management authority; `Some`, including an empty
+    /// vector, is the installed registry's complete provider projection.
     pub(crate) fn new(
         creatable: Option<BTreeSet<String>>,
-        summaries: Vec<ProviderSummaryWire>,
+        summaries: Option<Vec<ProviderSummaryWire>>,
     ) -> Self {
         Self {
             creatable,
-            summaries,
+            provider_registry_installed: summaries.is_some(),
+            summaries: summaries.unwrap_or_default(),
         }
+    }
+
+    fn registered_provider(
+        &self,
+        provider: &str,
+    ) -> Result<Option<&ProviderSummaryWire>, SelectionRefusal> {
+        let summary = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider);
+        if self.provider_registry_installed && summary.is_none() {
+            return Err(SelectionRefusal::ProviderUnavailable {
+                provider: provider.to_owned(),
+                reason: None,
+            });
+        }
+        Ok(summary)
     }
 
     /// Session overrides cannot inherit the active route's discovery evidence.
@@ -410,6 +433,9 @@ impl ModelSelectionAuthority {
         self.summaries
             .iter()
             .find(|summary| summary.provider == provider)
+            .filter(|summary| {
+                summary.selection_availability(None) == ProviderAvailabilityWire::Available
+            })
             .map(|summary| summary.models.as_slice())
             .filter(|models| !models.is_empty())
     }
@@ -569,10 +595,7 @@ impl ModelSelectionAuthority {
             .map(str::trim)
             .filter(|provider| !provider.is_empty())
             .unwrap_or(current_provider);
-        let summary = self
-            .summaries
-            .iter()
-            .find(|summary| summary.provider == provider);
+        let summary = self.registered_provider(provider)?;
         if summary.is_some_and(|summary| !summary.model_is_selectable(requested_model)) {
             return Err(SelectionRefusal::ProviderUnavailable {
                 provider: provider.to_owned(),
@@ -787,7 +810,12 @@ impl ModelSelectionAuthority {
             .map(str::trim)
             .filter(|provider| !provider.is_empty());
         match (model, provider) {
-            (None, None) => Ok((parent_provider.to_owned(), parent_model.to_owned())),
+            (None, None) => {
+                // The factory validates the inherited account route at
+                // pickup. Only provider removal is independent of that route.
+                self.registered_provider(parent_provider)?;
+                Ok((parent_provider.to_owned(), parent_model.to_owned()))
+            }
             (None, Some(_)) => Err(SelectionRefusal::InvalidSelector {
                 message: "spawn_subagent `provider` only disambiguates a `model` — name the model"
                     .to_owned(),
@@ -842,17 +870,15 @@ impl ModelSelectionAuthority {
     }
 
     fn child_matching_rows(&self, matches_model: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+        let matches_model = &matches_model;
         self.summaries
             .iter()
-            .filter(|summary| {
-                matches!(summary.availability, ProviderAvailabilityWire::Available)
-                    && self.provider_is_creatable(&summary.provider)
-            })
+            .filter(|summary| self.provider_is_creatable(&summary.provider))
             .flat_map(|summary| {
                 summary
                     .models
                     .iter()
-                    .filter(|known| matches_model(known))
+                    .filter(move |known| summary.model_is_selectable(known) && matches_model(known))
                     .map(move |known| (summary.provider.clone(), known.clone()))
             })
             .collect()

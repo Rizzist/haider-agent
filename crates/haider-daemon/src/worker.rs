@@ -480,7 +480,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
                 .map_err(hub_error)?
                 .and_then(|facade| facade.management.read())
                 .map_or_else(Vec::new, |view| view.providers);
-            if !crate::model_select::ModelSelectionAuthority::new(None, summaries)
+            if !crate::model_select::ModelSelectionAuthority::new(None, Some(summaries))
                 .catalog_key_is_current(&switch.to_provider, key)
             {
                 return Err(HaiderError::new(
@@ -22353,7 +22353,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .and_then(|facade| facade.management.read())
                 .map(|view| view.providers)
                 .unwrap_or_default();
-            let mut page = crate::model_select::ModelSelectionAuthority::new(None, summaries)
+            let mut page = crate::model_select::ModelSelectionAuthority::new(None, Some(summaries))
                 .model_catalog(filter.as_deref(), usize::MAX);
             let cap = haider_tools::LIST_MODELS_ROW_CAP;
             let truncated = page.models.len() > cap;

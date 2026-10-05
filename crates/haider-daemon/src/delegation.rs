@@ -420,9 +420,13 @@ impl DelegationHandle {
                     false,
                 )
             })?
-            .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
-            .unwrap_or_default();
+            .map(|facade| {
+                facade
+                    .management
+                    .read()
+                    .map(|view| view.providers)
+                    .unwrap_or_default()
+            });
         let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
         Ok(authority
             .resolve_child_selector(

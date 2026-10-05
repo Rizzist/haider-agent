@@ -16555,7 +16555,7 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
             "explicit configured models must not become fetched inventory"
         );
         let view = management.read().expect("published management");
-        let catalog = crate::model_select::ModelSelectionAuthority::new(None, view.providers)
+        let catalog = crate::model_select::ModelSelectionAuthority::new(None, Some(view.providers))
             .model_catalog(Some("customprov-confirm"), 50);
         assert_eq!(catalog.models.len(), ids.len());
         assert!(
@@ -17662,7 +17662,7 @@ fn management_read_ages_configured_admission_without_rewriting_the_published_lis
     assert_eq!(view.revision, 7);
     assert!(view.providers[0].model_is_selectable("deployment"));
     assert!(
-        crate::model_select::ModelSelectionAuthority::new(None, view.providers)
+        crate::model_select::ModelSelectionAuthority::new(None, Some(view.providers))
             .validate_selection_with_status("work", None, "deployment")
             .is_ok()
     );
@@ -18312,7 +18312,7 @@ async fn stale_catalog_refreshes_in_background_without_refusing_existing_admissi
             .find(|row| row.provider == "work")
             .expect("work");
         assert!(
-            crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]))
                 .validate_selection_with_status("work", None, "deployment")
                 .is_ok(),
             "new session is admitted too"
@@ -18430,7 +18430,7 @@ fn daemon_turn_and_new_session_admission_agree_across_configured_provider_kinds(
                 "{catalog:?} {inventory:?}"
             );
             assert_eq!(
-                crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]))
                     .validate_selection_with_status("synthetic", None, "deployment")
                     .is_ok(),
                 available

@@ -8485,7 +8485,7 @@ impl HubConnection {
                     .map(|model| {
                         let key = crate::model_select::ModelSelectionAuthority::new(
                             None,
-                            vec![summary.clone()],
+                            Some(vec![summary.clone()]),
                         )
                         .model_catalog_key(provider, &model);
                         (model, key)
@@ -12166,9 +12166,9 @@ impl HubConnection {
                 None,
             );
         };
-        let (mut summaries, descriptors) = self
-            .hub
-            .accounts()?
+        let facade = self.hub.accounts()?;
+        let (mut summaries, descriptors) = facade
+            .as_ref()
             .and_then(|facade| facade.management.read())
             .map_or_else(
                 || (Vec::new(), Vec::new()),
@@ -12197,7 +12197,7 @@ impl HubConnection {
         }
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
-            summaries,
+            facade.as_ref().map(|_| summaries),
         )
         .scoped_to_session_route(&current, selected_provider);
         if expected_catalog_key
@@ -14808,12 +14808,13 @@ impl HubConnection {
     fn tuning_authority(
         &self,
     ) -> Result<crate::model_select::ModelSelectionAuthority, SessionHubError> {
-        let summaries = self
-            .hub
-            .accounts()?
-            .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
-            .unwrap_or_default();
+        let summaries = self.hub.accounts()?.map(|facade| {
+            facade
+                .management
+                .read()
+                .map(|view| view.providers)
+                .unwrap_or_default()
+        });
         Ok(crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             summaries,
@@ -16868,9 +16869,9 @@ impl HubConnection {
                 None,
             );
         }
-        let mut summaries = self
-            .hub
-            .accounts()?
+        let facade = self.hub.accounts()?;
+        let mut summaries = facade
+            .as_ref()
             .and_then(|facade| facade.management.read())
             .map_or_else(Vec::new, |view| view.providers);
         match self
@@ -16889,7 +16890,10 @@ impl HubConnection {
                 );
             }
         }
-        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        let authority = crate::model_select::ModelSelectionAuthority::new(
+            creatable,
+            facade.as_ref().map(|_| summaries),
+        );
         if [expected_catalog_key.as_ref(), resolved_catalog_key.as_ref()]
             .into_iter()
             .flatten()

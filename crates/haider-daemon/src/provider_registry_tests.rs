@@ -76,7 +76,8 @@ fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
             .map_or("fixture-model", String::as_str)
             .to_owned();
         let has_known_models = summary.has_known_models();
-        let authority = crate::model_select::ModelSelectionAuthority::new(None, vec![summary]);
+        let authority =
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]));
         let selection = authority.validate_selection_with_status(provider, None, &model);
         assert!(selection.is_ok(), "{provider}: {selection:?}");
         if has_known_models {
@@ -2386,7 +2387,7 @@ fn configured_deployments_are_selectable_only_after_success_or_unsupported_disco
         let summary = registry.summary("azure-test", &|_| true).expect("summary");
         assert_eq!(summary.models, ["my-deployment"]);
         let authority =
-            crate::model_select::ModelSelectionAuthority::new(None, vec![summary.clone()]);
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary.clone()]));
         assert_eq!(
             authority
                 .validate_selection_with_status("azure-test", None, "my-deployment")
@@ -2460,7 +2461,7 @@ fn configured_deployments_are_selectable_only_after_success_or_unsupported_disco
             .is_ok()
     );
     assert!(
-        crate::model_select::ModelSelectionAuthority::new(None, vec![failed])
+        crate::model_select::ModelSelectionAuthority::new(None, Some(vec![failed]))
             .validate_selection_with_status("azure-test", None, "my-deployment")
             .is_ok()
     );
@@ -2776,7 +2777,7 @@ fn configured_availability_retains_stale_success_and_rejects_negative_evidence()
                 expected
             );
             assert_eq!(
-                crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]))
                     .validate_selection_with_status("work", None, "deployment")
                     .is_ok(),
                 expected
@@ -2864,14 +2865,15 @@ fn aged_snapshot_admits_configured_model_before_the_next_registry_publication() 
         .expect("registry");
         let mut summary = registry.summary("work", &|_| true).expect("fresh summary");
         summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 100 };
-        let fresh = crate::model_select::ModelSelectionAuthority::new(None, vec![summary.clone()]);
+        let fresh =
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary.clone()]));
         assert!(
             fresh
                 .validate_selection_with_status("work", None, "deployment")
                 .is_err()
         );
         summary.project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[]);
-        let aged = crate::model_select::ModelSelectionAuthority::new(None, vec![summary]);
+        let aged = crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]));
         assert!(
             aged.validate_selection_with_status("work", None, "deployment")
                 .is_ok()
@@ -2937,7 +2939,7 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
                 "{provider}: {summary:?}"
             );
             assert_eq!(
-                crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]))
                     .validate_selection_with_status(provider, None, "deployment")
                     .is_ok(),
                 expected,
@@ -3186,7 +3188,7 @@ fn unsupported_adapters_accept_explicit_models_without_fabricating_inventory() {
                 .contains("configured (unverified)")
         );
         assert!(
-            crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]))
                 .validate_selection_with_status(provider, None, "synthetic-explicit-model")
                 .is_ok()
         );

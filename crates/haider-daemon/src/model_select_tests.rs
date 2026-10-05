@@ -55,7 +55,7 @@ fn authority(
     creatable_providers: &[&str],
     summaries: Vec<ProviderSummaryWire>,
 ) -> ModelSelectionAuthority {
-    ModelSelectionAuthority::new(creatable(creatable_providers), summaries)
+    ModelSelectionAuthority::new(creatable(creatable_providers), Some(summaries))
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn selection_derives_limits_when_inventory_details_are_incomplete() {
     assert_eq!(selection.context_window, Some(1_000_000));
     assert_eq!(selection.max_output_tokens, 128_000);
 
-    let selection = authority(&["custom"], Vec::new())
+    let selection = ModelSelectionAuthority::new(creatable(&["custom"]), None)
         .validate_selection_with_status("custom", None, "future-model")
         .expect("unknown inventory permits passthrough");
     assert!(selection.max_output_tokens > 4_096);
@@ -110,7 +110,7 @@ fn absent_provider_selects_within_the_current_provider() {
 /// is not creatable is a typed refusal, and the copy speaks model selection.
 #[test]
 fn uncreatable_provider_is_refused_typed() {
-    let authority = authority(&["openai"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), None);
     let refusal = authority
         .validate_selection("openai", Some("frontier-imaginary"), "some-model")
         .expect_err("uncreatable provider must refuse");
@@ -225,7 +225,7 @@ fn model_unknown_carries_inventory_age_when_fetch_time_is_known() {
 /// errors surface at turn time, never a guessed refusal.
 #[test]
 fn unknown_inventory_accepts_honestly() {
-    let authority = authority(&["openai", "anthropic-oauth"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai", "anthropic-oauth"]), None);
     assert_eq!(
         authority.validate_selection("openai", Some("anthropic-oauth"), "fable-5"),
         Ok(("anthropic-oauth".to_owned(), "fable-5".to_owned()))
@@ -236,7 +236,7 @@ fn unknown_inventory_accepts_honestly() {
 /// creatability — the session already runs it (explicit == absent).
 #[test]
 fn current_provider_rows_skip_creatability() {
-    let authority = ModelSelectionAuthority::new(None, Vec::new());
+    let authority = ModelSelectionAuthority::new(None, None);
     assert_eq!(
         authority.validate_selection("fake", Some("fake"), "fake-model-2"),
         Ok(("fake".to_owned(), "fake-model-2".to_owned()))
@@ -244,6 +244,103 @@ fn current_provider_rows_skip_creatability() {
     assert_eq!(
         authority.validate_selection("fake", None, "fake-model-2"),
         Ok(("fake".to_owned(), "fake-model-2".to_owned()))
+    );
+}
+
+#[test]
+fn missing_provider_in_a_registered_snapshot_is_unavailable() {
+    let healthy = summary("healthy", &["m-one"], ProviderAvailabilityWire::Available);
+    for rows in [Vec::new(), vec![healthy.clone()]] {
+        // Even a factory declaration cannot supply a row removed from an
+        // installed management registry. Test empty and nonempty registries.
+        let authority = ModelSelectionAuthority::new(creatable(&["ghost", "healthy"]), Some(rows));
+        for requested in [None, Some("ghost")] {
+            assert!(matches!(
+                authority.validate_selection("ghost", requested, "m-one"),
+                Err(SelectionRefusal::ProviderUnavailable { provider, .. }) if provider == "ghost"
+            ));
+        }
+        for (model, provider) in [(None, None), (Some("m-one"), Some("ghost"))] {
+            assert!(matches!(
+                authority.resolve_child_selector("ghost", "m-one", model, provider),
+                Err(SelectionRefusal::ProviderUnavailable { provider, .. }) if provider == "ghost"
+            ));
+        }
+    }
+    // A factory-only caller has no management registry to prove removal.
+    let factory = ModelSelectionAuthority::new(creatable(&["ghost"]), None);
+    assert!(factory.validate_selection("ghost", None, "m-one").is_ok());
+    assert!(
+        factory
+            .validate_selection("other", Some("ghost"), "m-one")
+            .is_ok()
+    );
+    assert_eq!(
+        factory.resolve_child_selector("ghost", "m-one", None, None),
+        Ok(("ghost".into(), "m-one".into()))
+    );
+    // An existing provider with unknown inventory remains distinct from a
+    // missing provider, and a removed parent can select a healthy target.
+    let mut unknown = summary("ghost", &[], ProviderAvailabilityWire::Available);
+    unknown.inventory = haider_rpc::ModelInventoryWire::NeverFetched;
+    unknown.catalog = haider_rpc::ProviderCatalogKindWire::Adapter;
+    let present = ModelSelectionAuthority::new(None, Some(vec![unknown]));
+    assert!(present.validate_selection("ghost", None, "m-one").is_ok());
+    assert!(
+        present
+            .resolve_child_selector("ghost", "m-one", None, None)
+            .is_ok()
+    );
+    let rescue = ModelSelectionAuthority::new(creatable(&["healthy"]), Some(vec![healthy]));
+    assert_eq!(
+        rescue.validate_selection("ghost", Some("healthy"), "m-one"),
+        Ok(("healthy".into(), "m-one".into()))
+    );
+}
+
+#[test]
+fn child_selection_filters_unavailable_parent_inventory() {
+    for disabled in [false, true] {
+        let mut parent = summary(
+            "parent",
+            &["target"],
+            if disabled {
+                ProviderAvailabilityWire::Available
+            } else {
+                ProviderAvailabilityWire::Unavailable
+            },
+        );
+        parent.enabled = !disabled;
+        let healthy = summary("healthy", &["target"], ProviderAvailabilityWire::Available);
+        let authority = ModelSelectionAuthority::new(
+            creatable(&["parent", "healthy"]),
+            Some(vec![parent.clone(), healthy]),
+        );
+        for model in ["target", "tar-get"] {
+            assert_eq!(
+                authority.resolve_child_selector("parent", "target", Some(model), None),
+                Ok(("healthy".into(), "target".into()))
+            );
+        }
+        assert_eq!(
+            authority.resolve_child_selector("parent", "target", None, None),
+            Ok(("parent".into(), "target".into()))
+        );
+        let alone = ModelSelectionAuthority::new(creatable(&["parent"]), Some(vec![parent]));
+        assert!(matches!(
+            alone.resolve_child_selector("parent", "target", Some("target"), None),
+            Err(SelectionRefusal::ModelNotResolvable { .. })
+        ));
+    }
+    let mut parent = summary("parent", &["target"], ProviderAvailabilityWire::Available);
+    parent.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "refresh due".into(),
+    };
+    let healthy = ModelSelectionAuthority::new(None, Some(vec![parent]));
+    assert_eq!(
+        healthy.resolve_child_selector("parent", "target", None, None),
+        Ok(("parent".into(), "target".into()))
     );
 }
 
@@ -261,7 +358,7 @@ fn enabled_custom_openai_and_anthropic_profiles_are_creatable() {
             ProviderAvailabilityWire::Available,
         );
         custom.api_family = family;
-        let authority = ModelSelectionAuthority::new(creatable(&["openai"]), vec![custom]);
+        let authority = ModelSelectionAuthority::new(creatable(&["openai"]), Some(vec![custom]));
         assert_eq!(
             authority.validate_selection("openai", Some("my-endpoint"), "local-model"),
             Ok(("my-endpoint".to_owned(), "local-model".to_owned()))
@@ -272,7 +369,7 @@ fn enabled_custom_openai_and_anthropic_profiles_are_creatable() {
 /// An empty model is a malformed selector, not a lookup.
 #[test]
 fn empty_model_is_an_invalid_selector() {
-    let authority = authority(&["openai"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), None);
     assert!(matches!(
         authority.validate_selection("openai", None, "  "),
         Err(SelectionRefusal::InvalidSelector { .. })
@@ -369,7 +466,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
 /// a mid-session pair switch — is pinned in `pair_switch_runtime_tests.rs`.
 #[test]
 fn absent_selector_inherits_the_parents_current_pair() {
-    let authority = authority(&["openai"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), None);
     assert_eq!(
         authority.resolve_child_selector("anthropic-oauth", "fable-5", None, None),
         Ok(("anthropic-oauth".to_owned(), "fable-5".to_owned()))
@@ -582,7 +679,7 @@ fn near_match_ranking_is_nearest_first_capped_and_empty_inventory_safe() {
     assert_eq!(suggestions.len(), 5);
     assert_eq!(suggestions[0], "glm-4.7-flashx · haider-code");
 
-    let empty = authority(&["openai"], Vec::new())
+    let empty = ModelSelectionAuthority::new(creatable(&["openai"]), None)
         .resolve_child_selector("openai", "gpt-a", Some("anything"), None)
         .expect_err("empty inventory refuses honestly");
     assert!(matches!(
@@ -697,7 +794,7 @@ fn explicit_pair_validates_like_a_live_selection() {
 /// MODEL; the provider only disambiguates it.
 #[test]
 fn provider_without_model_is_an_invalid_selector() {
-    let authority = authority(&["openai"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), None);
     assert!(matches!(
         authority.resolve_child_selector("openai", "gpt-a", None, Some("openai")),
         Err(SelectionRefusal::InvalidSelector { .. })
@@ -718,7 +815,8 @@ fn provider_without_model_is_an_invalid_selector() {
 /// them (the fast half). Expected RUNTIME failure: the named assertions.
 #[test]
 fn le_bedrock_and_vertex_pairs_validate_effort_but_refuse_fast() {
-    let authority = authority(&["bedrock", "vertex", "anthropic"], Vec::new());
+    let authority =
+        ModelSelectionAuthority::new(creatable(&["bedrock", "vertex", "anthropic"]), None);
     authority
         .validate_effort("bedrock", "anthropic.claude-opus-5", Some("xhigh"))
         .expect("normalized bedrock spelling resolves the opus-5 ladder");

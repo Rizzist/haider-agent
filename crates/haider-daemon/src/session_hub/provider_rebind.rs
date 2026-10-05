@@ -124,7 +124,7 @@ impl HubConnection {
         };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
-            view.providers.clone(),
+            Some(view.providers.clone()),
         );
         if let Err(refusal) = authority.validate_selection_with_status(
             &current.provider,

@@ -240,7 +240,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         {
             crate::model_select::ModelSelectionAuthority::new(
                 self.store.hub().creatable_providers().map_err(hub_error)?,
-                view.providers,
+                Some(view.providers),
             )
             .validate_selection_with_status(
                 &previous.provider,

@@ -11045,7 +11045,7 @@ impl AccountsProviderFactory {
         haider_protocol::output_budget::SessionOutputBudgetV1,
     )> {
         let authority =
-            crate::model_select::ModelSelectionAuthority::new(None, vec![profile.clone()]);
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![profile.clone()]));
         // Automatic routing has already checked target availability and credentials.
         let selection = authority
             .validate_selection_with_status(&profile.provider, None, model)
@@ -11202,7 +11202,10 @@ impl AccountsProviderFactory {
         if !remote_authority {
             return Ok(());
         }
-        let authority = crate::model_select::ModelSelectionAuthority::new(None, summaries);
+        let authority = crate::model_select::ModelSelectionAuthority::new(
+            None,
+            self.management.as_ref().map(|_| summaries),
+        );
         let selection = authority
             .validate_selection_with_status(&metadata.provider, None, &metadata.model)
             .and_then(|selection| {
