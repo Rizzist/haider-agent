@@ -4080,12 +4080,14 @@ impl LiveDriver {
                     }
                 }
                 model.accounts.revision = Some(revision);
-                model.accounts.message = Some(match replacement_active_alias {
-                    Some(active) => {
-                        format!("removed `{removed_alias}` · active → `{active}`")
-                    }
-                    None => format!("removed `{removed_alias}`"),
-                });
+                model
+                    .accounts
+                    .set_message(Some(match replacement_active_alias {
+                        Some(active) => {
+                            format!("removed `{removed_alias}` · active → `{active}`")
+                        }
+                        None => format!("removed `{removed_alias}`"),
+                    }));
                 model.dirty = true;
                 vec![LiveCommand::AccountList, LiveCommand::ProviderList]
             }
@@ -4552,12 +4554,12 @@ impl LiveDriver {
                 } else {
                     "imported"
                 };
-                model.accounts.message = Some(format!(
+                model.accounts.set_message(Some(format!(
                     "✓ {action} {} → {} · {}",
                     descriptor.provider,
                     descriptor.alias,
                     crate::format::mask_identity(&descriptor.identity)
-                ));
+                )));
                 model.dirty = true;
                 vec![
                     LiveCommand::AccountList,
@@ -5296,7 +5298,9 @@ impl LiveDriver {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.accounts.message = Some(format!("`{alias}` not removed — {message}"));
+                    model
+                        .accounts
+                        .set_message(Some(format!("`{alias}` not removed — {message}")));
                     model.dirty = true;
                     return Vec::new();
                 }
@@ -5312,7 +5316,9 @@ impl LiveDriver {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.accounts.message = Some(format!("✗ import failed — {message}"));
+                    model
+                        .accounts
+                        .set_message(Some(format!("✗ import failed — {message}")));
                     model.dirty = true;
                     return Vec::new();
                 }

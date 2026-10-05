@@ -3234,7 +3234,10 @@ fn render_accounts(
     // The body line the row cursor sits on, for the follow latch.
     let mut cursor_line: Option<usize> = None;
 
-    lines.push(Line::from(vec![
+    // Action feedback is pinned separately from the scrolling roster so it
+    // remains visible even when the selected account is at the bottom.
+    let mut notice_lines = Vec::new();
+    notice_lines.push(Line::from(vec![
         Span::styled(
             "ACCOUNTS",
             theme
@@ -3246,10 +3249,7 @@ fn render_accounts(
             theme.dim_style(),
         ),
     ]));
-    // The action note rides under the head — EXCEPT while the 971 F1(b)
-    // replace confirm is up: that one line belongs beside the form it is
-    // asking about, down in the card block, not at the top of a body the
-    // reader has scrolled away from.
+    // Replacement confirmation still belongs beside its owning form.
     if let Some(message) = model
         .accounts
         .message
@@ -3262,7 +3262,7 @@ fn render_accounts(
         // One column stays free for the `⋮` scroll gutter.
         let width = usize::from(area.width.saturating_sub(1)).max(1);
         for chunk in wrap_words(message, width) {
-            lines.push(Line::styled(chunk, theme.gold_style()));
+            notice_lines.push(Line::styled(chunk, theme.gold_style()));
         }
     }
     // 970 owner decision: `google-antigravity` ships ENABLED BY DEFAULT with
@@ -3686,7 +3686,13 @@ fn render_accounts(
         theme.faint_style(),
     );
     let band = bottom_band(model, theme, frame, area, BandHeights::new(1, 1, 1), hits);
-    let inner = band.content;
+    let notice_height = u16::try_from(notice_lines.len())
+        .unwrap_or(u16::MAX)
+        .min(band.content.height.saturating_sub(1));
+    let [notice_area, inner] =
+        Layout::vertical([Constraint::Length(notice_height), Constraint::Min(0)])
+            .areas(band.content);
+    frame.render_widget(Paragraph::new(notice_lines), notice_area);
     // The pin ladder INSIDE the band's content. Everything is pinned while
     // the roster still gets a few rows; under pressure the pending FORM
     // unpins first (the scroll body keeps it in view by itself, below), then

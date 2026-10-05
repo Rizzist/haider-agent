@@ -8275,12 +8275,12 @@ async fn handle_oauth_import_heal(
         return Ok(OAuthImportHealResult::NotImported);
     }
     let receipts = store.account_add_receipts().await?;
-    let latest = latest_oauth_receipt_identities(&receipts);
+    let latest = latest_oauth_receipt_identities(&receipts)?;
     let Some((_, OAuthReceiptIdentity::Import(identity))) = latest.get(descriptor.alias.as_str())
     else {
         return Ok(OAuthImportHealResult::NotImported);
     };
-    if identity.alias != descriptor.alias.as_str() || identity.provider != descriptor.provider {
+    if identity.provider != descriptor.provider {
         return Ok(OAuthImportHealResult::NotImported);
     }
     // Preserve import provenance: an error must stop healing/refresh rather
@@ -9209,21 +9209,21 @@ async fn select_oauth_import_alias(
     // descriptor still belongs to that source: the alias may have been
     // removed and later reused by a loopback OAuth add. The latest committed
     // account.add revision for each alias is the incarnation authority.
-    let mut prior_aliases = latest_oauth_receipt_identities(&receipts)
-        .into_values()
-        .filter_map(|(_, identity)| match identity {
+    let mut prior_aliases = latest_oauth_receipt_identities(&receipts)?
+        .into_iter()
+        .filter_map(|(alias, (_, identity))| match identity {
             OAuthReceiptIdentity::Import(identity)
                 if identity.source == source
                     && identity.provider == provider
-                    && !is_probe_account_alias(&identity.alias)
+                    && !is_probe_account_alias(&alias)
                     && accounts
-                        .get(&CredentialAlias::new(&identity.alias))
+                        .get(&CredentialAlias::new(&alias))
                         .is_some_and(|descriptor| {
                             descriptor.provider == provider
                                 && descriptor.auth_method == AuthMethod::OAuth
                         }) =>
             {
-                Some(identity.alias)
+                Some(alias)
             }
             OAuthReceiptIdentity::Import(_) | OAuthReceiptIdentity::Add(_) => None,
         })
@@ -9251,7 +9251,7 @@ async fn select_oauth_import_alias(
 
 fn latest_oauth_receipt_identities(
     receipts: &[haider_core::AccountAddReceiptRow],
-) -> HashMap<String, (u64, OAuthReceiptIdentity)> {
+) -> Result<HashMap<String, (u64, OAuthReceiptIdentity)>, HaiderError> {
     let mut latest_by_alias = HashMap::new();
     for row in receipts.iter().filter(|row| row.state == "committed") {
         let (Some(revision), Ok(identity)) = (
@@ -9260,7 +9260,11 @@ fn latest_oauth_receipt_identities(
         ) else {
             continue;
         };
-        let alias = identity.alias().to_owned();
+        let alias = committed_oauth_response(row, &identity)?
+            .descriptor
+            .alias
+            .as_str()
+            .to_owned();
         if latest_by_alias
             .get(&alias)
             .is_none_or(|(current, _)| revision > *current)
@@ -9268,7 +9272,43 @@ fn latest_oauth_receipt_identities(
             latest_by_alias.insert(alias, (revision, identity));
         }
     }
-    latest_by_alias
+    Ok(latest_by_alias)
+}
+
+/// The request records command coordinates; identity matching may save to a
+/// different alias. The committed response is the durable write authority,
+/// including receipts persisted by builds that requested a phantom alias.
+fn committed_oauth_response(
+    row: &AccountAddReceiptRow,
+    identity: &OAuthReceiptIdentity,
+) -> Result<AccountAddReceiptResponse, HaiderError> {
+    let response: AccountAddReceiptResponse = row
+        .response_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "committed OAuth account receipt {} has no decodable response",
+                    row.command_id
+                ),
+                false,
+            )
+        })?;
+    if response.descriptor.provider != identity.provider()
+        || response.descriptor.auth_method != AuthMethod::OAuth
+    {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!(
+                "committed OAuth account receipt {} has mismatched response coordinates",
+                row.command_id
+            ),
+            false,
+        ));
+    }
+    Ok(response)
 }
 
 async fn alias_has_pending_login_reservation(
@@ -12536,7 +12576,11 @@ async fn durable_account_heads_from(
         };
         record_durable_account_head(
             &mut heads,
-            identity.alias().to_owned(),
+            committed_oauth_response(row, &identity)?
+                .descriptor
+                .alias
+                .as_str()
+                .to_owned(),
             DurableAccountHead {
                 command_id: row.command_id.clone(),
                 revision,
@@ -12783,32 +12827,25 @@ async fn reconcile_oauth_add_receipts_from(
         let provider = identity.provider().to_owned();
         let alias = CredentialAlias::new(identity.alias());
         let is_import = matches!(identity, OAuthReceiptIdentity::Import(_));
-        if reserved.contains(alias.as_str()) {
+        // Pending/staged receipts still use the request and staged bundle.
+        // Only a committed response proves where the write landed.
+        if row.state == "pending" && reserved.contains(alias.as_str()) {
             continue;
         }
         match row.state.as_str() {
             "committed" => {
+                let response = committed_oauth_response(row, &identity)?;
+                let alias = &response.descriptor.alias;
+                if reserved.contains(alias.as_str()) {
+                    continue;
+                }
                 if !durable_heads.get(alias.as_str()).is_some_and(|head| {
                     head.mutation == DurableAccountMutation::Add
                         && head.command_id == row.command_id
                 }) {
                     continue;
                 }
-                let response: AccountAddReceiptResponse = row
-                    .response_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok())
-                    .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            format!(
-                                "committed OAuth account receipt {} has no response",
-                                row.command_id
-                            ),
-                            false,
-                        )
-                    })?;
-                if accounts.get(&alias).is_none() {
+                if accounts.get(alias).is_none() {
                     let mut descriptor = response.descriptor;
                     descriptor.active =
                         accounts.active_for_provider(&descriptor.provider).is_none();

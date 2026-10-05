@@ -18725,3 +18725,465 @@ async fn v2_fake_oauth_mode_refuses_claude_import_adoption_and_heal() {
     assert_eq!(oauth_import_read_count(), 0, "no import file was read");
     store.close().await.expect("close store");
 }
+
+/// Historical receipts intentionally retain the old request coordinates.
+/// No migration or future-write change can substitute for reading the saved alias.
+async fn a18_commit_oauth_receipt(
+    store: &SqliteStoreHandle,
+    command: &str,
+    requested: &str,
+    descriptor: CredentialDescriptor,
+    source: Option<&str>,
+) {
+    let request = match source {
+        Some(source) => OAuthImportIdentity {
+            source: source.into(),
+            alias: requested.into(),
+            provider: descriptor.provider.clone(),
+            candidate: None,
+        }
+        .canonical_json()
+        .expect("import coordinates"),
+        None => OAuthAddIdentity {
+            provider: descriptor.provider.clone(),
+            display_alias: requested.into(),
+            physical_alias: requested.into(),
+            auth_method: "oauth".into(),
+        }
+        .canonical_json()
+        .expect("add coordinates"),
+    };
+    store
+        .account_add_claim_receipt(
+            command.into(),
+            blake3::hash(request.as_bytes()).to_hex().to_string(),
+            request,
+        )
+        .await
+        .expect("claim historical receipt");
+    store
+        .finalize_account_add_receipt(command.into(), AccountAddReceiptResponse { descriptor })
+        .await
+        .expect("commit historical response");
+}
+
+fn a18_descriptor(alias: &str, provider: &str, identity: &str) -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: CredentialAlias::new(alias),
+        provider: provider.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: identity.into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(stable_test_identity(identity, Some(identity))),
+        created_at_ms: Some(1),
+    }
+}
+
+#[tokio::test]
+async fn a18_immediate_restart_after_fresh_identity_dedup_preserves_one_account() {
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let vault = Arc::new(MemoryVault::new());
+        let (mut actor, snapshot, _) = start_oauth_import_test_actor(
+            &store,
+            Arc::clone(&vault),
+            HashSet::new(),
+            RefreshFenceRegistry::default(),
+        );
+        let commands = actor.commands();
+        let (sink, mut frames) = channel_sink();
+        for (command, requested) in [("a18-first", "saved"), ("a18-dedup", "phantom")] {
+            let bundle = if provider == OPENAI_OAUTH_PROVIDER_NAME {
+                openai_import_test_bundle(command.as_bytes(), b"synthetic-refresh", 1)
+                    .with_account_identity(stable_test_identity(
+                        "same@example.test",
+                        Some("user:1:a;workspace:4:team"),
+                    ))
+            } else {
+                claude_relogin_bundle(command.as_bytes(), "account=a;organization=o", u64::MAX - 1)
+            };
+            commands
+                .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+                    command_id: command.into(),
+                    provider: provider.into(),
+                    display_alias: requested.into(),
+                    claim: Some(OAuthReadyClaim::for_account_test(
+                        provider, requested, bundle,
+                    )),
+                    route: LoginRoute {
+                        request_id: RequestId::new(command),
+                        sink: Arc::clone(&sink),
+                    },
+                })))
+                .await
+                .expect("send fresh login");
+            let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+                .await
+                .expect("login deadline")
+                .expect("login response");
+            let WireFrame::Response {
+                body: ResponseBody::AccountAdd { descriptor: saved },
+                ..
+            } = frame
+            else {
+                panic!("unexpected response: {frame:?}");
+            };
+            assert_eq!(saved.alias.as_str(), "saved");
+        }
+        actor.shutdown().await;
+        let mut restarted = memory_accounts();
+        for descriptor in snapshot.lock().expect("rows").iter().cloned() {
+            restarted.add(descriptor).expect("existing projection");
+        }
+        reconcile_oauth_add_receipts(
+            &store,
+            &mut restarted,
+            &VaultProvision::Available(vault as Arc<dyn Vault>),
+        )
+        .await
+        .expect("immediate restart must not add the saved alias twice");
+        assert_eq!(restarted.list().len(), 1);
+        assert_eq!(restarted.list()[0].alias.as_str(), "saved");
+        store.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn a18_historical_retarget_recovery_uses_saved_alias_in_every_projection_state() {
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        for (request_present, saved_present) in
+            [(false, true), (true, false), (false, false), (true, true)]
+        {
+            let dir = test_store_dir();
+            let store = open_store(dir.path()).await;
+            let saved = a18_descriptor("saved", provider, "latest identity");
+            a18_commit_oauth_receipt(&store, "old-format", "requested", saved.clone(), None).await;
+            let mut accounts = memory_accounts();
+            if request_present {
+                accounts
+                    .add(a18_descriptor("requested", provider, "untouched identity"))
+                    .expect("requested row");
+            }
+            if saved_present {
+                accounts.add(saved.clone()).expect("saved row");
+            }
+            let heads = durable_account_heads(&store)
+                .await
+                .expect("lifecycle heads");
+            assert_eq!(heads["saved"].command_id, "old-format");
+            assert!(
+                !heads.contains_key("requested"),
+                "request is not a lifecycle write"
+            );
+            reconcile_oauth_add_receipts(
+                &store,
+                &mut accounts,
+                &VaultProvision::Available(Arc::new(MemoryVault::new())),
+            )
+            .await
+            .expect("recover committed response");
+            assert_eq!(accounts.list().len(), 1 + usize::from(request_present));
+            assert_eq!(
+                accounts
+                    .get(&CredentialAlias::new("saved"))
+                    .expect("saved row")
+                    .identity,
+                "latest identity"
+            );
+            if request_present {
+                assert_eq!(
+                    accounts
+                        .get(&CredentialAlias::new("requested"))
+                        .expect("untouched request")
+                        .identity,
+                    "untouched identity"
+                );
+                if !saved_present {
+                    assert!(
+                        !accounts
+                            .get(&CredentialAlias::new("saved"))
+                            .expect("recovered row")
+                            .active,
+                        "healing does not steal active"
+                    );
+                }
+            }
+            // Reserving the unused request does not fence recovery of the saved alias.
+            let rows = DurableAccountReceiptRows::load(&store).await.expect("rows");
+            let mut missing = memory_accounts();
+            reconcile_oauth_add_receipts_from(
+                &store,
+                &mut missing,
+                &VaultProvision::Available(Arc::new(MemoryVault::new())),
+                &rows.oauth_add,
+                &heads,
+                &HashSet::from(["requested".into()]),
+            )
+            .await
+            .expect("request reservation is unrelated");
+            assert!(missing.get(&CredentialAlias::new("saved")).is_some());
+            let mut reserved = memory_accounts();
+            reconcile_oauth_add_receipts_from(
+                &store,
+                &mut reserved,
+                &VaultProvision::Available(Arc::new(MemoryVault::new())),
+                &rows.oauth_add,
+                &heads,
+                &HashSet::from(["saved".into()]),
+            )
+            .await
+            .expect("saved alias reserved");
+            assert!(reserved.list().is_empty());
+            store.close().await.expect("close");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a18_retargeted_adds_obey_tombstones_and_explicit_alias_reuse() {
+    for neighbor in [false, true] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let provider = ANTHROPIC_OAUTH_PROVIDER_NAME;
+        a18_commit_oauth_receipt(
+            &store,
+            "first-a",
+            "a",
+            a18_descriptor("a", provider, "A"),
+            None,
+        )
+        .await;
+        if neighbor {
+            a18_commit_oauth_receipt(
+                &store,
+                "first-b",
+                "b",
+                a18_descriptor("b", provider, "B"),
+                None,
+            )
+            .await;
+        }
+        a18_commit_oauth_receipt(
+            &store,
+            "dedup-a",
+            "phantom",
+            a18_descriptor("a", provider, "A refreshed"),
+            None,
+        )
+        .await;
+        let revision = store.management_revision().await.expect("revision");
+        let remove_identity = RemoveIdentity {
+            alias: "a".into(),
+            expected_revision: Some(revision),
+        };
+        let (json, digest) = command_json(&remove_identity).expect("remove coordinates");
+        store
+            .account_remove_claim_receipt::<RemoveReceipt>(
+                "remove-a".into(),
+                digest,
+                json,
+                serde_json::to_string(&RemoveRecovery {
+                    provider: provider.into(),
+                    was_active: true,
+                })
+                .expect("recovery"),
+                Some(revision),
+                "a".into(),
+                provider.into(),
+                true,
+            )
+            .await
+            .expect("claim remove");
+        store
+            .finalize_account_remove_receipt(
+                "remove-a".into(),
+                RemoveReceipt {
+                    removed_alias: CredentialAlias::new("a"),
+                    replacement_active_alias: neighbor.then(|| CredentialAlias::new("b")),
+                },
+            )
+            .await
+            .expect("remove tombstone");
+        for reuse in [false, true] {
+            if reuse {
+                a18_commit_oauth_receipt(
+                    &store,
+                    "reuse-a",
+                    "a",
+                    a18_descriptor("a", provider, "C reused alias"),
+                    None,
+                )
+                .await;
+                // Another dedup after explicit reuse must outrank the original tombstone.
+                a18_commit_oauth_receipt(
+                    &store,
+                    "dedup-c",
+                    "phantom",
+                    a18_descriptor("a", provider, "C latest"),
+                    None,
+                )
+                .await;
+            }
+            let mut accounts = memory_accounts();
+            let provision = VaultProvision::Available(Arc::new(MemoryVault::new()));
+            reconcile_remove_receipts(&store, &mut accounts, &provision)
+                .await
+                .expect("remove recovery");
+            reconcile_oauth_add_receipts(&store, &mut accounts, &provision)
+                .await
+                .expect("add recovery");
+            assert_eq!(
+                accounts
+                    .get(&CredentialAlias::new("a"))
+                    .map(|row| row.identity.as_str()),
+                reuse.then_some("C latest"),
+                "latest saved-alias mutation wins"
+            );
+            assert_eq!(accounts.get(&CredentialAlias::new("b")).is_some(), neighbor);
+            assert!(accounts.get(&CredentialAlias::new("phantom")).is_none());
+        }
+        store.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn a18_import_ownership_follows_saved_alias_and_keeps_untouched_source() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let provider = OPENAI_OAUTH_PROVIDER_NAME;
+    let imported = a18_descriptor("openai-oauth", provider, "imported user/workspace");
+    let other = a18_descriptor("other", provider, "other user/workspace");
+    a18_commit_oauth_receipt(
+        &store,
+        "import-x",
+        "openai-oauth",
+        imported.clone(),
+        Some("codex"),
+    )
+    .await;
+    a18_commit_oauth_receipt(&store, "add-b", "other", other.clone(), None).await;
+    // Interactive through imported X saves B; X retains source ownership.
+    a18_commit_oauth_receipt(&store, "through-x", "openai-oauth", other.clone(), None).await;
+    let mut accounts = memory_accounts();
+    accounts.add(imported.clone()).expect("imported");
+    accounts.add(other).expect("other");
+    let rows = store.account_add_receipts().await.expect("receipts");
+    let latest = latest_oauth_receipt_identities(&rows).expect("latest ownership");
+    assert!(matches!(
+        latest["openai-oauth"].1,
+        OAuthReceiptIdentity::Import(_)
+    ));
+    assert!(matches!(latest["other"].1, OAuthReceiptIdentity::Add(_)));
+    assert_eq!(
+        select_oauth_import_alias(
+            &store,
+            &accounts,
+            "next-import",
+            "codex",
+            provider,
+            "openai-oauth"
+        )
+        .await
+        .expect("source selection")
+        .as_str(),
+        "openai-oauth"
+    );
+    // Import then fresh interactive identity match saves X; import ownership ends.
+    a18_commit_oauth_receipt(&store, "match-x", "phantom", imported, None).await;
+    let rows = store.account_add_receipts().await.expect("receipts");
+    let latest = latest_oauth_receipt_identities(&rows).expect("latest ownership");
+    assert!(matches!(
+        latest["openai-oauth"].1,
+        OAuthReceiptIdentity::Add(_)
+    ));
+    assert!(!latest.contains_key("phantom"));
+    assert_eq!(
+        select_oauth_import_alias(
+            &store,
+            &accounts,
+            "next-import",
+            "codex",
+            provider,
+            "openai-oauth"
+        )
+        .await
+        .expect("new import alias")
+        .as_str(),
+        "openai-oauth-2"
+    );
+    // A historical import can also carry different request and saved aliases.
+    // Its source ownership and next import must resolve the saved row.
+    a18_commit_oauth_receipt(
+        &store,
+        "retargeted-import",
+        "import-request",
+        accounts
+            .get(&CredentialAlias::new("openai-oauth"))
+            .expect("saved import")
+            .clone(),
+        Some("codex"),
+    )
+    .await;
+    let rows = store.account_add_receipts().await.expect("receipts");
+    let latest = latest_oauth_receipt_identities(&rows).expect("saved source ownership");
+    assert!(matches!(
+        latest["openai-oauth"].1,
+        OAuthReceiptIdentity::Import(_)
+    ));
+    assert!(!latest.contains_key("import-request"));
+    assert_eq!(
+        select_oauth_import_alias(
+            &store,
+            &accounts,
+            "next-import",
+            "codex",
+            provider,
+            "openai-oauth"
+        )
+        .await
+        .expect("retargeted source selection")
+        .as_str(),
+        "openai-oauth"
+    );
+    let descriptor = accounts
+        .get(&CredentialAlias::new("openai-oauth"))
+        .expect("saved imported descriptor")
+        .clone();
+    let fences = RefreshFenceRegistry::default();
+    let bundle = openai_import_test_bundle(b"synthetic-access", b"synthetic-refresh", 1);
+    let expected = OAuthRefreshFence {
+        fence_epoch: fences.current(&descriptor.alias),
+        generation: bundle.generation,
+        issuer: bundle.issuer.clone(),
+        audience: bundle.audience.clone(),
+        resource: bundle.resource.clone(),
+        subject_hash: bundle.identity.subject_hash.clone(),
+    };
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+    let native = Arc::new(StubAccountClaudeNative::unavailable());
+    // An empty synthetic vault stops before the import source can be read.
+    // Recognized source ownership must fail closed rather than NotImported.
+    handle_oauth_import_heal(
+        &store,
+        &mut accounts,
+        Arc::new(MemoryVault::new()),
+        &snapshot,
+        None,
+        &test_provider_registry(),
+        &mut AutomaticCatalogDiscoveryQueue::new(true),
+        &HashSet::new(),
+        &fences,
+        &HashSet::new(),
+        &descriptor,
+        &expected,
+        native.clone(),
+    )
+    .await
+    .expect_err("retargeted import retains source ownership");
+    assert_eq!(native.reads(), 0, "no native credential source was read");
+    store.close().await.expect("close");
+}

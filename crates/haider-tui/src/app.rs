@@ -690,6 +690,16 @@ impl AppModel {
 }
 
 impl AccountsState {
+    /// Every new action notice, including a repeated message, reveals the
+    /// focused row against the notice's reduced roster viewport. The renderer
+    /// consumes the latch once so later explicit paging remains possible.
+    pub fn set_message(&mut self, message: Option<String>) {
+        if message.is_some() {
+            self.follow_cursor.set(true);
+        }
+        self.message = message;
+    }
+
     /// Applies an `account.list` snapshot, gated on revision monotonicity.
     /// `None` revisions (older daemons) always apply.
     pub fn apply_snapshot(&mut self, rows: Vec<AccountRow>, revision: Option<u64>) -> bool {
@@ -11694,12 +11704,13 @@ impl AppModel {
         if self.screen == Screen::Accounts {
             return;
         }
-        self.accounts.message = self.accounts.adoption_candidate.as_ref().map(|candidate| {
+        self.accounts
+            .set_message(self.accounts.adoption_candidate.as_ref().map(|candidate| {
             format!(
                 "import {} login? y confirms · n cancels · `haider account import {} --confirm`",
                 candidate.source_label, candidate.source
             )
-        });
+        }));
         // P1 MASK LAW (the U2 owner addendum): every open starts masked —
         // a reveal never survives into a later visit, whichever way the
         // last one ended (esc, ⌃C, a screen switch).
@@ -11748,9 +11759,11 @@ impl AppModel {
         if self.accounts.pending_select.is_some() {
             return;
         }
+        self.accounts.follow_cursor.set(true);
         let Some(row) = self.accounts.rows.iter().find(|row| row.alias == alias) else {
-            self.accounts.message =
-                Some(format!("· no account \"{alias}\" — /accounts to see them"));
+            self.accounts.set_message(Some(format!(
+                "· no account \"{alias}\" — /accounts to see them"
+            )));
             self.dirty = true;
             return;
         };
@@ -11778,7 +11791,7 @@ impl AppModel {
                 }
                 let oauth = row.method == haider_protocol::credential::AuthMethod::OAuth;
                 self.accounts.pending_relogin = relogin.then(|| alias.to_owned());
-                self.accounts.message = Some(if relogin {
+                self.accounts.set_message(Some(if relogin {
                     format!(
                         "· `{alias}` unusable — enter again re-logs it in place · ↑/↓ choose live"
                     )
@@ -11790,7 +11803,7 @@ impl AppModel {
                     format!(
                         "· `{alias}` unusable — ↑/↓ choose live · x removes it; /login adds a new key"
                     )
-                });
+                }));
                 self.dirty = true;
                 return;
             }
@@ -11800,12 +11813,12 @@ impl AppModel {
         if row.selected {
             // Sim parity: re-clicking a usable active row re-emits the message
             // without a daemon round-trip (useAccount has no early return).
-            self.accounts.message = Some(format!(
+            self.accounts.set_message(Some(format!(
                 "✓ {} → {} · {} · active",
                 row.provider,
                 row.alias,
                 auth_label(row.method)
-            ));
+            )));
             self.dirty = true;
             return;
         }
@@ -11814,7 +11827,7 @@ impl AppModel {
         };
         let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
         self.accounts.pending_select = Some(alias.to_owned());
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.requests.push(AppRequest::AccountSetActive {
             alias: alias.to_owned(),
             confirm_new_epoch,
@@ -11856,12 +11869,12 @@ impl AppModel {
             }
         }
         self.accounts.revision = Some(revision);
-        self.accounts.message = Some(format!(
+        self.accounts.set_message(Some(format!(
             "✓ {} → {} · {} · active",
             descriptor.provider,
             descriptor.alias,
             auth_label(descriptor.auth_method)
-        ));
+        )));
         // Choosing an account IS choosing the session identity (W5f-2):
         // the committed pick rides into the composer line and pins, so the
         // next `session.create` carries it and no later snapshot undoes it.
@@ -12176,7 +12189,8 @@ impl AppModel {
         {
             self.accounts.pending_select = None;
         }
-        self.accounts.message = Some(format!("· {alias}: {message}"));
+        self.accounts
+            .set_message(Some(format!("· {alias}: {message}")));
         self.dirty = true;
     }
 
@@ -12677,7 +12691,7 @@ impl AppModel {
         let alias = smallest_free_alias(provider, &self.accounts.rows);
         self.oauth_attempt_seq += 1;
         let attempt = self.oauth_attempt_seq;
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.oauth_add = Some(OAuthAddCard {
             provider: provider.to_owned(),
             title,
@@ -12713,7 +12727,7 @@ impl AppModel {
             self.open_oauth_add(AccountAddKind::GoogleAntigravity);
             return;
         }
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.antigravity_consent = Some(AccountAddKind::GoogleAntigravity);
         self.dirty = true;
     }
@@ -12742,7 +12756,8 @@ impl AppModel {
     /// record of an acceptance that never happened.
     fn decline_antigravity_consent(&mut self) {
         if self.antigravity_consent.take().is_some() {
-            self.accounts.message = Some("· Google Antigravity sign-in cancelled".to_owned());
+            self.accounts
+                .set_message(Some("· Google Antigravity sign-in cancelled".to_owned()));
             self.dirty = true;
         }
     }
@@ -12755,14 +12770,14 @@ impl AppModel {
             return;
         }
         let Some(title) = oauth_relogin_title(provider) else {
-            self.accounts.message = Some(format!(
+            self.accounts.set_message(Some(format!(
                 "· re-login is not available for {provider}; add it again"
-            ));
+            )));
             return;
         };
         self.oauth_attempt_seq += 1;
         let attempt = self.oauth_attempt_seq;
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.oauth_add = Some(OAuthAddCard {
             provider: provider.to_owned(),
             title,
@@ -12784,7 +12799,8 @@ impl AppModel {
             self.requests.push(AppRequest::OAuthAddCancel {
                 attempt: card.attempt,
             });
-            self.accounts.message = Some("· authorize cancelled".to_owned());
+            self.accounts
+                .set_message(Some("· authorize cancelled".to_owned()));
             self.dirty = true;
         }
     }
@@ -12940,7 +12956,7 @@ impl AppModel {
                     " · provider exposes no stable identity; re-login through this alias to update it",
                 );
             }
-            self.accounts.message = Some(message);
+            self.accounts.set_message(Some(message));
             self.requests.push(AppRequest::AccountsRefresh);
             self.dirty = true;
         }
@@ -13027,8 +13043,8 @@ impl AppModel {
                             base_url: None,
                         });
                         self.oauth_add = None;
-                        self.accounts.message =
-                            Some(format!("✓ {provider} → {alias} · oauth · active"));
+                        self.accounts
+                            .set_message(Some(format!("✓ {provider} → {alias} · oauth · active")));
                         let _ = attempt;
                         self.dirty = true;
                     } else {
@@ -13056,7 +13072,7 @@ impl AppModel {
         let provider = card.provider.clone();
         let alias = card.alias.clone();
         let attempt = card.attempt;
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.requests.push(AppRequest::OAuthAddStart {
             provider,
             alias,
@@ -13086,7 +13102,8 @@ impl AppModel {
                 if self.daemon_lists_provider("gemini") {
                     self.open_login_card("gemini", None);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("Gemini accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Gemini accounts")));
                     self.dirty = true;
                 }
             }
@@ -13094,7 +13111,8 @@ impl AppModel {
                 if self.daemon_lists_provider("deepseek") {
                     self.open_login_card("deepseek", None);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("DeepSeek accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("DeepSeek accounts")));
                     self.dirty = true;
                 }
             }
@@ -13102,7 +13120,8 @@ impl AppModel {
                 if self.daemon_lists_provider("haider-code") {
                     self.open_login_card("haider-code", None);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("Haider Code accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Haider Code accounts")));
                     self.dirty = true;
                 }
             }
@@ -13110,7 +13129,8 @@ impl AppModel {
                 if self.daemon_lists_provider("xai") {
                     self.open_login_card("xai", None);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("xAI accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("xAI accounts")));
                     self.dirty = true;
                 }
             }
@@ -13123,7 +13143,8 @@ impl AppModel {
                 if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1) {
                     self.open_oauth_add(kind);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("OAuth sign-in"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("OAuth sign-in")));
                     self.dirty = true;
                 }
             }
@@ -13134,7 +13155,8 @@ impl AppModel {
                 if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
                     self.open_oauth_add(kind);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("Kimi OAuth sign-in"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Kimi OAuth sign-in")));
                     self.dirty = true;
                 }
             }
@@ -13142,7 +13164,8 @@ impl AppModel {
                 if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
                     self.open_oauth_add(kind);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("Grok OAuth sign-in"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Grok OAuth sign-in")));
                     self.dirty = true;
                 }
             }
@@ -13154,8 +13177,8 @@ impl AppModel {
                 if self.daemon_lists_provider(GOOGLE_ANTIGRAVITY_PROVIDER) {
                     self.open_antigravity_add();
                 } else {
-                    self.accounts.message =
-                        Some(self.stale_daemon_note("Google Antigravity accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Google Antigravity accounts")));
                     self.dirty = true;
                 }
             }
@@ -13168,7 +13191,8 @@ impl AppModel {
                 {
                     self.open_custom_add();
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("custom providers"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("custom providers")));
                     self.dirty = true;
                 }
             }
@@ -13212,9 +13236,9 @@ impl AppModel {
         // `accounts_replace_key` and by nothing else.
         if let Some(pending) = self.pending_account_secret() {
             self.accounts.pending_replace = Some(kind);
-            self.accounts.message = Some(format!(
+            self.accounts.set_message(Some(format!(
                 "discard the pending {pending} entry? enter replaces it · esc keeps it"
-            ));
+            )));
             self.dirty = true;
             return false;
         }
@@ -13288,7 +13312,7 @@ impl AppModel {
             self.cancel_custom_add();
         }
         self.close_login_card();
-        self.accounts.message = None;
+        self.accounts.set_message(None);
     }
 
     /// The keys of the 971 F1(b) replace confirm. It outranks every accounts
@@ -13311,7 +13335,7 @@ impl AppModel {
             }
             KeyCode::Esc => {
                 self.accounts.pending_replace = None;
-                self.accounts.message = None;
+                self.accounts.set_message(None);
                 self.dirty = true;
             }
             _ => {}
@@ -13341,7 +13365,7 @@ impl AppModel {
             base_url: None,
         }));
         self.custom_attempt_seq += 1;
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         let name = smallest_free_alias("custom", &taken);
         let cursor = name.chars().count();
         self.custom_add = Some(CustomProviderCard {
@@ -13935,10 +13959,10 @@ impl AppModel {
             return None;
         }
         if credential_staged {
-            self.accounts.message = Some(format!(
+            self.accounts.set_message(Some(format!(
                 "✓ provider {} configured · registering its account…",
                 card.name
-            ));
+            )));
             let login_attempt = self.open_staged_login_card(&card.name, card.name.clone());
             self.dirty = true;
             return Some(login_attempt);
@@ -13950,7 +13974,7 @@ impl AppModel {
         }
         // G4b: every keyed kind chains into the masked key card; the copy
         // names what the "key" actually is on each surface.
-        self.accounts.message = Some(match card.kind {
+        self.accounts.set_message(Some(match card.kind {
             CustomCardKind::Azure => format!(
                 "✓ provider {} configured · Azure OpenAI — now add its api-key",
                 card.name
@@ -13967,7 +13991,7 @@ impl AppModel {
                 "✓ provider {} created · OpenAI-compatible — now add its key",
                 card.name
             ),
-        });
+        }));
         self.open_login_card(&card.name, None);
         self.dirty = true;
         None
@@ -14160,9 +14184,9 @@ impl AppModel {
             selected: true,
             base_url: Some(base_url.to_owned()),
         });
-        self.accounts.message = Some(format!(
+        self.accounts.set_message(Some(format!(
             "✓ added {provider} · {alias} · api key · OpenAI-compatible — now active"
-        ));
+        )));
         self.dirty = true;
     }
 
@@ -14192,7 +14216,8 @@ impl AppModel {
         match code {
             KeyCode::Char('y') if self.accounts.adoption_candidate.is_some() => {
                 if let Some(candidate) = self.accounts.adoption_candidate.take() {
-                    self.accounts.message = Some(format!("importing {} login…", candidate.source));
+                    self.accounts
+                        .set_message(Some(format!("importing {} login…", candidate.source)));
                     self.requests.push(AppRequest::AccountImportDevice {
                         candidate: candidate.candidate,
                         source: candidate.source,
@@ -14202,7 +14227,8 @@ impl AppModel {
             }
             KeyCode::Char('n') if self.accounts.adoption_candidate.is_some() => {
                 self.accounts.adoption_candidate = None;
-                self.accounts.message = Some("local login import cancelled".to_owned());
+                self.accounts
+                    .set_message(Some("local login import cancelled".to_owned()));
                 if self.device_discovery_available() {
                     self.requests.push(AppRequest::DeviceCandidatesRefresh);
                 }
@@ -14210,12 +14236,12 @@ impl AppModel {
             }
             KeyCode::Esc if self.accounts.pending_remove.is_some() => {
                 self.accounts.pending_remove = None;
-                self.accounts.message = None;
+                self.accounts.set_message(None);
                 self.dirty = true;
             }
             KeyCode::Esc if self.accounts.pending_relogin.is_some() => {
                 self.accounts.pending_relogin = None;
-                self.accounts.message = None;
+                self.accounts.set_message(None);
                 self.dirty = true;
             }
             KeyCode::Esc => self.exit_accounts(),
@@ -14226,9 +14252,9 @@ impl AppModel {
                     .get(self.accounts.cursor)
                     .map(|row| row.alias.clone())
                 {
-                    self.accounts.message = Some(format!(
+                    self.accounts.set_message(Some(format!(
                         "remove account `{alias}`? enter confirms · esc cancels"
-                    ));
+                    )));
                     self.accounts.pending_remove = Some(alias);
                     self.dirty = true;
                 }
@@ -14241,9 +14267,11 @@ impl AppModel {
                         .accounts
                         .cursor
                         .min(self.accounts.rows.len().saturating_sub(1));
-                    self.accounts.message = Some(format!("removed `{alias}` (demo)"));
+                    self.accounts
+                        .set_message(Some(format!("removed `{alias}` (demo)")));
                 } else {
-                    self.accounts.message = Some(format!("removing `{alias}`…"));
+                    self.accounts
+                        .set_message(Some(format!("removing `{alias}`…")));
                     self.requests.push(AppRequest::AccountRemove { alias });
                 }
                 self.dirty = true;
@@ -14330,10 +14358,10 @@ impl AppModel {
             "· {} login available: {identity} · `{command}`",
             candidate.source_label
         ));
-        self.accounts.message = Some(format!(
+        self.accounts.set_message(Some(format!(
             "import {} login ({identity})? y confirms · n cancels · `{command}`",
             candidate.source_label
-        ));
+        )));
         self.accounts.adoption_candidate = Some(candidate);
         self.dirty = true;
         true
@@ -18660,17 +18688,19 @@ impl AppModel {
             ErrorAction::Reimport => {
                 self.enter_accounts();
                 self.requests.push(AppRequest::DeviceCandidatesRefresh);
-                self.accounts.message = Some("· looking for credentials to re-adopt…".into());
+                self.accounts
+                    .set_message(Some("· looking for credentials to re-adopt…".into()));
             }
             ErrorAction::SwitchAccount => {
                 self.enter_accounts();
-                self.accounts.message = Some("· choose another usable account".into());
+                self.accounts
+                    .set_message(Some("· choose another usable account".into()));
             }
             ErrorAction::EditKey => {
                 self.enter_accounts();
-                self.accounts.message = Some(
+                self.accounts.set_message(Some(
                     "· replace this key by removing the rejected account, then add it again".into(),
-                );
+                ));
             }
             ErrorAction::TopUp => self.projection.push_note(format!(
                 "· add credits in the {} billing portal, then retry",
@@ -19858,6 +19888,12 @@ impl AppModel {
             // tui.js:3604 onClick useAccount). Value-carrying alias, and
             // NEVER an optimistic flip — select_account only requests.
             Hit::AccountRow(alias) if self.screen == Screen::Accounts => {
+                if let Some(cursor) = self.accounts.rows.iter().position(|row| row.alias == alias) {
+                    if cursor != self.accounts.cursor {
+                        self.accounts.pending_relogin = None;
+                    }
+                    self.accounts.cursor = cursor;
+                }
                 self.select_account(&alias);
             }
             Hit::AccountAdd(kind)
@@ -19870,7 +19906,7 @@ impl AppModel {
                 if self.screen == Screen::Providers {
                     self.enter_accounts();
                 }
-                self.accounts.message = None;
+                self.accounts.set_message(None);
                 // 971 F1(b): ONE pending add-form at a time — the choice
                 // REPLACES whatever is open, and only a form already holding
                 // typed secret bytes gets a confirm before the discard.
@@ -21582,7 +21618,7 @@ impl AppModel {
             }
             Some(PendingCacheChange::Account { .. }) => {
                 self.accounts.pending_select = None;
-                self.accounts.message = Some(notice.clone());
+                self.accounts.set_message(Some(notice.clone()));
             }
             Some(PendingCacheChange::Fast { .. }) | None => {}
         }
