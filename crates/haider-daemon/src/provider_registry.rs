@@ -1605,6 +1605,9 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             }
         }
         if self.injected_providers.contains(&profile.provider_id) {
+            // The registered transport is the injected adapter, including
+            // when its name matches a public HTTP catalog's builtin name.
+            summary.catalog = haider_rpc::ProviderCatalogKindWire::Adapter;
             // Unknown profiles are disabled placeholders until an adapter
             // registers them. Explicit disablement of a known profile still
             // wins, as does model membership in the shared selection rule.

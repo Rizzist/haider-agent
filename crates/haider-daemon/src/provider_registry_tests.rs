@@ -35,6 +35,7 @@ fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
         "fake".to_owned(),
         "openai".to_owned(),
         "anthropic".to_owned(),
+        HAIDER_CODE_PROVIDER_NAME.to_owned(),
     ]);
     let store: Arc<dyn ProviderRegistryStoreLike> = Arc::new(MemoryProviderStore::default());
     let mut registry = ProviderRegistry::new(
@@ -51,7 +52,11 @@ fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
                 .model_is_selectable("fixture-model")
         );
     }
-    let registered = std::collections::BTreeSet::from(["fake".to_owned(), "openai".to_owned()]);
+    let registered = std::collections::BTreeSet::from([
+        "fake".to_owned(),
+        "openai".to_owned(),
+        HAIDER_CODE_PROVIDER_NAME.to_owned(),
+    ]);
     registry = registry.with_injected_factory(&registered);
     for provider in &registered {
         let summary = registry
@@ -59,6 +64,15 @@ fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
             .expect("injected summary");
         assert!(summary.model_is_selectable("fixture-model"));
         assert!(summary.selection_reason(Some("fixture-model")).is_none());
+        assert_eq!(
+            summary.catalog,
+            haider_rpc::ProviderCatalogKindWire::Adapter
+        );
+        assert!(
+            crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
+                .validate_selection_with_status(provider, None, "fixture-model")
+                .is_ok()
+        );
     }
     assert!(
         !registry
