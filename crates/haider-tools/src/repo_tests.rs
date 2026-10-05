@@ -368,7 +368,7 @@ fn dot_git_is_always_excluded_and_noncanonical_roots_are_rejected() {
             stable_order: true,
             max_files: 100,
             max_ignore_control_bytes: None,
-            deadline: Some(Instant::now() + std::time::Duration::from_secs(1)),
+            deadline: Some(Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         },
     )
     .expect("walk");

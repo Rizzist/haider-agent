@@ -287,7 +287,8 @@ async fn natural_exit_leaves_lingering_group_members_alone() {
                     "if ($pid) { while (!-e q(started)) { select undef, undef, undef, 0.01 } ",
                     "print q(leader); exit 0 } ",
                     "open $started, q(>), q(started); print $started q(started); close $started; ",
-                    "select undef, undef, undef, 0.5; ",
+                    "close STDIN; close STDOUT; close STDERR; alarm 60; ",
+                    "while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
                     "open $survived, q(>), q(survived); print $survived q(survived); ",
                     "close $survived; while (!-e q(cleanup)) { ",
                     "select undef, undef, undef, 0.01 }'",
@@ -311,7 +312,15 @@ async fn natural_exit_leaves_lingering_group_members_alone() {
             .retained(),
         b"leader"
     );
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    fs::write(workspace.path().join("release-descendant"), b"released")
+        .expect("release descendant");
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while !workspace.path().join("survived").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("naturally detached descendant remains alive");
     assert_eq!(
         probe_group_liveness(pid),
         PidLiveness::Alive,
@@ -323,7 +332,8 @@ async fn natural_exit_leaves_lingering_group_members_alone() {
         "survived"
     );
     fs::write(workspace.path().join("cleanup"), b"stop").expect("release descendant fixture");
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
         if probe_group_liveness(pid) == PidLiveness::Dead {
             return;
         }

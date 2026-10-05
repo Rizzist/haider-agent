@@ -44,10 +44,9 @@ const UPSTREAM_429_COUNT: usize = 6;
 const CALLER_DEADLINE: Duration = Duration::from_millis(32_400);
 const TERMINAL_PUBLICATION_GRACE: Duration = Duration::from_secs(2);
 const TERMINAL_OBSERVER_DEADLINE: Duration = Duration::from_millis(34_400);
-// Registry #94: once the terminal append is durable, replay has no provider
-// wait; reuse the two-second local publication/store grace rather than adding
-// an unrelated wall-clock constant.
-const REPLAY_OBSERVER_DEADLINE: Duration = TERMINAL_PUBLICATION_GRACE;
+// Replay completion is an observed store event. The hang watchdog is separate
+// from the deadline-derived ladder/overhead law asserted below.
+const REPLAY_OBSERVER_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 // The first five lower-half jittered delays can total 15.5--31 seconds. Pick
 // a real run coordinate whose deterministic ladder leaves 10.9 seconds for
 // worker startup plus six loopback/store cycles under the explicit 32.4-second

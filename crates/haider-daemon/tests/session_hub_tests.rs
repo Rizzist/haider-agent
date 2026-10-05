@@ -840,7 +840,8 @@ fn sidecar_path(root: &tempfile::TempDir, session_id: &SessionId) -> std::path::
 /// `hub.shutdown()` guarantees, with no intermediate stable point.
 async fn stable_sidecar(path: &std::path::Path) -> String {
     let mut prev: Option<String> = None;
-    for _ in 0..300 {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
         if let Ok(cur) = std::fs::read_to_string(path) {
             if !cur.is_empty() && prev.as_deref() == Some(cur.as_str()) {
                 return cur;
@@ -849,7 +850,7 @@ async fn stable_sidecar(path: &std::path::Path) -> String {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    prev.unwrap_or_default()
+    panic!("sidecar did not stabilize before {deadline:?}: {prev:?}")
 }
 
 async fn append_delta(

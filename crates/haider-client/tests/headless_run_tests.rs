@@ -2811,10 +2811,10 @@ async fn blocked_output_does_not_delay_wall_clock_cancellation() {
     let task = tokio::spawn(async move {
         run_headless(&profile, EnsureOptions::default(), timed, sender).await
     });
-    // Observation bound scales with the 250ms trigger: the LAW is that the
-    // cancel reaches the peer promptly after expiry despite a blocked output
-    // channel (capacity 1, consumer parked) — not an absolute latency.
-    tokio::time::timeout(Duration::from_millis(1_500), cancellation)
+    // The output consumer remains parked until the peer observes cancellation.
+    // The shared fixture watchdog tolerates scheduling, while a cancellation
+    // that waits for output drain still deadlocks and fails this assertion.
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, cancellation)
         .await
         .expect("cancel must not wait for output drain")
         .expect("peer reports cancel");

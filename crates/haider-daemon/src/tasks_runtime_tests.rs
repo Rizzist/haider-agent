@@ -409,7 +409,7 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
         .await
         .expect("autonomous Ask resolves to Allow");
     assert!(matches!(autonomous, ToolDispatchResult::Completed(_)));
-    timeout(Duration::from_secs(3), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !autonomous_marker.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -464,7 +464,7 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
         .await
         .expect("Allow monitor dispatch");
     assert!(matches!(allowed, ToolDispatchResult::Completed(_)));
-    timeout(Duration::from_secs(3), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !allow_marker.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

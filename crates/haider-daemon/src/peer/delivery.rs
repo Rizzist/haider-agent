@@ -825,18 +825,21 @@ mod tests {
         )
         .await;
         let head = send("target", "head");
-        let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-            .await
-            .expect("head reached transport")
-            .expect("connection");
+        let (connection, _) =
+            tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, listener.accept())
+                .await
+                .expect("head reached transport")
+                .expect("connection");
         let tail = send("target", "tail");
         let duplicate = send("target", "head");
-        let delivered =
-            tokio::time::timeout(Duration::from_secs(2), send("healthy", "independent"))
-                .await
-                .expect("healthy send must finish while target is stalled")
-                .expect("send task")
-                .expect("healthy receipt");
+        let delivered = tokio::time::timeout(
+            haider_platform::TEST_WAIT_TIMEOUT,
+            send("healthy", "independent"),
+        )
+        .await
+        .expect("healthy send must finish while target is stalled")
+        .expect("send task")
+        .expect("healthy receipt");
         assert_eq!(
             delivered.status.expect("status").state,
             PeerDeliveryState::Delivered

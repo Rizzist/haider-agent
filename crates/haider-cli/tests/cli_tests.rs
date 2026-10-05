@@ -767,7 +767,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
     );
     proxy
         .held_started
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .expect("slow catalog request starts");
     let exited_before_release = wait_for_child_exit(&mut slow_add, Duration::from_secs(2));
     proxy.release_held();
@@ -893,7 +893,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
     );
     if proxy
         .held_started
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .is_err()
     {
         let output = first.wait_with_output().expect("first replacement output");
@@ -982,7 +982,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
     )));
     let request = proxy
         .chats
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .expect("production adapter HTTP request");
     assert_eq!(request["model"], "real-current");
     assert_eq!(daemon_pid(&owner.profile), Some(daemon));

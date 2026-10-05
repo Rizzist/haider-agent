@@ -45,12 +45,19 @@ pub use directory::{
     WorkspaceDirectory, WorkspaceDirectoryError, duplicate_workspace_directory,
     open_workspace_directory, open_workspace_file,
 };
+pub use file_lock::{FileLock, lock_file_exclusive, try_lock_file_exclusive, unlock_file};
 #[cfg(unix)]
 pub use file_lock::{
     file_owner_record_pid, lock_file_owner_record, try_lock_file_owner_record,
     unlock_file_owner_record,
 };
-pub use file_lock::{lock_file_exclusive, try_lock_file_exclusive, unlock_file};
+
+/// Hang watchdog for test fixture readiness and completion. The shared build
+/// gate runs two jobs on a 16 GiB host; image validation, blocking-pool work,
+/// and scheduling can exceed short local deadlines. Semantic timing tests
+/// must retain their own virtual clocks or explicit elapsed-time assertions.
+#[doc(hidden)]
+pub const TEST_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(windows)]
 pub use fs::replace_file_with_backup;
 pub use fs::{

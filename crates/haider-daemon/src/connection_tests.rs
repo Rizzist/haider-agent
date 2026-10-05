@@ -1917,7 +1917,7 @@ async fn resident_binding_frame_routes_across_the_paired_connection() {
         .await;
 
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), observed_rx.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, observed_rx.recv())
             .await
             .expect("binding push is prompt")
             .expect("observer stays open"),

@@ -189,7 +189,7 @@ async fn x_goog_api_key_is_sensitive_and_request_consumes_fixed_origin_guard() {
     };
     tokio::select! {
         result = &mut execution => panic!("fixed resolver did not stall request: {result:?}"),
-        observed = tokio::time::timeout(Duration::from_secs(1), resolution_observed) => {
+        observed = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, resolution_observed) => {
             observed.expect("reqwest consumes pinned Gemini resolver");
         }
     }

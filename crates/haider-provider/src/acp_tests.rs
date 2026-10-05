@@ -1367,7 +1367,8 @@ async fn spawned_child_round_trips_initialize_and_is_reaped_without_an_orphan() 
     // The stderr drain is a separate task; give it a bounded window to observe
     // the child's one diagnostics line.
     let mut tail = connection.stderr_tail();
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
         if !tail.is_empty() {
             break;
         }

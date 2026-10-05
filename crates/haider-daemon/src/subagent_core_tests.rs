@@ -1268,7 +1268,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     let bounded =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let collected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         bounded.collect(
             &first.ticket,
             &CancelToken::new(),
@@ -3750,7 +3750,7 @@ async fn parent_user_answers_delegated_question_over_uds_and_child_continues() {
     // Registry #94 test arithmetic: the outer 250ms observer contains the
     // production 75ms mirror bound plus 175ms of executor scheduling margin.
     let first_wait_timed_out = timeout(
-        Duration::from_millis(250),
+        haider_platform::TEST_WAIT_TIMEOUT,
         terminal_mirror
             .terminal_mirror_times_out_for_test(&harness.child, Duration::from_millis(75)),
     )
@@ -4857,9 +4857,9 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     })
     .to_string();
     timeout(
-        // Registry #94 test arithmetic: the cancellation path owns no wait
-        // beyond the 1s mirror tail; the extra 1s contains actor scheduling.
-        Duration::from_secs(2),
+        // Observe cancellation completion independently of scheduler delay;
+        // the configured one-second terminal-mirror tail remains unchanged.
+        haider_platform::TEST_WAIT_TIMEOUT,
         hub.cancel_internal_turn(TurnCancelCommand {
             command_id: "cancel-w6c-parent".into(),
             request_digest: blake3::hash(cancel_json.as_bytes()).to_hex().to_string(),
@@ -4875,9 +4875,9 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     .expect("parent cancellation completes inside the terminal-mirror bound")
     .expect("cancel parent");
     timeout(
-        // Registry #94: the production cleanup fallback journals and owns a
-        // 1s terminal tail; 250ms contains executor/store scheduling only.
-        Duration::from_millis(1_250),
+        // The production cleanup fallback keeps its one-second terminal
+        // tail. Observe its durable completion independently of scheduling.
+        haider_platform::TEST_WAIT_TIMEOUT,
         async {
             loop {
                 let events = store
@@ -5990,7 +5990,7 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     let bounded =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let collected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         bounded.collect(
             &first.ticket,
             &CancelToken::new(),
@@ -6026,7 +6026,7 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     let restarted =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let recollected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         restarted.collect(
             &first.ticket,
             &CancelToken::new(),

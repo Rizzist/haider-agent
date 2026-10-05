@@ -8,10 +8,9 @@
 //! through a drop guard, so no test leaks a process past its assertions.
 #![allow(clippy::expect_used)]
 
-use std::io::{BufRead as _, Read as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use haider_client::{ProfileEnv, ResolvedProfile, resolve_profile};
@@ -56,8 +55,7 @@ fn warm_autospawn_binaries(haider: &Path, payload: &Path, haiderd: &Path) {
         // macOS validates each newly written Mach-O inode before entering
         // `main`: measured cold launches were 4.975 s and 4.79 s, while the
         // same inodes then launched in 0.23 s, 0.20 s, and 0.24 s. Charge
-        // that one-time validation to this process fixture, not the 950 ms
-        // own-child authentication assertion. The thin CLI's local --version
+        // that one-time validation to this process fixture. The thin CLI's local --version
         // does not execute its payload, so warm that separate inode too.
         // All three version paths precede profile/store/runtime-directory/
         // socket setup; warming cannot start a daemon or mutate a profile.
@@ -96,7 +94,10 @@ fn resolved_for(store: &Path) -> ResolvedProfile {
 }
 
 fn haider_command(store: &Path) -> Command {
+    use std::os::unix::process::CommandExt as _;
     let mut command = Command::new(haider_binary());
+    // Keep ordinary captured descendants identifiable after launcher exit.
+    command.process_group(0);
     configure_test_home(&mut command, store);
     command
         .env("HAIDER_PROFILE_DIR", store)
@@ -127,7 +128,10 @@ fn test_home(store: &Path) -> PathBuf {
     store.join("machine-home")
 }
 
-const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+// A hang watchdog, separate from the launcher's own readiness/deadline policy.
+// Covers cold image validation and scheduling in the shared two-slot gate.
+const CHILD_EXIT_TIMEOUT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
+const CAPTURE_DRAIN_TIMEOUT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
 /// Waits for a captured child without allowing a broken candidate or launcher
 /// to consume the test runner forever. Every caller supplies the operation it
@@ -136,88 +140,193 @@ fn wait_for_output(child: Child, waiting_for: &str) -> Output {
     wait_for_output_with_timeout(child, waiting_for, CHILD_EXIT_TIMEOUT)
 }
 
-fn wait_for_output_with_timeout(mut child: Child, waiting_for: &str, timeout: Duration) -> Output {
-    #[derive(Clone, Copy)]
+fn wait_for_output_with_timeout(child: Child, waiting_for: &str, timeout: Duration) -> Output {
+    capture_child(child, waiting_for, timeout, CAPTURE_DRAIN_TIMEOUT)
+}
+
+/// Own both readers in this scope. A timeout drops their descriptors during
+/// unwinding instead of leaving read-to-EOF threads parked on inherited pipes.
+fn capture_child(
+    mut child: Child,
+    waiting_for: &str,
+    timeout: Duration,
+    drain_timeout: Duration,
+) -> Output {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    #[derive(Debug)]
     enum CapturedStream {
         Stdout,
         Stderr,
     }
-
-    let (sender, receiver) = mpsc::channel();
-    let mut stream_count = 0;
-    if let Some(mut stdout) = child.stdout.take() {
-        stream_count += 1;
-        let sender = sender.clone();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
-            let _ = sender.send((CapturedStream::Stdout, result));
-        });
+    let child_pid = child.id();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    if let Some(pipe) = &stdout_pipe {
+        nonblocking_capture(pipe);
     }
-    if let Some(mut stderr) = child.stderr.take() {
-        stream_count += 1;
-        let sender = sender.clone();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let result = stderr.read_to_end(&mut bytes).map(|_| bytes);
-            let _ = sender.send((CapturedStream::Stderr, result));
-        });
+    if let Some(pipe) = &stderr_pipe {
+        nonblocking_capture(pipe);
     }
-    drop(sender);
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                let kill_result = child.kill();
-                let reap_deadline = Instant::now() + Duration::from_millis(250);
-                let reap_result = loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => break format!("reaped with {status}"),
-                        Ok(None) if Instant::now() < reap_deadline => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Ok(None) => break "still running after kill".to_owned(),
-                        Err(error) => break format!("reap failed: {error}"),
-                    }
-                };
-                panic!(
-                    "timed out after {timeout:?} waiting for {waiting_for}; \
-                     kill result: {kill_result:?}; {reap_result}"
-                );
-            }
-            Err(error) => panic!("poll child while waiting for {waiting_for}: {error}"),
-        }
-    };
-
-    let drain_deadline = Instant::now() + Duration::from_secs(1);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    for _ in 0..stream_count {
-        let remaining = drain_deadline.saturating_duration_since(Instant::now());
-        let (stream, bytes) = receiver.recv_timeout(remaining).unwrap_or_else(|error| {
-            panic!("drain captured output after waiting for {waiting_for}: {error}")
-        });
-        let bytes = bytes.unwrap_or_else(|error| {
-            panic!("read captured output after waiting for {waiting_for}: {error}")
-        });
-        match stream {
-            CapturedStream::Stdout => stdout = bytes,
-            CapturedStream::Stderr => stderr = bytes,
+    let deadline = Instant::now() + timeout;
+    let mut drain_deadline = None;
+    let mut status = None;
+    loop {
+        drain_capture(&mut stdout_pipe, &mut stdout, waiting_for, "stdout");
+        drain_capture(&mut stderr_pipe, &mut stderr, waiting_for, "stderr");
+        if status.is_none() {
+            status = child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("poll child for {waiting_for}: {error}"));
+            if status.is_some() {
+                drain_deadline = Some(Instant::now() + drain_timeout);
+            }
         }
-    }
-    Output {
-        status,
-        stdout,
-        stderr,
+        if let Some(status) = status
+            && stdout_pipe.is_none()
+            && stderr_pipe.is_none()
+        {
+            return Output {
+                status,
+                stdout,
+                stderr,
+            };
+        }
+        let pending: Vec<_> = [
+            stdout_pipe.as_ref().map(|_| CapturedStream::Stdout),
+            stderr_pipe.as_ref().map(|_| CapturedStream::Stderr),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let wait_deadline = drain_deadline.unwrap_or(deadline);
+        if Instant::now() >= wait_deadline {
+            let descendants = capture_process_states(child_pid);
+            if let Some(status) = status {
+                panic!(
+                    "drain captured output after waiting for {waiting_for}; \
+                       bound={drain_timeout:?}; pending streams={pending:?}; \
+                       child PID={child_pid}, exited={status}; now={descendants}",
+                );
+            }
+            let kill_result = child.kill();
+            let reap_deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+            let reap_result = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break format!("reaped with {status}"),
+                    Ok(None) if Instant::now() < reap_deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Ok(None) => break "still running after kill".to_owned(),
+                    Err(error) => break format!("reap failed: {error}"),
+                }
+            };
+            panic!(
+                "timed out after {timeout:?} waiting for {waiting_for}; \
+                   kill result: {kill_result:?}; {reap_result}; pending streams={pending:?}; \
+                   child PID={child_pid}; before={descendants}; now={}",
+                capture_process_states(child_pid)
+            );
+        }
+        let mut descriptors = Vec::new();
+        if let Some(pipe) = &stdout_pipe {
+            descriptors.push(PollFd::new(pipe, PollFlags::IN));
+        }
+        if let Some(pipe) = &stderr_pipe {
+            descriptors.push(PollFd::new(pipe, PollFlags::IN));
+        }
+        // Pipe readiness/EOF wakes immediately. A bounded repair poll also
+        // notices direct-child exit when neither stream produces traffic.
+        let wait = wait_deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(25));
+        let wait = Timespec::try_from(wait).expect("bounded capture poll duration");
+        match poll(&mut descriptors, Some(&wait)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(error) => panic!("poll captured output for {waiting_for}: {error}"),
+        }
     }
 }
 
+fn nonblocking_capture(pipe: &impl std::os::fd::AsFd) {
+    let flags = rustix::fs::fcntl_getfl(pipe).expect("read capture pipe flags");
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)
+        .expect("nonblocking capture pipe");
+}
+
+fn drain_capture<R: std::io::Read>(
+    pipe: &mut Option<R>,
+    bytes: &mut Vec<u8>,
+    waiting_for: &str,
+    stream: &str,
+) {
+    let Some(reader) = pipe.as_mut() else { return };
+    // Keep a continuously writing child from starving the exit watchdog.
+    for _ in 0..16 {
+        let mut buffer = [0; 8192];
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                *pipe = None;
+                return;
+            }
+            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => panic!("read captured {stream} for {waiting_for}: {error}"),
+        }
+    }
+}
+
+/// Numeric process receipts only: never copy ambient process arguments or
+/// credentials. Include live descendants while the child exists and its process
+/// group after exit (fixtures can retain captured pipes beyond the direct child).
+fn capture_process_states(child_pid: u32) -> String {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,stat="])
+        .output();
+    let Ok(output) = output else {
+        return "process-state query unavailable".into();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let rows: Vec<_> = text
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            Some((
+                fields.first()?.parse::<u32>().ok()?,
+                fields.get(1)?.parse::<u32>().ok()?,
+                fields.get(2)?.parse::<u32>().ok()?,
+                line,
+            ))
+        })
+        .collect();
+    let mut owned = std::collections::HashSet::from([child_pid]);
+    loop {
+        let count = owned.len();
+        for (pid, parent, group, _) in &rows {
+            if owned.contains(parent) || *group == child_pid {
+                owned.insert(*pid);
+            }
+        }
+        if count == owned.len() {
+            break;
+        }
+    }
+    let states = rows
+        .iter()
+        .filter(|(pid, _, _, _)| owned.contains(pid))
+        .map(|(_, _, _, row)| *row)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "pid ppid pgid stat: [{states}] (reparented descendants outside this group may be absent)"
+    )
+}
+
 fn output_with_timeout(command: &mut Command, waiting_for: &str) -> Output {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -240,9 +349,73 @@ fn bounded_child_wait_allows_a_prompt_exit() {
 }
 
 #[test]
+fn capture_waits_for_eof_from_both_descendant_streams() {
+    for script in [
+        "(sleep 2; printf late-out) & printf early-out",
+        "(sleep 2; printf late-err >&2) & printf early-err >&2",
+        "(sleep 2; printf late-out; printf late-err >&2) & printf early-out",
+    ] {
+        let output = output_with_timeout(Command::new("sh").args(["-c", script]), "descendant EOF");
+        assert!(output.status.success());
+        if script.contains("late-out") {
+            assert!(output.stdout.ends_with(b"late-out"));
+        }
+        if script.contains("late-err") {
+            assert!(output.stderr.ends_with(b"late-err"));
+        }
+    }
+}
+
+#[test]
+fn capture_timeout_identifies_the_retained_stream_and_child_state() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut child = Command::new("sh")
+        .args(["-c", "(sleep 60) &"])
+        .process_group(0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn retained-pipe fixture");
+    let pid = child.id();
+    let reader_path = format!(
+        "/dev/fd/{}",
+        child.stdout.as_ref().expect("capture reader").as_raw_fd()
+    );
+    let reader_identity = std::fs::metadata(&reader_path).expect("live reader identity");
+    // Reap first so the direct-child deadline is immaterial to this control.
+    child.wait().expect("direct child exit");
+    let panic = std::panic::catch_unwind(|| {
+        capture_child(
+            child,
+            "retained stdout fixture",
+            CHILD_EXIT_TIMEOUT,
+            Duration::from_millis(50),
+        )
+    })
+    .expect_err("retained pipe must fail");
+    let reader_closed = std::fs::metadata(&reader_path).map_or(true, |current| {
+        (current.dev(), current.ino()) != (reader_identity.dev(), reader_identity.ino())
+    });
+    let group = haider_platform::ProcessId::from_raw(i32::try_from(pid).expect("owned PID range"))
+        .expect("owned fixture process group");
+    haider_platform::signal_process_group_id(group, haider_platform::ProcessSignal::Kill)
+        .expect("kill owned fixture group");
+    assert!(
+        reader_closed,
+        "timeout must close the reader while its writer is still alive"
+    );
+    let message = panic.downcast_ref::<String>().expect("panic receipt");
+    assert!(message.contains("pending streams=[Stdout]"), "{message}");
+    assert!(message.contains("exited="), "{message}");
+    assert!(message.contains("pid ppid pgid stat"), "{message}");
+}
+
+#[test]
 fn bounded_child_wait_failure_names_the_stuck_operation() {
     let child = Command::new("sh")
-        .args(["-c", "sleep 60"])
+        .args(["-c", "exec sleep 60"])
         .spawn()
         .expect("spawn stalled child");
     let panic = std::panic::catch_unwind(|| {
@@ -389,66 +562,71 @@ struct ObservedRun {
     run_id: String,
 }
 
-fn observe_active_run(launcher: &mut Child) -> (ObservedRun, std::thread::JoinHandle<()>) {
-    let stdout = launcher.stdout.take().expect("launcher stdout");
-    let (observed_tx, observed_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut stdout = std::io::BufReader::new(stdout);
-        let mut observation_pending = Some(observed_tx);
-        loop {
-            let mut line = String::new();
-            match stdout.read_line(&mut line) {
-                Ok(0) => {
-                    if let Some(sender) = observation_pending.take() {
-                        let _ = sender.send(Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "launcher exited before publishing the provider-active thinking state",
-                        )));
-                    }
-                    break;
-                }
-                Ok(_) => {
-                    let Ok(document) = serde_json::from_str::<serde_json::Value>(&line) else {
-                        continue;
-                    };
-                    let payload = document.get("payload");
-                    let active = payload.and_then(|value| value.get("type"))
-                        == Some(&serde_json::Value::String("run_state".into()))
-                        && payload
-                            .and_then(|value| value.get("state"))
+/// Consume exactly the readiness line, then return this same pipe to the
+/// shared EOF capture. No observer thread or independently owned reader can
+/// outlive the launcher/capture scope.
+fn observe_active_run(launcher: &mut Child) -> ObservedRun {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut stdout = launcher.stdout.take().expect("launcher stdout");
+    nonblocking_capture(&stdout);
+    let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0];
+        match stdout.read(&mut byte) {
+            Ok(0) => panic!(
+                "launcher exited before provider-active thinking state; child={:?}; {}",
+                launcher.try_wait(),
+                capture_process_states(launcher.id())
+            ),
+            Ok(_) => {
+                line.push(byte[0]);
+                assert!(line.len() <= 8 * 1024 * 1024, "bounded thinking envelope");
+                if byte[0] == b'\n' {
+                    if let Ok(document) = serde_json::from_slice::<serde_json::Value>(&line) {
+                        let payload = document.get("payload");
+                        if payload
+                            .and_then(|value| value.get("type"))
                             .and_then(serde_json::Value::as_str)
-                            == Some("thinking");
-                    if active && let Some(sender) = observation_pending.take() {
-                        let observation = (|| {
-                            Ok(ObservedRun {
+                            == Some("run_state")
+                            && payload
+                                .and_then(|value| value.get("state"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("thinking")
+                        {
+                            let observed = ObservedRun {
                                 run_id: document["run_id"]
                                     .as_str()
-                                    .ok_or_else(|| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            "thinking envelope has no run id",
-                                        )
-                                    })?
+                                    .expect("thinking envelope run id")
                                     .to_owned(),
-                            })
-                        })();
-                        let _ = sender.send(observation);
+                            };
+                            launcher.stdout = Some(stdout);
+                            return observed;
+                        }
                     }
-                }
-                Err(error) => {
-                    if let Some(sender) = observation_pending.take() {
-                        let _ = sender.send(Err(error));
-                    }
-                    break;
+                    line.clear();
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => panic!("read thinking readiness: {error}"),
         }
-    });
-    let observed = observed_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("provider-active thinking state within daemon startup budget")
-        .expect("read provider-active thinking state");
-    (observed, reader)
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let status = launcher.wait();
+            panic!(
+                "thinking readiness timed out; child={status:?}; pending stream=Stdout; {}",
+                capture_process_states(launcher.id())
+            );
+        }
+        // Poll only when this stream has no immediately available byte.
+        let mut ready = [PollFd::new(&stdout, PollFlags::IN)];
+        let wait = Timespec::try_from(Duration::from_millis(25)).expect("readiness poll bound");
+        match poll(&mut ready, Some(&wait)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(error) => panic!("poll thinking readiness: {error}"),
+        }
+    }
 }
 
 fn durable_run_head(store: &Path, observed: &ObservedRun) -> (String, bool) {
@@ -478,7 +656,7 @@ fn durable_run_head(store: &Path, observed: &ObservedRun) -> (String, bool) {
 
 /// Registry #158 signal matrix: a second client interrupt takes the immediate
 /// exit path after its durable `Cancelling` receipt. Test-only fake-provider
-/// settlement is held past the 250 ms linger so the run cannot terminalize
+/// settlement is gated until daemon drain so the run cannot terminalize
 /// first. Both the intact coordinate and a deliberately degraded coordinate
 /// must reach the same absolute launcher deadline, then durably cancel during
 /// graceful drain.
@@ -493,6 +671,15 @@ fn sigint_twice_with_nonterminal_run_honors_absolute_linger_for_both_endpoints()
         let guard = DaemonGuard {
             store: store.path().to_path_buf(),
         };
+        let gate_dir = tempfile::Builder::new()
+            .prefix("hcs-")
+            .tempdir_in("/tmp")
+            .expect("short cancellation gate directory");
+        let gate_path = gate_dir.path().join("cancel.sock");
+        let gate = std::os::unix::net::UnixListener::bind(&gate_path)
+            .expect("bind cancellation settlement gate");
+        gate.set_nonblocking(true)
+            .expect("nonblocking cancellation gate");
         let mut launcher = haider_command(store.path());
         launcher
             .args([
@@ -507,30 +694,48 @@ fn sigint_twice_with_nonterminal_run_honors_absolute_linger_for_both_endpoints()
                 "hold for double interrupt",
             ])
             .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
-            .env("HAIDER_TEST_CANCEL_SETTLE_DELAY_MS", "500")
+            .env("HAIDER_TEST_CANCEL_SETTLE_GATE", &gate_path)
             .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string());
         if remove_endpoint {
             launcher.env("HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY", "1");
         }
         let mut launcher = launcher.spawn().expect("spawn stalled run launcher");
         let daemon_pid = wait_for_daemon_ready(&profile, &guard);
-        let (observed, stdout_reader) = observe_active_run(&mut launcher);
+        let observed = observe_active_run(&mut launcher);
 
         haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
             .expect("first SIGINT to run client");
-        let cancellation_deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let (state, terminal) = durable_run_head(store.path(), &observed);
-            if state == "cancelling" && !terminal {
-                break;
+        let cancellation_deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+        let (mut settlement, _) = loop {
+            match gate.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < cancellation_deadline,
+                        "{case} first SIGINT did not reach cancellation settlement gate"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{case} accept cancellation gate: {error}"),
             }
-            assert!(
-                Instant::now() < cancellation_deadline,
-                "{case} first SIGINT did not retain a durable nonterminal cancellation: \
-                 state={state} terminal={terminal}"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        };
+        settlement
+            .set_read_timeout(Some(haider_platform::TEST_WAIT_TIMEOUT))
+            .expect("cancellation gate read timeout");
+        let mut ready = [0];
+        settlement
+            .read_exact(&mut ready)
+            .expect("committed cancellation gate receipt");
+        assert_eq!(ready, [1]);
+        let (state, terminal) = durable_run_head(store.path(), &observed);
+        assert_eq!(
+            state, "cancelling",
+            "{case} gate must follow committed cancellation"
+        );
+        assert!(
+            !terminal,
+            "{case} gated cancellation must remain nonterminal"
+        );
         haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
             .expect("second SIGINT to run client");
         if remove_endpoint {
@@ -538,7 +743,6 @@ fn sigint_twice_with_nonterminal_run_honors_absolute_linger_for_both_endpoints()
                 .expect("unlink daemon endpoint during double-interrupt teardown");
         }
         let client = wait_for_output(launcher, &format!("{case} double-interrupt client"));
-        stdout_reader.join().expect("join launcher stdout reader");
         assert!(
             !client.status.success(),
             "double-interrupted client unexpectedly succeeded: stderr={}",
@@ -571,6 +775,7 @@ fn sigint_twice_with_nonterminal_run_honors_absolute_linger_for_both_endpoints()
         let (final_state, terminal) = durable_run_head(store.path(), &observed);
         assert!(terminal, "{case} graceful drain left the run nonterminal");
         assert_eq!(final_state, "cancelled");
+        drop(settlement);
     }
 }
 
@@ -858,12 +1063,11 @@ fn absolute_idle_linger_durably_settles_a_nonterminal_run() {
         .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string())
         .spawn()
         .expect("spawn hanging run launcher");
-    let (observed, stdout_reader) = observe_active_run(&mut launcher);
+    let observed = observe_active_run(&mut launcher);
     let daemon_pid = guard.pid().expect("spawned daemon PID");
 
     launcher.kill().expect("SIGKILL run launcher");
     let output = wait_for_output(launcher, "SIGKILLed nonterminal run launcher");
-    stdout_reader.join().expect("join launcher stdout reader");
     assert!(
         !output.status.success(),
         "killed launcher must not exit successfully"
@@ -1313,12 +1517,10 @@ fn parent_exit_leaves_the_daemon_running() {
         store: store.path().to_path_buf(),
     };
 
-    let started = Instant::now();
     let output = output_with_timeout(
         &mut haider_command(store.path()),
         "haider launcher to spawn the persistent daemon and exit",
     );
-    let launch_elapsed = started.elapsed();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("daemon ready"));
@@ -1326,16 +1528,9 @@ fn parent_exit_leaves_the_daemon_running() {
         stdout.contains("spawned"),
         "first launch must spawn: {stdout}"
     );
-    let launch_deadline = if std::env::var("CI").is_ok() {
-        Duration::from_secs(10)
-    } else {
-        Duration::from_millis(950)
-    };
-    assert!(
-        launch_elapsed < launch_deadline,
-        "an authenticated own child must skip the 40 x 25 ms loser grace; launch took \
-         {launch_elapsed:?} (deadline {launch_deadline:?})"
-    );
+    // Success and the positive readiness receipt gate this assertion. Launch
+    // latency under sandbox/image validation is not evidence of the loser path;
+    // the launcher unit tests pin that path independently with a paused clock.
 
     // The launcher has fully exited; the daemon must still serve, and the
     // daemon log must exist owner-only in the profile store.
@@ -1353,6 +1548,27 @@ fn parent_exit_leaves_the_daemon_running() {
     }
 
     guard.terminate_and_wait(&profile.endpoint_path);
+}
+
+#[test]
+fn parent_exit_liveness_assertion_rejects_a_stopped_daemon() {
+    ensure_haiderd_built();
+    let store = tempfile::tempdir().expect("store dir");
+    let profile = resolved_for(store.path());
+    let guard = DaemonGuard {
+        store: store.path().to_path_buf(),
+    };
+    let output = output_with_timeout(
+        &mut haider_command(store.path()),
+        "negative-control launcher",
+    );
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("daemon ready"));
+    guard.terminate_and_wait(&profile.endpoint_path);
+    assert!(
+        std::panic::catch_unwind(|| assert_daemon_serves(&profile)).is_err(),
+        "post-exit liveness must reject a daemon that genuinely stopped"
+    );
 }
 
 // MUTATION CHECK (W3b1/R8 numeric race-loser contract): map

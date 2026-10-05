@@ -52,6 +52,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
+// Fixture watchdog only. Readiness/Stop assertions below use observed events;
+// the bound covers full-suite image work and shared-machine scheduling.
+const RUNTIME_FIXTURE_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
+
 struct FixedProviderFactory {
     provider: Arc<FakeProvider>,
 }
@@ -486,7 +490,7 @@ async fn wait_for_run_state(
     run_id: &RunId,
     expected: RunState,
 ) -> Vec<haider_protocol::envelope::RawEnvelope> {
-    match timeout(Duration::from_secs(12), async {
+    match timeout(RUNTIME_FIXTURE_DEADLINE, async {
         loop {
             let events = store.read(session_id, 0, 4096).await.expect("journal");
             if events.iter().any(|event| {
@@ -498,7 +502,7 @@ async fn wait_for_run_state(
             }) {
                 break events;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -521,7 +525,7 @@ async fn abandon_active_graph_and_wait_for_done(
     run_id: &RunId,
     device_id: DeviceId,
 ) -> Vec<haider_protocol::envelope::RawEnvelope> {
-    let pending_menu = timeout(Duration::from_secs(12), async {
+    let pending_menu = timeout(RUNTIME_FIXTURE_DEADLINE, async {
         loop {
             let events = store.read(session_id, 0, 4096).await.expect("journal");
             if let Some(opening) = events.into_iter().find(|event| {
@@ -541,7 +545,7 @@ async fn abandon_active_graph_and_wait_for_done(
                 };
                 break (menu, opening.seq);
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
@@ -915,12 +919,12 @@ async fn permission_poll_timeout_leaves_the_card_actionable_and_undispatched() {
         device_id.clone(),
     )
     .await;
-    let events = timeout(Duration::from_secs(12), async {
+    let events = timeout(RUNTIME_FIXTURE_DEADLINE, async {
         loop {
             if backend.polls.load(Ordering::Acquire) == 1 {
                 break store.read(&session_id, 0, 4096).await.expect("journal");
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -1053,7 +1057,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
     )
     .await;
 
-    let before_restart = timeout(Duration::from_secs(12), async {
+    let before_restart = timeout(RUNTIME_FIXTURE_DEADLINE, async {
         loop {
             let events = store.read(&session_id, 0, 4096).await.expect("journal");
             if events.iter().any(|event| {
@@ -1065,7 +1069,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
             }) {
                 break events;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -1496,7 +1500,7 @@ async fn turn_cancel_emergency_stops_backend_and_journals_computer_cancelled() {
     )
     .await;
 
-    timeout(Duration::from_secs(8), backend.entered.notified())
+    timeout(RUNTIME_FIXTURE_DEADLINE, backend.entered.notified())
         .await
         .expect("fake backend enters in-flight wait");
     hub.cancel_internal_turn(TurnCancelCommand {
@@ -1767,7 +1771,7 @@ async fn presence_stop_cancels_the_in_flight_action_and_the_run() {
     });
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let presence =
-        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+        crate::cu_presence::CuPresence::new(RUNTIME_FIXTURE_DEADLINE, Duration::from_secs(1));
     let factory: Arc<dyn TurnToolFactory> = Arc::new(
         BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
             .with_presence(Arc::clone(&presence)),
@@ -1801,7 +1805,7 @@ async fn presence_stop_cancels_the_in_flight_action_and_the_run() {
         device_id.clone(),
     )
     .await;
-    timeout(Duration::from_secs(8), backend.entered.notified())
+    timeout(RUNTIME_FIXTURE_DEADLINE, backend.entered.notified())
         .await
         .expect("backend enters the in-flight wait");
 
@@ -1905,8 +1909,9 @@ async fn presence_stop_during_a_parked_click_never_clicks_and_cancels_the_run() 
     let provider = Arc::new(FakeProvider::new(steps));
     let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
     let presence =
-        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+        crate::cu_presence::CuPresence::new(RUNTIME_FIXTURE_DEADLINE, Duration::from_secs(1));
     let pointers = Arc::new(AtomicUsize::new(0));
+    presence.set_pointer_ack_timeout_for_test(RUNTIME_FIXTURE_DEADLINE);
     presence.register_renderer(
         haider_tools::presence::PresenceSurface::Screen,
         Arc::new({
@@ -1954,7 +1959,7 @@ async fn presence_stop_during_a_parked_click_never_clicks_and_cancels_the_run() 
     )
     .await;
     // Pointers: screenshot (no ack wait) then the first click, which parks.
-    timeout(Duration::from_secs(8), async {
+    timeout(RUNTIME_FIXTURE_DEADLINE, async {
         while pointers.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -1990,7 +1995,7 @@ async fn presence_stop_during_a_parked_click_never_clicks_and_cancels_the_run() 
 async fn cancel_between_rounds(via_presence: bool) {
     let root = tempfile::tempdir().expect("profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
-    let provider = Arc::new(FakeProvider::new(vec![
+    let (provider, round_barrier) = FakeProvider::new(vec![
         FakeStep::EmitToolCall {
             call_id: "between-0".into(),
             name: "computer".into(),
@@ -2002,7 +2007,7 @@ async fn cancel_between_rounds(via_presence: bool) {
         FakeStep::ExpectToolResult {
             call_id: "between-0".into(),
         },
-        FakeStep::Delay { ms: 5_000 },
+        FakeStep::Delay { ms: 0 },
         FakeStep::EmitToolCall {
             call_id: "between-1".into(),
             name: "computer".into(),
@@ -2011,10 +2016,12 @@ async fn cancel_between_rounds(via_presence: bool) {
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-    ]));
+    ])
+    .with_stream_barrier(2, 1);
+    let provider = Arc::new(provider);
     let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
     let presence =
-        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+        crate::cu_presence::CuPresence::new(RUNTIME_FIXTURE_DEADLINE, Duration::from_secs(1));
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let factory: Arc<dyn TurnToolFactory> = Arc::new(
         BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
@@ -2050,25 +2057,11 @@ async fn cancel_between_rounds(via_presence: bool) {
         device_id.clone(),
     )
     .await;
-    // Wait for the screenshot's tool result, then let the next provider
-    // round start (it sits in its 5 s delay).
-    timeout(Duration::from_secs(8), async {
-        loop {
-            let events = store.read(&session_id, 0, 4096).await.expect("journal");
-            if events.iter().any(|event| {
-                matches!(
-                    event.payload.decode_event(),
-                    Ok(EventPayload::ToolResult { ref call_id, .. }) if call_id == "between-0"
-                )
-            }) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("screenshot settles");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Request two has consumed the screenshot result and is parked before
+    // its next action. This event cannot be missed or outrun by scheduling.
+    timeout(RUNTIME_FIXTURE_DEADLINE, round_barrier.wait_until_entered())
+        .await
+        .expect("second provider round reaches its barrier");
     if via_presence {
         assert_eq!(
             presence.stop(haider_tools::presence::PresenceSurface::Screen),
@@ -2166,7 +2159,7 @@ async fn cancel_while_settling(via_presence: bool, iteration: usize) {
     }
     let provider = Arc::new(FakeProvider::new(steps));
     let presence =
-        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+        crate::cu_presence::CuPresence::new(RUNTIME_FIXTURE_DEADLINE, Duration::from_secs(1));
     let backend = Arc::new(CancelOnReturnBackend {
         fire: Mutex::new(None),
     });
@@ -2276,7 +2269,7 @@ impl ScreenshotRedactionPolicy for ParkFirstRedaction {
             self.release
                 .lock()
                 .expect("release lock")
-                .recv_timeout(std::time::Duration::from_secs(10))
+                .recv_timeout(RUNTIME_FIXTURE_DEADLINE)
                 .expect("redaction release");
         }
         Ok(std::borrow::Cow::Borrowed(png))
@@ -2456,7 +2449,7 @@ async fn dispatcher_conceal_result(action: &str, reply: ConcealReply) {
         log: Arc::clone(&log),
     });
     let presence =
-        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+        crate::cu_presence::CuPresence::new(RUNTIME_FIXTURE_DEADLINE, Duration::from_secs(1));
     presence.register_renderer(
         haider_tools::presence::PresenceSurface::Screen,
         Arc::new({
@@ -2471,6 +2464,9 @@ async fn dispatcher_conceal_result(action: &str, reply: ConcealReply) {
             }
         }),
     );
+    if matches!(reply, ConcealReply::Ack | ConcealReply::Failed) {
+        presence.set_conceal_ack_timeout_for_test(RUNTIME_FIXTURE_DEADLINE);
+    }
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let factory: Arc<dyn TurnToolFactory> = Arc::new(
         BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
@@ -2683,7 +2679,7 @@ async fn dispatcher_conceals_capturable_presence_around_screenshot_and_inspect()
         log: Arc::clone(&log),
     });
     let presence =
-        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+        crate::cu_presence::CuPresence::new(RUNTIME_FIXTURE_DEADLINE, Duration::from_secs(1));
     presence.register_renderer(
         haider_tools::presence::PresenceSurface::Screen,
         Arc::new({
@@ -2697,6 +2693,7 @@ async fn dispatcher_conceals_capturable_presence_around_screenshot_and_inspect()
             }
         }),
     );
+    presence.set_conceal_ack_timeout_for_test(RUNTIME_FIXTURE_DEADLINE);
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -2741,7 +2738,7 @@ async fn dispatcher_conceals_capturable_presence_around_screenshot_and_inspect()
         device_id.clone(),
     )
     .await;
-    timeout(Duration::from_secs(10), entered_rx.recv())
+    timeout(RUNTIME_FIXTURE_DEADLINE, entered_rx.recv())
         .await
         .expect("image admission entered")
         .expect("redaction observer");
@@ -2805,8 +2802,9 @@ async fn slow_cancel_commit_still_settles_a_stop_refused_action_as_cancelled() {
     let provider = Arc::new(FakeProvider::new(steps));
     let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
     let presence =
-        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+        crate::cu_presence::CuPresence::new(RUNTIME_FIXTURE_DEADLINE, Duration::from_secs(1));
     presence.set_stop_cancel_delay(Duration::from_millis(400));
+    presence.set_pointer_ack_timeout_for_test(RUNTIME_FIXTURE_DEADLINE);
     let pointers = Arc::new(AtomicUsize::new(0));
     presence.register_renderer(
         haider_tools::presence::PresenceSurface::Screen,
@@ -2854,7 +2852,7 @@ async fn slow_cancel_commit_still_settles_a_stop_refused_action_as_cancelled() {
         device_id.clone(),
     )
     .await;
-    timeout(Duration::from_secs(8), async {
+    timeout(RUNTIME_FIXTURE_DEADLINE, async {
         while pointers.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }

@@ -238,7 +238,7 @@ async fn anthropic_oauth_subscription_is_bearer_beta_without_api_key_and_fixed_o
         result = &mut execution => {
             panic!("fixed connection resolver did not stall the request: {result:?}");
         }
-        observed = tokio::time::timeout(Duration::from_secs(1), resolution_observed) => {
+        observed = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, resolution_observed) => {
             observed.expect("reqwest must consume the pinned fixed resolver");
         }
     }
@@ -2333,7 +2333,7 @@ async fn non_reading_peer_hits_typed_request_upload_deadline() {
         .expect("server received request headers");
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(270)).await;
-    let error = tokio::time::timeout(Duration::from_secs(1), opening)
+    let error = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, opening)
         .await
         .expect("upload must have a deadline")
         .expect("provider task")
