@@ -1160,11 +1160,7 @@ fn normalize_provider_inventory(
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         });
     summary.inventory = summary.inventory.at_time(now);
-    if matches!(
-        summary.inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
-            | haider_rpc::ModelInventoryWire::Unavailable { .. }
-    ) {
+    if !summary.has_known_models() {
         summary.models.clear();
         summary.model_details.clear();
         summary.default_model = None;
@@ -1269,6 +1265,20 @@ impl ProvidersState {
     /// the caller keeps its current figure rather than inventing a number.
     #[must_use]
     pub fn declared_window(&self, provider: &str, model: &str) -> Option<u64> {
+        self.model_detail(provider, model)
+            .and_then(|detail| detail.context_window)
+    }
+
+    /// Maximum output budget for this exact provider/model row. New daemons
+    /// always project a declared or pinned fallback value; `None` preserves
+    /// compatibility with older daemons.
+    #[must_use]
+    pub fn declared_output_limit(&self, provider: &str, model: &str) -> Option<u64> {
+        self.model_detail(provider, model)
+            .and_then(|detail| detail.max_output_tokens)
+    }
+
+    fn model_detail(&self, provider: &str, model: &str) -> Option<&haider_rpc::ModelDetailWire> {
         self.providers
             .iter()
             .find(|summary| summary.provider == provider)
@@ -1278,7 +1288,13 @@ impl ProvidersState {
                     .iter()
                     .find(|detail| detail.name == model)
             })
-            .and_then(|detail| detail.context_window)
+    }
+
+    /// Whether the catalog carries a detail row for `model` at all — then
+    /// its (possibly absent) window is the catalog's authoritative answer.
+    #[must_use]
+    pub fn model_listed(&self, provider: &str, model: &str) -> bool {
+        self.model_detail(provider, model).is_some()
     }
 }
 
@@ -4177,6 +4193,74 @@ pub struct InboxCounts {
     pub unseen: usize,
 }
 
+/// The open full-detail view of one tool row (973-tui-toolview).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolDetailView {
+    /// The item id the view was opened for — resolved against the viewed
+    /// transcript every frame, so a row that vanished closes nothing and
+    /// shows an honest "no longer available" line.
+    pub item_id: String,
+    /// First display row shown. The renderer clamps it against the rows it
+    /// actually produced and publishes the clamp in `scroll_max`.
+    pub scroll: usize,
+    /// The largest meaningful `scroll`, as of the last frame.
+    pub scroll_max: std::cell::Cell<usize>,
+    /// Display rows one page moves, as of the last frame.
+    pub page: std::cell::Cell<usize>,
+    /// The wrapped body of the last paint, reused while its key holds
+    /// (973 repair: a scroll re-slices it instead of re-diffing).
+    pub layout: std::cell::RefCell<Option<DetailLayout>>,
+    /// Where the transcript under the view stood when it opened — the
+    /// CONTENT the top row showed, not a raw row offset (973 repair 5).
+    /// Closing hands it back to the renderer, which puts that content on
+    /// the top row again against whatever geometry the frame then has.
+    pub return_to: Option<ScrollAnchor>,
+}
+
+/// A content-anchored transcript position (973-tui-toolview repair 5).
+///
+/// `scroll_back` counts rows up from the BOTTOM, and the transcript layout
+/// cache only ESTIMATES the height of history it has not measured. Any
+/// re-measure below the viewport therefore moves the content a raw offset
+/// points at. The anchor names the content instead: the entry on the top
+/// row and the wrapped row inside it. The renderer publishes one every
+/// frame and re-derives `scroll_back` from it when the geometry was re-laid
+/// out under an untouched offset, and when the full-detail view closes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrollAnchor {
+    /// Which transcript it belongs to: `session`, or `chip:<agent>`.
+    pub surface: String,
+    /// The display entry on the top row; `None` for the prefix rows above
+    /// entry 0 (the origin line, a chip's metrics).
+    pub entry: Option<usize>,
+    /// That entry's item id, when it has one: a later mutation that put a
+    /// different item at the index invalidates the anchor rather than
+    /// landing on the wrong content.
+    pub item: Option<String>,
+    /// The wrapped row, inside the entry (or the prefix), on the top row.
+    pub row: u64,
+    /// The bottom offset this anchor was painted at.
+    pub scroll_back: u64,
+}
+
+/// Everything the full-detail body is a function of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailLayoutKey {
+    pub width: u16,
+    /// The viewed projection's entry storage (main vs. a subagent chip).
+    pub source: usize,
+    pub revision: u64,
+    pub mutation: u64,
+}
+
+/// A cached full-detail body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailLayout {
+    pub key: DetailLayoutKey,
+    pub result: Option<Vec<crate::toolfold::Segment>>,
+    pub rows: std::rc::Rc<Vec<crate::toolview::DisplayRow>>,
+}
+
 /// Incremental search over the currently attached transcript.  Matching is
 /// entry based so the renderer can jump through its existing wrapped-row
 /// geometry without copying or reflowing the transcript.
@@ -4404,6 +4488,11 @@ pub enum Hit {
     ToolFoldToggle(String),
     /// The bounded expanded region's `⏎ show all` affordance.
     ToolShowAll(String),
+    /// A collapsed row's `… +N lines (⌃O to expand)` affordance — opens the
+    /// row's full-detail view (973-tui-toolview).
+    ToolDetail(String),
+    /// The full-detail view's `esc back` header — closes the view.
+    ToolDetailClose,
     /// The live background-task line under the composer — click expands it
     /// into the per-task list, and folds it again.
     TaskLineToggle,
@@ -5054,6 +5143,9 @@ pub struct ModelPickerRow {
     /// `oauth` / `api` — what a turn on this row meters.
     pub auth: &'static str,
     pub context_window: Option<u64>,
+    /// Daemon-declared row origin; `None` for placeholders, mixed groups and
+    /// older daemons.
+    pub source: Option<haider_rpc::ModelDetailSourceWire>,
     /// Age in milliseconds of the provider inventory used for this row.
     pub inventory_age_ms: Option<u64>,
     /// Provider availability — unavailable rows render dimmed and refuse
@@ -5245,6 +5337,13 @@ pub struct AppModel {
     /// ⌃G / `/tokens` context panel (sim tui.js:2946-2977) — session
     /// surfaces only; esc closes.
     pub token_panel: bool,
+    /// The (provider, model) pair the context meter last resolved against
+    /// (973-context-meter), maintained by [`Self::refresh_context_window`].
+    meter_identity: Option<(String, String)>,
+    /// The latest snapshot at the moment the identity pair last CHANGED:
+    /// while it is still the latest, it describes the previous model, so
+    /// its window may not stand in for the current model's.
+    meter_snapshot_before_switch: Option<haider_protocol::context::ContextFootprint>,
     /// `/tree` — selected row (sim treeSel).
     pub tree_sel: usize,
     /// `/tree` — the VIEWED branch (`None` = the root/main branch; sim
@@ -5311,6 +5410,9 @@ pub struct AppModel {
     /// Creation-only dated allocation. The leaf named by `cwd` remains
     /// absent until the daemon brokers the first workspace-writing effect.
     pub pending_workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+    /// Display-only path for the next dated allocation. The launcher uses
+    /// this instead of implying its shell cwd is the new session workspace.
+    pub pending_workspace_display: Option<String>,
     /// Sanitised process launch directory used for TUI-origin registration.
     /// Android and non-local surfaces leave this absent.
     pub launch_origin_path: Option<haider_protocol::session::LaunchOriginPathV1>,
@@ -5319,6 +5421,20 @@ pub struct AppModel {
     /// Canonical workspace of the attached session, learned from
     /// `SessionSummary` or the create response.
     pub session_workspace_cwd: Option<String>,
+    /// The attached session's dated leaf is resolved but not on disk yet
+    /// (it materialises on the first write). Set by the live driver's
+    /// presence probe; the session header and origin line speak it.
+    pub session_workspace_uncreated: bool,
+    /// The user's home directory, ABSOLUTE, when the host process knows it
+    /// (the executable seeds it from `HOME`). Tool rows shorten paths under
+    /// it to `~/…`; `None` (every test fixture) shortens nothing.
+    pub home_dir: Option<String>,
+    /// The full-detail view of one tool row (973-tui-toolview): ⌃O on a
+    /// focused row, or a click on its `… +N lines` affordance. It COVERS
+    /// the transcript and owns the keys while open; closing it (Esc, ⌃O,
+    /// q, ⏎) returns to the transcript exactly where it was — the view
+    /// never writes the transcript's scroll state.
+    pub tool_detail: Option<ToolDetailView>,
     /// Per-open card counter: `/voice` and `/tools` mint a FRESH menu id
     /// each time, exactly as the sim's `nid()` does (review r2 P1-1 — fixed
     /// ids let a stale answer apply its consequences to a later card).
@@ -5484,6 +5600,14 @@ pub struct AppModel {
     /// the model cannot know which wrapped row an entry lands on — and
     /// clears it only when it LANDS, exactly as `pending_jump` does.
     pub pending_tool_reveal: std::cell::RefCell<Option<String>>,
+    /// The content on the transcript's top row as of the LAST frame, while
+    /// scrolled back (973 repair 5) — renderer-written, the `scroll_max`
+    /// frame-feedback discipline. `None` while following the bottom.
+    pub scroll_anchor: std::cell::RefCell<Option<ScrollAnchor>>,
+    /// A one-shot "put this content back on the top row" (973 repair 5),
+    /// armed when the full-detail view closes and resolved by the next
+    /// frame against its own geometry.
+    pub scroll_restore: std::cell::RefCell<Option<ScrollAnchor>>,
     /// Tool-row disclosure states read from the profile at boot, keyed by
     /// session id (verify 1, F3). Consulted the FIRST time a session is
     /// opened in this process; its own slot is authoritative afterwards.
@@ -5883,6 +6007,8 @@ impl Default for AppModel {
         Self {
             screen: Screen::Boot,
             token_panel: false,
+            meter_identity: None,
+            meter_snapshot_before_switch: None,
             tree_sel: 0,
             tree_view: None,
             pending_jump: std::cell::RefCell::new(None),
@@ -5936,9 +6062,13 @@ impl Default for AppModel {
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
             cwd: "/".to_owned(),
             pending_workspace_allocation: None,
+            pending_workspace_display: None,
             launch_origin_path: None,
             session_dir: "~/dev/enterprise-suite".to_owned(),
             session_workspace_cwd: None,
+            session_workspace_uncreated: false,
+            home_dir: None,
+            tool_detail: None,
             card_seq: 0,
             vfs: vfs_seed(),
             launcher_shellout: None,
@@ -5991,6 +6121,8 @@ impl Default for AppModel {
             tasks_line_expanded: false,
             tasks_line_page: 0,
             pending_tool_reveal: std::cell::RefCell::new(None),
+            scroll_anchor: std::cell::RefCell::new(None),
+            scroll_restore: std::cell::RefCell::new(None),
             persisted_tool_rows: std::collections::BTreeMap::new(),
             session_last_models: std::collections::HashMap::new(),
             session_kinds: std::collections::HashMap::new(),
@@ -7084,15 +7216,7 @@ impl AppModel {
     #[must_use]
     pub fn current_pair_detail(&self) -> Option<&haider_rpc::ModelDetailWire> {
         self.providers
-            .providers
-            .iter()
-            .find(|summary| summary.provider == self.identity.provider)
-            .and_then(|summary| {
-                summary
-                    .model_details
-                    .iter()
-                    .find(|detail| detail.name == self.identity.model_short)
-            })
+            .model_detail(&self.identity.provider, &self.identity.model_short)
     }
 
     /// Whether the session's CURRENT pair accepts image attachments, as the
@@ -7287,7 +7411,9 @@ impl AppModel {
         let had_overlay = self.transcript_search.is_some()
             || self.search_jump.borrow().is_some()
             || self.mention_completion.is_some()
-            || self.inbox_open;
+            || self.inbox_open
+            || self.tool_detail.is_some();
+        self.tool_detail = None;
         self.transcript_search = None;
         *self.search_jump.borrow_mut() = None;
         self.mention_completion = None;
@@ -8441,6 +8567,9 @@ impl AppModel {
             self.dirty = true;
             return;
         }
+        if self.tool_detail_key(key) {
+            return;
+        }
         if self.screen == Screen::Loom
             && self
                 .loom_authoring
@@ -8562,7 +8691,7 @@ impl AppModel {
                 // deliberately NOT used: it is tmux's own default prefix,
                 // which is exactly the terminal this fallback exists for.
                 KeyCode::Char('o') if matches!(self.screen, Screen::Session | Screen::Subagent) => {
-                    self.toggle_all_tool_rows();
+                    self.ctrl_o_tool_rows();
                 }
                 KeyCode::Char('f') if matches!(self.screen, Screen::Session | Screen::Subagent) => {
                     self.open_transcript_search();
@@ -11702,19 +11831,70 @@ impl AppModel {
 
     /// Re-derives the identity's context window from the discovered catalog
     /// (W5g-1: real limits, never guessed). A provider-declared window
-    /// always wins; with none declared the current figure stands — seed
-    /// defaults remain honest fallbacks, not fabrications. Idempotent, so
-    /// catalog arrivals may call it even for a PINNED identity: the pin
-    /// protects the user's provider/model choice, not a stale number.
+    /// always wins. With none declared, a LIVE identity's window becomes
+    /// unknown (`0`): neither the previous model's window nor the profile's
+    /// output budget may stand in for it (973-context-meter — the owner's
+    /// "always 100%" was `used / 4,096`). Only the demo, which fabricates
+    /// locally, keeps its sim seed. Idempotent, so catalog arrivals may call
+    /// it even for a PINNED identity: the pin protects the user's
+    /// provider/model choice, not a stale number.
     pub fn refresh_context_window(&mut self) {
-        if let Some(window) = self
+        let pair = (
+            self.identity.provider.clone(),
+            self.identity.model_short.clone(),
+        );
+        if self.meter_identity.as_ref() != Some(&pair) {
+            if self.meter_identity.is_some() {
+                self.meter_snapshot_before_switch = self.projection.latest_footprint().cloned();
+            }
+            self.meter_identity = Some(pair);
+        }
+        let declared = self
             .providers
-            .declared_window(&self.identity.provider, &self.identity.model_short)
-            && self.identity.context_window != window
-        {
+            .declared_window(&self.identity.provider, &self.identity.model_short);
+        let window = match declared {
+            Some(window) => window,
+            None if self.mode.fabricates_locally() => return,
+            None => 0,
+        };
+        if self.identity.context_window != window {
             self.identity.context_window = window;
             self.dirty = true;
         }
+    }
+
+    /// The session context meter (973-context-meter): the latest durable
+    /// snapshot against the CURRENT model's window, through the one pure
+    /// resolution every surface renders.
+    #[must_use]
+    pub fn context_meter(&self) -> crate::context_meter::ContextMeter {
+        // A snapshot's window may stand in for an undeclared one only while
+        // the catalog has no row for the current model (not yet loaded, or
+        // a model outside it). When the catalog lists the model without a
+        // window, "unknown" is the answer — a snapshot window then belongs
+        // to a previously selected model.
+        // Nor may a snapshot taken before the last model switch: until the
+        // new model's first request it describes the previous model.
+        let snapshot_predates_model = self.meter_snapshot_before_switch.is_some()
+            && self.projection.latest_footprint() == self.meter_snapshot_before_switch.as_ref();
+        let snapshot_window_allowed = self.mode.fabricates_locally()
+            || !(snapshot_predates_model
+                || self
+                    .providers
+                    .model_listed(&self.identity.provider, &self.identity.model_short));
+        crate::context_meter::ContextMeter::resolve(
+            self.projection.latest_footprint(),
+            self.projection.context_tokens(),
+            self.identity.context_window,
+            snapshot_window_allowed,
+            |window| {
+                crate::context_meter::derived_reserved_output(
+                    self.providers
+                        .declared_output_limit(&self.identity.provider, &self.identity.model_short),
+                    window,
+                )
+            },
+        )
     }
 
     /// The auth flavor of the CURRENT identity pair — `oauth` or `api` —
@@ -11897,19 +12077,16 @@ impl AppModel {
         };
         // Adopt only once the provider's MODEL truth is here: a
         // half-adopted identity (right provider, demo-seed model) would
-        // send a foreign slug to the subscription API and 400. The next
-        // snapshot completes the picture; nothing is lost by waiting.
+        // send a foreign slug to the subscription API and 400. Static
+        // catalog rows are model truth even when remote discovery fails.
         let model_known = self
             .providers
             .providers
             .iter()
             .find(|summary| summary.provider == provider)
             .is_some_and(|summary| {
-                !matches!(
-                    summary.inventory,
-                    haider_rpc::ModelInventoryWire::NeverFetched
-                        | haider_rpc::ModelInventoryWire::Unavailable { .. }
-                ) && (summary.default_model.is_some() || !summary.models.is_empty())
+                summary.has_known_models()
+                    && (summary.default_model.is_some() || !summary.models.is_empty())
             });
         if !model_known {
             return;
@@ -16493,7 +16670,7 @@ impl AppModel {
 
     /// The projection currently on screen. A missing child has no rows;
     /// it must never fall back to navigating the hidden main transcript.
-    fn viewed_tool_projection(&self) -> Option<&SessionProjection> {
+    pub(crate) fn viewed_tool_projection(&self) -> Option<&SessionProjection> {
         match self.screen {
             Screen::Subagent => self.viewed_chip().map(|chip| &chip.transcript),
             Screen::Session => Some(&self.projection),
@@ -16590,6 +16767,116 @@ impl AppModel {
         true
     }
 
+    /// Where tool-row paths shorten from: the attached session's canonical
+    /// workspace (else the process cwd), then the home directory.
+    #[must_use]
+    pub fn tool_path_context(&self) -> crate::toolview::PathContext {
+        let workspace = self
+            .session_workspace_cwd
+            .clone()
+            .or_else(|| (!self.cwd.is_empty()).then(|| self.cwd.clone()));
+        crate::toolview::PathContext {
+            workspace,
+            home: self.home_dir.clone(),
+        }
+    }
+
+    /// Open the full-detail view of one tool row of the VIEWED transcript.
+    /// Answers `false` (and opens nothing) for an id that is not a tool row
+    /// there — a stale click can never open a view onto another surface.
+    pub fn open_tool_detail(&mut self, item_id: &str) -> bool {
+        if !self.tool_row_ids().iter().any(|id| id == item_id) {
+            return false;
+        }
+        // The last frame's anchor is where the reader is — unless the
+        // offset moved since that frame painted (then there is no content
+        // position to promise yet, and the raw offset stands).
+        let return_to = self
+            .scroll_anchor
+            .borrow()
+            .clone()
+            .filter(|anchor| anchor.scroll_back == self.scroll_back.get());
+        self.tool_detail = Some(ToolDetailView {
+            item_id: item_id.to_owned(),
+            return_to,
+            ..ToolDetailView::default()
+        });
+        self.dirty = true;
+        true
+    }
+
+    /// Close the full-detail view and put the reader back EXACTLY where
+    /// they were (owner: "Esc back identical"): the content that was on the
+    /// transcript's top row returns to it, whatever the layout cache
+    /// re-measured underneath meanwhile (973 repair 5).
+    pub fn close_tool_detail(&mut self) {
+        if let Some(view) = self.tool_detail.take() {
+            // Stamped with the offset as of the close, so a gesture that
+            // moves it before the next frame (a jump to the bottom) wins.
+            *self.scroll_restore.borrow_mut() = view.return_to.map(|anchor| ScrollAnchor {
+                scroll_back: self.scroll_back.get(),
+                ..anchor
+            });
+            self.dirty = true;
+        }
+    }
+
+    /// Scroll the open full-detail view by `delta` display rows, clamped to
+    /// the last frame's measured maximum.
+    pub fn scroll_tool_detail(&mut self, delta: isize) {
+        let Some(view) = self.tool_detail.as_mut() else {
+            return;
+        };
+        let max = view.scroll_max.get();
+        let current = view.scroll.min(max);
+        view.scroll = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta.unsigned_abs()).min(max)
+        };
+        self.dirty = true;
+    }
+
+    /// ⌃O. With a tool row FOCUSED (⌥N/⌥P, `/collapse next`, a click) it
+    /// opens that row's full detail — Claude Code's "ctrl+o to expand". With
+    /// no focus it keeps its 971 meaning, ⌥T's Alt-free twin: every row at
+    /// once (owner ruling 4).
+    pub fn ctrl_o_tool_rows(&mut self) {
+        if let Some(id) = self.focused_tool_row().map(str::to_owned)
+            && self.open_tool_detail(&id)
+        {
+            return;
+        }
+        self.toggle_all_tool_rows();
+    }
+
+    /// Keys while the full-detail view is open. Answers `true` when the key
+    /// was the view's; chords it does not own (⌃C, ⌃T, …) fall through.
+    fn tool_detail_key(&mut self, key: KeyEvent) -> bool {
+        if self.tool_detail.is_none() {
+            return false;
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self
+            .tool_detail
+            .as_ref()
+            .map_or(1, |view| view.page.get().max(1));
+        let page = isize::try_from(page).unwrap_or(1);
+        match key.code {
+            KeyCode::Char('o') if control => self.close_tool_detail(),
+            _ if control => return false,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close_tool_detail(),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_tool_detail(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_tool_detail(1),
+            KeyCode::PageUp => self.scroll_tool_detail(-page),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_tool_detail(page),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_tool_detail(isize::MIN),
+            KeyCode::End | KeyCode::Char('G') => self.scroll_tool_detail(isize::MAX),
+            _ => {}
+        }
+        true
+    }
+
     /// ⌥T / ⌃O / `/collapse` — every tool row at once.
     pub fn toggle_all_tool_rows(&mut self) {
         self.toolfold.toggle_all();
@@ -16634,7 +16921,7 @@ impl AppModel {
             crate::projection::TranscriptEntry::Item(block)
                 if block.item_id.as_str() == item_id =>
             {
-                Some(crate::render::retained_output_rows(block, width))
+                Some(crate::render::expanded_display_rows(block, width))
             }
             _ => None,
         }) else {
@@ -18312,6 +18599,9 @@ impl AppModel {
         self.session_title = None;
         self.session_name = None;
         self.session_workspace_cwd = None;
+        // Re-judged by the live presence probe for the new surface.
+        self.session_workspace_uncreated = false;
+        self.tool_detail = None;
         self.launch_origin = None;
         self.lockdown_provider = None;
         self.lockdown_boundary_known = false;
@@ -18343,6 +18633,8 @@ impl AppModel {
         self.tasks_line_expanded = false;
         self.tasks_line_page = 0;
         *self.pending_tool_reveal.borrow_mut() = None;
+        *self.scroll_anchor.borrow_mut() = None;
+        *self.scroll_restore.borrow_mut() = None;
         self.auto_resuming = false;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
@@ -18530,6 +18822,9 @@ impl AppModel {
         self.session_head = std::mem::take(&mut slot.head);
         self.session_dir = std::mem::take(&mut slot.dir);
         self.session_workspace_cwd = slot.workspace_cwd.take();
+        // Re-judged by the live presence probe for the new surface.
+        self.session_workspace_uncreated = false;
+        self.tool_detail = None;
         self.launch_origin = slot.launch_origin.take();
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
@@ -19276,6 +19571,12 @@ impl AppModel {
         if self.help_open {
             return;
         }
+        if self.tool_detail.is_some() {
+            if hit == Hit::ToolDetailClose {
+                self.close_tool_detail();
+            }
+            return;
+        }
         if self.shells_open && !matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus) {
             return;
         }
@@ -19595,6 +19896,15 @@ impl AppModel {
                 self.toolfold.set_focus(Some(&item_id));
                 self.toolfold.toggle_fold(&item_id);
             }
+            // The door opens the view and changes NOTHING else (973 repair
+            // 5): moving the focus here re-laid the transcript out under the
+            // view (a focused member unfolds its run, a new disclosure
+            // revision re-seeds the height estimates), so Esc came back to
+            // a different screen than the one the reader clicked on.
+            Hit::ToolDetail(item_id) => {
+                self.open_tool_detail(&item_id);
+            }
+            Hit::ToolDetailClose => self.close_tool_detail(),
             Hit::ToolShowAll(item_id)
                 if matches!(self.screen, Screen::Session | Screen::Subagent) =>
             {
@@ -19841,6 +20151,11 @@ impl AppModel {
         // The login gate joins the help gate (TUI6.2c finding 7 —
         // consistency: nothing scrolls beneath a modal).
         if self.help_open || self.login.is_some() {
+            return;
+        }
+        // The full-detail view scrolls itself, never the transcript under it.
+        if self.tool_detail.is_some() {
+            self.scroll_tool_detail(if up { -3 } else { 3 });
             return;
         }
         // The all-sessions browser scrolls under the wheel: it is a long
@@ -20115,16 +20430,10 @@ impl AppModel {
             if !summary.enabled {
                 continue;
             }
-            let known_inventory = !matches!(
-                summary.inventory,
-                haider_rpc::ModelInventoryWire::NeverFetched
-                    | haider_rpc::ModelInventoryWire::Unavailable { .. }
+            let available = matches!(
+                summary.availability,
+                haider_rpc::ProviderAvailabilityWire::Available
             );
-            let available = known_inventory
-                && matches!(
-                    summary.availability,
-                    haider_rpc::ProviderAvailabilityWire::Available
-                );
             let reason = summary
                 .availability_reason
                 .clone()
@@ -20157,7 +20466,7 @@ impl AppModel {
                     _ => "api",
                 }
             };
-            if !known_inventory || summary.models.is_empty() {
+            if !summary.has_known_models() || summary.models.is_empty() {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
                     providers: vec![summary.provider.clone()],
@@ -20173,6 +20482,7 @@ impl AppModel {
                     model: String::new(),
                     auth,
                     context_window: None,
+                    source: None,
                     inventory_age_ms,
                     available,
                     reason: Some(
@@ -20213,6 +20523,11 @@ impl AppModel {
                     model: model.clone(),
                     auth,
                     context_window: self.providers.declared_window(&summary.provider, model),
+                    source: summary
+                        .model_details
+                        .iter()
+                        .find(|detail| detail.name == *model)
+                        .and_then(|detail| detail.source),
                     inventory_age_ms,
                     available,
                     reason: reason.clone(),
@@ -20252,6 +20567,7 @@ impl AppModel {
                     model: self.identity.model_short.clone(),
                     auth,
                     context_window: None,
+                    source: None,
                     inventory_age_ms,
                     available: false,
                     reason: Some("unlisted by advisory provider catalog".to_owned()),
@@ -20380,6 +20696,11 @@ impl AppModel {
             model: first.model.clone(),
             auth: "api",
             context_window,
+            source: group
+                .iter()
+                .all(|row| row.source == first.source)
+                .then_some(first.source)
+                .flatten(),
             inventory_age_ms,
             available: available_providers > 0,
             reason,
@@ -20753,6 +21074,20 @@ impl AppModel {
         // Model retention: a COMMITTED pick is what the next boot opens on.
         self.model_commits += 1;
         self.flash = Some(format!("· model → {model} · {provider}"));
+        self.dirty = true;
+    }
+
+    /// A user-set output budget did not fit the newly selected model: the
+    /// daemon clamped it. Keep the model flash and append the typed notice.
+    pub fn apply_output_budget_clamp(
+        &mut self,
+        clamp: &haider_protocol::output_budget::OutputBudgetClampV1,
+    ) {
+        let notice = clamp.notice();
+        self.flash = Some(match self.flash.take() {
+            Some(flash) => format!("{flash} · {notice}"),
+            None => format!("· {notice}"),
+        });
         self.dirty = true;
     }
 

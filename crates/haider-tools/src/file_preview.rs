@@ -77,10 +77,16 @@ pub(crate) async fn bounded_file_read<C: CasSink>(
         ));
     }
     let truncated = paged || selected_redaction;
-    let truncation =
-        truncated.then(|| ToolTruncation::from_bytes(contents.as_bytes(), preview.len()));
+    // A footer or content-addressed artifact of the original would let a
+    // caller test guesses for a masked value, including one on another page.
+    let safe_source = if redacted.replacements > 0 {
+        redacted.text.as_bytes()
+    } else {
+        contents.as_bytes()
+    };
+    let truncation = truncated.then(|| ToolTruncation::from_bytes(safe_source, preview.len()));
     let artifact = if paged {
-        Some(cas.put_owned(contents.into_bytes()).await?)
+        Some(cas.put_owned(safe_source.to_vec()).await?)
     } else {
         None
     };

@@ -26,6 +26,12 @@ pub trait GcloudAccessTokenSource: Send + Sync {
     /// Returns the current ADC access token bytes (trimmed), or a typed,
     /// secret-free error naming what failed.
     fn print_access_token(&self) -> Result<Zeroizing<Vec<u8>>, HaiderError>;
+
+    /// Stable active gcloud account, when the source can report it. The
+    /// access token itself rotates and cannot identify a Vertex account.
+    fn active_account_id(&self) -> Result<Option<String>, HaiderError> {
+        Ok(None)
+    }
 }
 
 /// Production source: `gcloud auth print-access-token` with no shell, no
@@ -33,6 +39,23 @@ pub trait GcloudAccessTokenSource: Send + Sync {
 pub struct GcloudCli;
 
 impl GcloudAccessTokenSource for GcloudCli {
+    fn active_account_id(&self) -> Result<Option<String>, HaiderError> {
+        let output = std::process::Command::new("gcloud")
+            .args(["config", "get-value", "account"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| gcloud_error(format!("could not query active account: {error}")))?;
+        if !output.status.success() || output.stdout.len() > 1024 {
+            return Ok(None);
+        }
+        let account = String::from_utf8_lossy(&output.stdout);
+        let account = account.trim();
+        if account == "(unset)" {
+            return Ok(None);
+        }
+        Ok(haider_protocol::credential::AccountIdentity::sanitized_field(account))
+    }
+
     fn print_access_token(&self) -> Result<Zeroizing<Vec<u8>>, HaiderError> {
         if crate::android_policy::enabled() {
             return Err(crate::android_policy::denied());

@@ -43,7 +43,7 @@ use haider_store::{
 use haider_tools::{
     ComputerBackend, ComputerCancelToken, ComputerError, ComputerInspection,
     ComputerInspectionBounds, ComputerOutput, ComputerPermissionPoll, ComputerResult,
-    ExcludeRegionScreenshotRedaction, ScreenshotRedactionRegion,
+    ExcludeRegionScreenshotRedaction, ScreenshotRedactionPolicy, ScreenshotRedactionRegion,
 };
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
@@ -262,13 +262,33 @@ fn action_name(action: &ComputerAction) -> &'static str {
     }
 }
 
-fn large_png_fixture() -> Vec<u8> {
-    let pixels = image::RgbaImage::from_pixel(3_000, 1_000, image::Rgba([31, 61, 127, 255]));
+fn encode_png_fixture(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+    let pixels = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
     let mut encoded = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(pixels)
         .write_to(&mut encoded, ImageFormat::Png)
         .expect("encode PNG fixture");
     encoded.into_inner()
+}
+
+/// Wider than the delivered bound, so admission must downscale it. Encoded
+/// once per test binary: fake backends hand it out on every capture, and
+/// they run on the async runtime thread.
+fn large_png_fixture() -> Vec<u8> {
+    static PNG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PNG.get_or_init(|| encode_png_fixture(3_000, 1_000, [31, 61, 127, 255]))
+        .clone()
+}
+
+/// A capture for tests about presence, Stop and cancellation timing, which
+/// do not exercise screenshot bounding. The large fixture costs ~1.3 s of
+/// unoptimised decode/resize/encode per capture (measured, debug profile),
+/// which under CI's parallel load pushed these tests' multi-capture runs
+/// past their deadlines (wave-973 CI, 0312d6e8/8ffc5866).
+fn small_png_fixture() -> Vec<u8> {
+    static PNG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PNG.get_or_init(|| encode_png_fixture(320, 200, [31, 61, 127, 255]))
+        .clone()
 }
 
 fn inspect_png_fixture() -> Vec<u8> {
@@ -310,6 +330,7 @@ async fn create_session_with_interaction_mode(
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -1266,8 +1287,7 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
             }
         })
         .expect("computer screenshot result");
-    assert_eq!(image.width, 2048);
-    assert!(image.height < 1_000);
+    assert_eq!((image.width, image.height), (1_567, 522));
     assert!(!journal_json.contains("data_base64"));
     let cas_bytes = store.get(&image.artifact).await.expect("screenshot CAS");
     assert!(!journal_json.contains(&base64::engine::general_purpose::STANDARD.encode(&cas_bytes)));
@@ -1305,6 +1325,33 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
             _ => None,
         })
         .expect("provider inspect image");
+    let (older_preview, older_images) = requests[2]
+        .messages
+        .iter()
+        .find_map(|message| match message.blocks.as_slice() {
+            [
+                Block::ToolResult {
+                    call_id,
+                    preview,
+                    images,
+                    ..
+                },
+            ] if call_id == "cu2-screenshot" => Some((preview, images)),
+            _ => None,
+        })
+        .expect("older screenshot result remains as retrievable history");
+    assert!(older_images.is_empty());
+    assert!(older_preview.contains("\"scope\":\"computer_screenshot_history\""));
+    assert!(older_preview.contains(image.artifact.as_str()));
+    assert_eq!(
+        requests[2]
+            .attachments
+            .iter()
+            .map(|attachment| &attachment.artifact)
+            .collect::<Vec<_>>(),
+        vec![&inspect_image.artifact],
+        "only the newest full computer screenshot reaches the provider"
+    );
     assert_ne!(inspect_image.artifact, image.artifact);
     assert_eq!((inspect_image.width, inspect_image.height), (1_500, 700));
     assert_eq!(
@@ -1655,4 +1702,1194 @@ async fn screenshot_region_redacts_before_crop_and_installs_delivered_mapping() 
             .iter()
             .any(|attachment| attachment.artifact == image.artifact)
     );
+}
+
+/// A backend that honours its action cancel token the way the real macOS
+/// backend does (returns `Cancelled` promptly instead of being dropped).
+struct CancelAwareBackend {
+    entered: Notify,
+}
+
+#[async_trait]
+impl ComputerBackend for CancelAwareBackend {
+    async fn execute(
+        &self,
+        action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<ComputerOutput> {
+        cancel.check()?;
+        if matches!(action, ComputerAction::Wait { .. }) {
+            self.entered.notify_one();
+            while !cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            return Err(ComputerError::Cancelled);
+        }
+        Ok(ComputerOutput::Confirmed {
+            action: "confirmed".into(),
+        })
+    }
+}
+
+/// Owner 2026-09-24 (cu-presence): the overlay's Stop button cancels the
+/// in-flight computer action at once AND the run, through the same
+/// receipt-backed turn cancellation as ESC, and no later CU action runs.
+/// MUTATION CHECK: drop the run cancel hook (or the in-flight cancel) from
+/// `CuPresence::stop`. Expected runtime failure: the run never reaches
+/// `Cancelled` / the follow-up click is executed.
+#[tokio::test]
+async fn presence_stop_cancels_the_in_flight_action_and_the_run() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "presence-wait".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "wait", "ms": 60_000}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "presence-wait".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "presence-click".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "left_click", "x": 1, "y": 1}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]));
+    let backend = Arc::new(CancelAwareBackend {
+        entered: Notify::new(),
+    });
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("presence-stop-session");
+    let run_id = RunId::new("presence-stop-run");
+    let device_id = DeviceId::new("presence-stop-device");
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    timeout(Duration::from_secs(8), backend.entered.notified())
+        .await
+        .expect("backend enters the in-flight wait");
+
+    // The human presses Stop on the overlay.
+    assert!(
+        presence.stop(haider_tools::presence::PresenceSurface::Screen) >= 1,
+        "the running computer-use run holds a screen presence lease"
+    );
+
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    // The provider may race ahead and REQUEST another action before the
+    // turn cancellation lands; it may be authorized but must never be
+    // dispatched to the OS.
+    let click_effects: Vec<EffectId> = events
+        .iter()
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Effect(EffectPhase::Intent(intent)))
+                if intent.summary == "computer left_click" =>
+            {
+                Some(intent.effect)
+            }
+            _ => None,
+        })
+        .collect();
+    let dispatched_click = events.iter().any(|event| {
+        matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Effect(EffectPhase::Dispatched { ref effect }))
+                if click_effects.contains(effect)
+        )
+    });
+    assert!(
+        !dispatched_click,
+        "no CU action may be dispatched after Stop"
+    );
+    let wait_cancelled = events.iter().any(|event| {
+        matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Effect(EffectPhase::Outcome {
+                outcome: EffectOutcome::Cancelled,
+                ..
+            }))
+        )
+    });
+    assert!(wait_cancelled, "the in-flight wait is journaled Cancelled");
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+/// A Screen renderer that records pointer commands but never acknowledges
+/// them, so every click parks in the bounded pointer-ack wait.
+struct SilentOverlay {
+    pointers: Arc<AtomicUsize>,
+}
+
+impl crate::cu_presence::PresenceRenderer for SilentOverlay {
+    fn send(&mut self, command: &haider_tools::presence::PresenceCommand) -> bool {
+        if matches!(
+            command,
+            haider_tools::presence::PresenceCommand::Pointer { .. }
+        ) {
+            self.pointers.fetch_add(1, Ordering::SeqCst);
+        }
+        true
+    }
+    fn acknowledges_pointers(&self) -> bool {
+        true
+    }
+}
+
+/// Verifier finding (191a8d60) + the live "~60 s cancelling" hang: Stop
+/// pressed while a click is parked on its pointer ack. The click must never
+/// execute and the run must reach `Cancelled` promptly (the live repro sat in
+/// `cancelling` until daemon shutdown).
+/// MUTATION CHECK: remove the post-ack `is_stopped` re-check. Expected
+/// runtime failure: the backend records the click.
+#[tokio::test]
+async fn presence_stop_during_a_parked_click_never_clicks_and_cancels_the_run() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut steps = Vec::new();
+    for index in 0..4 {
+        if index > 0 {
+            steps.push(FakeStep::ExpectToolResult {
+                call_id: format!("parked-{}", index - 1),
+            });
+        }
+        steps.push(FakeStep::EmitToolCall {
+            call_id: format!("parked-{index}"),
+            name: "computer".into(),
+            args: if index == 0 {
+                serde_json::json!({"action": "screenshot"})
+            } else {
+                serde_json::json!({"action": "left_click", "x": 3, "y": 4})
+            },
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    let provider = Arc::new(FakeProvider::new(steps));
+    let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let pointers = Arc::new(AtomicUsize::new(0));
+    presence.register_renderer(
+        haider_tools::presence::PresenceSurface::Screen,
+        Arc::new({
+            let pointers = Arc::clone(&pointers);
+            move |_sink| {
+                Some(Box::new(SilentOverlay {
+                    pointers: Arc::clone(&pointers),
+                })
+                    as Box<dyn crate::cu_presence::PresenceRenderer>)
+            }
+        }),
+    );
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("presence-parked-session");
+    let run_id = RunId::new("presence-parked-run");
+    let device_id = DeviceId::new("presence-parked-device");
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    // Pointers: screenshot (no ack wait) then the first click, which parks.
+    timeout(Duration::from_secs(8), async {
+        while pointers.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the first click reaches its pointer-ack wait");
+    assert!(presence.stop(haider_tools::presence::PresenceSurface::Screen) >= 1);
+
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    let clicked = backend
+        .actions
+        .lock()
+        .expect("actions lock")
+        .iter()
+        .any(|action| matches!(action, ComputerAction::LeftClick { .. }));
+    assert!(!clicked, "no click reached the OS after Stop");
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Outcome {
+            outcome: EffectOutcome::Cancelled,
+            ..
+        }))
+    )));
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+/// Live 3-repair trial 1: Stop landed BETWEEN provider rounds (the previous
+/// computer action had completed and the provider was preparing the next
+/// request), and the run sat in `cancelling`. Drive exactly that moment —
+/// either through the presence Stop or through the same internal turn
+/// cancellation directly — and require a prompt `Cancelled`.
+async fn cancel_between_rounds(via_presence: bool) {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "between-0".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "screenshot"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "between-0".into(),
+        },
+        FakeStep::Delay { ms: 5_000 },
+        FakeStep::EmitToolCall {
+            call_id: "between-1".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "left_click", "x": 3, "y": 4}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]));
+    let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let tag = if via_presence { "presence" } else { "direct" };
+    let session_id = SessionId::new(format!("between-{tag}-session"));
+    let run_id = RunId::new(format!("between-{tag}-run"));
+    let device_id = DeviceId::new(format!("between-{tag}-device"));
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    // Wait for the screenshot's tool result, then let the next provider
+    // round start (it sits in its 5 s delay).
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let events = store.read(&session_id, 0, 4096).await.expect("journal");
+            if events.iter().any(|event| {
+                matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::ToolResult { ref call_id, .. }) if call_id == "between-0"
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("screenshot settles");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if via_presence {
+        assert_eq!(
+            presence.stop(haider_tools::presence::PresenceSurface::Screen),
+            1
+        );
+    } else {
+        let request_json = format!(r#"{{"run":"{run_id}"}}"#);
+        hub.cancel_internal_turn(TurnCancelCommand {
+            command_id: format!("between-{tag}-cancel"),
+            request_digest: crate::delegation::digest_bytes(request_json.as_bytes()),
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: run_id.clone(),
+            cancelling_event_id: EventId::new(format!("between-{tag}-cancelling")),
+            device_id,
+        })
+        .await
+        .expect("cancel");
+    }
+    wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    let clicked = backend
+        .actions
+        .lock()
+        .expect("actions lock")
+        .iter()
+        .any(|action| matches!(action, ComputerAction::LeftClick { .. }));
+    assert!(!clicked, "no click after the cancellation");
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+#[tokio::test]
+async fn presence_stop_between_provider_rounds_cancels_promptly() {
+    cancel_between_rounds(true).await;
+}
+
+#[tokio::test]
+async fn direct_turn_cancel_between_provider_rounds_cancels_promptly() {
+    cancel_between_rounds(false).await;
+}
+
+/// Fires a cancellation from INSIDE the completing action, so it lands while
+/// the core is settling the tool result and opening the next provider round —
+/// the exact window of live 3-repair trial 1 (`cancelling` 2 ms after
+/// `provider_round_terminal`).
+struct CancelOnReturnBackend {
+    fire: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[async_trait]
+impl ComputerBackend for CancelOnReturnBackend {
+    async fn execute(
+        &self,
+        action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<ComputerOutput> {
+        cancel.check()?;
+        if matches!(action, ComputerAction::LeftClick { .. })
+            && let Some(fire) = self.fire.lock().expect("fire lock").take()
+        {
+            fire();
+        }
+        Ok(match action {
+            ComputerAction::Screenshot => ComputerOutput::ScreenshotPng(small_png_fixture()),
+            _ => ComputerOutput::Confirmed {
+                action: "confirmed".into(),
+            },
+        })
+    }
+}
+
+async fn cancel_while_settling(via_presence: bool, iteration: usize) {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut steps = Vec::new();
+    for index in 0..5 {
+        if index > 0 {
+            steps.push(FakeStep::ExpectToolResult {
+                call_id: format!("settle-{}", index - 1),
+            });
+        }
+        steps.push(FakeStep::EmitToolCall {
+            call_id: format!("settle-{index}"),
+            name: "computer".into(),
+            args: if index == 0 {
+                serde_json::json!({"action": "screenshot"})
+            } else {
+                serde_json::json!({"action": "left_click", "x": 3, "y": 4})
+            },
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    let provider = Arc::new(FakeProvider::new(steps));
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let backend = Arc::new(CancelOnReturnBackend {
+        fire: Mutex::new(None),
+    });
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let tag = format!("{}-{iteration}", if via_presence { "p" } else { "d" });
+    let session_id = SessionId::new(format!("settle-{tag}-session"));
+    let run_id = RunId::new(format!("settle-{tag}-run"));
+    let device_id = DeviceId::new(format!("settle-{tag}-device"));
+    let fire: Box<dyn FnOnce() + Send> = if via_presence {
+        let presence = Arc::clone(&presence);
+        Box::new(move || {
+            presence.stop(haider_tools::presence::PresenceSurface::Screen);
+        })
+    } else {
+        let hub = hub.clone();
+        let (session_id, run_id, device_id) =
+            (session_id.clone(), run_id.clone(), device_id.clone());
+        let generation = store.worker_generation();
+        Box::new(move || {
+            tokio::spawn(async move {
+                let request_json = format!(r#"{{"run":"{run_id}"}}"#);
+                let _ = hub
+                    .cancel_internal_turn(TurnCancelCommand {
+                        command_id: format!("settle-cancel-{run_id}"),
+                        request_digest: crate::delegation::digest_bytes(request_json.as_bytes()),
+                        request_json,
+                        session_id,
+                        worker_generation: generation,
+                        run_id: run_id.clone(),
+                        cancelling_event_id: EventId::new(format!("settle-cancelling-{run_id}")),
+                        device_id,
+                    })
+                    .await;
+            });
+        })
+    };
+    *backend.fire.lock().expect("fire lock") = Some(fire);
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn presence_stop_while_an_action_settles_cancels_promptly() {
+    for iteration in 0..10 {
+        cancel_while_settling(true, iteration).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_turn_cancel_while_an_action_settles_cancels_promptly() {
+    for iteration in 0..10 {
+        cancel_while_settling(false, iteration).await;
+    }
+}
+
+/// Shared ordered log for the dispatcher-level conceal test.
+type OrderLog = Arc<Mutex<Vec<String>>>;
+
+/// Records every capture the dispatcher asks the OS for, in order.
+struct LoggingBackend {
+    log: OrderLog,
+}
+
+/// Parks the first image admission after the backend has returned. This
+/// exposes whether Reveal was sent before post-processing starts.
+struct ParkFirstRedaction {
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    first: AtomicBool,
+}
+
+impl ScreenshotRedactionPolicy for ParkFirstRedaction {
+    fn redact_png<'a>(&self, png: &'a [u8]) -> ComputerResult<std::borrow::Cow<'a, [u8]>> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            self.entered.send(()).expect("redaction observer");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("redaction release");
+        }
+        Ok(std::borrow::Cow::Borrowed(png))
+    }
+}
+
+#[async_trait]
+impl ComputerBackend for LoggingBackend {
+    async fn execute(
+        &self,
+        action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<ComputerOutput> {
+        cancel.check()?;
+        match action {
+            ComputerAction::Screenshot => {
+                self.log
+                    .lock()
+                    .expect("log")
+                    .push("capture:screenshot".into());
+                Ok(ComputerOutput::ScreenshotPng(small_png_fixture()))
+            }
+            ComputerAction::Inspect { .. } => {
+                self.log.lock().expect("log").push("capture:inspect".into());
+                Ok(ComputerOutput::Inspection {
+                    inspection: ComputerInspection {
+                        role: Some("button".into()),
+                        label: None,
+                        title: None,
+                        bounds: None,
+                        value: None,
+                    },
+                    screenshot_png: small_png_fixture(),
+                })
+            }
+            _ => Ok(ComputerOutput::Confirmed {
+                action: "confirmed".into(),
+            }),
+        }
+    }
+}
+
+/// A capturable Screen renderer (a Linux notification, or an overlay whose
+/// capture exclusion was refused) that logs conceal/reveal and, like the
+/// real helpers, acknowledges each Conceal once its UI is off screen — so
+/// the dispatcher's capture follows the ack rather than the 600 ms bound.
+struct CapturableOverlay {
+    log: OrderLog,
+    sink: crate::cu_presence::EventSink,
+}
+
+impl crate::cu_presence::PresenceRenderer for CapturableOverlay {
+    fn send(&mut self, command: &haider_tools::presence::PresenceCommand) -> bool {
+        use haider_tools::presence::{PresenceCommand, PresenceEvent};
+        let entry = match command {
+            PresenceCommand::Conceal { seq, .. } => {
+                // Acked from the helper's side (a separate task): the
+                // daemon holds its presence state lock while sending.
+                let (sink, seq) = (Arc::clone(&self.sink), *seq);
+                tokio::spawn(async move { sink(PresenceEvent::Ack { seq }) });
+                "conceal"
+            }
+            PresenceCommand::Reveal { .. } => "reveal",
+            _ => return true,
+        };
+        self.log.lock().expect("log").push(entry.into());
+        true
+    }
+    fn capturable(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConcealReply {
+    Ack,
+    Failed,
+    Silent,
+    HelperDies,
+    SendFails,
+}
+
+struct RefusingOverlay {
+    log: OrderLog,
+    sink: crate::cu_presence::EventSink,
+    reply: ConcealReply,
+}
+
+impl crate::cu_presence::PresenceRenderer for RefusingOverlay {
+    fn send(&mut self, command: &haider_tools::presence::PresenceCommand) -> bool {
+        use haider_tools::presence::{PresenceCommand, PresenceEvent};
+        match command {
+            PresenceCommand::Conceal { seq, .. } => {
+                self.log.lock().expect("log").push("conceal".into());
+                match self.reply {
+                    ConcealReply::Ack | ConcealReply::Failed => {
+                        let sink = Arc::clone(&self.sink);
+                        let event = if matches!(self.reply, ConcealReply::Ack) {
+                            PresenceEvent::Ack { seq: *seq }
+                        } else {
+                            PresenceEvent::ConcealFailed {
+                                seq: *seq,
+                                message: "window remained visible".into(),
+                            }
+                        };
+                        tokio::spawn(async move { sink(event) });
+                    }
+                    ConcealReply::Silent => {}
+                    ConcealReply::HelperDies => {
+                        #[cfg(unix)]
+                        {
+                            use std::io::Write as _;
+                            use std::process::{Command, Stdio};
+                            let mut child = Command::new("/bin/sh")
+                                .args(["-c", "read line; exit 0"])
+                                .stdin(Stdio::piped())
+                                .spawn()
+                                .expect("spawn disposable helper");
+                            writeln!(child.stdin.take().expect("helper stdin"), "conceal")
+                                .expect("send conceal to helper");
+                            assert!(child.wait().expect("reap helper").success());
+                            self.log.lock().expect("log").push("helper:exited".into());
+                        }
+                    }
+                    ConcealReply::SendFails => return false,
+                }
+            }
+            PresenceCommand::Reveal { .. } => {
+                self.log.lock().expect("log").push("reveal".into());
+                if matches!(self.reply, ConcealReply::HelperDies) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn capturable(&self) -> bool {
+        true
+    }
+
+    fn close(&mut self) {
+        self.log.lock().expect("log").push("renderer:closed".into());
+    }
+}
+
+async fn dispatcher_conceal_result(action: &str, reply: ConcealReply) {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let call_id = format!("conceal-{action}-{reply:?}");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: call_id.clone(),
+            name: "computer".into(),
+            args: if action == "screenshot" {
+                serde_json::json!({"action": "screenshot"})
+            } else {
+                serde_json::json!({"action": "inspect", "x": 3, "y": 4})
+            },
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: call_id.clone(),
+        },
+        FakeStep::EmitText {
+            text: "done".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let log: OrderLog = Arc::new(Mutex::new(Vec::new()));
+    let backend = Arc::new(LoggingBackend {
+        log: Arc::clone(&log),
+    });
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    presence.register_renderer(
+        haider_tools::presence::PresenceSurface::Screen,
+        Arc::new({
+            let log = Arc::clone(&log);
+            move |sink| {
+                Some(Box::new(RefusingOverlay {
+                    log: Arc::clone(&log),
+                    sink,
+                    reply,
+                })
+                    as Box<dyn crate::cu_presence::PresenceRenderer>)
+            }
+        }),
+    );
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new(format!("{call_id}-session"));
+    let run_id = RunId::new(format!("{call_id}-run"));
+    let device_id = DeviceId::new(format!("{call_id}-device"));
+    create_session(&hub, &session_id, &device_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
+    let result = events
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::ToolResult {
+                call_id: id,
+                result,
+            }) if id == call_id => Some(result),
+            _ => None,
+        })
+        .expect("computer tool result");
+    let log = log.lock().expect("log").clone();
+    if matches!(reply, ConcealReply::Ack) {
+        assert_eq!(result.status, ToolResultStatus::Completed);
+        assert_eq!(
+            log.iter().take(3).cloned().collect::<Vec<_>>(),
+            vec![
+                "conceal".to_owned(),
+                format!("capture:{action}"),
+                "reveal".to_owned()
+            ]
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.starts_with("capture:"))
+                .count(),
+            1
+        );
+    } else {
+        assert_eq!(
+            result.status,
+            ToolResultStatus::Failed,
+            "{action} {reply:?}"
+        );
+        #[cfg(unix)]
+        if matches!(reply, ConcealReply::HelperDies) {
+            assert!(log.contains(&"helper:exited".into()));
+        }
+        let preview: serde_json::Value =
+            serde_json::from_str(&result.preview).expect("typed failure preview");
+        assert_eq!(preview["status"], "failed");
+        assert_eq!(preview["error"]["kind"], "backend");
+        assert_eq!(
+            preview["error"]["message"],
+            "presence panels could not be verified absent from the capture"
+        );
+        assert!(
+            !log.iter().any(|entry| entry.starts_with("capture:")),
+            "backend capture ran on refused conceal: {log:?}"
+        );
+        if matches!(reply, ConcealReply::SendFails) {
+            assert!(log.contains(&"renderer:closed".into()), "{log:?}");
+        } else {
+            assert!(log.contains(&"reveal".into()), "{log:?}");
+        }
+    }
+    assert_eq!(
+        presence.capture_holders(haider_tools::presence::PresenceSurface::Screen),
+        0,
+        "the capture guard must be dropped before settling the tool result"
+    );
+    let effect = events
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Effect(EffectPhase::Intent(intent)))
+                if intent.summary == format!("computer {action}") =>
+            {
+                Some(intent.effect)
+            }
+            _ => None,
+        })
+        .expect("computer effect intent");
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Outcome { effect: id, outcome, .. }))
+            if id == effect && match reply {
+                ConcealReply::Ack => matches!(outcome, EffectOutcome::Ok),
+                _ => matches!(outcome, EffectOutcome::Failed { .. }),
+            }
+    )));
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_screenshot_on_typed_conceal_failure() {
+    dispatcher_conceal_result("screenshot", ConcealReply::Failed).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_inspect_on_typed_conceal_failure() {
+    dispatcher_conceal_result("inspect", ConcealReply::Failed).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_screenshot_on_conceal_deadline() {
+    dispatcher_conceal_result("screenshot", ConcealReply::Silent).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_inspect_on_conceal_deadline() {
+    dispatcher_conceal_result("inspect", ConcealReply::Silent).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_screenshot_after_helper_death() {
+    dispatcher_conceal_result("screenshot", ConcealReply::HelperDies).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_inspect_after_helper_death() {
+    dispatcher_conceal_result("inspect", ConcealReply::HelperDies).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_screenshot_on_conceal_send_failure() {
+    dispatcher_conceal_result("screenshot", ConcealReply::SendFails).await;
+}
+
+#[tokio::test]
+async fn dispatcher_refuses_inspect_on_conceal_send_failure() {
+    dispatcher_conceal_result("inspect", ConcealReply::SendFails).await;
+}
+
+/// Negative controls: a real Ack allows both model-facing captures.
+#[tokio::test]
+async fn dispatcher_captures_screenshot_after_conceal_ack() {
+    dispatcher_conceal_result("screenshot", ConcealReply::Ack).await;
+}
+
+#[tokio::test]
+async fn dispatcher_captures_inspect_after_conceal_ack() {
+    dispatcher_conceal_result("inspect", ConcealReply::Ack).await;
+}
+
+/// Verifier finding (0ddd89a0): nothing tested that the broker dispatcher
+/// itself conceals a capturable indicator around model-facing captures.
+/// MUTATION CHECK: replace `self.cu_presence.conceal_for_capture().await`
+/// in worker.rs with `None`. Expected runtime failure: no "conceal" around
+/// either capture.
+#[tokio::test]
+async fn dispatcher_conceals_capturable_presence_around_screenshot_and_inspect() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "conceal-shot".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "screenshot"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "conceal-shot".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "conceal-inspect".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "inspect", "x": 3, "y": 4}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "conceal-inspect".into(),
+        },
+        FakeStep::EmitText {
+            text: "done".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let log: OrderLog = Arc::new(Mutex::new(Vec::new()));
+    let backend = Arc::new(LoggingBackend {
+        log: Arc::clone(&log),
+    });
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    presence.register_renderer(
+        haider_tools::presence::PresenceSurface::Screen,
+        Arc::new({
+            let log = Arc::clone(&log);
+            move |sink| {
+                Some(Box::new(CapturableOverlay {
+                    log: Arc::clone(&log),
+                    sink,
+                })
+                    as Box<dyn crate::cu_presence::PresenceRenderer>)
+            }
+        }),
+    );
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let redaction = Arc::new(ParkFirstRedaction {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        first: AtomicBool::new(true),
+    });
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend_and_redaction(
+            Arc::clone(&backend) as Arc<dyn ComputerBackend>,
+            redaction,
+        )
+        .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("conceal-wiring-session");
+    let run_id = RunId::new("conceal-wiring-run");
+    let device_id = DeviceId::new("conceal-wiring-device");
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("image admission entered")
+        .expect("redaction observer");
+    assert_eq!(
+        log.lock().expect("log").clone(),
+        vec!["conceal", "capture:screenshot", "reveal"],
+        "Reveal must precede slow image admission"
+    );
+    release_tx.send(()).expect("release redaction");
+    wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
+    let log = log.lock().expect("log").clone();
+    assert_eq!(
+        log,
+        vec![
+            "conceal",
+            "capture:screenshot",
+            "reveal",
+            "conceal",
+            "capture:inspect",
+            "reveal",
+        ],
+        "each model-facing capture is bracketed by conceal/reveal"
+    );
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+/// Verifier finding (0ddd89a0), "cause A": a Stop-refused action that
+/// returns immediately (`Err(Cancelled)`, mapped to a `Cancelled` tool
+/// result) lets the provider start ANOTHER round before the slower turn
+/// cancellation commits (here Stop's cancel is delayed 400 ms), so the model
+/// issues a further action after the human pressed Stop. Waiting for the
+/// cancellation stops the run at the refused action.
+/// MUTATION CHECK (cause A only; cause B stays fixed): make the Stop-refused
+/// branch return `Err(ToolError::Computer(ComputerError::Cancelled))`.
+/// Expected runtime failure: the "slow-2" tool call is started after Stop.
+#[tokio::test]
+async fn slow_cancel_commit_still_settles_a_stop_refused_action_as_cancelled() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut steps = Vec::new();
+    for index in 0..4 {
+        if index > 0 {
+            steps.push(FakeStep::ExpectToolResult {
+                call_id: format!("slow-{}", index - 1),
+            });
+        }
+        steps.push(FakeStep::EmitToolCall {
+            call_id: format!("slow-{index}"),
+            name: "computer".into(),
+            args: if index == 0 {
+                serde_json::json!({"action": "screenshot"})
+            } else {
+                serde_json::json!({"action": "left_click", "x": 3, "y": 4})
+            },
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    let provider = Arc::new(FakeProvider::new(steps));
+    let backend = Arc::new(FakeComputerBackend::new(small_png_fixture()));
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    presence.set_stop_cancel_delay(Duration::from_millis(400));
+    let pointers = Arc::new(AtomicUsize::new(0));
+    presence.register_renderer(
+        haider_tools::presence::PresenceSurface::Screen,
+        Arc::new({
+            let pointers = Arc::clone(&pointers);
+            move |_sink| {
+                Some(Box::new(SilentOverlay {
+                    pointers: Arc::clone(&pointers),
+                })
+                    as Box<dyn crate::cu_presence::PresenceRenderer>)
+            }
+        }),
+    );
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("slow-cancel-session");
+    let run_id = RunId::new("slow-cancel-run");
+    let device_id = DeviceId::new("slow-cancel-device");
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    timeout(Duration::from_secs(8), async {
+        while pointers.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the first click parks on its pointer ack");
+    assert!(presence.stop(haider_tools::presence::PresenceSurface::Screen) >= 1);
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::RunFailed { .. } | EventPayload::RunState(RunState::Errored))
+        )),
+        "a Stop is a cancellation, never a failure"
+    );
+    let later_call = events.iter().any(|event| {
+        matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Item(ItemEvent::Started {
+                item: TurnItem::ToolCall { ref call_id, .. },
+                ..
+            })) if call_id == "slow-2"
+        )
+    });
+    assert!(
+        !later_call,
+        "no further model round (and no further action) starts after Stop"
+    );
+    let clicked = backend
+        .actions
+        .lock()
+        .expect("actions lock")
+        .iter()
+        .any(|action| matches!(action, ComputerAction::LeftClick { .. }));
+    assert!(!clicked, "no click reached the OS after Stop");
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
 }

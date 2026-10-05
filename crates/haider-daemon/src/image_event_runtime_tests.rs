@@ -34,6 +34,7 @@ async fn image_output_context_commits_self_contained_omitted_prompt_extension() 
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

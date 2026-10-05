@@ -76,6 +76,7 @@ mod config;
 mod connection;
 #[cfg(test)]
 mod context_core_tests;
+mod cu_presence;
 mod delegation;
 #[cfg(all(test, unix))]
 mod delegation_rollup_tests;
@@ -156,8 +157,8 @@ mod project_instructions_tests;
 
 pub use accounts::{
     AccountProviderBuilder, AccountsDependencies, AnthropicValidator, ConnectionTransport,
-    CredentialValidator, ProviderCredentialValidator, ValidatedIdentity, ValidationError,
-    ValidationFailureKind, VaultProvision,
+    CredentialValidator, ProviderCredentialValidator, ProviderModelDiscoverer, ValidatedIdentity,
+    ValidationError, ValidationFailureKind, VaultProvision,
 };
 pub use config::DaemonConfig;
 pub use diagnostics::{BUILD_UUID, BUILD_VERSION, process_started_unix_ms};

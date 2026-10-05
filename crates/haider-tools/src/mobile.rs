@@ -437,7 +437,7 @@ fn action_name(action: &MobileAction) -> &'static str {
 #[must_use]
 pub fn mobile_manifest() -> ToolManifest {
     ToolManifest {
-        name: "mobile".into(),
+        name: haider_protocol::mobile::MOBILE_TOOL_NAME.into(),
         description: "Observe and control an explicitly activated mobile capability, list apps, or read SMS data. Call screenshot or a11y_tree before coordinate or element actions.".into(),
         effects: vec![
             EffectClass::ReadSms,

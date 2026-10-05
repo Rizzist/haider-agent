@@ -8,7 +8,6 @@ use crate::app::{AppModel, Hit, LauncherRow, LoomPane, Screen, update_version_la
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_INTRO_TEXT, PALETTE_MAX_ROWS, help_catalog_lines};
 use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
-use crate::plain::status_glyph;
 use crate::projection::{ItemBlock, SessionProjection, TranscriptEntry};
 use crate::sanctum::SanctumLine;
 use crate::theme::{Theme, ThemeKey};
@@ -23,6 +22,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const TRANSCRIPT_OVERSCAN_ROWS: u64 = 2;
+/// The main session transcript's [`crate::app::ScrollAnchor::surface`].
+const SESSION_SURFACE: &str = "session";
 const TRANSCRIPT_CACHE_ENTRIES: usize = 96;
 const TRANSCRIPT_EAGER_ENTRIES: usize = 64;
 const EXTREME_ENTRY_BYTES: usize = 64 * 1024;
@@ -54,6 +55,8 @@ pub(crate) struct LayoutCtx<'a> {
     /// Foldable runs over this projection's entries — sorted and disjoint,
     /// computed once per frame by [`foldable_runs`].
     pub runs: &'a [crate::toolfold::FoldRun],
+    /// Where tool-row paths shorten from (workspace, then `~`).
+    pub paths: &'a crate::toolview::PathContext,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -72,6 +75,23 @@ struct EntryMarks {
     summary: Option<usize>,
     /// Index, in the produced `lines`, of the `⏎ show all` affordance.
     show_all: Option<usize>,
+    /// Index of a collapsed row's `… +N lines (⌃O to expand)` affordance.
+    detail: Option<usize>,
+    /// Index of the row's `⎿` result line — every row's click route into
+    /// the full-detail view.
+    result: Option<usize>,
+}
+
+/// What [`TranscriptLayoutCache::reconcile`] had to do this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relayout {
+    /// Nothing that moves a row start.
+    None,
+    /// The reader's disclosure (focus, collapse/expand, fold) or the path
+    /// context changed: every entry was re-measured at the same width.
+    Disclosure,
+    /// Width, theme, or the entries themselves changed.
+    Other,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +101,9 @@ pub(crate) struct TranscriptLayoutCache {
     theme: Option<ThemeKey>,
     /// The tool-disclosure revision the cached geometry was measured under.
     fold_revision: u64,
+    /// The path context tool headers were shortened under: a workspace
+    /// learned after a row was measured re-shortens every row.
+    paths_fingerprint: u64,
     revision: u64,
     entry_mutation_revision: u64,
     source_ptr: usize,
@@ -122,6 +145,11 @@ struct CachedTranscriptEntry {
     /// below the line the reader clicked.
     show_all_row: Option<u64>,
     summary_row: Option<u64>,
+    /// Wrapped-row offset of the `(⌃O to expand)` affordance, measured the
+    /// same way as `show_all_row`.
+    detail_row: Option<u64>,
+    /// Wrapped-row offset of the `⎿` result line (opens the detail view).
+    result_row: Option<u64>,
 }
 
 impl TranscriptLayoutCache {
@@ -148,7 +176,9 @@ impl TranscriptLayoutCache {
         Arc::clone(&self.runs)
     }
 
-    fn reconcile(&mut self, projection: &SessionProjection, ctx: LayoutCtx<'_>) {
+    /// Bring the cache up to date with this frame's inputs, and say what
+    /// kind of re-layout that took.
+    fn reconcile(&mut self, projection: &SessionProjection, ctx: LayoutCtx<'_>) -> Relayout {
         let (theme_key, width, phase) = (ctx.theme.key, ctx.width, ctx.phase);
         // A disclosure change is a LAYOUT change: a collapsed row is two
         // rows where an expanded one was twelve, so every cached row start
@@ -157,7 +187,8 @@ impl TranscriptLayoutCache {
         let layout_changed = !self.initialized
             || self.width != width
             || self.theme != Some(theme_key)
-            || self.fold_revision != ctx.fold.revision();
+            || self.fold_revision != ctx.fold.revision()
+            || self.paths_fingerprint != ctx.paths.fingerprint();
         let source = projection.entries();
         let projection_changed = self.revision != projection.render_revision()
             || self.source_ptr != source.as_ptr() as usize
@@ -170,10 +201,24 @@ impl TranscriptLayoutCache {
             && projection_changed
             && source.len() > self.source_len;
         if !layout_changed && !projection_changed && !phase_changed {
-            return;
+            return Relayout::None;
         }
-
+        // Only the reader's disclosure (or the path context) changed: the
+        // same entries at the same width and theme, re-measured. Those are
+        // the re-layouts a content anchor must survive (973 repair 5); a
+        // resize or theme switch keeps its pinned raw-offset behaviour.
+        let disclosure_only = self.initialized
+            && self.width == width
+            && self.theme == Some(theme_key)
+            && !entries_mutated
+            && !projection_changed;
+        let mut relayout = Relayout::None;
         if layout_changed || entries_mutated || (projection_changed && !append_only) {
+            relayout = if layout_changed && disclosure_only {
+                Relayout::Disclosure
+            } else {
+                Relayout::Other
+            };
             self.entries.clear();
             self.corrections.clear();
             self.seed_estimates(projection, ctx);
@@ -202,11 +247,13 @@ impl TranscriptLayoutCache {
         self.width = width;
         self.theme = Some(theme_key);
         self.fold_revision = ctx.fold.revision();
+        self.paths_fingerprint = ctx.paths.fingerprint();
         self.revision = projection.render_revision();
         self.entry_mutation_revision = projection.entry_mutation_revision();
         self.source_ptr = source.as_ptr() as usize;
         self.source_len = source.len();
         self.phase = phase;
+        relayout
     }
 
     fn seed_estimates(&mut self, projection: &SessionProjection, ctx: LayoutCtx<'_>) {
@@ -394,10 +441,24 @@ fn cache_transcript_entry_window(
         .summary
         .and_then(|index| lines.get(..index))
         .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
+    let detail_row = marks
+        .detail
+        .and_then(|index| lines.get(..index))
+        .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
+    let result_row = marks
+        .result
+        .and_then(|index| lines.get(..index))
+        .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
+    // Live tool AND model-command rows wear the spinner, so both re-render
+    // on the animation clock.
     let dynamic = matches!(
         entry,
         TranscriptEntry::Item(ItemBlock {
             item: TurnItem::ToolCall {
+                status: haider_protocol::item::ToolStatus::Pending
+                    | haider_protocol::item::ToolStatus::InProgress,
+                ..
+            } | TurnItem::CommandExecution {
                 status: haider_protocol::item::ToolStatus::Pending
                     | haider_protocol::item::ToolStatus::InProgress,
                 ..
@@ -414,6 +475,8 @@ fn cache_transcript_entry_window(
         windowed: false,
         show_all_row,
         summary_row,
+        detail_row,
+        result_row,
     }
 }
 
@@ -531,6 +594,8 @@ fn cache_extreme_agent_entry(
             dynamic: false,
             show_all_row: None,
             summary_row: None,
+            detail_row: None,
+            result_row: None,
             windowed: true,
         };
     }
@@ -582,6 +647,8 @@ fn cache_extreme_agent_entry(
             dynamic: false,
             show_all_row: None,
             summary_row: None,
+            detail_row: None,
+            result_row: None,
             windowed: true,
         };
     };
@@ -647,6 +714,8 @@ fn cache_extreme_agent_entry(
         dynamic: false,
         show_all_row: None,
         summary_row: None,
+        detail_row: None,
+        result_row: None,
         windowed: true,
     }
 }
@@ -677,6 +746,7 @@ fn wrapped_lines_height(lines: &[Line<'_>], width: u16) -> u16 {
 
 /// Select only the contiguous transcript slice intersecting the viewport
 /// plus a two-row overscan. Returned scroll coordinates remain global.
+#[derive(Clone, Copy)]
 struct TranscriptViewport<'a> {
     prefix: &'a [Line<'static>],
     suffix: &'a [Line<'static>],
@@ -721,10 +791,13 @@ pub fn foldable_runs(
             return None;
         }
         match &block.item {
+            // 973-tui-toolview: runs fold by FAMILY (`Read 3 files`,
+            // `Searched for 2 patterns`, `Ran 3 shell commands`); writes and
+            // edits never fold — their diff is the point of the row.
             TurnItem::ToolCall { name, status, .. }
                 if *status == haider_protocol::item::ToolStatus::Completed =>
             {
-                Some(name.clone())
+                crate::toolview::fold_key(name)
             }
             // Keep user actions separate from model calls, including when
             // folded; both use the established "shell commands" noun.
@@ -774,9 +847,14 @@ pub fn foldable_runs(
             }
         }
         // The elbow speaks for the LATEST call in the run — "where did that
-        // leave things?", not "how did it start?".
+        // leave things?", not "how did it start?". A run of reads or searches
+        // has no such answer (the first line of a file is not a result), so
+        // its fold row stands alone, as the reference's `Read 1 file` does.
+        if matches!(run.name.as_str(), "read" | "search") {
+            continue;
+        }
         if let Some(TranscriptEntry::Item(last)) = entries.get(run.last()) {
-            let output = last.output_text();
+            let output = last.tool_output();
             // A tail the 8 KiB cap cut at the front opens on a mid-line
             // FRAGMENT; the elbow speaks with the first WHOLE line instead.
             let body = if last.output_truncated {
@@ -844,6 +922,182 @@ fn resolve_tool_reveal(
     model.sticky_suppressed.set(true);
 }
 
+/// The content anchor this frame must honour, if any (973 repair 5):
+///
+/// - a restore the full-detail view armed when it closed — unless the
+///   reducer has moved the offset since (a jump to the bottom, say);
+/// - the last frame's own anchor, when the cache re-measured every entry
+///   for a disclosure change (a focus, a collapse, a fold) under an offset
+///   nothing else moved: the bottom-relative offset would otherwise point
+///   at whatever the new height estimates put there.
+fn frame_anchor(
+    model: &AppModel,
+    surface: &str,
+    relayout: Relayout,
+) -> Option<crate::app::ScrollAnchor> {
+    let offset = model.scroll_back.get();
+    if let Some(restore) = model.scroll_restore.borrow_mut().take()
+        && restore.surface == surface
+        && restore.scroll_back == offset
+    {
+        return Some(restore);
+    }
+    if relayout != Relayout::Disclosure || offset == 0 {
+        return None;
+    }
+    model
+        .scroll_anchor
+        .borrow()
+        .clone()
+        .filter(|anchor| anchor.surface == surface && anchor.scroll_back == offset)
+}
+
+/// The bottom offset that puts `anchor`'s content on the top row against
+/// THIS frame's geometry (973 repair 5). The anchor entry and every entry a
+/// viewport below it can show are measured first, so the offset is exact
+/// where the reader looks rather than estimated; entries further down keep
+/// their estimates, which move the offset and the content together.
+/// `None` when the anchor no longer names this transcript's content.
+fn anchored_scroll_back(
+    cache: &mut TranscriptLayoutCache,
+    projection: &SessionProjection,
+    ctx: LayoutCtx<'_>,
+    anchor: &crate::app::ScrollAnchor,
+    prefix_rows: u64,
+    suffix_rows: u64,
+    viewport_height: u16,
+) -> Option<u64> {
+    let top = match anchor.entry {
+        None => anchor.row.min(prefix_rows.checked_sub(1)?),
+        Some(index) => {
+            let entries = projection.entries();
+            let entry = entries.get(index)?;
+            if let Some(item) = &anchor.item {
+                match entry {
+                    TranscriptEntry::Item(block) if block.item_id.as_str() == item => {}
+                    _ => return None,
+                }
+            }
+            let mut uncovered = anchor
+                .row
+                .saturating_add(u64::from(viewport_height))
+                .saturating_add(TRANSCRIPT_OVERSCAN_ROWS);
+            let mut at = index;
+            while at < entries.len() && uncovered > 0 {
+                cache.materialize(projection, ctx, at, None);
+                uncovered = uncovered
+                    .saturating_sub(cache.entries.get(&at).map_or(0, |entry| entry.height));
+                at += 1;
+            }
+            let height = cache.entries.get(&index).map_or(0, |entry| entry.height);
+            prefix_rows
+                .saturating_add(cache.row_start(projection, index))
+                .saturating_add(anchor.row.min(height.saturating_sub(1)))
+        }
+    };
+    let total = prefix_rows
+        .saturating_add(cache.total_rows)
+        .saturating_add(suffix_rows);
+    let max = total.saturating_sub(u64::from(viewport_height));
+    Some(max.saturating_sub(top.min(max)))
+}
+
+/// The content on the top row of a painted frame, as an anchor — `None`
+/// while following the bottom (973 repair 5).
+fn scroll_anchor_at(
+    cache: &TranscriptLayoutCache,
+    projection: &SessionProjection,
+    surface: &str,
+    prefix_rows: u64,
+    scroll: u64,
+    scroll_back: u64,
+) -> Option<crate::app::ScrollAnchor> {
+    if scroll_back == 0 {
+        return None;
+    }
+    if scroll < prefix_rows {
+        return Some(crate::app::ScrollAnchor {
+            surface: surface.to_owned(),
+            entry: None,
+            item: None,
+            row: scroll,
+            scroll_back,
+        });
+    }
+    let row = scroll - prefix_rows;
+    if row >= cache.total_rows || projection.entries().is_empty() {
+        return None;
+    }
+    let index = cache.entry_at_row(projection, row);
+    let inside = row.checked_sub(cache.row_start(projection, index))?;
+    let item = match projection.entries().get(index)? {
+        TranscriptEntry::Item(block) => Some(block.item_id.as_str().to_owned()),
+        _ => None,
+    };
+    Some(crate::app::ScrollAnchor {
+        surface: surface.to_owned(),
+        entry: Some(index),
+        item,
+        row: inside,
+        scroll_back,
+    })
+}
+
+/// A transcript viewport laid out for the frame, honouring `anchor` when
+/// one is set: the offset is re-derived from the anchor after every
+/// measuring pass until the content it names sits on the top row of the
+/// window the pass painted (973 repair 5).
+fn anchored_viewport(
+    model: &AppModel,
+    cache: &mut TranscriptLayoutCache,
+    projection: &SessionProjection,
+    ctx: LayoutCtx<'_>,
+    viewport: TranscriptViewport<'_>,
+    anchor: Option<&crate::app::ScrollAnchor>,
+) -> (Vec<Line<'static>>, u64, u64, u64) {
+    let prefix_rows = u64::from(wrapped_lines_height(viewport.prefix, viewport.width));
+    let suffix_rows = u64::from(wrapped_lines_height(viewport.suffix, viewport.width));
+    let mut laid = virtualized_transcript_lines(
+        cache,
+        projection,
+        ctx,
+        TranscriptViewport {
+            scroll_back: model.scroll_back.get(),
+            ..viewport
+        },
+    );
+    let Some(anchor) = anchor else {
+        return laid;
+    };
+    for _ in 0..VIEWPORT_PASSES {
+        let Some(offset) = anchored_scroll_back(
+            cache,
+            projection,
+            ctx,
+            anchor,
+            prefix_rows,
+            suffix_rows,
+            viewport.height,
+        ) else {
+            break;
+        };
+        if offset == model.scroll_back.get() {
+            break;
+        }
+        model.scroll_back.set(offset);
+        laid = virtualized_transcript_lines(
+            cache,
+            projection,
+            ctx,
+            TranscriptViewport {
+                scroll_back: offset,
+                ..viewport
+            },
+        );
+    }
+    laid
+}
+
 /// A tool call whose outcome is known. Only settled calls fold — a live row
 /// is exactly what the reader is watching.
 pub(crate) const fn settled_tool(status: haider_protocol::item::ToolStatus) -> bool {
@@ -853,13 +1107,52 @@ pub(crate) const fn settled_tool(status: haider_protocol::item::ToolStatus) -> b
     )
 }
 
+/// The transcript lines for one viewport, SELF-CONSISTENT (973 repair 5).
+///
+/// One pass picks its window from the geometry it starts with, then
+/// measures the entries it shows — and a measured height that differs from
+/// its estimate moves the bottom-anchored window. A pass whose window moved
+/// under it painted rows from one window at another's offset: blank rows
+/// under the tail, and click targets a row away from the glyphs they sit
+/// on. The pass therefore repeats (measured entries stay cached, so this
+/// converges in one or two more) until the window it painted is the window
+/// it ends on.
 fn virtualized_transcript_lines(
     cache: &mut TranscriptLayoutCache,
     projection: &SessionProjection,
     ctx: LayoutCtx<'_>,
     viewport: TranscriptViewport<'_>,
 ) -> (Vec<Line<'static>>, u64, u64, u64) {
-    let TranscriptViewport {
+    let mut pass = virtualized_pass(cache, projection, ctx, &viewport);
+    for _ in 0..VIEWPORT_PASSES {
+        if pass.start_scroll == pass.scroll {
+            break;
+        }
+        pass = virtualized_pass(cache, projection, ctx, &viewport);
+    }
+    (pass.lines, pass.base, pass.total, pass.scroll)
+}
+
+/// Extra passes [`virtualized_transcript_lines`] may take to converge.
+const VIEWPORT_PASSES: usize = 4;
+
+struct ViewportPass {
+    lines: Vec<Line<'static>>,
+    base: u64,
+    total: u64,
+    /// The scroll row the pass chose its window for.
+    start_scroll: u64,
+    /// The scroll row its measurements ended on.
+    scroll: u64,
+}
+
+fn virtualized_pass(
+    cache: &mut TranscriptLayoutCache,
+    projection: &SessionProjection,
+    ctx: LayoutCtx<'_>,
+    viewport: &TranscriptViewport<'_>,
+) -> ViewportPass {
+    let &TranscriptViewport {
         prefix,
         suffix,
         scroll_back,
@@ -873,6 +1166,7 @@ fn virtualized_transcript_lines(
     let total = suffix_base.saturating_add(suffix_rows);
     let max_scroll = total.saturating_sub(u64::from(viewport_height));
     let scroll = max_scroll.saturating_sub(scroll_back.min(max_scroll));
+    let start_scroll = scroll;
     let wanted_start = scroll.saturating_sub(TRANSCRIPT_OVERSCAN_ROWS);
     let wanted_end = scroll
         .saturating_add(u64::from(viewport_height))
@@ -938,7 +1232,13 @@ fn virtualized_transcript_lines(
         .saturating_add(suffix_rows);
     let max_scroll = total.saturating_sub(u64::from(viewport_height));
     let scroll = max_scroll.saturating_sub(scroll_back.min(max_scroll));
-    (lines, base, total, scroll)
+    ViewportPass {
+        lines,
+        base,
+        total,
+        start_scroll,
+        scroll,
+    }
 }
 
 /// Register the visible portion of every durable image row. Geometry uses
@@ -1089,7 +1389,9 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Sessions => render_sessions(model, theme, frame, body, &mut hits),
         }
     }
-    if model.inbox_open {
+    if model.tool_detail.is_some() {
+        render_tool_detail(model, theme, frame, body, &mut hits);
+    } else if model.inbox_open {
         render_inbox(model, theme, frame, body);
         hits.clear();
     } else if model.help_open {
@@ -1210,6 +1512,124 @@ fn ellipsize_spans<'s>(spans: Vec<Span<'s>>, cap: usize, theme: &Theme) -> Vec<S
     kept
 }
 
+/// Lazy-workspace badges, most explicit first. Every tier says the leaf is
+/// NOT on disk yet (ratified 972 contract: the TUI must not imply the
+/// directory exists before the first write), so a narrow launcher trades
+/// wording, never the fact.
+const PENDING_WORKSPACE_BADGES: [&str; 3] =
+    [" · created on first write", " · not created yet", " · new"];
+/// The origin line's cue for a dated leaf that is still unmaterialised. That
+/// line wraps, so it can afford the whole statement at any width.
+const PENDING_WORKSPACE_ORIGIN_CUE: &str = " · not created yet (created on first write)";
+/// The fewest allocation-id hex digits a narrowed leaf keeps (`s-0123abcd…`)
+/// before the badge itself is allowed to shorten further.
+const PENDING_LEAF_MIN_HEX: usize = 8;
+/// The absolute floor, used only when even the shortest badge cannot sit
+/// beside an 8-digit leaf.
+const PENDING_LEAF_FLOOR_HEX: usize = 4;
+
+fn cells(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// Fit a fresh session's resolved-but-unmaterialised workspace path and its
+/// lazy-state badge into `budget` cells, returning `(path, badge)`.
+///
+/// The row's two load-bearing facts are WHICH dated leaf this is and that it
+/// does NOT exist yet, so neither is ever the thing a right-end ellipsis
+/// eats. Discrete path shapes are tried most-detailed first, each with the
+/// most explicit worded badge that still fits: the full path, then middle elision
+/// of the parents (`~/…/Haider/<date>/s-<id>`, then `…/<date>/s-<id>`).
+/// Only when the whole `<date>/s-<id>` tail cannot fit does the leaf's hex
+/// tail shorten — keeping the date and at least eight id digits, with the
+/// badge wording (never its presence) yielding first. `None` means the
+/// frame is too narrow for even `…/<date>/s-xxxx…` plus ` · new`.
+pub(crate) fn fit_pending_workspace(path: &str, budget: usize) -> Option<(String, &'static str)> {
+    // Split on EITHER separator (a Windows home-relative spelling can mix
+    // them: `~/Documents\Haider\…`); elided shapes rejoin with the one
+    // nearest the leaf, i.e. the native spelling of the dated components.
+    let separators = ['/', '\\'];
+    let parts: Vec<&str> = path.split(separators).collect();
+    let sep = path
+        .rfind(separators)
+        .and_then(|index| path[index..].chars().next())
+        .unwrap_or('/')
+        .to_string();
+    let mut shapes = vec![path.to_owned()];
+    if parts.len() > 3 {
+        // `~/…/Haider/<date>/<leaf>` style: keep the root component and a
+        // growing suffix, eliding parents from the middle outward.
+        for keep_from in 2..parts.len() - 1 {
+            shapes.push(format!(
+                "{}{sep}…{sep}{}",
+                parts[0],
+                parts[keep_from..].join(&sep)
+            ));
+        }
+    }
+    if parts.len() > 2 {
+        shapes.push(format!("…{sep}{}", parts[parts.len() - 2..].join(&sep)));
+    }
+    for shape in &shapes {
+        // The bare ` · new` is reserved for the narrowed rung: a whole path
+        // never buys itself the weakest wording.
+        if let Some(badge) = PENDING_WORKSPACE_BADGES[..2]
+            .iter()
+            .find(|badge| cells(shape) + cells(badge) <= budget)
+        {
+            return Some((shape.clone(), badge));
+        }
+    }
+    // The tail itself must shorten: keep `…/<date>/` and the leaf's head;
+    // the last rung drops the `…/` lead too (`<date>/s-xxxx… · new`), which
+    // is what an 80-column session header can hold.
+    let leaf = parts.last().copied().unwrap_or(path);
+    let (head, bare_head) = if parts.len() > 1 {
+        let date = parts[parts.len() - 2];
+        (format!("…{sep}{date}{sep}"), format!("{date}{sep}"))
+    } else {
+        (String::new(), String::new())
+    };
+    let id_prefix = if leaf.starts_with("s-") { 2 } else { 0 };
+    let leaf_chars: Vec<char> = leaf.chars().collect();
+    let narrowed = |lead: &str, keep: usize| -> String {
+        let kept: String = leaf_chars.iter().take(keep).collect();
+        format!("{lead}{kept}…")
+    };
+    for (lead, floor, badges) in [
+        (&head, PENDING_LEAF_MIN_HEX, &PENDING_WORKSPACE_BADGES[..]),
+        (
+            &head,
+            PENDING_LEAF_FLOOR_HEX,
+            &PENDING_WORKSPACE_BADGES[2..],
+        ),
+        (
+            &bare_head,
+            PENDING_LEAF_FLOOR_HEX,
+            &PENDING_WORKSPACE_BADGES[2..],
+        ),
+    ] {
+        let min_keep = (id_prefix + floor).min(leaf_chars.len());
+        for badge in badges {
+            let room = budget.saturating_sub(cells(badge));
+            // Grow the kept leaf head as far as the room allows.
+            let mut best = None;
+            for keep in min_keep..leaf_chars.len() {
+                let candidate = narrowed(lead, keep);
+                if cells(&candidate) <= room {
+                    best = Some(candidate);
+                } else {
+                    break;
+                }
+            }
+            if let Some(shape) = best {
+                return Some((shape, badge));
+            }
+        }
+    }
+    None
+}
+
 /// A chip whose CHROME (the `[ ]` border stand-in) and label carry
 /// different inks — the sim's frame-bordered pills with colored text
 /// (`.mic`, `.backbtn`, `.voice`: border frame, label gold/dim).
@@ -1242,11 +1662,28 @@ fn voice_header_chip<'a>(model: &AppModel, theme: &Theme) -> Option<Vec<Span<'a>
     ))
 }
 
-/// Paint the voice chip at the RIGHT end of the header's top row — over a
-/// rect exactly the chip's width, so the left-aligned product line on the
-/// same row is never cleared. `left_used` is the display width the product
-/// line already occupies; the chip is dropped (narrow terminal) when it would
-/// overlap that content, and hidden entirely when voice is off.
+/// The computer-use presence chip (owner 2026-09-24, "show it like
+/// ChatGPT/Codex"): `[ ◉ controlling screen · esc stop ]` while the current
+/// run has driven the desktop (or `phone`) within the shared idle window.
+/// Esc is the existing turn cancel: it stops this session's main-thread run
+/// only (owner decision 2026-09-25) — the run whose own `computer`/`mobile`
+/// calls light this chip. A subagent driving the screen keeps running and is
+/// stopped by the overlay Stop or `agent cancel --all`; `run --stop`
+/// addresses runs launched through the headless run API.
+fn cu_presence_header_chip<'a>(model: &AppModel, theme: &Theme) -> Option<Vec<Span<'a>>> {
+    let surface = model.projection.cu_presence()?;
+    Some(chip_two_tone(
+        format!("◉ controlling {} · esc stop", surface.noun()),
+        theme.warn_style(),
+        theme.warn_style().add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Paint the header's TOP-RIGHT chips — the computer-use presence chip, then
+/// the voice chip to its left — each over a rect exactly its width, so the
+/// left-aligned product line on the same row is never cleared. `left_used`
+/// is the display width the product line already occupies; a chip that
+/// would overlap it (narrow terminal) is dropped, presence last.
 fn render_header_voice_chip(
     model: &AppModel,
     theme: &Theme,
@@ -1257,19 +1694,30 @@ fn render_header_voice_chip(
     if header_area.height == 0 {
         return;
     }
-    if let Some(spans) = voice_header_chip(model, theme) {
+    let mut right = header_area.x + header_area.width;
+    let limit = header_area.x.saturating_add(left_used).saturating_add(2);
+    for spans in [
+        cu_presence_header_chip(model, theme),
+        voice_header_chip(model, theme),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let chip_w = u16::try_from(Line::from(spans.clone()).width()).unwrap_or(0);
-        if chip_w > 0 && left_used.saturating_add(2).saturating_add(chip_w) <= header_area.width {
-            frame.render_widget(
-                Paragraph::new(Line::from(spans)),
-                Rect {
-                    x: header_area.x + header_area.width - chip_w,
-                    y: header_area.y,
-                    width: chip_w,
-                    height: 1,
-                },
-            );
+        if chip_w == 0 || right.saturating_sub(chip_w) < limit {
+            continue;
         }
+        right -= chip_w;
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: right,
+                y: header_area.y,
+                width: chip_w,
+                height: 1,
+            },
+        );
+        right = right.saturating_sub(1);
     }
 }
 
@@ -1715,18 +2163,54 @@ fn render_launcher(
     ));
     header_top.push(Span::styled(" · ", theme.dim_style()));
     header_top.push(Span::styled(identity.device.clone(), theme.bright_style()));
-    header_bottom.extend([
-        Span::styled("provider ", theme.dim_style()),
-        Span::styled(identity.provider.clone(), theme.bright_style()),
-        Span::styled(" · model ", theme.dim_style()),
-        Span::styled(identity.model_short.clone(), theme.bright_style()),
-        Span::styled(" · account ", theme.dim_style()),
-        Span::styled(identity.account.clone(), theme.bright_style()),
-        Span::styled(" · dir ", theme.dim_style()),
-        Span::styled(model.launcher_dir.clone(), theme.bright_style()),
-        Span::styled(" · mesh ", theme.dim_style()),
-        Span::styled("off", theme.bright_style()),
-    ]);
+    if let Some(workspace) = model.pending_workspace_display.as_ref() {
+        // A fresh interactive session has already resolved its dated leaf,
+        // but that leaf deliberately does not exist yet. Put both facts first
+        // so the owner-width frame cannot keep showing the launch cwd or clip
+        // the lazy-materialisation contract behind provider metadata.
+        // Narrow frames middle-elide the parents and then the id's tail;
+        // the date, a recognisable `s-` prefix and the not-yet-created badge
+        // survive down to 80 columns (owner-delegated UX, lane 973 repair).
+        let used = Line::from(header_bottom.clone()).width();
+        let budget = usize::from(area.width)
+            .saturating_sub(used)
+            .saturating_sub(cells("dir "));
+        let (shown, badge) = fit_pending_workspace(workspace, budget)
+            .unwrap_or_else(|| (workspace.clone(), PENDING_WORKSPACE_BADGES[0]));
+        header_bottom.extend([
+            Span::styled("dir ", theme.dim_style()),
+            Span::styled(shown, theme.bright_style()),
+            Span::styled(badge, theme.dim_style()),
+        ]);
+        let identity_tail = [
+            Span::styled(" · provider ", theme.dim_style()),
+            Span::styled(identity.provider.clone(), theme.bright_style()),
+            Span::styled(" · model ", theme.dim_style()),
+            Span::styled(identity.model_short.clone(), theme.bright_style()),
+            Span::styled(" · account ", theme.dim_style()),
+            Span::styled(identity.account.clone(), theme.bright_style()),
+            Span::styled(" · mesh ", theme.dim_style()),
+            Span::styled("off", theme.bright_style()),
+        ];
+        let used = Line::from(header_bottom.clone()).width();
+        let tail_width = Line::from(identity_tail.to_vec()).width();
+        if used.saturating_add(tail_width) <= usize::from(area.width) {
+            header_bottom.extend(identity_tail);
+        }
+    } else {
+        header_bottom.extend([
+            Span::styled("provider ", theme.dim_style()),
+            Span::styled(identity.provider.clone(), theme.bright_style()),
+            Span::styled(" · model ", theme.dim_style()),
+            Span::styled(identity.model_short.clone(), theme.bright_style()),
+            Span::styled(" · account ", theme.dim_style()),
+            Span::styled(identity.account.clone(), theme.bright_style()),
+            Span::styled(" · dir ", theme.dim_style()),
+            Span::styled(model.launcher_dir.clone(), theme.bright_style()),
+            Span::styled(" · mesh ", theme.dim_style()),
+            Span::styled("off", theme.bright_style()),
+        ]);
+    }
     let band_cap = area.width as usize;
     let header_top = ellipsize_spans(header_top, band_cap, theme);
     let header_bottom = ellipsize_spans(header_bottom, band_cap, theme);
@@ -5708,6 +6192,12 @@ fn render_model_picker(
                 theme.dim_style(),
             ),
         ];
+        if let Some(source) = row.source {
+            spans.push(Span::styled(
+                format!("  {}", source.as_str()),
+                theme.dim_style(),
+            ));
+        }
         if row.is_current {
             let current = if is_top_api_group(row) && row.providers.len() > 1 {
                 format!(
@@ -6257,10 +6747,32 @@ fn render_session(
     header_top.push(Span::styled(format!(" v{VERSION}"), theme.dim_style()));
     // The session's working dir — `cd` retargets it (sim: "the agent
     // works elsewhere while the session stays global").
-    header_top.push(Span::styled(
-        format!(" · {}", model.session_dir),
-        theme.bright_style(),
-    ));
+    // A dated leaf that is not on disk yet keeps its cue in this FIXED
+    // header (972 contract) — the origin line scrolls away with the
+    // transcript, so it can never be the only carrier. Fitted like the
+    // launcher row; at 80 columns that is `<date>/s-xxxx… · new`.
+    let header_fit = if model.session_workspace_uncreated {
+        let used = Line::from(header_top.clone()).width();
+        let budget = usize::from(area.width)
+            .saturating_sub(used)
+            .saturating_sub(cells(" · "));
+        fit_pending_workspace(&model.session_dir, budget)
+    } else {
+        None
+    };
+    if let Some((shown, badge)) = header_fit {
+        header_top.push(Span::styled(format!(" · {shown}"), theme.bright_style()));
+        header_top.push(Span::styled(badge, theme.dim_style()));
+    } else if model.session_workspace_uncreated {
+        // Narrower than even `<date>/s-xxxx… · new`: the fixed header keeps
+        // the STATE (the path is secondary and still on the origin line).
+        header_top.push(Span::styled(PENDING_WORKSPACE_BADGES[2], theme.dim_style()));
+    } else {
+        header_top.push(Span::styled(
+            format!(" · {}", model.session_dir),
+            theme.bright_style(),
+        ));
+    }
     // W-flow inline identity: a BOUND agent type recolors the session's own
     // accent — the head callsign trades its gold for the type's registry
     // color and a `{glyph} @{id}` chip rides beside it. The fallback law is
@@ -6350,6 +6862,7 @@ fn render_session(
     // in the same global wrapped-row space as before.
     let mut transcript_cache = model.transcript_layout.borrow_mut();
     let transcript_runs = transcript_cache.cached_runs(&model.projection, &model.toolfold);
+    let tool_paths = model.tool_path_context();
     let layout_ctx = LayoutCtx {
         theme,
         width: transcript_area.width,
@@ -6358,8 +6871,9 @@ fn render_session(
         timings: &model.tool_timings,
         now_ms: model.clock_ms,
         runs: transcript_runs.as_ref(),
+        paths: &tool_paths,
     };
-    transcript_cache.reconcile(&model.projection, layout_ctx);
+    let relayout = transcript_cache.reconcile(&model.projection, layout_ctx);
     // The origin is context chrome, not conversation content. On the short
     // session rung it must shed before replayed assistant text: otherwise a
     // 90x10 cold attach can be perfectly caught up while the only historical
@@ -6370,8 +6884,16 @@ fn render_session(
             .as_ref()
             .and_then(|(_, origin)| origin.as_ref())
             .map(|origin| {
+                let state = if model.session_workspace_uncreated {
+                    PENDING_WORKSPACE_ORIGIN_CUE
+                } else {
+                    ""
+                };
                 vec![Line::styled(
-                    format!("· Opened from {origin} · Workspace: {}", model.session_dir),
+                    format!(
+                        "· Opened from {origin} · Workspace: {}{state}",
+                        model.session_dir
+                    ),
                     theme.dim_style(),
                 )]
             })
@@ -6415,9 +6937,24 @@ fn render_session(
     if transcript_area.height > 1 && (!transcript_cache.entries.is_empty() || !tail.is_empty()) {
         tail.push(Line::default());
     }
-    let total = origin_rows.saturating_add(transcript_cache.total_rows.saturating_add(u64::from(
-        wrapped_lines_height(&tail, transcript_area.width),
-    )));
+    let tail_rows = u64::from(wrapped_lines_height(&tail, transcript_area.width));
+    // 973 repair 5: a re-layout under an untouched offset, or a closing
+    // detail view, puts the same CONTENT back on the top row.
+    let mut anchor = frame_anchor(model, SESSION_SURFACE, relayout);
+    if let Some(offset) = anchor.as_ref().and_then(|anchor| {
+        anchored_scroll_back(
+            &mut transcript_cache,
+            &model.projection,
+            layout_ctx,
+            anchor,
+            origin_rows,
+            tail_rows,
+            transcript_area.height,
+        )
+    }) {
+        model.scroll_back.set(offset);
+    }
+    let total = origin_rows.saturating_add(transcript_cache.total_rows.saturating_add(tail_rows));
     let max_scroll_rows = total.saturating_sub(u64::from(transcript_area.height));
     let max_scroll = max_scroll_rows;
     // RENDER is the single scroll authority (review r3 P2-2): the frame
@@ -6430,6 +6967,7 @@ fn render_session(
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
+    let anchored_offset = model.scroll_back.get();
     // B2b-m3: resolve an armed tree jump IN THIS FRAME — node → display
     // entry → wrapped row, every step through the renderer's width-keyed
     // geometry. A resize invalidates the cache before this lookup, so the
@@ -6482,24 +7020,39 @@ fn render_session(
             .scroll_back
             .set(max_scroll_rows.saturating_sub(row.min(max_scroll_rows)));
     }
-    let scroll_back = model.scroll_back.get();
-    let (visible_lines, visible_base, visible_total, scroll) = virtualized_transcript_lines(
+    // A reveal or a jump this frame chose a NEW place; the anchor names
+    // the old one and must not pull the view back to it.
+    if anchor.is_some() && model.scroll_back.get() != anchored_offset {
+        anchor = None;
+    }
+    let (visible_lines, visible_base, visible_total, scroll) = anchored_viewport(
+        model,
         &mut transcript_cache,
         &model.projection,
         layout_ctx,
         TranscriptViewport {
             prefix: &origin_prefix,
             suffix: &tail,
-            scroll_back,
+            scroll_back: model.scroll_back.get(),
             height: transcript_area.height,
             width: transcript_area.width,
         },
+        anchor.as_ref(),
     );
     let corrected_max = visible_total.saturating_sub(u64::from(transcript_area.height));
     model.scroll_max.set(corrected_max);
     model
         .scroll_back
         .set(model.scroll_back.get().min(corrected_max));
+    let scroll_back = model.scroll_back.get();
+    *model.scroll_anchor.borrow_mut() = scroll_anchor_at(
+        &transcript_cache,
+        &model.projection,
+        SESSION_SURFACE,
+        origin_rows,
+        corrected_max.saturating_sub(scroll_back.min(corrected_max)),
+        scroll_back,
+    );
     // D4: an open `plan` proposal owns the transcript area — the full
     // markdown document renders here (scrolled), while the decision menu
     // keeps the composer band through the ordinary blocking-menu path.
@@ -6568,10 +7121,15 @@ fn render_session(
             )),
             transcript_area,
         );
+        // `scroll` counts the origin prefix's wrapped rows (the viewport
+        // puts them ahead of entry 0), so every entry hit starts after them
+        // too. Passing 0 here put each click `origin_rows` above the row it
+        // was drawn on whenever a session showed its "Opened from" line
+        // (973-tui-toolview: the `(⌃O to expand)` door found it).
         image_reveal_hits(
             &transcript_cache,
             &model.projection,
-            0,
+            origin_rows,
             scroll,
             transcript_area,
             hits,
@@ -6584,7 +7142,7 @@ fn render_session(
             &transcript_cache,
             &model.projection,
             layout_ctx,
-            0,
+            origin_rows,
             scroll,
             transcript_area,
             hits,
@@ -7234,11 +7792,11 @@ fn highlight_transcript_lines(
         .collect()
 }
 
-/// ⌃G / `/tokens` — context by model (sim tui.js:2946-2977), floated
-/// above the input band. Live rows carry the W7b footprint truth: an
-/// EXACT snapshot prints plain splits, an ESTIMATED one keeps the sim's
-/// `~` prefixes; with no snapshot yet the sim's fabricated 62/28/10
-/// split stands in (demo parity).
+/// ⌃G / `/tokens` — context by model (sim tui.js:2946-2977),
+/// floated above the input band. Live rows carry the W7b footprint truth:
+/// an EXACT snapshot prints plain splits, an ESTIMATED one keeps the sim's
+/// `~` prefixes. Only the DEMO (which fabricates locally) keeps the sim's
+/// 62/28/10 split with no snapshot; a live session says it has none yet.
 fn render_token_panel(
     model: &AppModel,
     theme: &Theme,
@@ -7246,102 +7804,77 @@ fn render_token_panel(
     area: Rect,
     input_top: u16,
 ) {
-    struct PanelRow {
-        label: String,
-        tokens: u64,
-        window: u64,
-        detail: String,
-    }
     let identity = &model.identity;
-    let main_label = format!("● {} · {}", identity.model_short, identity.provider);
-    let main = model.projection.latest_footprint().map_or_else(
-        || {
-            // Sim math (tui.js:2951-2953): fabricated splits + burn-rate
-            // turns estimate from the transcript's user rows.
-            let tokens = model.projection.context_tokens();
-            let window = identity.context_window;
-            let turns = u64::from(model.projection.user_row_count().max(1));
-            let burn = (tokens / turns).max(6000);
-            let to_threshold = (window.saturating_mul(85) / 100).saturating_sub(tokens);
-            let detail = format!(
-                "in ~{} · out ~{} · cached ~{} · ≈{} turns to auto-compaction",
-                fmt_tok(tokens.saturating_mul(62) / 100),
-                fmt_tok(tokens.saturating_mul(28) / 100),
-                fmt_tok(tokens.saturating_mul(10) / 100),
-                to_threshold.div_ceil(burn).max(1),
-            );
-            PanelRow {
-                label: main_label.clone(),
-                tokens,
-                window,
-                detail,
-            }
-        },
-        |footprint| {
-            let approx = match footprint.truth {
-                haider_protocol::context::ContextFootprintTruth::Exact => "",
-                haider_protocol::context::ContextFootprintTruth::Estimated => "~",
-            };
-            let mut detail = format!(
-                "in {approx}{} · out {approx}{} · cached {approx}{}",
-                fmt_tok(footprint.input_tokens),
-                fmt_tok(footprint.output_tokens),
-                fmt_tok(footprint.cached_input_tokens),
-            );
-            if let Some(turns) = footprint.estimated_turns_to_threshold {
-                detail.push_str(&format!(" · ≈{turns} turns to auto-compaction"));
-            }
-            PanelRow {
-                label: main_label.clone(),
-                tokens: footprint.used_tokens,
-                window: footprint.context_window.unwrap_or(identity.context_window),
-                detail,
-            }
-        },
-    );
-    let mut rows = vec![main];
+    // 973-context-meter: every row resolves through the ONE meter, so the
+    // panel, the status line and the mirror can never disagree; the main
+    // row's detail defines each number (prompt incl. cached, reply,
+    // auto-compaction trigger).
+    let main_meter = model.context_meter();
+    let main_detail = if model.mode.fabricates_locally() && !main_meter.from_snapshot {
+        // Sim math (tui.js:2951-2953): fabricated splits + burn-rate turns
+        // estimate from the transcript's user rows — demo parity only.
+        let tokens = main_meter.used_tokens;
+        let turns = u64::from(model.projection.user_row_count().max(1));
+        let burn = (tokens / turns).max(6000);
+        let to_threshold = main_meter
+            .auto_compact_at
+            .unwrap_or_default()
+            .saturating_sub(tokens);
+        vec![format!(
+            "in ~{} · out ~{} · cached ~{} · ≈{} turns to auto-compaction",
+            fmt_tok(tokens.saturating_mul(62) / 100),
+            fmt_tok(tokens.saturating_mul(28) / 100),
+            fmt_tok(tokens.saturating_mul(10) / 100),
+            to_threshold.div_ceil(burn).max(1),
+        )]
+    } else {
+        main_meter.detail_lines()
+    };
+    let mut rows = vec![(
+        format!("● {} · {}", identity.model_short, identity.provider),
+        main_meter,
+        main_detail,
+    )];
     for (_, chip) in crate::app::flatten_chips(&model.chips) {
-        let (tokens, window, detail) = chip.transcript.latest_footprint().map_or_else(
-            || (chip.tokens, identity.context_window, String::new()),
-            |footprint| {
-                (
-                    footprint.used_tokens,
-                    footprint.context_window.unwrap_or(identity.context_window),
-                    String::new(),
+        // A child's window is ITS model's: its own snapshot, else the
+        // catalog row for its model — never the parent's figure.
+        let declared = model
+            .providers
+            .declared_window(&identity.provider, &chip.model)
+            .unwrap_or(0);
+        let meter = crate::context_meter::ContextMeter::resolve(
+            chip.transcript.latest_footprint(),
+            chip.tokens,
+            declared,
+            true,
+            |window| {
+                crate::context_meter::derived_reserved_output(
+                    model
+                        .providers
+                        .declared_output_limit(&identity.provider, &chip.model),
+                    window,
                 )
             },
         );
-        rows.push(PanelRow {
-            label: format!("└ {} · {}", chip.name, chip.model),
-            tokens,
-            window,
-            detail,
-        });
+        rows.push((
+            format!("└ {} · {}", chip.name, chip.model),
+            meter,
+            Vec::new(),
+        ));
     }
     let mut lines = vec![Line::styled(
         "context by model — ⌃G · /tokens · esc closes",
         theme.dim_style(),
     )];
-    for row in &rows {
-        #[allow(clippy::cast_precision_loss)]
-        let pct = if row.window == 0 {
-            0.0
-        } else {
-            row.tokens as f64 / row.window as f64
-        };
-        let mut text = format!(
-            "{}  {} {}%  {}/{}",
-            row.label,
-            meter_cells(pct, 12),
-            (pct.clamp(0.0, 1.0) * 100.0).round(),
-            fmt_tok(row.tokens),
-            fmt_tok(row.window),
-        );
-        if !row.detail.is_empty() {
-            text.push_str(" · ");
-            text.push_str(&row.detail);
+    for (label, meter, detail) in &rows {
+        lines.push(Line::styled(
+            format!("{label}  {}", panel_meter_text(meter)),
+            theme.text_style(),
+        ));
+        // One fact per line so a narrow terminal clips none of them.
+        for fact in detail {
+            lines.push(Line::styled(format!("    {fact}"), theme.dim_style()));
         }
-        lines.push(Line::styled(text, theme.text_style()));
     }
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let width = area.width.saturating_sub(2).max(24);
@@ -7361,6 +7894,25 @@ fn render_token_panel(
         ),
         rect,
     );
+}
+
+/// One `/tokens` panel row's meter: `▰▰▱… 17%  34k/200k`, or the honest
+/// `34k tok · window unknown`.
+fn panel_meter_text(meter: &crate::context_meter::ContextMeter) -> String {
+    match (meter.window, meter.fraction(), meter.percent()) {
+        (Some(window), Some(fraction), Some(percent)) => format!(
+            "{} {percent}%  {}{}/{}",
+            meter_cells(fraction, 12),
+            meter.approx(),
+            fmt_tok(meter.used_tokens),
+            fmt_tok(window),
+        ),
+        _ => format!(
+            "{}{} tok · window unknown",
+            meter.approx(),
+            fmt_tok(meter.used_tokens)
+        ),
+    }
 }
 
 /// `/tree` — the session tree (B2b-m3; sim tui.js:3366-3430). ONE branch
@@ -11006,6 +11558,7 @@ fn render_subagent(
     }
     let mut transcript_cache = chip.transcript_layout.borrow_mut();
     let transcript_runs = transcript_cache.cached_runs(&chip.transcript, &model.toolfold);
+    let tool_paths = model.tool_path_context();
     let layout_ctx = LayoutCtx {
         theme,
         width: transcript_area.width,
@@ -11014,8 +11567,10 @@ fn render_subagent(
         timings: &model.tool_timings,
         now_ms: model.clock_ms,
         runs: transcript_runs.as_ref(),
+        paths: &tool_paths,
     };
-    transcript_cache.reconcile(&chip.transcript, layout_ctx);
+    let relayout = transcript_cache.reconcile(&chip.transcript, layout_ctx);
+    let surface = format!("chip:{}", chip.agent);
     let mut tail: Vec<Line<'static>> = Vec::new();
     // Session parity: the tail is up for the WHOLE running turn, not just the
     // THINKING beat. Judged on `display` (the badge's truth), NOT the raw
@@ -11046,12 +11601,26 @@ fn render_subagent(
     if !prefix.is_empty() || !transcript_cache.entries.is_empty() || !tail.is_empty() {
         tail.push(Line::default());
     }
-    let total = u64::from(wrapped_lines_height(&prefix, transcript_area.width))
+    let prefix_rows = u64::from(wrapped_lines_height(&prefix, transcript_area.width));
+    let tail_rows = u64::from(wrapped_lines_height(&tail, transcript_area.width));
+    // 973 repair 5: the session transcript's content anchoring, here too.
+    let mut anchor = frame_anchor(model, &surface, relayout);
+    if let Some(offset) = anchor.as_ref().and_then(|anchor| {
+        anchored_scroll_back(
+            &mut transcript_cache,
+            &chip.transcript,
+            layout_ctx,
+            anchor,
+            prefix_rows,
+            tail_rows,
+            transcript_area.height,
+        )
+    }) {
+        model.scroll_back.set(offset);
+    }
+    let total = prefix_rows
         .saturating_add(transcript_cache.total_rows)
-        .saturating_add(u64::from(wrapped_lines_height(
-            &tail,
-            transcript_area.width,
-        )));
+        .saturating_add(tail_rows);
     let max_scroll = total.saturating_sub(u64::from(transcript_area.height));
     model.scroll_max.set(max_scroll);
     // Drag-autoscroll edges (QoL wave), as on the session transcript.
@@ -11059,15 +11628,20 @@ fn render_subagent(
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
+    let anchored_offset = model.scroll_back.get();
     resolve_tool_reveal(
         model,
         &transcript_cache,
         &chip.transcript,
-        u64::from(wrapped_lines_height(&prefix, transcript_area.width)),
+        prefix_rows,
         max_scroll,
         transcript_area.height,
     );
-    let (visible_lines, visible_base, visible_total, scroll) = virtualized_transcript_lines(
+    if anchor.is_some() && model.scroll_back.get() != anchored_offset {
+        anchor = None;
+    }
+    let (visible_lines, visible_base, visible_total, scroll) = anchored_viewport(
+        model,
         &mut transcript_cache,
         &chip.transcript,
         layout_ctx,
@@ -11078,12 +11652,21 @@ fn render_subagent(
             height: transcript_area.height,
             width: transcript_area.width,
         },
+        anchor.as_ref(),
     );
     let corrected_max = visible_total.saturating_sub(u64::from(transcript_area.height));
     model.scroll_max.set(corrected_max);
     model
         .scroll_back
         .set(model.scroll_back.get().min(corrected_max));
+    *model.scroll_anchor.borrow_mut() = scroll_anchor_at(
+        &transcript_cache,
+        &chip.transcript,
+        &surface,
+        prefix_rows,
+        corrected_max.saturating_sub(model.scroll_back.get().min(corrected_max)),
+        model.scroll_back.get(),
+    );
     frame.render_widget(
         Paragraph::new(Text::from(visible_lines))
             .wrap(Wrap { trim: false })
@@ -11093,7 +11676,6 @@ fn render_subagent(
             )),
         transcript_area,
     );
-    let prefix_rows = u64::from(wrapped_lines_height(&prefix, transcript_area.width));
     image_reveal_hits(
         &transcript_cache,
         &chip.transcript,
@@ -11766,6 +12348,12 @@ fn wrapped_menu_body(
             .flat_map(|logical| wrap_body(logical, budget))
             .map(|row| (row, DiffTone::Body))
             .collect();
+        rows.extend(
+            crate::projection::error_identity_lines(presentation)
+                .iter()
+                .flat_map(|line| wrap_body(line, budget))
+                .map(|row| (row, DiffTone::Body)),
+        );
         let facts = crate::projection::error_fact_segments(presentation, Some(now_ms));
         rows.push((shed_fact_line(&facts, budget), DiffTone::Body));
         return rows;
@@ -14675,42 +15263,11 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
     // The derived WAITING-on-subagents badge overlays plain IDLE (§2.6).
     let (badge, _) = model.status_badge();
     let (state, detail) = model.status_badge_state_detail();
-    let identity = &model.identity;
-    // W7b meter truth: the durable occupancy snapshot beats the
-    // cumulative usage sum, and an ESTIMATED snapshot wears `~` so the
-    // meter never claims a precision it does not have.
-    let (tokens, window, approx) = model.projection.latest_footprint().map_or_else(
-        || {
-            (
-                model.projection.context_tokens(),
-                identity.context_window,
-                "",
-            )
-        },
-        |footprint| {
-            (
-                footprint.used_tokens,
-                footprint.context_window.unwrap_or(identity.context_window),
-                match footprint.truth {
-                    haider_protocol::context::ContextFootprintTruth::Exact => "",
-                    haider_protocol::context::ContextFootprintTruth::Estimated => "~",
-                },
-            )
-        },
-    );
-    #[allow(clippy::cast_precision_loss)]
-    let pct = if window == 0 {
-        0.0
-    } else {
-        tokens as f64 / window as f64
-    };
-    let meter = format!(
-        "{approx}{} tok · {} {}% of {}",
-        fmt_tok(tokens),
-        meter_cells(pct, METER_CELLS_DEFAULT),
-        (pct.clamp(0.0, 1.0) * 100.0).round(),
-        fmt_tok(window)
-    );
+    // W7b meter truth through the ONE resolution (973-context-meter): the
+    // durable occupancy snapshot beats the usage fallback, an ESTIMATED
+    // snapshot wears `~`, and an unknown window reads unknown — never a
+    // percentage of a guessed (or output-budget) window.
+    let meter = model.context_meter().status_text(METER_CELLS_DEFAULT);
 
     // F2c: token usage sits DIRECTLY right of the state — the identity
     // block (model / auth / reasoning) moved to the composer's top rule.
@@ -14763,6 +15320,18 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             state: None,
             detail: None,
         });
+    }
+    if let Some(budget) = model.projection.request_budget() {
+        let label = format!("  {}", budget.status_label());
+        if badge_cells + label.chars().count() <= width as usize {
+            badge_cells += label.chars().count();
+            segments.push(StatusSegment {
+                text: label,
+                tone: StatusSegmentTone::Dim,
+                state: None,
+                detail: None,
+            });
+        }
     }
     let meter_shown = badge_cells + 2 + meter.chars().count() <= width as usize;
     if meter_shown {
@@ -15194,7 +15763,7 @@ fn peer_entry_lines<'a>(
 ///  ✗ Provider rate limit reached            ← err ink, BOLD (title)
 ///  ▏ Wait for the provider limit to reset,  ← err rail · dim detail,
 ///  ▏ then retry.                              wrapped by display cells
-///  ▏ rate-limited · HTTP 429 · req 8f3a2c1… ← dim fact line, whole-
+///  ▏ rate-limited · HTTP 429 · Request id: …  ← dim fact line, whole-
 ///                                             segment shed to width
 /// ```
 ///
@@ -15232,7 +15801,12 @@ fn error_entry_lines<'a>(
     if budget == 0 {
         return;
     }
-    for logical in presentation.detail.split('\n') {
+    let identity = crate::projection::error_identity_lines(presentation);
+    for logical in presentation
+        .detail
+        .split('\n')
+        .chain(identity.iter().map(String::as_str))
+    {
         for row in wrap_body(logical, budget) {
             lines.push(Line::from(vec![
                 Span::raw(" "),
@@ -15446,11 +16020,11 @@ fn todo_row<'a>(item: &'a TodoItem, all: &[TodoItem], theme: &Theme, phase: u8) 
     Line::from(spans)
 }
 
-// ---- 971-tui-collapse: the collapsed tool row ----
+// ---- 971-tui-collapse / 973-tui-toolview: the tool row ----
 
 /// One [`crate::toolfold::Segment`] row as a themed ratatui line. This and
 /// [`Theme::tone_style`] are the whole seam between "what the text MEANS"
-/// (`toolfold.rs`, colourless) and "what ink it wears" (the theme).
+/// (`toolfold.rs` / `toolview.rs`, colourless) and "what ink it wears".
 fn toned_line(segments: &[crate::toolfold::Segment], theme: &Theme) -> Line<'static> {
     Line::from(
         segments
@@ -15460,20 +16034,95 @@ fn toned_line(segments: &[crate::toolfold::Segment], theme: &Theme) -> Line<'sta
     )
 }
 
-/// One DISPLAY row of expanded tool output: the 4-cell indent, then the row
-/// split into meaning-toned runs (owner item 3 — a non-zero exit code, a
-/// verdict, a `file:line`, a thread id each keep their own ink). The body
-/// ink is `dim`, not the old `faint`: this is text a reader reads.
+/// A tool-row segment list as a themed line held to the tool-row contrast
+/// floor on `ground` (973-tui-toolview repair: every tone a tool row draws —
+/// accent `file:line` tokens and Desert's green included — clears 4.5:1).
+fn tool_line_on(
+    segments: &[crate::toolfold::Segment],
+    theme: &Theme,
+    ground: crate::theme::Rgb,
+) -> Line<'static> {
+    Line::from(
+        segments
+            .iter()
+            .map(|segment| {
+                Span::styled(
+                    segment.text.clone(),
+                    theme.tool_tone_style_on(segment.tone, ground),
+                )
+            })
+            .collect::<Vec<Span<'static>>>(),
+    )
+}
+
+/// [`tool_line_on`] on the page ground.
+fn tool_line(segments: &[crate::toolfold::Segment], theme: &Theme) -> Line<'static> {
+    tool_line_on(segments, theme, theme.bg)
+}
+
+/// One DISPLAY row of an expanded tool row or the full-detail view, inked.
 ///
-/// The row arrives already wrapped to the content budget by
-/// `toolfold::output_rows`, so nothing is ellipsized away here — verify 1
-/// (F2) found `show all` silently dropping the suffix of every long line.
-fn tool_output_line(text: &str, theme: &Theme) -> Line<'static> {
-    let mut spans = vec![Span::styled("    ", theme.faint_style())];
-    for segment in crate::toolfold::meaning_segments(text) {
-        spans.push(Span::styled(segment.text, theme.tone_style(segment.tone)));
+/// Rows arrive already wrapped to the content width by
+/// `toolview::detail_rows`, so nothing is ellipsized away here. Output rows
+/// are split into meaning-toned runs (owner item 3 — a non-zero exit code,
+/// a verdict, a `file:line`, a thread id each keep their own ink); diff rows
+/// wear the added/removed ground across the whole row, with the `+`/`-`
+/// marker carrying the meaning where a terminal draws no colour.
+fn display_row_line(
+    row: &crate::toolview::DisplayRow,
+    theme: &Theme,
+    width: usize,
+) -> Line<'static> {
+    use crate::toolview::{DETAIL_INDENT, DiffKind, RowRole};
+    let indent = Span::styled(" ".repeat(DETAIL_INDENT), theme.faint_style());
+    match row.role {
+        RowRole::Heading => Line::from(vec![
+            indent,
+            Span::styled(
+                row.text.clone(),
+                theme.dim_style().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        RowRole::Args => Line::from(vec![
+            indent,
+            Span::styled(row.text.clone(), theme.text_style()),
+        ]),
+        RowRole::Note(tone) => Line::from(vec![
+            indent,
+            Span::styled(row.text.clone(), theme.tool_tone_style(tone)),
+        ]),
+        RowRole::Output => {
+            let mut spans = vec![indent];
+            for segment in crate::toolfold::meaning_segments(&row.text) {
+                spans.push(Span::styled(
+                    segment.text,
+                    theme.tool_tone_style(segment.tone),
+                ));
+            }
+            Line::from(spans)
+        }
+        RowRole::Diff { kind, first } => {
+            let style = match kind {
+                DiffKind::Added => theme.diff_added_style(),
+                DiffKind::Removed => theme.diff_removed_style(),
+                DiffKind::Context => theme.dim_style(),
+                DiffKind::Gap => theme.tool_tone_style(crate::toolfold::Tone::Structure),
+            };
+            let marker = if first { kind.marker() } else { ' ' };
+            let gutter = if row.gutter.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", row.gutter)
+            };
+            let mut body = format!("{gutter}{marker} {}", row.text);
+            if matches!(kind, DiffKind::Added | DiffKind::Removed) {
+                // The ground spans the row, as the reference's does.
+                let used = DETAIL_INDENT + unicode_width::UnicodeWidthStr::width(body.as_str());
+                body.push_str(&" ".repeat(width.saturating_sub(used)));
+            }
+            Line::from(vec![indent, Span::styled(body, style)])
+        }
     }
-    Line::from(spans)
 }
 
 /// The glyph's tone per terminal status. A live row no longer PULSES its
@@ -15492,10 +16141,9 @@ const fn status_tone(status: haider_protocol::item::ToolStatus) -> crate::toolfo
     }
 }
 
-/// The terminal-status WORD a summary row shows where no exit code exists.
-/// `Completed` needs none (the ✓ glyph already said it), and a cancellation
-/// wears metadata ink — it is an outcome, never a failure (the frozen
-/// `ToolStatus` law).
+/// The terminal-status WORD a quiet-mode header shows where no exit code
+/// exists. `Completed` needs none, and a cancellation wears metadata ink —
+/// it is an outcome, never a failure (the frozen `ToolStatus` law).
 fn status_outcome(status: haider_protocol::item::ToolStatus) -> Option<crate::toolfold::Segment> {
     use crate::toolfold::{Segment, Tone};
     use haider_protocol::item::ToolStatus;
@@ -15510,14 +16158,27 @@ fn status_outcome(status: haider_protocol::item::ToolStatus) -> Option<crate::to
     Some(Segment::new(word, tone))
 }
 
-/// Retained output lines. This counts what the client actually HOLDS (the
-/// bounded 8 KiB tail), not what the tool produced — a truncated row says so
-/// on its own honesty marker rather than claiming a total it never saw.
-fn retained_output_lines(block: &ItemBlock) -> usize {
-    if block.output_tail.is_empty() {
-        return 0;
+/// How a status settles for the `⎿` result line.
+const fn settle_of(status: haider_protocol::item::ToolStatus) -> crate::toolview::Settle {
+    use crate::toolview::Settle;
+    use haider_protocol::item::ToolStatus;
+    match status {
+        ToolStatus::Completed => Settle::Done,
+        ToolStatus::Pending | ToolStatus::InProgress => Settle::Running,
+        ToolStatus::Failed => Settle::Failed,
+        ToolStatus::Rejected => Settle::Rejected,
+        ToolStatus::Conflict => Settle::Conflict,
+        ToolStatus::Unknown => Settle::Unknown,
+        ToolStatus::Cancelled => Settle::Cancelled,
     }
-    block.output_text().lines().count()
+}
+
+/// Retained output lines. This counts what the client actually HOLDS (the
+/// bounded 8 KiB tail, or the joined result preview), not what the tool
+/// produced — a truncated row says so on its own honesty marker rather than
+/// claiming a total it never saw.
+fn retained_output_lines(block: &ItemBlock) -> usize {
+    block.tool_output().lines().count()
 }
 
 /// The client-observed duration for this call, or `None` when its start was
@@ -15529,9 +16190,82 @@ fn observed_elapsed(block: &ItemBlock, ctx: LayoutCtx<'_>) -> Option<u64> {
         .map(|timing| timing.elapsed_ms(ctx.now_ms))
 }
 
+/// What a tool row derives from its block beyond the header facts: its
+/// family, how it settled, the diff its arguments carry, and the full
+/// command when the one-line header could not carry it.
+#[derive(Default)]
+pub(crate) struct ToolRowExtras {
+    kind: Option<crate::toolview::ToolKind>,
+    settle: crate::toolview::Settle,
+    exit_code: Option<i32>,
+    diff: Option<crate::toolview::ToolDiff>,
+    inline_args: Option<String>,
+}
+
+/// A command worth showing in full in place: one the header had to cut to
+/// its first line (a heredoc, a multi-line script).
+fn multi_line_command(command: &str) -> Option<String> {
+    (command.trim().lines().count() > 1).then(|| command.to_owned())
+}
+
+pub(crate) fn tool_extras(block: &ItemBlock) -> ToolRowExtras {
+    match &block.item {
+        TurnItem::ToolCall {
+            name, args, status, ..
+        } => {
+            let kind = crate::toolview::tool_kind(name);
+            ToolRowExtras {
+                kind: Some(kind),
+                settle: settle_of(*status),
+                exit_code: None,
+                // Numbered only from the edit tool's own spans.
+                diff: crate::toolview::tool_diff(name, args, block.edit_spans()),
+                inline_args: if kind == crate::toolview::ToolKind::Shell {
+                    crate::toolview::shell_command(args)
+                        .as_deref()
+                        .and_then(multi_line_command)
+                } else {
+                    None
+                },
+            }
+        }
+        TurnItem::CommandExecution {
+            command,
+            status,
+            exit_code,
+            ..
+        } => ToolRowExtras {
+            kind: Some(crate::toolview::ToolKind::Shell),
+            settle: settle_of(*status),
+            exit_code: *exit_code,
+            diff: None,
+            inline_args: multi_line_command(command),
+        },
+        _ => ToolRowExtras::default(),
+    }
+}
+
+/// Every display row an expanded tool row shows in place, at `width`.
+fn expanded_rows(
+    block: &ItemBlock,
+    extras: &ToolRowExtras,
+    width: usize,
+) -> Vec<crate::toolview::DisplayRow> {
+    let output = block.compact_output();
+    crate::toolview::detail_rows(
+        &crate::toolview::DetailFacts {
+            args: extras.inline_args.as_deref(),
+            diff: extras.diff.as_ref(),
+            output: &output.text,
+            ..crate::toolview::DetailFacts::default()
+        },
+        width,
+    )
+}
+
 /// Render one tool-ish row in its current disclosure state: a fold head, a
-/// hidden fold member, a collapsed summary (+ `└` sub-line), a bounded
-/// expanded region (+ `show all`), or every retained row.
+/// hidden fold member, a collapsed header (+ `⎿` result + diff preview), a
+/// bounded expanded region (+ `show all`), or every display row.
 fn tool_disclosure_lines<'a>(
     lines: &mut Vec<Line<'a>>,
     block: &'a ItemBlock,
@@ -15541,6 +16275,7 @@ fn tool_disclosure_lines<'a>(
     marks: &mut EntryMarks,
 ) {
     use crate::toolfold::{self as tf, FoldRole, RowState};
+    use crate::toolview as tv;
     let theme = ctx.theme;
     let cells = ctx.width as usize;
     let item_id = block.item_id.as_str();
@@ -15559,34 +16294,92 @@ fn tool_disclosure_lines<'a>(
         // existing correction machinery.
         FoldRole::Member => return,
         FoldRole::Head(run) => {
-            lines.push(toned_line(&tf::fold_segments(run), theme));
+            lines.push(tool_line(&tf::fold_segments(run), theme));
             if ctx.fold.verbosity().shows_subline()
                 && let Some(text) = run.subline.as_deref()
                 && let Some(segments) = tf::subline_segments(text, cells)
             {
-                lines.push(toned_line(&segments, theme));
+                // The elbow speaks for the run's LATEST call, so it is that
+                // call's door into the full-detail view (973 repair 5: it
+                // looked like every other `⎿` line and opened nothing).
+                marks.result = Some(lines.len());
+                lines.push(tool_line(&segments, theme));
             }
             return;
         }
         FoldRole::Alone => {}
     }
     let state = ctx.fold.state_of(item_id);
-    let summary = toned_line(&tf::summary_segments(facts, ctx.phase, cells), theme);
     // The focused row wears the shared hover band (ground shifts, ink
-    // stays) so ⏎/Space always has a visible subject.
-    lines.push(hover_band(
-        summary,
-        ctx.fold.focus() == Some(item_id),
-        ctx.width,
+    // stays) so ⏎/Space always has a visible subject — its ink is held to
+    // the floor on THAT ground.
+    let focused = ctx.fold.focus() == Some(item_id);
+    let summary = tool_line_on(
+        &tf::summary_segments(facts, ctx.phase, cells),
         theme,
-    ));
-    let output = block.output_text();
+        if focused { theme.sel_bg } else { theme.bg },
+    );
+    lines.push(hover_band(summary, focused, ctx.width, theme));
+    let extras = tool_extras(block);
+    let compact = block.compact_output();
+    let output = &compact.text;
+    let shows_subline = ctx.fold.verbosity().shows_subline();
+    if shows_subline
+        && let Some(segments) = tv::result_segments(
+            &tv::ResultFacts {
+                kind: extras.kind,
+                settle: extras.settle,
+                exit_code: extras.exit_code,
+                reason: block.tool_reason.as_deref(),
+                output,
+                output_cut: block.output_truncated,
+                diff: extras.diff.as_ref(),
+                matches: block.search_matches(),
+                output_shown: !state.is_collapsed(),
+            },
+            cells,
+        )
+    {
+        marks.result = Some(lines.len());
+        lines.push(tool_line(&segments, theme));
+    }
+    // A result the TOOL declared bounded says so on every disclosure state
+    // (973 repair): its payload can look complete otherwise.
+    let bound_note = compact
+        .result_bound
+        .map(|bound| format!("    {}", bound.note()))
+        .or_else(|| {
+            compact.limit_reached.then(|| {
+                "    ⋯ the tool stopped at its output limit — not the complete output".to_owned()
+            })
+        });
     if state.is_collapsed() {
-        if ctx.fold.verbosity().shows_subline()
-            && let Some(segments) =
-                tf::subline_segments_from(&output, block.output_truncated, cells)
+        // The inline diff preview: a SUCCESSFUL write or edit shows a few
+        // rows of what changed, then the door to the rest. A failed one
+        // shows only its reason — what it tried to write is detail.
+        if shows_subline
+            && extras.settle == tv::Settle::Done
+            && let Some(diff) = extras.diff.as_ref().filter(|diff| !diff.lines.is_empty())
         {
-            lines.push(toned_line(&segments, theme));
+            let (start, end) = diff.preview_window(tv::DIFF_PREVIEW_ROWS);
+            let preview = tv::diff_rows_clipped(diff, start..end, cells);
+            let clipped = preview
+                .iter()
+                .zip(&diff.lines[start..end])
+                .any(|(row, line)| row.text != tv::sanitize(&line.text));
+            for row in &preview {
+                lines.push(display_row_line(row, theme, cells));
+            }
+            let hidden = diff.lines.len().saturating_sub(end - start);
+            if hidden > 0 {
+                marks.detail = Some(lines.len());
+                lines.push(tool_line(&tv::more_segments(hidden), theme));
+            } else if clipped {
+                // A one-line write wider than the row hid no LINES, but it
+                // still has more to show — the same door opens it.
+                marks.detail = Some(lines.len());
+                lines.push(tool_line(&tv::clipped_segments(), theme));
+            }
         }
         // The honesty markers are NOT verbosity-gated and not disclosure-
         // gated: a bounded tail and an undecodable chunk are facts about
@@ -15599,34 +16392,37 @@ fn tool_disclosure_lines<'a>(
                 theme.dim_style(),
             ));
         }
+        if let Some(note) = &bound_note {
+            lines.push(Line::styled(note.clone(), theme.dim_style()));
+        }
         if block.output_decode_error {
             lines.push(Line::styled(
                 "    ⚠ some output could not be decoded",
-                theme.warn_style(),
+                theme.tool_tone_style(crate::toolfold::Tone::Warn),
             ));
         }
         return;
     }
-    // Every retained row, hard-wrapped to the content budget: `show all`
-    // now really does show all of it (F2).
-    let retained = tf::output_rows(&output, cells.saturating_sub(OUTPUT_INDENT));
+    // Every display row — full command, full diff, retained output — hard-
+    // wrapped to the row: `show all` really does show all of it (F2).
+    let rows = expanded_rows(block, &extras, cells);
     let (start, end, below) = if matches!(state, RowState::ShowAll) {
-        (0, retained.len(), 0)
+        (0, rows.len(), 0)
     } else {
         tf::bounded_window(
-            retained.len(),
+            rows.len(),
             ctx.fold.scroll_of(item_id),
             tf::EXPANDED_MAX_ROWS,
         )
     };
-    for text in &retained[start..end] {
-        lines.push(tool_output_line(text, theme));
+    for row in &rows[start..end] {
+        lines.push(display_row_line(row, theme, cells));
     }
     if start > 0 || below > 0 {
         // Remembered by LINE index; the cache measures it into a wrapped
         // row so the hit lands on the glyphs the reader sees (F6).
         marks.show_all = Some(lines.len());
-        lines.push(toned_line(&tf::show_all_segments(start, below), theme));
+        lines.push(tool_line(&tf::show_all_segments(start, below), theme));
     }
     // Honesty below the tail (r2: bottom-anchored viewport). Only where the
     // output was actually shown — a collapsed row has already returned.
@@ -15636,28 +16432,325 @@ fn tool_disclosure_lines<'a>(
             theme.dim_style(),
         ));
     }
+    if let Some(note) = bound_note {
+        lines.push(Line::styled(note, theme.dim_style()));
+    }
     if block.output_decode_error {
         lines.push(Line::styled(
             "    ⚠ some output could not be decoded",
-            theme.warn_style(),
+            theme.tool_tone_style(crate::toolfold::Tone::Warn),
         ));
     }
 }
 
-/// Cells the output indent costs, so the wrap budget and the rendered row
-/// agree exactly.
-pub(crate) const OUTPUT_INDENT: usize = 4;
-
-/// How many DISPLAY rows one tool row's retained output wraps to at `width`
+/// How many DISPLAY rows one tool row's expanded body wraps to at `width`
 /// — the clamp the scroll gestures need, taken from the same function that
 /// renders them so the two can never disagree.
 #[must_use]
-pub fn retained_output_rows(block: &ItemBlock, width: u16) -> usize {
-    crate::toolfold::output_rows(
-        &block.output_text(),
-        (width as usize).saturating_sub(OUTPUT_INDENT),
-    )
-    .len()
+pub fn expanded_display_rows(block: &ItemBlock, width: u16) -> usize {
+    expanded_rows(block, &tool_extras(block), width as usize).len()
+}
+
+/// The header facts for one tool-ish item (`ToolCall` or
+/// `CommandExecution`) in the Claude Code idiom: `● Verb(argument)`.
+fn tool_row_facts<'b>(block: &'b ItemBlock, ctx: LayoutCtx<'_>) -> crate::toolfold::RowFacts<'b> {
+    use crate::toolfold::{RowFacts, Tone};
+    use crate::toolview as tv;
+    let subline_outcome = ctx.fold.verbosity().shows_subline();
+    match &block.item {
+        TurnItem::ToolCall {
+            name, status, args, ..
+        } => {
+            let remote_profile = if name == "ssh_shell" || name == "process_exec" {
+                args.get("profile").and_then(serde_json::Value::as_str)
+            } else {
+                None
+            };
+            let verb = tv::verb(name);
+            RowFacts {
+                name: remote_profile.map_or_else(
+                    || verb.clone(),
+                    |profile| format!("↗ remote · {profile} · {verb}"),
+                ),
+                name_tone: Tone::Name,
+                args: tv::header_args(name, args, ctx.paths),
+                glyph: tv::BULLET,
+                glyph_tone: status_tone(*status),
+                // The protocol carries NO exit code on a generic tool call;
+                // the row shows the terminal STATUS instead of inventing one.
+                exit_code: None,
+                outcome: status_outcome(*status),
+                output_lines: retained_output_lines(block),
+                elapsed_ms: observed_elapsed(block, ctx),
+                streaming: !settled_tool(*status),
+                spinner: true,
+                reason: block.tool_reason.as_deref(),
+                subline_outcome,
+            }
+        }
+        TurnItem::CommandExecution {
+            command,
+            status,
+            exit_code,
+            ..
+        } => {
+            let outcome = exit_code
+                .is_none()
+                .then(|| status_outcome(*status))
+                .flatten();
+            if block.user_command {
+                // A user `!` command keeps its sigil: it is PROVENANCE, and
+                // a running one must still look like the reader's own.
+                RowFacts {
+                    name: tv::one_line(command),
+                    name_tone: Tone::Body,
+                    args: String::new(),
+                    glyph: "!",
+                    glyph_tone: Tone::Accent,
+                    exit_code: *exit_code,
+                    outcome,
+                    output_lines: retained_output_lines(block),
+                    elapsed_ms: observed_elapsed(block, ctx),
+                    streaming: !settled_tool(*status),
+                    spinner: false,
+                    reason: None,
+                    subline_outcome,
+                }
+            } else {
+                RowFacts {
+                    name: "Bash".to_owned(),
+                    name_tone: Tone::Name,
+                    args: tv::one_line(command),
+                    glyph: tv::BULLET,
+                    glyph_tone: match exit_code {
+                        Some(code) if *code != 0 => Tone::Err,
+                        _ => status_tone(*status),
+                    },
+                    exit_code: *exit_code,
+                    outcome,
+                    output_lines: retained_output_lines(block),
+                    elapsed_ms: observed_elapsed(block, ctx),
+                    streaming: !settled_tool(*status),
+                    spinner: true,
+                    reason: None,
+                    subline_outcome,
+                }
+            }
+        }
+        _ => RowFacts::default(),
+    }
+}
+
+/// The full-detail view's `⎿` line and wrapped body for one tool row: the
+/// full arguments, the full diff, the AUTHORITATIVE output (the joined
+/// result wherever the streamed tail was capped — 973 repair), its honesty
+/// notes, and the unshortened reason.
+fn tool_detail_body(
+    block: &ItemBlock,
+    cells: usize,
+) -> (
+    Option<Vec<crate::toolfold::Segment>>,
+    Vec<crate::toolview::DisplayRow>,
+) {
+    use crate::toolview as tv;
+    let extras = tool_extras(block);
+    let output = block.detail_output();
+    let result = tv::result_segments(
+        &tv::ResultFacts {
+            kind: extras.kind,
+            settle: extras.settle,
+            exit_code: extras.exit_code,
+            reason: block.tool_reason.as_deref(),
+            output: &output.text,
+            output_cut: output.tail_cut,
+            diff: extras.diff.as_ref(),
+            matches: block.search_matches(),
+            output_shown: true,
+        },
+        cells,
+    );
+    let full_args = match &block.item {
+        TurnItem::ToolCall { name, args, .. } => tv::full_args(name, args),
+        TurnItem::CommandExecution { command, .. } => Some(command.clone()),
+        _ => None,
+    };
+    // The unshortened reason: the typed presentation or the raw reason the
+    // result carried, before the transcript's one-line bound.
+    let full_reason = block
+        .tool_result
+        .as_ref()
+        .and_then(|result| {
+            result
+                .presentation
+                .as_ref()
+                .map(crate::projection::format_error_presentation)
+                .or_else(|| result.reason.clone())
+        })
+        .or_else(|| block.tool_reason.clone());
+    let mut notes: Vec<String> = Vec::new();
+    if output.stream_replaced {
+        notes.push(
+            "⋯ the streamed output was capped at 8 KiB — shown above is the tool's complete result"
+                .to_owned(),
+        );
+    }
+    if let Some(bound) = output.result_bound {
+        notes.push(bound.note());
+    }
+    if output.limit_reached {
+        notes.push(
+            "⋯ the tool stopped at its output limit — this result is not the complete output"
+                .to_owned(),
+        );
+    }
+    let rows = tv::detail_rows(
+        &tv::DetailFacts {
+            args: full_args.as_deref(),
+            diff: extras.diff.as_ref(),
+            output: &output.text,
+            output_truncated: output.tail_cut,
+            output_decode_error: block.output_decode_error,
+            source_notes: &notes,
+            reason: full_reason.as_deref(),
+            headings: true,
+        },
+        cells,
+    );
+    (result, rows)
+}
+
+/// The full-detail view of one tool row (973-tui-toolview): ⌃O on a focused
+/// row, or a click on its `(⌃O to expand)` door. It covers the body with the
+/// row's header, its `⎿` result, and then EVERYTHING the client holds for
+/// the call — the full arguments (the whole heredoc), the full diff with its
+/// line numbers, every retained output row, and the unshortened reason —
+/// scrollable, closed by esc / ⌃O / q / ⏎. It reads the transcript and never
+/// writes its scroll, so closing it lands the reader exactly where they were.
+fn render_tool_detail(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    use crate::toolview as tv;
+    let Some(view) = &model.tool_detail else {
+        return;
+    };
+    hits.clear();
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Block::default().style(theme.text_style()), area);
+    let cells = area.width as usize;
+    let block = model.viewed_tool_projection().and_then(|projection| {
+        projection.entries().iter().find_map(|entry| match entry {
+            TranscriptEntry::Item(block) if block.item_id.as_str() == view.item_id => Some(block),
+            _ => None,
+        })
+    });
+    let Some(block) = block else {
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![Line::styled(
+                "  this tool row is no longer in the transcript · esc back",
+                theme.dim_style(),
+            )])),
+            area,
+        );
+        return;
+    };
+    let paths = model.tool_path_context();
+    let ctx = LayoutCtx {
+        theme,
+        width: area.width,
+        phase: model.anim_phase,
+        fold: &model.toolfold,
+        timings: &model.tool_timings,
+        now_ms: model.clock_ms,
+        runs: &[],
+        paths: &paths,
+    };
+    let mut facts = tool_row_facts(block, ctx);
+    // The header carries its outcome in full here; the `⎿` line follows.
+    facts.subline_outcome = true;
+    let mut head: Vec<Line<'static>> = vec![tool_line(
+        &crate::toolfold::summary_segments(&facts, model.anim_phase, cells),
+        theme,
+    )];
+    // The wrapped body (and the `⎿` line, which needs the same diff) is
+    // cached on the view, keyed by everything it is a function of: a paint
+    // that only scrolls re-slices it instead of re-diffing a 120 KB write.
+    let key = crate::app::DetailLayoutKey {
+        width: area.width,
+        source: model
+            .viewed_tool_projection()
+            .map_or(0, |projection| projection.entries().as_ptr() as usize),
+        revision: model
+            .viewed_tool_projection()
+            .map_or(0, SessionProjection::render_revision),
+        mutation: model
+            .viewed_tool_projection()
+            .map_or(0, SessionProjection::entry_mutation_revision),
+    };
+    let cached = view
+        .layout
+        .borrow()
+        .as_ref()
+        .filter(|layout| layout.key == key)
+        .map(|layout| (layout.result.clone(), std::rc::Rc::clone(&layout.rows)));
+    let (result, rows) = cached.unwrap_or_else(|| {
+        let (result, rows) = tool_detail_body(block, cells);
+        let rows = std::rc::Rc::new(rows);
+        *view.layout.borrow_mut() = Some(crate::app::DetailLayout {
+            key,
+            result: result.clone(),
+            rows: std::rc::Rc::clone(&rows),
+        });
+        (result, rows)
+    });
+    if let Some(segments) = &result {
+        head.push(tool_line(segments, theme));
+    }
+    // Header rows + the hint row + one breathing row sit above the body.
+    let chrome = head.len() + 2;
+    let body_height = (area.height as usize).saturating_sub(chrome).max(1);
+    let max = rows.len().saturating_sub(body_height);
+    let start = view.scroll.min(max);
+    let end = start.saturating_add(body_height).min(rows.len());
+    view.scroll_max.set(max);
+    view.page.set(body_height.saturating_sub(1).max(1));
+    let position = if rows.is_empty() {
+        "nothing retained".to_owned()
+    } else {
+        format!("rows {}–{} of {}", start + 1, end, rows.len())
+    };
+    let hint_row = head.len();
+    let mut lines = head;
+    lines.push(Line::from(vec![
+        Span::styled(tv::ELBOW.replace('⎿', " "), theme.faint_style()),
+        Span::styled(format!("full detail · {position} · "), theme.dim_style()),
+        Span::styled("↑↓ PgUp PgDn scroll · esc / ⌃O back", theme.dim_style()),
+    ]));
+    lines.push(Line::default());
+    for row in &rows[start..end] {
+        lines.push(display_row_line(row, theme, cells));
+    }
+    let hint_y = area
+        .y
+        .saturating_add(u16::try_from(hint_row).unwrap_or(u16::MAX));
+    if hint_y < area.y.saturating_add(area.height) {
+        hits.push((
+            Rect {
+                x: area.x,
+                y: hint_y,
+                width: area.width,
+                height: 1,
+            },
+            Hit::ToolDetailClose,
+        ));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 /// Register the click targets for every visible tool row (971-tui-collapse).
@@ -15719,6 +16812,29 @@ fn tool_row_hits(
             && let Some(rect) = row_rect(start.saturating_add(offset))
         {
             hits.push((rect, Hit::ToolShowAll(item_id.clone())));
+        }
+        // The collapsed preview's `(⌃O to expand)` door opens the row's
+        // full-detail view.
+        if let Some(offset) = entry.detail_row
+            && let Some(rect) = row_rect(start.saturating_add(offset))
+        {
+            hits.push((rect, Hit::ToolDetail(item_id.clone())));
+        }
+        // 973 repair: EVERY row's `⎿` result line is a click route into the
+        // same full-detail view (shell, read, write, edit alike), so a click
+        // and ⌃O expand the same way and Esc returns the same way. A fold
+        // head's elbow is its latest member's (repair 5).
+        if let Some(offset) = entry.result_row
+            && let Some(rect) = row_rect(start.saturating_add(offset))
+        {
+            let door = match ctx.role(index) {
+                FoldRole::Head(run) => match projection.entries().get(run.last()) {
+                    Some(TranscriptEntry::Item(latest)) => latest.item_id.as_str().to_owned(),
+                    _ => item_id.clone(),
+                },
+                _ => item_id.clone(),
+            };
+            hits.push((rect, Hit::ToolDetail(door)));
         }
         if let Some(offset) = entry.summary_row
             && let Some(rect) = row_rect(start.saturating_add(offset))
@@ -15874,68 +16990,12 @@ fn item_lines<'a>(
                 ),
             ]));
         }
-        TurnItem::ToolCall {
-            name, status, args, ..
-        } => {
-            // 971-tui-collapse: ONE summary row by default (sim ToolRow's
-            // glyph · maroon name · dim desc, now carrying the exit/lines/
-            // duration figures), an indented `└` first-result line, and the
-            // full output only where the reader asked for it. The old form
-            // printed the whole retained tail in `faint` (1.4:1) on every
-            // row — the owner's "darker text … navigation difficult".
-            let remote_profile = if name == "ssh_shell" || name == "process_exec" {
-                args.get("profile").and_then(serde_json::Value::as_str)
-            } else {
-                None
-            };
-            let facts = crate::toolfold::RowFacts {
-                name: remote_profile.map_or_else(
-                    || name.clone(),
-                    |profile| format!("↗ remote · {profile} · {name}"),
-                ),
-                name_tone: crate::toolfold::Tone::Name,
-                args: crate::toolfold::semantic_summary(name, args),
-                glyph: status_glyph(*status),
-                glyph_tone: status_tone(*status),
-                // The protocol carries NO exit code on a generic tool call;
-                // the row shows the terminal STATUS word instead of
-                // inventing a number.
-                exit_code: None,
-                outcome: status_outcome(*status),
-                output_lines: retained_output_lines(block),
-                elapsed_ms: observed_elapsed(block, ctx),
-                streaming: !settled_tool(*status),
-                spinner: true,
-                reason: block.tool_reason.as_deref(),
-            };
-            tool_disclosure_lines(lines, block, ctx, index, &facts, marks);
-        }
-        TurnItem::CommandExecution {
-            command,
-            status,
-            exit_code,
-            ..
-        } => {
-            // The `$`/`!` sigil is the command row's glyph, and the command
-            // itself is BODY text — it is prose the reader reads, not a
-            // label. Everything else is the shared collapsed row.
-            let facts = crate::toolfold::RowFacts {
-                name: command.clone(),
-                name_tone: crate::toolfold::Tone::Body,
-                args: String::new(),
-                glyph: if block.user_command { "!" } else { "$" },
-                glyph_tone: crate::toolfold::Tone::Accent,
-                exit_code: *exit_code,
-                outcome: exit_code
-                    .is_none()
-                    .then(|| status_outcome(*status))
-                    .flatten(),
-                output_lines: retained_output_lines(block),
-                elapsed_ms: observed_elapsed(block, ctx),
-                streaming: !settled_tool(*status),
-                spinner: false,
-                reason: None,
-            };
+        // 971-tui-collapse + 973-tui-toolview: ONE `● Verb(argument)`
+        // header by default, a `⎿` result line, an inline diff preview for
+        // writes and edits, and the full content only where the reader
+        // asked for it (in place, or the ⌃O full-detail view).
+        TurnItem::ToolCall { .. } | TurnItem::CommandExecution { .. } => {
+            let facts = tool_row_facts(block, ctx);
             tool_disclosure_lines(lines, block, ctx, index, &facts, marks);
         }
         TurnItem::FileChange {
@@ -15943,15 +17003,33 @@ fn item_lines<'a>(
             added,
             removed,
         } => {
-            // Sim shape (seed rows, tui.js:480): a completed fs_edit tool
-            // row — ✓ glyph · maroon name · dim path · dim +a −r meta.
+            // 973-tui-toolview: an applied file change reads like the edit
+            // row it reports — `● Edit(path)` over its `⎿` line counts.
+            let (added, removed) = (*added as usize, *removed as usize);
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("✓ ", theme.ok_style()),
-                Span::styled("fs_edit", theme.maroon_style()),
-                Span::styled(format!(" {path}"), theme.dim_style()),
-                Span::styled(format!(" +{added} −{removed}"), theme.dim_style()),
+                Span::styled(
+                    format!("{} ", crate::toolview::BULLET),
+                    theme.tool_tone_style(crate::toolfold::Tone::Ok),
+                ),
+                Span::styled("Edit", theme.maroon_style()),
+                Span::styled(format!("({})", ctx.paths.shorten(path)), theme.dim_style()),
             ]));
+            let diff = crate::toolview::ToolDiff {
+                added,
+                removed,
+                ..crate::toolview::ToolDiff::default()
+            };
+            if let Some(segments) = crate::toolview::result_segments(
+                &crate::toolview::ResultFacts {
+                    kind: Some(crate::toolview::ToolKind::Edit),
+                    diff: Some(&diff),
+                    ..crate::toolview::ResultFacts::default()
+                },
+                width as usize,
+            ) {
+                lines.push(tool_line(&segments, theme));
+            }
         }
         TurnItem::ChildSpawn { agent } => {
             lines.push(Line::styled(
@@ -16036,8 +17114,15 @@ fn item_lines<'a>(
                     &block.item,
                 )
             {
+                if let Some(summary) = budget.transcript_summary() {
+                    lines.push(Line::styled(format!("  {summary}"), theme.gold_style()));
+                }
+            } else if let Some(note) =
+                haider_protocol::loop_guard::LoopSuspectedV1::from_extension_item(&block.item)
+            {
+                // A non-terminal steer: gold like a budget checkpoint.
                 lines.push(Line::styled(
-                    format!("  {}", budget.summary()),
+                    format!("  {}", note.summary()),
                     theme.gold_style(),
                 ));
             } else if let Some(marker) =
@@ -16088,5 +17173,135 @@ fn item_lines<'a>(
                 lines.push(Line::styled(format!("  ⋯ {label}"), theme.faint_style()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_workspace_fit_tests {
+    use super::{PENDING_WORKSPACE_BADGES, cells, fit_pending_workspace};
+
+    const LEAF: &str = "~/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef";
+    /// The launcher's second row spends 27 cells on the mark and 4 on `dir `.
+    const fn budget(width: usize) -> usize {
+        width - 27 - 4
+    }
+
+    fn joined(path: &str, width: usize) -> String {
+        let Some((shown, badge)) = fit_pending_workspace(path, budget(width)) else {
+            panic!("{path:?} must fit {width} columns");
+        };
+        let row = format!("{shown}{badge}");
+        assert!(
+            cells(&row) <= budget(width),
+            "{row:?} overflows {width} columns"
+        );
+        row
+    }
+
+    #[test]
+    fn owner_width_keeps_the_exact_path_and_full_badge() {
+        assert_eq!(
+            joined(LEAF, 120),
+            format!("{LEAF} · created on first write")
+        );
+    }
+
+    #[test]
+    fn width_118_keeps_the_full_path_and_trades_badge_wording() {
+        assert_eq!(joined(LEAF, 118), format!("{LEAF} · not created yet"));
+    }
+
+    #[test]
+    fn width_80_keeps_date_leaf_prefix_and_badge() {
+        let row = joined(LEAF, 80);
+        assert_eq!(row, "…/1448-04-10/s-01234567… · created on first write");
+        assert!(PENDING_WORKSPACE_BADGES.iter().any(|b| row.ends_with(b)));
+    }
+
+    #[test]
+    fn middle_elision_prefers_keeping_the_haider_root() {
+        // 27 + 4 + 56 + 25 = 112: `~/…/Haider/<date>/<leaf>` with full badge.
+        assert_eq!(
+            joined(LEAF, 112),
+            "~/…/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef · created on first write"
+        );
+    }
+
+    #[test]
+    fn long_unabbreviated_home_still_shows_date_leaf_and_state() {
+        let long = "/private/var/folders/zz/very-long-isolated-profile-root-0123456789/home/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef";
+        for width in [80, 100, 118, 120, 160] {
+            let row = joined(long, width);
+            assert!(row.contains("1448-04-10/s-01234567"), "{width}: {row}");
+            assert!(
+                PENDING_WORKSPACE_BADGES.iter().any(|b| row.ends_with(b)),
+                "{width}: {row}"
+            );
+        }
+        assert_eq!(
+            joined(long, 118),
+            "/…/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef · not created yet"
+        );
+    }
+
+    #[test]
+    fn windows_separators_elide_the_same_way() {
+        let windows = r"C:\Users\someone.with.a.long.name\Documents\Haider\1448-04-10\s-0123456789abcdef0123456789abcdef";
+        let row = joined(windows, 80);
+        assert!(row.starts_with(r"…\1448-04-10\s-01234567"), "{row}");
+        assert!(row.ends_with(" · created on first write"), "{row}");
+    }
+
+    #[test]
+    fn mixed_windows_separators_keep_date_and_leaf() {
+        // `~/` + a native Windows remainder (the old abbreviate spelling).
+        let mixed = r"~/Documents\Haider\1448-04-11\s-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            joined(mixed, 80),
+            r"…\1448-04-11\s-01234567… · created on first write"
+        );
+        assert_eq!(joined(mixed, 118), format!("{mixed} · not created yet"));
+        assert_eq!(
+            joined(mixed, 112),
+            r"~\…\Haider\1448-04-11\s-0123456789abcdef0123456789abcdef · created on first write"
+        );
+        // Pure backslash home-relative and drive-absolute spellings.
+        let native = r"~\Documents\Haider\1448-04-11\s-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            joined(native, 80),
+            r"…\1448-04-11\s-01234567… · created on first write"
+        );
+        let drive =
+            r"C:\Users\owner\Documents\Haider\1448-04-11\s-0123456789abcdef0123456789abcdef";
+        let row = joined(drive, 118);
+        assert!(row.contains(r"1448-04-11\s-0123456789abcdef"), "{row}");
+        assert!(
+            row.ends_with(" · not created yet") || row.ends_with(" · created on first write"),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn the_80_column_session_header_budget_keeps_date_id_and_state() {
+        // 80 - (chip 10 + 2 + mark 24 + 2 + `haider v0.0.972` 15) - ` · ` = 24.
+        let Some((shown, badge)) = fit_pending_workspace(LEAF, 24) else {
+            panic!("the 80-column session header budget must fit");
+        };
+        assert_eq!(format!("{shown}{badge}"), "1448-04-10/s-0123… · new");
+    }
+
+    #[test]
+    fn narrow_frames_shorten_badge_wording_before_losing_the_state() {
+        // 30 cells: `…/1448-04-10/s-01234567…` (24) + ` · new` (6).
+        let Some((shown, badge)) = fit_pending_workspace(LEAF, 30) else {
+            panic!("a 30-cell budget must fit");
+        };
+        assert_eq!(format!("{shown}{badge}"), "…/1448-04-10/s-01234567… · new");
+        // 26 cells: the 4-digit floor keeps a recognisable id and the state.
+        let Some((shown, badge)) = fit_pending_workspace(LEAF, 26) else {
+            panic!("a 26-cell budget must fit");
+        };
+        assert_eq!(format!("{shown}{badge}"), "…/1448-04-10/s-0123… · new");
+        assert!(fit_pending_workspace(LEAF, 10).is_none());
     }
 }

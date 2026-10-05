@@ -334,30 +334,35 @@ fn provider_timeout_retry_requires_a_full_post_backoff_budget() {
     assert!(!short.retryable);
     assert_eq!(short.presentation.allowed_actions, vec![ErrorAction::None]);
 
-    let mut timeout = ProviderError::new(ProviderErrorKind::Transport, "provider timeout")
-        .with_presentation(ErrorPresentation::new(
-            "provider-timeout",
-            "Provider request timed out",
-            "The provider did not open in time.",
-            ErrorScope::Turn,
-            [ErrorAction::Retry],
-        ))
-        // The restored default can park for 60 seconds. With no outer
-        // deadline, only the typed reason prevents another identical wait.
-        .with_timeout_budget(60_000, 60_000)
-        .with_timeout_reason(ProviderTimeoutReason::ResponseOpen);
+    for reason in [
+        ProviderTimeoutReason::RequestUpload,
+        ProviderTimeoutReason::ResponseOpen,
+    ] {
+        let mut timeout = ProviderError::new(ProviderErrorKind::Transport, "provider timeout")
+            .with_presentation(ErrorPresentation::new(
+                "provider-timeout",
+                "Provider request timed out",
+                "The provider request did not finish in time.",
+                ErrorScope::Turn,
+                [ErrorAction::Retry],
+            ))
+            // Without an outer deadline, the typed reason prevents another
+            // identical long wait while preserving explicit user retry.
+            .with_timeout_budget(60_000, 60_000)
+            .with_timeout_reason(reason);
 
-    assert!(!provider_error_allows_retry(
-        &mut timeout,
-        None,
-        &RunId::new("response-open-timeout"),
-        1,
-    ));
-    assert!(timeout.retryable, "the caller may explicitly retry");
-    assert_eq!(
-        timeout.presentation.allowed_actions,
-        vec![ErrorAction::Retry]
-    );
+        assert!(!provider_error_allows_retry(
+            &mut timeout,
+            None,
+            &RunId::new("request-phase-timeout"),
+            1,
+        ));
+        assert!(timeout.retryable, "the caller may explicitly retry");
+        assert_eq!(
+            timeout.presentation.allowed_actions,
+            vec![ErrorAction::Retry]
+        );
+    }
 }
 
 #[test]
@@ -511,9 +516,9 @@ fn reported_usage() -> Usage {
 
 /// MUTATION CHECK: move the provider-view marker back to a standalone append
 /// in the real request path. The production batch containing that marker is
-/// no longer the exact five-event pre-change journal sequence followed by the
-/// new progress marker. Budget visibility shares this boundary rather than
-/// introducing an additional request-side append.
+/// must remain the exact five-event journal sequence under the unbounded
+/// default. An explicit request policy adds the budget progress pair in the
+/// same append, as covered by the budget-specific tests below.
 #[tokio::test]
 async fn production_request_path_batches_provider_view_with_attempt_facts() {
     let session_id = SessionId::new("provider-view-production-batch");
@@ -555,15 +560,15 @@ async fn production_request_path_batches_provider_view_with_attempt_facts() {
         })
         .collect::<Vec<_>>();
     assert_eq!(request_batches.len(), 1);
-    assert_eq!(request_batches[0].len(), 7);
-    assert_request_boundary_golden(&request_batches[0][..5]);
-    let progress = RequestBudgetStatusV1::from_extension_item(completed_extension_item(
-        &request_batches[0][5..],
-        PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
-    ))
-    .expect("typed request budget shares the request boundary");
-    assert_eq!(progress.phase, RequestBudgetPhaseV1::Progress);
-    assert_eq!(progress.used, 1);
+    assert_eq!(request_batches[0].len(), 5);
+    assert_request_boundary_golden(&request_batches[0]);
+    assert!(!request_batches[0].iter().any(|payload| matches!(
+        payload,
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { kind, .. },
+            ..
+        }) if kind == PROVIDER_REQUEST_BUDGET_EXTENSION_KIND
+    )));
     let provider_attempt = ProviderViewAttemptV1::try_from_extension_item(
         completed_extension_item(&request_batches[0], PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND),
     )
@@ -914,8 +919,10 @@ async fn hard_request_checkpoint_and_named_terminal_share_one_atomic_append() {
         1,
         1,
     );
-    config.provider_request_tranche = 1;
-    config.max_provider_requests_per_turn = 2;
+    config.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     config.provider_requests_already_made = 2;
     let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
         reason: FinishReason::EndTurn,
@@ -999,8 +1006,10 @@ async fn rejected_hard_request_checkpoint_exposes_neither_handle_nor_terminal() 
         1,
         1,
     );
-    config.provider_request_tranche = 1;
-    config.max_provider_requests_per_turn = 2;
+    config.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     config.provider_requests_already_made = 2;
     let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
         reason: FinishReason::EndTurn,

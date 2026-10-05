@@ -392,9 +392,11 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
         model_details: models
             .iter()
             .map(|&model| haider_rpc::ModelDetailWire {
+                source: None,
                 name: model.to_owned(),
                 display_name: None,
                 context_window: None,
+                max_output_tokens: Some(30_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),

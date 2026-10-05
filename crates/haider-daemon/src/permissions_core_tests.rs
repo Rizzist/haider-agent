@@ -302,6 +302,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -464,6 +465,7 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: SessionInteractionModeV1::Autonomous,
         system_prompt_version: None,
@@ -589,6 +591,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -1068,6 +1071,7 @@ fn create_durable_session(store: &Store, session_id: &SessionId) {
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -1660,18 +1664,18 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Union full-pack pin: 971 redaction, 972 task_outcome/output ergonomics,
     // 972-ax-testrun, the typed `tool_script` DAG schema, and handle sources. The
     // default instruct-pipe pack is unchanged: the large orchestration schema
-    // remains discovery-only until explicitly promoted. +123 bytes: the
-    // spawn_subagent description states the 2026-09-25 stop semantics.
+    // remains discovery-only until explicitly promoted. Both stop scopes and
+    // the optional request-budget description are included in this pin.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_186;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_180;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_137;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_131;
     #[cfg(target_os = "windows")]
     // `tool_script` nests the platform-specific `process_exec` schema, so
     // Windows carries the historical 3-byte command-description delta twice.
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_133;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_127;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_131;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_125;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

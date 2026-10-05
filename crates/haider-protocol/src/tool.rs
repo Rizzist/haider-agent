@@ -22,6 +22,16 @@ pub const TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC: u64 = 192 * 1024 * 1024;
 /// Maximum width or height retained for a tool-produced image. Larger source
 /// screenshots are downscaled before they enter the CAS.
 pub const TOOL_RESULT_IMAGE_MAX_DIMENSION: u32 = 2_048;
+/// Compatibility envelope for screenshots returned by the computer tool,
+/// narrower than the generic tool-image ceiling above. Both limits come from
+/// Anthropic's computer-use tool guidance (long edge <= 1568 px, total area
+/// about 1.15 megapixels); captures are downscaled to satisfy both, and the
+/// stricter pixel limit is what bounds a 16:9 desktop capture.
+/// <https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool>
+pub const COMPUTER_SCREENSHOT_MAX_DIMENSION: u32 = 1_568;
+/// Pixel-area half of the computer-screenshot envelope; see
+/// [`COMPUTER_SCREENSHOT_MAX_DIMENSION`].
+pub const COMPUTER_SCREENSHOT_MAX_PIXELS: u64 = 1_150_000;
 /// Maximum tool-result images admitted to one provider request.
 pub const TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN: usize = 5;
 /// Maximum encoded tool-result image bytes admitted to one provider request.
@@ -106,7 +116,9 @@ pub struct ToolInventorySnapshot {
 pub struct BoundedResult {
     pub preview: String,
     pub truncated: bool,
-    /// Exact byte provenance for an output projection that discarded bytes.
+    /// Byte provenance for the complete safe rendering before projection.
+    /// With no redaction this is the original output; with redaction it is
+    /// the redacted rendering so the footer cannot test secret guesses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<ToolTruncation>,
     /// Applied file mutations, in workspace-receipt order.
@@ -145,8 +157,11 @@ pub struct BoundedResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolTruncation {
     pub truncated: bool,
+    /// Complete source bytes for unredacted output, or complete safe-rendering
+    /// bytes when a producer masked content. The field name is retained on wire.
     pub original_bytes: u64,
     pub payload_bytes: u64,
+    /// Digest of the same byte stream counted by `original_bytes`.
     pub sha256: String,
 }
 
@@ -185,6 +200,44 @@ pub struct ToolFileEffect {
     pub path: String,
     pub absolute_path: String,
     pub bytes: u64,
+    /// Where each SINGLE-LOCATION replacement of an edit landed, measured by
+    /// the tool WHILE applying it (973-tui-toolview). A `replace_all` that
+    /// matched more than once records no span (repair 5): no reader numbers
+    /// such an edit, and one span per occurrence grew the result with the
+    /// match count. Additive and optional: omitted when empty, ignored by
+    /// older readers, absent in older journals — and a reader without a span
+    /// for an edit shows no line numbers rather than inferring them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edit_spans: Vec<EditSpanV1>,
+}
+
+/// One applied single-location replacement of an edit call, in application
+/// order (a multi-occurrence `replace_all` has none — see
+/// [`ToolFileEffect::edit_spans`]).
+///
+/// Line numbers are 1-based and counted in `'\n'` bytes (a CRLF file counts
+/// the same lines; a final line without a newline is still a line). A side
+/// is `None` exactly when its number would not be TRUE: the replaced text
+/// was not one contiguous run of the pre-edit file (an earlier replacement
+/// in the same call produced part of it), or the inserted text does not
+/// survive intact in the post-edit file (a later replacement changed it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditSpanV1 {
+    /// Index of the requested edit (`edits[i]`, or 0 for a single edit).
+    pub edit_index: u32,
+    /// Always 0 since repair 5 (a span is only recorded for an edit that
+    /// replaced exactly once); kept for wire compatibility.
+    pub occurrence: u32,
+    /// First line of the replaced text in the PRE-edit file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_start_line: Option<u32>,
+    /// Lines the replaced text spans (`str::lines` count).
+    pub old_line_count: u32,
+    /// First line of the inserted text in the POST-edit file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_start_line: Option<u32>,
+    /// Lines the inserted text spans (`str::lines` count; 0 for a deletion).
+    pub new_line_count: u32,
 }
 
 impl BoundedResult {
@@ -300,6 +353,18 @@ pub enum ToolResultData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repaired: Option<bool>,
     },
+    /// The provider stopped because the response-token limit was reached
+    /// while this tool call's arguments were still open. The actor records
+    /// the raw partial bytes for diagnosis but never executes the call.
+    OutputLimitTruncation {
+        tool: String,
+        message: String,
+        /// Whether the actor sent the ordinary split-write continuation.
+        /// A repeated truncation reports false and remains a tool error,
+        /// never a malformed-call strike or a run terminal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repaired: Option<bool>,
+    },
     FsSearch {
         matches: Vec<FsSearchMatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -307,6 +372,8 @@ pub enum ToolResultData {
         binary_files_skipped: usize,
         skipped_sensitive: usize,
         files_scanned: usize,
+        /// Safe-rendering bytes for a search that masked any content; otherwise
+        /// the historical scanned source-byte count.
         bytes_scanned: usize,
     },
     FsGlob {
@@ -327,7 +394,10 @@ pub enum ToolResultData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsSearchMatch {
     pub path: String,
+    /// One-based physical line. Zero withholds the coordinate after a masked
+    /// secret spanning lines, whose hidden line count it would reveal.
     pub line: usize,
+    /// One-based column in the redacted line, never in the source line.
     pub column: usize,
     pub text: String,
     pub context_before: Vec<String>,

@@ -82,6 +82,7 @@ pub(crate) struct RunOptions {
     pub provider: Option<ProviderSelection>,
     pub model: Option<String>,
     pub attachments: Vec<PathBuf>,
+    pub max_output_tokens: Option<u64>,
     pub budget: RunBudgetV1,
     pub resume_run_id: Option<RunId>,
     pub session_id: Option<SessionId>,
@@ -137,6 +138,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     let mut prompt_stdin = false;
     let mut action = RunAction::Execute;
     let mut budget = RunBudgetV1::default();
+    let mut max_output_tokens = None;
     let mut request_tranche = None;
     let mut max_requests = None;
     let mut resume_run_id = None;
@@ -229,6 +231,8 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 )?);
             }
             "--max-requests" => return Err("duplicate --max-requests flag".into()),
+            // `--max-tokens` keeps its 0.0.972 meaning: the cumulative run
+            // token budget. The per-response output budget has its own flag.
             "--max-tokens" if budget.max_tokens.is_none() => {
                 index += 1;
                 budget.max_tokens = Some(parse_positive_u64(
@@ -237,6 +241,14 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 )?);
             }
             "--max-tokens" => return Err("duplicate --max-tokens flag".into()),
+            "--max-output-tokens" if max_output_tokens.is_none() => {
+                index += 1;
+                max_output_tokens = Some(parse_positive_u64(
+                    rest.get(index).map(String::as_str),
+                    "--max-output-tokens",
+                )?);
+            }
+            "--max-output-tokens" => return Err("duplicate --max-output-tokens flag".into()),
             "--max-cost" if budget.max_cost_microusd.is_none() => {
                 index += 1;
                 budget.max_cost_microusd =
@@ -383,13 +395,16 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     }
 
     if request_tranche.is_some() || max_requests.is_some() {
-        let defaults = haider_protocol::request_budget::RequestBudgetV1::default();
-        let request_budget = haider_protocol::request_budget::RequestBudgetV1 {
-            tranche: usize::try_from(request_tranche.unwrap_or(defaults.tranche as u64))
-                .map_err(|_| "--request-tranche exceeds this platform's range")?,
-            hard_cap: usize::try_from(max_requests.unwrap_or(defaults.hard_cap as u64))
-                .map_err(|_| "--max-requests exceeds this platform's range")?,
-        };
+        let hard_cap = max_requests
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| "--max-requests exceeds this platform's range")?;
+        let tranche = request_tranche
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| "--request-tranche exceeds this platform's range")?;
+        let request_budget =
+            haider_protocol::request_budget::RequestBudgetV1::from_opt_in(tranche, hard_cap);
         request_budget.validate()?;
         budget.request_budget = Some(request_budget);
     }
@@ -409,10 +424,11 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || allow_writes_seen
             || allow_exec_seen
             || auto_allow_seen
+            || max_output_tokens.is_some()
             || !budget.is_empty()
             || seed.is_some()
         {
-            return Err("--session inherits the session's configuration and request ceiling; configuration and run-budget overrides are not accepted".into());
+            return Err("--session inherits the session's configuration and any configured request policy; configuration and run-budget overrides are not accepted".into());
         }
     }
     if resume_run_id.is_some() && action != RunAction::Execute {
@@ -433,6 +449,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || allow_exec_seen
             || auto_allow_seen
             || trust_hooks
+            || max_output_tokens.is_some()
         {
             return Err("--resume inherits the source session's model and permissions".into());
         }
@@ -472,6 +489,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || account.is_some()
             || ssh_scope.is_some()
             || !attachments.is_empty()
+            || max_output_tokens.is_some()
             || !budget.is_empty()
             || seed.is_some()
             || read_only
@@ -511,6 +529,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             provider,
             model,
             attachments,
+            max_output_tokens,
             budget,
             seed,
         },
@@ -880,7 +899,9 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         } else {
             request_model
         },
-        max_tokens: profile.default_max_tokens,
+        // Zero is the feature-gated daemon sentinel for deriving the exact
+        // model-row limit. Explicit --max-output-tokens is an exact override.
+        max_tokens: options.max_output_tokens.unwrap_or(0),
         budget: options.budget.clone(),
         seed: options.seed,
         replay_of: None,
@@ -1000,7 +1021,24 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             if result.outcome != HeadlessOutcome::Done
                 && let Some(failure) = &result.failure
             {
-                eprintln!("haider: {}", failure.message);
+                if let Some(presentation) = &failure.presentation {
+                    eprintln!("haider: {} — {}", presentation.title, presentation.detail);
+                    for line in provider_identity_lines(presentation) {
+                        eprintln!("haider: {line}");
+                    }
+                    // Print output is an owner-local surface (this machine's
+                    // terminal); JSON/JSONL never carry this field.
+                    if options.output == RunOutput::Print
+                        && let Some(raw) = &result.provider_raw_detail_local
+                    {
+                        eprintln!(
+                            "haider: {}: {raw}",
+                            haider_protocol::error::PROVIDER_RAW_DETAIL_LABEL
+                        );
+                    }
+                } else {
+                    eprintln!("haider: {}", failure.message);
+                }
                 if matches!(
                     failure.code,
                     HeadlessFailureCode::Run(ErrorCode::CredentialMissing)
@@ -1047,6 +1085,22 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             ExitCode::from(exit_code_for_error(&error))
         }
     }
+}
+
+fn provider_identity_lines(
+    presentation: &haider_protocol::error::ErrorPresentation,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(status) = presentation.provider_http_status {
+        lines.push(format!("HTTP {status}"));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        lines.push(format!("Provider error type: {error_type}"));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        lines.push(format!("Request id: {request_id}"));
+    }
+    lines
 }
 
 #[cfg(unix)]
@@ -1124,6 +1178,9 @@ Permission options:\n\
   --trust-hooks     Trust configured hooks for this run\n\
 \n\
 Use --session ID to submit an ordinary turn to an existing native session.\n\
+Request limits are opt-in: --max-requests N uses tranche min(32, N);\n\
+--request-tranche N alone uses hard cap 64. Supplying neither flag leaves requests unbounded.\n\
+\n\
 Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
 --timeout <duration>, --start, --status, --stop, --stop-main, --stop-subagents,\n\
 and --replay.\n\
@@ -1134,7 +1191,10 @@ Stopping a run:\n\
                          child turns); their monitors are removed\n\
   --stop-main RUN        Stop only the run; its subagents keep running and a\n\
                          subagent it was waiting on delivers its result later\n\
-  --stop-subagents RUN   Stop only the subagents in the run's tree; the run continues";
+  --stop-subagents RUN   Stop only the subagents in the run's tree; the run continues\n\
+\n\
+Budgets: --max-tokens N caps the run's cumulative token usage (exit 77 when\n\
+exhausted); --max-output-tokens N sets the per-response output limit.";
 
 pub(crate) fn read_stdin_prompt_from(mut input: impl Read) -> io::Result<String> {
     let mut bytes = Vec::new();
@@ -2251,11 +2311,21 @@ fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Res
             name: &task.name,
         })
         .collect();
+    // JSON output is shareable: the SDK already stripped owner-local fields;
+    // strip again so a caller-built result cannot leak them.
+    let shareable_presentation = result
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.presentation.clone())
+        .map(|mut presentation| {
+            presentation.strip_local_only();
+            presentation
+        });
     let error = result.failure.as_ref().map(|failure| RunJsonError {
         code: failure.code.as_str(),
         message: &failure.message,
         retryable: failure.retryable,
-        presentation: failure.presentation.as_ref(),
+        presentation: shareable_presentation.as_ref(),
     });
     serde_json::to_writer(
         &mut output,
@@ -2417,7 +2487,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits() {
+    fn print_error_identity_includes_http_status() {
+        let presentation = haider_protocol::error::ErrorPresentation::new(
+            "provider-overloaded",
+            "Provider is overloaded",
+            "Overloaded",
+            haider_protocol::error::ErrorScope::Turn,
+            [haider_protocol::error::ErrorAction::Retry],
+        )
+        .with_http_status(503)
+        .with_provider_error_type(Some("overloaded_error"))
+        .with_request_id(Some("req_fixture503"));
+        assert_eq!(
+            provider_identity_lines(&presentation),
+            [
+                "HTTP 503",
+                "Provider error type: overloaded_error",
+                "Request id: req_fixture503",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn request_budget_is_opt_in_and_single_flags_choose_valid_counterparts() {
+        let unbounded = parse_run_options_with_config(&["-p".into(), "long task".into()])
+            .expect("unbounded default");
+        assert_eq!(unbounded.options.budget.request_budget, None);
+
         let parsed = parse_run_options_with_config(&[
             "-p".into(),
             "long task".into(),
@@ -2430,6 +2528,34 @@ mod tests {
             Some(haider_protocol::request_budget::RequestBudgetV1 {
                 tranche: 32,
                 hard_cap: 96
+            })
+        );
+        let small_cap = parse_run_options_with_config(&[
+            "-p".into(),
+            "long task".into(),
+            "--max-requests".into(),
+            "5".into(),
+        ])
+        .expect("small hard cap without a tranche");
+        assert_eq!(
+            small_cap.options.budget.request_budget,
+            Some(haider_protocol::request_budget::RequestBudgetV1 {
+                tranche: 5,
+                hard_cap: 5
+            })
+        );
+        let tranche = parse_run_options_with_config(&[
+            "-p".into(),
+            "long task".into(),
+            "--request-tranche".into(),
+            "40".into(),
+        ])
+        .expect("tranche override");
+        assert_eq!(
+            tranche.options.budget.request_budget,
+            Some(haider_protocol::request_budget::RequestBudgetV1 {
+                tranche: 40,
+                hard_cap: 64
             })
         );
         for flags in [
@@ -2556,6 +2682,7 @@ mod tests {
             permission_denials: Vec::new(),
             terminal_seq: Some(7),
             background_tasks_running: Vec::new(),
+            provider_raw_detail_local: None,
             failure: Some(haider_client::HeadlessRunFailure {
                 code: HeadlessFailureCode::Run(ErrorCode::RequestBudgetExceeded),
                 message: message.into(),

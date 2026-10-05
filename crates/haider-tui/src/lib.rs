@@ -14,6 +14,7 @@ pub mod cache_usage;
 pub mod clipboard;
 pub mod commands;
 pub mod composer;
+pub mod context_meter;
 pub mod custom_commands;
 pub mod demo_store;
 pub mod fleet;
@@ -47,6 +48,7 @@ pub mod terms_journal;
 pub mod theme;
 pub mod throughput;
 pub mod toolfold;
+pub mod toolview;
 pub mod wordmark;
 
 /// Crate marker used by the workspace self-test.

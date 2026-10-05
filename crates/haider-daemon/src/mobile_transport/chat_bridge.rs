@@ -148,26 +148,12 @@ impl DaemonMobileChatBridge {
             .to_string_lossy()
             .into_owned();
         let created = runtime
-            .request(RequestBody::SessionCreateWithPermissionOverrides {
-                command_id: CommandId::new(self.next_coordinate("create")),
+            .request(mobile_session_create_request(
+                self.next_coordinate("create"),
                 cwd,
                 provider,
                 model,
-                max_tokens: haider_client::DEFAULT_MAX_TOKENS,
-                permission_overrides: Some(SessionPermissionOverridesV1 {
-                    allow_mobile: true,
-                    ..SessionPermissionOverridesV1::default()
-                }),
-                workspace_allocation: None,
-                cache_policy: None,
-                interaction_mode: SessionInteractionModeV1::Interactive,
-                ssh_scope: None,
-                account_alias: None,
-                resolve_provider: false,
-                resolve_model: false,
-                effort: None,
-                fast: None,
-            })
+            ))
             .await?;
         let (session_id, created_seq, worker_generation) = match created.body {
             ResponseBody::SessionCreate {
@@ -239,6 +225,7 @@ impl DaemonMobileChatBridge {
                         model,
                         provider: Some(provider),
                         confirm_new_epoch,
+                        max_tokens: None,
                     })
                     .await?;
                 let worker_generation = match selected.body {
@@ -276,6 +263,34 @@ impl DaemonMobileChatBridge {
                 responder.send(ChatEvent::SessionConfig(config)).await
             }
         }
+    }
+}
+
+fn mobile_session_create_request(
+    command_id: String,
+    cwd: String,
+    provider: String,
+    model: String,
+) -> RequestBody {
+    RequestBody::SessionCreateWithPermissionOverrides {
+        command_id: CommandId::new(command_id),
+        cwd,
+        provider,
+        model,
+        max_tokens: 0,
+        permission_overrides: Some(SessionPermissionOverridesV1 {
+            allow_mobile: true,
+            ..SessionPermissionOverridesV1::default()
+        }),
+        workspace_allocation: None,
+        cache_policy: None,
+        interaction_mode: SessionInteractionModeV1::Interactive,
+        ssh_scope: None,
+        account_alias: None,
+        resolve_provider: false,
+        resolve_model: false,
+        effort: None,
+        fast: None,
     }
 }
 
@@ -993,11 +1008,28 @@ impl TurnProjection {
             }
             EventPayload::RunFailed {
                 code,
-                message,
                 retryable,
+                presentation,
                 ..
             } => {
-                self.failure = Some(MobileChatError::new(code.as_str(), message, retryable));
+                let mut parts = vec![code.as_str().to_owned()];
+                if let Some(presentation) = presentation {
+                    if let Some(error_type) = presentation.provider_error_type {
+                        parts.push(format!("Provider error type: {error_type}"));
+                    }
+                    if let Some(status) = presentation.provider_http_status {
+                        parts.push(format!("HTTP {status}"));
+                    }
+                    if let Some(request_id) = presentation.provider_request_id {
+                        parts.push(format!("Request id: {request_id}"));
+                    }
+                    parts.push(presentation.detail);
+                }
+                self.failure = Some(MobileChatError::new(
+                    code.as_str(),
+                    parts.join(" · "),
+                    retryable,
+                ));
             }
             EventPayload::RunState(state) => {
                 if let Some(status) = run_status(&state) {

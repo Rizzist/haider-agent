@@ -131,7 +131,7 @@ fn timing(model: &mut AppModel, id: &str, ms: u64) {
 
 /// The wave's reference transcript: all four row kinds at once.
 ///
-/// * `verify` — a settled tool call with output → COLLAPSED summary + `└`.
+/// * `verify` — a settled tool call with output → COLLAPSED summary + `⎿`.
 /// * `probe-1..3` — three consecutive shell commands → FOLDED (`Ran 3 …`).
 /// * `grep` — a settled call the reader EXPANDED → bounded region.
 /// * `monitor` — a live call → spinner + elapsed.

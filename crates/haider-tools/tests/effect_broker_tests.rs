@@ -799,11 +799,9 @@ async fn edit_ask_carries_redacted_numbered_review_on_existing_permission_menu()
     )
     .expect("seed review target");
     let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
-    let operation = FsEdit::new(
-        "review.rs",
-        "sk-abcdefghijklmnopqrstuvwxyz123456",
-        "sk-zyxwvutsrqponmlkjihgfedcba654321",
-    );
+    // The anchor is visible text next to (not touching) the redacted key;
+    // the key itself stays in the review's context lines, redacted.
+    let operation = FsEdit::new("review.rs", "fn token() {", "fn rotated_token() {");
     let intent = broker.normalize(&operation).await.expect("normalize edit");
     let AuthorizationVerdict::Ask { menu } = broker
         .authorize(&intent, &PermissionPolicy::default())
@@ -825,8 +823,48 @@ async fn edit_ask_carries_redacted_numbered_review_on_existing_permission_menu()
     assert_eq!(review.hunks[0].lines[0].old_line, Some(1));
     let encoded = serde_json::to_string(opened).expect("serialize menu");
     assert!(!encoded.contains("abcdefghijklmnopqrstuvwxyz"));
-    assert!(!encoded.contains("zyxwvutsrqponmlkjihgfedcba"));
     assert!(encoded.contains("REDACTED"));
+    assert!(encoded.contains("rotated_token"));
+}
+
+/// The Ask review applies the same anchor rule as the edit: an anchor on
+/// redacted content (a correct or a wrong guess) fails the review alike, so
+/// the permission menu cannot test a guess before any read.
+#[tokio::test]
+async fn edit_ask_review_refuses_redacted_anchors_alike() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    fs::write(
+        directory.path().join("review.rs"),
+        "fn token() {\n    let api_key = \"sk-abcdefghijklmnopqrstuvwxyz123456\";\n}\n",
+    )
+    .expect("seed review target");
+    let mut views = Vec::new();
+    for guess in [
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "sk-abcdefghijklmnopqrstuvwxyz654321",
+    ] {
+        let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
+        let intent = broker
+            .normalize(&FsEdit::new("review.rs", guess, guess))
+            .await
+            .expect("normalize edit");
+        let error = broker
+            .authorize(&intent, &PermissionPolicy::default())
+            .await
+            .expect_err("review refuses the redacted anchor");
+        assert!(
+            matches!(
+                error,
+                haider_tools::ToolError::AnchorInRedactedContent {
+                    whole_file: false,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        views.push(error.to_string());
+    }
+    assert_eq!(views[0], views[1]);
 }
 
 #[tokio::test]

@@ -13,3 +13,18 @@ linker = "x86_64-linux-android26-clang"
 
 [target.i686-linux-android]
 linker = "i686-linux-android26-clang"
+
+# Windows MSVC: link the C runtime statically (registry #176). The default
+# dynamic CRT makes every shipped PE import VCRUNTIME140.dll, which clean
+# Windows installs without the VC++ redistributable lack, so haider.exe dies
+# with 0xC0000135 (STATUS_DLL_NOT_FOUND) before main; Chocolatey's verifier hit
+# this on 0.0.972. cc-built C (ring, BLAKE3, bundled SQLite) follows this
+# feature, and aws-lc-sys maps it to /MT for both its cc and CMake builders.
+# A RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS environment value replaces these flags;
+# `scripts/release_packaging.py verify-windows-imports` fails any shipped PE
+# that imports a redistributable CRT DLL, so such a regression cannot publish.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -287,7 +287,7 @@ async fn search_and_read_redact_without_spilling_inline_results() {
 
     let result = broker
         .fs_search(
-            &FsSearch::new(".", "sk-").with_repo_options(true, true),
+            &FsSearch::new(".", "token=").with_repo_options(true, true),
             &allow_read(),
             &mut cas,
             ResultBounds::default(),
@@ -380,7 +380,10 @@ async fn search_and_read_redact_without_spilling_inline_results() {
         )
         .await
         .expect("search embedded key body");
-    assert!(searched_key.preview.contains("[REDACTED:private_key]"));
+    assert!(
+        searched_key.preview.is_empty(),
+        "a raw secret query cannot probe masked bytes"
+    );
     assert!(!searched_key.preview.contains("AA=="));
     assert!(searched_key.artifact.is_none());
     assert!(cas.0.is_empty());
@@ -503,7 +506,7 @@ async fn search_tail_matches_keep_multiline_quote_state_before_context_selection
             .expect("fixture");
             let result = broker
                 .fs_search(
-                    &FsSearch::new(".", "SYNTHETICTAIL987"),
+                    &FsSearch::new(".", "after"),
                     &allow_read(),
                     &mut cas,
                     ResultBounds::default(),
@@ -515,8 +518,8 @@ async fn search_tail_matches_keep_multiline_quote_state_before_context_selection
                 panic!("typed search data");
             };
             assert_eq!(matches.len(), 1);
-            assert_eq!(matches[0].line, 2);
-            assert_eq!(matches[0].text, "[REDACTED:secret_value] after");
+            assert_eq!(matches[0].line, 0);
+            assert_eq!(matches[0].text, "[REDACTED:password] after");
             assert!(result.artifact.is_none());
             assert!(cas.0.is_empty());
         }

@@ -172,7 +172,8 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
                 (value["model_details"] as? JsonArray).orEmpty().map {
                     val model = it.jsonObject
                     ai.diffforge.haider.transport.SessionModel(model.string("name"), model.optionalNumber("context_window"),
-                        model.strings("supported_efforts").toList(), model.optionalString("default_effort"))
+                        model.strings("supported_efforts").toList(), model.optionalString("default_effort"),
+                        model.optionalString("source"))
                 },
                 value.optionalString("inventory_authority") ?: "unknown",
                 value.optionalString("endpoint"))

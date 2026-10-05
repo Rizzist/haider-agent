@@ -52,6 +52,35 @@ async fn complete_nonrepository_receipt_preserves_unchanged_preexisting_dirt() {
 }
 
 #[tokio::test]
+async fn secret_bearing_tree_has_no_published_path_or_raw_content_digest() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("oracle.txt"),
+        "password=violet-sunrise\n",
+    )
+    .expect("synthetic file");
+    let error = capture(workspace.path().into())
+        .await
+        .expect_err("redacted content cannot be an unkeyed receipt");
+    assert!(error.message.contains("redacted material"));
+    assert!(!error.message.contains("violet-sunrise"));
+    assert!(!error.message.contains("oracle.txt"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn synthetic_pem_filename_is_absent_from_receipt_error() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let name = "password=-----BEGIN\x20PRIVATE KEY-----\nVGVzdA==\n-----END PRIVATE KEY-----";
+    fs::write(workspace.path().join(name), "public fixture").expect("synthetic filename");
+    let error = capture(workspace.path().into())
+        .await
+        .expect_err("redacted filename cannot be a receipt key");
+    assert!(error.message.contains("redacted material"));
+    assert!(!error.message.contains("VGVzdA=="));
+}
+
+#[tokio::test]
 async fn complete_receipt_detects_same_size_edit_and_orders_created_and_deleted_files() {
     let workspace = tempfile::tempdir().expect("workspace");
     fs::write(workspace.path().join("z-edit"), "old").expect("original");

@@ -54,6 +54,7 @@ data class SessionModel(
     val contextWindow: Long?,
     val supportedEfforts: List<String>,
     val defaultEffort: String?,
+    val source: String? = null,
 )
 
 data class SessionProvider(
@@ -267,6 +268,7 @@ object Frames {
                             contextWindow = model.nullableLong("contextWindow"),
                             supportedEfforts = model.getJSONArray("supportedEfforts").mapStrings(),
                             defaultEffort = model.nullableString("defaultEffort"),
+                            source = model.nullableString("source"),
                         )
                     },
                 )

@@ -1,7 +1,7 @@
 //! Collapsed tool rows — the transcript's readability law (971-tui-collapse).
 //!
 //! Reference: Claude Code's TUI renders a tool call as ONE summary row plus
-//! an indented `└` sub-line, folds a run of consecutive same-tool calls into
+//! an indented `⎿` sub-line, folds a run of consecutive same-tool calls into
 //! `Ran N shell commands`, and keeps the full output one keystroke away.
 //! Owner (2026-09-08): "tool responses should be compressed by default …
 //! then expand if needed by the user (can go back to compressed from the
@@ -28,7 +28,7 @@ use unicode_width::UnicodeWidthStr;
 /// quiet and a debugging run stays verbose across restarts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Verbosity {
-    /// Summary row only — no `└` sub-line, no output. The orchestration mode.
+    /// Summary row only — no `⎿` sub-line, no output. The orchestration mode.
     Quiet,
     /// Summary row + the first meaningful result line. The owner's default.
     #[default]
@@ -78,7 +78,7 @@ impl Verbosity {
         matches!(self, Self::Verbose)
     }
 
-    /// Quiet drops the `└` sub-line — the summary row stands alone.
+    /// Quiet drops the `⎿` sub-line — the summary row stands alone.
     #[must_use]
     pub const fn shows_subline(self) -> bool {
         !matches!(self, Self::Quiet)
@@ -90,7 +90,7 @@ impl Verbosity {
 /// that opened it (the owner's "can go back to compressed" rule).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RowState {
-    /// Summary row (+ `└` sub-line outside quiet).
+    /// Summary row (+ `⎿` sub-line outside quiet).
     #[default]
     Collapsed,
     /// Summary row + a BOUNDED output region ([`EXPANDED_MAX_ROWS`]) that
@@ -255,7 +255,7 @@ pub enum Tone {
     /// never decoration.
     #[default]
     Meta,
-    /// Barely-there ink: the `└` elbow and the row's structural glyphs only.
+    /// Barely-there ink: the `⎿` elbow and the row's structural glyphs only.
     Structure,
     /// The identity ink: tool names, thread/run/agent ids.
     Name,
@@ -632,6 +632,11 @@ pub struct RowFacts<'a> {
     pub spinner: bool,
     /// The bounded terminal reason, when the projection joined one.
     pub reason: Option<&'a str>,
+    /// The `⎿` result line speaks for the outcome (973-tui-toolview): the
+    /// header then carries only glyph · verb(args), liveness and a duration
+    /// worth reading (≥ 1s). `false` keeps every figure on the header —
+    /// what quiet mode needs, since it draws no `⎿` line to carry them.
+    pub subline_outcome: bool,
 }
 
 /// The collapsed summary row: `⟨glyph⟩ name(args) · exit N · N lines · Ns`.
@@ -679,6 +684,12 @@ pub fn summary_segments_with_motion(
         if let Some(ms) = facts.elapsed_ms {
             tail.push(Segment::new(format!(" {}", fmt_duration(ms)), Tone::Meta));
         }
+    } else if facts.subline_outcome {
+        // The `⎿` line carries exit code, outcome, line count and reason;
+        // the header keeps only a duration a reader would notice.
+        if let Some(ms) = facts.elapsed_ms.filter(|ms| *ms >= 1_000) {
+            tail.push(Segment::new(format!(" · {}", fmt_duration(ms)), Tone::Meta));
+        }
     } else {
         if let Some(code) = facts.exit_code {
             failing = code != 0;
@@ -705,7 +716,10 @@ pub fn summary_segments_with_motion(
             tail.push(Segment::new(format!(" · {}", fmt_duration(ms)), Tone::Meta));
         }
     }
-    if let Some(reason) = facts.reason.filter(|reason| !reason.is_empty()) {
+    if let Some(reason) = facts
+        .reason
+        .filter(|reason| !reason.is_empty() && !facts.subline_outcome)
+    {
         // E8 visual pass: a reason on a SETTLED, non-failing row is a
         // recovered in-flight retry ("transient web_fetch failure — retry
         // 2/2 succeeded") — quiet metadata, never an alarming tone. Only a
@@ -737,7 +751,7 @@ pub fn summary_segments_with_motion(
     head
 }
 
-/// The `└` sub-line under a collapsed row: the result's first MEANINGFUL
+/// The `⎿` sub-line under a collapsed row: the result's first MEANINGFUL
 /// line, coloured by meaning. `None` when the call produced nothing worth a
 /// line — the summary row then stands alone rather than growing an empty elbow.
 #[must_use]
@@ -763,7 +777,7 @@ pub fn subline_segments_from(
         output
     };
     let line = first_meaningful_line(body)?;
-    let mut segments = vec![Segment::new("    └ ", Tone::Structure)];
+    let mut segments = vec![Segment::new(crate::toolview::ELBOW, Tone::Structure)];
     let budget = if width == 0 {
         line.chars().count()
     } else {
@@ -785,11 +799,12 @@ pub fn subline_segments_from(
 /// the client never had.
 #[must_use]
 pub fn fold_segments(run: &FoldRun) -> Vec<Segment> {
+    let (lead, noun) = crate::toolview::fold_phrase(&run.name, run.len);
     let mut segments = vec![
         Segment::new("  ", Tone::Structure),
-        Segment::new("Ran ", Tone::Meta),
+        Segment::new(lead, Tone::Meta),
         Segment::new(run.len.to_string(), Tone::Emphasis),
-        Segment::new(format!(" {}", fold_noun(&run.name, run.len)), Tone::Meta),
+        Segment::new(format!(" {noun}"), Tone::Meta),
     ];
     if run.truncated {
         segments.push(Segment::new(
@@ -837,7 +852,7 @@ pub fn fold_noun(name: &str, count: usize) -> String {
 /// is what the internal scroll has already passed.
 #[must_use]
 pub fn show_all_segments(above: usize, below: usize) -> Vec<Segment> {
-    let mut segments = vec![Segment::new("    └ ", Tone::Structure)];
+    let mut segments = vec![Segment::new(crate::toolview::ELBOW, Tone::Structure)];
     let hidden = above + below;
     segments.push(Segment::new(
         format!("⋯ {hidden} more row{}", if hidden == 1 { "" } else { "s" }),
@@ -1093,7 +1108,7 @@ pub enum FoldRole<'a> {
 
 /// One foldable run: which entries, the tool they share, and the sub-line
 /// the fold row speaks with. `subline` is the LATEST member's first
-/// meaningful result line — the reference's `Ran 2 shell commands` / `└
+/// meaningful result line — the reference's `Ran 2 shell commands` / `⎿
 /// Resuming agent a830387` pair, where the elbow answers "and where did that
 /// leave things?" rather than repeating the oldest call.
 #[derive(Clone, PartialEq, Eq, Debug)]

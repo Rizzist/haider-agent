@@ -6,6 +6,7 @@
 
 use base64::Engine as _;
 use regex::Regex;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -27,18 +28,101 @@ pub(crate) fn redact_private_key_lines(input: &str) -> RedactedText {
 }
 
 fn redact_lines(input: &str, policy: RedactionPolicy) -> RedactedText {
+    redact_lines_with_spans(input, policy, None)
+}
+
+fn redact_lines_with_spans(
+    input: &str,
+    policy: RedactionPolicy,
+    mut raw_spans: Option<&mut Vec<RawRedaction>>,
+) -> RedactedText {
     let mut state = RedactionState::default();
     let mut output = String::with_capacity(input.len());
     let mut replacements = 0usize;
+    let mut line_start = 0usize;
+    let mut line_spans = Vec::new();
     for line in input.split_inclusive('\n') {
-        let redacted = redact_line(line, &mut state, policy);
+        line_spans.clear();
+        let redacted = redact_line_spans(
+            line,
+            &mut state,
+            policy,
+            raw_spans.is_some().then_some(&mut line_spans),
+        );
+        if let Some(raw_spans) = raw_spans.as_deref_mut() {
+            raw_spans.extend(line_spans.iter().map(|span| RawRedaction {
+                raw: line_start + span.raw.start..line_start + span.raw.end,
+                marker: span.marker,
+            }));
+        }
         output.push_str(&redacted.text);
         replacements = replacements.saturating_add(redacted.replacements);
+        line_start += line.len();
     }
     RedactedText {
         text: output,
         replacements,
     }
+}
+
+/// Raw byte ranges of `input` that `fs_read` of `path` replaces with a
+/// marker: the explicit-path rendering, or the whole file for a path whose
+/// read is one `sensitive_file` marker. Ranges are ordered and disjoint; the
+/// bytes between them are exactly the visible text of the rendering.
+pub(crate) fn explicit_read_redacted_spans(path: &Path, input: &str) -> ExplicitReadSpans {
+    if is_sensitive_path(path)
+        || (is_token_config_path(path) && token_config_contains_secret(input.as_bytes()))
+    {
+        return ExplicitReadSpans {
+            spans: if input.is_empty() {
+                Vec::new()
+            } else {
+                vec![RawRedaction {
+                    raw: 0..input.len(),
+                    marker: "[REDACTED:sensitive_file]",
+                }]
+            },
+            whole_file: true,
+        };
+    }
+    let mut spans = Vec::new();
+    let _ = redact_lines_with_spans(input, RedactionPolicy::ExplicitPath, Some(&mut spans));
+    ExplicitReadSpans {
+        spans,
+        whole_file: false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExplicitReadSpans {
+    pub spans: Vec<RawRedaction>,
+    pub whole_file: bool,
+}
+
+/// One replaced span: the `raw` bytes of the input render as `marker`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawRedaction {
+    pub raw: Range<usize>,
+    /// Read only by the rendering-equivalence test, which proves the spans
+    /// reproduce `fs_read` byte for byte.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub marker: &'static str,
+}
+
+/// The rendering of `text` with every (ordered, disjoint) span replaced by
+/// its marker: for spans from [`explicit_read_redacted_spans`], exactly the
+/// text `fs_read` presents.
+#[cfg(test)]
+pub(crate) fn render_raw_redactions(text: &str, spans: &[RawRedaction]) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for span in spans {
+        output.push_str(&text[cursor..span.raw.start]);
+        output.push_str(span.marker);
+        cursor = span.raw.end;
+    }
+    output.push_str(&text[cursor..]);
+    output
 }
 
 /// Forced secret redaction for the provider-lockdown sandbox. The returned
@@ -80,6 +164,46 @@ pub fn redact_output_text(input: &str) -> String {
     redact_private_key_lines(input).text
 }
 
+/// A durable workspace receipt must not publish a raw path or a digest of a
+/// file that an explicit read would hide. The caller can report an incomplete
+/// receipt instead of exporting a guessable identity for that entry.
+pub fn workspace_receipt_path_sensitive(path: &Path) -> bool {
+    is_sensitive_path(path)
+        || path
+            .to_str()
+            .is_some_and(|text| redact_output_text(text) != text)
+}
+
+/// Marker that replaces a path the agent must not learn verbatim.
+pub(crate) const SENSITIVE_PATH_MARKER: &str = "[REDACTED:sensitive_path]";
+
+/// Whether a path returned to an agent must be replaced by the marker. The
+/// receipt detector also catches credential assignments embedded in
+/// otherwise ordinary names (`password=<value>.txt`).
+pub(crate) fn model_path_masked(path: &Path) -> bool {
+    workspace_receipt_path_sensitive(path) || is_token_config_path(path)
+}
+
+/// One presentation rule for every path listing, summary, and error returned
+/// to an agent.
+pub(crate) fn model_visible_path(path: &Path) -> String {
+    if model_path_masked(path) {
+        SENSITIVE_PATH_MARKER.to_owned()
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// Whether the output redactor would change any part of `bytes`. Mutation
+/// producers use this to keep exact integrity facts (content digests, byte
+/// counts) in the owner-local journal instead of agent-visible results.
+pub fn content_redaction_affected(bytes: &[u8]) -> bool {
+    let mut detector = crate::OutputRedactor::default();
+    let _ = detector.push_bytes(bytes);
+    let _ = detector.finish_bytes();
+    detector.redactions_applied()
+}
+
 /// The quote window shares the process-output ceiling. Once exhausted without
 /// a closing quote, fail closed for the rest of this input/stream; do not scan
 /// for a later delimiter or retain the discarded bytes.
@@ -92,6 +216,13 @@ pub(crate) struct RedactionState {
 }
 
 impl RedactionState {
+    /// A secret (open quote or PEM block) continues past the last line fed
+    /// in. The redactor keeps its physical line breaks, so later line
+    /// coordinates would count the hidden value's lines.
+    pub(crate) fn spans_lines(&self) -> bool {
+        self.private_key || self.quoted.active()
+    }
+
     pub(crate) fn discard_oversized_line(&mut self) {
         if self.quoted.active() {
             self.quoted.exhausted = true;
@@ -106,14 +237,17 @@ impl RedactionState {
 #[derive(Clone, Debug, Default)]
 struct QuotedValue {
     quote: Option<u8>,
+    /// Class of the assignment that opened the quote; continuation lines keep it.
+    kind: Option<SecretKind>,
     escaped: bool,
     remaining: usize,
     exhausted: bool,
 }
 
 impl QuotedValue {
-    fn start(&mut self, quote: u8) {
+    fn start(&mut self, quote: u8, kind: SecretKind) {
         self.quote = Some(quote);
+        self.kind = Some(kind);
         self.escaped = false;
         self.remaining = QUOTED_SECRET_MAX_BYTES - 1;
     }
@@ -152,20 +286,41 @@ pub(crate) fn redact_line_with_state(line: &str, state: &mut RedactionState) -> 
 }
 
 fn redact_line(line: &str, state: &mut RedactionState, policy: RedactionPolicy) -> RedactedText {
+    redact_line_spans(line, state, policy, None)
+}
+
+/// `redact_line`, optionally recording the raw byte range of every replaced
+/// span (relative to `line`).
+fn redact_line_spans(
+    line: &str,
+    state: &mut RedactionState,
+    policy: RedactionPolicy,
+    mut raw_spans: Option<&mut Vec<RawRedaction>>,
+) -> RedactedText {
     let begins = line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----");
     let ends = line.contains("-----END") && line.contains("PRIVATE KEY-----");
     let was_quoted = state.quoted.active();
     // Even a line replaced by a PEM marker must advance quote/escape state:
     // a same-line BEGIN/END pair cannot expose the password's next line.
-    let redacted = redact_with_state(line, policy, &mut state.quoted);
+    let redacted =
+        redact_with_state_spans(line, policy, &mut state.quoted, raw_spans.as_deref_mut());
     if state.private_key || (begins && !(was_quoted && state.quoted.active())) {
         state.private_key = !ends;
+        if let Some(raw_spans) = raw_spans {
+            // The whole line (a CR included) becomes one marker; only the LF
+            // survives.
+            raw_spans.clear();
+            raw_spans.push(RawRedaction {
+                raw: 0..line.strip_suffix('\n').unwrap_or(line).len(),
+                marker: SecretKind::PrivateKey.marker(),
+            });
+        }
+        let mut text = SecretKind::PrivateKey.marker().to_owned();
+        if line.ends_with('\n') {
+            text.push('\n');
+        }
         return RedactedText {
-            text: if line.ends_with('\n') {
-                "[REDACTED:private_key]\n".into()
-            } else {
-                "[REDACTED:private_key]".into()
-            },
+            text,
             replacements: 1,
         };
     }
@@ -176,7 +331,76 @@ fn redact_line(line: &str, state: &mut RedactionState, policy: RedactionPolicy) 
 struct Span {
     start: usize,
     end: usize,
-    kind: &'static str,
+    kind: SecretKind,
+}
+
+/// Every class a redaction marker can name. Detection decides the class;
+/// `marker` is the single authoritative table of the bytes a class renders
+/// as. Every marker is pinned by `marker_table_bytes_are_pinned` (plus
+/// `redaction_labels_v1.golden`), and the subset lockdown can emit is frozen
+/// by its byte contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretKind {
+    /// A PEM private-key block, in every policy.
+    PrivateKey,
+    /// Lockdown only: a bare base64 line. Default mode reports `HighEntropy`,
+    /// since it cannot claim key material without PEM context.
+    PrivateKeyMaterial,
+    AwsAccessKey,
+    /// A vendor `sk-` key or an explicit API-key assignment.
+    ApiKey,
+    GithubToken,
+    SlackToken,
+    GitlabToken,
+    NpmToken,
+    StripeApiKey,
+    GoogleApiKey,
+    /// Default mode: a parsed JWT shape (see `is_jwt`). Lockdown: any value
+    /// its legacy known-secret regex matched without a vendor prefix.
+    Jwt,
+    BearerToken,
+    BasicAuth,
+    /// An explicit password/passphrase assignment or URL userinfo password.
+    Password,
+    /// Any other explicit credential assignment.
+    SecretValue,
+    /// Text accepted by the entropy detector, including qualifying invalid
+    /// JWT lookalikes.
+    HighEntropy,
+}
+
+impl SecretKind {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::PrivateKey => "[REDACTED:private_key]",
+            Self::PrivateKeyMaterial => "[REDACTED:private_key_material]",
+            Self::AwsAccessKey => "[REDACTED:aws_access_key]",
+            Self::ApiKey => "[REDACTED:api_key]",
+            Self::GithubToken => "[REDACTED:github_token]",
+            Self::SlackToken => "[REDACTED:slack_token]",
+            Self::GitlabToken => "[REDACTED:gitlab_token]",
+            Self::NpmToken => "[REDACTED:npm_token]",
+            Self::StripeApiKey => "[REDACTED:stripe_api_key]",
+            Self::GoogleApiKey => "[REDACTED:google_api_key]",
+            Self::Jwt => "[REDACTED:jwt]",
+            Self::BearerToken => "[REDACTED:bearer_token]",
+            Self::BasicAuth => "[REDACTED:basic_auth]",
+            Self::Password => "[REDACTED:password]",
+            Self::SecretValue => "[REDACTED:secret_value]",
+            Self::HighEntropy => "[REDACTED:high_entropy]",
+        }
+    }
+
+    /// Classes produced by credential context. Such a value may continue
+    /// across lines inside a quote, so it is replaced once per physical line.
+    /// (A known-format `sk-` key is also `ApiKey`; it cannot contain a
+    /// newline, so the per-line split leaves it a single span.)
+    const fn is_per_line(self) -> bool {
+        matches!(
+            self,
+            Self::SecretValue | Self::Password | Self::ApiKey | Self::BearerToken | Self::BasicAuth
+        )
+    }
 }
 
 /// Paths search/glob never reveal, even when hidden-file traversal is enabled.
@@ -238,19 +462,49 @@ pub(crate) fn token_config_contains_secret(bytes: &[u8]) -> bool {
     })
 }
 
-#[cfg(test)]
 pub(crate) fn redact_text(input: &str) -> RedactedText {
-    redact_with_state(
-        input,
-        RedactionPolicy::Standard,
-        &mut QuotedValue::default(),
-    )
+    if has_pem_assignment_overlap(input) {
+        // A quoted assignment may begin on an earlier physical line than the
+        // PEM header. Use the stateful line path for that exceptional overlap
+        // so the header, body, and line breaks agree with process output.
+        redact_lines(input, RedactionPolicy::Standard)
+    } else {
+        redact_with_state(
+            input,
+            RedactionPolicy::Standard,
+            &mut QuotedValue::default(),
+        )
+    }
+}
+
+fn has_pem_assignment_overlap(input: &str) -> bool {
+    if !input.contains("PRIVATE KEY-----") {
+        return false;
+    }
+    let Some(pem) = private_key_regex() else {
+        return false;
+    };
+    let assignments = secret_assignment_spans(input, &mut QuotedValue::default());
+    pem.find_iter(input).any(|key| {
+        assignments
+            .iter()
+            .any(|value| value.start < key.end() && key.start() < value.end)
+    })
 }
 
 fn redact_with_state(
     input: &str,
     policy: RedactionPolicy,
     quoted: &mut QuotedValue,
+) -> RedactedText {
+    redact_with_state_spans(input, policy, quoted, None)
+}
+
+fn redact_with_state_spans(
+    input: &str,
+    policy: RedactionPolicy,
+    quoted: &mut QuotedValue,
+    mut raw_spans: Option<&mut Vec<RawRedaction>>,
 ) -> RedactedText {
     let spans = redaction_spans(input, policy, quoted);
     if spans.is_empty() {
@@ -267,9 +521,13 @@ fn redact_with_state(
             continue;
         }
         output.push_str(&input[cursor..span.start]);
-        output.push_str("[REDACTED:");
-        output.push_str(span.kind);
-        output.push(']');
+        output.push_str(span.kind.marker());
+        if let Some(raw_spans) = raw_spans.as_deref_mut() {
+            raw_spans.push(RawRedaction {
+                raw: span.start..span.end,
+                marker: span.kind.marker(),
+            });
+        }
         cursor = span.end;
         replacements = replacements.saturating_add(1);
     }
@@ -280,10 +538,19 @@ fn redact_with_state(
     }
 }
 
-/// Produces the exact UTF-8 byte prefix of standard redaction without allocating
-/// the complete redacted value. `full_len` is the byte length that complete
-/// value would have had, so callers retain the existing truncation decision.
+/// Produces the exact UTF-8 byte prefix of standard redaction. The usual path
+/// avoids allocating the complete rendering; a PEM/assignment overlap uses the
+/// stateful line rendering so it cannot expose the body or drop line breaks.
+/// `full_len` is the complete rendered byte length.
 pub(crate) fn redact_text_bounded(input: &str, max_bytes: usize) -> BoundedRedactedText {
+    if has_pem_assignment_overlap(input) {
+        let redacted = redact_lines(input, RedactionPolicy::Standard);
+        return BoundedRedactedText {
+            text: utf8_prefix(&redacted.text, max_bytes).to_owned(),
+            replacements: redacted.replacements,
+            full_len: redacted.text.len(),
+        };
+    }
     let spans = redaction_spans(
         input,
         RedactionPolicy::Standard,
@@ -310,12 +577,11 @@ pub(crate) fn redact_text_bounded(input: &str, max_bytes: usize) -> BoundedRedac
             prefix_complete = push_bounded(&mut output, plain, max_bytes);
         }
         full_len = full_len.saturating_add(plain.len());
-        for replacement in ["[REDACTED:", span.kind, "]"] {
-            if prefix_complete {
-                prefix_complete = push_bounded(&mut output, replacement, max_bytes);
-            }
-            full_len = full_len.saturating_add(replacement.len());
+        let marker = span.kind.marker();
+        if prefix_complete {
+            prefix_complete = push_bounded(&mut output, marker, max_bytes);
         }
+        full_len = full_len.saturating_add(marker.len());
         cursor = span.end;
         replacements = replacements.saturating_add(1);
     }
@@ -338,7 +604,7 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
             spans.push(Span {
                 start: found.start(),
                 end: found.end(),
-                kind: "private_key",
+                kind: SecretKind::PrivateKey,
             });
         }
     }
@@ -357,7 +623,11 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
             spans.push(Span {
                 start: found.start(),
                 end: found.end(),
-                kind: known_kind(found.as_str()),
+                kind: if policy == RedactionPolicy::Lockdown {
+                    lockdown_known_kind(found.as_str())
+                } else {
+                    default_known_kind(found.as_str())
+                },
             });
         }
     }
@@ -368,14 +638,16 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
     {
         for captures in regex.captures_iter(input) {
             if let Some(found) = captures.get(1) {
-                if spans
-                    .iter()
-                    .any(|span| span.start == found.start() && span.end == found.end())
-                {
+                if spans.iter().any(|span| {
+                    span.kind != SecretKind::HighEntropy
+                        && span.kind != SecretKind::SecretValue
+                        && span.start == found.start()
+                        && span.end == found.end()
+                }) {
                     continue;
                 }
                 if !spans.iter().any(|span| {
-                    span.kind == "private_key"
+                    span.kind == SecretKind::PrivateKey
                         && found.start() < span.end
                         && span.start < found.end()
                 }) {
@@ -383,7 +655,7 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
                     spans.push(Span {
                         start: found.start(),
                         end: found.end(),
-                        kind: "secret_value",
+                        kind: SecretKind::Password,
                     });
                 }
             }
@@ -391,18 +663,46 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
     }
     if policy != RedactionPolicy::Lockdown {
         for span in secret_assignment_spans(input, quoted) {
-            // Keep a known key's marker, but a PEM-looking continuation is
-            // still inside the quoted value and must preserve its line ending.
+            // Keep a concrete known format's marker. An invalid JWT-shaped
+            // value is only generic entropy or secret context, so a more
+            // specific assignment field still wins.
             if spans.iter().any(|other| {
-                other.kind != "private_key" && other.start == span.start && other.end == span.end
+                other.kind != SecretKind::PrivateKey
+                    && other.kind != SecretKind::HighEntropy
+                    && other.kind != SecretKind::SecretValue
+                    && other.start == span.start
+                    && other.end == span.end
             }) {
                 continue;
             }
-            // An enclosing PEM block retains priority over assignments in its
-            // body. A PEM-looking delimiter inside a quote is secret text.
-            if spans.iter().any(|other| {
-                other.kind == "private_key" && other.start < span.start && span.start < other.end
-            }) {
+            // Mask the union when a credential assignment and a PEM block
+            // overlap. In particular, a value beginning at the PEM header
+            // must never replace the block with a shorter assignment span;
+            // a quote extending beyond the PEM end must stay hidden too.
+            let pem_union = spans
+                .iter()
+                .filter(|other| {
+                    other.kind == SecretKind::PrivateKey
+                        && span.start < other.end
+                        && other.start < span.end
+                })
+                .fold(None, |union: Option<Span>, other| {
+                    let current = union.unwrap_or(span);
+                    Some(Span {
+                        start: current.start.min(other.start),
+                        end: current.end.max(other.end),
+                        kind: SecretKind::PrivateKey,
+                    })
+                });
+            if let Some(pem_union) = pem_union {
+                spans.retain(|other| pem_union.start >= other.end || other.start >= pem_union.end);
+                push_secret_lines(
+                    &mut spans,
+                    input,
+                    pem_union.start,
+                    pem_union.end,
+                    SecretKind::PrivateKey,
+                );
                 continue;
             }
             spans.retain(|other| span.start >= other.end || other.start >= span.end);
@@ -429,7 +729,7 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
             spans.push(Span {
                 start: found.start(),
                 end: found.end(),
-                kind: "high_entropy",
+                kind: SecretKind::HighEntropy,
             });
         }
     }
@@ -447,15 +747,19 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
             spans.push(Span {
                 start: found.start(),
                 end: found.end(),
-                kind: "private_key_material",
+                kind: if policy == RedactionPolicy::Lockdown {
+                    SecretKind::PrivateKeyMaterial
+                } else {
+                    SecretKind::HighEntropy
+                },
             });
         }
     }
     spans.sort_by_key(|span| (span.start, span.end));
     let mut output = Vec::with_capacity(spans.len());
     for span in spans {
-        if span.kind == "secret_value" {
-            push_secret_lines(&mut output, input, span.start, span.end);
+        if span.kind.is_per_line() {
+            push_secret_lines(&mut output, input, span.start, span.end, span.kind);
         } else {
             output.push(span);
         }
@@ -516,18 +820,90 @@ fn private_key_material_regex() -> Option<&'static Regex> {
         .as_ref()
 }
 
-fn known_kind(value: &str) -> &'static str {
-    if value.starts_with("AKIA") || value.starts_with("ASIA") {
-        "aws_access_key"
-    } else if value.starts_with("sk-") {
-        "api_key"
-    } else if value.starts_with("ghp_") || value.starts_with("github_pat_") {
-        "github_token"
-    } else if value.starts_with("xox") {
-        "slack_token"
-    } else {
-        "jwt"
+/// Vendor prefixes both classifiers recognize. The prefix sets are
+/// disjoint, so table order does not change the result.
+const COMMON_KNOWN_PREFIXES: &[(&[&str], SecretKind)] = &[
+    (&["AKIA", "ASIA"], SecretKind::AwsAccessKey),
+    (&["sk-"], SecretKind::ApiKey),
+    (&["ghp_", "github_pat_"], SecretKind::GithubToken),
+    (&["xox"], SecretKind::SlackToken),
+];
+
+/// Vendor prefixes only `extended_secret_regex` matches. Among that regex's
+/// alternatives, only the GitLab token families begin with `gl`.
+const EXTENDED_KNOWN_PREFIXES: &[(&[&str], SecretKind)] = &[
+    (&["gl"], SecretKind::GitlabToken),
+    (&["npm_"], SecretKind::NpmToken),
+    (
+        &["sk_live_", "pk_live_", "sk_test_", "rk_live_"],
+        SecretKind::StripeApiKey,
+    ),
+    (&["AIza"], SecretKind::GoogleApiKey),
+];
+
+/// Upper bound on each JWT segment decoded while classifying process output.
+const JWT_PART_MAX_BYTES: usize = 16 * 1024;
+
+fn prefix_kind(value: &str, table: &[(&[&str], SecretKind)]) -> Option<SecretKind> {
+    table
+        .iter()
+        .find(|(prefixes, _)| prefixes.iter().any(|prefix| value.starts_with(prefix)))
+        .map(|(_, kind)| *kind)
+}
+
+// The restricted provider has an established byte contract. Keep its original
+// classifier independent of the more precise labels used by ordinary previews.
+fn lockdown_known_kind(value: &str) -> SecretKind {
+    prefix_kind(value, COMMON_KNOWN_PREFIXES).unwrap_or(SecretKind::Jwt)
+}
+
+fn default_known_kind(value: &str) -> SecretKind {
+    prefix_kind(value, COMMON_KNOWN_PREFIXES)
+        .or_else(|| prefix_kind(value, EXTENDED_KNOWN_PREFIXES))
+        .unwrap_or_else(|| {
+            if is_jwt(value) {
+                SecretKind::Jwt
+            } else {
+                if looks_high_entropy(value) {
+                    SecretKind::HighEntropy
+                } else {
+                    SecretKind::SecretValue
+                }
+            }
+        })
+}
+
+fn is_jwt(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let (Some(header), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    // The marker describes a parsed JWT shape, not a verified signature.
+    // Bound decoding and JSON parsing for attacker-controlled process output.
+    if [header, payload, signature]
+        .iter()
+        .any(|part| part.len() > JWT_PART_MAX_BYTES)
+    {
+        return false;
     }
+    let decoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let Ok(header) = decoder.decode(header) else {
+        return false;
+    };
+    let Ok(payload) = decoder.decode(payload) else {
+        return false;
+    };
+    decoder
+        .decode(signature)
+        .is_ok_and(|bytes| !bytes.is_empty())
+        && serde_json::from_slice::<serde_json::Value>(&header)
+            .ok()
+            .is_some_and(|json| json.get("alg").is_some_and(serde_json::Value::is_string))
+        && serde_json::from_slice::<serde_json::Value>(&payload)
+            .ok()
+            .is_some_and(|json| json.is_object())
 }
 
 fn extended_secret_regex() -> Option<&'static Regex> {
@@ -540,18 +916,19 @@ fn extended_secret_regex() -> Option<&'static Regex> {
 fn secret_assignment_regex() -> Option<&'static Regex> {
     static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(
-        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|pass[_-]?phrase|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)(["']|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
+        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?P<field>password|passwd|pass[_-]?phrase|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?P<scheme>Bearer|Basic)\s+)(?P<value>["']|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
     ).ok()).as_ref()
 }
 
 fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
     let mut spans = Vec::new();
+    let continuation_kind = quoted.kind.unwrap_or(SecretKind::SecretValue);
     let mut cursor = quoted.consume(input);
     if cursor > 0 {
         spans.push(Span {
             start: 0,
             end: cursor,
-            kind: "secret_value",
+            kind: continuation_kind,
         });
     }
     if quoted.active() {
@@ -559,14 +936,23 @@ fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
     }
     if let Some(regex) = secret_assignment_regex() {
         for captures in regex.captures_iter(input) {
-            let Some(value) = captures.get(1) else {
+            let Some(value) = captures.name("value") else {
                 continue;
             };
             if value.start() < cursor {
                 continue;
             }
+            if is_existing_redaction_marker(value.as_str()) {
+                cursor = value.end();
+                continue;
+            }
+            let kind = assignment_kind(
+                captures.name("field").map(|field| field.as_str()),
+                captures.name("scheme").map(|scheme| scheme.as_str()),
+                value.as_str(),
+            );
             let end = if matches!(value.as_str(), "\"" | "'") {
-                quoted.start(input.as_bytes()[value.start()]);
+                quoted.start(input.as_bytes()[value.start()], kind);
                 value.end() + quoted.consume(&input[value.end()..])
             } else {
                 value.end()
@@ -574,7 +960,7 @@ fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
             spans.push(Span {
                 start: value.start(),
                 end,
-                kind: "secret_value",
+                kind,
             });
             cursor = end;
             if quoted.active() {
@@ -585,19 +971,83 @@ fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
     spans
 }
 
-fn push_secret_lines(spans: &mut Vec<Span>, input: &str, start: usize, end: usize) {
+fn is_existing_redaction_marker(value: &str) -> bool {
+    use SecretKind::*;
+    [
+        PrivateKey,
+        PrivateKeyMaterial,
+        AwsAccessKey,
+        ApiKey,
+        GithubToken,
+        SlackToken,
+        GitlabToken,
+        NpmToken,
+        StripeApiKey,
+        GoogleApiKey,
+        Jwt,
+        BearerToken,
+        BasicAuth,
+        Password,
+        SecretValue,
+        HighEntropy,
+    ]
+    .into_iter()
+    .any(|kind| value == kind.marker())
+}
+
+/// Classify the terminal field captured by the winning assignment rule. A
+/// namespace prefix such as PASSWORD_RESET_ has no authority over TOKEN.
+fn assignment_kind(field: Option<&str>, scheme: Option<&str>, value: &str) -> SecretKind {
+    if scheme.is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+        || starts_with_auth_scheme(value, "bearer")
+    {
+        SecretKind::BearerToken
+    } else if scheme.is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+        || starts_with_auth_scheme(value, "basic")
+    {
+        SecretKind::BasicAuth
+    } else {
+        match field.map(str::to_ascii_lowercase).as_deref() {
+            Some("api_key" | "api-key" | "apikey") => SecretKind::ApiKey,
+            Some("password" | "passwd" | "passphrase" | "pass_phrase" | "pass-phrase") => {
+                SecretKind::Password
+            }
+            _ => SecretKind::SecretValue,
+        }
+    }
+}
+
+fn starts_with_auth_scheme(value: &str, scheme: &str) -> bool {
+    let Some(head) = value.get(..scheme.len()) else {
+        return false;
+    };
+    head.eq_ignore_ascii_case(scheme)
+        && value[scheme.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+}
+
+fn push_secret_lines(
+    spans: &mut Vec<Span>,
+    input: &str,
+    start: usize,
+    end: usize,
+    kind: SecretKind,
+) {
     // Preserve physical line numbering for fs_read, including empty lines.
     // Newlines count toward the quote window even though they remain visible.
+    // Every line of the value renders its marker, an empty one included (a
+    // zero-length span): otherwise an empty interior line would stay a blank
+    // visible line and reveal where the value contains `\n\n`.
     let mut cursor = start;
     for line in input[start..end].split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
-        if !content.is_empty() {
-            spans.push(Span {
-                start: cursor,
-                end: cursor + content.len(),
-                kind: "secret_value",
-            });
-        }
+        spans.push(Span {
+            start: cursor,
+            end: cursor + content.len(),
+            kind,
+        });
         cursor += line.len();
     }
 }

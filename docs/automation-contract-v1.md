@@ -561,6 +561,8 @@ model), `workflow`, `workflow_trigger`, `parent_slot`, `workflow_author`, and
 `agent_type`; `request_budget` sets the child's per-turn request allowance.
 The default provider declaration contains only the required `task` and
 `prompt` fields and inherits the parent's current model/provider pair.
+Omitting `request_budget` leaves the child unbounded by provider-request count;
+explicit token, cost, and time policies and cancellation remain independent.
 `list_tools(filter="spawn_subagent")` describes and durably promotes the full
 authorized declaration, including all optional controls. Both declarations
 set `additionalProperties: false`;

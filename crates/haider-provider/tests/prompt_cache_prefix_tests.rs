@@ -140,6 +140,7 @@ fn turn_n(model: &str, provider: &str) -> TurnRequest {
         tools: tools(),
         attachments: Vec::new(),
         cache_metadata: Some(cache_metadata(provider, 1, 1)),
+        tool_result_image_projection: Default::default(),
     }
 }
 

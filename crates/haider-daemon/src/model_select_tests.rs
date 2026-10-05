@@ -55,6 +55,26 @@ fn authority(
     ModelSelectionAuthority::new(creatable(creatable_providers), summaries)
 }
 
+#[test]
+fn selection_derives_limits_when_inventory_details_are_incomplete() {
+    let mut anthropic = summary(
+        "anthropic-oauth",
+        &["claude-fable-5-1"],
+        ProviderAvailabilityWire::Available,
+    );
+    anthropic.api_family = ProviderApiFamilyWire::AnthropicMessages;
+    let selection = authority(&["anthropic-oauth"], vec![anthropic])
+        .validate_selection_with_status("anthropic-oauth", None, "claude-fable-5-1")
+        .expect("known model selection");
+    assert_eq!(selection.context_window, Some(1_000_000));
+    assert_eq!(selection.max_output_tokens, 128_000);
+
+    let selection = authority(&["custom"], Vec::new())
+        .validate_selection_with_status("custom", None, "future-model")
+        .expect("unknown inventory permits passthrough");
+    assert!(selection.max_output_tokens > 4_096);
+}
+
 // ───────────────────────────── live-session selection ───────────────────────
 
 /// LAW (absent_provider_keeps_legacy_bytes_and_behavior, behavior half): an
@@ -281,9 +301,11 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
     first.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 900 };
     first.model_details = vec![
         ModelDetailWire {
+            source: None,
             name: "glm-4.7-flashx".into(),
             display_name: Some("ZAI Flash X".into()),
             context_window: Some(128_000),
+            max_output_tokens: Some(32_768),
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: vec!["fast".into()],
@@ -291,9 +313,11 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
             supports_vision: Some(true),
         },
         ModelDetailWire {
+            source: None,
             name: "glm-4.7-air".into(),
             display_name: None,
             context_window: None,
+            max_output_tokens: Some(8_192),
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: Vec::new(),
@@ -314,6 +338,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
     assert!(row.capabilities.fast);
     assert!(row.capabilities.pdf);
     assert_eq!(row.capabilities.context_window, Some(128_000));
+    assert_eq!(row.capabilities.max_output_tokens, 32_768);
 
     assert_eq!(
         authority
@@ -767,4 +792,38 @@ fn remote_inventory_cannot_admit_an_unresolved_model_after_failed_discovery() {
             .expect("real ID"),
         ("haider-code".into(), "deepseek-v4-flash".into())
     );
+}
+
+#[test]
+fn static_subscription_row_is_selectable_after_catalog_403() {
+    let mut subscription = summary(
+        "anthropic-oauth",
+        &["claude-fable-5-1"],
+        ProviderAvailabilityWire::Available,
+    );
+    subscription.catalog = haider_rpc::ProviderCatalogKindWire::Authenticated;
+    subscription.model_details = vec![ModelDetailWire {
+        source: Some(haider_rpc::ModelDetailSourceWire::Static),
+        name: "claude-fable-5-1".into(),
+        display_name: None,
+        context_window: Some(1_000_000),
+        max_output_tokens: None,
+        supported_efforts: Vec::new(),
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    }];
+    subscription.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "provider does not serve a model list to this credential (403)".into(),
+    };
+    let authority = authority(&["anthropic-oauth"], vec![subscription]);
+    assert_eq!(
+        authority.validate_selection("anthropic-oauth", None, "claude-fable-5-1"),
+        Ok(("anthropic-oauth".into(), "claude-fable-5-1".into()))
+    );
+    assert!(matches!(
+        authority.validate_selection("anthropic-oauth", None, "invented-model"),
+        Err(SelectionRefusal::ModelUnknown { .. })
+    ));
 }

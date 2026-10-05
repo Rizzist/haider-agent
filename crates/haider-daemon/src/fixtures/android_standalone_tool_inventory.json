@@ -470,7 +470,7 @@
           },
           "request_budget": {
             "additionalProperties": false,
-            "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+            "description": "Optional child per-turn provider request budget. Omit it for no request-count cap. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
             "properties": {
               "hard_cap": {
                 "minimum": 1,
@@ -1598,7 +1598,7 @@
               },
               "request_budget": {
                 "additionalProperties": false,
-                "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+                "description": "Optional child per-turn provider request budget. Omit it for no request-count cap. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
                 "properties": {
                   "hard_cap": {
                     "minimum": 1,
@@ -2884,7 +2884,7 @@
               },
               "request_budget": {
                 "additionalProperties": false,
-                "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+                "description": "Optional child per-turn provider request budget. Omit it for no request-count cap. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
                 "properties": {
                   "hard_cap": {
                     "minimum": 1,

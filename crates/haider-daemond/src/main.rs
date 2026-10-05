@@ -56,6 +56,12 @@ mod telemetry;
 /// exits 64 rather than degrading), and it announces itself loudly on
 /// stderr AND in its log so the profile's daemon.log names the condition.
 const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
+/// TEST-ONLY companion of [`FAKE_PROVIDER_ENV`], read only while that seam
+/// is armed: a JSON object `{"<model>": <context window>}` giving the fake
+/// turns per-model windows, so a real-binary PTY probe can exercise the
+/// context meter and compaction thresholds per model (973-context-meter).
+/// Models it does not name keep the honest unknown window.
+const FAKE_CONTEXT_WINDOWS_ENV: &str = "HAIDER_TEST_FAKE_CONTEXT_WINDOWS";
 const READY_DELAY_ENV: &str = "HAIDER_TEST_READY_DELAY_MS";
 const DISABLE_ENDPOINT_RECOVERY_ENV: &str = "HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY";
 const DISABLE_DEGRADED_IDLE_REAP_ENV: &str = "HAIDER_TEST_DISABLE_DEGRADED_IDLE_REAP";
@@ -168,6 +174,13 @@ fn prepare_dispatch() -> Result<Option<ParsedArgs>, ExitCode> {
         println!("haiderd {}", env!("CARGO_PKG_VERSION"));
         return Ok(None);
     }
+    // The daemon re-executes itself as its computer-use presence overlay (a
+    // UI process that needs the real main thread); it never starts a daemon.
+    if matches!(args.as_slice(), [argument] if argument == haider_tools::presence::PRESENCE_HELPER_ARG)
+    {
+        let status = haider_tools::presence::run_presence_overlay_helper();
+        return Err(ExitCode::from(u8::try_from(status).unwrap_or(EX_SOFTWARE)));
+    }
     if matches!(args.as_slice(), [argument] if argument == "--client-self-test")
         || matches!(args.as_slice(), [argument, flag, _] if argument == "--client-self-test" && flag == "--payload")
     {
@@ -278,7 +291,17 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
     let script = script
         .into_string()
         .map_err(|_| format!("{FAKE_PROVIDER_ENV} is not valid UTF-8"))?;
-    let fake = FakeFactory::from_script(&script)?;
+    let fake = FakeProviderRoutes::from_script(&script)?;
+    let context_windows = match std::env::var(FAKE_CONTEXT_WINDOWS_ENV) {
+        Ok(json) => serde_json::from_str::<std::collections::BTreeMap<String, u64>>(&json)
+            .map_err(|error| {
+                format!("{FAKE_CONTEXT_WINDOWS_ENV} is not a model→window map: {error}")
+            })?,
+        Err(std::env::VarError::NotPresent) => std::collections::BTreeMap::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{FAKE_CONTEXT_WINDOWS_ENV} is not valid UTF-8"));
+        }
+    };
     eprintln!("haiderd: TEST MODE — every turn resolves to the injected fake provider");
     // Every turn resolves to the fake regardless of what the session was
     // created with, so the creatable set includes the release default too:
@@ -291,7 +314,10 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
     providers.insert("fake".to_owned());
     Ok(DaemonDependencies {
         provider_factory: ProviderFactoryConfig::Injected {
-            factory: Arc::new(fake),
+            factory: Arc::new(FakeFactory {
+                routes: fake,
+                context_windows,
+            }),
             providers,
         },
         ..DaemonDependencies::default()
@@ -300,12 +326,12 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
 
 /// The injected factory: one deterministic provider for every turn, or one
 /// per session model when the script is a `by_model` map.
-enum FakeFactory {
+enum FakeProviderRoutes {
     Single(Arc<FakeProvider>),
     ByModel(HashMap<String, Arc<FakeProvider>>),
 }
 
-impl FakeFactory {
+impl FakeProviderRoutes {
     fn from_script(script: &str) -> Result<Self, String> {
         let parsed: serde_json::Value = serde_json::from_str(script)
             .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not JSON: {error}"))?;
@@ -341,21 +367,28 @@ impl FakeFactory {
     }
 }
 
+struct FakeFactory {
+    routes: FakeProviderRoutes,
+    context_windows: std::collections::BTreeMap<String, u64>,
+}
+
 #[async_trait::async_trait]
 impl ProviderFactory for FakeFactory {
     async fn resolve_for_turn(
         &self,
         metadata: &SessionMetadataV1,
     ) -> Result<ResolvedTurnProvider, HaiderError> {
-        let fake = match self {
-            Self::Single(fake) => Arc::clone(fake),
-            Self::ByModel(models) => models.get(&metadata.model).cloned().ok_or_else(|| {
-                HaiderError::new(
-                    haider_protocol::error::ErrorCode::InvalidArgument,
-                    format!("test fake script has no route for model {}", metadata.model),
-                    false,
-                )
-            })?,
+        let fake = match &self.routes {
+            FakeProviderRoutes::Single(fake) => Arc::clone(fake),
+            FakeProviderRoutes::ByModel(models) => {
+                models.get(&metadata.model).cloned().ok_or_else(|| {
+                    HaiderError::new(
+                        haider_protocol::error::ErrorCode::InvalidArgument,
+                        format!("test fake script has no route for model {}", metadata.model),
+                        false,
+                    )
+                })?
+            }
         };
         Ok(ResolvedTurnProvider {
             provider: fake,
@@ -365,7 +398,7 @@ impl ProviderFactory for FakeFactory {
             // the IMPLEMENTATION, not to rewrite the session.
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
-            context_window: None,
+            context_window: self.context_windows.get(&metadata.model).copied(),
             account_alias: None,
             account_incarnation: None,
             active_no_auth: false,

@@ -216,6 +216,10 @@ fn consecutive_persists_schedule_at_most_one_sweep_per_count_window() {
     let store = Store::open(root.path()).expect("store");
     let session_id = SessionId::new("provider-view-count-window");
     create_session(&store, &session_id);
+    // Expiry is clamped monotone per session, so the already-expired
+    // sentinels live in their own session.
+    let sentinel_session = SessionId::new("provider-view-count-window-sentinels");
+    create_session(&store, &sentinel_session);
 
     for _ in 1..PROVIDER_VIEW_SWEEP_PERSIST_INTERVAL {
         let (ledger, blobs) = provider_view("warmup");
@@ -227,7 +231,7 @@ fn consecutive_persists_schedule_at_most_one_sweep_per_count_window() {
     for _ in 0..PROVIDER_VIEW_SWEEP_PERSIST_INTERVAL {
         let (expired_ledger, expired_blobs) = provider_view("expired-sentinel");
         store
-            .persist_provider_view_until(&session_id, expired_ledger, expired_blobs, 0)
+            .persist_provider_view_until(&sentinel_session, expired_ledger, expired_blobs, 0)
             .expect("persist expired sweep sentinel");
         let (ledger, blobs) = provider_view("counted-persist");
         store
@@ -310,4 +314,219 @@ fn due_sweep_expires_at_the_retention_boundary_and_rearms() {
         None,
         "a completed due sweep must not run again on the next persist"
     );
+}
+
+/// Seeds `sessions` unrelated live sessions directly in SQL. Each has one
+/// trunk of `history` blocks and `requests` leaves with one own block each,
+/// which is the shape a long-running session produces.
+fn seed_live_sessions(connection: &Connection, sessions: usize, requests: usize, history: usize) {
+    let far = 4_000_000_000_000_i64;
+    let mut unique = 0_u64;
+    let mut next_hash = || {
+        unique += 1;
+        format!("blake3:{unique:064x}")
+    };
+    let transaction = connection
+        .unchecked_transaction()
+        .expect("seed transaction");
+    for session in 0..sessions {
+        let session_id = format!("seeded-live-{session}");
+        transaction
+            .execute(
+                "INSERT INTO provider_view_history_segments(session_id) VALUES (?1)",
+                [&session_id],
+            )
+            .expect("trunk");
+        let trunk = transaction.last_insert_rowid();
+        for ordinal in 0..history {
+            transaction
+                .execute(
+                    "INSERT INTO provider_view_history_blocks(
+                        segment_id, block_ordinal, content_hash, byte_len
+                     ) VALUES (?1, ?2, ?3, 1)",
+                    params![trunk, ordinal as i64, next_hash()],
+                )
+                .expect("trunk block");
+        }
+        for request in 1..=requests {
+            transaction
+                .execute(
+                    "INSERT INTO provider_view_requests(
+                        session_id, request_ordinal, provider, model, cache_epoch, expires_at_ms
+                     ) VALUES (?1, ?2, 'p', 'm', 'c', ?3)",
+                    params![&session_id, request as i64, far],
+                )
+                .expect("request");
+            transaction
+                .execute(
+                    "INSERT INTO provider_view_history_segments(
+                        session_id, parent_segment_id, parent_block_count
+                     ) VALUES (?1, ?2, ?3)",
+                    params![&session_id, trunk, history as i64],
+                )
+                .expect("leaf");
+            let leaf = transaction.last_insert_rowid();
+            transaction
+                .execute(
+                    "INSERT INTO provider_view_history_blocks(
+                        segment_id, block_ordinal, content_hash, byte_len
+                     ) VALUES (?1, ?2, ?3, 1)",
+                    params![leaf, history as i64, next_hash()],
+                )
+                .expect("leaf block");
+            transaction
+                .execute(
+                    "INSERT INTO provider_view_request_history(
+                        session_id, request_ordinal, segment_id, block_count, history_digest
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        &session_id,
+                        request as i64,
+                        leaf,
+                        (history + 1) as i64,
+                        format!("{request:064x}")
+                    ],
+                )
+                .expect("request history");
+        }
+    }
+    transaction.commit().expect("seed commit");
+}
+
+/// SQLite VM operations (in units of 64) one full expiry sweep of a fixed
+/// expired session costs next to `unrelated` large live sessions.
+fn expiry_sweep_ops(unrelated: usize) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let root = tempfile::tempdir().expect("profile");
+    let session_id = SessionId::new("provider-view-expiring-session");
+    {
+        let store = Store::open(root.path()).expect("store");
+        create_session(&store, &session_id);
+        let mut texts = Vec::new();
+        for turn in 0..12 {
+            texts.push(format!("expiring-turn-{turn}"));
+            let history = texts
+                .iter()
+                .map(|text| ProviderViewBlobV1::new(text.clone().into_bytes()))
+                .collect::<Vec<_>>();
+            let (mut ledger, mut blobs) = provider_view("expiring");
+            ledger.history_blocks = history.iter().map(|blob| blob.block.clone()).collect();
+            blobs.truncate(2);
+            blobs.extend(history);
+            store
+                .persist_provider_view_until(&session_id, ledger, blobs, 10)
+                .expect("persist expiring view");
+        }
+    }
+    let provider_views = ProviderViewStore::open(root.path()).expect("provider-view store");
+    let mut connection = Connection::open(root.path().join("store.sqlite")).expect("database");
+    seed_live_sessions(&connection, unrelated, 40, 200);
+    let ops = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&ops);
+    connection
+        .progress_handler(
+            64,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )
+        .expect("install progress handler");
+    assert_eq!(
+        provider_views
+            .sweep_expired(&mut connection, 10)
+            .expect("sweep expiring session"),
+        12
+    );
+    connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .expect("remove progress handler");
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM provider_view_requests WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("remaining expiring requests");
+    assert_eq!(remaining, 0);
+    ops.load(Ordering::Relaxed)
+}
+
+/// Stage 4 defect 3: GC re-derived every live request's reachable history for
+/// each queued hash, so an expiry sweep cost O(queued x live x history) and
+/// could run inline before a persist.
+///
+/// MUTATION CHECK: compute liveness over every live request (the former
+/// `drain_gc` recursion) instead of the sessions owning the hash. Expected
+/// runtime failure: doubling the unrelated live store doubles the cost.
+#[test]
+fn expiry_sweep_cost_does_not_scale_with_unrelated_live_history() {
+    let small = expiry_sweep_ops(20);
+    let large = expiry_sweep_ops(40);
+    assert!(
+        large * 4 <= small * 5,
+        "sweep cost must not grow with unrelated live sessions: {small} -> {large}"
+    );
+}
+
+/// MUTATION CHECK: loop `maintenance_step` inside the due path or reset the
+/// schedule before the backlog is drained. Expected runtime failure: one
+/// persist-time call expires the whole backlog, or the remainder is postponed
+/// for a full sweep interval.
+#[test]
+fn due_sweep_runs_one_bounded_step_and_stays_due_until_drained() {
+    let root = tempfile::tempdir().expect("profile");
+    let session_id = SessionId::new("provider-view-bounded-due-sweep");
+    let backlog = PROVIDER_VIEW_SWEEP_REQUEST_BATCH + 40;
+    {
+        let store = Store::open(root.path()).expect("store");
+        create_session(&store, &session_id);
+        for index in 0..backlog {
+            let (ledger, blobs) = provider_view(&format!("backlog-{index}"));
+            store
+                .persist_provider_view_until(&session_id, ledger, blobs, 0)
+                .expect("persist expired backlog");
+        }
+    }
+    let provider_views = ProviderViewStore::open(root.path()).expect("provider-view store");
+    let mut connection = Connection::open(root.path().join("store.sqlite")).expect("database");
+    let due = Instant::now() + PROVIDER_VIEW_SWEEP_INTERVAL;
+    assert_eq!(
+        provider_views
+            .sweep_expired_if_due_at(&mut connection, due, 0)
+            .expect("first bounded step"),
+        Some(PROVIDER_VIEW_SWEEP_REQUEST_BATCH)
+    );
+    assert_eq!(
+        provider_views
+            .sweep_expired_if_due_at(&mut connection, due, 0)
+            .expect("continued step"),
+        Some(40)
+    );
+    assert_eq!(
+        provider_views
+            .sweep_expired_if_due_at(&mut connection, due, 0)
+            .expect("drained"),
+        None
+    );
+    let (requests, queued): (i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM provider_view_requests),
+                    (SELECT COUNT(*) FROM provider_view_gc)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("counts");
+    assert_eq!((requests, queued), (0, 0));
+    for index in [0, backlog - 1] {
+        let (ledger, _) = provider_view(&format!("backlog-{index}"));
+        let path = provider_views
+            .cas
+            .path_for(&ArtifactRef::new(
+                ledger.history_blocks[0].content_hash.clone(),
+            ))
+            .expect("CAS path");
+        assert!(!path.exists(), "expired unique block is reclaimed");
+    }
 }

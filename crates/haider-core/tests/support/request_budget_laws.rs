@@ -2,7 +2,9 @@
 // Included from runtime_tests to share its provider/dispatcher fixtures.
 use super::*;
 use haider_protocol::ceiling::{INTERNAL_CEILING_EXIT_CODE, InternalCeilingTerminalV1};
-use haider_protocol::request_budget::{RequestBudgetPhaseV1, RequestBudgetStatusV1};
+use haider_protocol::request_budget::{
+    RequestBudgetPhaseV1, RequestBudgetStatusV1, RequestBudgetV1,
+};
 
 fn statuses(events: &[RawEnvelope]) -> Vec<RequestBudgetStatusV1> {
     events
@@ -72,8 +74,10 @@ async fn hard_request_bound_preserves_typed_terminal_before_provider_rebind_refr
         hard_cap: 2,
     });
     let mut bounded = config();
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 2;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     bounded.ceiling_workspace = Some(workspace.path().into());
     bounded.provider_rebind_resolver = Some(resolver.clone());
     let provider = Arc::new(FakeProvider::new(rounds(3)));
@@ -118,8 +122,10 @@ async fn hard_request_bound_preserves_typed_terminal_before_provider_rebind_refr
 #[tokio::test]
 async fn soft_request_bound_is_once_typed_and_in_the_actual_model_request() {
     let mut bounded = config();
-    bounded.provider_request_tranche = 2;
-    bounded.max_provider_requests_per_turn = 5;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 2,
+        hard_cap: 5,
+    });
     let mut script = rounds(4);
     script.push(FakeStep::Finish {
         reason: FinishReason::EndTurn,
@@ -174,12 +180,15 @@ async fn soft_request_bound_is_once_typed_and_in_the_actual_model_request() {
 #[tokio::test]
 async fn hard_request_bound_restores_partial_text_and_tool_history_after_actor_restart() {
     let mut bounded = config();
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 2;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     let store = Arc::new(MemoryStore::new());
     let provider = Arc::new(FakeProvider::new(rounds(3)));
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         bounded,
@@ -283,8 +292,10 @@ impl haider_core::RetrySleeper for ImmediateRetrySleeper {
 #[tokio::test]
 async fn request_budget_ignores_transport_retries_at_the_soft_and_hard_bounds() {
     let mut bounded = config();
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 2;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     bounded.retry_sleeper = Arc::new(ImmediateRetrySleeper);
     let mut script = vec![FakeStep::Error {
         kind: ProviderErrorKind::Overloaded,
@@ -346,14 +357,13 @@ async fn request_budget_ignores_transport_retries_at_the_soft_and_hard_bounds() 
 }
 
 #[test]
-fn default_request_budget_covers_the_reported_fifty_three_round_workload() {
-    assert_eq!(config().provider_request_tranche, 32);
-    assert_eq!(config().max_provider_requests_per_turn, 64);
+fn default_request_budget_is_unbounded() {
+    assert_eq!(config().provider_request_budget, None);
 }
 
 #[tokio::test]
-async fn default_budget_completes_fifty_three_logical_requests() {
-    let mut script = rounds(52);
+async fn default_budget_completes_more_than_sixty_four_logical_requests() {
+    let mut script = rounds(64);
     script.push(FakeStep::Finish {
         reason: FinishReason::EndTurn,
     });
@@ -367,21 +377,15 @@ async fn default_budget_completes_fifty_three_logical_requests() {
     );
     let task = tokio::spawn(actor.run());
     let outcome = handle
-        .submit_turn(SubmitTurn::new("complete fifty-three rounds"))
+        .submit_turn(SubmitTurn::new("complete sixty-five rounds"))
         .await
         .expect("accept")
         .wait()
         .await
         .expect("outcome");
     assert_eq!(outcome.state, RunState::Done);
-    assert_eq!(provider.requests().len(), 53);
-    assert_eq!(
-        statuses(&store.events(&SessionId::new(SESSION)).await)
-            .iter()
-            .filter(|status| status.phase == RequestBudgetPhaseV1::SoftBound)
-            .count(),
-        1
-    );
+    assert_eq!(provider.requests().len(), 65);
+    assert!(statuses(&store.events(&SessionId::new(SESSION)).await).is_empty());
     drop(handle);
     task.await.expect("actor joins");
 }
@@ -389,8 +393,10 @@ async fn default_budget_completes_fifty_three_logical_requests() {
 #[tokio::test]
 async fn recovered_child_checkpoint_restores_budget_even_without_legacy_count() {
     let mut bounded = config();
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 4;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 4,
+    });
     let provider = Arc::new(FakeProvider::new(rounds(5)));
     let store = Arc::new(MemoryStore::new());
     let (actor, handle) = HarnessActor::new_with_dispatcher(
@@ -488,8 +494,10 @@ async fn capped_actor_seals_untouched_tree_and_exact_partial_progress_with_hidde
     )
     .expect("preexisting dirty workspace");
     let mut bounded = config();
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 2;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     bounded.ceiling_workspace = Some(workspace.path().into());
     let provider = Arc::new(FakeProvider::new(rounds(3)));
     let store = Arc::new(MemoryStore::new());
@@ -625,8 +633,10 @@ async fn capped_actor_recovery_uses_original_durable_tree_receipt_and_prior_tool
     std::fs::write(workspace.path().join("edited.txt"), "before").expect("existing file");
     std::fs::write(workspace.path().join("deleted.txt"), "remove").expect("deleted original");
     let mut bounded = config();
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 2;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     bounded.ceiling_workspace = Some(workspace.path().into());
     let store = Arc::new(MemoryStore::new());
     let (actor, handle) = HarnessActor::new_with_dispatcher(
@@ -799,6 +809,7 @@ async fn capped_actor_recovery_uses_original_durable_tree_receipt_and_prior_tool
     ]));
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let (recovered_actor, recovered) = HarnessActor::new_with_dispatcher(
         bounded,
@@ -895,8 +906,10 @@ async fn capped_actor_recovery_uses_original_durable_tree_receipt_and_prior_tool
 async fn capped_actor_counts_reused_provider_call_id_in_each_logical_request() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut bounded = config();
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 2;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     bounded.ceiling_workspace = Some(workspace.path().into());
     let mut script = rounds(2);
     for step in &mut script {
@@ -908,6 +921,7 @@ async fn capped_actor_counts_reused_provider_call_id_in_each_logical_request() {
     let store = Arc::new(MemoryStore::new());
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         bounded,
@@ -992,8 +1006,10 @@ impl ToolDispatcher for RemoveCeilingWorkspaceDispatcher {
 async fn capped_actor_preserves_typed_cap_and_progress_when_post_tree_is_unavailable() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut bounded = config();
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 1;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 1,
+    });
     bounded.ceiling_workspace = Some(workspace.path().into());
     let provider = Arc::new(FakeProvider::new(rounds(1)));
     let store = Arc::new(MemoryStore::new());
@@ -1055,8 +1071,10 @@ async fn unavailable_pre_turn_tree_allows_chat_and_preserves_cap_with_partial_pr
     let missing = workspace.path().join("missing-workspace");
     let mut bounded = config();
     bounded.ceiling_workspace = Some(missing);
-    bounded.provider_request_tranche = 1;
-    bounded.max_provider_requests_per_turn = 1;
+    bounded.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 1,
+    });
     let chat_provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitText {
             text: "chat still works".into(),

@@ -41,3 +41,13 @@ fn lockdown_passphrase_bytes_remain_frozen() {
         assert_eq!(redact_lockdown_text(&input), input);
     }
 }
+
+#[test]
+fn lockdown_label_bytes_remain_frozen_across_default_label_changes() {
+    assert_eq!(
+        redact_lockdown_text(
+            "eyJabcdefghijk.eyJabcdefghijk.abcdefghijkl\npassphrase=quartz-jumping-vexed-fibers\n"
+        ),
+        "[REDACTED:jwt]\n[REDACTED:high_entropy]\n"
+    );
+}

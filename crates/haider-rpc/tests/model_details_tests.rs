@@ -24,11 +24,11 @@ fn provider_summary_without_model_details_decodes_an_empty_vector() {
     assert!(summary.model_details.is_empty());
 }
 
-/// MUTATION CHECK: omit model details or their context windows during
+/// MUTATION CHECK: omit model details or their token limits during
 /// serialization. Expected runtime failure: the decoded summary differs from
 /// the provider-declared names and windows below.
 #[test]
-fn provider_summary_model_details_round_trip_names_and_windows() {
+fn provider_summary_model_details_round_trip_token_limits() {
     let summary = ProviderSummaryWire {
         provider: "openai".to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
@@ -39,9 +39,11 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
         models: vec!["frontier-a".to_owned(), "frontier-b".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "frontier-a".to_owned(),
                 display_name: Some("Frontier A".to_owned()),
                 context_window: Some(200_000),
+                max_output_tokens: Some(128_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -49,9 +51,11 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "frontier-b".to_owned(),
                 display_name: None,
                 context_window: None,
+                max_output_tokens: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -88,6 +92,29 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
     assert_eq!(decoded.model_details[0].context_window, Some(200_000));
     assert_eq!(decoded.model_details[1].name, "frontier-b");
     assert_eq!(decoded.model_details[1].context_window, None);
+}
+
+#[test]
+fn model_output_limit_error_data_round_trips_additively() {
+    let data = haider_rpc::ErrorData::ModelOutputLimit {
+        provider: "anthropic-oauth".into(),
+        model: "claude-fable-5-1".into(),
+        requested: 200_000,
+        max_output_tokens: 128_000,
+        context_window: Some(1_000_000),
+    };
+    let json = serde_json::to_value(&data).expect("serialize typed limit error");
+    assert_eq!(json["kind"], "model_output_limit");
+    assert_eq!(json["max_output_tokens"], 128_000);
+    assert!(matches!(
+        serde_json::from_value(json).expect("decode typed limit error"),
+        haider_rpc::ErrorData::ModelOutputLimit {
+            requested: 200_000,
+            max_output_tokens: 128_000,
+            context_window: Some(1_000_000),
+            ..
+        }
+    ));
 }
 
 /// MUTATION CHECK: require the additive response-open budget, omit a present
@@ -220,4 +247,42 @@ fn provenance_refresh_is_a_state_check_even_for_an_empty_successful_catalog() {
             state
         );
     }
+}
+
+#[test]
+fn static_model_source_preserves_membership_under_a_failed_fetch() {
+    let mut summary: haider_rpc::ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider":"anthropic-oauth", "api_family":"anthropic_messages", "models":["claude-fable-5-1"],
+        "model_details":[{"name":"claude-fable-5-1","source":"static","context_window":1000000}],
+        "inventory":{"state":"unavailable","reason":"403"}, "availability":"available", "enabled":true
+    })).expect("static provider summary");
+    assert!(summary.has_static_models());
+    assert_eq!(
+        summary.model_inventory_status("claude-fable-5-1"),
+        haider_rpc::ModelInventoryStatusWire::Listed
+    );
+    assert_eq!(
+        summary.model_inventory_status("invented"),
+        haider_rpc::ModelInventoryStatusWire::Unlisted
+    );
+    summary.model_details[0].source = None;
+    assert!(!summary.has_static_models());
+    assert_eq!(
+        summary.model_inventory_status("claude-fable-5-1"),
+        haider_rpc::ModelInventoryStatusWire::Unknown
+    );
+}
+
+#[test]
+fn future_model_source_decodes_without_losing_the_row() {
+    let detail: ModelDetailWire = serde_json::from_value(serde_json::json!({
+        "name": "future-model",
+        "source": "future_catalog"
+    }))
+    .expect("future row source decodes");
+    assert_eq!(detail.name, "future-model");
+    assert_eq!(
+        detail.source,
+        Some(haider_rpc::ModelDetailSourceWire::Unknown)
+    );
 }
