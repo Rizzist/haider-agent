@@ -17633,6 +17633,65 @@ fn persisted_configured_deployment_turns_share_the_selection_availability_rule()
     );
 }
 
+#[test]
+fn management_read_ages_configured_admission_without_rewriting_the_published_list() {
+    let mut summary = keyless_summary("work", "http://127.0.0.1:19373/v1");
+    summary.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    summary.configured_models = vec!["deployment".into()];
+    summary.models.clear();
+    summary.model_details.clear();
+    summary.default_model = None;
+    summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+    summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Authoritative;
+    summary.availability = ProviderAvailabilityWire::Unavailable;
+    summary.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "pending".into(),
+        account_alias: None,
+        account_incarnation: None,
+    });
+    summary.catalog_scope =
+        AccountsProviderFactory::descriptor_catalog_key(&summary, None).map(|key| {
+            haider_rpc::ProviderCatalogScopeWire {
+                key,
+                account_alias: None,
+                account_incarnation: None,
+            }
+        });
+    let management = ManagementSnapshot::new(7, Vec::new(), vec![summary]);
+    let view = management.read().expect("aged view");
+    assert_eq!(view.revision, 7);
+    assert!(view.providers[0].model_is_selectable("deployment"));
+    assert!(
+        crate::model_select::ModelSelectionAuthority::new(None, view.providers)
+            .validate_selection_with_status("work", None, "deployment")
+            .is_ok()
+    );
+    let factory = AccountsProviderFactory::new_with_management(
+        Arc::new(StdMutex::new(Vec::new())),
+        management.clone(),
+        VaultProvision::Unsupported,
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    assert!(
+        factory
+            .admit_persisted_model(&enterprise_metadata("work", "deployment"))
+            .is_ok()
+    );
+    assert!(
+        management
+            .inspect(|published| published.providers[0].models.is_empty())
+            .expect("raw snapshot")
+    );
+    let mut retired = management.read().expect("aged view").providers.remove(0);
+    retired.catalog_scope.as_mut().expect("producer scope").key = "retired-owner".into();
+    management.publish(8, Vec::new(), vec![retired]);
+    assert!(
+        factory
+            .admit_persisted_model(&enterprise_metadata("work", "deployment"))
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn pending_fetched_default_recovery_keeps_its_owner_and_drops_retired_owners() {
     for (model, retire, expected) in [

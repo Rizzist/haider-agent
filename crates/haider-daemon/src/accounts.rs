@@ -997,7 +997,7 @@ impl ManagementSnapshot {
             let mut view = view.clone();
             let now = unix_ms_after(Duration::ZERO);
             for provider in &mut view.providers {
-                provider.inventory = provider.inventory.clone().at_time(now);
+                provider.project_inventory_at_time(now, &view.descriptors);
             }
             view
         })

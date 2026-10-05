@@ -6,6 +6,112 @@ use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire,
 };
 
+#[test]
+fn aging_projection_keeps_configured_ids_selectable_at_the_exact_boundary() {
+    for models in [vec!["other"], vec![]] {
+        for catalog in ["public", "authenticated", "custom", "adapter", "offline"] {
+            let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+                "provider": "work", "api_family": "openai_chat_completions",
+                "endpoint": "http://127.0.0.1:19373/v1", "enabled": true,
+                "models": models, "configured_models": ["deployment"],
+                "catalog": catalog, "inventory_authority": "authoritative",
+                "inventory": {"state":"fetched", "fetched_at_ms":100},
+                "availability": if models.is_empty() { "unavailable" } else { "available" }
+            }))
+            .expect("fresh negative listing");
+            summary.project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS - 1, &[]);
+            assert!(!summary.model_is_selectable("deployment"));
+            summary.project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[]);
+            assert!(
+                summary.model_is_selectable("deployment"),
+                "{catalog}: {summary:?}"
+            );
+            assert!(summary.models.contains(&"deployment".into()));
+            assert!(
+                summary.model_details.is_empty(),
+                "no fetched metadata invented"
+            );
+            assert!(
+                summary
+                    .selection_reason(None)
+                    .expect("stale reason")
+                    .contains("refresh")
+            );
+
+            let mut credential_missing = summary.clone();
+            credential_missing.inventory =
+                haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 100 };
+            credential_missing.auth_methods = vec![AuthMethod::ApiKey];
+            credential_missing.availability = ProviderAvailabilityWire::Unavailable;
+            credential_missing
+                .project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[]);
+            assert!(!credential_missing.model_is_selectable("deployment"));
+            let mut disabled = summary.clone();
+            disabled.enabled = false;
+            disabled.project_inventory_at_time(u64::MAX, &[]);
+            assert!(!disabled.model_is_selectable("deployment"));
+            let mut rejected = summary;
+            rejected.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+                reason: "authentication failed".into(),
+            };
+            rejected.availability = ProviderAvailabilityWire::Unavailable;
+            rejected.project_inventory_at_time(u64::MAX, &[]);
+            assert!(!rejected.model_is_selectable("deployment"));
+        }
+    }
+}
+
+#[test]
+fn aging_projection_preserves_account_health_evidence() {
+    use haider_protocol::credential::{
+        CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
+    };
+    for method in [AuthMethod::ApiKey, AuthMethod::OAuth] {
+        for (status, active, provider, ready) in [
+            (CredentialStatus::Ok, true, "work", true),
+            (
+                CredentialStatus::Limited { until_ms: u64::MAX },
+                true,
+                "work",
+                true,
+            ),
+            (CredentialStatus::Expired, true, "work", false),
+            (CredentialStatus::Revoked, true, "work", false),
+            (
+                CredentialStatus::NeedsAttention {
+                    reason: CredentialAttentionReason::SourceUnreadable,
+                },
+                true,
+                "work",
+                false,
+            ),
+            (CredentialStatus::Ok, false, "work", false),
+            (CredentialStatus::Ok, true, "other", false),
+        ] {
+            let descriptor: CredentialDescriptor = serde_json::from_value(serde_json::json!({
+                "alias":"synthetic", "provider":provider, "auth_method":method,
+                "identity":"synthetic", "status":status, "active":active
+            }))
+            .expect("metadata-only account");
+            let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+                "provider":"work", "api_family":"openai_chat_completions",
+                "endpoint":"http://127.0.0.1:19373/v1", "enabled":true,
+                "auth_methods":[method], "configured_models":["deployment"],
+                "inventory":{"state":"fetched", "fetched_at_ms":100},
+                "availability":"unavailable"
+            }))
+            .expect("fresh empty listing");
+            summary
+                .project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[descriptor]);
+            assert_eq!(
+                summary.model_is_selectable("deployment"),
+                ready,
+                "{method:?}: {status:?}, active={active}, provider={provider}"
+            );
+        }
+    }
+}
+
 /// MUTATION CHECK: remove `serde(default)` from
 /// `ProviderSummaryWire::model_details`. Expected runtime failure: decoding
 /// this old-daemon summary returns a missing-field error.

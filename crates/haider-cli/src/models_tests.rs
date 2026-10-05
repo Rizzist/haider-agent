@@ -168,3 +168,32 @@ fn cli_preserves_static_rows_when_subscription_catalog_returns_403() {
     assert_eq!(value["models"][0]["source"], "static");
     assert_eq!(value["models"][0]["context_window"], 1_000_000);
 }
+
+#[test]
+fn cli_projects_configured_rows_when_a_fresh_empty_list_ages_before_render() {
+    let summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider":"work", "api_family":"openai_chat_completions",
+        "endpoint":"http://127.0.0.1:19373/v1", "enabled":true,
+        "models":[], "configured_models":["deployment"],
+        "inventory":{"state":"fetched", "fetched_at_ms":100},
+        "inventory_authority":"authoritative", "availability":"unavailable"
+    }))
+    .expect("fresh empty list");
+    let fresh = provider_view(
+        summary.clone(),
+        &[],
+        100 + haider_rpc::MODEL_INVENTORY_TTL_MS - 1,
+    );
+    assert_eq!(fresh.availability, "unavailable");
+    assert!(fresh.models.is_empty());
+    let aged = provider_view(summary, &[], 100 + haider_rpc::MODEL_INVENTORY_TTL_MS);
+    assert_eq!(aged.availability, "available");
+    assert_eq!(aged.models.len(), 1);
+    assert_eq!(aged.models[0].model, "deployment");
+    assert!(aged.models[0].context_window.is_none());
+    assert!(
+        aged.availability_reason
+            .expect("stale reason")
+            .contains("refresh")
+    );
+}

@@ -2821,6 +2821,40 @@ fn configured_availability_retains_stale_success_and_rejects_negative_evidence()
 }
 
 #[test]
+fn aged_snapshot_admits_configured_model_before_the_next_registry_publication() {
+    for models in [vec![discovered("other", true, None)], vec![]] {
+        let mut profile = removable_provider_profile_for_catalog_test();
+        profile.configured_models = vec!["deployment".into()];
+        // Exercise the authoritative membership veto as well as availability.
+        profile.provenance = ProviderProvenance::BuiltIn;
+        let registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            vec![profile],
+            model_source([("work", models)]),
+        )
+        .expect("registry");
+        let mut summary = registry.summary("work", &|_| true).expect("fresh summary");
+        summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 100 };
+        let fresh = crate::model_select::ModelSelectionAuthority::new(None, vec![summary.clone()]);
+        assert!(
+            fresh
+                .validate_selection_with_status("work", None, "deployment")
+                .is_err()
+        );
+        summary.project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[]);
+        let aged = crate::model_select::ModelSelectionAuthority::new(None, vec![summary]);
+        assert!(
+            aged.validate_selection_with_status("work", None, "deployment")
+                .is_ok()
+        );
+        assert!(
+            aged.validate_selection_with_status("work", None, "unconfigured")
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
     for provider in [
         "work",

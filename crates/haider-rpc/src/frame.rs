@@ -1576,6 +1576,49 @@ pub struct ProviderSummaryWire {
 }
 
 impl ProviderSummaryWire {
+    /// Age the entire projection, including configuration-owned IDs. A list
+    /// can expire between publication and read; admission must not wait for
+    /// the producer's next refresh tick to stop treating absence as proof.
+    pub fn project_inventory_at_time(
+        &mut self,
+        now_ms: u64,
+        descriptors: &[haider_protocol::credential::CredentialDescriptor],
+    ) {
+        let fetched = matches!(self.inventory, ModelInventoryWire::Fetched { .. });
+        self.inventory = self.inventory.clone().at_time(now_ms);
+        if !matches!(self.inventory, ModelInventoryWire::Stale { .. }) {
+            return;
+        }
+        for model in &self.configured_models {
+            if !self.models.contains(model) {
+                // Configuration supplies the ID, never fetched metadata.
+                self.models.push(model.clone());
+            }
+        }
+        let credential_ready = self.auth_methods.is_empty()
+            || descriptors.iter().any(|descriptor| {
+                descriptor.provider == self.provider
+                    && descriptor.active
+                    && matches!(
+                        &descriptor.status,
+                        haider_protocol::credential::CredentialStatus::Ok
+                            | haider_protocol::credential::CredentialStatus::Limited { .. }
+                    )
+            });
+        if fetched
+            && !self.configured_models.is_empty()
+            && self.enabled
+            && self.api_family != ProviderApiFamilyWire::Unknown
+            && self.endpoint.is_some()
+            && credential_ready
+        {
+            // Even an empty successful list becomes uncertainty. Credential
+            // rejection uses Unavailable inventory and cannot enter here.
+            self.availability = ProviderAvailabilityWire::Available;
+            self.availability_reason = None;
+        }
+    }
+
     /// Shared admission policy for every consumer of a catalog projection.
     /// Stale successful inventory remains selectable; a fresh list that omits
     /// an explicitly configured deployment is definite negative evidence.

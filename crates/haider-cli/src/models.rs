@@ -378,7 +378,7 @@ fn provider_view(
     now_ms: u64,
 ) -> ProviderView {
     let mut provider = provider;
-    provider.inventory = provider.inventory.at_time(now_ms);
+    provider.project_inventory_at_time(now_ms, descriptors);
     if !provider.has_known_models() {
         provider.models.clear();
         provider.model_details.clear();
