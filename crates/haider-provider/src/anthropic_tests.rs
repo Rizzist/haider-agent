@@ -3575,10 +3575,11 @@ async fn binding_stream_case(case: &str, fallback_status: u16, fallback_body: &s
     let server = tokio::spawn(async move {
         let mut policies = Vec::new();
         for ordinal in 0..4 {
-            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("physical request missing")
-                .expect("accept");
+            let (mut socket, _) =
+                tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, listener.accept())
+                    .await
+                    .expect("physical request missing")
+                    .expect("accept");
             let (headers, payload) = read_http_request(&mut socket).await;
             let policy = payload.pointer("/thinking/block_binding").is_some();
             let beta = headers
@@ -4283,7 +4284,8 @@ async fn fixed_error_fake(
 
     let mut policies = Vec::new();
     for _ in 0..requests {
-        let Ok(accepted) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+        let Ok(accepted) =
+            tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, listener.accept()).await
         else {
             break;
         };
