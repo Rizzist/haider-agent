@@ -98,3 +98,6 @@ lock-shared-owners-coexist-and-fence-writers-until-the-last-owner-releases	linux
 lock-closing-a-forked-shared-guard-cannot-unlock-the-live-parent	linux	haider-platform	lib	closing_a_forked_shared_guard_cannot_unlock_the_live_parent	crates/haider-platform/src/file_lock_tests.rs
 lock-file-lock-fences-another-opener-until-unlock-or-close	linux	haider-platform	lib	file_lock_fences_another_opener_until_unlock_or_close	crates/haider-platform/src/file_lock_tests.rs
 lock-parent-exit-liveness	linux	haider-cli	test:autospawn_tests	parent_exit_leaves_the_daemon_running	crates/haider-cli/tests/autospawn_tests.rs
+lock-owned-observer-teardown-confirmed	linux	haider-tools	lib	exit_observer_failure_sweeps_the_owned_process_group	crates/haider-tools/src/process.rs
+lock-background-observer-teardown-confirmed	linux	haider-tools	lib	exit_observer_failure_sweeps_the_background_process_group	crates/haider-tools/src/tasks.rs
+lock-content-budget-watchdog	linux	haider-tools	lib	observed_length_content_budget_is_explicitly_elided	crates/haider-tools/src/workspace_receipt_tests.rs

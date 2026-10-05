@@ -1098,6 +1098,27 @@ struct Supervisor {
 struct AbortProcessGroup {
     group: Option<ProcessGroup>,
 }
+
+#[cfg(all(test, unix))]
+#[allow(clippy::expect_used)]
+pub(crate) async fn assert_fixture_group_swept(group: ProcessGroup, pid: i32) {
+    // SIGKILL delivery and orphan reaping can finish after the supervisor has
+    // reaped its leader. Require actual kernel-observed death before releasing
+    // the fixture; a failed assertion still kills only this owned group.
+    let mut abort = AbortProcessGroup { group: Some(group) };
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    loop {
+        if !haider_platform::process_group_exists(group).expect("probe fixture process group") {
+            abort.group = None;
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture process group {pid} remains live after teardown"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 impl Drop for AbortProcessGroup {
     fn drop(&mut self) {
         if let Some(group) = self.group.take() {
@@ -2551,7 +2572,7 @@ mod supervisor_tests {
             "/usr/bin/perl -e '$SIG{TERM}=q(IGNORE); ",
             "open $started, q(>), q(observer-descendant-started.log); ",
             "print $started q(started); close $started; ",
-            "alarm 60; while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
+            "alarm 600; while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
             "open $survived, q(>), q(observer-descendant-survived.log); ",
             "print $survived q(survived); close $survived; sleep 30' & ",
             "while :; do :; done",
@@ -2627,15 +2648,12 @@ mod supervisor_tests {
         assert!(!leaked.load(Ordering::Acquire));
         assert!(!live.load(Ordering::Acquire));
         assert!(descendant_started.exists(), "owned descendant starts");
+        assert_fixture_group_swept(group, pid.as_raw_nonzero().get()).await;
         std::fs::write(workspace.path().join("release-descendant"), b"released")
             .expect("release descendant after teardown");
         assert!(
             !descendant_survived.exists(),
             "exit-observer failure detached instead of sweeping the group"
-        );
-        assert!(
-            !platform_group_exists(group, pid).expect("probe swept process group"),
-            "process group remains live after observer-failure teardown"
         );
     }
 }

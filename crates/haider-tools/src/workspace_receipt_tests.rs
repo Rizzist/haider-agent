@@ -228,7 +228,7 @@ fn observed_length_content_budget_is_explicitly_elided() {
     let reader = super::AnchoredWorkspaceReader::new(workspace.path()).expect("anchored reader");
     let mut builder = super::ReceiptBuilder::new(
         WorkspaceReceiptStrategy::RepositoryWalk,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT,
     );
 
     let reason = builder
