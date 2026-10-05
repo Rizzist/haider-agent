@@ -18106,6 +18106,7 @@ async fn startup_reconciles_legacy_defaults_against_only_active_hydrated_invento
             "unused",
             &std::collections::BTreeSet::new(),
             true,
+            None,
         )
         .await
         .expect("startup");
@@ -18500,6 +18501,7 @@ async fn startup_restores_catalog_rejection_only_for_the_exact_producer() {
             "unused",
             &std::collections::BTreeSet::new(),
             true,
+            None,
         )
         .await
         .expect("startup");

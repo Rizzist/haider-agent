@@ -2699,7 +2699,9 @@ pub enum ProviderFactoryConfig {
     /// Accounts-backed resolution with an injected provider constructor —
     /// the login→next-turn test seam.
     AccountsWith(Arc<dyn crate::accounts::AccountProviderBuilder>),
-    /// Fully injected factory plus its creatable-provider set.
+    /// Fully injected factory plus its creatable-provider set. The factory
+    /// owns credential and transport readiness for these registrations;
+    /// accounts-backed availability applies to `Accounts` / `AccountsWith`.
     Injected {
         factory: Arc<dyn ProviderFactory>,
         providers: BTreeSet<String>,

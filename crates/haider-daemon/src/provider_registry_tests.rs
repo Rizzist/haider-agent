@@ -29,6 +29,82 @@ fn discovered(slug: &str, visible: bool, priority: Option<i64>) -> DiscoveredMod
     discovered_with_context(slug, visible, priority, None)
 }
 
+#[test]
+fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
+    let names = std::collections::BTreeSet::from([
+        "fake".to_owned(),
+        "openai".to_owned(),
+        "anthropic".to_owned(),
+    ]);
+    let store: Arc<dyn ProviderRegistryStoreLike> = Arc::new(MemoryProviderStore::default());
+    let mut registry = ProviderRegistry::new(
+        store.clone(),
+        initial_provider_profiles(&names, "unused"),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("registry");
+    for provider in &names {
+        assert!(
+            !registry
+                .summary(provider, &|_| false)
+                .expect("accounts-backed summary")
+                .model_is_selectable("fixture-model")
+        );
+    }
+    let registered = std::collections::BTreeSet::from(["fake".to_owned(), "openai".to_owned()]);
+    registry = registry.with_injected_factory(&registered);
+    for provider in &registered {
+        let summary = registry
+            .summary(provider, &|_| false)
+            .expect("injected summary");
+        assert!(summary.model_is_selectable("fixture-model"));
+        assert!(summary.selection_reason(Some("fixture-model")).is_none());
+    }
+    assert!(
+        !registry
+            .summary("anthropic", &|_| false)
+            .expect("unregistered accounts-backed provider")
+            .model_is_selectable("fixture-model")
+    );
+    assert!(registry.summary("removed", &|_| true).is_none());
+
+    // A known provider's explicit disablement and fresh negative membership
+    // remain authoritative even when transport construction is injected.
+    registry
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.provider_id == "openai")
+        .expect("known profile")
+        .enabled = false;
+    let disabled = registry.summary("openai", &|_| false).expect("disabled");
+    assert!(!disabled.model_is_selectable("fixture-model"));
+    assert_eq!(
+        disabled.selection_reason(None).as_deref(),
+        Some("provider is disabled")
+    );
+    let mut fresh = registry.summary("fake", &|_| false).expect("fake");
+    fresh.configured_models = vec!["missing".into()];
+    fresh.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: u64::MAX,
+    };
+    assert!(!fresh.model_is_selectable("missing"));
+
+    let reloaded = ProviderRegistry::new(
+        store,
+        initial_provider_profiles(&names, "unused"),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("reload without injected registration");
+    for provider in &registered {
+        assert!(
+            !reloaded
+                .summary(provider, &|_| false)
+                .expect("production summary")
+                .model_is_selectable("fixture-model")
+        );
+    }
+}
+
 fn discovered_with_context(
     slug: &str,
     visible: bool,

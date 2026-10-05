@@ -13956,6 +13956,7 @@ impl AccountsRuntime {
         default_model: &str,
         provider_names: &std::collections::BTreeSet<String>,
         discovery_disabled: bool,
+        injected_provider_names: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<Self, HaiderError> {
         let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
         let descriptor_store: Box<dyn StoreLike> = match &dependencies.descriptor_store {
@@ -14058,6 +14059,9 @@ impl AccountsRuntime {
             initial_provider_profiles(provider_names, default_model),
             model_source.clone(),
         )?;
+        if let Some(names) = injected_provider_names {
+            providers = providers.with_injected_factory(names);
+        }
         let mut startup_catalog_discoveries = HashSet::new();
         // R10: every daemon vault consumer funnels through this ONE wrap.
         // Global aliases are the descriptor coordinate, but the Keychain is

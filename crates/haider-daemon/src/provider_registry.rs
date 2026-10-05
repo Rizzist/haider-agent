@@ -632,6 +632,7 @@ pub(crate) struct ProviderRegistry<S> {
     profiles: Vec<ProviderProfileV1>,
     model_source: Arc<dyn ProviderModelSourceLike>,
     resilience: ProviderResilienceConfigV1,
+    injected_providers: std::collections::BTreeSet<String>,
 }
 
 impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
@@ -711,7 +712,19 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             profiles,
             model_source,
             resilience,
+            injected_providers: std::collections::BTreeSet::new(),
         })
+    }
+
+    /// A fully injected factory owns its credentials and transport. Its
+    /// explicit registrations supply availability instead of account health;
+    /// this runtime-only authority must never enter the durable profiles.
+    pub(crate) fn with_injected_factory(
+        mut self,
+        providers: &std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.injected_providers = providers.clone();
+        self
     }
 
     pub(crate) fn get(&self, provider: &str) -> Option<&ProviderProfileV1> {
@@ -1590,6 +1603,14 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 summary.availability = ProviderAvailabilityWire::Unavailable;
                 summary.availability_reason = Some("provider has no credential".to_owned());
             }
+        }
+        if self.injected_providers.contains(&profile.provider_id) {
+            // Unknown profiles are disabled placeholders until an adapter
+            // registers them. Explicit disablement of a known profile still
+            // wins, as does model membership in the shared selection rule.
+            summary.enabled |= profile.provenance == ProviderProvenance::Unknown;
+            summary.availability = ProviderAvailabilityWire::Available;
+            summary.availability_reason = None;
         }
         summary.availability = summary.selection_availability(None);
         summary.availability_reason = summary.selection_reason(None);
