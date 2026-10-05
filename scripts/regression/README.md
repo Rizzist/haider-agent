@@ -15,3 +15,6 @@ cleared by the candidate. An optional `--candidate-target` reuses a private
 worktree-local candidate library target. The script records source identities,
 commands, exit codes, binary hashes, and immutable replay journals, then deletes
 its own source/build/runtime scratch directory. It requires at least 6 GiB free.
+
+A separate candidate-open stage records normal startup metadata projections
+before comparing the complete journals and metadata around receipt replay.

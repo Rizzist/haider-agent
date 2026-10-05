@@ -272,6 +272,15 @@ fn main() {
             create_parent(&root.join("true-old-kept-pin"), true, false, true, false);
             child(&root.join("true-old-kept-pin"), false);
         }
+        "candidate-open" => {
+            for (name, _, _, _, _, _) in CASES {
+                haider_store::Store::open(&root.join(name)).unwrap();
+            }
+            haider_store::Store::open(&root.join("true-old-kept-pin")).unwrap();
+        }
+        "old-parent-open" => {
+            haider_store::Store::open(&root.join("old-created-parent")).unwrap();
+        }
         "old-parent-seed" => {
             let root = root.join("old-created-parent");
             std::fs::create_dir_all(root.join("work")).unwrap();
