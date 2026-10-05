@@ -12204,12 +12204,12 @@ impl AppModel {
         let snapshot_predates_model = self.meter_snapshot_before_switch.is_some()
             && self.projection.latest_footprint() == self.meter_snapshot_before_switch.as_ref();
         let snapshot_window_allowed = self.mode.fabricates_locally()
-            || (!identity.model_short.is_empty()
-                && !(snapshot_predates_model
-                    || !self.current_catalog_matches_session_route()
-                    || self
-                        .providers
-                        .model_listed(&identity.provider, &identity.model_short)));
+            || !(identity.model_short.is_empty()
+                || snapshot_predates_model
+                || !self.current_catalog_matches_session_route()
+                || self
+                    .providers
+                    .model_listed(&identity.provider, &identity.model_short));
         crate::context_meter::ContextMeter::resolve(
             self.projection.latest_footprint(),
             self.projection.context_tokens(),
