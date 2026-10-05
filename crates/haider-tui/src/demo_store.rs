@@ -78,6 +78,10 @@ use std::path::{Path, PathBuf};
 /// The state file's name — `demo-` prefixed on purpose (see module docs).
 pub const DEMO_STORE_FILE: &str = "demo-tui-state.json";
 
+// Reuse the v2 item extension carrier: released readers reject new EntryDto
+// variants, but retain unknown TurnItem extensions without losing the store.
+const WORKSPACE_RECEIPT_EXTENSION_KIND: &str = "haider.demo.workspace.v1";
+
 /// The on-disk format version. Checked as part of guard 1: any value
 /// outside [`SUPPORTED_VERSIONS`] (or its absence) rejects the whole file
 /// back to seeds — the demo store never guesses at a foreign format
@@ -412,9 +416,6 @@ pub enum EntryDto {
     Note {
         text: String,
     },
-    Workspace {
-        event: haider_protocol::workspace::WorkspaceEventPayload,
-    },
     Shell {
         cmd: String,
         out: String,
@@ -560,7 +561,12 @@ pub fn snapshot(model: &AppModel) -> StateDto {
 
 fn projection_to_dto(projection: &SessionProjection) -> ProjectionDto {
     ProjectionDto {
-        entries: projection.entries().iter().map(entry_to_dto).collect(),
+        entries: projection
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| entry_to_dto(entry, index))
+            .collect(),
         menu: projection.open_menu().cloned(),
         todos: projection.todos().map(|panel| TodosDto {
             item_id: panel.item_id.clone(),
@@ -572,7 +578,7 @@ fn projection_to_dto(projection: &SessionProjection) -> ProjectionDto {
     }
 }
 
-fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
+fn entry_to_dto(entry: &TranscriptEntry, index: usize) -> EntryDto {
     match entry {
         TranscriptEntry::User {
             text,
@@ -610,8 +616,17 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             spoken: block.spoken,
         },
         TranscriptEntry::Note { text } => EntryDto::Note { text: text.clone() },
-        TranscriptEntry::Workspace { event } => EntryDto::Workspace {
-            event: event.clone(),
+        TranscriptEntry::Workspace { event } => EntryDto::Item {
+            item_id: ItemId::new(format!("demo-workspace-receipt-{index}")),
+            item: TurnItem::Extension {
+                kind: WORKSPACE_RECEIPT_EXTENSION_KIND.into(),
+                data: serde_json::json!(event),
+            },
+            output_tail_b64: String::new(),
+            output_truncated: false,
+            output_decode_error: false,
+            tool_reason: None,
+            spoken: false,
         },
         TranscriptEntry::Refusal {
             provider,
@@ -867,6 +882,12 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             tool_reason,
             spoken,
         } => {
+            if let TurnItem::Extension { kind, data } = &item
+                && kind == WORKSPACE_RECEIPT_EXTENSION_KIND
+                && let Ok(event) = serde_json::from_value(data.clone())
+            {
+                return TranscriptEntry::Workspace { event };
+            }
             // A restored block is FINAL: no stream survives a restart, so
             // `streaming` is false and the fragment accumulator is empty
             // (the sim's reloaded entries render as finished rows).
@@ -893,7 +914,6 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             })
         }
         EntryDto::Note { text } => TranscriptEntry::Note { text },
-        EntryDto::Workspace { event } => TranscriptEntry::Workspace { event },
         EntryDto::Shell { cmd, out } => TranscriptEntry::Shell { cmd, out },
     }
 }

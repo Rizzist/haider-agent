@@ -62,10 +62,25 @@ fn workspace_notices_follow_the_render_context_in_plain_tui_and_demo_replay() {
         }
     }
     let id = model.active_session.clone().expect("session");
-    let dto: demo_store::StateDto = serde_json::from_value(
-        serde_json::to_value(demo_store::snapshot(&model)).expect("snapshot JSON"),
-    )
-    .expect("decode snapshot");
+    let wire = serde_json::to_value(demo_store::snapshot(&model)).expect("snapshot JSON");
+    let entries = wire["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|session| session["id"] == id.as_str())
+        .expect("active session")["projection"]["entries"]
+        .as_array()
+        .expect("entries");
+    // Released v2 readers strictly decode EntryDto. A workspace receipt
+    // must use the existing item/extension carrier, never a new row kind.
+    let receipt = entries
+        .iter()
+        .find(|entry| entry["item"]["data"]["type"] == "workspace_selected")
+        .expect("workspace receipt");
+    assert_eq!(receipt["kind"], "item");
+    assert_eq!(receipt["item"]["item"], "extension");
+    assert_eq!(receipt["item"]["data"]["path"], "C:/Users/alice/next");
+    let dto: demo_store::StateDto = serde_json::from_value(wire).expect("decode snapshot");
     let mut restored = AppModel::new();
     restored.display_homes = vec!["C:/Users/alice".into()];
     demo_store::hydrate(&mut restored, dto);
