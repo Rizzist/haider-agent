@@ -682,7 +682,6 @@ fn upgrade_budget_source_enrichment_preserves_legacy_default_classification() {
 /// have never been rebound. On provider changes, the current writer clears both.
 #[test]
 fn upgrade_cross_provider_pick_reconstructs_historical_creation_and_rebind_pins() {
-    use haider_store::SessionSelectModelCommand;
     for (variant, picks) in [
         (
             "same-provider",
@@ -725,35 +724,10 @@ fn upgrade_cross_provider_pick_reconstructs_historical_creation_and_rebind_pins(
                     .expect("rebind pin and endpoint");
             }
             for (index, &(provider, model)) in picks.iter().enumerate() {
-                store
-                    .select_session_model(&SessionSelectModelCommand {
-                        command_id: format!("old-pick-{index}"),
-                        request_digest: format!("old-pick-{index}"),
-                        request_json: "{}".into(),
-                        session_id: parent.session_id.clone(),
-                        worker_generation: store.worker_generation(),
-                        provider: provider.into(),
-                        model: model.into(),
-                        expected_pair: None,
-                        account_alias: None,
-                        output_budget: None,
-                        event_id: EventId::new(format!("old-pick-event-{index}")),
-                        device_id: DeviceId::new("test"),
-                    })
-                    .expect("model pick");
+                legacy_pick(&store, &parent.session_id, index, provider, model);
             }
-            // The journal contains the same pick, but the pre-upgrade writer kept
-            // a creation pin without a rebind id. Restore that historical fixture.
+            // Both the events and metadata above use the pre-upgrade rule.
             drop(store);
-            if !rebind {
-                rusqlite::Connection::open(root.path().join("store.sqlite"))
-                .expect("historical fixture")
-                .execute(
-                    "UPDATE sessions SET meta_json = json_set(meta_json, '$.account_alias', 'bed-b') WHERE id = ?1",
-                    [parent.session_id.as_str()],
-                )
-                .expect("old writer metadata");
-            }
             let store = Store::open(root.path()).expect("old writer reopened");
             let metadata = store
                 .session_metadata(&parent.session_id)
@@ -827,6 +801,534 @@ fn upgrade_cross_provider_pick_reconstructs_historical_creation_and_rebind_pins(
                     "{variant}, rebind={rebind}: changed {key}"
                 );
             }
+        }
+    }
+}
+
+/// Historical model picks had no pin-clear fields. Append that actual payload
+/// and project the old writer's rule, rather than generating a candidate clear
+/// event and merely restoring its metadata afterwards.
+fn legacy_pick(store: &Store, session: &SessionId, index: usize, provider: &str, model: &str) {
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    let mut metadata = store
+        .session_metadata(session)
+        .expect("metadata")
+        .expect("session");
+    if metadata.provider != provider {
+        if metadata.provider_rebind_id.is_some() {
+            metadata.account_alias = None;
+        }
+        metadata.provider_base_url = None;
+        metadata.provider_rebind_id = None;
+    }
+    metadata.provider = provider.into();
+    metadata.model = model.into();
+    let mut events = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(format!("old-pick-{session}-{index}")),
+        seq: 0,
+        session_id: session.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("test"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: json!({"type":"model_selected", "provider":provider, "model":model}).into(),
+    }];
+    store.append_worker(&mut events).expect("old pick event");
+    rusqlite::Connection::open(store.database_path())
+        .expect("historical fixture")
+        .execute(
+            "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+            rusqlite::params![
+                session.as_str(),
+                serde_json::to_string(&metadata).expect("metadata JSON")
+            ],
+        )
+        .expect("old writer metadata");
+}
+
+fn candidate_pick(store: &Store, session: &SessionId, index: usize, provider: &str, model: &str) {
+    store
+        .select_session_model(&haider_store::SessionSelectModelCommand {
+            command_id: format!("candidate-pick-{session}-{index}"),
+            request_digest: format!("candidate-pick-{session}-{index}"),
+            request_json: "{}".into(),
+            session_id: session.clone(),
+            worker_generation: store.worker_generation(),
+            provider: provider.into(),
+            model: model.into(),
+            expected_pair: None,
+            account_alias: None,
+            output_budget: None,
+            event_id: EventId::new(format!("candidate-picked-{session}-{index}")),
+            device_id: DeviceId::new("test"),
+        })
+        .expect("candidate pick");
+}
+
+fn legacy_descendant(store: &Store, parent: &SessionId, id: &str) -> (SessionCreateCommand, Value) {
+    let metadata = store
+        .session_metadata(parent)
+        .expect("metadata")
+        .expect("parent");
+    let mut old = old_body();
+    old["provider"] = json!(metadata.provider);
+    old["model"] = json!(metadata.model);
+    let mut child = create_command(id, &old);
+    child.provider = metadata.provider;
+    child.model = metadata.model;
+    store
+        .create_session(&child)
+        .expect("legacy ten-key descendant");
+    assert!(
+        replay(store, &child.command_id, &old)
+            .expect("exact old request")
+            .is_some()
+    );
+    let mut new = old;
+    new["max_tokens_source"] = Value::Null;
+    new["inheritance_parent_session_id"] = json!(parent);
+    new["inherited_account_alias"] = json!(metadata.account_alias);
+    new["inherited_provider_base_url"] = json!(metadata.provider_base_url);
+    new["inherited_provider_rebind_id"] = json!(metadata.provider_rebind_id);
+    (child, new)
+}
+
+fn assert_mixed_replay(store: &Store, child: &SessionCreateCommand, body: &Value) {
+    let journal = store
+        .journal_replay(&child.session_id)
+        .expect("child journal");
+    assert!(
+        replay(store, &child.command_id, body)
+            .expect("actual route replays")
+            .is_some()
+    );
+    for (key, value) in [
+        ("inherited_account_alias", json!("resurrected-pin")),
+        (
+            "inherited_provider_base_url",
+            json!("http://127.0.0.1:9009"),
+        ),
+        ("inherited_provider_rebind_id", json!("invented-witness")),
+        ("inheritance_parent_session_id", json!("invented-parent")),
+        ("provider", json!("openai")),
+        ("model", json!("changed-model")),
+        ("max_tokens", json!(8192)),
+    ] {
+        let mut changed = body.clone();
+        changed[key] = value;
+        assert!(
+            replay(store, &child.command_id, &changed).is_err(),
+            "changed {key}"
+        );
+    }
+    assert_eq!(
+        store
+            .journal_replay(&child.session_id)
+            .expect("unchanged journal"),
+        journal
+    );
+}
+
+fn mixed_creation_pin(roundtrip: bool, delegated: bool) {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let parent = create_command(
+        "mixed-parent",
+        &if delegated {
+            old_body()
+        } else {
+            json!({"parent":true})
+        },
+    );
+    if delegated {
+        let source = create_command("mixed-root", &json!({"parent":true}));
+        store
+            .create_session_with_configuration(
+                &source,
+                SessionInteractionModeV1::Interactive,
+                Some("resurrected-pin".into()),
+            )
+            .expect("delegation source pin");
+        let route = store
+            .session_metadata(&source.session_id)
+            .expect("source metadata")
+            .expect("source");
+        store
+            .create_session_with_workspace_configuration(
+                &parent,
+                SessionInteractionModeV1::Interactive,
+                None,
+                None,
+                Some(route),
+            )
+            .expect("inherited delegated creation pin");
+    } else {
+        store
+            .create_session_with_configuration(
+                &parent,
+                SessionInteractionModeV1::Interactive,
+                Some("resurrected-pin".into()),
+            )
+            .expect("initial creation pin");
+    }
+    // A genuine old event keeps the creation pin; the following candidate
+    // event records the clear. The descendant's old format distinguishes neither.
+    legacy_pick(
+        &store,
+        &parent.session_id,
+        0,
+        "bedrock",
+        "anthropic.claude-haiku-4-5",
+    );
+    candidate_pick(
+        &store,
+        &parent.session_id,
+        1,
+        "anthropic",
+        "claude-sonnet-5",
+    );
+    if roundtrip {
+        candidate_pick(
+            &store,
+            &parent.session_id,
+            2,
+            "bedrock",
+            "anthropic.claude-opus-5",
+        );
+    }
+    let (child, new) = legacy_descendant(&store, &parent.session_id, "mixed-child");
+    assert_eq!(new["inherited_account_alias"], Value::Null);
+    drop(store);
+    let store = Store::open(root.path()).expect("candidate restart");
+    if roundtrip {
+        // Opening the store backfills this optional index. Clear it after
+        // restart to exercise the fallback to each decoded event's evidence.
+        let changed = rusqlite::Connection::open(store.database_path()).expect("legacy index fixture")
+            .execute("UPDATE events SET payload_kind = NULL WHERE session_id = ?1 AND payload_kind = 'model_selected'",
+                [parent.session_id.as_str()]).expect("unindexed parent facts");
+        assert_eq!(changed, 3);
+    }
+    assert_mixed_replay(&store, &child, &new);
+}
+
+#[test]
+fn mixed_creation_pin_clear_before_legacy_child() {
+    mixed_creation_pin(false, false);
+}
+#[test]
+fn mixed_creation_pin_clear_roundtrip_before_legacy_child() {
+    mixed_creation_pin(true, false);
+}
+#[test]
+fn mixed_delegated_parent_creation_pin_clear_before_legacy_descendant() {
+    mixed_creation_pin(false, true);
+}
+
+fn mixed_fork_pin(metafork: bool) {
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::RunId;
+    use haider_protocol::session_fork::{
+        SessionMetaforkProposal, SessionMetaforkRemoval, SessionMetaforkReviewManifest,
+    };
+    use haider_protocol::{DeliveryMode, EventPayload};
+    use haider_store::{
+        SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit, TurnAcceptCommand,
+        TurnAcceptOutcome,
+    };
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = create_command("mixed-source", &json!({"source":true}));
+    store
+        .create_session_with_configuration(
+            &source,
+            SessionInteractionModeV1::Interactive,
+            Some("resurrected-pin".into()),
+        )
+        .expect("source creation pin without rebind witness");
+    let run = RunId::new("mixed-source-turn");
+    let TurnAcceptOutcome::Committed { envelopes, .. } = store
+        .accept_turn(&TurnAcceptCommand {
+            command_id: "mixed-source-turn".into(),
+            request_digest: "mixed-source-turn".into(),
+            request_json: "{}".into(),
+            session_id: source.session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "fork source prompt".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("mixed-queued"),
+            user_event_id: EventId::new("mixed-user"),
+            active_event_id: EventId::new("mixed-active"),
+            device_id: DeviceId::new("test"),
+        })
+        .expect("source turn")
+    else {
+        panic!("new turn commits");
+    };
+    let user_seq = envelopes
+        .iter()
+        .find(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone().into()),
+                Ok(EventPayload::UserMessage { .. })
+            )
+        })
+        .expect("user prompt coordinate")
+        .seq;
+    let (node, seq) = envelopes
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value(event.payload.clone().into()).ok()?
+            else {
+                return None;
+            };
+            Some((node.node, event.seq))
+        })
+        .expect("fork cutoff");
+    let mut done = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("mixed-done"),
+        seq: 0,
+        session_id: source.session_id.clone(),
+        branch_id: None,
+        run_id: Some(run),
+        agent_id: None,
+        device_id: DeviceId::new("test"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Done,
+        ))
+        .expect("done payload")
+        .into(),
+    }];
+    store.append_worker(&mut done).expect("finish source turn");
+    let mut command = SessionForkCommand {
+        command_id: "mixed-fork".into(),
+        request_digest: "mixed-fork".into(),
+        request_json: "{}".into(),
+        source_session_id: source.session_id.clone(),
+        session_id: SessionId::new("mixed-fork"),
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        fork_node_id: node,
+        fork_seq: seq,
+        name: None,
+        metafork: metafork.then(|| SessionMetaforkCommit {
+            description: "omit reviewed source prompt".into(),
+            model_proposal: SessionMetaforkProposal {
+                removals: vec![SessionMetaforkRemoval {
+                    from_seq: user_seq,
+                    through_seq: user_seq,
+                    reason: "omit source prompt".into(),
+                    preview: None,
+                    reviewed_events: Vec::new(),
+                }],
+            },
+            accepted_proposal_digest: String::new(),
+        }),
+        audit_event_id: EventId::new("mixed-fork-audit"),
+        device_id: DeviceId::new("test"),
+    };
+    if let Some(meta) = &mut command.metafork {
+        meta.accepted_proposal_digest = SessionMetaforkReviewManifest {
+            command_id: command.command_id.clone(),
+            source_session_id: command.source_session_id.clone(),
+            worker_generation: command.worker_generation,
+            source_branch_id: None,
+            fork_node_id: command.fork_node_id.clone(),
+            fork_seq: command.fork_seq,
+            name: None,
+            description: meta.description.clone(),
+            model_proposal: meta.model_proposal.clone(),
+        }
+        .digest()
+        .expect("accepted review digest");
+    }
+    let SessionForkOutcome::Committed { created, .. } = store.fork_session(&command).expect("fork")
+    else {
+        panic!("new fork commits");
+    };
+    assert_eq!(
+        created.metadata.account_alias.as_deref(),
+        Some("resurrected-pin")
+    );
+    assert_eq!(created.metadata.provider_rebind_id, None);
+    candidate_pick(
+        &store,
+        &created.session_id,
+        1,
+        "anthropic",
+        "claude-sonnet-5",
+    );
+    let (child, new) = legacy_descendant(&store, &created.session_id, "mixed-fork-child");
+    drop(store);
+    let store = Store::open(root.path()).expect("candidate restart");
+    assert_mixed_replay(&store, &child, &new);
+}
+
+#[test]
+fn mixed_fork_creation_pin_clear_before_legacy_descendant() {
+    mixed_fork_pin(false);
+}
+#[test]
+fn mixed_metafork_creation_pin_clear_before_legacy_descendant() {
+    mixed_fork_pin(true);
+}
+
+#[test]
+fn mixed_writer_cycles_preserve_each_child_cutoff_and_later_rebind() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let parent = create_command("cycles-parent", &json!({"parent":true}));
+    store
+        .create_session_with_configuration(
+            &parent,
+            SessionInteractionModeV1::Interactive,
+            Some("resurrected-pin".into()),
+        )
+        .expect("creation pin");
+    let mut children = Vec::new();
+    // The old-only A→B→A control must keep the initial pin at its exact cutoff.
+    legacy_pick(
+        &store,
+        &parent.session_id,
+        0,
+        "anthropic",
+        "claude-sonnet-5",
+    );
+    legacy_pick(
+        &store,
+        &parent.session_id,
+        1,
+        "bedrock",
+        "anthropic.claude-opus-5",
+    );
+    children.push(legacy_descendant(
+        &store,
+        &parent.session_id,
+        "cycles-old-child",
+    ));
+    for cycle in 0..3 {
+        candidate_pick(
+            &store,
+            &parent.session_id,
+            cycle * 4,
+            "anthropic",
+            "claude-sonnet-5",
+        );
+        candidate_pick(
+            &store,
+            &parent.session_id,
+            cycle * 4 + 1,
+            "anthropic",
+            "claude-haiku-4-5",
+        );
+        let metadata = store
+            .session_metadata(&parent.session_id)
+            .expect("metadata")
+            .expect("parent");
+        store
+            .commit_resolved_route(
+                &parent.session_id,
+                &metadata.provider,
+                &metadata.model,
+                metadata.selection_epoch.expect("epoch"),
+                None,
+                &DeviceId::new("test"),
+            )
+            .expect("route-only fact");
+        legacy_pick(
+            &store,
+            &parent.session_id,
+            cycle * 4 + 2,
+            "bedrock",
+            "anthropic.claude-opus-5",
+        );
+        children.push(legacy_descendant(
+            &store,
+            &parent.session_id,
+            &format!("cycles-child-{cycle}"),
+        ));
+    }
+    store
+        .rebind_session_provider(&SessionProviderRebindCommand {
+            command_id: "cycles-later-rebind".into(),
+            request_digest: "cycles-later-rebind".into(),
+            request_json: "{}".into(),
+            session_id: parent.session_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "bedrock".into(),
+            base_url: Some("http://127.0.0.1:8010".into()),
+            account: Some("later-pin".into()),
+            event_id: EventId::new("cycles-rebound"),
+            device_id: DeviceId::new("test"),
+        })
+        .expect("later explicit route");
+    children.push(legacy_descendant(
+        &store,
+        &parent.session_id,
+        "cycles-rebound-child",
+    ));
+    candidate_pick(
+        &store,
+        &parent.session_id,
+        99,
+        "anthropic",
+        "claude-sonnet-5",
+    );
+    children.push(legacy_descendant(
+        &store,
+        &parent.session_id,
+        "cycles-cleared-child",
+    ));
+    drop(store);
+    for _ in 0..2 {
+        let store = Store::open(root.path()).expect("candidate restart");
+        for (child, body) in &children {
+            let journal = store.journal_replay(&child.session_id).expect("journal");
+            assert!(
+                replay(&store, &child.command_id, body)
+                    .expect("exact historical cutoff")
+                    .is_some()
+            );
+            let mut wrong = body.clone();
+            wrong["inherited_account_alias"] = if body["inherited_account_alias"].is_null() {
+                json!("resurrected-pin")
+            } else {
+                Value::Null
+            };
+            assert!(
+                replay(&store, &child.command_id, &wrong).is_err(),
+                "no alternate alias accepted"
+            );
+            assert_eq!(
+                store.journal_replay(&child.session_id).expect("unchanged"),
+                journal
+            );
         }
     }
 }

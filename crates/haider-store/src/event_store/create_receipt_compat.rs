@@ -155,13 +155,15 @@ pub(super) fn legacy_delegated_create_matches(
         if let Some(rebound) = SessionProviderRebound::from_payload_value(&event.payload) {
             rebound.apply_to_metadata(&mut metadata);
         } else if let Some(selected) = ModelSelected::from_payload_value(&event.payload) {
+            // A downgraded writer can create a ten-key child receipt after
+            // newer parent events. Use each event's clear evidence, not the
+            // child's receipt schema, to reconstruct the parent route.
+            if selected.cleared_account_pin.is_some() {
+                metadata.account_alias = None;
+            }
             if metadata.provider != selected.provider {
-                // The ten-key receipt was written before route inheritance.
-                // All events before its child's Created cutoff therefore use
-                // the old daemon rule (v0.0.972 / 8ffc5866): creation pins
-                // survive a provider pick; rebind pins do not. Events record
-                // a payload schema version, not the writing daemon version.
-                // Newer receipt schemas never enter this reconstruction.
+                // Old picks without explicit clear semantics kept creation
+                // pins, but cleared pins introduced by a provider rebind.
                 if metadata.provider_rebind_id.is_some() {
                     metadata.account_alias = None;
                 }
