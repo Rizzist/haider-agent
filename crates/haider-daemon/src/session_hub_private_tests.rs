@@ -2739,6 +2739,8 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
     });
     let mut failure_provider = provider_summary("fake");
     failure_provider.models = vec!["fake-v1".into()];
+    // This working provider lets admission reach the injected scope-write failure.
+    failure_provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     failure_provider.default_model = Some("fake-v1".into());
     failure_hub
         .install_accounts(crate::accounts::AccountsFacade {

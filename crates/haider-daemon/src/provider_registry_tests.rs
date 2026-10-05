@@ -2132,7 +2132,13 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
         unavailable.availability,
         haider_rpc::ProviderAvailabilityWire::Available
     );
-    assert_eq!(unavailable.availability_reason, None);
+    assert!(
+        unavailable
+            .availability_reason
+            .as_deref()
+            .expect("visible transport uncertainty")
+            .contains("catalog transport failed")
+    );
     assert_eq!(
         unavailable.default_model.as_deref(),
         Some("deepseek-v4-flash")
