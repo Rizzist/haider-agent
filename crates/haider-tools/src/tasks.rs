@@ -1050,7 +1050,7 @@ mod supervisor_tests {
             .await
             .expect("spawn background process");
         let pid = spawn.pid;
-        let group = spawn.process_group;
+        let mut fixture_group = crate::process::FixtureProcessGroup::new(spawn.process_group);
         let (_kill, kill_signal) = task_kill_channel();
         let observer_started = descendant_started.clone();
         let exit_observation: BackgroundLeaderExitObservation = Box::pin(async move {
@@ -1093,7 +1093,7 @@ mod supervisor_tests {
             "observer failure was not preserved: {status:?}"
         );
         assert!(descendant_started.exists(), "owned descendant starts");
-        crate::process::assert_fixture_group_swept(group, pid).await;
+        fixture_group.assert_swept(pid).await;
         std::fs::write(workspace.path().join("release-descendant"), b"released")
             .expect("release descendant after teardown");
         assert!(

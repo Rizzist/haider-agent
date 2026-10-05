@@ -1099,31 +1099,37 @@ struct AbortProcessGroup {
     group: Option<ProcessGroup>,
 }
 
-#[cfg(all(test, unix))]
-#[allow(clippy::expect_used)]
-pub(crate) async fn assert_fixture_group_swept(group: ProcessGroup, pid: i32) {
-    // SIGKILL delivery and orphan reaping can finish after the supervisor has
-    // reaped its leader. Require actual kernel-observed death before releasing
-    // the fixture; a failed assertion still kills only this owned group.
-    let mut abort = AbortProcessGroup { group: Some(group) };
-    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
-    loop {
-        if !haider_platform::process_group_exists(group).expect("probe fixture process group") {
-            abort.group = None;
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "fixture process group {pid} remains live after teardown"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
 impl Drop for AbortProcessGroup {
     fn drop(&mut self) {
         if let Some(group) = self.group.take() {
             let _ = haider_platform::signal_process_group(group, Signal::KILL);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct FixtureProcessGroup(AbortProcessGroup);
+
+#[cfg(all(test, unix))]
+#[allow(clippy::expect_used)]
+impl FixtureProcessGroup {
+    pub(crate) fn new(group: ProcessGroup) -> Self {
+        Self(AbortProcessGroup { group: Some(group) })
+    }
+
+    pub(crate) async fn assert_swept(&mut self, pid: i32) {
+        // KILL delivery and orphan reaping can finish after leader reaping.
+        // Keep failure cleanup armed until actual kernel-observed group death.
+        let group = self.0.group.expect("owned fixture group");
+        let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+        while haider_platform::process_group_exists(group).expect("probe fixture process group") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture process group {pid} remains live after teardown"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.0.group = None;
     }
 }
 
@@ -2587,6 +2593,7 @@ mod supervisor_tests {
         let mut child = command.spawn().expect("spawn supervised process");
         let raw_pid = child.id().expect("child pid");
         let group = haider_platform::register_process_group(raw_pid).expect("register group");
+        let mut fixture_group = FixtureProcessGroup::new(group);
         let pid = i32::try_from(raw_pid)
             .ok()
             .and_then(Pid::from_raw)
@@ -2613,32 +2620,36 @@ mod supervisor_tests {
                 message: "descendant did not start before observer injection".into(),
             })
         });
-        let completion = supervise_process_with_exit_observation(
-            Supervisor {
-                child,
-                stdout,
-                stderr,
-                stdin,
-                pid,
-                group,
-                call_id: "observer-failure".into(),
-                effect: EffectId::new("effect-observer-failure"),
-                command_arg_digest: "blake3:test".into(),
-                workspace_revision: None,
-                cancel,
-                live: Arc::clone(&live),
-                leaked: Arc::clone(&leaked),
-                control_gate: Arc::new(StdMutex::new(())),
-                cas: Box::new(NoopCas),
-                output: Arc::new(NoopOutput),
-                bounds: ProcessBounds {
-                    kill_grace: Duration::from_millis(100),
-                    ..ProcessBounds::default()
+        let completion = tokio::time::timeout(
+            haider_platform::TEST_WAIT_TIMEOUT,
+            supervise_process_with_exit_observation(
+                Supervisor {
+                    child,
+                    stdout,
+                    stderr,
+                    stdin,
+                    pid,
+                    group,
+                    call_id: "observer-failure".into(),
+                    effect: EffectId::new("effect-observer-failure"),
+                    command_arg_digest: "blake3:test".into(),
+                    workspace_revision: None,
+                    cancel,
+                    live: Arc::clone(&live),
+                    leaked: Arc::clone(&leaked),
+                    control_gate: Arc::new(StdMutex::new(())),
+                    cas: Box::new(NoopCas),
+                    output: Arc::new(NoopOutput),
+                    bounds: ProcessBounds {
+                        kill_grace: Duration::from_millis(100),
+                        ..ProcessBounds::default()
+                    },
                 },
-            },
-            exit_observation,
+                exit_observation,
+            ),
         )
-        .await;
+        .await
+        .expect("observer-failure supervision remains bounded");
 
         let error = completion
             .result
@@ -2648,7 +2659,7 @@ mod supervisor_tests {
         assert!(!leaked.load(Ordering::Acquire));
         assert!(!live.load(Ordering::Acquire));
         assert!(descendant_started.exists(), "owned descendant starts");
-        assert_fixture_group_swept(group, pid.as_raw_nonzero().get()).await;
+        fixture_group.assert_swept(pid.as_raw_nonzero().get()).await;
         std::fs::write(workspace.path().join("release-descendant"), b"released")
             .expect("release descendant after teardown");
         assert!(
