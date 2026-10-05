@@ -492,6 +492,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
             promotion_models: std::collections::HashMap::from([(
@@ -514,6 +515,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
             promotion_models: std::collections::HashMap::new(),
@@ -536,6 +538,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
             promotion_models: std::collections::HashMap::new(),
