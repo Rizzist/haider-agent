@@ -68,11 +68,23 @@ fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
             summary.catalog,
             haider_rpc::ProviderCatalogKindWire::Adapter
         );
-        assert!(
-            crate::model_select::ModelSelectionAuthority::new(None, vec![summary])
-                .validate_selection_with_status(provider, None, "fixture-model")
-                .is_ok()
-        );
+        // Injection supplies transport availability, not permission to select
+        // an invented row from a catalog that already lists known models.
+        let model = summary
+            .models
+            .first()
+            .map_or("fixture-model", String::as_str)
+            .to_owned();
+        let has_known_models = summary.has_known_models();
+        let authority = crate::model_select::ModelSelectionAuthority::new(None, vec![summary]);
+        let selection = authority.validate_selection_with_status(provider, None, &model);
+        assert!(selection.is_ok(), "{provider}: {selection:?}");
+        if has_known_models {
+            assert!(matches!(
+                authority.validate_selection_with_status(provider, None, "fixture-model"),
+                Err(crate::model_select::SelectionRefusal::ModelUnknown { .. })
+            ));
+        }
     }
     assert!(
         !registry
