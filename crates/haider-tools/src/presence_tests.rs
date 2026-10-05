@@ -978,3 +978,169 @@ fn linux_stale_stop_never_reaches_a_later_generation() {
     router.posted(0);
     assert!(!router.on_action(0, "stop"));
 }
+
+fn apply_surface_labels(
+    commands: Vec<PresenceCommand>,
+    labels: &mut BTreeMap<PresenceSurface, String>,
+) {
+    for command in commands {
+        match command {
+            PresenceCommand::Show { surface, label } => {
+                labels.insert(surface, label);
+            }
+            PresenceCommand::Hide { surface, .. } => {
+                labels.remove(&surface);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn released_owners_never_keep_current_or_deferred_surface_labels() {
+    for surface in [
+        PresenceSurface::Screen,
+        PresenceSurface::Phone,
+        PresenceSurface::Browser,
+    ] {
+        let secondary = if surface == PresenceSurface::Phone {
+            PresenceSurface::Browser
+        } else {
+            PresenceSurface::Phone
+        };
+        for (a, b) in [
+            (Some("Amina"), Some("Bilal")),
+            (Some("Bilal"), Some("Amina")),
+            (None, Some("Bilal")),
+            (Some("same"), Some("same")),
+        ] {
+            for emoji in [false, true] {
+                for matured in [false, true] {
+                    for release in ["end", "cancel", "idle", "stop"] {
+                        let mut m = PresenceMachine::<String>::new(Duration::from_secs(1));
+                        let t = Instant::now();
+                        let mut labels = BTreeMap::new();
+                        let actor = |name: Option<&str>| {
+                            name.map(|name| PresenceActor {
+                                name: name.into(),
+                                emoji,
+                            })
+                        };
+                        for (key, name, ms) in [("a", a, 0), ("b", b, 10)] {
+                            apply_surface_labels(
+                                m.begin_action_as(
+                                    key.into(),
+                                    surface,
+                                    PresenceMark::Wait,
+                                    None,
+                                    t + Duration::from_millis(ms),
+                                    actor(name),
+                                )
+                                .unwrap()
+                                .1,
+                                &mut labels,
+                            );
+                        }
+                        if matured {
+                            apply_surface_labels(
+                                m.tick(t + Duration::from_millis(170)),
+                                &mut labels,
+                            );
+                        }
+                        match release {
+                            "end" | "cancel" => apply_surface_labels(
+                                m.end(
+                                    &"b".into(),
+                                    if release == "end" {
+                                        PresenceEndReason::RunEnded
+                                    } else {
+                                        PresenceEndReason::Cancelled
+                                    },
+                                ),
+                                &mut labels,
+                            ),
+                            "idle" => {
+                                m.finish_action(&"b".into(), t + Duration::from_millis(20));
+                                apply_surface_labels(
+                                    m.tick(t + Duration::from_secs(2)),
+                                    &mut labels,
+                                );
+                            }
+                            "stop" => {
+                                apply_surface_labels(
+                                    m.begin_action_as(
+                                        "b".into(),
+                                        secondary,
+                                        PresenceMark::Wait,
+                                        None,
+                                        t + Duration::from_millis(180),
+                                        actor(b),
+                                    )
+                                    .unwrap()
+                                    .1,
+                                    &mut labels,
+                                );
+                                apply_surface_labels(
+                                    m.stop_at(secondary, t + Duration::from_millis(190)).1,
+                                    &mut labels,
+                                );
+                            }
+                            _ => unreachable!(),
+                        }
+                        let expected = a.map_or_else(
+                            || surface.badge_label().to_owned(),
+                            |name| surface.actor_label(name, emoji),
+                        );
+                        assert_eq!(
+                            labels.get(&surface),
+                            Some(&expected),
+                            "{surface:?} {a:?}/{b:?} {release} matured={matured} emoji={emoji}"
+                        );
+                        assert_eq!(m.labels[&surface].owner, "a");
+                        apply_surface_labels(m.tick(t + Duration::from_secs(3)), &mut labels);
+                        assert_eq!(labels.get(&surface), Some(&expected));
+                        apply_surface_labels(
+                            m.end(&"a".into(), PresenceEndReason::RunEnded),
+                            &mut labels,
+                        );
+                        assert!(labels.is_empty());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn equal_named_new_lease_cannot_inherit_a_released_pending_generation() {
+    let t = Instant::now();
+    let surface = PresenceSurface::Screen;
+    let mut m = PresenceMachine::<String>::default();
+    let mut labels = BTreeMap::new();
+    for i in 0..20 {
+        apply_surface_labels(
+            m.begin_action_as(
+                "a".into(),
+                surface,
+                PresenceMark::Wait,
+                None,
+                t + Duration::from_millis(i * 20),
+                Some(PresenceActor {
+                    name: "same".into(),
+                    emoji: true,
+                }),
+            )
+            .unwrap()
+            .1,
+            &mut labels,
+        );
+        apply_surface_labels(
+            m.end(&"a".into(), PresenceEndReason::Cancelled),
+            &mut labels,
+        );
+        assert!(labels.is_empty());
+        assert!(m.pending_labels.is_empty());
+        apply_surface_labels(m.tick(t + Duration::from_millis(i * 20 + 200)), &mut labels);
+        assert!(labels.is_empty());
+    }
+}

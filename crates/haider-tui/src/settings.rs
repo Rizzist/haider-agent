@@ -130,6 +130,7 @@ pub struct SettingsStore {
     /// 973-activity-icons: the explicitly chosen activity display, mirrored
     /// into every write. `None` = never chosen.
     activity_icons: Option<haider_protocol::activity::ActivityDisplay>,
+    activity_icons_dirty: bool,
 }
 
 impl SettingsStore {
@@ -146,6 +147,7 @@ impl SettingsStore {
             last_saved_verbosity: None,
             tool_rows: BTreeMap::new(),
             activity_icons: None,
+            activity_icons_dirty: false,
         }
     }
 
@@ -163,22 +165,32 @@ impl SettingsStore {
     /// Seed the tracked choice (boot-time load) so other saves preserve it.
     pub fn set_activity_icons(&mut self, mode: Option<haider_protocol::activity::ActivityDisplay>) {
         self.activity_icons = mode;
+        self.activity_icons_dirty = false;
     }
 
-    /// Persist an `/icons` choice, carrying everything else.
+    /// Whether an explicit choice has not yet been durably written.
+    #[must_use]
+    pub const fn activity_icons_dirty(&self) -> bool {
+        self.activity_icons_dirty
+    }
+
+    /// Persist an explicit `/icons` choice, carrying everything else.
+    /// Reaffirming a choice writes again: a failed or externally replaced
+    /// settings path must never receive a cached success acknowledgment.
     pub fn save_activity_icons_if_changed(
         &mut self,
         theme: ThemeChoice,
         mode: haider_protocol::activity::ActivityDisplay,
-    ) {
-        if self.activity_icons == Some(mode) {
-            return;
-        }
+    ) -> bool {
         self.activity_icons = Some(mode);
+        self.activity_icons_dirty = true;
         if self.write_dto(theme, self.notifications) {
             self.last_saved = Some(theme);
             self.last_saved_notifications = Some(self.notifications);
             self.last_saved_verbosity = Some(self.verbosity);
+            true
+        } else {
+            false
         }
     }
 
@@ -408,7 +420,7 @@ impl SettingsStore {
         }
     }
 
-    fn write_dto(&self, theme: ThemeChoice, notifications: bool) -> bool {
+    fn write_dto(&mut self, theme: ThemeChoice, notifications: bool) -> bool {
         let dto = SettingsDto {
             version: SETTINGS_VERSION,
             theme: theme.name().to_owned(),
@@ -447,8 +459,12 @@ impl SettingsStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json.as_bytes())
+        let saved = std::fs::write(&tmp, json.as_bytes())
             .and_then(|()| std::fs::rename(&tmp, &self.path))
-            .is_ok()
+            .is_ok();
+        if saved {
+            self.activity_icons_dirty = false;
+        }
+        saved
     }
 }

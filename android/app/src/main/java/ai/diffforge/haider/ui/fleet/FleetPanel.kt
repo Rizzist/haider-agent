@@ -75,6 +75,7 @@ data class FleetEntry(
     val node: FleetNode,
     /** The snapshot's daemon-clock instant (activity decay reference). */
     val generatedAtMs: Long? = null,
+    val receivedAtElapsedMs: Long,
 )
 
 /** Pure selection over the panel's reads, so the list itself can be pinned. */
@@ -93,12 +94,15 @@ object FleetPanelModel {
         titles: Map<String, String?> = emptyMap(),
     ): List<FleetEntry> = panel.entries
         .mapNotNull { (sessionId, load) ->
-            (load as? FleetLoad.Snapshot)?.snapshot?.let { sessionId to it }
+            (load as? FleetLoad.Snapshot)?.let { sessionId to it }
         }
-        .flatMap { (sessionId, snapshot) ->
+        .flatMap { (sessionId, load) ->
+            val snapshot = load.snapshot
             FleetModel.flatten(snapshot.roots)
                 .filter { it.state.active }
-                .map { FleetEntry(sessionId, titles[sessionId], it, snapshot.generatedAtMs) }
+                .map {
+                    FleetEntry(sessionId, titles[sessionId], it, snapshot.generatedAtMs, load.receivedAtElapsedMs)
+                }
         }
 
     fun finished(panel: Map<String, FleetLoad>): Int = panel.values
@@ -188,10 +192,11 @@ fun FleetPanelContent(
     // 973-activity-icons: map the phone's clock onto the daemon's via the
     // snapshot instant, and recompose only at the next instant an icon can
     // change (hot-window / linger boundary) — no polling loop.
-    val receivedAt = remember(panel) { SystemClock.elapsedRealtime() }
     var tick by remember { mutableLongStateOf(0L) }
     val daemonNow: (FleetEntry) -> Long? = { entry ->
-        entry.generatedAtMs?.let { it + (SystemClock.elapsedRealtime() - receivedAt) }
+        entry.generatedAtMs?.let {
+            it + (SystemClock.elapsedRealtime() - entry.receivedAtElapsedMs).coerceAtLeast(0L)
+        }
     }
     val nextChange = entries.mapNotNull { entry ->
         val now = daemonNow(entry) ?: return@mapNotNull null

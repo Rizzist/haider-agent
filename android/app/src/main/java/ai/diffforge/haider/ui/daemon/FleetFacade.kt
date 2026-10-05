@@ -268,7 +268,11 @@ enum class FleetCompleteness { Bounded, Complete, Unknown }
 sealed interface FleetLoad {
     data object Unread : FleetLoad
     data object Loading : FleetLoad
-    data class Snapshot(val snapshot: FleetSnapshot) : FleetLoad
+    data class Snapshot(
+        val snapshot: FleetSnapshot,
+        /** Local monotonic receipt anchor; retained with this read, even while the panel is closed. */
+        val receivedAtElapsedMs: Long = android.os.SystemClock.elapsedRealtime(),
+    ) : FleetLoad
 
     /** The daemon does not offer `session_fleet_v1` (frame.rs:395). */
     data class Unavailable(val reason: String) : FleetLoad

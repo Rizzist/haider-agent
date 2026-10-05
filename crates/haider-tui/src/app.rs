@@ -5659,6 +5659,10 @@ pub struct AppModel {
     /// changes it and bumps the commit counter the runtime persists.
     pub activity_display: haider_protocol::activity::ActivityDisplay,
     pub activity_display_commits: u64,
+    /// Explicit intent, independent of the environment-resolved display.
+    pub activity_display_choice: Option<haider_protocol::activity::ActivityDisplay>,
+    /// Last attempted commit; failed saves stay dirty without retrying every frame.
+    pub activity_display_attempted_commits: u64,
     /// Model retention (owner 2026-08-15): bumped on every COMMITTED model
     /// pick so the runtime persists the pair and the next boot opens on it.
     pub model_commits: u64,
@@ -6148,6 +6152,8 @@ impl Default for AppModel {
             notification_commits: 0,
             activity_display: haider_protocol::activity::ActivityDisplay::Emoji,
             activity_display_commits: 0,
+            activity_display_choice: None,
+            activity_display_attempted_commits: 0,
             model_commits: 0,
             notification_run_state: None,
             background_notification_states: std::collections::HashMap::new(),
@@ -7159,11 +7165,10 @@ impl AppModel {
             D::Text => D::Off,
             D::Off => D::Emoji,
         });
-        if next != self.activity_display {
-            self.activity_display = next;
-            self.activity_display_commits += 1;
-        }
-        self.flash = Some(format!("· activity icons {}", next.name()));
+        self.activity_display = next;
+        self.activity_display_choice = Some(next);
+        self.activity_display_commits += 1;
+        self.flash = Some(format!("· activity icons {} (saving…)", next.name()));
         self.dirty = true;
     }
 

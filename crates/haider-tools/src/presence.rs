@@ -359,6 +359,7 @@ pub enum PresenceRefusal {
 /// of them stops the run and run end retires all of them.
 #[derive(Debug, Clone)]
 struct Lease {
+    generation: u64,
     /// Surface -> time of its latest activity.
     surfaces: BTreeMap<PresenceSurface, Instant>,
     /// Surface of the action most recently begun (what `finish` refreshes).
@@ -376,6 +377,14 @@ impl Lease {
     }
 }
 
+/// A displayed or deferred label belongs to one incarnation of a live lease.
+#[derive(Debug, Clone)]
+struct OwnedLabel<K> {
+    owner: K,
+    generation: u64,
+    text: String,
+}
+
 /// Session-scoped presence state. `K` identifies one run (the daemon uses
 /// `session/run`). The machine is pure: callers pass `now` and forward the
 /// returned commands to the matching surface renderer.
@@ -385,9 +394,9 @@ pub struct PresenceMachine<K: Ord + Clone> {
     shown: BTreeSet<PresenceSurface>,
     /// The badge label each shown surface currently displays, so a different
     /// actor taking over a shown surface re-labels it (973-activity-icons).
-    labels: BTreeMap<PresenceSurface, String>,
+    labels: BTreeMap<PresenceSurface, OwnedLabel<K>>,
     /// A relabel waits briefly so rapid actor alternation yields one Show.
-    pending_labels: BTreeMap<PresenceSurface, (String, Instant)>,
+    pending_labels: BTreeMap<PresenceSurface, (OwnedLabel<K>, Instant)>,
     idle_timeout: Duration,
     next_seq: u64,
 }
@@ -442,7 +451,8 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         if self.leases.get(&key).is_some_and(Lease::stopped) {
             return Err(PresenceRefusal::Stopped);
         }
-        let lease = self.leases.entry(key).or_insert_with(|| Lease {
+        let lease = self.leases.entry(key.clone()).or_insert_with(|| Lease {
+            generation: self.next_seq,
             surfaces: BTreeMap::new(),
             current: surface,
             actor: None,
@@ -460,21 +470,29 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             || surface.badge_label().to_owned(),
             |actor| surface.actor_label(&actor.name, actor.emoji),
         );
-        // First show, or a DIFFERENT actor now drives an already-shown
-        // surface: (re)issue Show so the badge names who is acting now.
+        let owned = OwnedLabel {
+            owner: key,
+            generation: lease.generation,
+            text: label.clone(),
+        };
         if self.shown.insert(surface) {
             self.pending_labels.remove(&surface);
-            self.labels.insert(surface, label.clone());
+            self.labels.insert(surface, owned);
             commands.push(PresenceCommand::Show { surface, label });
-        } else if self.labels.get(&surface) == Some(&label) {
-            self.pending_labels.remove(&surface);
         } else if self
-            .pending_labels
+            .labels
             .get(&surface)
-            .map(|(pending, _)| pending)
-            != Some(&label)
+            .is_some_and(|current| current.text == label)
         {
-            self.pending_labels.insert(surface, (label, now));
+            self.labels.insert(surface, owned);
+            self.pending_labels.remove(&surface);
+        } else if let Some((pending, _)) = self.pending_labels.get_mut(&surface)
+            && pending.text == label
+        {
+            // Equal text needs no new debounce, but its owner may have changed.
+            *pending = owned;
+        } else {
+            self.pending_labels.insert(surface, (owned, now));
         }
         let seq = self.next_seq;
         self.next_seq = if seq >= CONCEAL_ACK_SEQ_START - 1 {
@@ -551,9 +569,19 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             .collect();
         for (surface, label) in ready {
             self.pending_labels.remove(&surface);
-            if self.labels.get(&surface) != Some(&label) {
-                self.labels.insert(surface, label.clone());
-                commands.push(PresenceCommand::Show { surface, label });
+            if self.label_is_live(surface, &label) {
+                let changed = self
+                    .labels
+                    .get(&surface)
+                    .is_none_or(|current| current.text != label.text);
+                let text = label.text.clone();
+                self.labels.insert(surface, label);
+                if changed {
+                    commands.push(PresenceCommand::Show {
+                        surface,
+                        label: text,
+                    });
+                }
             }
         }
         commands
@@ -621,17 +649,56 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         surface: PresenceSurface,
         reason: PresenceEndReason,
     ) -> Vec<PresenceCommand> {
-        let still_used = self
+        let remaining = self
             .leases
-            .values()
-            .any(|lease| !lease.stopped() && lease.surfaces.contains_key(&surface));
-        if !still_used && self.shown.remove(&surface) {
+            .iter()
+            .filter(|(_, lease)| !lease.stopped() && lease.surfaces.contains_key(&surface))
+            .max_by_key(|(_, lease)| lease.surfaces[&surface]);
+        let Some((owner, lease)) = remaining else {
             self.labels.remove(&surface);
             self.pending_labels.remove(&surface);
-            vec![PresenceCommand::Hide { surface, reason }]
-        } else {
-            Vec::new()
+            return if self.shown.remove(&surface) {
+                vec![PresenceCommand::Hide { surface, reason }]
+            } else {
+                Vec::new()
+            };
+        };
+        let replacement = OwnedLabel {
+            owner: owner.clone(),
+            generation: lease.generation,
+            text: lease.actor.as_ref().map_or_else(
+                || surface.badge_label().to_owned(),
+                |actor| surface.actor_label(&actor.name, actor.emoji),
+            ),
+        };
+        if self
+            .pending_labels
+            .get(&surface)
+            .is_some_and(|(label, _)| !self.label_is_live(surface, label))
+        {
+            self.pending_labels.remove(&surface);
         }
+        if self
+            .labels
+            .get(&surface)
+            .is_some_and(|label| self.label_is_live(surface, label))
+        {
+            return Vec::new();
+        }
+        // An invalid current owner cannot remain visible for the debounce window.
+        // Rebind immediately to a live lease, keeping its badge on screen.
+        self.pending_labels.remove(&surface);
+        let label = replacement.text.clone();
+        self.labels.insert(surface, replacement);
+        vec![PresenceCommand::Show { surface, label }]
+    }
+
+    fn label_is_live(&self, surface: PresenceSurface, label: &OwnedLabel<K>) -> bool {
+        self.leases.get(&label.owner).is_some_and(|lease| {
+            lease.generation == label.generation
+                && !lease.stopped()
+                && lease.surfaces.contains_key(&surface)
+        })
     }
 }
 
