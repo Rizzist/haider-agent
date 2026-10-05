@@ -12877,6 +12877,11 @@ async fn append_payloads(
         )?;
         if bookkeeping {
             envelope.render.ui = false;
+            envelope.agent_id = store
+                .hub()
+                .delegation_for_child_session(store.session_id().clone())
+                .await?
+                .map(|record| record.agent_id);
         }
         envelopes.push(envelope);
     }
