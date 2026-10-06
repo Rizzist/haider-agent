@@ -68,23 +68,42 @@ fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
             summary.catalog,
             haider_rpc::ProviderCatalogKindWire::Adapter
         );
-        // Injection supplies transport availability, not permission to select
-        // an invented row from a catalog that already lists known models.
+        // Injection supplies transport availability. Membership still obeys
+        // the inventory's authoritative or advisory contract.
         let model = summary
             .models
             .first()
             .map_or("fixture-model", String::as_str)
             .to_owned();
         let has_known_models = summary.has_known_models();
+        let advisory =
+            summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory;
         let authority =
             crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]));
         let selection = authority.validate_selection_with_status(provider, None, &model);
         assert!(selection.is_ok(), "{provider}: {selection:?}");
         if has_known_models {
-            assert!(matches!(
-                authority.validate_selection_with_status(provider, None, "fixture-model"),
-                Err(crate::model_select::SelectionRefusal::ModelUnknown { .. })
-            ));
+            let unlisted = authority.validate_selection_with_status(
+                provider,
+                None,
+                "synthetic-unlisted-injected-regression-id",
+            );
+            if advisory {
+                assert_eq!(
+                    unlisted
+                        .expect("advisory inventory permits explicit unlisted ids")
+                        .inventory_status,
+                    haider_rpc::ModelInventoryStatusWire::Unlisted
+                );
+            } else {
+                assert!(
+                    matches!(
+                        unlisted,
+                        Err(crate::model_select::SelectionRefusal::ModelUnknown { .. })
+                    ),
+                    "{provider}: {unlisted:?}"
+                );
+            }
         }
     }
     assert!(
@@ -111,10 +130,22 @@ fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
     );
     let mut fresh = registry.summary("fake", &|_| false).expect("fake");
     fresh.configured_models = vec!["missing".into()];
+    fresh.models = vec!["listed".into()];
     fresh.inventory = haider_rpc::ModelInventoryWire::Fetched {
         fetched_at_ms: u64::MAX,
     };
+    fresh.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Authoritative;
     assert!(!fresh.model_is_selectable("missing"));
+    let authority = crate::model_select::ModelSelectionAuthority::new(None, Some(vec![fresh]));
+    assert!(authority.validate_selection("fake", None, "listed").is_ok());
+    assert!(matches!(
+        authority.validate_selection("fake", None, "missing"),
+        Err(crate::model_select::SelectionRefusal::ProviderUnavailable { .. })
+    ));
+    assert!(matches!(
+        authority.validate_selection("fake", None, "synthetic-unlisted-injected-regression-id"),
+        Err(crate::model_select::SelectionRefusal::ModelUnknown { .. })
+    ));
 
     let reloaded = ProviderRegistry::new(
         store,
