@@ -55,7 +55,7 @@ def main():
     records = {}
     supervised = env.get("HAIDER_OWNED_DISK_SUPERVISION") == "1"
 
-    def journal_snapshot(stage, before_startup=None):
+    def journal_snapshot(stage, before_preparation=None):
         journals = []
         for db in sorted((work / "profiles").glob("*/store.sqlite")):
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
@@ -66,12 +66,12 @@ def main():
             journals.append({"case": db.parent.name, "events": rows, "metadata": metadata})
         serialized = json.dumps(journals, indent=2, default=lambda v: {"sqlite_blob_hex": v.hex()})
         (evidence / (stage + "-journals.json")).write_text(serialized + "\n")
-        if before_startup is not None:
-            previous = json.loads(before_startup)
+        if before_preparation is not None:
+            previous = json.loads(before_preparation)
             current = json.loads(serialized)
             assert {row["case"]: row["events"] for row in previous} == {
                 row["case"]: row["events"] for row in current
-            }, "startup changed the journal"
+            }, "metadata preparation changed the journal"
             projections = [
                 {"case": old["case"], "before": old["metadata"], "after": new["metadata"]}
                 for old, new in zip(previous, current) if old["metadata"] != new["metadata"]
@@ -175,7 +175,7 @@ def main():
             "candidate": sha, "tree": tree, "old": BASE, "old_tree": base_tree,
             "results": rows, "passed": len(rows), "failed": 0, "binaries": binaries,
             "old_created_parent": old_parent,
-            "journals_unchanged_by_replay": True, "startup_projected_before_replay": True, "commands": records,
+            "journals_unchanged_by_replay": True, "metadata_prepared_before_replay": True, "commands": records,
         }, indent=2) + "\n")
         print("Real old-writer regression: 7/7 plus old-created parent, journals unchanged", flush=True)
     finally:

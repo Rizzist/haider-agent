@@ -255,6 +255,17 @@ fn replay(root: &std::path::Path, other_child: bool) -> bool {
     );
     good == Ok(true) && bad.is_err()
 }
+fn prepare_metadata(root: &std::path::Path) {
+    let store = haider_store::Store::open(root).unwrap();
+    // Pre-epoch metadata is projected lazily by this getter, not Store::open.
+    // Prepare it before measuring whether receipt preflight changes anything.
+    for id in ["mixed-parent", "mixed-child"] {
+        store
+            .session_metadata(&haider_protocol::ids::SessionId::new(id))
+            .unwrap()
+            .unwrap();
+    }
+}
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let stage = &args[1];
@@ -274,12 +285,12 @@ fn main() {
         }
         "candidate-open" => {
             for (name, _, _, _, _, _) in CASES {
-                haider_store::Store::open(&root.join(name)).unwrap();
+                prepare_metadata(&root.join(name));
             }
-            haider_store::Store::open(&root.join("true-old-kept-pin")).unwrap();
+            prepare_metadata(&root.join("true-old-kept-pin"));
         }
         "old-parent-open" => {
-            haider_store::Store::open(&root.join("old-created-parent")).unwrap();
+            prepare_metadata(&root.join("old-created-parent"));
         }
         "old-parent-seed" => {
             let root = root.join("old-created-parent");
