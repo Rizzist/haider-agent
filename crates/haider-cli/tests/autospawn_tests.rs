@@ -282,13 +282,10 @@ fn drain_capture<R: std::io::Read>(
 /// credentials. Include live descendants while the child exists and its process
 /// group after exit (fixtures can retain captured pipes beyond the direct child).
 fn capture_process_states(child_pid: u32) -> String {
-    let output = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,pgid=,stat="])
-        .output();
-    let Ok(output) = output else {
-        return "process-state query unavailable".into();
+    let text = match capture_process_rows() {
+        Ok(text) => text,
+        Err(error) => return format!("process-state query unavailable: {error}"),
     };
-    let text = String::from_utf8_lossy(&output.stdout);
     let rows: Vec<_> = text
         .lines()
         .filter_map(|line| {
@@ -322,6 +319,36 @@ fn capture_process_states(child_pid: u32) -> String {
     format!(
         "pid ppid pgid stat: [{states}] (reparented descendants outside this group may be absent)"
     )
+}
+
+#[cfg(target_os = "macos")]
+fn capture_process_rows() -> std::io::Result<String> {
+    let rows = haider_platform::macos_process_states()?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {} {} {}",
+                row.pid, row.parent_pid, row.group_id, row.status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_process_rows() -> std::io::Result<String> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,stat="])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "numeric ps query exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn output_with_timeout(command: &mut Command, waiting_for: &str) -> Output {
@@ -371,14 +398,35 @@ fn capture_timeout_identifies_the_retained_stream_and_child_state() {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::process::CommandExt as _;
+    let fixture = tempfile::tempdir().expect("retained-pipe fixture directory");
+    let descendant_path = fixture.path().join("descendant-pid");
     let mut child = Command::new("sh")
-        .args(["-c", "(sleep 60) &"])
+        .args([
+            "-c",
+            "(sleep 600) & printf '%s' \"$!\" > \"$1\"",
+            "retained-pipe-fixture",
+        ])
+        .arg(&descendant_path)
         .process_group(0)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn retained-pipe fixture");
     let pid = child.id();
+    struct FixtureGroup(Option<haider_platform::ProcessId>);
+    impl Drop for FixtureGroup {
+        fn drop(&mut self) {
+            if let Some(group) = self.0.take() {
+                let _ = haider_platform::signal_process_group_id(
+                    group,
+                    haider_platform::ProcessSignal::Kill,
+                );
+            }
+        }
+    }
+    let group = haider_platform::ProcessId::from_raw(i32::try_from(pid).expect("owned PID range"))
+        .expect("owned fixture process group");
+    let mut cleanup = FixtureGroup(Some(group));
     let reader_path = format!(
         "/dev/fd/{}",
         child.stdout.as_ref().expect("capture reader").as_raw_fd()
@@ -386,6 +434,10 @@ fn capture_timeout_identifies_the_retained_stream_and_child_state() {
     let reader_identity = std::fs::metadata(&reader_path).expect("live reader identity");
     // Reap first so the direct-child deadline is immaterial to this control.
     child.wait().expect("direct child exit");
+    let descendant_pid = std::fs::read_to_string(&descendant_path)
+        .expect("descendant PID receipt")
+        .parse::<u32>()
+        .expect("numeric descendant PID");
     let panic = std::panic::catch_unwind(|| {
         capture_child(
             child,
@@ -398,10 +450,9 @@ fn capture_timeout_identifies_the_retained_stream_and_child_state() {
     let reader_closed = std::fs::metadata(&reader_path).map_or(true, |current| {
         (current.dev(), current.ino()) != (reader_identity.dev(), reader_identity.ino())
     });
-    let group = haider_platform::ProcessId::from_raw(i32::try_from(pid).expect("owned PID range"))
-        .expect("owned fixture process group");
     haider_platform::signal_process_group_id(group, haider_platform::ProcessSignal::Kill)
         .expect("kill owned fixture group");
+    cleanup.0 = None;
     assert!(
         reader_closed,
         "timeout must close the reader while its writer is still alive"
@@ -410,6 +461,13 @@ fn capture_timeout_identifies_the_retained_stream_and_child_state() {
     assert!(message.contains("pending streams=[Stdout]"), "{message}");
     assert!(message.contains("exited="), "{message}");
     assert!(message.contains("pid ppid pgid stat"), "{message}");
+    assert!(
+        message.contains(&format!("[{descendant_pid} "))
+            || message.contains(&format!("; {descendant_pid} ")),
+        "receipt must identify the actual live pipe holder: {message}"
+    );
+    assert!(message.contains(&format!(" {pid} ")), "{message}");
+    assert!(!message.contains("retained-pipe-fixture"), "{message}");
 }
 
 #[test]

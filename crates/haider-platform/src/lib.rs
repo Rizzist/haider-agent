@@ -82,9 +82,9 @@ pub use local_date::{
     CivilDateError, CivilDateSample, civil_from_unix_days, sample_local_civil_date,
     sample_utc_civil_date, sample_with_offset,
 };
-#[cfg(target_os = "macos")]
-pub use process::process_group_contains_only_leader;
 pub use process::program_on_path;
+#[cfg(target_os = "macos")]
+pub use process::{MacosProcessState, macos_process_states, process_group_contains_only_leader};
 pub use process::{
     ProcessExitMonitor, ProcessGroup, ProcessId, ProcessSignal, abandon_process_group,
     allocator_pressure_relief, configure_background_process, configure_process_environment,

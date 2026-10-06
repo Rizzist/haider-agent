@@ -76,7 +76,7 @@ warm-projection-seed-share	macos	haider-daemon	lib	concurrent_warm_readers_share
 # Lock ownership and fixture readiness under parallel load (lane 973-file-lock-flake).
 lock-file-refresh-lease-release-does-not-wait-for-a-duplicated-descriptor	linux	haider-accounts	lib	file_refresh_lease_release_does_not_wait_for_a_duplicated_descriptor	crates/haider-accounts/src/file_vault_tests.rs
 lock-capture-waits-for-eof-from-both-descendant-streams	linux	haider-cli	test:autospawn_tests	capture_waits_for_eof_from_both_descendant_streams	crates/haider-cli/tests/autospawn_tests.rs
-lock-capture-timeout-identifies-the-retained-stream-and-child-state	linux	haider-cli	test:autospawn_tests	capture_timeout_identifies_the_retained_stream_and_child_state	crates/haider-cli/tests/autospawn_tests.rs
+lock-capture-timeout-identifies-the-retained-stream-and-child-state	all	haider-cli	test:autospawn_tests	capture_timeout_identifies_the_retained_stream_and_child_state	crates/haider-cli/tests/autospawn_tests.rs
 lock-parent-exit-liveness-assertion-rejects-a-stopped-daemon	linux	haider-cli	test:autospawn_tests	parent_exit_liveness_assertion_rejects_a_stopped_daemon	crates/haider-cli/tests/autospawn_tests.rs
 lock-stderr-capture-cancellation-closes-the-reader-while-the-writer-is-alive	linux	haider-cli	test:update_restart_tests	stderr_capture_cancellation_closes_the_reader_while_the_writer_is_alive	crates/haider-cli/tests/update_restart_tests.rs
 lock-parked-pointer-fixture-waits-for-stop-even-after-the-policy-ack-window	linux	haider-daemon	lib	parked_pointer_fixture_waits_for_stop_even_after_the_policy_ack_window	crates/haider-daemon/src/cu_presence_tests.rs
