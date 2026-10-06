@@ -286,6 +286,10 @@ fn capture_process_states(child_pid: u32) -> String {
         Ok(text) => text,
         Err(error) => return format!("process-state query unavailable: {error}"),
     };
+    numeric_process_receipt(child_pid, &text)
+}
+
+fn numeric_process_receipt(child_pid: u32, text: &str) -> String {
     let rows: Vec<_> = text
         .lines()
         .filter_map(|line| {
@@ -294,7 +298,7 @@ fn capture_process_states(child_pid: u32) -> String {
                 fields.first()?.parse::<u32>().ok()?,
                 fields.get(1)?.parse::<u32>().ok()?,
                 fields.get(2)?.parse::<u32>().ok()?,
-                line,
+                *fields.get(3)?,
             ))
         })
         .collect();
@@ -313,12 +317,25 @@ fn capture_process_states(child_pid: u32) -> String {
     let states = rows
         .iter()
         .filter(|(pid, _, _, _)| owned.contains(pid))
-        .map(|(_, _, _, row)| *row)
+        // ps pads numeric columns differently across Unix targets. Preserve
+        // the numeric identity and state, with one canonical separator.
+        .map(|(pid, parent, group, state)| format!("{pid} {parent} {group} {state}"))
         .collect::<Vec<_>>()
         .join("; ");
     format!(
         "pid ppid pgid stat: [{states}] (reparented descendants outside this group may be absent)"
     )
+}
+
+#[test]
+fn numeric_process_receipt_normalizes_columns_and_retains_owned_descendants() {
+    let text = "43\t42\t99\tS+\n  41   1   40   S\n42 41 99 R\n40 1 40 S\n\
+                401 1 400 R\n44 1 40\ninvalid 1 40 S\n45 invalid 40 S\n46 1 invalid S";
+    assert_eq!(
+        numeric_process_receipt(40, text),
+        "pid ppid pgid stat: [43 42 99 S+; 41 1 40 S; 42 41 99 R; 40 1 40 S] \
+         (reparented descendants outside this group may be absent)"
+    );
 }
 
 #[cfg(target_os = "macos")]
