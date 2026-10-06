@@ -1722,6 +1722,144 @@ fn picker_and_daemon_share_configured_availability_for_every_provider_kind() {
 }
 
 #[test]
+fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
+    for catalog in [
+        haider_rpc::ProviderCatalogKindWire::Custom,
+        haider_rpc::ProviderCatalogKindWire::Public,
+        haider_rpc::ProviderCatalogKindWire::Authenticated,
+        haider_rpc::ProviderCatalogKindWire::Offline,
+        haider_rpc::ProviderCatalogKindWire::Adapter,
+    ] {
+        for aged in [false, true] {
+            for other_listed in [false, true] {
+                for accounts_first in [false, true] {
+                    for (state, status, active) in [
+                        ("anonymous", None, false),
+                        ("ok", Some(CredentialStatus::Ok), true),
+                        (
+                            "limited",
+                            Some(CredentialStatus::Limited { until_ms: u64::MAX }),
+                            true,
+                        ),
+                        ("expired", Some(CredentialStatus::Expired), true),
+                        ("revoked", Some(CredentialStatus::Revoked), true),
+                        (
+                            "attention",
+                            Some(CredentialStatus::NeedsAttention {
+                                reason: haider_protocol::credential::CredentialAttentionReason::SourceUnreadable,
+                            }),
+                            true,
+                        ),
+                        ("inactive", Some(CredentialStatus::Ok), false),
+                        ("missing", None, true),
+                        ("foreign", Some(CredentialStatus::Ok), true),
+                    ] {
+                        let mut model = live_model();
+                        let mut driver = LiveDriver::new("tui-freshness-boundary");
+                        let listed = if other_listed {
+                            &["another-listed"][..]
+                        } else {
+                            &[][..]
+                        };
+                        let mut summary = provider_summary("custom", listed, "");
+                        summary.catalog = catalog;
+                        summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+                        summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+                        summary.configured_models = vec!["deployment".into()];
+                        summary.default_model = None;
+                        summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+                            fetched_at_ms: if aged { 1 } else { u64::MAX },
+                        };
+                        summary.inventory_authority =
+                            haider_rpc::ModelInventoryAuthorityWire::Authoritative;
+                        summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+                        summary.availability_reason =
+                            Some("deployment is absent from the latest model list".into());
+                        if state == "anonymous" {
+                            summary.auth_methods.clear();
+                        } else {
+                            summary.auth_methods = vec![AuthMethod::ApiKey];
+                            summary.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+                                key: "synthetic-producer-1".into(),
+                                account_alias: Some("work".into()),
+                                account_incarnation: Some(1),
+                            });
+                        }
+                        let descriptors = status
+                            .map(|status| {
+                                let provider = if state == "foreign" {
+                                    "elsewhere"
+                                } else {
+                                    "custom"
+                                };
+                                let mut descriptor = oauth_descriptor(provider, "work", active);
+                                descriptor.auth_method = AuthMethod::ApiKey;
+                                descriptor.incarnation = 1;
+                                descriptor.status = status;
+                                vec![descriptor]
+                            })
+                            .unwrap_or_default();
+                        let accounts = LiveReply::Accounts {
+                            descriptors,
+                            revision: Some(2),
+                            sources: vec![],
+                        };
+                        if accounts_first {
+                            pass(&mut driver, &mut model, accounts.clone());
+                        }
+                        pass(
+                            &mut driver,
+                            &mut model,
+                            LiveReply::Providers {
+                                providers: vec![summary],
+                                revision: 2,
+                            },
+                        );
+                        if !accounts_first {
+                            // Until the matching account arrives, an authenticated
+                            // unavailable row cannot acquire readiness from expiry.
+                            if state != "anonymous" {
+                                assert!(!model.providers.providers[0].model_is_selectable("deployment"));
+                            }
+                            pass(&mut driver, &mut model, accounts);
+                        }
+                        let expected = aged && matches!(state, "anonymous" | "ok" | "limited");
+                        let context = format!(
+                            "{catalog:?} aged={aged} other={other_listed} accounts_first={accounts_first} state={state}"
+                        );
+                        let summary = &model.providers.providers[0];
+                        assert_eq!(summary.model_is_selectable("deployment"), expected, "{context}");
+                        if expected {
+                            assert!(matches!(summary.inventory, haider_rpc::ModelInventoryWire::Stale { .. }), "{context}");
+                            assert!(summary.selection_reason(Some("deployment")).unwrap_or_default().contains("refresh"), "{context}");
+                            assert!(summary.model_details.iter().filter(|row| row.name == "deployment").all(|row| row.context_window.is_none() && row.max_output_tokens.is_none()), "{context}");
+                            let row = model.model_picker_rows().into_iter().find(|row| row.model == "deployment").expect("aged configuration is visible");
+                            assert!(row.available, "{context}");
+                        } else if let Some(row) = model.model_picker_rows().into_iter().find(|row| row.model == "deployment") {
+                            assert!(!row.available, "{context}");
+                        }
+                        if aged && matches!(state, "expired" | "revoked" | "attention") {
+                            // Readiness can recover before another provider reply.
+                            // Same-incarnation listing proof must survive the
+                            // unhealthy account reply in either arrival order.
+                            let mut descriptor = oauth_descriptor("custom", "work", true);
+                            descriptor.auth_method = AuthMethod::ApiKey;
+                            descriptor.incarnation = 1;
+                            pass(&mut driver, &mut model, LiveReply::Accounts {
+                                descriptors: vec![descriptor],
+                                revision: Some(3),
+                                sources: vec![],
+                            });
+                            assert!(model.providers.providers[0].model_is_selectable("deployment"), "recovered: {context}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn restored_private_preference_is_hidden_until_live_owner_is_proven() {
     for scope_known in [false, true] {
         let mut model = live_model();

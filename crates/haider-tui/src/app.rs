@@ -1152,17 +1152,28 @@ pub struct ProvidersState {
     focus_after_refresh: Option<String>,
 }
 
+fn provider_inventory_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// Normalize wire compatibility projections at the client snapshot boundary.
 /// Old flat rows cannot supply provenance or a default of their own.
 fn normalize_provider_inventory(
     mut summary: haider_rpc::ProviderSummaryWire,
 ) -> haider_rpc::ProviderSummaryWire {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        });
-    summary.inventory = summary.inventory.at_time(now);
+    // An available producer has already established credential readiness.
+    // Otherwise an authenticated negative needs its matching account reply
+    // before expiry can change availability; retain the original Fetched
+    // evidence until bootstrap supplies that proof.
+    if summary.auth_methods.is_empty()
+        || summary.availability == haider_rpc::ProviderAvailabilityWire::Available
+    {
+        summary.project_inventory_at_time_with_credential_ready(provider_inventory_now_ms(), true);
+    }
     if !summary.has_known_models() {
         summary.models.clear();
         summary.model_details.clear();
@@ -12061,6 +12072,29 @@ impl AppModel {
             });
     }
 
+    fn project_provider_inventories(&mut self) {
+        let now_ms = provider_inventory_now_ms();
+        for summary in &mut self.providers.providers {
+            let credential_ready = summary.auth_methods.is_empty()
+                || self.accounts.rows.iter().any(|row| {
+                    row.provider == summary.provider
+                        && row.selected
+                        && matches!(
+                            &row.status,
+                            haider_protocol::credential::CredentialStatus::Ok
+                                | haider_protocol::credential::CredentialStatus::Limited { .. }
+                        )
+                });
+            if !credential_ready {
+                // A later healthy account reply may establish readiness for
+                // this same producer. Keep its original listing timestamp
+                // rather than consuming the freshness transition first.
+                continue;
+            }
+            summary.project_inventory_at_time_with_credential_ready(now_ms, credential_ready);
+        }
+    }
+
     /// Retire stale catalogs independently of the global management revision.
     /// A newer provider reply can precede its account reply: hold it until
     /// that exact incarnation arrives, without exposing its rows as current.
@@ -12422,6 +12456,7 @@ impl AppModel {
     /// account or provider snapshot applies; demo never calls it.
     pub fn bootstrap_identity_from_daemon(&mut self) {
         self.fence_provider_catalogs();
+        self.project_provider_inventories();
         let current_scope = self
             .accounts
             .rows

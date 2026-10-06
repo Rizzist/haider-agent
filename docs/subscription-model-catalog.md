@@ -147,6 +147,10 @@ Staleness schedules background refresh with bounded backoff; it never blocks
 new sessions or turns of existing sessions. The daemon's admission, CLI, TUI
 picker and summaries use `ProviderSummaryWire::selection_availability` and its
 shared reason projection. A fresh empty list does not authorize configured rows.
+The TUI ages the complete projection through the same RPC policy, including
+configured IDs omitted by a fresh list. An authenticated unavailable snapshot
+retains its original listing evidence until the matching typed account view
+can supply credential readiness; either reply order is supported.
 Producer-scoped authentication rejection and unsupported-discovery evidence
 survive restart in an additive optional `catalog_evidence` map. A different
 producer cannot inherit it, and a fresh successful list clears it.

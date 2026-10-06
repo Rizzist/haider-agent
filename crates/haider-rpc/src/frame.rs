@@ -1584,6 +1584,27 @@ impl ProviderSummaryWire {
         now_ms: u64,
         descriptors: &[haider_protocol::credential::CredentialDescriptor],
     ) {
+        let credential_ready = self.auth_methods.is_empty()
+            || descriptors.iter().any(|descriptor| {
+                descriptor.provider == self.provider
+                    && descriptor.active
+                    && matches!(
+                        &descriptor.status,
+                        haider_protocol::credential::CredentialStatus::Ok
+                            | haider_protocol::credential::CredentialStatus::Limited { .. }
+                    )
+            });
+        self.project_inventory_at_time_with_credential_ready(now_ms, credential_ready);
+    }
+
+    /// Clients with a typed account projection supply the same readiness
+    /// proof without reconstructing transport descriptors. Aging and model
+    /// availability remain one policy here.
+    pub fn project_inventory_at_time_with_credential_ready(
+        &mut self,
+        now_ms: u64,
+        credential_ready: bool,
+    ) {
         let fetched = matches!(self.inventory, ModelInventoryWire::Fetched { .. });
         self.inventory = self.inventory.clone().at_time(now_ms);
         if !matches!(self.inventory, ModelInventoryWire::Stale { .. }) {
@@ -1595,16 +1616,6 @@ impl ProviderSummaryWire {
                 self.models.push(model.clone());
             }
         }
-        let credential_ready = self.auth_methods.is_empty()
-            || descriptors.iter().any(|descriptor| {
-                descriptor.provider == self.provider
-                    && descriptor.active
-                    && matches!(
-                        &descriptor.status,
-                        haider_protocol::credential::CredentialStatus::Ok
-                            | haider_protocol::credential::CredentialStatus::Limited { .. }
-                    )
-            });
         if fetched
             && !self.configured_models.is_empty()
             && self.enabled
