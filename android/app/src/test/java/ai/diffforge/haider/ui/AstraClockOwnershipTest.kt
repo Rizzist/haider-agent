@@ -49,7 +49,7 @@ class AstraClockOwnershipTest {
     private fun capture(name: String) {
         val folder = System.getenv("HAIDER_EVIDENCE_DIR") ?: "build/outputs/activity-clock"
         java.io.File(folder).mkdirs()
-        rule.onRoot().captureRoboImage("$folder/$name.png")
+        rule.onNodeWithTag(FLEET_PANEL_TAG, useUnmergedTree = true).captureRoboImage("$folder/$name.png")
     }
 
     /** Astra's exact two-session repro, plus fresh-current/history controls. */
