@@ -101,3 +101,5 @@ lock-parent-exit-liveness	linux	haider-cli	test:autospawn_tests	parent_exit_leav
 lock-owned-observer-teardown-confirmed	linux	haider-tools	lib	exit_observer_failure_sweeps_the_owned_process_group	crates/haider-tools/src/process.rs
 lock-background-observer-teardown-confirmed	linux	haider-tools	lib	exit_observer_failure_sweeps_the_background_process_group	crates/haider-tools/src/tasks.rs
 lock-content-budget-watchdog	linux	haider-tools	lib	observed_length_content_budget_is_explicitly_elided	crates/haider-tools/src/workspace_receipt_tests.rs
+lock-cancellation-receipt-nonblocking-reader	all	haider-cli	test:autospawn_tests	cancellation_gate_receipt_waits_for_an_inherited_nonblocking_reader	crates/haider-cli/tests/autospawn_tests.rs
+lock-cancellation-receipt-eof-control	all	haider-cli	test:autospawn_tests	cancellation_gate_receipt_preserves_eof_failure	crates/haider-cli/tests/autospawn_tests.rs

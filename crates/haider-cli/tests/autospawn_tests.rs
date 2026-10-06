@@ -712,6 +712,95 @@ fn durable_run_head(store: &Path, observed: &ObservedRun) -> (String, bool) {
     (state, terminal)
 }
 
+fn cancellation_gate_receipt(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<u8> {
+    // Darwin can inherit O_NONBLOCK from the listener. A read timeout does
+    // not clear that flag: normalize it before the bounded blocking receipt.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(haider_platform::TEST_WAIT_TIMEOUT))?;
+    let mut ready = [0];
+    stream.read_exact(&mut ready)?;
+    Ok(ready[0])
+}
+
+#[test]
+fn cancellation_gate_receipt_waits_for_an_inherited_nonblocking_reader() {
+    use std::io::Write as _;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc::{TryRecvError, channel};
+
+    for nonblocking in [false, true] {
+        let (mut reader, mut writer) = UnixStream::pair().expect("receipt socket pair");
+        reader
+            .set_nonblocking(nonblocking)
+            .expect("plant accepted-socket mode on either Unix platform");
+        let observer = reader
+            .try_clone()
+            .expect("observe the reader's shared mode");
+        std::thread::scope(|scope| {
+            struct CloseReader(UnixStream);
+            impl Drop for CloseReader {
+                fn drop(&mut self) {
+                    let _ = self.0.shutdown(Shutdown::Both);
+                }
+            }
+            // Wake and join the scoped reader even if a fixture assertion fails.
+            let cleanup = CloseReader(observer);
+            let (result_sender, result_receiver) = channel();
+            scope.spawn(move || {
+                let result = cancellation_gate_receipt(&mut reader);
+                let _ = result_sender.send(result);
+            });
+            let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+            // Publish no byte until the reader can block. Without the fix it
+            // returns WouldBlock first, independently of thread scheduling.
+            while rustix::fs::fcntl_getfl(&cleanup.0)
+                .expect("accepted reader mode")
+                .contains(rustix::fs::OFlags::NONBLOCK)
+            {
+                match result_receiver.try_recv() {
+                    Err(TryRecvError::Empty) => {}
+                    result => panic!("receipt returned before its writer was released: {result:?}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "receipt reader did not become blocking"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            writer
+                .write_all(&[1])
+                .expect("release the real receipt byte");
+            assert_eq!(
+                result_receiver
+                    .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
+                    .expect("receipt reader completes")
+                    .expect("read the released receipt"),
+                1
+            );
+        });
+    }
+}
+
+#[test]
+fn cancellation_gate_receipt_preserves_eof_failure() {
+    let (mut reader, writer) =
+        std::os::unix::net::UnixStream::pair().expect("receipt EOF socket pair");
+    reader.set_nonblocking(true).expect("plant inherited mode");
+    // Keep the peer socket alive while publishing EOF so this control reaches
+    // the bounded read, including on platforms that reject options after close.
+    writer
+        .shutdown(std::net::Shutdown::Write)
+        .expect("publish receipt EOF");
+    assert_eq!(
+        cancellation_gate_receipt(&mut reader)
+            .expect_err("EOF cannot stand in for committed cancellation")
+            .kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    drop(writer);
+}
+
 /// Registry #158 signal matrix: a second client interrupt takes the immediate
 /// exit path after its durable `Cancelling` receipt. Test-only fake-provider
 /// settlement is gated until daemon drain so the run cannot terminalize
@@ -777,14 +866,9 @@ fn sigint_twice_with_nonterminal_run_honors_absolute_linger_for_both_endpoints()
                 Err(error) => panic!("{case} accept cancellation gate: {error}"),
             }
         };
-        settlement
-            .set_read_timeout(Some(haider_platform::TEST_WAIT_TIMEOUT))
-            .expect("cancellation gate read timeout");
-        let mut ready = [0];
-        settlement
-            .read_exact(&mut ready)
+        let ready = cancellation_gate_receipt(&mut settlement)
             .expect("committed cancellation gate receipt");
-        assert_eq!(ready, [1]);
+        assert_eq!(ready, 1);
         let (state, terminal) = durable_run_head(store.path(), &observed);
         assert_eq!(
             state, "cancelling",
