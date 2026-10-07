@@ -1348,6 +1348,207 @@ fn native_permission_action_keys_obey_the_shared_dwell() {
     }
 }
 
+fn native_grant_model(paired: bool) -> AppModel {
+    use haider_protocol::permission::{
+        PermissionGrantAction, PermissionGrantNeeded, SystemPermission,
+    };
+    let mut m = AppModel::new();
+    m.screen = Screen::Session;
+    m.active_session = Some(haider_protocol::ids::SessionId::new("synthetic"));
+    if paired {
+        let mut menu = decision("grant");
+        menu.options[0].key = "retry".into();
+        menu.options[1].key = "deny".into();
+        m.projection.apply(&EventPayload::MenuOpened(menu));
+    }
+    m.projection.set_permission_card(PermissionGrantNeeded {
+        request_id: "native-grant".into(),
+        menu_id: decision("grant").id,
+        request_seq: 1,
+        opening_generation: 1,
+        call_id: "synthetic-call".into(),
+        effect_id: haider_protocol::ids::EffectId::new("synthetic-effect"),
+        permission: SystemPermission::ScreenRecording,
+        pane_name: "Fixture".into(),
+        settings_url: "fixture-settings".into(),
+        actions: vec![PermissionGrantAction::OpenSettings],
+        auto_restart_pending: false,
+        poll_timeout_ms: 1000,
+    });
+    m
+}
+
+fn replace_native_grant(m: &mut AppModel, replacement: &str) {
+    let mut card = m.projection.permission_card().unwrap().clone();
+    match replacement {
+        "request" => card.request_id = "next-native-grant".into(),
+        "binding" => {
+            card.request_seq += 1;
+            card.opening_generation += 1;
+            card.call_id = "next-call".into();
+            card.effect_id = haider_protocol::ids::EffectId::new("next-effect");
+            card.permission = haider_protocol::permission::SystemPermission::Accessibility;
+        }
+        "reissue" => {}
+        "repaint" => return,
+        _ => unreachable!(),
+    }
+    m.projection.set_permission_card(card);
+}
+
+fn assert_native_grant_action(m: &AppModel, settings: bool) {
+    let card = m.projection.permission_card().unwrap();
+    if settings {
+        assert!(m.outbox.is_empty());
+        assert!(matches!(m.requests.as_slice(),
+            [crate::app::AppRequest::OpenPermissionSettings { request_id, permission, .. }]
+                if request_id == &card.request_id && permission == &card.permission));
+    } else {
+        assert!(m.requests.is_empty());
+        assert_eq!(m.outbox.len(), 1);
+        assert_eq!(m.outbox[0].answer.menu, card.menu_id);
+    }
+}
+
+#[test]
+fn mature_native_grant_replacements_retire_queued_action_keys() {
+    // Dwell and target binding are independent protections: the old key must
+    // stay stale after the replacement has been painted and fully matured.
+    for paired in [false, true] {
+        for replacement in ["request", "binding", "reissue", "repaint"] {
+            for gap in [400, 1000, 120] {
+                for code in [
+                    KeyCode::Char('o'),
+                    KeyCode::Char('O'),
+                    KeyCode::Enter,
+                    KeyCode::Char('r'),
+                    KeyCode::Char('R'),
+                    KeyCode::Char('1'),
+                    KeyCode::Char('2'),
+                ] {
+                    let settings = matches!(code, KeyCode::Char('o' | 'O'));
+                    if !paired && !settings {
+                        continue;
+                    }
+                    let mut m = native_grant_model(paired);
+                    let t = Instant::now();
+                    m.record_painted_input_at(t - Duration::from_secs(1));
+                    let old = m.painted_stamp();
+                    replace_native_grant(&mut m, replacement);
+                    m.record_painted_input_at(t);
+                    dispatch(&mut m, k(code), old, t + Duration::from_millis(gap));
+                    if replacement == "repaint" {
+                        assert_native_grant_action(&m, settings);
+                        continue;
+                    }
+                    assert!(
+                        m.requests.is_empty() && m.outbox.is_empty(),
+                        "old key crossed native grant: paired={paired} {replacement} gap={gap} {code:?}"
+                    );
+                    let current = m.painted_stamp();
+                    dispatch(
+                        &mut m,
+                        k(code),
+                        current,
+                        t + Duration::from_millis(gap.max(400)),
+                    );
+                    assert_native_grant_action(&m, settings);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mature_native_grant_replacements_retire_queued_clicks_and_held_presses() {
+    let mouse = |kind| {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    for paired in [false, true] {
+        for replacement in ["request", "binding", "reissue", "repaint"] {
+            for held in [false, true] {
+                for hit in [
+                    crate::app::Hit::PermissionOpenSettings,
+                    crate::app::Hit::PermissionRetry,
+                ] {
+                    let settings = hit == crate::app::Hit::PermissionOpenSettings;
+                    if !paired && !settings {
+                        continue;
+                    }
+                    let mut m = native_grant_model(paired);
+                    let hits = [(ratatui::layout::Rect::new(1, 1, 8, 1), hit)];
+                    let t = Instant::now();
+                    m.record_painted_input_at(t - Duration::from_secs(1));
+                    let old = m.painted_stamp();
+                    if held {
+                        assert!(dispatch_queued_input(
+                            &mut m,
+                            &hits,
+                            QueuedInput {
+                                event: mouse(MouseEventKind::Down(MouseButton::Left)),
+                                presented: old.clone(),
+                                received_at: t,
+                            }
+                        ));
+                    }
+                    replace_native_grant(&mut m, replacement);
+                    m.record_painted_input_at(t);
+                    let at = t + Duration::from_secs(1);
+                    let kinds = if held {
+                        vec![MouseEventKind::Up(MouseButton::Left)]
+                    } else {
+                        vec![
+                            MouseEventKind::Down(MouseButton::Left),
+                            MouseEventKind::Up(MouseButton::Left),
+                        ]
+                    };
+                    for kind in kinds {
+                        dispatch_queued_input(
+                            &mut m,
+                            &hits,
+                            QueuedInput {
+                                event: mouse(kind),
+                                presented: old.clone(),
+                                received_at: at,
+                            },
+                        );
+                    }
+                    if replacement == "repaint" {
+                        assert_native_grant_action(&m, settings);
+                        continue;
+                    }
+                    assert!(
+                        m.requests.is_empty() && m.outbox.is_empty(),
+                        "old mouse crossed native grant: paired={paired} {replacement} held={held} settings={settings}"
+                    );
+                    paint(&mut m);
+                    let current = m.painted_stamp();
+                    for kind in [
+                        MouseEventKind::Down(MouseButton::Left),
+                        MouseEventKind::Up(MouseButton::Left),
+                    ] {
+                        dispatch_queued_input(
+                            &mut m,
+                            &hits,
+                            QueuedInput {
+                                event: mouse(kind),
+                                presented: current.clone(),
+                                received_at: at,
+                            },
+                        );
+                    }
+                    assert_native_grant_action(&m, settings);
+                }
+            }
+        }
+    }
+}
+
 fn metadata_provider(models: Vec<String>) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
         provider: "synthetic".into(),
