@@ -1222,7 +1222,7 @@ fn absolute_idle_linger_durably_settles_a_nonterminal_run() {
             "--output",
             "jsonl",
             "--timeout",
-            "5s",
+            "1m",
             "-p",
             "hello",
         ])

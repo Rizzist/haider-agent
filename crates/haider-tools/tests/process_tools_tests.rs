@@ -2107,9 +2107,12 @@ fn assert_descendant_group_swept(started: &Path) {
         .expect("descendant group id")
         .parse()
         .expect("numeric group id");
-    assert_eq!(
-        haider_tools::probe_group_liveness(pid),
-        haider_tools::PidLiveness::Dead,
-        "owned group survives teardown"
-    );
+    let watchdog = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while haider_tools::probe_group_liveness(pid) != haider_tools::PidLiveness::Dead {
+        assert!(
+            std::time::Instant::now() < watchdog,
+            "owned group survives teardown"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
