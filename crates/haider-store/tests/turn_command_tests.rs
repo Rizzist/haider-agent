@@ -759,6 +759,7 @@ fn cancel_records_intent_and_reports_already_terminal() {
         TurnCancelOutcome::Committed {
             ref cancelled,
             envelope: Some(_),
+            ..
         } if cancelled.status == TurnCancellationStatus::Accepted
     ));
     let head_after_first = store.latest_seq(&session_id).expect("head");
@@ -770,6 +771,7 @@ fn cancel_records_intent_and_reports_already_terminal() {
         TurnCancelOutcome::Committed {
             ref cancelled,
             envelope: None,
+            ..
         } if cancelled.status == TurnCancellationStatus::Accepted
     ));
     assert_eq!(
@@ -811,6 +813,7 @@ fn cancel_records_intent_and_reports_already_terminal() {
         TurnCancelOutcome::Committed {
             ref cancelled,
             envelope: None,
+            ..
         } if cancelled.status == TurnCancellationStatus::AlreadyTerminal
             && cancelled.terminal_seq == Some(terminal_seq)
     ));
@@ -1465,4 +1468,97 @@ fn subagent_stop_receipt_fences_generation_identity_and_replays() {
     store
         .subagent_stop_receipt("stop-a", "digest-other", &body(generation + 7))
         .expect_err("lookup refuses the conflicting body too");
+}
+
+/// Public operation identity is stable across process generations. An unfinished
+/// claim owns only its originally captured runs, never a retry's newer snapshot.
+#[test]
+fn public_stop_claim_persists_incarnations_and_replays_across_restart() {
+    use haider_store::StopOperationClaim;
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session = SessionId::new("public-stop");
+    create(&store, &session);
+    let generation = store.worker_generation();
+    let body = r#"{"operation":"headless.run.stop","session":"public-stop","scope":"all"}"#;
+    let first = serde_json::json!({"generation": generation, "runs": ["old-run"]});
+    let newer = serde_json::json!({"generation": generation + 1, "runs": ["new-run"]});
+    assert!(
+        store
+            .claim_stop_operation("stale-stop", generation + 1, "digest", body, &first)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .stop_operation_receipt("stale-stop", "digest", body)
+            .expect("lookup"),
+        None
+    );
+    assert_eq!(
+        store
+            .claim_stop_operation("public-stop", generation, "digest", body, &first)
+            .expect("claim"),
+        StopOperationClaim::Pending(first.clone())
+    );
+    drop(store);
+    let store = Store::open(root.path()).expect("restart");
+    assert_eq!(
+        store
+            .claim_stop_operation(
+                "public-stop",
+                store.worker_generation(),
+                "digest",
+                body,
+                &newer
+            )
+            .expect("resume"),
+        StopOperationClaim::Pending(first)
+    );
+    let response = serde_json::json!({"status":"accepted", "run":"old-run"});
+    assert_eq!(
+        store
+            .finalize_stop_operation("public-stop", &session, "digest", body, &response)
+            .expect("commit"),
+        response
+    );
+    assert_eq!(
+        store
+            .claim_stop_operation("public-stop", generation, "digest", body, &newer)
+            .expect("replay"),
+        StopOperationClaim::Committed(response.clone())
+    );
+    assert_eq!(
+        store
+            .finalize_stop_operation("public-stop", &session, "digest", body, &newer)
+            .expect("first response wins"),
+        response
+    );
+    for scope in ["main", "subagents"] {
+        let changed = format!("{{\"operation\":\"headless.run.stop\",\"scope\":\"{scope}\"}}");
+        assert_eq!(
+            store
+                .claim_stop_operation(
+                    "public-stop",
+                    store.worker_generation(),
+                    "changed",
+                    &changed,
+                    &newer
+                )
+                .expect_err("changed scope refused")
+                .code,
+            haider_protocol::error::ErrorCode::InvalidArgument
+        );
+    }
+    assert!(matches!(
+        store
+            .claim_stop_operation(
+                "fresh-stop",
+                store.worker_generation(),
+                "digest",
+                body,
+                &newer
+            )
+            .expect("new command may target new run"),
+        StopOperationClaim::Pending(_)
+    ));
 }

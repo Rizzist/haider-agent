@@ -254,12 +254,13 @@ pub enum ChipDisplayState {
     Waiting,
     Done,
     Error,
+    Cancelled,
 }
 
 impl ChipDisplayState {
     /// The protocol's `ChipState` → this display vocabulary (W3c3, report
-    /// R11 cut 2: `AgentChipState` is the SOLE chip-state authority on the
-    /// live stream). `Running` has no protocol twin, so it stays demo-only;
+    /// R11 cut 2: reports never supply chip state). `Running` has no
+    /// protocol twin, so it stays demo-only;
     /// `Closed` maps to `Done` because closing is the `ChipModel::closed`
     /// flag plus the sweep, not a badge — a closed child's last honest
     /// badge is that it finished.
@@ -312,6 +313,7 @@ impl ChipDisplayState {
             Self::Waiting => "◔",
             Self::Done => "✓",
             Self::Error => "✗",
+            Self::Cancelled => "⊘",
         }
     }
 
@@ -328,6 +330,7 @@ impl ChipDisplayState {
             Self::Waiting => "WAITING",
             Self::Done => "DONE",
             Self::Error => "ERROR",
+            Self::Cancelled => "CANCELLED",
         }
     }
 }

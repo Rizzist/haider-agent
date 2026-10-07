@@ -366,8 +366,8 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        123,
-        "run_stop_scope_v1 and model output limits add two features to the existing 121-feature set"
+        124,
+        "stop scope, helper stop semantics and model output limits extend the 121-feature set"
     );
     assert_eq!(
         welcome_features(),

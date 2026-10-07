@@ -627,6 +627,11 @@ fn map_frame_translates_every_uncorrelated_frame_it_owns() {
             presentation: None,
         }]
     );
+    assert_eq!(
+        map_frame(WireFrame::SessionRosterDelta { summaries: vec![] }),
+        vec![LiveReply::RosterUpdated { sessions: vec![] }],
+        "child journal heads must reach the driver"
+    );
     assert!(
         map_frame(WireFrame::Pong { nonce: 1 }).is_empty(),
         "frames the link does not own map to nothing, never to a panic"
@@ -1124,4 +1129,86 @@ async fn explicit_reconnect_retires_socket_and_delivers_fresh_handshake_before_r
         .await
         .expect("peer completion")
         .expect("peer");
+}
+
+#[tokio::test]
+async fn roster_watch_is_negotiated_once_on_each_socket() {
+    for supported in [false, true] {
+        let tmp = short_dir();
+        let endpoint = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&endpoint).expect("bind peer");
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut decoder = uds_codec::Decoder::new(LIMIT);
+            assert!(matches!(
+                read_frames(&mut stream, &mut decoder).await.first(),
+                Some(WireFrame::Hello(_))
+            ));
+            let mut hello = welcome();
+            if supported {
+                hello
+                    .features
+                    .insert(haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.into());
+            }
+            write_frame(&mut stream, &WireFrame::Welcome(hello)).await;
+            let frames = read_frames(&mut stream, &mut decoder).await;
+            let WireFrame::Request { request_id, body } = &frames[0] else {
+                panic!("expected request")
+            };
+            if supported {
+                assert!(matches!(body, RequestBody::SessionListWatch {}));
+                write_frame(
+                    &mut stream,
+                    &WireFrame::Response {
+                        request_id: request_id.clone(),
+                        body: ResponseBody::SessionListWatch { accepted: true },
+                    },
+                )
+                .await;
+                write_frame(
+                    &mut stream,
+                    &WireFrame::SessionRosterDelta { summaries: vec![] },
+                )
+                .await;
+            } else {
+                assert!(
+                    matches!(body, RequestBody::SessionList { .. }),
+                    "an older daemon must receive no watch"
+                );
+                write_frame(
+                    &mut stream,
+                    &WireFrame::Response {
+                        request_id: request_id.clone(),
+                        body: ResponseBody::SessionList {
+                            sessions: vec![],
+                            next_cursor: None,
+                        },
+                    },
+                )
+                .await;
+            }
+            // Keep the owned peer alive until the link has collected the reply.
+            let _ = read_frames(&mut stream, &mut decoder).await;
+        });
+        let mut link = link_to(tmp.path(), &endpoint).await;
+        if !supported {
+            link.commands
+                .send(LiveCommand::List { cursor: None })
+                .await
+                .expect("list");
+        }
+        let reply = next_reply(&mut link).await;
+        if supported {
+            assert!(matches!(reply, LiveReply::RosterUpdated { sessions } if sessions.is_empty()));
+        } else {
+            assert!(
+                matches!(reply, LiveReply::Listed { sessions, next_cursor: None } if sessions.is_empty())
+            );
+        }
+        drop(link);
+        tokio::time::timeout(BOUND, peer)
+            .await
+            .expect("peer exits")
+            .expect("peer passed");
+    }
 }

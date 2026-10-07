@@ -908,6 +908,7 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
         // truth); the clocks reload so a terminal chip's frozen final and
         // a live chip's running measure both survive a restart.
         child_session: None,
+        state_child_head_seq: None,
         handoff_dir: None,
         spawned_at_ms: dto.spawned_at_ms,
         last_event_at_ms: dto.last_event_at_ms,
@@ -955,6 +956,7 @@ fn chip_state_from_label(label: &str) -> ChipDisplayState {
         "WAITING" => ChipDisplayState::Waiting,
         "DONE" => ChipDisplayState::Done,
         "ERROR" => ChipDisplayState::Error,
+        "CANCELLED" => ChipDisplayState::Cancelled,
         _ => ChipDisplayState::Idle,
     }
 }

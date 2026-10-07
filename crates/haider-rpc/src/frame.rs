@@ -422,6 +422,10 @@ pub const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
 /// ignores the scope field, so clients must require this feature before
 /// sending a non-default scope.
 pub const FEATURE_RUN_STOP_SCOPE_V1: &str = "run_stop_scope_v1";
+/// Main-only interruption, current-incarnation named stop, and full tree stop
+/// share this negotiated semantic contract (including durable replay).
+pub const FEATURE_HELPER_STOP_V1: &str = "helper_stop_v1";
+pub const HELPER_STOP_UNSUPPORTED_MESSAGE: &str = "this daemon is older than the CLI and cannot end helper tasks reliably; restart the daemon (haider daemon restart) and try again";
 /// Daemon implements receipt-backed per-session provider/account/endpoint
 /// routing changes (`session.provider.rebind`) at the next request boundary.
 pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";

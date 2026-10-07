@@ -2293,6 +2293,7 @@ fn welcome_features() -> BTreeSet<String> {
     BTreeSet::from([
         haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned(),
         haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned(),
+        haider_rpc::FEATURE_HELPER_STOP_V1.to_owned(),
         haider_rpc::FEATURE_AGENT_MESSAGE_V1.to_owned(),
         FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned(),
@@ -2437,6 +2438,8 @@ fn encode_welcome_for_peer(
                     features: welcome.features,
                 });
             }
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(haider_rpc::FEATURE_HELPER_STOP_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(haider_rpc::FEATURE_AGENT_CLI_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })

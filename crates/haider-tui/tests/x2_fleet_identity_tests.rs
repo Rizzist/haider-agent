@@ -683,6 +683,8 @@ fn destroy_takes_two_presses_and_the_arm_names_its_target() {
     live.active_session = Some(sid());
     live.daemon_features
         .insert(haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned());
+    live.daemon_features
+        .insert(haider_rpc::FEATURE_HELPER_STOP_V1.to_owned());
     live.fleet.detail = Some(AgentId::new("ag-recon"));
     live.handle(key(KeyCode::Char('d')));
     live.handle(key(KeyCode::Char('d')));
@@ -699,7 +701,10 @@ fn destroy_takes_two_presses_and_the_arm_names_its_target() {
     let command = commands.first().expect("one agent cancel command").clone();
     assert_eq!(
         command_required_features(&command),
-        &[haider_rpc::FEATURE_AGENT_CANCEL_V1]
+        &[
+            haider_rpc::FEATURE_HELPER_STOP_V1,
+            haider_rpc::FEATURE_AGENT_CANCEL_V1
+        ]
     );
     let (command_id, context) = match &command {
         LiveCommand::AgentCancel {
@@ -799,5 +804,40 @@ fn a_foreign_member_refuses_the_destroy_honestly() {
         }),
         "feature absence is an honest refusal: {:?}",
         stale_live.flash
+    );
+}
+
+#[test]
+fn older_daemon_cannot_confirm_helper_stop_and_both_controls_fit_narrow_screen() {
+    let mut model = fleet_model(snapshot(mixed_tree()));
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(sid());
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned());
+    model.fleet.detail = Some(AgentId::new("ag-recon"));
+    model.handle(key(KeyCode::Char('d')));
+    let flash = model.flash.as_deref().expect("armed instructions");
+    assert!(flash.contains("d confirms") && flash.contains("esc cancels"));
+    assert!(flash.chars().count() < 80);
+    model.handle(key(KeyCode::Char('d')));
+    assert!(
+        model.requests.is_empty(),
+        "old method existence does not promise current stop semantics"
+    );
+    assert_eq!(
+        model.flash.as_deref(),
+        Some(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE)
+    );
+    let cancel = LiveCommand::Cancel {
+        command_id: haider_rpc::CommandId::new("cancel"),
+        session: sid(),
+        worker_generation: 1,
+        run_id: haider_protocol::ids::RunId::new("run"),
+        branch: None,
+    };
+    assert_eq!(
+        command_required_features(&cancel),
+        &[haider_rpc::FEATURE_HELPER_STOP_V1]
     );
 }

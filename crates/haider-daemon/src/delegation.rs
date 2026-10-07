@@ -67,7 +67,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod stop;
 #[cfg(all(test, unix))]
 pub(crate) use stop::pause_after_first_drain;
-pub(crate) use stop::{SubagentStopSummary, SubagentTreeRoot};
+pub(crate) use stop::{StopIncarnation, SubagentStopSummary, SubagentTreeRoot};
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHILD_NUDGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -946,6 +946,11 @@ impl DelegationHandle {
             state: DelegationState::Spawned,
             report: None,
         };
+        // A stop snapshot must not observe registration without the original
+        // accepted child run. Share its admission mutex across that boundary;
+        // launch itself remains outside the lock.
+        let monitor = self.hub.inner_monitor();
+        let _admission = monitor.admission_lock().await;
         let record = match self.hub.create_delegation(record).await? {
             DelegationCreateOutcome::Committed(record)
             | DelegationCreateOutcome::IdempotentReplay(record) => record,

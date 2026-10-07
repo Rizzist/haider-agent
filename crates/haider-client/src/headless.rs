@@ -2492,15 +2492,16 @@ pub async fn headless_run_status(
     }
 }
 
-/// A non-default stop scope requires a daemon that advertises
-/// `run_stop_scope_v1`: an older daemon ignores the field and would silently
-/// perform a full stop. The ensure step then fails with `MissingFeatures`
-/// before any request is sent, so nothing is stopped.
+/// Every stop requires the daemon's helper-stop semantic capability. Scoped
+/// requests additionally require scope decoding; refusal precedes mutation.
 #[must_use]
 pub fn stop_scope_ensure_options(
     mut ensure: EnsureOptions,
     scope: haider_rpc::RunStopScopeWire,
 ) -> EnsureOptions {
+    ensure
+        .required_features
+        .insert(haider_rpc::FEATURE_HELPER_STOP_V1.to_owned());
     if !scope.is_all() {
         ensure
             .required_features

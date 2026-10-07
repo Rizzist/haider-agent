@@ -8968,6 +8968,7 @@ fn subtree_counts(model: &AppModel) -> String {
     let mut working = 0;
     let mut done = 0;
     let mut failed = 0;
+    let mut cancelled = 0;
     let mut idle = 0;
     let mut closing = 0;
     for (_, chip) in &rows {
@@ -8982,6 +8983,7 @@ fn subtree_counts(model: &AppModel) -> String {
             S::Running | S::Tool | S::Thinking | S::Streaming => working += 1,
             S::Done => done += 1,
             S::Error => failed += 1,
+            S::Cancelled => cancelled += 1,
             S::Idle => idle += 1,
         }
     }
@@ -8992,6 +8994,7 @@ fn subtree_counts(model: &AppModel) -> String {
         (working, "◐ {} working"),
         (done, "✓ {} done"),
         (failed, "✗ {} failed"),
+        (cancelled, "⊘ {} cancelled"),
         (idle, "○ {} idle"),
         (closing, "⊘ {} closing"),
     ] {
@@ -10883,7 +10886,7 @@ fn render_fleet(
                 if model.fleet.kill_armed.as_ref() == Some(&node.agent_id) {
                     lines.push(Line::styled(
                         format!(
-                            "  destroy {} only (its subagents keep running)? press d again to confirm · esc cancels",
+                            "  d confirms · esc cancels — end {} only?",
                             fleet::callsign(node)
                         ),
                         theme.err_style(),

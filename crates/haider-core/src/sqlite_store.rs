@@ -38,8 +38,8 @@ use haider_store::{
     SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRecencyKey, SessionRecencyRow,
     SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
     SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, SubagentStopClaim, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
+    ShellExecAcceptOutcome, StopOperationClaim, Store, SubagentStopClaim, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -2417,6 +2417,53 @@ impl SqliteStoreHandle {
                     &request_json,
                     &response,
                 )
+            })
+        })
+        .await
+    }
+
+    pub async fn stop_operation_receipt(
+        &self,
+        command_id: String,
+        digest: String,
+        json: String,
+    ) -> Result<Option<serde_json::Value>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.stop_operation_receipt(&command_id, &digest, &json))
+        })
+        .await
+    }
+
+    pub async fn claim_stop_operation(
+        &self,
+        command_id: String,
+        generation: u64,
+        digest: String,
+        json: String,
+        intent: serde_json::Value,
+    ) -> Result<StopOperationClaim, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.claim_stop_operation(&command_id, generation, &digest, &json, &intent)
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_stop_operation(
+        &self,
+        command_id: String,
+        session: SessionId,
+        digest: String,
+        json: String,
+        response: serde_json::Value,
+    ) -> Result<serde_json::Value, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_stop_operation(&command_id, &session, &digest, &json, &response)
             })
         })
         .await

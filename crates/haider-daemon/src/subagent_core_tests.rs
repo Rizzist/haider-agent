@@ -6855,3 +6855,7 @@ async fn activity_typed_spawn_freezes_display_identity_in_the_replayed_manifest(
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close store");
 }
+
+#[cfg(unix)]
+#[path = "subagent_monitor_boundary_tests.rs"]
+mod subagent_monitor_boundary_tests;

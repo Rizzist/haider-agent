@@ -1326,6 +1326,10 @@ pub enum LiveReply {
         sessions: Vec<SessionSummary>,
         next_cursor: Option<String>,
     },
+    /// Incremental roster heads; never a claim that a paged list is complete.
+    RosterUpdated {
+        sessions: Vec<SessionSummary>,
+    },
     /// `session.attach` answered. The attach RESPONSE always precedes the
     /// first event for its attachment (the daemon's register→replay seam);
     /// this is where the attachment id becomes routable.
@@ -3354,89 +3358,9 @@ impl LiveDriver {
             LiveReply::Listed {
                 sessions,
                 next_cursor,
-            } => {
-                for summary in sessions {
-                    let workspace_display = summary
-                        .workspace_cwd
-                        .as_deref()
-                        .or_else(|| {
-                            summary
-                                .metadata
-                                .as_ref()
-                                .map(|metadata| metadata.cwd.as_str())
-                        })
-                        .map(workspace_display_path);
-                    if let Some(metadata) = summary.metadata.as_ref() {
-                        self.workspace_paths
-                            .insert(summary.session_id.clone(), metadata.cwd.clone());
-                        if metadata.workspace_allocation.is_some() {
-                            self.dated_sessions.insert(summary.session_id.clone());
-                        }
-                        if let Some(origin) = metadata.launch_origin.as_ref() {
-                            self.origin_revisions
-                                .insert(summary.session_id.clone(), origin.revision);
-                        }
-                    }
-                    self.binding_worker_generation = Some(summary.worker_generation);
-                    model.upsert_live_session(&summary.session_id);
-                    if let Some(display) = workspace_display {
-                        if model.active_session.as_ref() == Some(&summary.session_id) {
-                            model.session_dir = display;
-                        } else if let Some(row) = model
-                            .sessions
-                            .iter_mut()
-                            .find(|row| row.id == summary.session_id)
-                        {
-                            row.dir = display;
-                        }
-                    }
-                    // Launcher fix 2: the additive turn/footprint fields
-                    // hydrate the row's counts at list time — tolerantly
-                    // (an older daemon's summary stores nothing).
-                    model.note_summary_counts(&summary);
-                    self.generations
-                        .insert(summary.session_id.clone(), summary.worker_generation);
-                    if !self.attachments.contains_key(&summary.session_id) {
-                        self.cold.insert(
-                            summary.session_id,
-                            Cold {
-                                head_seq: summary.head_seq,
-                            },
-                        );
-                    }
-                }
-                model.dirty = true;
-                // ADE seam (`haider --session <id>`): the LIST is the proof
-                // of existence — open the target the moment it appears; once
-                // the list is COMPLETE (no next page) an unknown id flashes
-                // honestly instead of waiting forever.
-                if let Some(target) = model.initial_session.clone() {
-                    if model.sessions.iter().any(|entry| entry.id == target) {
-                        model.initial_session = None;
-                        model.open_session(&target);
-                    } else if next_cursor.is_none() {
-                        model.initial_session = None;
-                        model.flash =
-                            Some(format!("· --session: {} is not a known session", target));
-                    }
-                }
-                let mut follow = next_cursor.map_or_else(Vec::new, |cursor| {
-                    vec![LiveCommand::List {
-                        cursor: Some(cursor),
-                    }]
-                });
-                // D1: hydrate the Loom registry once per connection — the
-                // typed-chip colors and graph annotations read from it.
-                // Round 4: the dedup latch (`loom_requested`) is separate
-                // from the truth latch (`loom_loaded`, set only when the
-                // reply installs) so /loom can render LOADING honestly.
-                if !model.loom_requested && model.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
-                    model.loom_requested = true;
-                    follow.push(LiveCommand::LoomList {
-                        epoch: self.connection_epoch,
-                    });
-                }
-                follow
+            } => self.apply_session_summaries(model, sessions, next_cursor, true),
+            LiveReply::RosterUpdated { sessions } => {
+                self.apply_session_summaries(model, sessions, None, false)
             }
             LiveReply::Attached {
                 session,
@@ -3875,9 +3799,7 @@ impl LiveDriver {
                 model.apply_fleet_snapshot(*snapshot);
                 // Events applied while the read flew folded into ONE chase:
                 // re-read now, only while the screen is still open.
-                if std::mem::take(&mut self.fleet_chase)
-                    && model.screen == crate::app::Screen::Fleet
-                {
+                if std::mem::take(&mut self.fleet_chase) {
                     return self.fleet_refresh(model);
                 }
                 Vec::new()
@@ -5781,7 +5703,9 @@ impl LiveDriver {
                 let mut commands = self.resume(model);
                 // A fleet screen left open across the redial re-reads its
                 // snapshot on the fresh socket — the same one-emitter seam.
-                if model.screen == crate::app::Screen::Fleet {
+                if (model.screen == crate::app::Screen::Fleet || !model.chips.is_empty())
+                    && model.daemon_serves(haider_rpc::FEATURE_SESSION_FLEET_V1)
+                {
                     commands.extend(self.fleet_refresh(model));
                 }
                 // A pinned graph re-reads its reduction on the fresh socket:
@@ -6079,6 +6003,109 @@ impl LiveDriver {
         }
     }
 
+    fn apply_session_summaries(
+        &mut self,
+        model: &mut AppModel,
+        sessions: Vec<SessionSummary>,
+        next_cursor: Option<String>,
+        list_complete: bool,
+    ) -> Vec<LiveCommand> {
+        let mut child_changed = false;
+        for summary in sessions {
+            child_changed |= crate::app::flatten_chips(&model.chips)
+                .iter()
+                .any(|(_, chip)| {
+                    chip.child_session.as_deref() == Some(summary.session_id.as_str())
+                        && chip
+                            .metrics
+                            .as_ref()
+                            .is_none_or(|metrics| metrics.head_seq < summary.head_seq)
+                });
+            let workspace_display = summary
+                .workspace_cwd
+                .as_deref()
+                .or_else(|| {
+                    summary
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.cwd.as_str())
+                })
+                .map(workspace_display_path);
+            if let Some(metadata) = summary.metadata.as_ref() {
+                self.workspace_paths
+                    .insert(summary.session_id.clone(), metadata.cwd.clone());
+                if metadata.workspace_allocation.is_some() {
+                    self.dated_sessions.insert(summary.session_id.clone());
+                }
+                if let Some(origin) = metadata.launch_origin.as_ref() {
+                    self.origin_revisions
+                        .insert(summary.session_id.clone(), origin.revision);
+                }
+            }
+            self.binding_worker_generation = Some(summary.worker_generation);
+            model.upsert_live_session(&summary.session_id);
+            if let Some(display) = workspace_display {
+                if model.active_session.as_ref() == Some(&summary.session_id) {
+                    model.session_dir = display;
+                } else if let Some(row) = model
+                    .sessions
+                    .iter_mut()
+                    .find(|row| row.id == summary.session_id)
+                {
+                    row.dir = display;
+                }
+            }
+            // Launcher fix 2: the additive turn/footprint fields
+            // hydrate the row's counts at list time — tolerantly
+            // (an older daemon's summary stores nothing).
+            model.note_summary_counts(&summary);
+            self.generations
+                .insert(summary.session_id.clone(), summary.worker_generation);
+            if !self.attachments.contains_key(&summary.session_id) {
+                self.cold.insert(
+                    summary.session_id,
+                    Cold {
+                        head_seq: summary.head_seq,
+                    },
+                );
+            }
+        }
+        model.dirty = true;
+        // ADE seam (`haider --session <id>`): the LIST is the proof
+        // of existence — open the target the moment it appears; once
+        // the list is COMPLETE (no next page) an unknown id flashes
+        // honestly instead of waiting forever.
+        if let Some(target) = model.initial_session.clone() {
+            if model.sessions.iter().any(|entry| entry.id == target) {
+                model.initial_session = None;
+                model.open_session(&target);
+            } else if list_complete && next_cursor.is_none() {
+                model.initial_session = None;
+                model.flash = Some(format!("· --session: {} is not a known session", target));
+            }
+        }
+        let mut follow = next_cursor.map_or_else(Vec::new, |cursor| {
+            vec![LiveCommand::List {
+                cursor: Some(cursor),
+            }]
+        });
+        // D1: hydrate the Loom registry once per connection — the
+        // typed-chip colors and graph annotations read from it.
+        // Round 4: the dedup latch (`loom_requested`) is separate
+        // from the truth latch (`loom_loaded`, set only when the
+        // reply installs) so /loom can render LOADING honestly.
+        if !model.loom_requested && model.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
+            model.loom_requested = true;
+            follow.push(LiveCommand::LoomList {
+                epoch: self.connection_epoch,
+            });
+        }
+        if child_changed && model.daemon_serves(haider_rpc::FEATURE_SESSION_FLEET_V1) {
+            follow.extend(self.fleet_refresh(model));
+        }
+        follow
+    }
+
     /// One committed envelope: route it, record menu coordinates, and honor
     /// the reducer's strict gap law.
     /// Issue the single-flight `session.fleet` read for the ACTIVE session,
@@ -6098,15 +6125,15 @@ impl LiveDriver {
         vec![LiveCommand::SessionFleet { session }]
     }
 
-    /// The fleet screen's refresh cadence IS the event stream (the same
-    /// cadence that keeps the subagents panel current): one APPLIED
-    /// envelope for the attached session while the screen is open chases
-    /// one bounded re-read; bursts fold through the single-flight gate.
+    /// The fleet and main chip projections share the event cadence: one
+    /// applied parent envelope chases child truth, including a message
+    /// starting a later child run. Bursts fold through the single-flight gate.
     /// No new polling loop — a quiet (terminal) session renders its
     /// durable snapshot once and never re-reads.
     fn fleet_event_chase(&mut self, model: &AppModel, session: &SessionId) -> Vec<LiveCommand> {
-        if model.screen != crate::app::Screen::Fleet
+        if (model.screen != crate::app::Screen::Fleet && model.chips.is_empty())
             || model.active_session.as_ref() != Some(session)
+            || !model.daemon_serves(haider_rpc::FEATURE_SESSION_FLEET_V1)
         {
             return Vec::new();
         }

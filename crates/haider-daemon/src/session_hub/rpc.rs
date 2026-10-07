@@ -907,7 +907,7 @@ struct FleetChildTruth {
     metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
 }
 
-/// Reduces one child's exact durable run and direct metrics from the same
+/// Reduces one child's current durable run and direct metrics from the same
 /// sealed journal head. Delegation bookkeeping is only the fallback for the
 /// launch-crash window; it cannot distinguish failed from cancelled.
 async fn fleet_child_truth(
@@ -917,7 +917,7 @@ async fn fleet_child_truth(
     initial_model: &str,
 ) -> Result<FleetChildTruth, HaiderError> {
     let mut folder = crate::usage_report::SessionFolder::new(initial_model);
-    let mut latest_state = None;
+    let mut runs = HashMap::<RunId, (u64, RunState)>::new();
     let mut since_seq = 0;
     while since_seq < through_seq {
         let page = store
@@ -938,10 +938,12 @@ async fn fleet_child_truth(
             }
             since_seq = envelope.seq;
             advanced = true;
-            if envelope.run_id.as_ref() == Some(&record.child_run_id)
+            if let Some(run) = &envelope.run_id
                 && let Ok(EventPayload::RunState(state)) = envelope.payload.decode_event()
             {
-                latest_state = Some(state);
+                runs.entry(run.clone())
+                    .and_modify(|(_, current)| *current = state.clone())
+                    .or_insert((envelope.seq, state));
             }
             folder.push(&envelope);
         }
@@ -949,7 +951,13 @@ async fn fleet_child_truth(
             break;
         }
     }
-    let state = fleet_agent_state(record, latest_state.as_ref());
+    let latest_state = runs
+        .values()
+        .filter(|(_, state)| !state.is_terminal())
+        .max_by_key(|(first_seq, _)| first_seq)
+        .or_else(|| runs.values().max_by_key(|(first_seq, _)| first_seq))
+        .map(|(_, state)| state);
+    let state = fleet_agent_state(record, latest_state);
     let metrics = folder.agent_snapshot(
         &record.child_session_id,
         Some(&record.agent_id),
@@ -14996,65 +15004,89 @@ impl HubConnection {
             );
         }
 
-        // Owner decision 2026-09-25: cancelling a named subagent stops that
-        // subagent only (its original run, any later messaged or
-        // monitor-woken run, and its own monitors). Its children keep
-        // running; `agent.cancel_all` is the explicit tree stop.
-        let target_command = match agent_cancel_command(
-            &record,
-            command_id.as_str(),
-            "manual",
-            worker_generation,
-            self.hub.device_id(),
-        ) {
-            Ok(command) => command,
-            Err(error) => return self.respond_turn_error(request_id, error),
-        };
-        // Astra 13-final B4: the request's generation and command identity
-        // are validated before ANY monitor removal or cancel side effect. A
-        // committed receipt replays unfenced (R2, like `turn.cancel`); a
-        // conflicting reuse of the command id is refused by the lookup; a
-        // fresh command must carry the current generation.
+        let _operation = self.hub.inner.stop_operations.lock().await;
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "operation": "agent.cancel", "session_id": &session_id, "agent": &agent,
+        }))
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
         match self
             .hub
-            .turn_cancel_receipt(
-                &command_id,
-                &target_command.request_digest,
-                &target_command.request_json,
+            .inner
+            .store
+            .stop_operation_receipt(
+                command_id.as_str().to_owned(),
+                digest.clone(),
+                request_json.clone(),
             )
             .await
         {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                let current = self.hub.worker_generation();
-                if worker_generation != current {
-                    return self.respond_turn_error(
-                        request_id,
-                        stale_generation_error(worker_generation, current),
-                    );
-                }
-            }
-            Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
-            }
-            Err(error) => return Err(error),
+            Ok(Some(response)) => return self.respond_stop_operation(request_id, response),
+            Ok(None) => {}
+            Err(error) => return self.respond_turn_error(request_id, error),
         }
+        let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
+        let monitor = self.hub.inner_monitor();
+        let admission = monitor.admission_lock().await;
+        let intent = serde_json::to_value(
+            delegation
+                .delegation_stop_incarnation(&record, &admission)
+                .await
+                .map_err(SessionHubError::Store)?,
+        )
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let intent = match self
+            .hub
+            .inner
+            .store
+            .claim_stop_operation(
+                command_id.as_str().to_owned(),
+                worker_generation,
+                digest.clone(),
+                request_json.clone(),
+                intent,
+            )
+            .await
+        {
+            Ok(haider_core::StopOperationClaim::Committed(response)) => {
+                return self.respond_stop_operation(request_id, response);
+            }
+            Ok(haider_core::StopOperationClaim::Pending(intent)) => intent,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        let incarnation =
+            serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let _fence = monitor.stop_fences().fence(&record.child_session_id);
+        drop(admission);
         let prefix = format!(
             "agent-cancel-{}",
             &crate::delegation::stable_digest(&[command_id.as_str(), record.agent_id.as_str()])
                 [..24]
         );
-        let cancelled = match crate::delegation::DelegationHandle::new(self.hub.clone())
-            .cancel_single_subagent(&record, target_command, &prefix)
+        let primary = match agent_cancel_command(
+            &record,
+            &format!("{prefix}-primary"),
+            "manual",
+            self.hub.worker_generation(),
+            self.hub.device_id(),
+        ) {
+            Ok(command) => command,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        let cancelled = match delegation
+            .cancel_single_subagent_incarnation(&record, primary, &prefix, Some(incarnation))
             .await
         {
             Ok(cancelled) => cancelled,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
-
-        self.send(WireFrame::Response {
+        self.commit_stop_operation(
             request_id,
-            body: ResponseBody::AgentCancel {
+            &command_id,
+            &session_id,
+            &digest,
+            &request_json,
+            ResponseBody::AgentCancel {
                 agent: record.agent_id,
                 child_session_id: cancelled.session_id,
                 child_run_id: cancelled.run_id,
@@ -15064,7 +15096,45 @@ impl HubConnection {
                 },
                 terminal_seq: cancelled.terminal_seq,
             },
-        })
+        )
+        .await
+    }
+
+    fn respond_stop_operation(
+        &self,
+        request_id: RequestId,
+        response: serde_json::Value,
+    ) -> Result<(), SessionHubError> {
+        let body = serde_json::from_value(response)
+            .map_err(|e| SessionHubError::Task(format!("invalid helper-stop receipt: {e}")))?;
+        self.send(WireFrame::Response { request_id, body })
+    }
+
+    async fn commit_stop_operation(
+        &self,
+        request_id: RequestId,
+        command: &CommandId,
+        session: &SessionId,
+        digest: &str,
+        json: &str,
+        body: ResponseBody,
+    ) -> Result<(), SessionHubError> {
+        let response =
+            serde_json::to_value(body).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let response = self
+            .hub
+            .inner
+            .store
+            .finalize_stop_operation(
+                command.as_str().to_owned(),
+                session.clone(),
+                digest.to_owned(),
+                json.to_owned(),
+                response,
+            )
+            .await
+            .map_err(SessionHubError::Store)?;
+        self.respond_stop_operation(request_id, response)
     }
 
     /// `agent.cancel_all`: stops every subagent in the session's delegation
@@ -15077,6 +15147,7 @@ impl HubConnection {
         session_id: SessionId,
         worker_generation: u64,
     ) -> Result<(), SessionHubError> {
+        let _operation = self.hub.inner.stop_operations.lock().await;
         if command_id.as_str().trim().is_empty() {
             return self.respond_error(
                 request_id,
@@ -15087,122 +15158,83 @@ impl HubConnection {
             );
         }
         let request_json = serde_json::to_string(&serde_json::json!({
-            "session_id": &session_id,
-            "worker_generation": worker_generation,
+            "operation": "agent.cancel_all", "session_id": &session_id,
         }))
-        .map_err(|error| {
-            SessionHubError::Task(format!(
-                "cannot encode agent-cancel-all coordinates: {error}"
-            ))
-        })?;
-        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
-        // Astra 13-final B4: replay, identity and generation are settled
-        // before any removal or cancel. The receipt lookup is unfenced (a
-        // committed stop replays its response across restarts); the claim is
-        // generation-fenced and atomic, so a stale or conflicting request
-        // has zero side effects.
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
         match self
             .hub
-            .subagent_stop_receipt(&command_id, &request_digest, &request_json)
+            .inner
+            .store
+            .stop_operation_receipt(
+                command_id.as_str().to_owned(),
+                digest.clone(),
+                request_json.clone(),
+            )
             .await
         {
-            Ok(Some(response)) => {
-                return self.respond_agent_cancel_all(request_id, session_id, response);
-            }
+            Ok(Some(response)) => return self.respond_stop_operation(request_id, response),
             Ok(None) => {}
             Err(error) => return self.respond_turn_error(request_id, error),
         }
-        let current = self.hub.worker_generation();
-        if worker_generation != current {
-            return self.respond_turn_error(
-                request_id,
-                stale_generation_error(worker_generation, current),
-            );
-        }
-        match self
+        let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
+        let root = crate::delegation::SubagentTreeRoot::Session(session_id.clone());
+        let monitor = self.hub.inner_monitor();
+        let admission = monitor.admission_lock().await;
+        let intent = serde_json::to_value(
+            delegation
+                .stop_incarnations(&root, &admission)
+                .await
+                .map_err(SessionHubError::Store)?,
+        )
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let intent = match self
             .hub
-            .claim_subagent_stop_receipt(
-                &command_id,
+            .inner
+            .store
+            .claim_stop_operation(
+                command_id.as_str().to_owned(),
                 worker_generation,
-                &request_digest,
-                &request_json,
+                digest.clone(),
+                request_json.clone(),
+                intent,
             )
             .await
         {
-            Ok(haider_core::SubagentStopClaim::Committed(response)) => {
-                return self.respond_agent_cancel_all(request_id, session_id, response);
+            Ok(haider_core::StopOperationClaim::Committed(response)) => {
+                return self.respond_stop_operation(request_id, response);
             }
-            Ok(
-                haider_core::SubagentStopClaim::Fresh
-                | haider_core::SubagentStopClaim::ResumePending,
-            ) => {}
+            Ok(haider_core::StopOperationClaim::Pending(intent)) => intent,
             Err(error) => return self.respond_turn_error(request_id, error),
-        }
+        };
+        let targets: Vec<crate::delegation::StopIncarnation> =
+            serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let _fences = targets
+            .iter()
+            .filter(|target| target.session_id != session_id)
+            .map(|target| monitor.stop_fences().fence(&target.session_id))
+            .collect::<Vec<_>>();
+        drop(admission);
         let prefix = format!(
             "agent-cancel-all-{}",
-            &crate::delegation::stable_digest(&[
-                command_id.as_str(),
-                session_id.as_str(),
-                &worker_generation.to_string(),
-            ])[..24]
+            &crate::delegation::stable_digest(&[command_id.as_str(), session_id.as_str()])[..24]
         );
-        let stopped = match crate::delegation::DelegationHandle::new(self.hub.clone())
-            .stop_subagent_tree(
-                crate::delegation::SubagentTreeRoot::Session(session_id.clone()),
-                &prefix,
-            )
+        let stopped = delegation
+            .stop_subagent_tree_incarnations(root, &prefix, Some(&targets))
             .await
-        {
-            Ok(stopped) => stopped,
-            Err(error) => return self.respond_turn_error(request_id, error),
-        };
-        let response = serde_json::to_value(stopped.wire()).map_err(|error| {
-            SessionHubError::Task(format!("cannot encode agent-cancel-all response: {error}"))
-        })?;
-        let response = match self
-            .hub
-            .finalize_subagent_stop_receipt(
-                &command_id,
-                &session_id,
-                &request_digest,
-                &request_json,
-                response,
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return self.respond_turn_error(request_id, error),
-        };
-        self.respond_agent_cancel_all(request_id, session_id, response)
-    }
-
-    fn respond_agent_cancel_all(
-        &self,
-        request_id: RequestId,
-        session_id: SessionId,
-        response: serde_json::Value,
-    ) -> Result<(), SessionHubError> {
-        let stopped = match serde_json::from_value::<haider_rpc::SubagentStopSummaryWire>(response)
-        {
-            Ok(stopped) => stopped,
-            Err(error) => {
-                return self.respond_turn_error(
-                    request_id,
-                    HaiderError::new(
-                        ErrorCode::StoreCorrupt,
-                        format!("agent-cancel-all receipt response is invalid: {error}"),
-                        false,
-                    ),
-                );
-            }
-        };
-        self.send(WireFrame::Response {
+            .map_err(SessionHubError::Store)?;
+        self.commit_stop_operation(
             request_id,
-            body: ResponseBody::AgentCancelAll {
-                session_id,
-                stopped,
+            &command_id,
+            &session_id,
+            &digest,
+            &request_json,
+            ResponseBody::AgentCancelAll {
+                session_id: session_id.clone(),
+                stopped: stopped.wire(),
             },
-        })
+        )
+        .await
     }
 
     async fn queue_list(
@@ -16337,6 +16369,7 @@ impl HubConnection {
                 None,
             );
         };
+        let _operation = self.hub.inner.stop_operations.lock().await;
         let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
         let tree = crate::delegation::SubagentTreeRoot::Run {
             session_id: found.session_id.clone(),
@@ -16348,118 +16381,134 @@ impl HubConnection {
         );
         let echo_scope = (!scope.is_all()).then_some(scope);
         let request_json = serde_json::to_string(&serde_json::json!({
-            "session_id": &found.session_id,
-            "worker_generation": self.hub.worker_generation(),
-            "run_id": &run_id,
+            "operation": "headless.run.stop", "session_id": &found.session_id,
+            "run_id": &run_id, "scope": scope,
         }))
-        .map_err(|error| {
-            SessionHubError::Task(format!("cannot encode headless stop coordinates: {error}"))
-        })?;
-        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
-        // A command id already used with different semantics is refused
-        // before the subagent tree is touched (Astra 13-final B4).
-        let replayed = match self
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
             .hub
-            .turn_cancel_receipt(&command_id, &request_digest, &request_json)
+            .inner
+            .store
+            .stop_operation_receipt(
+                command_id.as_str().to_owned(),
+                digest.clone(),
+                request_json.clone(),
+            )
             .await
         {
-            Ok(replayed) => replayed,
-            Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
+            Ok(Some(response)) => return self.respond_stop_operation(request_id, response),
+            Ok(None) => {}
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }
+        let monitor = self.hub.inner_monitor();
+        let admission = monitor.admission_lock().await;
+        let targets = delegation
+            .stop_incarnations(&tree, &admission)
+            .await
+            .map_err(SessionHubError::Store)?;
+        let intent =
+            serde_json::to_value(targets).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let intent = match self
+            .hub
+            .inner
+            .store
+            .claim_stop_operation(
+                command_id.as_str().to_owned(),
+                self.hub.worker_generation(),
+                digest.clone(),
+                request_json.clone(),
+                intent,
+            )
+            .await
+        {
+            Ok(haider_core::StopOperationClaim::Committed(response)) => {
+                return self.respond_stop_operation(request_id, response);
             }
-            Err(error) => return Err(error),
+            Ok(haider_core::StopOperationClaim::Pending(intent)) => intent,
+            Err(error) => return self.respond_turn_error(request_id, error),
         };
+        let targets: Vec<crate::delegation::StopIncarnation> =
+            serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let _fences = targets
+            .iter()
+            .filter(|target| {
+                matches!(scope, Scope::All | Scope::Subagents)
+                    && target.session_id != found.session_id
+            })
+            .map(|target| monitor.stop_fences().fence(&target.session_id))
+            .collect::<Vec<_>>();
+        drop(admission);
         let mut subagents = crate::delegation::SubagentStopSummary::default();
         if matches!(scope, Scope::All | Scope::Subagents) {
-            // Subagents first, so the main run's own stop cleanup finds no
-            // live child to detach and delivers no cancelled results.
             subagents = delegation
-                .stop_subagent_tree(tree.clone(), &prefix)
+                .stop_subagent_tree_incarnations(tree.clone(), &prefix, Some(&targets))
                 .await
                 .map_err(SessionHubError::Store)?;
         }
-        if matches!(scope, Scope::Subagents) || found.state.is_terminal() {
-            if matches!(scope, Scope::Main) {
-                subagents.still_running = delegation
-                    .live_subagent_count(&tree)
-                    .await
-                    .map_err(SessionHubError::Store)?;
-            }
-            let terminal = found.state.is_terminal();
-            return self.send(WireFrame::Response {
-                request_id,
-                body: ResponseBody::HeadlessRunStop {
-                    session_id: found.session_id,
-                    run_id,
-                    status: if terminal {
+        let (status, terminal_seq) =
+            if matches!(scope, Scope::Subagents) || found.state.is_terminal() {
+                (
+                    if found.state.is_terminal() {
                         CancelStatus::AlreadyTerminal
                     } else {
                         CancelStatus::Accepted
                     },
-                    terminal_seq: terminal.then_some(found.state_seq),
-                    scope: echo_scope,
-                    subagents: Some(subagents.wire()),
-                },
-            });
-        }
-        let cancelled = match replayed {
-            Some(cancelled) => cancelled,
-            None => {
+                    found.state.is_terminal().then_some(found.state_seq),
+                )
+            } else {
+                let inner_json = serde_json::to_string(&serde_json::json!({
+                    "session_id": &found.session_id, "run_id": &run_id,
+                }))
+                .map_err(|e| SessionHubError::Task(e.to_string()))?;
                 let command = TurnCancelCommand {
-                    command_id: command_id.0,
-                    request_digest,
-                    request_json,
+                    command_id: format!("{prefix}-main"),
+                    request_digest: blake3::hash(inner_json.as_bytes()).to_hex().to_string(),
+                    request_json: inner_json,
                     session_id: found.session_id.clone(),
                     worker_generation: self.hub.worker_generation(),
                     run_id: run_id.clone(),
-                    cancelling_event_id: EventId::new(random_id("headless-cancelling")?),
-                    device_id: self.hub.inner.device_id.clone(),
+                    cancelling_event_id: EventId::new(format!("{prefix}-cancelling")),
+                    device_id: self.hub.device_id(),
                 };
-                match self.hub.cancel_turn(command).await {
+                let cancelled = match self.hub.cancel_turn(command).await {
                     Ok(TurnCancelOutcome::Committed { cancelled, .. })
                     | Ok(TurnCancelOutcome::IdempotentReplay { cancelled }) => cancelled,
                     Err(SessionHubError::Store(error)) => {
                         return self.respond_turn_error(request_id, error);
                     }
                     Err(error) => return Err(error),
-                }
-            }
-        };
-        if matches!(scope, Scope::All) {
-            // A second walk closes the window in which the run spawned a
-            // child between the first pass and its own cancellation.
-            let again = delegation
-                .stop_subagent_tree(tree, &prefix)
-                .await
-                .map_err(SessionHubError::Store)?;
-            subagents.cancelled_runs = subagents
-                .cancelled_runs
-                .saturating_add(again.cancelled_runs);
-            subagents.sessions = subagents.sessions.max(again.sessions);
-            subagents.monitors_removed = subagents
-                .monitors_removed
-                .saturating_add(again.monitors_removed);
-            subagents.still_running = again.still_running;
-        } else {
+                };
+                (
+                    match cancelled.status {
+                        TurnCancellationStatus::Accepted => CancelStatus::Accepted,
+                        TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
+                    },
+                    cancelled.terminal_seq,
+                )
+            };
+        if matches!(scope, Scope::Main) {
             subagents.still_running = delegation
                 .live_subagent_count(&tree)
                 .await
                 .map_err(SessionHubError::Store)?;
         }
-        self.send(WireFrame::Response {
+        self.commit_stop_operation(
             request_id,
-            body: ResponseBody::HeadlessRunStop {
-                session_id: cancelled.session_id,
-                run_id: cancelled.run_id,
-                status: match cancelled.status {
-                    TurnCancellationStatus::Accepted => CancelStatus::Accepted,
-                    TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
-                },
-                terminal_seq: cancelled.terminal_seq,
+            &command_id,
+            &found.session_id,
+            &digest,
+            &request_json,
+            ResponseBody::HeadlessRunStop {
+                session_id: found.session_id.clone(),
+                run_id,
+                status,
+                terminal_seq,
                 scope: echo_scope,
                 subagents: Some(subagents.wire()),
             },
-        })
+        )
+        .await
     }
 
     async fn run_retry(
@@ -20805,15 +20854,6 @@ fn authorize(capabilities: &CapabilitySet, operation: Operation) -> Result<(), &
     })
 }
 
-/// The store's own stale-generation refusal, raised before any side effect.
-fn stale_generation_error(provided: u64, current: u64) -> HaiderError {
-    HaiderError::new(
-        ErrorCode::SingleWriterViolation,
-        format!("stale worker generation {provided}; current generation is {current}"),
-        false,
-    )
-}
-
 fn agent_cancel_command(
     record: &haider_core::DelegationRecord,
     command_id: &str,
@@ -20826,7 +20866,6 @@ fn agent_cancel_command(
         "agent": record.agent_id,
         "child_session_id": record.child_session_id,
         "child_run_id": record.child_run_id,
-        "worker_generation": worker_generation,
         "reason": reason,
     }))
     .map_err(|error| {

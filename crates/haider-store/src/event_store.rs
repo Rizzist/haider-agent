@@ -1772,6 +1772,13 @@ pub enum SubagentStopClaim {
     Committed(serde_json::Value),
 }
 
+/// An immutable public stop claim, including the exact run incarnations it owns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StopOperationClaim {
+    Pending(serde_json::Value),
+    Committed(serde_json::Value),
+}
+
 /// Secret-free coordinates for atomically accepting a direct user shell
 /// command. The command bytes themselves live in the ordinary started item
 /// and in the canonical receipt request JSON, never in this response.
@@ -1994,6 +2001,7 @@ pub enum TurnCancelOutcome {
     Committed {
         cancelled: CancelledTurn,
         envelope: Option<Box<RawEnvelope>>,
+        delivery_obligations: Vec<RawEnvelope>,
     },
     IdempotentReplay {
         cancelled: CancelledTurn,
@@ -7736,6 +7744,19 @@ impl Store {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(DelegationCreateOutcome::IdempotentReplay(existing));
         }
+        if latest_run_state(
+            &transaction,
+            &record.parent_session_id,
+            &record.parent_run_id,
+        )?
+        .is_some_and(|(state, _, _)| matches!(state, RunState::Cancelling | RunState::Cancelled))
+        {
+            return Err(store_error(
+                ErrorCode::RunNotActive,
+                "the delegating run has already been stopped",
+                false,
+            ));
+        }
         let live_count = live_delegation_count(&transaction)?;
         if live_count >= SUBAGENT_LIVE_LIMIT {
             let detail = format!(
@@ -8628,6 +8649,126 @@ impl Store {
             response,
             now_ms()?,
             "agent-cancel-all",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(response.clone())
+    }
+
+    /// Public helper-stop receipt. Transport generations fence fresh claims,
+    /// but are not semantic identity: a completed retry survives a restart.
+    pub fn stop_operation_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<serde_json::Value>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "helper.stop.v1",
+            request_digest,
+            request_json,
+            "helper-stop",
+        )
+    }
+
+    /// Claims the complete public operation and its immutable run IDs before
+    /// any removal/cancellation. Pending retries retain the first intent.
+    pub fn claim_stop_operation(
+        &self,
+        command_id: &str,
+        generation: u64,
+        request_digest: &str,
+        request_json: &str,
+        intent: &serde_json::Value,
+    ) -> StoreResult<StopOperationClaim> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response(
+            &transaction,
+            command_id,
+            "helper.stop.v1",
+            request_digest,
+            request_json,
+            "helper-stop",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(StopOperationClaim::Committed(response));
+        }
+        let pending: Option<String> = transaction
+            .query_row(
+                "SELECT recovery_json FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        if let Some(pending) = pending {
+            let intent = serde_json::from_str(&pending)
+                .map_err(|e| corrupt(format!("helper-stop intent is invalid: {e}")))?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(StopOperationClaim::Pending(intent));
+        }
+        if generation != self.worker_generation {
+            return Err(stale_generation(generation, self.worker_generation));
+        }
+        claim_pending_receipt(
+            &transaction,
+            command_id,
+            "helper.stop.v1",
+            request_digest,
+            request_json,
+            now_ms()?,
+        )?;
+        let intent_json = serde_json::to_string(intent)
+            .map_err(|e| corrupt(format!("cannot encode helper-stop intent: {e}")))?;
+        transaction
+            .execute(
+                "UPDATE command_receipts SET recovery_json = ?2 WHERE command_id = ?1",
+                params![command_id, intent_json],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(StopOperationClaim::Pending(intent.clone()))
+    }
+
+    pub fn finalize_stop_operation(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+        request_digest: &str,
+        request_json: &str,
+        response: &serde_json::Value,
+    ) -> StoreResult<serde_json::Value> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response(
+            &transaction,
+            command_id,
+            "helper.stop.v1",
+            request_digest,
+            request_json,
+            "helper-stop",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(response);
+        }
+        finalize_command_receipt(
+            &transaction,
+            command_id,
+            session_id.as_str(),
+            None,
+            None,
+            response,
+            now_ms()?,
+            "helper-stop",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(response.clone())
@@ -12561,6 +12702,7 @@ impl Store {
             now,
         )?;
 
+        let was_cancelled = state == RunState::Cancelled;
         let (cancelled, envelope) = cancellation_intent_in_transaction(
             &transaction,
             command,
@@ -12569,6 +12711,12 @@ impl Store {
             branch_id,
             now,
         )?;
+        let delivery_obligations =
+            if was_cancelled || cancelled.status == TurnCancellationStatus::Accepted {
+                reserve_cancelled_parent_deliveries(&transaction, command, now)?
+            } else {
+                Vec::new()
+            };
         finalize_command_receipt(
             &transaction,
             &command.command_id,
@@ -12583,6 +12731,7 @@ impl Store {
         Ok(TurnCancelOutcome::Committed {
             cancelled,
             envelope,
+            delivery_obligations,
         })
     }
 
@@ -12753,6 +12902,11 @@ impl Store {
             .map(|envelope| *envelope)
             .collect::<Vec<_>>();
         envelopes.extend(retract_envelopes);
+        envelopes.extend(reserve_cancelled_parent_deliveries(
+            &transaction,
+            cancel,
+            now,
+        )?);
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(TurnRetractOutcome::Committed {
             retracted,
@@ -15225,6 +15379,91 @@ fn lookup_run_retry_receipt(
                 })?;
     }
     Ok(accepted)
+}
+
+/// The parent cannot become cancelling without durably owing every
+/// uncollected foreground child's result. No hub admission or display list
+/// participates, so graceful drain and crash recovery cannot lose ownership.
+fn reserve_cancelled_parent_deliveries(
+    transaction: &Connection,
+    command: &TurnCancelCommand,
+    now: u64,
+) -> StoreResult<Vec<RawEnvelope>> {
+    use haider_protocol::subagent_stop::{
+        DetachedDeliveryPhaseV1, DetachedDeliveryV1, DetachedReasonV1,
+    };
+    let records = {
+        let mut statement = transaction.prepare_cached(&format!(
+            "{} WHERE parent_session_id = ?1 AND parent_run_id = ?2 ORDER BY created_at_ms, call_id",
+            delegation_select())).map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map(
+                params![command.session_id.as_str(), command.run_id.as_str()],
+                stored_delegation,
+            )
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        rows.into_iter()
+            .map(decode_delegation)
+            .collect::<StoreResult<Vec<_>>>()?
+    };
+    let mut envelopes = Vec::new();
+    for record in records {
+        let background = record
+            .manifest
+            .coordinates
+            .as_ref()
+            .and_then(|c| c.get("background"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if background || record.state == DelegationState::Collected {
+            continue;
+        }
+        let id = format!(
+            "detached-delivery-owed-{}",
+            &stable_digest(&[record.parent_session_id.as_str(), record.agent_id.as_str()])[..24]
+        );
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM events WHERE event_id = ?1",
+                [&id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        if exists {
+            continue;
+        }
+        let item = DetachedDeliveryV1 {
+            agent: record.agent_id,
+            phase: DetachedDeliveryPhaseV1::Owed,
+            reason: DetachedReasonV1::MainStopped,
+        }
+        .to_extension_item()
+        .map_err(|e| corrupt(e.to_string()))?;
+        let mut envelope = unstamped_command_envelope(
+            EventId::new(&id),
+            &command.session_id,
+            record.parent_branch_id,
+            Some(command.run_id.clone()),
+            command.device_id.clone(),
+            command.worker_generation,
+            EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                item_id: haider_protocol::ids::ItemId::new(&id),
+                item,
+            }),
+            PromptRender::Omit,
+        )?;
+        envelope.agent_id = record.parent_agent_id;
+        envelope.render.ui = false;
+        envelopes.push(envelope);
+    }
+    if !envelopes.is_empty() {
+        append_transaction_envelopes(transaction, &command.session_id, now, &mut envelopes)?;
+    }
+    Ok(envelopes)
 }
 
 fn cancellation_intent_in_transaction(

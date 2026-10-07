@@ -252,9 +252,13 @@ impl Connection {
         if self.client.welcome().features.contains(feature) {
             Ok(())
         } else {
-            Err(Failure::protocol(format!(
-                "daemon does not advertise {feature}"
-            )))
+            Err(Failure::protocol(
+                if feature == haider_rpc::FEATURE_HELPER_STOP_V1 {
+                    haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE.to_owned()
+                } else {
+                    format!("daemon does not advertise {feature}")
+                },
+            ))
         }
     }
 
@@ -400,6 +404,7 @@ async fn execute(options: &Options) -> Result<(Value, u8), Failure> {
             }
         }
         ("agent", "cancel") if options.flags.contains_key("--all") => {
+            connection.require(haider_rpc::FEATURE_HELPER_STOP_V1)?;
             // Owner decision 2026-09-25: the explicit "stop all" — every
             // subagent in the session's tree, however deep, including
             // children started by messaged or monitor-woken child turns.
@@ -427,6 +432,9 @@ async fn execute(options: &Options) -> Result<(Value, u8), Failure> {
             }
         }
         ("agent", "message" | "cancel") => {
+            if options.verb == "cancel" {
+                connection.require(haider_rpc::FEATURE_HELPER_STOP_V1)?;
+            }
             connection.require(if options.verb == "message" {
                 haider_rpc::FEATURE_AGENT_MESSAGE_V1
             } else {

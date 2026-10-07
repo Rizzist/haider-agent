@@ -1765,6 +1765,11 @@ fn stop_scope_unsupported_message(
     scope: haider_rpc::RunStopScopeWire,
     error: &HeadlessRunError,
 ) -> Option<String> {
+    if let HeadlessRunError::Ensure(EnsureError::MissingFeatures { missing, .. }) = error
+        && missing.contains(haider_rpc::FEATURE_HELPER_STOP_V1)
+    {
+        return Some(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE.to_owned());
+    }
     let flag = match scope {
         haider_rpc::RunStopScopeWire::Main => "--stop-main",
         haider_rpc::RunStopScopeWire::Subagents => "--stop-subagents",
@@ -3386,6 +3391,23 @@ mod tests {
                     .contains(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1),
                 required,
                 "{scope:?}"
+            );
+        }
+        let unsupported = HeadlessRunError::Ensure(EnsureError::MissingFeatures {
+            missing: std::collections::BTreeSet::from([
+                haider_rpc::FEATURE_HELPER_STOP_V1.to_owned()
+            ]),
+            daemon_version: "old".into(),
+        });
+        for scope in [Scope::All, Scope::Main, Scope::Subagents] {
+            assert!(
+                haider_client::stop_scope_ensure_options(base.clone(), scope)
+                    .required_features
+                    .contains(haider_rpc::FEATURE_HELPER_STOP_V1)
+            );
+            assert_eq!(
+                super::stop_scope_unsupported_message(scope, &unsupported).as_deref(),
+                Some(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE)
             );
         }
         let missing = HeadlessRunError::Ensure(EnsureError::MissingFeatures {

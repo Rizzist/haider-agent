@@ -495,3 +495,101 @@ fn bounded_descendant_reduction_preserves_tree_order_and_truncation() {
     assert_eq!(depth_bounded.descendants[0].direct_child_count, 1);
     assert_eq!(depth_bounded.descendants[1].direct_child_count, 0);
 }
+
+#[test]
+fn cancellation_atomically_reserves_all_foreground_results_before_drain() {
+    use haider_protocol::subagent_stop::DetachedDeliveryV1;
+    use haider_store::{
+        TurnAcceptCommand, TurnCancelCommand, TurnCancelOutcome, TurnRetractCommand,
+        TurnRetractOutcome,
+    };
+    for retract in [false, true] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("store");
+        let parent = SessionId::new("owed-parent");
+        let child = SessionId::new("owed-child");
+        create_session(&store, &parent);
+        create_session(&store, &child);
+        store
+            .accept_turn(&TurnAcceptCommand {
+                command_id: "owed-parent-submit".into(),
+                request_digest: "digest".into(),
+                request_json: "{}".into(),
+                session_id: parent.clone(),
+                worker_generation: store.worker_generation(),
+                run_id: RunId::new("parent-run"),
+                agent_id: None,
+                branch_id: None,
+                text: "parent prompt".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+                queued_event_id: EventId::new("owed-parent-queued"),
+                user_event_id: EventId::new("owed-parent-user"),
+                active_event_id: EventId::new("owed-parent-active"),
+                device_id: DeviceId::new("test"),
+            })
+            .expect("accepted parent before its first response");
+        let requested = record(&parent, &child);
+        store
+            .create_delegation(&requested)
+            .expect("operator child of queued parent");
+        let command = TurnCancelCommand {
+            command_id: "owed-main-stop".into(),
+            request_digest: "digest".into(),
+            request_json: "{}".into(),
+            session_id: parent.clone(),
+            run_id: RunId::new("parent-run"),
+            worker_generation: store.worker_generation(),
+            cancelling_event_id: EventId::new("owed-cancelling"),
+            device_id: DeviceId::new("test"),
+        };
+        let obligations = if retract {
+            let outcome = store
+                .retract_turn(&TurnRetractCommand {
+                    cancel: command,
+                    retracted_event_id: EventId::new("owed-retracted"),
+                })
+                .expect("retract");
+            let TurnRetractOutcome::Committed { envelopes, .. } = outcome else {
+                panic!("fresh retract")
+            };
+            envelopes
+                .into_iter()
+                .filter(|e| e.event_id.as_str().starts_with("detached-delivery-owed-"))
+                .collect::<Vec<_>>()
+        } else {
+            let outcome = store.cancel_turn(&command).expect("cancel");
+            let TurnCancelOutcome::Committed {
+                delivery_obligations,
+                ..
+            } = outcome
+            else {
+                panic!("fresh cancel")
+            };
+            delivery_obligations
+        };
+        assert_eq!(obligations.len(), 1);
+        let event = obligations[0].payload.decode_event().expect("event");
+        let EventPayload::Item(haider_protocol::item::ItemEvent::Completed { item, .. }) = event
+        else {
+            panic!("item")
+        };
+        assert_eq!(
+            DetachedDeliveryV1::from_extension_item(&item)
+                .expect("obligation")
+                .agent,
+            requested.agent_id
+        );
+        assert_eq!(
+            store.latest_seq(&parent).expect("durable head"),
+            obligations[0].seq
+        );
+        drop(store);
+        let store = Store::open(root.path()).expect("restart immediately after acceptance");
+        let page = store.read(&parent, 0, 100).expect("recovery journal");
+        assert!(
+            page.iter()
+                .any(|event| event.event_id == obligations[0].event_id)
+        );
+    }
+}

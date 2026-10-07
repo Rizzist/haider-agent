@@ -14,8 +14,8 @@
 //!   walks the delegation tree by SESSION, so children spawned in later runs
 //!   (messaged `run-child-message-*` runs, monitor-woken subturns) are
 //!   reached. It is unbounded in depth, cycle-safe through a seen-set, removes
-//!   every descendant session's monitors, and repeats until a pass finds
-//!   nothing live.
+//!   every descendant session's monitors. Public operations durably claim
+//!   exact run and monitor incarnations; replay never retargets later work.
 
 use super::*;
 use crate::monitor_stop_fence::MonitorStopFence;
@@ -128,7 +128,82 @@ fn is_background_record(record: &DelegationRecord) -> bool {
         == Some(true)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StopIncarnation {
+    pub(crate) session_id: SessionId,
+    pub(crate) runs: Vec<RunId>,
+    pub(crate) monitors: Vec<String>,
+}
+
 impl DelegationHandle {
+    pub(crate) async fn stop_incarnations(
+        &self,
+        root: &SubagentTreeRoot,
+        admission: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<Vec<StopIncarnation>, HaiderError> {
+        // Root run IDs are causal anchors, not cancellation targets. A child
+        // registered by one of these runs while the stop is in flight belongs
+        // to this intent; a child registered by a later run does not.
+        let mut anchor = match root {
+            SubagentTreeRoot::Run { session_id, run_id } => StopIncarnation {
+                session_id: session_id.clone(),
+                runs: vec![run_id.clone()],
+                monitors: Vec::new(),
+            },
+            SubagentTreeRoot::Session(session_id) => {
+                self.session_stop_incarnation(session_id, admission).await?
+            }
+        };
+        anchor.monitors.clear();
+        let mut targets = vec![anchor];
+        for record in self.walk_tree(root).await? {
+            targets.push(self.delegation_stop_incarnation(&record, admission).await?);
+        }
+        Ok(targets)
+    }
+
+    pub(crate) async fn delegation_stop_incarnation(
+        &self,
+        record: &DelegationRecord,
+        admission: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<StopIncarnation, HaiderError> {
+        let mut target = self
+            .session_stop_incarnation(&record.child_session_id, admission)
+            .await?;
+        // Registration precedes child turn acceptance. That stable original
+        // run belongs to the intent even before it has a journal head.
+        if !target.runs.contains(&record.child_run_id) {
+            target.runs.push(record.child_run_id.clone());
+            target.runs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        }
+        Ok(target)
+    }
+
+    pub(crate) async fn session_stop_incarnation(
+        &self,
+        session: &SessionId,
+        admission: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<StopIncarnation, HaiderError> {
+        let mut runs = self
+            .child_session_snapshot(session)
+            .await?
+            .states
+            .into_keys()
+            .collect::<Vec<_>>();
+        runs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let monitors = self
+            .hub
+            .inner_monitor()
+            .stop_monitor_ids(&self.hub, session, admission)
+            .await
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), true))?;
+        Ok(StopIncarnation {
+            session_id: session.clone(),
+            runs,
+            monitors,
+        })
+    }
+
     /// Nonterminal runs of a session that a cancel can still move: every run
     /// that is neither terminal nor already cancelling, including queued and
     /// later (messaged or monitor-woken) runs.
@@ -222,15 +297,27 @@ impl DelegationHandle {
     /// the cancelled runs settled and a final monitor drain ran (Astra
     /// 13-final B1): no run being stopped can leave a monitor behind that
     /// later restarts stopped work.
+    #[cfg(test)]
     pub(crate) async fn stop_subagent_tree(
         &self,
         root: SubagentTreeRoot,
         command_prefix: &str,
     ) -> Result<SubagentStopSummary, HaiderError> {
+        self.stop_subagent_tree_incarnations(root, command_prefix, None)
+            .await
+    }
+
+    pub(crate) async fn stop_subagent_tree_incarnations(
+        &self,
+        root: SubagentTreeRoot,
+        command_prefix: &str,
+        incarnations: Option<&[StopIncarnation]>,
+    ) -> Result<SubagentStopSummary, HaiderError> {
         let monitor = self.hub.inner_monitor();
         let fences = monitor.stop_fences().clone();
         let mut summary = SubagentStopSummary::default();
         let mut held = HashMap::<SessionId, MonitorStopFence>::new();
+        let mut claimed = incarnations.map(<[StopIncarnation]>::to_vec);
         // Every run this request moved to cancelling, plus any run found
         // already cancelling in the tree: the stop converges all of them.
         let mut moved = Vec::<(SessionId, RunId)>::new();
@@ -244,6 +331,26 @@ impl DelegationHandle {
                     .max(u64::try_from(visited.len()).unwrap_or(u64::MAX));
                 let mut cancelled_this_pass = 0_u64;
                 for record in &visited {
+                    if let Some(claimed) = &mut claimed
+                        && !claimed
+                            .iter()
+                            .any(|target| target.session_id == record.child_session_id)
+                    {
+                        if !claimed.iter().any(|target| {
+                            target.session_id == record.parent_session_id
+                                && target.runs.contains(&record.parent_run_id)
+                        }) {
+                            continue;
+                        }
+                        // The delegation's original run is a stable child of
+                        // an already claimed run. Do not capture later message
+                        // runs that arrived before this walk discovered it.
+                        claimed.push(StopIncarnation {
+                            session_id: record.child_session_id.clone(),
+                            runs: vec![record.child_run_id.clone()],
+                            monitors: Vec::new(),
+                        });
+                    }
                     // Fence, then drain monitors, before any cancel: a
                     // monitor must not wake a session the same pass is about
                     // to stop, and no new one can be registered meanwhile.
@@ -253,12 +360,17 @@ impl DelegationHandle {
                         entry.insert(fences.fence(&record.child_session_id));
                         summary.monitors_removed = summary.monitors_removed.saturating_add(
                             monitor
-                                .remove_all_for_stop(
+                                .remove_for_stop_incarnation(
                                     &self.hub,
                                     &record.child_session_id,
                                     command_prefix,
+                                    claimed.as_deref().and_then(|targets| {
+                                        targets.iter().find(|target| {
+                                            target.session_id == record.child_session_id
+                                        })
+                                    }),
                                 )
-                                .await,
+                                .await?,
                         );
                         #[cfg(all(test, unix))]
                         first_drain_test_pause(&record.child_session_id, "tree").await;
@@ -267,7 +379,9 @@ impl DelegationHandle {
                         .child_session_snapshot(&record.child_session_id)
                         .await?;
                     for (run_id, state) in &snapshot.states {
-                        if *state == RunState::Cancelling {
+                        if *state == RunState::Cancelling
+                            && stop_owns_run(claimed.as_deref(), &record.child_session_id, run_id)
+                        {
                             let key = (record.child_session_id.clone(), run_id.clone());
                             if !targets.contains(&key) {
                                 targets.push(key);
@@ -275,6 +389,9 @@ impl DelegationHandle {
                         }
                     }
                     for run_id in self.live_session_runs(&record.child_session_id).await? {
+                        if !stop_owns_run(claimed.as_deref(), &record.child_session_id, &run_id) {
+                            continue;
+                        }
                         let command = stop_cancel_command(
                             &self.hub,
                             record,
@@ -318,15 +435,35 @@ impl DelegationHandle {
             for session in held.keys() {
                 summary.monitors_removed = summary.monitors_removed.saturating_add(
                     monitor
-                        .remove_all_for_stop(&self.hub, session, command_prefix)
-                        .await,
+                        .remove_for_stop_incarnation(
+                            &self.hub,
+                            session,
+                            command_prefix,
+                            claimed.as_deref().and_then(|targets| {
+                                targets.iter().find(|target| &target.session_id == session)
+                            }),
+                        )
+                        .await?,
                 );
                 still_live |= !self.live_session_runs(session).await?.is_empty();
             }
-            // A run admitted meanwhile (for example a message to a stopped
-            // subagent) is cancelled by another round; a run that could not
-            // be cancelled at all is reported, not retried forever.
-            if !still_live || cancelled_this_round == 0 {
+            // Repeat convergence only for the claimed incarnations. Later
+            // messaged runs remain independent and are reported truthfully;
+            // they must never become targets of this earlier intent.
+            let late_descendant = if let Some(claimed) = &claimed {
+                self.walk_tree(&root).await?.iter().any(|record| {
+                    !claimed
+                        .iter()
+                        .any(|target| target.session_id == record.child_session_id)
+                        && claimed.iter().any(|target| {
+                            target.session_id == record.parent_session_id
+                                && target.runs.contains(&record.parent_run_id)
+                        })
+                })
+            } else {
+                false
+            };
+            if !late_descendant && (!still_live || cancelled_this_round == 0) {
                 break;
             }
         }
@@ -554,11 +691,23 @@ impl DelegationHandle {
     /// first durable effect, so a refused primary leaves nothing changed.
     /// Monitors are removed only after it, and a final drain runs once the
     /// cancelled runs settled (B1).
+    #[cfg(test)]
     pub(crate) async fn cancel_single_subagent(
         &self,
         record: &DelegationRecord,
         primary: TurnCancelCommand,
         command_prefix: &str,
+    ) -> Result<haider_core::CancelledTurn, HaiderError> {
+        self.cancel_single_subagent_incarnation(record, primary, command_prefix, None)
+            .await
+    }
+
+    pub(crate) async fn cancel_single_subagent_incarnation(
+        &self,
+        record: &DelegationRecord,
+        primary: TurnCancelCommand,
+        command_prefix: &str,
+        incarnation: Option<StopIncarnation>,
     ) -> Result<haider_core::CancelledTurn, HaiderError> {
         let monitor = self.hub.inner_monitor();
         let fences = monitor.stop_fences().clone();
@@ -569,11 +718,19 @@ impl DelegationHandle {
             fences.mark_run_stopped(&record.child_session_id, &primary_run);
         }
         let monitors_removed = monitor
-            .remove_all_for_stop(&self.hub, &record.child_session_id, command_prefix)
-            .await;
+            .remove_for_stop_incarnation(
+                &self.hub,
+                &record.child_session_id,
+                command_prefix,
+                incarnation.as_ref(),
+            )
+            .await?;
         #[cfg(all(test, unix))]
         first_drain_test_pause(&record.child_session_id, "named").await;
-        for cancelled in self.cancel_live_runs(record, command_prefix).await? {
+        for cancelled in self
+            .cancel_live_runs(record, command_prefix, incarnation.as_ref())
+            .await?
+        {
             // The original run finished earlier; report the later run this
             // request actually stopped.
             if primary_result.status == haider_core::TurnCancellationStatus::AlreadyTerminal {
@@ -593,7 +750,7 @@ impl DelegationHandle {
         let command_prefix = command_prefix.to_owned();
         tokio::spawn(async move {
             if let Err(error) = coordinator
-                .settle_named_cancel(&record, &command_prefix)
+                .settle_named_cancel(&record, &command_prefix, incarnation.as_ref())
                 .await
             {
                 tracing::warn!(?error, "named subagent cancellation did not converge");
@@ -609,12 +766,16 @@ impl DelegationHandle {
         &self,
         record: &DelegationRecord,
         command_prefix: &str,
+        incarnation: Option<&StopIncarnation>,
     ) -> Result<Vec<haider_core::CancelledTurn>, HaiderError> {
         let fences = self.hub.inner_monitor().stop_fences().clone();
         let mut accepted = Vec::new();
         loop {
             let mut this_pass = 0_usize;
             for run_id in self.live_session_runs(&record.child_session_id).await? {
+                if incarnation.is_some_and(|target| !target.runs.contains(&run_id)) {
+                    continue;
+                }
                 let command =
                     stop_cancel_command(&self.hub, record, &run_id, command_prefix, "manual")?;
                 let cancelled = self.hub.cancel_internal_turn(command).await?;
@@ -636,6 +797,7 @@ impl DelegationHandle {
         &self,
         record: &DelegationRecord,
         command_prefix: &str,
+        incarnation: Option<&StopIncarnation>,
     ) -> Result<(), HaiderError> {
         loop {
             let targets = self
@@ -643,16 +805,24 @@ impl DelegationHandle {
                 .await?
                 .states
                 .into_iter()
-                .filter(|(_, state)| *state == RunState::Cancelling)
+                .filter(|(run, state)| {
+                    *state == RunState::Cancelling
+                        && incarnation.is_none_or(|target| target.runs.contains(run))
+                })
                 .map(|(run_id, _)| (record.child_session_id.clone(), run_id))
                 .collect::<Vec<_>>();
             self.converge_cancelled_runs(&targets).await?;
             self.hub
                 .inner_monitor()
-                .remove_all_for_stop(&self.hub, &record.child_session_id, command_prefix)
-                .await;
+                .remove_for_stop_incarnation(
+                    &self.hub,
+                    &record.child_session_id,
+                    command_prefix,
+                    incarnation,
+                )
+                .await?;
             if self
-                .cancel_live_runs(record, command_prefix)
+                .cancel_live_runs(record, command_prefix, incarnation)
                 .await?
                 .is_empty()
             {
@@ -1407,5 +1577,17 @@ fn parent_fact_envelope(
             prompt,
         },
         payload: payload.into(),
+    })
+}
+
+fn stop_owns_run(
+    incarnations: Option<&[StopIncarnation]>,
+    session: &SessionId,
+    run: &RunId,
+) -> bool {
+    incarnations.is_none_or(|targets| {
+        targets
+            .iter()
+            .any(|target| &target.session_id == session && target.runs.contains(run))
     })
 }

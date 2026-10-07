@@ -950,3 +950,235 @@ fn verifier_delete_keeps_monitor_fence_until_cache_eviction() {
     drop(root);
     });
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_report_stop_epoch_dismissal_survives_fence_release_and_replay() {
+    let world = MonitorWorld::new("completion-direct-epoch").await;
+    let mut report = test_report(
+        "direct-epoch-report",
+        "old direct observation",
+        MonitorReportStatus::Matched,
+    );
+    report.session_id = world.session.clone();
+    let (arrived, resume) = crate::completion::astra22_boundary_hook::install(&world.session);
+    let hub = world.hub.clone();
+    let pending_report = report.clone();
+    let wake = tokio::spawn(async move { hub.wake_monitor_report(pending_report).await });
+    tokio::time::timeout(std::time::Duration::from_secs(20), arrived)
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let monitor = world.hub.inner_monitor();
+        let _admission = monitor.admission_lock().await;
+        let fence = monitor.stop_fences().fence(&world.session);
+        drop(fence);
+    }
+    resume.send(()).unwrap();
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(20), wake)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(receipt.durable);
+    assert!(!receipt.handed_off);
+    assert_eq!(receipt.disposition, "follow_up_pending");
+    world.hub.inner_monitor().completion_cache().await.clear();
+    let replay = world.hub.wake_monitor_report(report.clone()).await.unwrap();
+    assert!(!replay.handed_off);
+    let journal = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    assert!(journal.projection.is_settled("monitor:direct-epoch-report"));
+    assert!(!journal.events.iter().any(|event| matches!(event,
+        haider_protocol::completion::CompletionEvent::CompletionAdmitted { obligation_id, .. }
+            if obligation_id == "monitor:direct-epoch-report"
+    )));
+    assert!(
+        world
+            .store
+            .read(&world.session, 0, 256)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| !event.event_id.as_str().starts_with("monitor-user-"))
+    );
+    world.hub.inner_monitor().shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn follow_up_waiting_on_completion_does_not_block_registry_operations() {
+    let world = MonitorWorld::new("completion-lock-order").await;
+    let id = pending_task(&world).await;
+    let monitor = world.hub.inner_monitor();
+    let completion = monitor.completion_lock().await;
+    let (arrived, resume) = crate::completion::astra22_boundary_hook::install(&world.session);
+    let hub = world.hub.clone();
+    let lease = world.lease.clone();
+    let coordinates = world.coordinates("dismiss-during-wake");
+    let control = tokio::spawn(async move {
+        hub.execute_monitor_tool(
+            &lease,
+            coordinates,
+            MonitorRequest::FollowUp {
+                obligation_id: id,
+                action: CompletionControl::Dismiss,
+                attempt: 0,
+                evidence_event_ids: Vec::new(),
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(20), arrived)
+        .await
+        .unwrap()
+        .unwrap();
+    let listed = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        monitor.client_list(&world.hub, world.session.clone()),
+    )
+    .await
+    .expect("registry listing must finish while completion is held");
+    assert!(matches!(
+        listed.outcome,
+        haider_rpc::MonitorListOutcomeWire::Listed { .. }
+    ));
+    resume.send(()).unwrap();
+    drop(completion);
+    tokio::time::timeout(std::time::Duration::from_secs(20), control)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::completion::load(&world.hub, &world.session)
+            .await
+            .unwrap()
+            .projection
+            .is_settled("task:completion-task")
+    );
+    monitor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_dismisses_expired_monitor_follow_up_before_cold_projection_resume() {
+    for run_bound in [true, false] {
+        let label = format!("completion-expired-stop-run-bound-{run_bound}");
+        let world = MonitorWorld::new(&label).await;
+        let monitor = world.hub.inner_monitor();
+        let completion = monitor.completion_lock().await;
+        let mut report = test_report(
+            "expired-stop-report",
+            "old one-shot report",
+            MonitorReportStatus::Matched,
+        );
+        report.session_id = world.session.clone();
+        report.occurrence = MonitorOccurrence::Once;
+        let mut registered = registration(None);
+        registered.owner_session_id = world.session.clone();
+        registered.monitor_id = report.monitor_id.clone();
+        world
+            .lease
+            .append(&mut [monitor_envelope(
+                &world.session,
+                if run_bound { Some(&world.run) } else { None },
+                None,
+                None,
+                "expired-monitor-registration",
+                world.hub.device_id(),
+                world.hub.worker_generation(),
+                MonitorJournalEvent::MonitorRegistered {
+                    registration: registered,
+                }
+                .to_value()
+                .unwrap(),
+            )])
+            .await
+            .unwrap();
+        observe_monitor(&world, report.clone()).await;
+        world
+            .lease
+            .append(&mut [monitor_envelope(
+                &world.session,
+                if run_bound { Some(&world.run) } else { None },
+                None,
+                None,
+                "expired-monitor-auto-removal",
+                world.hub.device_id(),
+                world.hub.worker_generation(),
+                MonitorJournalEvent::MonitorRemoved {
+                    monitor_id: report.monitor_id.clone(),
+                    reason: MonitorRemovalReason::OneShotComplete,
+                    removed_at_ms: now_ms(),
+                }
+                .to_value()
+                .unwrap(),
+            )])
+            .await
+            .unwrap();
+        let listed = monitor.client_list(&world.hub, world.session.clone()).await;
+        assert!(
+            matches!(listed.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.is_empty())
+        );
+        assert!(
+            !crate::completion::load(&world.hub, &world.session)
+                .await
+                .unwrap()
+                .projection
+                .is_settled("monitor:expired-stop-report")
+        );
+        let admission = monitor.admission_lock().await;
+        let captured_monitors = monitor
+            .stop_monitor_ids(&world.hub, &world.session, &admission)
+            .await
+            .unwrap();
+        if !run_bound {
+            assert!(captured_monitors.contains(&report.monitor_id));
+        }
+        drop(admission);
+        let incarnation = crate::delegation::StopIncarnation {
+            session_id: world.session.clone(),
+            runs: vec![world.run.clone()],
+            monitors: if run_bound {
+                Vec::new()
+            } else {
+                captured_monitors
+            },
+        };
+        assert_eq!(
+            monitor
+                .remove_for_stop_incarnation(
+                    &world.hub,
+                    &world.session,
+                    "expired-stop",
+                    Some(&incarnation)
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        drop(completion);
+        monitor.completion_cache().await.clear();
+        let receipt = world.hub.wake_monitor_report(report).await.unwrap();
+        assert!(receipt.durable && !receipt.handed_off);
+        assert!(
+            crate::completion::load(&world.hub, &world.session)
+                .await
+                .unwrap()
+                .projection
+                .is_settled("monitor:expired-stop-report")
+        );
+        assert!(
+            world
+                .store
+                .read(&world.session, 0, 256)
+                .await
+                .unwrap()
+                .iter()
+                .all(|event| !event.event_id.as_str().starts_with("monitor-user-"))
+        );
+        monitor.shutdown().await.unwrap();
+    }
+}

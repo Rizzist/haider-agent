@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 struct FenceState {
     sessions: HashMap<SessionId, usize>,
     stopped_runs: HashSet<(SessionId, RunId)>,
+    epochs: HashMap<SessionId, u64>,
 }
 
 /// Shared fence registry owned by the monitor service.
@@ -41,11 +42,19 @@ impl MonitorStopFences {
     pub(crate) fn fence(&self, session: &SessionId) -> MonitorStopFence {
         self.with(|state| {
             *state.sessions.entry(session.clone()).or_default() += 1;
+            let epoch = state.epochs.entry(session.clone()).or_default();
+            *epoch = epoch.saturating_add(1);
         });
         MonitorStopFence {
             fences: self.clone(),
             session: session.clone(),
         }
+    }
+
+    /// Captured before a wake reads its source; a completed stop still changes
+    /// this token after its temporary fence has dropped.
+    pub(crate) fn epoch(&self, session: &SessionId) -> u64 {
+        self.with(|state| state.epochs.get(session).copied().unwrap_or_default())
     }
 
     /// True while a stop of `session` is in progress.

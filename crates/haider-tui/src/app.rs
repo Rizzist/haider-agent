@@ -1670,6 +1670,9 @@ pub struct ChipModel {
     /// truth; `None` (older daemon, demo seeds) never joins — a figure is
     /// never guessed off another row.
     pub child_session: Option<String>,
+    /// Sealed child head that supplied this chip's state. Parent chip events
+    /// have no child-run identity, so they cannot supersede this truth.
+    pub state_child_head_seq: Option<u64>,
     /// Exact daemon-advertised parent handoff path. Display code may name
     /// its final directory component but never re-derive it.
     pub handoff_dir: Option<String>,
@@ -1753,6 +1756,7 @@ impl ChipModel {
             // simply shows no elapsed. The demo driver's LIVE ChipAdd arm
             // stamps `spawned_at_ms` at creation instead.
             child_session: None,
+            state_child_head_seq: None,
             handoff_dir: None,
             spawned_at_ms: None,
             last_event_at_ms: None,
@@ -1771,7 +1775,7 @@ impl ChipModel {
     /// cut 2). The manifest is the ONLY source: `callsign` is display-only
     /// identity (§5.1 — never an address), `model_profile` is the model
     /// line. Placement is local-only. The chip starts IDLE because
-    /// `AgentChipState` is the sole chip-state authority; nothing here
+    /// state comes from committed chip events or child snapshots; nothing here
     /// guesses at a running state the stream has not reported.
     #[must_use]
     pub fn from_manifest(manifest: &haider_protocol::agent::AgentManifest) -> Self {
@@ -1816,6 +1820,7 @@ impl ChipModel {
                 .and_then(|coordinates| coordinates.get("child_session_id"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            state_child_head_seq: None,
             handoff_dir: manifest
                 .coordinates
                 .as_ref()
@@ -1857,7 +1862,11 @@ impl ChipModel {
     /// `chipIsLive` (tui.js:286): not closed, state ∉ {done, error}.
     #[must_use]
     pub fn is_live(&self) -> bool {
-        !self.closed && !matches!(self.state, ChipDisplayState::Done | ChipDisplayState::Error)
+        !self.closed
+            && !matches!(
+                self.state,
+                ChipDisplayState::Done | ChipDisplayState::Error | ChipDisplayState::Cancelled
+            )
     }
 
     /// S4: this chip's clock is stopped — closed, or a terminal state.
@@ -1965,6 +1974,9 @@ impl ChipModel {
                 "child"
             };
             return format!("waiting on {live_children} {plural}");
+        }
+        if self.state == ChipDisplayState::Cancelled {
+            return "cancelled".to_owned();
         }
         if self.state == ChipDisplayState::Done {
             return "report ready".to_owned();
@@ -2179,7 +2191,7 @@ pub fn login_recovery(code: &str, message: &str) -> String {
 
 /// The transcript note one `AgentReport` becomes (W3c3, report R11 cut 2:
 /// "maps `AgentReport` only to report summary/verification content" —
-/// never to chip STATE, which stays `AgentChipState`'s alone). The
+/// never to chip STATE, which comes from committed state facts). The
 /// vocabulary matches the `ChildResult` row the transcript already renders
 /// (`render.rs`: `└ subagent report — {summary}`).
 #[must_use]
@@ -8096,9 +8108,7 @@ impl AppModel {
         if self.fleet.kill_armed.as_ref() != Some(&agent) {
             let label = self.fleet_member_label(&agent);
             self.fleet.kill_armed = Some(agent);
-            self.flash = Some(format!(
-                "· destroy {label} only? its subagents keep running — press d again to confirm"
-            ));
+            self.flash = Some(format!("· d confirms · esc cancels — end {label} only?"));
             return;
         }
         self.fleet.kill_armed = None;
@@ -8124,6 +8134,8 @@ impl AppModel {
                 agent: agent.as_str().to_owned(),
             });
             self.flash = Some(format!("· destroying {label} — its row reads ⊘ cancelled"));
+        } else if !self.daemon_serves(haider_rpc::FEATURE_HELPER_STOP_V1) {
+            self.flash = Some(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE.to_owned());
         } else if self.daemon_serves(haider_rpc::FEATURE_AGENT_CANCEL_V1) {
             self.requests.push(AppRequest::AgentCancel {
                 agent: agent.as_str().to_owned(),
@@ -8243,6 +8255,37 @@ impl AppModel {
             .is_some_and(|active| active != &snapshot.session_id)
         {
             return;
+        }
+        for row in crate::fleet::flatten(&snapshot.roots) {
+            let node = row.node;
+            let Some(chip) = find_chip_mut(&mut self.chips, node.agent_id.as_str()) else {
+                continue;
+            };
+            if chip.child_session.as_deref() != Some(node.session_id.as_str()) {
+                continue;
+            }
+            let Some(metrics) = &node.metrics else {
+                continue;
+            };
+            if chip
+                .metrics
+                .as_ref()
+                .is_some_and(|current| current.head_seq > metrics.head_seq)
+            {
+                continue;
+            }
+            chip.metrics = Some(metrics.clone());
+            let state = match node.state {
+                haider_rpc::FleetAgentStateWire::Queued => ChipDisplayState::Idle,
+                haider_rpc::FleetAgentStateWire::Live => ChipDisplayState::Thinking,
+                haider_rpc::FleetAgentStateWire::Waiting => ChipDisplayState::Waiting,
+                haider_rpc::FleetAgentStateWire::Done => ChipDisplayState::Done,
+                haider_rpc::FleetAgentStateWire::Failed => ChipDisplayState::Error,
+                haider_rpc::FleetAgentStateWire::Cancelled => ChipDisplayState::Cancelled,
+                _ => continue,
+            };
+            chip.state_child_head_seq = Some(metrics.head_seq);
+            chip.set_state_at(state, snapshot.generated_at_ms);
         }
         self.fleet.snapshot = Some(snapshot);
         self.fleet.fetching = false;

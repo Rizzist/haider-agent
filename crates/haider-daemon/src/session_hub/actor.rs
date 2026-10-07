@@ -1318,34 +1318,41 @@ pub(super) async fn run_session_actor(
                 // states, so a missed wake delays reconciliation, not truth.
                 let result = store.cancel_turn(command).await;
                 if let Ok(TurnCancelOutcome::Committed {
-                    envelope: Some(envelope),
+                    envelope,
+                    delivery_obligations,
                     ..
                 }) = &result
                 {
-                    head = envelope.seq;
-                    authority_epoch = envelope.authority_epoch;
-                    observer.observe(HubObservation::Persisted {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                    publish(
-                        &mut attachments,
-                        std::slice::from_ref(envelope.as_ref()),
-                        catch_up_byte_budget,
-                        &metrics,
-                        &hooks,
-                    );
-                    observer.observe(HubObservation::Published {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                    if let Some(wake) = worker
-                        .as_ref()
-                        .and_then(|worker| worker.cancellation_wake.as_ref())
-                    {
-                        wake.send_modify(|generation| {
-                            *generation = generation.saturating_add(1);
+                    let mut published = Vec::new();
+                    if let Some(envelope) = envelope {
+                        published.push(envelope.as_ref().clone());
+                    }
+                    published.extend(delivery_obligations.iter().cloned());
+                    if let Some(last) = published.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                        observer.observe(HubObservation::Persisted {
+                            session_id: session_id.clone(),
+                            through_seq: head,
                         });
+                        publish(
+                            &mut attachments,
+                            &published,
+                            catch_up_byte_budget,
+                            &metrics,
+                            &hooks,
+                        );
+                        observer.observe(HubObservation::Published {
+                            session_id: session_id.clone(),
+                            through_seq: head,
+                        });
+                    }
+                    if envelope.is_some()
+                        && let Some(wake) = worker
+                            .as_ref()
+                            .and_then(|worker| worker.cancellation_wake.as_ref())
+                    {
+                        wake.send_modify(|generation| *generation = generation.saturating_add(1));
                     }
                 }
                 let _ = completed.send(result);

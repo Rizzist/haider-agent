@@ -981,6 +981,8 @@ struct HubInner {
     /// resume and a concurrent registration from both executing the same
     /// already-Installing item before either reaches its post-effect CAS.
     typed_install_serial: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes public stop claims and execution across all connections.
+    stop_operations: tokio::sync::Mutex<()>,
     /// Orders native workflow selection against every run admission. RPC pin
     /// and switch hold this through their idle check and commit; turn, retry,
     /// shell, and manual-compaction admission hold it until the nonterminal
@@ -2499,6 +2501,7 @@ impl SessionHub {
             actor_tasks: Mutex::new(Vec::new()),
             shell_registry_events_cancel,
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
+            stop_operations: tokio::sync::Mutex::new(()),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
             run_budget_coordinators: Mutex::new(HashMap::new()),
             checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
@@ -4648,60 +4651,6 @@ impl SessionHub {
                 command_id.as_str().to_owned(),
                 session_id.clone(),
                 accepted_seq,
-                response,
-            )
-            .await
-    }
-
-    pub(crate) async fn subagent_stop_receipt(
-        &self,
-        command_id: &haider_rpc::CommandId,
-        request_digest: &str,
-        request_json: &str,
-    ) -> Result<Option<serde_json::Value>, HaiderError> {
-        self.inner
-            .store
-            .subagent_stop_receipt(
-                command_id.as_str().to_owned(),
-                request_digest.to_owned(),
-                request_json.to_owned(),
-            )
-            .await
-    }
-
-    pub(crate) async fn claim_subagent_stop_receipt(
-        &self,
-        command_id: &haider_rpc::CommandId,
-        worker_generation: u64,
-        request_digest: &str,
-        request_json: &str,
-    ) -> Result<haider_core::SubagentStopClaim, HaiderError> {
-        self.inner
-            .store
-            .claim_subagent_stop_receipt(
-                command_id.as_str().to_owned(),
-                worker_generation,
-                request_digest.to_owned(),
-                request_json.to_owned(),
-            )
-            .await
-    }
-
-    pub(crate) async fn finalize_subagent_stop_receipt(
-        &self,
-        command_id: &haider_rpc::CommandId,
-        session_id: &SessionId,
-        request_digest: &str,
-        request_json: &str,
-        response: serde_json::Value,
-    ) -> Result<serde_json::Value, HaiderError> {
-        self.inner
-            .store
-            .finalize_subagent_stop_receipt(
-                command_id.as_str().to_owned(),
-                session_id.clone(),
-                request_digest.to_owned(),
-                request_json.to_owned(),
                 response,
             )
             .await

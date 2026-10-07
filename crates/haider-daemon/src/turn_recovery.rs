@@ -968,10 +968,165 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
         }
         visitor.finish_session(store, &session_id).await?;
     }
+    // Reconstruct missing ownership from cancelled parent/delegation truth,
+    // independent of the reducer checkpoint (terminal runs can be pruned).
+    // This also repairs a prior daemon's drain window and a worker's direct
+    // shutdown cancellation that did not go through the public cancel RPC.
+    let mut rearmed = recovered
+        .iter()
+        .filter_map(|work| match work {
+            RecoveredWork::DetachedChildren(children) => {
+                Some(children.agents.iter().map(|(agent, _)| agent.clone()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect::<HashSet<_>>();
+    for parent in store.session_ids().await? {
+        let mut checked = HashSet::new();
+        let mut stopped = HashSet::new();
+        let mut reserved = HashSet::new();
+        let mut truth = None;
+        let mut agents = Vec::new();
+        for record in store.delegations_for_parent_session(parent.clone()).await? {
+            let background = record
+                .manifest
+                .coordinates
+                .as_ref()
+                .and_then(|c| c.get("background"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            if background || record.state == haider_core::DelegationState::Collected {
+                continue;
+            }
+            if checked.insert(record.parent_run_id.clone())
+                && matches!(
+                    latest_run_state(
+                        store,
+                        &parent,
+                        &record.parent_run_id,
+                        record.parent_branch_id.as_ref()
+                    )
+                    .await?,
+                    Some(RunState::Cancelling | RunState::Cancelled)
+                )
+            {
+                stopped.insert(record.parent_run_id.clone());
+            }
+            if !stopped.contains(&record.parent_run_id) {
+                continue;
+            }
+            if truth.is_none() {
+                truth = Some(cancelled_parent_delivery_truth(store, &parent).await?);
+            }
+            let (owed, done) = truth.as_ref().ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "cancelled parent delivery truth is unavailable",
+                    true,
+                )
+            })?;
+            if done.contains(&record.agent_id) {
+                continue;
+            }
+            if !owed.contains_key(&record.agent_id) && reserved.insert(record.parent_run_id.clone())
+            {
+                let json = serde_json::json!({"session": parent, "run": record.parent_run_id,
+                        "reason": "recover-foreground-delivery"})
+                .to_string();
+                let outcome = store
+                    .cancel_turn(haider_core::TurnCancelCommand {
+                        command_id: format!(
+                            "recover-delivery-{}-{}-{}",
+                            parent,
+                            record.parent_run_id,
+                            store.worker_generation()
+                        ),
+                        request_digest: blake3::hash(json.as_bytes()).to_hex().to_string(),
+                        request_json: json,
+                        session_id: parent.clone(),
+                        run_id: record.parent_run_id.clone(),
+                        worker_generation: store.worker_generation(),
+                        device_id: device_id.clone(),
+                        cancelling_event_id: EventId::new(format!(
+                            "recover-delivery-cancelling-{}-{}",
+                            parent, record.parent_run_id
+                        )),
+                    })
+                    .await?;
+                if matches!(outcome, haider_core::TurnCancelOutcome::Committed { ref delivery_obligations, .. } if !delivery_obligations.is_empty())
+                    && !touched_sessions.contains(&parent)
+                {
+                    touched_sessions.push(parent.clone());
+                }
+            }
+            if rearmed.insert(record.agent_id.clone()) {
+                agents.push((
+                    record.agent_id.clone(),
+                    owed.get(&record.agent_id)
+                        .copied()
+                        .unwrap_or(haider_protocol::subagent_stop::DetachedReasonV1::MainStopped),
+                ));
+            }
+        }
+        if !agents.is_empty() {
+            recovered.push(RecoveredWork::DetachedChildren(RecoveredDetachedChildren {
+                agents,
+            }));
+        }
+    }
     Ok(StartupTurnRecovery {
         work: recovered,
         touched_sessions,
     })
+}
+
+/// Full durable terminal-delivery truth, independent of pruned run checkpoints.
+async fn cancelled_parent_delivery_truth(
+    store: &SqliteStoreHandle,
+    parent: &SessionId,
+) -> Result<
+    (
+        HashMap<AgentId, haider_protocol::subagent_stop::DetachedReasonV1>,
+        HashSet<AgentId>,
+    ),
+    HaiderError,
+> {
+    use haider_protocol::subagent_stop::{
+        DetachedChildResultV1, DetachedDeliveryPhaseV1, DetachedDeliveryV1,
+    };
+    let mut cursor = 0;
+    let mut owed = HashMap::new();
+    let mut done = HashSet::new();
+    loop {
+        let page = store.read(parent, cursor, PAGE_SIZE).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |event| event.seq);
+        for event in page {
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                event.payload.decode_event()
+            else {
+                continue;
+            };
+            if let Some(result) = DetachedChildResultV1::from_extension_item(&item) {
+                done.insert(result.agent);
+            } else if let TurnItem::ChildResult { report } = &item {
+                done.insert(report.agent.clone());
+            } else if let Some(delivery) = DetachedDeliveryV1::from_extension_item(&item) {
+                match delivery.phase {
+                    DetachedDeliveryPhaseV1::Owed => {
+                        owed.entry(delivery.agent).or_insert(delivery.reason);
+                    }
+                    DetachedDeliveryPhaseV1::Settled => {
+                        done.insert(delivery.agent);
+                    }
+                }
+            }
+        }
+    }
+    Ok((owed, done))
 }
 
 async fn load_recovery_checkpoint(

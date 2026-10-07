@@ -1285,6 +1285,50 @@ impl MonitorService {
         self.inner.completion_mutations.lock().await
     }
 
+    /// Final obligation validation/admission is serialized with every
+    /// registry mutation (including stop, client/tool remove and deletion).
+    pub(crate) async fn admission_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.mutations.lock().await
+    }
+
+    /// The caller holds `admission_lock` across capture, durable stop claim
+    /// and fence installation. Do not reacquire it through `client_list`.
+    pub(crate) async fn stop_monitor_ids(
+        &self,
+        hub: &SessionHub,
+        session: &SessionId,
+        _admission: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<Vec<String>, MonitorError> {
+        self.adopt_session_locked(hub, session).await?;
+        let mut ids = self
+            .inner
+            .registry
+            .snapshot(session)
+            .into_iter()
+            .map(|monitor| monitor.monitor_id)
+            .collect::<Vec<_>>();
+        // Client registrations are session-owned (run=None). An expired
+        // one-shot can still own a retained follow-up, so the live registry
+        // alone cannot define this stop's immutable monitor incarnation.
+        let journal = crate::completion::load(hub, session)
+            .await
+            .map_err(|error| MonitorError::Delivery(error.to_string()))?;
+        ids.extend(
+            journal
+                .projection
+                .pending
+                .values()
+                .filter(|obligation| {
+                    obligation.source == haider_protocol::completion::CompletionSource::Monitor
+                })
+                .filter_map(|obligation| journal.reports.get(&obligation.obligation_id))
+                .map(|report| report.monitor_id.clone()),
+        );
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// Admission fence shared by explicit subagent stops, monitor
     /// registration and monitor wakes.
     pub(crate) fn stop_fences(&self) -> &crate::monitor_stop_fence::MonitorStopFences {
@@ -2293,23 +2337,64 @@ impl MonitorService {
         }
     }
 
-    /// Durably removes every monitor registered by one session. Explicit
-    /// subagent stops use this so no timer, file, task or agent monitor can
-    /// wake a stopped subagent into a new run (owner decision 2026-09-25).
-    /// Each removal is receipt-backed under a command id derived from
-    /// `command_prefix`, so a retried stop replays instead of re-removing.
-    pub(crate) async fn remove_all_for_stop(
+    /// Durably removes the monitors owned by a claimed stop incarnation.
+    /// A later independent run's registrations are never retargeted by retry.
+    pub(crate) async fn remove_for_stop_incarnation(
         &self,
         hub: &SessionHub,
         session: &SessionId,
         command_prefix: &str,
-    ) -> u64 {
+        incarnation: Option<&crate::delegation::StopIncarnation>,
+    ) -> Result<u64, haider_protocol::error::HaiderError> {
+        let mut owned =
+            incarnation.map(|target| target.monitors.iter().cloned().collect::<HashSet<_>>());
+        // Late registrations belong to the run that registered them, not to
+        // a later message in the same child session. Fences block further
+        // registration before this scan; the final drain uses the same IDs.
+        if let (Some(target), Some(owned)) = (incarnation, owned.as_mut()) {
+            let mut cursor = 0;
+            loop {
+                let page = hub
+                    .read_internal_session_for(
+                        haider_platform::phase_trace::StoreReadCaller::Monitor,
+                        session,
+                        cursor,
+                        256,
+                    )
+                    .await?;
+                if page.is_empty() {
+                    break;
+                }
+                cursor = page.last().map_or(cursor, |e| e.seq);
+                for event in page {
+                    if event
+                        .run_id
+                        .as_ref()
+                        .is_some_and(|run| target.runs.contains(run))
+                        && let Some(MonitorJournalEvent::MonitorRegistered { registration }) =
+                            MonitorJournalEvent::from_value(&event.payload)
+                    {
+                        owned.insert(registration.monitor_id);
+                    }
+                }
+            }
+        }
         let listed = self.client_list(hub, session.clone()).await;
         let haider_rpc::MonitorListOutcomeWire::Listed { monitors } = listed.outcome else {
-            return 0;
+            return Err(haider_protocol::error::HaiderError::new(
+                haider_protocol::error::ErrorCode::Internal,
+                "helper monitor listing did not finish",
+                true,
+            ));
         };
         let mut removed = 0_u64;
         for monitor in monitors {
+            if owned
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&monitor.monitor_id))
+            {
+                continue;
+            }
             let command_id = haider_rpc::CommandId::new(format!(
                 "{command_prefix}-monitor-{}",
                 &stable_digest(&[session.as_str(), &monitor.monitor_id])[..24]
@@ -2327,17 +2412,44 @@ impl MonitorService {
                 haider_rpc::MonitorRemoveOutcomeWire::Removed { .. } => {
                     removed = removed.saturating_add(1);
                 }
-                outcome => {
-                    tracing::warn!(
-                        %session,
-                        monitor = %monitor.monitor_id,
-                        ?outcome,
-                        "stopped subagent monitor was not removed"
-                    );
+                haider_rpc::MonitorRemoveOutcomeWire::Rejected {
+                    rejection: haider_rpc::MonitorControlRejectionWire::NotFound { .. },
+                } => {} // A terminal one-shot can leave the live registry first.
+                _ => {
+                    return Err(haider_protocol::error::HaiderError::new(
+                        haider_protocol::error::ErrorCode::Internal,
+                        "helper monitor removal did not finish",
+                        true,
+                    ));
                 }
             }
         }
-        removed
+        let _admission = self.admission_lock().await;
+        let journal = crate::completion::load(hub, session).await?;
+        for obligation in journal.projection.pending.values() {
+            if obligation.source != haider_protocol::completion::CompletionSource::Monitor {
+                continue;
+            }
+            let Some(report) = journal.reports.get(&obligation.obligation_id) else {
+                continue;
+            };
+            if owned
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&report.monitor_id))
+            {
+                continue;
+            }
+            crate::completion::append(
+                hub,
+                obligation,
+                haider_protocol::completion::CompletionEvent::CompletionDismissed {
+                    obligation_id: obligation.obligation_id.clone(),
+                    attempt: obligation.attempt,
+                },
+            )
+            .await?;
+        }
+        Ok(removed)
     }
 
     pub(crate) async fn client_register(
@@ -4135,7 +4247,7 @@ impl MonitorService {
                 message: "monitor service is stopped for this session".into(),
             });
         }
-        let _mutation = self.inner.mutations.lock().await;
+        let mutation = self.inner.mutations.lock().await;
         if *self.inner.shutdown.borrow() || self.is_retired(store.session_id()) {
             return Err(ToolError::Runtime {
                 message: "monitor service is stopped for this session".into(),
@@ -4358,6 +4470,12 @@ impl MonitorService {
                 attempt,
                 evidence_event_ids,
             } => {
+                // Wakes own completion before registry admission. Follow-up
+                // control needs only completion serialization; never wait for
+                // it while holding the registry mutex in the opposite order.
+                drop(mutation);
+                #[cfg(test)]
+                crate::completion::astra22_boundary_hook::after_attempt(store.session_id()).await;
                 let receipt = crate::completion::control(
                     hub,
                     store,
