@@ -191,7 +191,7 @@ async fn overlay_stop_cancels_the_in_flight_action_the_run_and_refuses_later_act
     assert_eq!(recorded.spawned.load(Ordering::SeqCst), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn idle_expiry_hides_the_overlay_and_the_next_action_reshows_it() {
     let (presence, recorded) = presence_with_idle_timeout(
         PresenceSurface::Screen,

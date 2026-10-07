@@ -101,10 +101,26 @@ pub(crate) struct StallDeadlineTestClock {
     now_ms: AtomicU64,
     checked: Mutex<(u64, u64)>,
     parked_checks: Mutex<(u64, u64)>,
+    wait_clock_origin: Option<tokio::time::Instant>,
 }
 
 #[cfg(all(test, unix))]
 impl StallDeadlineTestClock {
+    /// Anchor the fixture's persisted wait budget to paused Tokio time.
+    /// Stall time stays frozen while the test exercises only the absolute wait.
+    pub(crate) fn for_paused_wait_deadline() -> Self {
+        Self {
+            wait_clock_origin: Some(tokio::time::Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    fn wait_elapsed_ms(&self) -> Option<u64> {
+        self.wait_clock_origin.map(|origin| {
+            duration_millis(tokio::time::Instant::now().saturating_duration_since(origin))
+        })
+    }
+
     pub(crate) fn set_now_ms(&self, now_ms: u64) {
         self.now_ms.store(now_ms, Ordering::SeqCst);
     }
@@ -360,15 +376,31 @@ impl DelegationHandle {
         stall_deadline: Duration,
         stall_deadline_clock: Arc<StallDeadlineTestClock>,
     ) -> Self {
-        Self {
-            #[cfg(test)]
-            establishment_fault: false,
+        Self::with_wait_budgets_and_stall_clock(
             hub,
             stall_deadline,
-            run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
-            settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
-            stall_deadline_clock: Some(stall_deadline_clock),
-        }
+            CHILD_RUN_WAIT_TIMEOUT,
+            CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            stall_deadline_clock,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_wait_budgets_and_stall_clock(
+        hub: SessionHub,
+        stall_deadline: Duration,
+        run_wait_timeout: Duration,
+        settlement_tail_timeout: Duration,
+        stall_deadline_clock: Arc<StallDeadlineTestClock>,
+    ) -> Self {
+        let mut handle = Self::with_wait_budgets(
+            hub,
+            stall_deadline,
+            run_wait_timeout,
+            settlement_tail_timeout,
+        );
+        handle.stall_deadline_clock = Some(stall_deadline_clock);
+        handle
     }
 
     #[cfg(test)]
@@ -1439,9 +1471,16 @@ impl DelegationHandle {
         // from the journal instead of restarting a relative timer.
         let now = tokio::time::Instant::now();
         let started_at_ms = self.parent_run_started_at_ms(record).await?;
+        let now_ms = unix_time_ms();
+        #[cfg(all(test, unix))]
+        let now_ms = self
+            .stall_deadline_clock
+            .as_ref()
+            .and_then(|clock| clock.wait_elapsed_ms())
+            .map_or(now_ms, |elapsed| started_at_ms.saturating_add(elapsed));
         let deadline = anchored_child_wait_deadline(
             now,
-            unix_time_ms(),
+            now_ms,
             started_at_ms,
             self.run_wait_timeout,
             run_deadline,

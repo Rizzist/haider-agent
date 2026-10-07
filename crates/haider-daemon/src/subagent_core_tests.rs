@@ -3246,7 +3246,13 @@ async fn start_parked_child_with_wait_budgets(
             tool_factory: delegation_tool_factory(),
             delegation: Some(match stall_clock {
                 Some(clock) => {
-                    DelegationHandle::with_stall_deadline_clock(hub.clone(), stall_deadline, clock)
+                    DelegationHandle::with_wait_budgets_and_stall_clock(
+                        hub.clone(),
+                        stall_deadline,
+                        run_wait_timeout,
+                        settlement_tail_timeout,
+                        clock,
+                    )
                 }
                 None => DelegationHandle::with_wait_budgets(
                     hub.clone(),
@@ -4209,19 +4215,27 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
 }
 
 /// MUTATION CHECK: remove `bounded_wait` around the delegated active wait.
-/// Expected RUNTIME failure: the outer five-second state observer times out
+/// Expected RUNTIME failure: the outer fixture state observer times out
 /// because the parent remains Waiting(LocalChild). Returning token/tool
 /// counters as completion also fails because the typed timeout disappears.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[cfg(unix)]
 async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
+    // Real store work must not consume the policy clock during startup or
+    // delivery. The external test runner bounds a genuinely stuck fixture.
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let wait_clock = Arc::new(StallDeadlineTestClock::for_paused_wait_deadline());
     let harness = start_parked_child_with_wait_budgets(
         "unanswered-bound",
         ParkedChildMode::Complete,
         Duration::from_secs(1),
         Duration::from_millis(2_250),
         Duration::from_millis(250),
-        None,
+        Some(wait_clock),
     )
     .await;
     let _ = wait_for_parent_delegated_menu(
@@ -4230,6 +4244,10 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
         &harness.child.agent_id,
     )
     .await;
+
+    // Expire the absolute active wait only after the parked child and its
+    // forwarded parent menu are durable, independent of host scheduling.
+    tokio::time::advance(Duration::from_millis(2_250)).await;
 
     wait_for_state(&harness.store, &harness.parent_session, |state| {
         *state == RunState::Errored
@@ -4289,6 +4307,8 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
     harness.manager.shutdown().await.expect("manager shutdown");
     harness.hub.shutdown().await.expect("hub shutdown");
     harness.store.close().await.expect("store close");
+    clock_guard.abort();
+    let _ = clock_guard.await;
 }
 
 /// MUTATION CHECK: send the exhausted path through `bounded_wait(0, cancel)`
@@ -4309,10 +4329,9 @@ async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
         manifest: harness.child.manifest.clone(),
     };
     timeout(
-        // Registry #94: the production run deadline is already zero. The
-        // outer 250ms covers only one local journal append and nonblocking
-        // actor enqueue; it grants no extra child-wait budget.
-        Duration::from_millis(250),
+        // The production run deadline is already zero. This watchdog bounds
+        // the durable handoff receipt without extending the child-wait budget.
+        haider_platform::TEST_WAIT_TIMEOUT,
         DelegationHandle::new(harness.hub.clone())
             .cancel_ticket(&ticket, Some(tokio::time::Instant::now())),
     )
