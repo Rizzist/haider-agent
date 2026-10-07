@@ -1308,7 +1308,21 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
-            ActorCommand::CancelTurn { command, completed } => {
+            ActorCommand::CancelTurn {
+                worker_lease,
+                command,
+                completed,
+            } => {
+                if worker_lease.as_ref().is_some_and(|lease_id| {
+                    worker.as_ref().map(|worker| &worker.lease_id) != Some(lease_id)
+                }) {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::SingleWriterViolation,
+                        "worker lease was superseded",
+                        false,
+                    )));
+                    continue;
+                }
                 // PERSIST-BEFORE-WAKE (R5, authoritative statement): the
                 // durable `Cancelling` intent commits and publishes BEFORE the
                 // registered worker's cancellation wake fires below, in this

@@ -464,9 +464,18 @@ async fn public_spawn_establishment_restart(
         .await
         .expect("recovery");
     if parent_cancelled.is_some() {
+        let only_cancelled_delivery = |work: &[crate::turn_recovery::RecoveredWork]| {
+            work.len() <= 1
+                && work.iter().all(|work| {
+                    matches!(work,
+                    crate::turn_recovery::RecoveredWork::DetachedChildren(children)
+                        if children.agents.as_slice() == [(record.agent_id.clone(),
+                            haider_protocol::subagent_stop::DetachedReasonV1::MainStopped)])
+                })
+        };
         assert!(
-            work.is_empty(),
-            "abandoned parent and child must never resume"
+            only_cancelled_delivery(&work),
+            "abandoned parent and child may only collect the exact owed cancellation result"
         );
         let settled = store
             .delegation(record.agent_id.clone())
@@ -511,11 +520,19 @@ async fn public_spawn_establishment_restart(
             .latest_seq(&record.child_session_id)
             .await
             .expect("child head");
-        assert!(
+        let parent_head = store.latest_seq(&parent).await.expect("parent head");
+        let repeated =
             crate::turn_recovery::recover_interrupted_turns(&store, &DeviceId::new("restart"))
                 .await
-                .expect("idempotent recovery")
-                .is_empty()
+                .expect("idempotent recovery");
+        assert!(
+            only_cancelled_delivery(&repeated),
+            "pending result collection remains recoverable without executable or duplicate work"
+        );
+        assert_eq!(
+            store.latest_seq(&parent).await.expect("parent head"),
+            parent_head,
+            "repeated recovery must not duplicate cancellation or delivery obligations"
         );
         assert_eq!(
             store

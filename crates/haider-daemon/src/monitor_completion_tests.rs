@@ -1080,7 +1080,7 @@ async fn stop_dismisses_expired_monitor_follow_up_before_cold_projection_resume(
         registered.owner_session_id = world.session.clone();
         registered.monitor_id = report.monitor_id.clone();
         world
-            .lease
+            .hub
             .append(&mut [monitor_envelope(
                 &world.session,
                 if run_bound { Some(&world.run) } else { None },
@@ -1099,7 +1099,7 @@ async fn stop_dismisses_expired_monitor_follow_up_before_cold_projection_resume(
             .unwrap();
         observe_monitor(&world, report.clone()).await;
         world
-            .lease
+            .hub
             .append(&mut [monitor_envelope(
                 &world.session,
                 if run_bound { Some(&world.run) } else { None },

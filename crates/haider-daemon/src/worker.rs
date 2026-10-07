@@ -4309,35 +4309,15 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             .collect::<Vec<_>>();
         let effect_scans = scan_unknown_effects(&lease, &reconciliation_targets).await?;
         let mut terminalized = false;
-        for ((run_id, state, _, branch_id, _), effect_scan) in
+        for ((run_id, _state, _, branch_id, _), effect_scan) in
             candidates.into_iter().zip(effect_scans)
         {
             let user_command_scope = durable_user_command_scope(&lease, run_id).await?;
             // P3-4 (park, don't cancel): request-input, permission, and local
             // child checkpoints were excluded from this sweep above.
-            if *state != RunState::Cancelling {
-                if let Some(scope) = user_command_scope.as_ref() {
-                    append_shell_payloads(
-                        &lease,
-                        &device_id,
-                        run_id,
-                        scope.branch_id.as_ref(),
-                        scope.agent_id.as_ref(),
-                        &event_ids,
-                        vec![EventPayload::RunState(RunState::Cancelling)],
-                    )
-                    .await?;
-                } else {
-                    append_run_state(
-                        &lease,
-                        &device_id,
-                        run_id,
-                        branch_id.as_ref(),
-                        &event_ids,
-                        RunState::Cancelling,
-                    )
-                    .await?;
-                }
+            let cancelled = lease.begin_owned_cancellation(run_id, &device_id).await?;
+            if cancelled.status == haider_store::TurnCancellationStatus::AlreadyTerminal {
+                continue;
             }
             let _ = append_unknown_effect_scan(
                 &lease,
@@ -4963,6 +4943,8 @@ async fn run_supervisor(
                 // a committed `session.select_model` reaches the NEXT turn
                 // without a worker restart. A failed read fails the turn
                 // honestly instead of silently pinning the spawn snapshot.
+                #[cfg(test)]
+                wait_for_test_turn_setup_boundary(lease.session_id()).await;
                 let turn_result = match fresh_turn_metadata(&lease).await {
                     Ok(fresh) => {
                         let startup_budget = wait_for_startup_headless_budget(
@@ -5013,6 +4995,32 @@ async fn run_supervisor(
                         break;
                     }
                     Err(error) => {
+                        // Admission may close while setup awaits a hub facade,
+                        // before this supervisor receives Shutdown. Drain owns
+                        // that accepted run's outcome, including its children.
+                        if *drain_wakes.borrow() {
+                            if let Err(drain_error) =
+                                lease.begin_owned_cancellation(&run_id, &device_id).await
+                            {
+                                tracing::error!(%run_id, ?drain_error, "turn setup drain cancellation failed");
+                                if let Some(ready) = recovery_ready {
+                                    let _ = ready.send(Err(drain_error));
+                                }
+                                let _ = lease.unregister_worker().await;
+                                return true;
+                            }
+                            if durable_run_state(&lease, &run_id)
+                                .await
+                                .is_some_and(|state| {
+                                    state.is_terminal() && state != RunState::Cancelled
+                                })
+                            {
+                                if let Some(ready) = recovery_ready {
+                                    let _ = ready.send(Ok(()));
+                                }
+                                continue;
+                            }
+                        }
                         if matches!(
                             durable_run_state(&lease, &run_id).await,
                             Some(RunState::Cancelling | RunState::Cancelled)
@@ -5341,6 +5349,10 @@ async fn run_supervisor(
                                     parked_checkpoint = true;
                                 }
                             } else {
+                                if let Err(error) = lease.begin_owned_cancellation(&active_run, &device_id).await {
+                                    tracing::error!(%active_run, ?error, "active turn drain cancellation failed");
+                                    return true;
+                                }
                                 active_cancel.cancel();
                             }
                             let cancelled = cancel_durable_queued_turns(
@@ -6918,17 +6930,28 @@ async fn cancel_durable_queued_turns(
         if active_run == Some(&run_id) || state != RunState::Queued {
             continue;
         }
-        if let Err(error) = append_run_state(
-            store,
-            device_id,
-            &run_id,
-            branch_id.as_ref(),
-            event_ids,
-            RunState::Cancelled,
-        )
-        .await
-        {
-            tracing::warn!(%run_id, ?error, "queued turn could not be terminalized during drain");
+        let terminalized = async {
+            let cancelled = store.begin_owned_cancellation(&run_id, device_id).await?;
+            if cancelled.status == haider_store::TurnCancellationStatus::AlreadyTerminal {
+                return Ok::<_, HaiderError>(());
+            }
+            let mut payloads =
+                cancelled_resumption_payloads(store, store.session_id(), &run_id).await?;
+            payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+            append_payloads(
+                store,
+                device_id,
+                &run_id,
+                branch_id.as_ref(),
+                event_ids,
+                payloads,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = terminalized {
+            tracing::error!(%run_id, ?error, "queued turn could not be terminalized during drain");
+            continue;
         }
         last = Some(run_id);
     }
@@ -7908,15 +7931,7 @@ async fn perform_shell_exec(
         .await;
     }
     if *drain_wakes.borrow() {
-        begin_shell_cancellation(
-            lease,
-            device_id,
-            &event_ids,
-            &run_id,
-            pending.branch_id.as_ref(),
-            pending.agent_id.as_ref(),
-        )
-        .await?;
+        begin_shell_cancellation(lease, device_id, &run_id).await?;
         return cancel_shell_exec(
             lease,
             device_id,
@@ -8130,14 +8145,7 @@ async fn perform_shell_exec(
                     continue;
                 }
                 if *shell_close.borrow_and_update() {
-                    begin_shell_cancellation(
-                        lease,
-                        device_id,
-                        &event_ids,
-                        &run_id,
-                        pending.branch_id.as_ref(),
-                        pending.agent_id.as_ref(),
-                    )
+                    begin_shell_cancellation(lease, device_id, &run_id)
                     .await?;
                     process_cancel.cancel();
                     let mut cancelled_result = wait.await.ok();
@@ -8170,14 +8178,7 @@ async fn perform_shell_exec(
                 }
                 let draining = *drain_wakes.borrow_and_update();
                 if draining {
-                    begin_shell_cancellation(
-                        lease,
-                        device_id,
-                        &event_ids,
-                        &run_id,
-                        pending.branch_id.as_ref(),
-                        pending.agent_id.as_ref(),
-                    )
+                    begin_shell_cancellation(lease, device_id, &run_id)
                     .await?;
                     process_cancel.cancel();
                     let mut cancelled_result = wait.await.ok();
@@ -8355,25 +8356,13 @@ async fn perform_shell_exec(
 async fn begin_shell_cancellation(
     lease: &HubStoreHandle,
     device_id: &DeviceId,
-    event_ids: &EventIdGenerator,
     run_id: &RunId,
-    branch_id: Option<&BranchId>,
-    agent_id: Option<&AgentId>,
 ) -> Result<(), HaiderError> {
     match durable_run_state(lease, run_id).await {
-        Some(RunState::RunningTool) => {
-            append_shell_payloads(
-                lease,
-                device_id,
-                run_id,
-                branch_id,
-                agent_id,
-                event_ids,
-                vec![EventPayload::RunState(RunState::Cancelling)],
-            )
+        Some(RunState::RunningTool | RunState::Cancelling | RunState::Cancelled) => lease
+            .begin_owned_cancellation(run_id, device_id)
             .await
-        }
-        Some(RunState::Cancelling) | Some(RunState::Cancelled) => Ok(()),
+            .map(|_| ()),
         Some(state) if state.is_terminal() => Ok(()),
         state => Err(HaiderError::new(
             ErrorCode::RunNotActive,
@@ -8516,6 +8505,49 @@ fn strip_foreign_provider_opaque_projection(
     projection.stable_history_end = remap(stable_before);
     projection.current_user_start = remap(current_before);
     projection.latest_compaction_summary_end = summary_before.map(remap);
+}
+
+#[cfg(test)]
+type TurnSetupBarrier = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+fn turn_setup_barriers()
+-> &'static std::sync::Mutex<std::collections::HashMap<SessionId, TurnSetupBarrier>> {
+    static BARRIERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<SessionId, TurnSetupBarrier>>,
+    > = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_turn_setup_barrier(
+    session: SessionId,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    turn_setup_barriers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(session, (arrived_tx, resume_rx));
+    (arrived, resume)
+}
+
+#[cfg(test)]
+async fn wait_for_test_turn_setup_boundary(session: &SessionId) {
+    let barrier = turn_setup_barriers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session);
+    if let Some((arrived, resume)) = barrier {
+        let _ = arrived.send(());
+        let _ = resume.await;
+    }
 }
 
 /// Re-reads THIS session's metadata for one logical turn (F1). The store is

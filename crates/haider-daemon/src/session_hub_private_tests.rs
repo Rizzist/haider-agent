@@ -5614,6 +5614,7 @@ async fn cancelling_committed_before_worker_done_rejects_done() {
     actor
         .commands
         .send(ActorCommand::CancelTurn {
+            worker_lease: None,
             command: TurnCancelCommand {
                 command_id: "cancel-before-done-command".into(),
                 request_digest: "cancel-before-done-digest".into(),
@@ -7925,5 +7926,169 @@ async fn session_delete_reclaims_only_its_retained_stopped_runs() {
     for run in &runs {
         assert!(!fences.registration_fenced(&deleted, run));
         assert!(fences.registration_fenced(&retained, run));
+    }
+}
+
+/// Drain crosses the actual supervisor setup boundary before Shutdown can
+/// be received. Removing the drain cancellation rule makes this Errored.
+#[tokio::test]
+async fn accepted_turn_setup_during_drain_cancels_without_run_failure() {
+    for draining in [true, false] {
+        let root = tempfile::tempdir().expect("temp store");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let session = SessionId::new(format!("setup-drain-{draining}"));
+        let run = RunId::new(format!("setup-drain-run-{draining}"));
+        hub.create_session(create_command(&session, "setup-drain"))
+            .await
+            .expect("session");
+        let accepted = match hub
+            .accept_turn(accept_command(
+                &session,
+                &run,
+                store.worker_generation(),
+                "setup-drain",
+            ))
+            .await
+            .expect("accept")
+        {
+            haider_store::TurnAcceptOutcome::Committed { accepted, .. }
+            | haider_store::TurnAcceptOutcome::IdempotentReplay { accepted } => accepted,
+        };
+        let (arrived, resume) = crate::worker::install_turn_setup_barrier(session.clone());
+        let manager = crate::worker::WorkerManager::start(
+            hub.clone(),
+            crate::worker::WorkerDependencies::unconfigured_for_tests(),
+            false,
+        );
+        let handle = manager.handle();
+        handle.submit(accepted).await.expect("handoff");
+        tokio::time::timeout(Duration::from_secs(20), arrived)
+            .await
+            .expect("setup boundary")
+            .expect("arrived");
+        if draining {
+            handle.begin_draining();
+            hub.begin_draining();
+        }
+        resume.send(()).expect("resume setup");
+        let expected = if draining {
+            RunState::Cancelled
+        } else {
+            RunState::Errored
+        };
+        let actual = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let events = store.read(&session, 0, 1024).await.expect("history");
+                if let Some(state) = events.iter().rev().find_map(|event| {
+                    if event.run_id.as_ref() != Some(&run) {
+                        return None;
+                    }
+                    match event.payload.decode_event() {
+                        Ok(EventPayload::RunState(state)) if state.is_terminal() => Some(state),
+                        _ => None,
+                    }
+                }) {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal outcome");
+        assert_eq!(actual, expected, "drain owns the startup terminal outcome");
+        tokio::time::timeout(Duration::from_secs(20), manager.shutdown())
+            .await
+            .expect("bounded drain")
+            .expect("shutdown");
+        let events = store.read(&session, 0, 1024).await.expect("history");
+        let failed = events.iter().any(|event| {
+            matches!(
+                event.payload.decode_event(),
+                Ok(EventPayload::RunFailed { .. })
+            )
+        });
+        assert_eq!(
+            failed, !draining,
+            "genuine non-drain setup errors remain failures"
+        );
+        hub.shutdown().await.expect("hub close");
+        store.close().await.expect("store close");
+    }
+}
+
+/// Owned cancellation remains available after public admission closes, but
+/// never grants a superseded lease authority or rewrites natural completion.
+#[tokio::test]
+async fn drain_cancellation_is_lease_fenced_and_preserves_terminal_done() {
+    for initial in [RunState::Queued, RunState::RunningTool, RunState::Done] {
+        let terminal = initial == RunState::Done;
+        let root = tempfile::tempdir().expect("temp store");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let session = SessionId::new(format!("owned-drain-{initial:?}"));
+        let run = RunId::new("owned-drain-run");
+        hub.append(&mut [run_state_envelope(
+            &session,
+            &run,
+            store.worker_generation(),
+            "owned-drain-queued",
+            RunState::Queued,
+        )])
+        .await
+        .expect("queued");
+        let old = hub
+            .acquire_worker_lease(session.clone())
+            .await
+            .expect("old lease");
+        let lease = hub
+            .acquire_worker_lease(session.clone())
+            .await
+            .expect("successor lease");
+        if initial != RunState::Queued {
+            lease
+                .append(&mut [run_state_envelope(
+                    &session,
+                    &run,
+                    store.worker_generation(),
+                    "owned-drain-done",
+                    initial.clone(),
+                )])
+                .await
+                .expect("done");
+        }
+        hub.begin_draining();
+        let before = store.latest_seq(&session).await.expect("head");
+        assert_eq!(
+            old.begin_owned_cancellation(&run, &DeviceId::new("drain-test"))
+                .await
+                .expect_err("stale lease refused")
+                .code,
+            ErrorCode::SingleWriterViolation
+        );
+        assert_eq!(store.latest_seq(&session).await.expect("head"), before);
+        let outcome = lease
+            .begin_owned_cancellation(&run, &DeviceId::new("drain-test"))
+            .await
+            .expect("owned cancellation");
+        assert_eq!(
+            outcome.status,
+            if terminal {
+                haider_store::TurnCancellationStatus::AlreadyTerminal
+            } else {
+                haider_store::TurnCancellationStatus::Accepted
+            }
+        );
+        let after = store.latest_seq(&session).await.expect("head");
+        if terminal {
+            assert_eq!(after, before);
+        }
+        lease
+            .begin_owned_cancellation(&run, &DeviceId::new("drain-test"))
+            .await
+            .expect("replay");
+        assert_eq!(store.latest_seq(&session).await.expect("head"), after);
+        hub.shutdown().await.expect("hub close");
+        store.close().await.expect("store close");
     }
 }

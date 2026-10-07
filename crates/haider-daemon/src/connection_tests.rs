@@ -374,6 +374,7 @@ fn welcome_features_pin_served_management_families() {
         BTreeSet::from([
             haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned(),
             haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned(),
+            haider_rpc::FEATURE_HELPER_STOP_V1.to_owned(),
             haider_rpc::FEATURE_AGENT_MESSAGE_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned(),
             FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
@@ -589,7 +590,27 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
             if features == &welcome.features && !user_command_withheld
     ));
 
-    let mut pre_agent_cli_welcome = welcome.clone();
+    let mut pre_helper_stop_welcome = welcome.clone();
+    assert!(
+        pre_helper_stop_welcome
+            .features
+            .remove(haider_rpc::FEATURE_HELPER_STOP_V1)
+    );
+    let pre_helper_stop = uds_codec::encode(
+        &WireFrame::Welcome(pre_helper_stop_welcome.clone()),
+        usize::MAX,
+    )
+    .expect("pre-helper-stop Welcome encodes");
+    let pre_helper_stop_body_len = pre_helper_stop.len() - 4;
+    let helper_stop_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+        .expect("tight peer first withholds helper stop semantics");
+    assert_eq!(
+        helper_stop_tight.bytes.as_slice(),
+        pre_helper_stop.as_slice()
+    );
+    assert_eq!(helper_stop_tight.features, pre_helper_stop_welcome.features);
+
+    let mut pre_agent_cli_welcome = pre_helper_stop_welcome.clone();
     assert!(
         pre_agent_cli_welcome
             .features
@@ -601,7 +622,7 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     )
     .expect("pre-agent-CLI Welcome encodes");
     let pre_agent_cli_body_len = pre_agent_cli.len() - 4;
-    let agent_cli_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+    let agent_cli_tight = encode_welcome_for_peer(welcome.clone(), pre_helper_stop_body_len - 1)
         .expect("tight peer first withholds only the new agent CLI shape");
     assert_eq!(agent_cli_tight.bytes.as_slice(), pre_agent_cli.as_slice());
     assert_eq!(agent_cli_tight.features, pre_agent_cli_welcome.features);
@@ -734,6 +755,11 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     assert!(
         selected_unmarked
             .features
+            .remove(haider_rpc::FEATURE_HELPER_STOP_V1)
+    );
+    assert!(
+        selected_unmarked
+            .features
             .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
     );
     assert!(
@@ -760,6 +786,11 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     let selected_unmarked = uds_codec::encode(&WireFrame::Welcome(selected_unmarked), usize::MAX)
         .expect("selected-encoding unmarked Welcome encodes");
     let mut selected_pre_prompt = selected_encoding.clone();
+    assert!(
+        selected_pre_prompt
+            .features
+            .remove(haider_rpc::FEATURE_HELPER_STOP_V1)
+    );
     assert!(
         selected_pre_prompt
             .features
