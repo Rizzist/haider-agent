@@ -127,10 +127,11 @@ fn source_reconcile_period(profile_id: &str) -> Duration {
     SOURCE_RECONCILE_BASE + Duration::from_millis(jitter)
 }
 
-struct CredentialSourceWatcher(
-    tokio::task::JoinHandle<()>,
-    #[cfg(test)] watch::Receiver<bool>,
-);
+struct CredentialSourceWatcher {
+    task: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    initial_scan: watch::Receiver<bool>,
+}
 
 impl CredentialSourceWatcher {
     fn new(
@@ -168,11 +169,11 @@ impl CredentialSourceWatcher {
                 ready.send_replace(true);
             }
         });
-        Self(
+        Self {
             task,
             #[cfg(test)]
             initial_scan,
-        )
+        }
     }
 }
 
@@ -180,15 +181,18 @@ impl CredentialSourceWatcher {
 impl CredentialSourceWatcher {
     #[allow(clippy::expect_used)]
     async fn wait_for_initial_scan(&mut self) {
-        while !*self.1.borrow_and_update() {
-            self.1.changed().await.expect("watcher remains live");
+        while !*self.initial_scan.borrow_and_update() {
+            self.initial_scan
+                .changed()
+                .await
+                .expect("watcher remains live");
         }
     }
 }
 
 impl Drop for CredentialSourceWatcher {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
 }
 
