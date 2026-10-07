@@ -2120,6 +2120,7 @@ fn assert_descendant_group_swept(started: &Path) {
 fn assert_descendant_group_swept_with_wait(started: &Path, mut wait: impl FnMut()) {
     let pid = fs::read_to_string(started)
         .expect("descendant group id")
+        .trim()
         .parse()
         .expect("numeric group id");
     let cleanup_pid =
