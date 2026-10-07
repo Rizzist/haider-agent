@@ -719,6 +719,8 @@ struct NeverOpensProvider {
     fallback: FakeProvider,
     requests: AtomicUsize,
     in_flight: Arc<AtomicUsize>,
+    opened: tokio::sync::Notify,
+    dropped: Arc<tokio::sync::Notify>,
 }
 
 impl NeverOpensProvider {
@@ -727,15 +729,18 @@ impl NeverOpensProvider {
             fallback: FakeProvider::new(Vec::new()),
             requests: AtomicUsize::new(0),
             in_flight,
+            opened: tokio::sync::Notify::new(),
+            dropped: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
 
-struct InFlightRequest(Arc<AtomicUsize>);
+struct InFlightRequest(Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
 
 impl Drop for InFlightRequest {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        self.1.notify_one();
     }
 }
 
@@ -756,13 +761,15 @@ impl Provider for NeverOpensProvider {
     async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let _guard = InFlightRequest(Arc::clone(&self.in_flight));
+        let _guard = InFlightRequest(Arc::clone(&self.in_flight), Arc::clone(&self.dropped));
+        self.opened.notify_one();
         std::future::pending().await
     }
 }
 
 struct DeadlineProviderFactory {
     provider: Arc<NeverOpensProvider>,
+    deadline: Instant,
 }
 
 struct FakeBudgetProviderFactory {
@@ -2136,6 +2143,10 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
 
 #[async_trait::async_trait]
 impl ProviderFactory for DeadlineProviderFactory {
+    fn request_deadline_for_test(&self) -> Option<Instant> {
+        Some(self.deadline)
+    }
+
     async fn resolve_for_turn(
         &self,
         metadata: &SessionMetadataV1,
@@ -2160,8 +2171,19 @@ impl ProviderFactory for DeadlineProviderFactory {
 /// early enough for the durable structured failure and terminal state to reach
 /// a headless client before the three-second run deadline. Dropping the open
 /// future must also release its request guard.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
+    // Keep virtual time fixed while SQLite and worker startup use real I/O.
+    // Only the provider-open/deadline race below may auto-advance the clock.
+    let keep_clock_fixed = || {
+        tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let clock_guard = keep_clock_fixed();
+    let deadline = Instant::now() + Duration::from_secs(3);
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
@@ -2173,6 +2195,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             diagnostics: None,
             provider_factory: Arc::new(DeadlineProviderFactory {
                 provider: Arc::clone(&provider),
+                deadline,
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
@@ -2217,7 +2240,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             .as_millis(),
     )
     .expect("test epoch milliseconds fit u64")
-    .saturating_add(3_000);
+    .saturating_add(3_600_000);
     let spec = HeadlessRunSpecV1 {
         agent_spawn: None,
         continuation_of: None,
@@ -2231,7 +2254,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         permission_overrides: SessionPermissionOverridesV1::default(),
         trust_hooks: false,
         budget: RunBudgetV1 {
-            max_time_ms: Some(5_000),
+            max_time_ms: None,
             ..RunBudgetV1::default()
         },
         request_deadline_unix_ms: Some(request_deadline_unix_ms),
@@ -2263,12 +2286,30 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         })
         .await
         .expect("accept headless turn");
-    let started = Instant::now();
     manager
         .handle()
         .submit(accepted)
         .await
         .expect("submit headless turn");
+
+    provider.opened.notified().await;
+    clock_guard.abort();
+    let _ = clock_guard.await;
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => panic!("headless deadline event preceded provider cancellation"),
+        () = provider.dropped.notified() => {}
+    }
+    let clock_guard = keep_clock_fixed();
+    assert!(
+        Instant::now() < deadline,
+        "provider cancellation precedes deadline event"
+    );
+    assert_eq!(
+        in_flight.load(Ordering::SeqCst),
+        0,
+        "request guard drops with the open future"
+    );
 
     let failure = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
@@ -2320,7 +2361,10 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
     })
     .await
     .expect("structured terminal arrives before the fixture watchdog");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        Instant::now() < deadline,
+        "durable terminal precedes deadline event"
+    );
     assert_eq!(failure.0, ErrorCode::ProviderTimeout);
     assert!(failure.1.contains("reason=deadline_exhausted"));
     assert!(!failure.2, "no full retry can fit before the deadline");
@@ -2352,16 +2396,11 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             }),
         "a never-opening provider on a live route must not enter WaitingForRoute"
     );
-    timeout(BUDGET_CASE_DEADLINE, async {
-        while in_flight.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("timed-out provider request is not orphaned");
     assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
 
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+    clock_guard.abort();
+    let _ = clock_guard.await;
 }

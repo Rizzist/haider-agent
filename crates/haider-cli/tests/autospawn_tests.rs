@@ -530,7 +530,7 @@ impl DaemonGuard {
     fn terminate_and_wait(&self, endpoint: &Path) {
         let pid = self.pid().expect("running daemon PID before cleanup");
         let _ = Command::new("kill").arg(pid.to_string()).status();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
         while (process_exists(pid) || endpoint.exists()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -614,7 +614,7 @@ fn wait_for_daemon_ready(profile: &ResolvedProfile, guard: &DaemonGuard) -> u32 
 }
 
 fn wait_for_daemon_exit(profile: &ResolvedProfile, pid: u32, boundary: &str) {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
     while process_exists(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1034,13 +1034,9 @@ fn daemon_stop_recovers_unreachable_lock_owner_with_matching_stale_or_absent_pid
 }
 
 fn wait_for_idle_daemon_exit(profile: &ResolvedProfile, daemon_pid: u32, spawn_path: &str) {
-    const IDLE_TTL_MS: u64 = 250;
-    const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;
-    const PROCESS_EXIT_GRACE_MS: u64 = 2_000;
-    // Registry #94: 250 ms requested idle TTL + the daemon's 5,000 ms
-    // graceful-drain budget + 2,000 ms process-observation grace = 7,250 ms.
-    const EXIT_DEADLINE: Duration =
-        Duration::from_millis(IDLE_TTL_MS + DAEMON_DRAIN_BUDGET_MS + PROCESS_EXIT_GRACE_MS);
+    // Exit/endpoint removal are the readiness receipts. This watchdog is
+    // independent of the daemon's idle-TTL and drain-policy inputs.
+    const EXIT_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
     let deadline = Instant::now() + EXIT_DEADLINE;
     while (process_exists(daemon_pid) || profile.endpoint_path.exists())
@@ -1050,7 +1046,7 @@ fn wait_for_idle_daemon_exit(profile: &ResolvedProfile, daemon_pid: u32, spawn_p
     }
     assert!(
         !process_exists(daemon_pid),
-        "{spawn_path} daemon {daemon_pid} survived the 7,250 ms idle-exit budget"
+        "{spawn_path} daemon {daemon_pid} survived the idle-exit fixture watchdog"
     );
     assert!(
         !profile.endpoint_path.exists(),
@@ -1195,10 +1191,7 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
 #[test]
 fn absolute_idle_linger_durably_settles_a_nonterminal_run() {
     const IDLE_TTL_MS: u64 = 250;
-    const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;
-    const PROCESS_EXIT_GRACE_MS: u64 = 2_000;
-    const EXIT_DEADLINE: Duration =
-        Duration::from_millis(IDLE_TTL_MS + DAEMON_DRAIN_BUDGET_MS + PROCESS_EXIT_GRACE_MS);
+    const EXIT_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
     ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
@@ -1677,7 +1670,7 @@ fn parent_exit_leaves_the_daemon_running() {
     };
 
     let output = output_with_timeout(
-        &mut haider_command(store.path()),
+        haider_command(store.path()).env("HAIDER_CLIENT_LIFECYCLE_TRACE", "1"),
         "haider launcher to spawn the persistent daemon and exit",
     );
     assert!(output.status.success());
@@ -1687,9 +1680,13 @@ fn parent_exit_leaves_the_daemon_running() {
         stdout.contains("spawned"),
         "first launch must spawn: {stdout}"
     );
-    // Success and the positive readiness receipt gate this assertion. Launch
-    // latency under sandbox/image validation is not evidence of the loser path;
-    // the launcher unit tests pin that path independently with a paused clock.
+    // Pin the real authenticated-peer PID wiring, without a launch-latency
+    // assertion. MU2 (qualify_ready_candidate(None, active)) loses this receipt.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("event=spawn_ready_candidate path=own_child candidate_pid="),
+        "cold launch must retain its authenticated child ownership: {stderr}"
+    );
 
     // The launcher has fully exited; the daemon must still serve, and the
     // daemon log must exist owner-only in the profile store.
@@ -1759,7 +1756,7 @@ fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
         .spawn()
         .expect("spawn winning daemon");
     // Wait until the winner serves its endpoint.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
     while !profile.endpoint_path.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }

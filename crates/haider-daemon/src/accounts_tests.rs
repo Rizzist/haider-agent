@@ -14144,13 +14144,16 @@ async fn credential_source_watcher_observes_atomic_origin_rotation() {
         .expect("enroll source");
     let registry = Arc::new(StdMutex::new(registry));
     let (changed_tx, mut changed_rx) = watch::channel(0_u64);
-    let _watcher = CredentialSourceWatcher::new(&registry, changed_tx);
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut watcher = CredentialSourceWatcher::new(&registry, changed_tx);
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        watcher.wait_for_initial_scan(),
+    )
+    .await
+    .expect("watcher captures initial source fingerprint");
 
     write_linked_codex_source(&root, "acct-watch", "rotated@example.test");
-    // 3s = twelve 250ms watcher cadences; this is a test-only scheduling
-    // allowance, not a product timeout.
+    // Await the recorded source change independently of watcher scheduling.
     tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, changed_rx.changed())
         .await
         .expect("watch deadline")
@@ -14636,16 +14639,20 @@ async fn credential_source_watcher_follows_a_kimi_endpoint_slot() {
     );
     let registry = Arc::new(StdMutex::new(registry));
     let (changed_tx, mut changed_rx) = watch::channel(0_u64);
-    let _watcher = CredentialSourceWatcher::new(&registry, changed_tx);
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut watcher = CredentialSourceWatcher::new(&registry, changed_tx);
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        watcher.wait_for_initial_scan(),
+    )
+    .await
+    .expect("watcher captures initial source fingerprint");
 
     write_linked_kimi_source(
         &root,
         "kimi-access-rotated",
         "kimi-code-env-0123456789abcdef.json",
     );
-    // 3s = twelve 250ms watcher cadences; a test-only scheduling allowance.
+    // Await the recorded source change independently of watcher scheduling.
     tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, changed_rx.changed())
         .await
         .expect("watch deadline")

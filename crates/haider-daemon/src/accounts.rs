@@ -127,7 +127,10 @@ fn source_reconcile_period(profile_id: &str) -> Duration {
     SOURCE_RECONCILE_BASE + Duration::from_millis(jitter)
 }
 
-struct CredentialSourceWatcher(tokio::task::JoinHandle<()>);
+struct CredentialSourceWatcher(
+    tokio::task::JoinHandle<()>,
+    #[cfg(test)] watch::Receiver<bool>,
+);
 
 impl CredentialSourceWatcher {
     fn new(
@@ -135,6 +138,8 @@ impl CredentialSourceWatcher {
         changed: watch::Sender<u64>,
     ) -> Self {
         let registry = Arc::clone(registry);
+        #[cfg(test)]
+        let (ready, initial_scan) = watch::channel(false);
         let task = tokio::spawn(async move {
             let mut observed = HashMap::new();
             let mut cadence = tokio::time::interval(Duration::from_millis(250));
@@ -159,9 +164,25 @@ impl CredentialSourceWatcher {
                     }
                 }
                 observed.retain(|source_id, _| live.contains(source_id));
+                #[cfg(test)]
+                ready.send_replace(true);
             }
         });
-        Self(task)
+        Self(
+            task,
+            #[cfg(test)]
+            initial_scan,
+        )
+    }
+}
+
+#[cfg(test)]
+impl CredentialSourceWatcher {
+    #[allow(clippy::expect_used)]
+    async fn wait_for_initial_scan(&mut self) {
+        while !*self.1.borrow_and_update() {
+            self.1.changed().await.expect("watcher remains live");
+        }
     }
 }
 

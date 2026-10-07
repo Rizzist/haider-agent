@@ -312,6 +312,12 @@ pub(crate) struct AcceptedCompaction {
 /// not session identity.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
+    /// Per-fixture monotonic clock projection for paused-time deadline tests.
+    #[cfg(test)]
+    fn request_deadline_for_test(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
     async fn resolve_for_turn(
         &self,
         metadata: &SessionMetadataV1,
@@ -8667,6 +8673,10 @@ async fn start_turn(
         .turn_start_journal_projection(&accepted.run_id)
         .await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
+    #[cfg(test)]
+    if let Some(deadline) = dependencies.provider_factory.request_deadline_for_test() {
+        provider_deadline = Some(deadline);
+    }
     let mut pinned_metadata = metadata.clone();
     pinned_metadata.context_economy = refresh_context_economy_from_journal(
         lease,

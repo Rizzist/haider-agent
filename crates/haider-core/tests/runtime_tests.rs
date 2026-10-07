@@ -6503,18 +6503,20 @@ async fn cancellation_mid_tool_completes_tool_as_cancelled_never_failed() {
 
 #[tokio::test]
 async fn cancellation_mid_stream_is_terminal_and_discards_later_events() {
-    let (handle, store, _) = runtime(vec![
+    let (provider, barrier) = FakeProvider::new(vec![
         FakeStep::EmitText {
             text: "first".into(),
         },
-        FakeStep::Delay { ms: 200 },
         FakeStep::EmitText {
             text: "second".into(),
         },
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
         },
-    ]);
+    ])
+    .with_stream_barrier(1, 1);
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), Arc::new(provider), store.clone());
     let mut subscriber = handle.subscribe();
     let turn = handle
         .submit_turn(SubmitTurn::new("cancel me"))
@@ -6531,6 +6533,7 @@ async fn cancellation_mid_stream_is_terminal_and_discards_later_events() {
     })
     .await
     .expect("first delta arrives");
+    barrier.wait_until_entered().await;
     turn.cancel();
     let outcome = turn.wait().await.expect("outcome");
     assert_eq!(outcome.state, RunState::Cancelled);
@@ -6561,7 +6564,11 @@ async fn cancellation_mid_stream_is_terminal_and_discards_later_events() {
             }) if text == "second"
         )
     }));
-    sleep(Duration::from_millis(250)).await;
+    barrier.release();
+    handle
+        .stop()
+        .await
+        .expect("cancelled actor joins before the final journal read");
     let after = store.events(&SessionId::new(SESSION)).await;
     assert_eq!(after.len(), before.len(), "nothing follows Cancelled");
 }

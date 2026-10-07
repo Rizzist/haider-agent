@@ -100,6 +100,7 @@ pub(crate) struct DelegationHandle {
 pub(crate) struct StallDeadlineTestClock {
     now_ms: AtomicU64,
     checked: Mutex<(u64, u64)>,
+    parked_checks: Mutex<(u64, u64)>,
 }
 
 #[cfg(all(test, unix))]
@@ -117,6 +118,31 @@ impl StallDeadlineTestClock {
             checked.1
         } else {
             0
+        }
+    }
+
+    pub(crate) fn parked_checks_at(&self, expected_ms: u64) -> u64 {
+        let checked = self
+            .parked_checks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.0 == expected_ms {
+            checked.1
+        } else {
+            0
+        }
+    }
+
+    fn observe_park(&self) {
+        let now_ms = self.now_ms.load(Ordering::SeqCst);
+        let mut checked = self
+            .parked_checks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.0 == now_ms {
+            checked.1 = checked.1.saturating_add(1);
+        } else {
+            *checked = (now_ms, 1);
         }
     }
 
@@ -1295,6 +1321,12 @@ impl DelegationHandle {
                         }
                         _ => {}
                     }
+                }
+                #[cfg(all(test, unix))]
+                if progress.human_required
+                    && let Some(clock) = &self.stall_deadline_clock
+                {
+                    clock.observe_park();
                 }
                 tokio::select! {
                     biased;

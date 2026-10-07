@@ -542,9 +542,10 @@ impl CredentialCatalogProxy {
                     ) {
                         let release_generation = observed_release.load(Ordering::SeqCst);
                         held_started_tx.send(()).expect("publish held request");
-                        let deadline = Instant::now() + Duration::from_secs(5);
+                        // A held request ends only on explicit release/teardown.
+                        // Auto-release would hide a blocking discovery regression.
                         while observed_release.load(Ordering::SeqCst) == release_generation
-                            && Instant::now() < deadline
+                            && !observed_stop.load(Ordering::SeqCst)
                         {
                             thread::sleep(Duration::from_millis(5));
                         }
@@ -769,7 +770,8 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         .held_started
         .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .expect("slow catalog request starts");
-    let exited_before_release = wait_for_child_exit(&mut slow_add, Duration::from_secs(2));
+    let exited_before_release =
+        wait_for_child_exit(&mut slow_add, haider_platform::TEST_WAIT_TIMEOUT);
     proxy.release_held();
     // The old path issues an unauthenticated endpoint probe before its
     // authenticated discovery. Release that second request too so the red
@@ -906,7 +908,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         );
     }
     assert!(
-        wait_for_child_exit(&mut first, Duration::from_secs(2)),
+        wait_for_child_exit(&mut first, haider_platform::TEST_WAIT_TIMEOUT),
         "first replacement waited for its catalog flight"
     );
     let mut second = spawn_keyed_account_command(
@@ -917,7 +919,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         "fixture-concurrent-key",
     );
     assert!(
-        wait_for_child_exit(&mut second, Duration::from_secs(2)),
+        wait_for_child_exit(&mut second, haider_platform::TEST_WAIT_TIMEOUT),
         "concurrent replacement waited for another credential's catalog flight"
     );
     assert_eq!(
@@ -939,7 +941,6 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
                 .is_some_and(|models| models.iter().any(|model| model == "real-current"))
     });
     assert_eq!(current["availability"], "available");
-    thread::sleep(Duration::from_millis(250));
     assert_eq!(
         proxy.model_requests.load(Ordering::SeqCst),
         concurrent_before + 1,

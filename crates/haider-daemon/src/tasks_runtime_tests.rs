@@ -357,7 +357,6 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
         }
         ToolDispatchResult::Deferred(_) => panic!("Ask became a deferred tool result"),
     }
-    tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(!ask_marker.exists(), "Ask started the monitor command");
     let ask_phases = process_effect_phases(&store, &ask_session).await;
     assert!(ask_phases.iter().any(|phase| matches!(

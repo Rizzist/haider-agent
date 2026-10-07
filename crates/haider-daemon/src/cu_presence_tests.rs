@@ -208,7 +208,7 @@ async fn idle_expiry_hides_the_overlay_and_the_next_action_reshows_it() {
             .await
             .expect("begin"),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
     while presence.is_shown(PresenceSurface::Screen) {
         assert!(
             Instant::now() < deadline,

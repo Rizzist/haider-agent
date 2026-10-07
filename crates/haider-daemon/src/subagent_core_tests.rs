@@ -3164,6 +3164,7 @@ async fn start_parked_child(
         stall_deadline,
         Duration::from_secs(241),
         Duration::from_secs(1),
+        None,
     )
     .await
 }
@@ -3175,6 +3176,7 @@ async fn start_parked_child_with_wait_budgets(
     stall_deadline: Duration,
     run_wait_timeout: Duration,
     settlement_tail_timeout: Duration,
+    stall_clock: Option<Arc<StallDeadlineTestClock>>,
 ) -> ParkedChildHarness {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -3236,12 +3238,17 @@ async fn start_parked_child_with_wait_budgets(
                 provider: provider.clone(),
             }),
             tool_factory: delegation_tool_factory(),
-            delegation: Some(DelegationHandle::with_wait_budgets(
-                hub.clone(),
-                stall_deadline,
-                run_wait_timeout,
-                settlement_tail_timeout,
-            )),
+            delegation: Some(match stall_clock {
+                Some(clock) => {
+                    DelegationHandle::with_stall_deadline_clock(hub.clone(), stall_deadline, clock)
+                }
+                None => DelegationHandle::with_wait_budgets(
+                    hub.clone(),
+                    stall_deadline,
+                    run_wait_timeout,
+                    settlement_tail_timeout,
+                ),
+            }),
             web_search: None,
         },
         false,
@@ -3651,17 +3658,26 @@ async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
 #[tokio::test]
 #[cfg(unix)]
 async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
-    // 300ms: under parallel suite load the child's first round can
-    // exceed a 35ms stall deadline BEFORE the park commits — a legal
-    // pre-park nudge that the parked-silence law must not miss-read
-    // (5/5 standalone, flaky in-suite at 35ms).
-    let harness = start_parked_child(
+    // Freeze the stall clock throughout child startup. No amount of executor
+    // delay can consume a stall interval before the durable human-input park.
+    let stall_clock = Arc::new(StallDeadlineTestClock::default());
+    let harness = start_parked_child_with_wait_budgets(
         "permission-stall",
         ParkedChildMode::StallAfterApproval,
         Duration::from_millis(300),
+        Duration::from_secs(241),
+        Duration::from_secs(1),
+        Some(Arc::clone(&stall_clock)),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(160)).await;
+    stall_clock.set_now_ms(u64::MAX);
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while stall_clock.parked_checks_at(u64::MAX) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("collector observes the park after the stall clock expires");
     let parked_payloads = typed_payloads(
         &harness
             .store
@@ -3747,15 +3763,15 @@ async fn parent_user_answers_delegated_question_over_uds_and_child_continues() {
         harness.hub.clone(),
         Duration::from_millis(75),
     );
-    // Registry #94 test arithmetic: the outer 250ms observer contains the
-    // production 75ms mirror bound plus 175ms of executor scheduling margin.
+    // The 75ms mirror deadline is policy input. The outer watchdog only
+    // detects a stuck fixture; the returned timeout outcome is the assertion.
     let first_wait_timed_out = timeout(
         haider_platform::TEST_WAIT_TIMEOUT,
         terminal_mirror
             .terminal_mirror_times_out_for_test(&harness.child, Duration::from_millis(75)),
     )
     .await
-    .expect("terminal mirror first wait honors its production bound")
+    .expect("terminal mirror returns its timeout outcome")
     .expect("terminal mirror reads child journal");
     assert!(
         first_wait_timed_out,
@@ -4199,6 +4215,7 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
         Duration::from_secs(1),
         Duration::from_millis(2_250),
         Duration::from_millis(250),
+        None,
     )
     .await;
     let _ = wait_for_parent_delegated_menu(
