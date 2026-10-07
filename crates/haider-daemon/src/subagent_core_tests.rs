@@ -4590,7 +4590,6 @@ async fn committed_child_progress_resets_the_stall_deadline() {
 #[cfg(unix)]
 async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     const STALL_DEADLINE: Duration = Duration::from_millis(100);
-    // Outer observation bound: twenty complete supervision cycles, each
     // The injected stall clock and durable progress receipts define the
     // semantic boundaries. This outer watchdog only catches a stuck fixture.
     const OBSERVATION_TIMEOUT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
