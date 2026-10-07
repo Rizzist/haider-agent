@@ -2185,6 +2185,11 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
     let clock_guard = keep_clock_fixed();
     let clock = ProviderDeadlineTestClock::new();
     let deadline = Instant::now() + Duration::from_secs(3);
+    let (deadline_sender, mut deadline_event) = tokio::sync::oneshot::channel();
+    let deadline_task = tokio::spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        let _ = deadline_sender.send(());
+    });
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
@@ -2291,7 +2296,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
     let _ = clock_guard.await;
     tokio::select! {
         biased;
-        () = tokio::time::sleep_until(deadline) => panic!("headless deadline event preceded provider cancellation"),
+        result = &mut deadline_event => panic!("headless deadline event preceded provider cancellation: {result:?}"),
         () = provider.dropped.notified() => {}
     }
     let clock_guard = keep_clock_fixed();
@@ -2359,6 +2364,14 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         Instant::now() < deadline,
         "durable terminal precedes deadline event"
     );
+    let terminal_observed_at = Instant::now();
+    assert!(
+        matches!(
+            deadline_event.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "deadline event must still be pending after durable terminal delivery"
+    );
     assert_eq!(failure.0, ErrorCode::ProviderTimeout);
     assert!(failure.1.contains("reason=deadline_exhausted"));
     assert!(!failure.2, "no full retry can fit before the deadline");
@@ -2371,23 +2384,31 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             .as_str(),
         "provider-timeout"
     );
+    let terminal_events = store
+        .read(&session_id, 0, 512)
+        .await
+        .expect("read terminalized run");
     assert!(
-        !store
-            .read(&session_id, 0, 512)
-            .await
-            .expect("read terminalized run")
-            .iter()
-            .any(|event| {
-                event.run_id.as_ref() == Some(&run_id)
-                    && event.payload.decode_event().is_ok_and(|payload| {
-                        matches!(
-                            payload,
-                            EventPayload::RunState(RunState::Waiting {
-                                reason: haider_protocol::state::WaitReason::NetworkUnavailable
-                            })
-                        )
-                    })
-            }),
+        !terminal_events.iter().any(|event| {
+            matches!(
+                HeadlessRunEventPayload::from_payload_value(&event.payload),
+                Some(HeadlessRunEventPayload::RunDeadlineExceeded(_))
+            )
+        }),
+        "early provider terminalization is not a caller deadline event"
+    );
+    assert!(
+        !terminal_events.iter().any(|event| {
+            event.run_id.as_ref() == Some(&run_id)
+                && event.payload.decode_event().is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::RunState(RunState::Waiting {
+                            reason: haider_protocol::state::WaitReason::NetworkUnavailable
+                        })
+                    )
+                })
+        }),
         "a never-opening provider on a live route must not enter WaitingForRoute"
     );
     assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
@@ -2397,4 +2418,10 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
     store.close().await.expect("store close");
     clock_guard.abort();
     let _ = clock_guard.await;
+    deadline_event
+        .await
+        .expect("headless deadline event fires after terminal delivery");
+    deadline_task.await.expect("deadline observer joins");
+    assert!(terminal_observed_at < Instant::now());
+    assert_eq!(Instant::now(), deadline);
 }
