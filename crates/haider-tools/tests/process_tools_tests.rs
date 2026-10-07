@@ -2107,12 +2107,19 @@ fn assert_descendant_group_swept(started: &Path) {
         .expect("descendant group id")
         .parse()
         .expect("numeric group id");
+    let cleanup_pid =
+        haider_platform::process_id(u32::try_from(pid).ok()).expect("positive descendant group id");
     let watchdog = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
     while haider_tools::probe_group_liveness(pid) != haider_tools::PidLiveness::Dead {
-        assert!(
-            std::time::Instant::now() < watchdog,
-            "owned group survives teardown"
-        );
+        if std::time::Instant::now() >= watchdog {
+            // The fixture must also clean up when a mutation leaves its own
+            // group alive. Preserve the failure before releasing that group.
+            let _ = haider_platform::signal_process_group_id(
+                cleanup_pid,
+                haider_platform::ProcessSignal::Kill,
+            );
+            panic!("owned group {pid} survived teardown; killed for fixture cleanup");
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
