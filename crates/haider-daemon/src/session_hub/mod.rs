@@ -1546,6 +1546,7 @@ impl AppendCommitter {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let byte_weight = command
             .request_json
@@ -1561,6 +1562,7 @@ impl AppendCommitter {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             },
             byte_weight,
             AppendCommitCompletion::CreateSession(completed),
@@ -1829,6 +1831,7 @@ enum ActorCommand {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
     },
     CreateBranch {
@@ -1838,6 +1841,14 @@ enum ActorCommand {
     CommitCheckpoint {
         command: CheckpointCommitCommand,
         completed: oneshot::Sender<Result<CheckpointCommitOutcome, HaiderError>>,
+    },
+    ResolvedRoute {
+        provider: String,
+        model: String,
+        epoch: u64,
+        alias: Option<String>,
+        device_id: DeviceId,
+        completed: oneshot::Sender<Result<u64, HaiderError>>,
     },
     SelectModel {
         command: SessionSelectModelCommand,
@@ -4228,6 +4239,8 @@ impl SessionHub {
         self.create_internal_session_with_interaction_mode(
             command,
             haider_protocol::session::SessionInteractionModeV1::Interactive,
+            None,
+            None,
         )
         .await
     }
@@ -4236,6 +4249,8 @@ impl SessionHub {
         &self,
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<CreatedSession, HaiderError> {
         if let Some(created) = self
             .inner
@@ -4250,7 +4265,13 @@ impl SessionHub {
             return Ok(created);
         }
         match self
-            .create_session_with_interaction_mode(command, interaction_mode, None, None)
+            .create_session_with_interaction_mode(
+                command,
+                interaction_mode,
+                account_alias,
+                None,
+                inherited_route,
+            )
             .await
             .map_err(hub_error_as_store)?
         {
@@ -4830,6 +4851,7 @@ impl SessionHub {
             haider_protocol::session::SessionInteractionModeV1::Interactive,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4840,6 +4862,7 @@ impl SessionHub {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<SessionCreateOutcome, SessionHubError> {
         if crate::android_policy::enabled() {
             crate::android_workspace::validate(std::path::Path::new(&command.cwd))?;
@@ -4853,6 +4876,7 @@ impl SessionHub {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
                 completed,
             })
             .await
@@ -8429,6 +8453,34 @@ impl HubStoreHandle {
             .store
             .session_metadata(&self.session_id)
             .await
+    }
+
+    pub(crate) async fn commit_resolved_route(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        alias: Option<&str>,
+    ) -> Result<u64, HaiderError> {
+        let actor = self
+            .hub
+            .actor_for(self.session_id.clone())
+            .await
+            .map_err(hub_error_as_store)?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::ResolvedRoute {
+                provider: metadata.provider.clone(),
+                model: metadata.model.clone(),
+                epoch: metadata.selection_epoch.unwrap_or(0),
+                alias: alias.map(str::to_owned),
+                device_id: self.hub.inner.device_id.clone(),
+                completed,
+            })
+            .await
+            .map_err(|_| hub_error_as_store(SessionHubError::Closed))?;
+        response
+            .await
+            .map_err(|_| hub_error_as_store(SessionHubError::Closed))?
     }
 
     /// Installs this lease's harness. The receiver cannot name another

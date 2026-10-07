@@ -3,10 +3,10 @@
 use haider_protocol::envelope::PromptRender;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
-use haider_protocol::session::SessionProviderRebound;
+use haider_protocol::session::{ModelSelected, SessionProviderRebound};
 use haider_store::{
     SessionCreateCommand, SessionProviderRebindCommand, SessionProviderRebindOutcome,
-    SessionSelectModelCommand, Store,
+    SessionSelectModelCommand, SessionSelectModelOutcome, Store,
 };
 
 fn create(store: &Store, session: &str) {
@@ -32,6 +32,49 @@ fn create(store: &Store, session: &str) {
         .expect("create session");
 }
 
+#[test]
+fn legacy_omitted_budget_source_does_not_mint_a_noop_selection_epoch() {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    use haider_store::SessionSelectModelOutcome;
+
+    let root = tempfile::tempdir().expect("temporary store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "legacy-budget-source");
+    let command = SessionSelectModelCommand {
+        command_id: "legacy-noop".into(),
+        request_digest: "legacy-noop-digest".into(),
+        request_json: "{}".into(),
+        session_id: SessionId::new("legacy-budget-source"),
+        worker_generation: store.worker_generation(),
+        provider: "source".into(),
+        model: "test-model".into(),
+        expected_pair: None,
+        account_alias: None,
+        output_budget: Some(SessionOutputBudgetV1 {
+            max_tokens: 4096,
+            source: SessionOutputBudgetSourceV1::Derived,
+            clamped: None,
+        }),
+        event_id: EventId::new("legacy-noop-event"),
+        device_id: DeviceId::new("test-device"),
+    };
+    let SessionSelectModelOutcome::Committed { selected, .. } = store
+        .select_session_model(&command)
+        .expect("no-op selection")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(selected.selected_seq, 0);
+    assert_eq!(
+        store
+            .session_metadata(&command.session_id)
+            .expect("metadata")
+            .expect("typed")
+            .selection_epoch,
+        Some(0)
+    );
+}
+
 fn command(store: &Store) -> SessionProviderRebindCommand {
     SessionProviderRebindCommand {
         command_id: "rebind-1".into(),
@@ -47,6 +90,170 @@ fn command(store: &Store) -> SessionProviderRebindCommand {
         event_id: EventId::new("rebound-1"),
         device_id: DeviceId::new("test-device"),
     }
+}
+
+#[test]
+fn cross_provider_pick_clears_pin_and_old_route_with_typed_notice() {
+    let root = tempfile::tempdir().expect("temporary store");
+    let store = Store::open(root.path()).expect("store");
+    create(&store, "session-a");
+    let id = SessionId::new("session-a");
+    let mut first = SessionSelectModelCommand {
+        command_id: "pin-source".into(),
+        request_digest: "pin-source-digest".into(),
+        request_json: r#"{"pin":"bed-a"}"#.into(),
+        session_id: id.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "source".into(),
+        model: "test-model".into(),
+        expected_pair: None,
+        account_alias: Some("bed-a".into()),
+        output_budget: None,
+        event_id: EventId::new("pin-source-event"),
+        device_id: DeviceId::new("test-device"),
+    };
+    store.select_session_model(&first).expect("pin source");
+    let current = store
+        .session_metadata(&id)
+        .expect("metadata")
+        .expect("typed");
+    store
+        .commit_resolved_route(
+            &id,
+            "source",
+            "test-model",
+            current.selection_epoch.unwrap_or(0),
+            Some("old-route"),
+            &DeviceId::new("test-device"),
+        )
+        .expect("served route");
+    first.command_id = "same-provider".into();
+    first.request_digest = "same-provider-digest".into();
+    first.request_json = r#"{"model":"same-provider-model"}"#.into();
+    first.model = "same-provider-model".into();
+    first.account_alias = None;
+    first.event_id = EventId::new("same-provider-event");
+    let SessionSelectModelOutcome::Committed { selected: same, .. } = store
+        .select_session_model(&first)
+        .expect("same-provider selection")
+    else {
+        panic!("same-provider commit");
+    };
+    assert_eq!(same.cleared_account_pin, None);
+    assert_eq!(
+        store
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .account_alias
+            .as_deref(),
+        Some("bed-a")
+    );
+    first.command_id = "cross-provider".into();
+    first.request_digest = "cross-provider-digest".into();
+    first.request_json = r#"{"provider":"target"}"#.into();
+    first.provider = "target".into();
+    first.account_alias = None;
+    first.event_id = EventId::new("cross-provider-event");
+    let SessionSelectModelOutcome::Committed { selected, envelope } = store
+        .select_session_model(&first)
+        .expect("cross-provider selection")
+    else {
+        panic!("committed selection");
+    };
+    assert_eq!(selected.cleared_account_pin.as_deref(), Some("bed-a"));
+    assert_eq!(
+        ModelSelected::from_payload_value(&envelope.payload)
+            .expect("fact")
+            .cleared_account_pin
+            .as_deref(),
+        Some("bed-a")
+    );
+    let metadata = store
+        .session_metadata(&id)
+        .expect("metadata")
+        .expect("typed");
+    assert_eq!(metadata.account_alias, None);
+    assert_eq!(metadata.resolved_route_alias, None);
+    assert!(!metadata.resolved_route_seen);
+    let SessionSelectModelOutcome::IdempotentReplay { selected: replay } =
+        store.select_session_model(&first).expect("retry")
+    else {
+        panic!("receipt replay");
+    };
+    assert_eq!(replay, selected);
+}
+
+#[test]
+fn derived_child_inherits_explicit_route_and_rejects_mismatched_provider() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    create(&store, "parent");
+    let parent = SessionId::new("parent");
+    let connection = rusqlite::Connection::open(store.database_path()).expect("fixture database");
+    connection.execute("UPDATE sessions SET meta_json = json_set(meta_json, '$.account_alias', 'bed-b', '$.provider_base_url', 'https://synthetic.invalid', '$.provider_rebind_id', 'rebind-parent') WHERE id = ?1", [parent.as_str()]).expect("explicit parent fixture");
+    drop(connection);
+    let source = store
+        .session_metadata(&parent)
+        .expect("parent metadata")
+        .expect("typed");
+    let child = SessionCreateCommand {
+        command_id: "create-derived".into(),
+        request_digest: "create-derived-digest".into(),
+        request_json: r#"{"child":"derived"}"#.into(),
+        session_id: SessionId::new("derived"),
+        cwd: "/tmp".into(),
+        provider: "source".into(),
+        model: "test-model".into(),
+        max_tokens: 4096,
+        max_tokens_source: None,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: "test-system".into(),
+        event_id: EventId::new("derived-created"),
+        device_id: DeviceId::new("test-device"),
+    };
+    store
+        .create_session_with_workspace_configuration(
+            &child,
+            Default::default(),
+            None,
+            None,
+            Some(source.clone()),
+        )
+        .expect("derived child");
+    let metadata = store
+        .session_metadata(&child.session_id)
+        .expect("child metadata")
+        .expect("typed");
+    assert_eq!(metadata.account_alias, source.account_alias);
+    assert_eq!(metadata.provider_base_url, source.provider_base_url);
+    assert_eq!(metadata.provider_rebind_id, source.provider_rebind_id);
+    let mut wrong = child.clone();
+    wrong.session_id = SessionId::new("wrong-provider");
+    wrong.command_id = "create-wrong-provider".into();
+    wrong.request_digest = "create-wrong-provider-digest".into();
+    wrong.request_json = r#"{"child":"wrong-provider"}"#.into();
+    wrong.provider = "target".into();
+    assert!(
+        store
+            .create_session_with_workspace_configuration(
+                &wrong,
+                Default::default(),
+                None,
+                None,
+                Some(source)
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .session_metadata(&wrong.session_id)
+            .expect("not created")
+            .is_none()
+    );
 }
 
 #[test]
@@ -197,7 +404,7 @@ fn provider_rebind_omitted_coordinates_clear_only_the_session_override() {
     };
     assert_eq!(
         *envelope.payload,
-        serde_json::json!({"type":"session_provider_rebound","rebind_id":"rebind-2","provider":"proxy"})
+        serde_json::json!({"type":"session_provider_rebound","rebind_id":"rebind-2","provider":"proxy","selection_epoch":envelope.seq})
     );
     let metadata = store
         .session_metadata(&command.session_id)
@@ -224,6 +431,7 @@ fn model_provider_switch_clears_rebind_override_but_same_provider_preserves_it()
         provider: "proxy".into(),
         model: "model-2".into(),
         expected_pair: None,
+        account_alias: None,
         output_budget: None,
         event_id: EventId::new("model-selected-1"),
         device_id: DeviceId::new("test-device"),
@@ -257,4 +465,607 @@ fn model_provider_switch_clears_rebind_override_but_same_provider_preserves_it()
     assert_eq!(switched.provider_base_url, None);
     assert_eq!(switched.provider_rebind_id, None);
     assert_eq!(switched.account_alias, None);
+}
+
+#[test]
+fn selection_epoch_survives_restart_and_advances_for_budget_model_and_route() {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    use haider_protocol::session::ModelSelected;
+    use haider_store::SessionSelectModelOutcome;
+
+    let root = tempfile::tempdir().expect("temporary store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "session-a");
+    let id = SessionId::new("session-a");
+    assert_eq!(
+        store
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .selection_epoch,
+        Some(0)
+    );
+    let mut selection = SessionSelectModelCommand {
+        command_id: "budget-1".into(),
+        request_digest: "budget-digest-1".into(),
+        request_json: r#"{"budget":20000}"#.into(),
+        session_id: id.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "source".into(),
+        model: "test-model".into(),
+        expected_pair: None,
+        account_alias: None,
+        output_budget: Some(SessionOutputBudgetV1 {
+            max_tokens: 20_000,
+            source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+            clamped: None,
+        }),
+        event_id: EventId::new("budget-event-1"),
+        device_id: DeviceId::new("test-device"),
+    };
+    let SessionSelectModelOutcome::Committed {
+        selected: budget,
+        envelope,
+    } = store
+        .select_session_model(&selection)
+        .expect("budget commit")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(budget.selected_seq, envelope.seq);
+    assert_eq!(
+        ModelSelected::from_payload_value(&envelope.payload)
+            .expect("fact")
+            .selection_epoch,
+        Some(budget.selected_seq)
+    );
+    selection.command_id = "noop-1".into();
+    selection.request_digest = "noop-digest-1".into();
+    selection.request_json = r#"{"noop":true}"#.into();
+    selection.event_id = EventId::new("noop-event-1");
+    let SessionSelectModelOutcome::Committed {
+        selected: noop,
+        envelope,
+    } = store
+        .select_session_model(&selection)
+        .expect("no-op commit")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(noop.selected_seq, budget.selected_seq);
+    assert!(envelope.seq > noop.selected_seq);
+    assert_eq!(
+        ModelSelected::from_payload_value(&envelope.payload)
+            .expect("no-op fact")
+            .selection_epoch,
+        Some(budget.selected_seq)
+    );
+    selection.command_id = "account-bind-1".into();
+    selection.request_digest = "account-bind-digest-1".into();
+    selection.request_json = r#"{"account":"account-A"}"#.into();
+    selection.account_alias = Some("account-A".into());
+    selection.event_id = EventId::new("account-bind-event-1");
+    let SessionSelectModelOutcome::Committed {
+        selected: account_bound,
+        ..
+    } = store
+        .select_session_model(&selection)
+        .expect("account binding commit")
+    else {
+        panic!("commit")
+    };
+    assert!(account_bound.selected_seq > noop.selected_seq);
+    assert_eq!(
+        store
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .account_alias
+            .as_deref(),
+        Some("account-A")
+    );
+    selection.command_id = "model-2".into();
+    selection.request_digest = "model-digest-2".into();
+    selection.request_json = r#"{"model":"another"}"#.into();
+    selection.model = "another".into();
+    selection.account_alias = None;
+    selection.event_id = EventId::new("model-event-2");
+    let SessionSelectModelOutcome::Committed {
+        selected: model, ..
+    } = store
+        .select_session_model(&selection)
+        .expect("model commit")
+    else {
+        panic!("commit")
+    };
+    assert!(model.selected_seq > budget.selected_seq);
+    let mut route = command(&store);
+    route.provider = "source".into();
+    let SessionProviderRebindOutcome::Committed {
+        selected: rebound,
+        envelope,
+    } = store.rebind_session_provider(&route).expect("route commit")
+    else {
+        panic!("commit")
+    };
+    assert!(rebound.selected_seq > model.selected_seq);
+    assert_eq!(
+        SessionProviderRebound::from_payload_value(&envelope.payload)
+            .expect("route fact")
+            .selection_epoch,
+        Some(rebound.selected_seq)
+    );
+    drop(store);
+    let reopened = Store::open(root.path()).expect("restart");
+    assert_eq!(
+        reopened
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .selection_epoch,
+        Some(rebound.selected_seq)
+    );
+    selection.command_id = "budget-3".into();
+    selection.request_digest = "budget-digest-3".into();
+    selection.request_json = r#"{"budget":12000}"#.into();
+    selection.worker_generation = reopened.worker_generation();
+    selection.output_budget = Some(SessionOutputBudgetV1 {
+        max_tokens: 12_000,
+        source: SessionOutputBudgetSourceV1::UserSet { requested: 12_000 },
+        clamped: None,
+    });
+    selection.event_id = EventId::new("budget-event-3");
+    let SessionSelectModelOutcome::Committed {
+        selected: after_restart,
+        ..
+    } = reopened
+        .select_session_model(&selection)
+        .expect("post-restart commit")
+    else {
+        panic!("commit")
+    };
+    assert!(after_restart.selected_seq > rebound.selected_seq);
+}
+
+#[test]
+fn first_route_is_journaled_without_advancing_request_selection_and_noop_is_silent() {
+    let root = tempfile::tempdir().expect("store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "route-first");
+    let id = SessionId::new("route-first");
+    let (epoch, facts) = store
+        .commit_resolved_route_fact(&id, "source", "test-model", 0, None, &DeviceId::new("test"))
+        .expect("first route");
+    assert_eq!(epoch, 0);
+    assert_eq!(facts.len(), 1);
+    let fact = ModelSelected::from_payload_value(&facts[0].payload).expect("typed");
+    assert!(fact.route_only);
+    assert_eq!(fact.selection_epoch, Some(0));
+    assert_eq!(
+        store
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .route_reset_epoch,
+        Some(0)
+    );
+    assert_eq!(fact.cleared_account_pin, None);
+    assert_eq!(fact.cleared_provider_endpoint, None);
+    assert!(
+        store
+            .commit_resolved_route_fact(
+                &id,
+                "source",
+                "test-model",
+                epoch,
+                None,
+                &DeviceId::new("test")
+            )
+            .expect("same route")
+            .1
+            .is_empty()
+    );
+}
+
+#[test]
+fn rebind_clears_previous_served_route_and_survives_reopen() {
+    for alias in [None, Some("old-served-alias")] {
+        let root = tempfile::tempdir().expect("store");
+        let store = Store::open(root.path()).expect("open");
+        create(&store, "session-a");
+        let id = SessionId::new("session-a");
+        store
+            .commit_resolved_route(
+                &id,
+                "source",
+                "test-model",
+                0,
+                alias,
+                &DeviceId::new("test"),
+            )
+            .expect("serve");
+        let mut rebind = command(&store);
+        rebind.account = None;
+        store
+            .rebind_session_provider(&rebind)
+            .expect("cross-provider rebind");
+        drop(store);
+        let store = Store::open(root.path()).expect("reopen");
+        let metadata = store.session_metadata(&id).expect("meta").expect("typed");
+        assert!(!metadata.resolved_route_seen);
+        assert_eq!(metadata.resolved_route_alias, None);
+        assert!(metadata.route_reset_epoch.is_some_and(|epoch| epoch > 0));
+    }
+}
+
+#[test]
+fn unchanged_rebind_preserves_the_served_route_and_reset_epoch() {
+    let root = tempfile::tempdir().expect("store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "session-a");
+    let id = SessionId::new("session-a");
+    store
+        .commit_resolved_route(
+            &id,
+            "source",
+            "test-model",
+            0,
+            Some("served"),
+            &DeviceId::new("test"),
+        )
+        .expect("serve");
+    let before = store
+        .session_metadata(&id)
+        .expect("metadata")
+        .expect("typed");
+    let mut same = command(&store);
+    same.provider = "source".into();
+    same.base_url = None;
+    same.account = None;
+    store.rebind_session_provider(&same).expect("no-op rebind");
+    let after = store
+        .session_metadata(&id)
+        .expect("metadata")
+        .expect("typed");
+    assert!(after.resolved_route_seen);
+    assert_eq!(after.resolved_route_alias, before.resolved_route_alias);
+    assert_eq!(after.route_reset_epoch, before.route_reset_epoch);
+}
+
+#[test]
+fn endpoint_only_and_both_choices_get_complete_clear_receipts_and_facts() {
+    for pin in [None, Some("synthetic-pin")] {
+        let root = tempfile::tempdir().expect("store");
+        let store = Store::open(root.path()).expect("open");
+        create(&store, "session-a");
+        let mut rebind = command(&store);
+        rebind.account = pin.map(str::to_owned);
+        store
+            .rebind_session_provider(&rebind)
+            .expect("explicit endpoint");
+        let select = SessionSelectModelCommand {
+            command_id: "clear-endpoint".into(),
+            request_digest: "clear-digest".into(),
+            request_json: "{}".into(),
+            session_id: rebind.session_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "target".into(),
+            model: "target-model".into(),
+            expected_pair: None,
+            account_alias: None,
+            output_budget: None,
+            event_id: EventId::new("clear-endpoint-fact"),
+            device_id: DeviceId::new("test"),
+        };
+        let SessionSelectModelOutcome::Committed { selected, envelope } =
+            store.select_session_model(&select).expect("clear")
+        else {
+            panic!("commit");
+        };
+        assert_eq!(selected.cleared_provider_endpoint, rebind.base_url);
+        assert_eq!(selected.cleared_account_pin.as_deref(), pin);
+        let fact = ModelSelected::from_payload_value(&envelope.payload).expect("fact");
+        assert_eq!(
+            fact.cleared_provider_endpoint,
+            selected.cleared_provider_endpoint
+        );
+        let notice = haider_protocol::session::model_selection_clear_notice(
+            fact.cleared_account_pin.as_deref(),
+            fact.cleared_provider_endpoint.as_deref(),
+            &fact.provider,
+        )
+        .expect("complete notice");
+        assert!(notice.contains("endpoint"));
+        if let Some(pin) = pin {
+            assert!(notice.contains(pin));
+        }
+        assert_eq!(
+            store
+                .session_select_model_receipt(
+                    &select.command_id,
+                    &select.request_digest,
+                    &select.request_json
+                )
+                .expect("replay"),
+            Some(selected)
+        );
+    }
+}
+
+#[test]
+fn clamps_survive_selection_replay_and_unreported_legacy_route_gets_one_fact() {
+    use haider_protocol::output_budget::{
+        OutputBudgetClampV1, SessionOutputBudgetSourceV1, SessionOutputBudgetV1,
+    };
+    let root = tempfile::tempdir().expect("store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "clamped");
+    let id = SessionId::new("clamped");
+    let clamp = OutputBudgetClampV1 {
+        requested: 50_000,
+        max_output_tokens: 8192,
+    };
+    let command = SessionSelectModelCommand {
+        command_id: "clamp".into(),
+        request_digest: "clamp-digest".into(),
+        request_json: "{}".into(),
+        session_id: id.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "source".into(),
+        model: "smaller".into(),
+        expected_pair: None,
+        account_alias: None,
+        output_budget: Some(SessionOutputBudgetV1 {
+            max_tokens: 8192,
+            source: SessionOutputBudgetSourceV1::UserSet { requested: 50_000 },
+            clamped: Some(clamp),
+        }),
+        event_id: EventId::new("clamp"),
+        device_id: DeviceId::new("test"),
+    };
+    let SessionSelectModelOutcome::Committed { selected, envelope } =
+        store.select_session_model(&command).expect("clamp")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(
+        ModelSelected::from_payload_value(&envelope.payload)
+            .expect("fact")
+            .output_budget_clamp,
+        Some(clamp)
+    );
+    let epoch = selected.selected_seq;
+    let mut metadata = store
+        .session_metadata(&id)
+        .expect("metadata")
+        .expect("typed");
+    assert_eq!(metadata.budget_clamp_notice_epoch, Some(epoch));
+    let (_, first) = store
+        .commit_resolved_route_fact(
+            &id,
+            "source",
+            "smaller",
+            epoch,
+            None,
+            &DeviceId::new("test"),
+        )
+        .expect("first route");
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        ModelSelected::from_payload_value(&first[0].payload)
+            .expect("route fact")
+            .output_budget_clamp,
+        None
+    );
+    metadata.resolved_route_seen = true;
+    metadata.budget_clamp_notice_epoch = None;
+    let raw = rusqlite::Connection::open(store.database_path()).expect("fixture journal");
+    raw.execute(
+        "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+        rusqlite::params![
+            id.as_str(),
+            serde_json::to_string(&metadata).expect("legacy fixture")
+        ],
+    )
+    .expect("legacy/inherited clamp without durable notice");
+    let (_, facts) = store
+        .commit_resolved_route_fact(
+            &id,
+            "source",
+            "smaller",
+            epoch,
+            None,
+            &DeviceId::new("test"),
+        )
+        .expect("unreported clamp");
+    assert_eq!(facts.len(), 1);
+    assert_eq!(
+        ModelSelected::from_payload_value(&facts[0].payload)
+            .expect("fact")
+            .output_budget_clamp,
+        Some(clamp)
+    );
+    let (_, again) = store
+        .commit_resolved_route_fact(
+            &id,
+            "source",
+            "smaller",
+            epoch,
+            None,
+            &DeviceId::new("test"),
+        )
+        .expect("same route");
+    assert!(
+        again.is_empty(),
+        "the same route cannot repeat a durable clamp warning"
+    );
+    assert_eq!(
+        store
+            .session_metadata(&id)
+            .expect("metadata")
+            .expect("typed")
+            .budget_clamp_notice_epoch,
+        Some(epoch)
+    );
+}
+
+#[test]
+fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+
+    for variant in ["provider", "model", "budget", "rebind", "a-b-a"] {
+        for old_alias in [None, Some("old-request-alias")] {
+            let root = tempfile::tempdir().expect("temporary store");
+            let store = Store::open(root.path()).expect("open");
+            create(&store, "session-a");
+            let id = SessionId::new("session-a");
+            let captured = store
+                .session_metadata(&id)
+                .expect("metadata")
+                .expect("typed");
+            let mut selection = SessionSelectModelCommand {
+                command_id: "new-selection".into(),
+                request_digest: "new-selection-digest".into(),
+                request_json: r#"{"step":1}"#.into(),
+                session_id: id.clone(),
+                worker_generation: store.worker_generation(),
+                provider: if matches!(variant, "provider" | "a-b-a") {
+                    "target"
+                } else {
+                    "source"
+                }
+                .into(),
+                model: if variant == "model" {
+                    "new-model"
+                } else {
+                    "test-model"
+                }
+                .into(),
+                expected_pair: None,
+                account_alias: None,
+                output_budget: (variant == "budget").then_some(SessionOutputBudgetV1 {
+                    max_tokens: 8192,
+                    source: SessionOutputBudgetSourceV1::UserSet { requested: 8192 },
+                    clamped: None,
+                }),
+                event_id: EventId::new("new-selection-event"),
+                device_id: DeviceId::new("test-device"),
+            };
+            if variant == "rebind" {
+                let mut rebind = command(&store);
+                rebind.account = None;
+                store
+                    .rebind_session_provider(&rebind)
+                    .expect("new endpoint/provider");
+            } else {
+                store
+                    .select_session_model(&selection)
+                    .expect("new selection");
+                if variant == "a-b-a" {
+                    selection.command_id = "return-selection".into();
+                    selection.request_digest = "return-selection-digest".into();
+                    selection.request_json = r#"{"step":2}"#.into();
+                    selection.provider = captured.provider.clone();
+                    selection.model = captured.model.clone();
+                    selection.event_id = EventId::new("return-selection-event");
+                    store
+                        .select_session_model(&selection)
+                        .expect("return to same pair");
+                }
+            }
+            let current = store
+                .session_metadata(&id)
+                .expect("metadata")
+                .expect("typed");
+            assert_ne!(
+                current.selection_epoch, captured.selection_epoch,
+                "{variant}"
+            );
+            assert!(!current.resolved_route_seen);
+            let head = store
+                .read_page(&id, 0, 64, 1024 * 1024)
+                .expect("journal")
+                .last()
+                .map(|event| event.seq);
+            drop(store);
+            let store = Store::open(root.path()).expect("restart");
+            let (returned_epoch, facts) = store
+                .commit_resolved_route_fact(
+                    &id,
+                    &captured.provider,
+                    &captured.model,
+                    captured.selection_epoch.unwrap_or(0),
+                    old_alias,
+                    &DeviceId::new("test-device"),
+                )
+                .expect("late old request callback");
+            assert_eq!(
+                returned_epoch,
+                captured.selection_epoch.unwrap_or(0),
+                "old request retains its epoch: {variant}"
+            );
+            assert!(
+                facts.is_empty(),
+                "stale route must not publish: {variant}/{old_alias:?}"
+            );
+            assert_eq!(
+                store
+                    .session_metadata(&id)
+                    .expect("metadata")
+                    .expect("typed"),
+                current,
+                "stale route must not change metadata: {variant}"
+            );
+            assert_eq!(
+                store
+                    .read_page(&id, 0, 64, 1024 * 1024)
+                    .expect("journal")
+                    .last()
+                    .map(|event| event.seq),
+                head,
+                "stale route must not append a hidden fact: {variant}"
+            );
+
+            let (epoch, facts) = store
+                .commit_resolved_route_fact(
+                    &id,
+                    &current.provider,
+                    &current.model,
+                    current.selection_epoch.unwrap_or(0),
+                    Some("current-request-alias"),
+                    &DeviceId::new("test-device"),
+                )
+                .expect("current request callback");
+            assert_eq!(epoch, current.selection_epoch.unwrap_or(0));
+            assert_eq!(
+                facts.len(),
+                1,
+                "current first route is published: {variant}"
+            );
+            let served = store
+                .session_metadata(&id)
+                .expect("metadata")
+                .expect("typed");
+            assert!(served.resolved_route_seen);
+            assert_eq!(
+                served.resolved_route_alias.as_deref(),
+                Some("current-request-alias")
+            );
+            assert!(
+                store
+                    .commit_resolved_route_fact(
+                        &id,
+                        &current.provider,
+                        &current.model,
+                        epoch,
+                        Some("current-request-alias"),
+                        &DeviceId::new("test-device"),
+                    )
+                    .expect("same current route callback")
+                    .1
+                    .is_empty(),
+                "same served route remains a no-op: {variant}"
+            );
+        }
+    }
 }
