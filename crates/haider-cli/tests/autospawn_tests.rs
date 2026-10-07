@@ -1032,6 +1032,20 @@ fn daemon_stop_recovers_unreachable_lock_owner_with_matching_stale_or_absent_pid
     }
 }
 
+fn assert_idle_linger_receipt(store: &Path, expected_ms: u64) {
+    let log = std::fs::read_to_string(store.join(haider_client::DAEMON_LOG_FILE))
+        .expect("daemon lifecycle receipt");
+    assert!(
+        log.lines().any(|line| {
+            line.contains("event=idle_shutdown_armed reason=launcher_vanished")
+                && line
+                    .split_whitespace()
+                    .any(|field| field == format!("idle_linger_ms={expected_ms}"))
+        }),
+        "launcher must wire the requested idle TTL into the daemon: {log}"
+    );
+}
+
 fn wait_for_idle_daemon_exit(profile: &ResolvedProfile, daemon_pid: u32, spawn_path: &str) {
     // Exit/endpoint removal are the readiness receipts. This watchdog is
     // independent of the daemon's idle-TTL and drain-policy inputs.
@@ -1110,6 +1124,7 @@ fn real_status_tui_and_probe_autospawns_share_short_idle_ttl() {
             )
         });
         wait_for_idle_daemon_exit(&profile, daemon_pid, spawn_path);
+        assert_idle_linger_receipt(store.path(), 250);
     }
 }
 
@@ -1122,10 +1137,8 @@ fn real_status_tui_and_probe_autospawns_share_short_idle_ttl() {
 #[test]
 fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     const IDLE_TTL_MS: u64 = 250;
-    const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;
-    // Registry #94: 250 ms idle TTL + the daemon's 5,000 ms graceful-drain
-    // budget = a 5,250 ms process-exit deadline. The retained kernel identity
-    // reports exit directly, so this boundary needs no polling allowance.
+    // The retained process identity reports exit; the daemon log separately
+    // pins the actual configured policy rather than a host elapsed bound.
     const EXIT_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
     ensure_haiderd_built();
@@ -1180,6 +1193,7 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
         !profile.endpoint_path.exists(),
         "idle exit must remove the profile endpoint"
     );
+    assert_idle_linger_receipt(store.path(), IDLE_TTL_MS);
 }
 
 /// Abrupt launcher death leaves no cancellation receipt, so a hanging fake
@@ -1261,6 +1275,7 @@ fn absolute_idle_linger_durably_settles_a_nonterminal_run() {
             && daemon_log.contains("durable_quiescent=false decision=shutdown"),
         "absolute linger did not observe and drain the nonterminal run: {daemon_log}"
     );
+    assert_idle_linger_receipt(store.path(), IDLE_TTL_MS);
 }
 
 /// Three default-policy `haider run` processes on one profile authenticate
