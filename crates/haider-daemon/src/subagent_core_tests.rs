@@ -3245,15 +3245,13 @@ async fn start_parked_child_with_wait_budgets(
             }),
             tool_factory: delegation_tool_factory(),
             delegation: Some(match stall_clock {
-                Some(clock) => {
-                    DelegationHandle::with_wait_budgets_and_stall_clock(
-                        hub.clone(),
-                        stall_deadline,
-                        run_wait_timeout,
-                        settlement_tail_timeout,
-                        clock,
-                    )
-                }
+                Some(clock) => DelegationHandle::with_wait_budgets_and_stall_clock(
+                    hub.clone(),
+                    stall_deadline,
+                    run_wait_timeout,
+                    settlement_tail_timeout,
+                    clock,
+                ),
                 None => DelegationHandle::with_wait_budgets(
                     hub.clone(),
                     stall_deadline,
