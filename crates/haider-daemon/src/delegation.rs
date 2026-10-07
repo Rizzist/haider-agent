@@ -2790,11 +2790,11 @@ impl DelegationHandle {
     }
 
     #[cfg(all(test, unix))]
-    pub(crate) async fn terminal_mirror_times_out_for_test(
+    pub(crate) async fn terminal_mirror_timeout_for_test(
         &self,
         record: &DelegationRecord,
         limit: Duration,
-    ) -> Result<bool, HaiderError> {
+    ) -> Result<Option<haider_platform::WaitTimeout>, HaiderError> {
         let ticket = DeferredTicket {
             id: record.agent_id.as_str().to_owned(),
             manifest: record.manifest.clone(),
@@ -2805,7 +2805,10 @@ impl DelegationHandle {
         mirror.emit_projections = false;
         self.mirror_until_child_terminal(record, &mut mirror, tokio::time::Instant::now() + limit)
             .await
-            .map(|outcome| matches!(outcome, ChildSettlementOutcome::TerminalTimedOut(_)))
+            .map(|outcome| match outcome {
+                ChildSettlementOutcome::TerminalTimedOut(timeout) => Some(timeout),
+                _ => None,
+            })
     }
 
     async fn mirror_child_chip_states(

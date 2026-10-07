@@ -3775,17 +3775,21 @@ async fn parent_user_answers_delegated_question_over_uds_and_child_continues() {
     );
     // The 75ms mirror deadline is policy input. The outer watchdog only
     // detects a stuck fixture; the returned timeout outcome is the assertion.
-    let first_wait_timed_out = timeout(
+    let first_wait_timeout = timeout(
         haider_platform::TEST_WAIT_TIMEOUT,
-        terminal_mirror
-            .terminal_mirror_times_out_for_test(&harness.child, Duration::from_millis(75)),
+        terminal_mirror.terminal_mirror_timeout_for_test(&harness.child, Duration::from_millis(75)),
     )
     .await
     .expect("terminal mirror returns its timeout outcome")
-    .expect("terminal mirror reads child journal");
+    .expect("terminal mirror reads child journal")
+    .expect("an InputRequired child is not terminal completion evidence");
+    assert_eq!(
+        first_wait_timeout.operation(),
+        "delegated child terminal mirror"
+    );
     assert!(
-        first_wait_timed_out,
-        "an InputRequired child is not terminal completion evidence"
+        first_wait_timeout.limit() <= Duration::from_millis(75),
+        "the production wait must use the requested mirror budget: {first_wait_timeout}"
     );
     let mut control = UdsControlClient::connect(harness.hub.clone()).await;
     let replayed = control.attach_control(harness.parent_session.clone()).await;
