@@ -2084,7 +2084,7 @@ fn android_runtime_teardown_drops_supervisor_and_kills_its_pinned_group() {
     let (mut broker, _) = broker(workspace.path());
     let execution = runtime.block_on(async {
         let execution = broker.process_exec(&ProcessExec::new("android-runtime-drop", concat!(
-            "echo $$ > group-pid; /bin/sh -c 'trap \"\" TERM; echo ready > ready; sleep 1; echo escaped > survived' & ",
+            "echo $$ > group-pid; /bin/sh -c 'trap \"\" TERM; echo ready > ready; while :; do sleep 1; done' & ",
             "while :; do sleep 1; done"
         )), &process_policy(), RecordingCas::default(), RecordingOutput::default(), ProcessBounds::default())
             .await.expect("start");
@@ -2097,12 +2097,27 @@ fn android_runtime_teardown_drops_supervisor_and_kills_its_pinned_group() {
     });
     // Keep caller and broker alive: only runtime abort drops the supervisor here.
     runtime.shutdown_timeout(Duration::from_secs(1));
-    assert_descendant_group_swept(&workspace.path().join("group-pid"));
+    // A fresh driver only reaps the killed Tokio child; it cannot resume the
+    // old supervisor or kill its descendant. This also fences zombie removal
+    // on macOS, where the group probe includes unreaped members.
+    let reaper = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("orphan reaper runtime");
+    assert_descendant_group_swept_with_wait(&workspace.path().join("group-pid"), || {
+        reaper.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+    });
     drop(execution);
     drop(broker);
 }
 
 fn assert_descendant_group_swept(started: &Path) {
+    assert_descendant_group_swept_with_wait(started, || {
+        std::thread::sleep(Duration::from_millis(5));
+    });
+}
+
+fn assert_descendant_group_swept_with_wait(started: &Path, mut wait: impl FnMut()) {
     let pid = fs::read_to_string(started)
         .expect("descendant group id")
         .parse()
@@ -2120,6 +2135,6 @@ fn assert_descendant_group_swept(started: &Path) {
             );
             panic!("owned group {pid} survived teardown; killed for fixture cleanup");
         }
-        std::thread::sleep(Duration::from_millis(5));
+        wait();
     }
 }
