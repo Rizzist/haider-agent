@@ -312,9 +312,9 @@ pub(crate) struct AcceptedCompaction {
 /// not session identity.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
-    /// Per-fixture monotonic clock projection for paused-time deadline tests.
+    /// Per-fixture wall/monotonic clock pair for paused-time deadline tests.
     #[cfg(test)]
-    fn request_deadline_for_test(&self) -> Option<tokio::time::Instant> {
+    fn deadline_clock_for_test(&self) -> Option<ProviderDeadlineTestClock> {
         None
     }
 
@@ -347,6 +347,31 @@ pub trait ProviderFactory: Send + Sync {
     #[doc(hidden)]
     fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
         None
+    }
+}
+
+/// Keep persisted Unix deadlines and Tokio timers on one injected clock.
+/// Each factory owns its fixture clock; concurrent tests share no clock state.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub struct ProviderDeadlineTestClock {
+    unix_ms: u64,
+    monotonic: tokio::time::Instant,
+}
+
+#[cfg(test)]
+impl ProviderDeadlineTestClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            unix_ms: unix_time_ms(),
+            monotonic: tokio::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn now_ms(self) -> u64 {
+        let elapsed = tokio::time::Instant::now().saturating_duration_since(self.monotonic);
+        self.unix_ms
+            .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
     }
 }
 
@@ -1116,6 +1141,8 @@ struct DaemonGraphFinalizationGuard {
     event_ids: Arc<EventIdGenerator>,
     budget_check: Option<BudgetCheckContext>,
     request_deadline_unix_ms: Option<u64>,
+    #[cfg(test)]
+    deadline_clock: Option<ProviderDeadlineTestClock>,
     request_deadline_fact_persisted: Arc<Mutex<bool>>,
 }
 
@@ -1166,7 +1193,12 @@ impl DaemonGraphFinalizationGuard {
             // durable terminal delivery: an early provider timeout is not a
             // claim that the caller deadline elapsed. Route-wait/recovery can
             // arrive after the absolute timestamp and records the fact below.
-            if unix_time_ms() < request_deadline {
+            let now_ms = unix_time_ms();
+            #[cfg(test)]
+            let now_ms = self
+                .deadline_clock
+                .map_or(now_ms, ProviderDeadlineTestClock::now_ms);
+            if now_ms < request_deadline {
                 return Ok(None);
             }
             let mut persisted = self.request_deadline_fact_persisted.lock().await;
@@ -8674,8 +8706,12 @@ async fn start_turn(
         .await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     #[cfg(test)]
-    if let Some(deadline) = dependencies.provider_factory.request_deadline_for_test() {
-        provider_deadline = Some(deadline);
+    let deadline_clock = dependencies.provider_factory.deadline_clock_for_test();
+    #[cfg(test)]
+    if let Some(clock) = deadline_clock {
+        provider_deadline = headless.as_ref().and_then(|context| {
+            provider_request_deadline_at(&context.spec, context.accepted_at_ms, clock.now_ms())
+        });
     }
     let mut pinned_metadata = metadata.clone();
     pinned_metadata.context_economy = refresh_context_economy_from_journal(
@@ -9688,6 +9724,8 @@ async fn start_turn(
         request_deadline_unix_ms: headless
             .as_ref()
             .and_then(|context| context.spec.request_deadline_unix_ms),
+        #[cfg(test)]
+        deadline_clock,
         request_deadline_fact_persisted: Arc::new(Mutex::new(
             headless
                 .as_ref()
@@ -11873,6 +11911,14 @@ fn provider_request_deadline_for(
     spec: &HeadlessRunSpecV1,
     accepted_at_ms: u64,
 ) -> Option<tokio::time::Instant> {
+    provider_request_deadline_at(spec, accepted_at_ms, unix_time_ms())
+}
+
+fn provider_request_deadline_at(
+    spec: &HeadlessRunSpecV1,
+    accepted_at_ms: u64,
+    now_ms: u64,
+) -> Option<tokio::time::Instant> {
     let budget_deadline = spec
         .budget
         .max_time_ms
@@ -11883,9 +11929,8 @@ fn provider_request_deadline_for(
         (None, Some(request)) => Some(request),
         (None, None) => None,
     }?;
-    tokio::time::Instant::now().checked_add(Duration::from_millis(
-        deadline_ms.saturating_sub(unix_time_ms()),
-    ))
+    tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(deadline_ms.saturating_sub(now_ms)))
 }
 
 struct HeadlessBudgetExpiry {

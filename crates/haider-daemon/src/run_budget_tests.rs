@@ -33,9 +33,9 @@ use crate::turn_recovery::{
     STARTUP_HYDRATION_PAYLOAD_KINDS, interrupted_recovery_payloads_for_test,
 };
 use crate::worker::{
-    BrokerToolFactory, ProviderFactory, QueuedBudgetArm, QueuedBudgetWake, ResolvedTurnProvider,
-    WorkerDependencies, WorkerManager, budget_request_is_unresolved_for_test,
-    budget_usage_from_envelopes_for_test, exhausted_budget,
+    BrokerToolFactory, ProviderDeadlineTestClock, ProviderFactory, QueuedBudgetArm,
+    QueuedBudgetWake, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
+    budget_request_is_unresolved_for_test, budget_usage_from_envelopes_for_test, exhausted_budget,
     projected_time_budget_exhaustion_for_test,
     route_retry_unresolved_attempt_is_chargeable_for_test, signal_queued_budget_change,
     wait_for_queued_budget_deadline_or_change,
@@ -769,7 +769,7 @@ impl Provider for NeverOpensProvider {
 
 struct DeadlineProviderFactory {
     provider: Arc<NeverOpensProvider>,
-    deadline: Instant,
+    clock: ProviderDeadlineTestClock,
 }
 
 struct FakeBudgetProviderFactory {
@@ -2143,8 +2143,8 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
 
 #[async_trait::async_trait]
 impl ProviderFactory for DeadlineProviderFactory {
-    fn request_deadline_for_test(&self) -> Option<Instant> {
-        Some(self.deadline)
+    fn deadline_clock_for_test(&self) -> Option<ProviderDeadlineTestClock> {
+        Some(self.clock)
     }
 
     async fn resolve_for_turn(
@@ -2183,6 +2183,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         })
     };
     let clock_guard = keep_clock_fixed();
+    let clock = ProviderDeadlineTestClock::new();
     let deadline = Instant::now() + Duration::from_secs(3);
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -2195,7 +2196,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             diagnostics: None,
             provider_factory: Arc::new(DeadlineProviderFactory {
                 provider: Arc::clone(&provider),
-                deadline,
+                clock,
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
@@ -2233,14 +2234,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
     })
     .await
     .expect("create session");
-    let request_deadline_unix_ms = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock after Unix epoch")
-            .as_millis(),
-    )
-    .expect("test epoch milliseconds fit u64")
-    .saturating_add(3_600_000);
+    let request_deadline_unix_ms = clock.now_ms().saturating_add(3_000);
     let spec = HeadlessRunSpecV1 {
         agent_spawn: None,
         continuation_of: None,
