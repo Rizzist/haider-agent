@@ -500,6 +500,18 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
     hub.shutdown()
         .await
         .expect("monitor dispatcher hub shutdown");
+    // Join all monitor owners before the final negative observation, so a
+    // delayed erroneous dispatch cannot pass merely by running after Ask.
+    assert!(
+        !ask_marker.exists(),
+        "Ask dispatched before joined shutdown"
+    );
+    assert!(
+        !process_effect_phases(&store, &ask_session)
+            .await
+            .iter()
+            .any(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
+    );
     store.close().await.expect("monitor dispatcher store close");
 }
 
