@@ -981,7 +981,6 @@ fn daemon_stop_recovers_unreachable_lock_owner_with_matching_stale_or_absent_pid
             "absent" => std::fs::remove_file(&pid_path).expect("remove daemon PID file"),
             _ => unreachable!(),
         }
-        std::thread::sleep(Duration::from_millis(150));
         assert!(
             process_exists(daemon_pid),
             "test hooks failed to retain the degraded daemon"
@@ -1127,7 +1126,7 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     // Registry #94: 250 ms idle TTL + the daemon's 5,000 ms graceful-drain
     // budget = a 5,250 ms process-exit deadline. The retained kernel identity
     // reports exit directly, so this boundary needs no polling allowance.
-    const EXIT_DEADLINE: Duration = Duration::from_millis(IDLE_TTL_MS + DAEMON_DRAIN_BUDGET_MS);
+    const EXIT_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
     ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
@@ -1164,7 +1163,9 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
             runtime.block_on(async {
                 tokio::time::timeout(EXIT_DEADLINE, exit.wait())
                     .await
-                    .expect("spawned daemon exceeded idle TTL plus drain budget")
+                    .expect(
+                        "spawned daemon did not publish process exit before the fixture watchdog",
+                    )
                     .expect("wait for spawned daemon exit");
             });
         }

@@ -2084,7 +2084,7 @@ fn android_runtime_teardown_drops_supervisor_and_kills_its_pinned_group() {
     let (mut broker, _) = broker(workspace.path());
     let execution = runtime.block_on(async {
         let execution = broker.process_exec(&ProcessExec::new("android-runtime-drop", concat!(
-            "/bin/sh -c 'trap \"\" TERM; echo ready > ready; sleep 1; echo escaped > survived' & ",
+            "echo $$ > group-pid; /bin/sh -c 'trap \"\" TERM; echo ready > ready; sleep 1; echo escaped > survived' & ",
             "while :; do sleep 1; done"
         )), &process_policy(), RecordingCas::default(), RecordingOutput::default(), ProcessBounds::default())
             .await.expect("start");
@@ -2097,11 +2097,7 @@ fn android_runtime_teardown_drops_supervisor_and_kills_its_pinned_group() {
     });
     // Keep caller and broker alive: only runtime abort drops the supervisor here.
     runtime.shutdown_timeout(Duration::from_secs(1));
-    std::thread::sleep(Duration::from_millis(1200));
-    assert!(
-        !workspace.path().join("survived").exists(),
-        "supervisor abort detached a live group"
-    );
+    assert_descendant_group_swept(&workspace.path().join("group-pid"));
     drop(execution);
     drop(broker);
 }
