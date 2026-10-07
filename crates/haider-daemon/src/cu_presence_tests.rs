@@ -199,6 +199,7 @@ async fn idle_expiry_hides_the_overlay_and_the_next_action_reshows_it() {
         false,
         Duration::from_millis(200),
     );
+    presence.set_idle_clock_for_test();
     let (stop, _) = counting_hook();
     let lease = PresenceLease::new(Arc::clone(&presence), "s/idle".into(), stop);
     let cancel = haider_tools::ComputerCancelToken::new();
@@ -208,14 +209,13 @@ async fn idle_expiry_hides_the_overlay_and_the_next_action_reshows_it() {
             .await
             .expect("begin"),
     );
-    let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
-    while presence.is_shown(PresenceSurface::Screen) {
-        assert!(
-            Instant::now() < deadline,
-            "idle ticker never retired presence"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while presence.is_shown(PresenceSurface::Screen) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("idle ticker retires presence on the virtual clock");
     assert!(
         recorded
             .commands

@@ -4215,8 +4215,8 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
 }
 
 /// MUTATION CHECK: remove `bounded_wait` around the delegated active wait.
-/// Expected RUNTIME failure: the outer fixture state observer times out
-/// because the parent remains Waiting(LocalChild). Returning token/tool
+/// Expected RUNTIME failure: the external fixture watchdog catches a parent
+/// that remains Waiting(LocalChild). Returning token/tool
 /// counters as completion also fails because the typed timeout disappears.
 #[tokio::test(start_paused = true)]
 #[cfg(unix)]

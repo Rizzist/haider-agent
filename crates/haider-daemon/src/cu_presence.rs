@@ -116,6 +116,8 @@ pub(crate) struct CuPresence {
     fixture_pointer_ack_timeout: StdMutex<Option<Duration>>,
     #[cfg(test)]
     fixture_conceal_ack_timeout: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    fixture_idle_clock: StdMutex<Option<(Instant, tokio::time::Instant)>>,
     me: Weak<CuPresence>,
 }
 
@@ -139,8 +141,24 @@ impl CuPresence {
             fixture_pointer_ack_timeout: StdMutex::new(None),
             #[cfg(test)]
             fixture_conceal_ack_timeout: StdMutex::new(None),
+            #[cfg(test)]
+            fixture_idle_clock: StdMutex::new(None),
             me: me.clone(),
         })
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some((wall, monotonic)) = *lock(&self.fixture_idle_clock) {
+            return wall + tokio::time::Instant::now().saturating_duration_since(monotonic);
+        }
+        Instant::now()
+    }
+
+    /// Pair the presence machine's standard clock with paused Tokio timers.
+    #[cfg(test)]
+    pub(crate) fn set_idle_clock_for_test(&self) {
+        *lock(&self.fixture_idle_clock) = Some((Instant::now(), tokio::time::Instant::now()));
     }
 
     /// Delays every Stop hook's turn cancellation (tests only).
@@ -191,7 +209,7 @@ impl CuPresence {
         let (seq, commands) =
             state
                 .machine
-                .begin_action(key.to_owned(), surface, mark, point, Instant::now())?;
+                .begin_action(key.to_owned(), surface, mark, point, self.now())?;
         state.hooks.insert(
             key.to_owned(),
             LeaseHooks {
@@ -220,7 +238,7 @@ impl CuPresence {
     /// The action begun for `key` finished; its idle window starts now.
     pub(crate) fn finish(&self, key: &str) {
         let mut state = lock(&self.state);
-        state.machine.finish_action(&key.to_owned(), Instant::now());
+        state.machine.finish_action(&key.to_owned(), self.now());
         if let Some(hooks) = state.hooks.get_mut(key) {
             hooks.in_flight = None;
         }
@@ -441,7 +459,7 @@ impl CuPresence {
 
     fn tick(&self) -> bool {
         let mut state = lock(&self.state);
-        let commands = state.machine.tick(Instant::now());
+        let commands = state.machine.tick(self.now());
         self.dispatch(&mut state, commands);
         let live = state.machine.has_leases();
         if !live {
