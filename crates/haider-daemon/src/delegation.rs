@@ -1386,7 +1386,7 @@ impl DelegationHandle {
                     () = cancel.cancelled() => {
                         return Ok(ChildWaitWake::ParentCancelled(record));
                     }
-                    () = tokio::time::sleep(CHILD_POLL_INTERVAL) => {}
+                    () = self.wait_for_collection_poll() => {}
                 }
             }
         };
@@ -3288,6 +3288,21 @@ impl DelegationHandle {
             "test_crash_window",
         )
         .await
+    }
+
+    async fn wait_for_collection_poll(&self) {
+        // The paused fixture keeps policy time fixed during native store I/O.
+        // Poll its actual collector without consuming that deadline clock.
+        #[cfg(all(test, unix))]
+        if self
+            .stall_deadline_clock
+            .as_ref()
+            .is_some_and(|clock| clock.wait_elapsed_ms().is_some())
+        {
+            tokio::task::yield_now().await;
+            return;
+        }
+        tokio::time::sleep(CHILD_POLL_INTERVAL).await;
     }
 
     async fn stall_cancel_requested(&self, record: &DelegationRecord) -> Result<bool, HaiderError> {
