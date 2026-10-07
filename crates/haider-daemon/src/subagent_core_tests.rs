@@ -1272,7 +1272,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         bounded.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await
@@ -1614,9 +1614,12 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
         .expect("delegation lookup")
         .expect("delegation row");
     delegation.launch(&established).await.expect("launch child");
-    timeout(Duration::from_secs(5), provider.gate_started.notified())
-        .await
-        .expect("first child request");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.gate_started.notified(),
+    )
+    .await
+    .expect("first child request");
     let first_request = provider.requests().remove(0);
     let handoff_line = format!(
         "Ephemeral parent handoff directory: {manifest_handoff} (EPHEMERAL; use it for shared specs, never durable storage)."
@@ -1673,7 +1676,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
     assert!(conflict.1.contains("different semantics"));
     provider.release_gate.notify_one();
 
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while provider.requests().len() < 2 {
             tokio::task::yield_now().await;
         }
@@ -1937,9 +1940,12 @@ async fn message_subagent_starts_an_idle_child_immediately() {
         serde_json::from_str(&tool_result.preview).expect("decode tool delivery receipt");
     assert_eq!(receipt.delivery, AgentMessageDelivery::DeliveredQueued);
     assert_ne!(receipt.child_run_id, child_record.child_run_id);
-    timeout(Duration::from_secs(5), provider.gate_started.notified())
-        .await
-        .expect("idle child starts second request");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.gate_started.notified(),
+    )
+    .await
+    .expect("idle child starts second request");
     let running_tool_result = dispatcher
         .execute(
             &parent_run,
@@ -1965,7 +1971,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
     );
     assert_eq!(running_receipt.child_run_id, receipt.child_run_id);
     provider.release_gate.notify_one();
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while provider.requests().len() < 3 {
             tokio::task::yield_now().await;
         }
@@ -2533,7 +2539,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .await
         .expect("submit parent worker");
 
-    timeout(Duration::from_secs(10), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&parent_session, 0, 512)
@@ -2866,7 +2872,7 @@ async fn wait_for_state(
     session_id: &SessionId,
     expected: impl Fn(&RunState) -> bool,
 ) {
-    let observed = timeout(Duration::from_secs(5), async {
+    let observed = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store.read(session_id, 0, 1024).await.expect("read run");
             if events.iter().any(|event| {
@@ -3043,7 +3049,7 @@ async fn autonomous_parent_keeps_delegated_request_input_answerable() {
         .submit(accepted)
         .await
         .expect("submit parent");
-    let child = timeout(Duration::from_secs(5), async {
+    let child = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if let Some(child) = hub
                 .delegations_for_parent_run(parent_session.clone(), parent_run.clone())
@@ -3319,7 +3325,7 @@ async fn wait_for_parent_delegated_menu(
     parent_session: &SessionId,
     agent: &AgentId,
 ) -> (Menu, u64, u64) {
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(parent_session, 0, 1024)
@@ -3584,11 +3590,11 @@ impl UdsControlClient {
         drop(drain_sender);
         let _ = stream.shutdown().await;
         drop(stream);
-        timeout(Duration::from_secs(5), serve_task)
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, serve_task)
             .await
             .expect("UDS serve task stops")
             .expect("UDS serve task joins");
-        timeout(Duration::from_secs(5), writer_owner)
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, writer_owner)
             .await
             .expect("UDS writer owner stops")
             .expect("UDS writer owner joins");
@@ -3602,7 +3608,7 @@ async fn wait_for_chip(
     agent: &haider_protocol::ids::AgentId,
     expected: ChipState,
 ) {
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let payloads = typed_payloads(
                 &store
@@ -4233,7 +4239,7 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
         *state == RunState::Cancelled
     })
     .await;
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = harness
                 .store
@@ -4318,7 +4324,7 @@ async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
         *state == RunState::Cancelled
     })
     .await;
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = harness
                 .store
@@ -4564,9 +4570,9 @@ async fn committed_child_progress_resets_the_stall_deadline() {
 async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     const STALL_DEADLINE: Duration = Duration::from_millis(100);
     // Outer observation bound: twenty complete supervision cycles, each
-    // initial deadline + grace deadline + two 25ms collector polls:
-    // 20 * (100ms + 100ms + 25ms + 25ms) = 5_000ms.
-    const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+    // The injected stall clock and durable progress receipts define the
+    // semantic boundaries. This outer watchdog only catches a stuck fixture.
+    const OBSERVATION_TIMEOUT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -4943,7 +4949,7 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
         *state == RunState::Cancelled
     })
     .await;
-    let child_head = timeout(Duration::from_secs(5), async {
+    let child_head = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&child.child_session_id, 0, 1024)
@@ -4989,7 +4995,7 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     })
     .await
     .expect("child reaches durable idle fence");
-    let terminal_metrics = timeout(Duration::from_secs(5), async {
+    let terminal_metrics = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&parent_session, 0, 1024)
@@ -6011,7 +6017,7 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
         bounded.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await
@@ -6047,7 +6053,7 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
         restarted.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await
