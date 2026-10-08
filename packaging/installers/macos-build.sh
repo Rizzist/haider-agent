@@ -117,6 +117,8 @@ hdiutil_retry() {
     if [ "$status" -eq 16 ] || LC_ALL=C grep -Eiq 'resource busy|device busy|resource temporarily unavailable|(^|[^[:alnum:]_])ebusy([^[:alnum:]_]|$)' "$diagnostic"; then
       retryable=1
     fi
+    # Negated conditionals suppress set -e inside the callback: it must return
+    # failure explicitly when cleanup fails, so the original status survives.
     if ! "$cleanup_attempt"; then
       cat "$diagnostic" >&2
       rm -f "$diagnostic"
@@ -141,6 +143,8 @@ detach_partial_mount() {
     return 0
   fi
   mounted=1
+  # Package presence only decides whether to retry detach. Device equality in
+  # mount_is_clear, before or after retries, is what proves cleanup succeeded.
   if [ -e "$work/mount/$name.pkg" ]; then
     hdiutil_retry detach no_cleanup "$work/mount" || true
     if mount_is_clear; then
