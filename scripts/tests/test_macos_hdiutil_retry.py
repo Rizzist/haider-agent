@@ -84,9 +84,22 @@ exec /usr/bin/hdiutil "$@"
                 for entity in image.get('system-entities', [])
                 if 'mount-point' in entity}
 
-    def mounted_test_mounts(self):
+    def mounted_test_mounts(self, inventory=None):
         owned = self.recorded_mountpoints()
-        return owned & self.disk_image_mountpoints() if owned else set()
+        if not owned:
+            return set()
+        if inventory is None:
+            inventory = self.disk_image_mountpoints()
+        mounted = owned & inventory
+        # realpath preserves some case/Unicode aliases on macOS. Check the
+        # recorded location itself, even if the inventory uses another spelling.
+        for point in owned:
+            try:
+                if point.stat().st_dev != point.parent.stat().st_dev:
+                    mounted.add(point)
+            except FileNotFoundError:
+                pass  # The builder already removed this work directory.
+        return mounted
 
     def assert_no_test_mounts(self):
         self.assertEqual(self.mounted_test_mounts(), set(), 'owned test mount retained')
@@ -95,11 +108,11 @@ exec /usr/bin/hdiutil "$@"
         owned = self.recorded_mountpoints()
         if not owned:
             return
-        for point in owned & self.disk_image_mountpoints():
+        for point in self.mounted_test_mounts():
             subprocess.run(['/usr/bin/hdiutil', 'detach', str(point)], check=True,
                            capture_output=True, text=True, timeout=60)
         remaining = self.disk_image_mountpoints()
-        self.assertEqual(owned & remaining, set(), 'owned test mount retained')
+        self.assertEqual(self.mounted_test_mounts(remaining), set(), 'owned test mount retained')
         # A failed builder retains its work directory. Remove it only after the
         # exact recorded mount is clear; never derive its location from TMPDIR.
         for point in owned:
@@ -337,7 +350,12 @@ exec /bin/rm "$@"
         points = self.recorded_mountpoints()
         self.assertEqual(len(points), 1)
         self.assertEqual(self.mounted_test_mounts(), points)
-        self.detach_leftover_test_mounts()
+        # A missing/alternate inventory spelling must not hide a real mount.
+        with patch.object(self, 'disk_image_mountpoints', return_value=set()):
+            self.assertEqual(self.mounted_test_mounts(), points)
+            with self.assertRaisesRegex(AssertionError, 'owned test mount retained'):
+                self.assert_no_test_mounts()
+            self.detach_leftover_test_mounts()
         self.assert_no_test_mounts()
         self.assertTrue(all(not point.parent.exists() for point in points))
 
