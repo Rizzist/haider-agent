@@ -788,8 +788,8 @@ pub fn sync_model_persistence(
     if let Some(store) = settings.as_mut() {
         store.save_last_model_if_changed(
             model.theme_choice,
-            &model.identity.provider,
-            &model.identity.model_short,
+            &model.launcher_identity.provider,
+            &model.launcher_identity.model_short,
         );
     }
 }
@@ -1064,6 +1064,16 @@ pub async fn run_demo(
     if let Some(store) = settings.as_mut() {
         store.set_tool_rows(tool_rows);
     }
+    if let Some((provider, model_short)) = settings
+        .as_ref()
+        .and_then(crate::settings::SettingsStore::load_last_model)
+    {
+        model.identity.provider = provider;
+        model.identity.model_short = model_short;
+        model.launcher_identity_pinned = true;
+        model.refresh_context_window();
+        model.launcher_identity = model.identity.clone();
+    }
     // 970: the terms acknowledgements this profile already carries — read
     // ONCE at boot so the first-login disclosure never reappears for a user
     // who has already answered it.
@@ -1074,6 +1084,7 @@ pub async fn run_demo(
         .unwrap_or_default();
     let mut seen_terms_commits = model.terms_ack_commits;
     let mut seen_theme_commits = model.theme_commits;
+    let mut seen_model_commits = model.model_commits;
     let mut seen_verbosity_commits = model.verbosity_commits;
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
@@ -1270,6 +1281,7 @@ pub async fn run_demo(
         }
         // Theme cycled: re-sync the emulator background.
         sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
+        sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
@@ -4350,8 +4362,9 @@ pub async fn run_live(
     {
         model.identity.provider = provider.clone();
         model.identity.model_short = model_short.clone();
-        model.identity_pinned = true;
+        model.launcher_identity_pinned = true;
         model.refresh_context_window();
+        model.launcher_identity = model.identity.clone();
         if let Some(store) = settings.as_mut() {
             store.set_last_model(Some((provider, model_short)));
         }

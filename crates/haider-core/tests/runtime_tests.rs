@@ -1581,12 +1581,12 @@ struct RecordingPairSwitchCommitter {
 
 #[async_trait]
 impl ProviderPairSwitchCommitter for RecordingPairSwitchCommitter {
-    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError> {
         self.switches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(switch.clone());
-        Ok(())
+        Ok(1)
     }
 }
 
@@ -1905,6 +1905,7 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     let promoted_window = estimated_input_tokens(&bounded, &continued_messages).saturating_add(1);
     assert!(promoted_window > window);
     bounded.context_window = Some(window);
+    bounded.selection_epoch = Some(0);
     bounded.context_compaction_v1 = true;
     bounded.compaction_guard_v1 = true;
     let compactor = Arc::new(IneffectiveContextCompactor::default());
@@ -1936,7 +1937,8 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     let committer = Arc::new(RecordingPairSwitchCommitter::default());
     bounded.provider_pair_switch_committer = Some(committer.clone());
 
-    let handle = HarnessActor::spawn(bounded, original.clone(), Arc::new(MemoryStore::new()));
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(bounded, original.clone(), store.clone());
     let outcome = handle
         .submit_committed_turn(SubmitCommittedTurn {
             run_id: RunId::new("ineffective-compaction-promotes"),
@@ -1955,16 +1957,31 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].model, "model-large");
     assert_eq!(requests[1].model, "model-large");
-    let switches = committer
-        .switches
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(switches.len(), 1);
-    assert_eq!(switches[0].from_provider, "fake-a");
-    assert_eq!(switches[0].from_model, "model-small");
-    assert_eq!(switches[0].to_provider, "fake-a");
-    assert_eq!(switches[0].to_model, "model-large");
-    assert_eq!(switches[0].cause, ProviderPairSwitchCause::CompactionGuard);
+    {
+        let switches = committer
+            .switches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(switches.len(), 1);
+        assert_eq!(switches[0].from_provider, "fake-a");
+        assert_eq!(switches[0].from_model, "model-small");
+        assert_eq!(switches[0].to_provider, "fake-a");
+        assert_eq!(switches[0].to_model, "model-large");
+        assert_eq!(switches[0].cause, ProviderPairSwitchCause::CompactionGuard);
+    }
+    let footprints: Vec<_> = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .iter()
+        .filter_map(completed_footprint)
+        .collect();
+    assert!(
+        !footprints.is_empty()
+            && footprints
+                .iter()
+                .all(|footprint| footprint.selection_epoch == Some(0)),
+        "a mid-turn selection cannot relabel the request's frozen begin-epoch"
+    );
 }
 
 /// MUTATION CHECK: change the strict window ordering to `>=` or trust only
@@ -7531,6 +7548,7 @@ async fn usage_batches_context_footprint_before_usage() {
     let store = Arc::new(BatchRecordingStore::new());
     let mut runtime_config = config();
     runtime_config.context_compaction_v1 = true;
+    runtime_config.selection_epoch = Some(17);
     let handle = HarnessActor::spawn(runtime_config, provider, store.clone());
 
     let outcome = handle
@@ -7569,6 +7587,15 @@ async fn usage_batches_context_footprint_before_usage() {
             && ContextFootprint::from_extension_item(started_item).is_some()
             && ContextFootprint::from_extension_item(completed_item).is_some()
     ));
+    let EventPayload::Item(ItemEvent::Completed { item, .. }) = &usage_batch[1] else {
+        panic!("footprint completion")
+    };
+    assert_eq!(
+        ContextFootprint::from_extension_item(item)
+            .expect("footprint")
+            .selection_epoch,
+        Some(17)
+    );
 }
 
 /// MUTATION CHECK: move `RunningTool` after dispatcher execution, or split the

@@ -128,7 +128,7 @@ fn file_review_and_answer_replay_to_the_same_visible_decision() {
     assert!(projection.open_menu().is_none());
     assert!(projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text.contains("permission allowed once")
+        TranscriptEntry::Note { text, .. } if text.contains("permission allowed once")
     )));
 }
 

@@ -55,6 +55,7 @@ fn seeded_session() -> AppModel {
     let mut model = seeded_launcher();
     model.sessions.clear();
     model.upsert_live_session(&sid());
+    model.note_session_metadata_at(&sid(), "anthropic", "fable-5", 30_000, Some(0), None);
     model.open_session(&sid());
     assert_eq!(model.screen, Screen::Session);
     model.requests.clear();
@@ -130,7 +131,40 @@ fn pass(
     model: &mut AppModel,
     reply: Option<LiveReply>,
 ) -> Vec<LiveCommand> {
-    live_pass(driver, model, reply, std::time::Instant::now()).commands
+    let mut commands = live_pass(driver, model, reply, std::time::Instant::now()).commands;
+    // Session selection now waits for that session's control attachment.
+    // Advance the synthetic wire through the attach before looking for the
+    // selection command, exactly as the live link does.
+    let attaching: Vec<_> = commands
+        .iter()
+        .filter_map(|command| match command {
+            LiveCommand::Attach { session, .. } | LiveCommand::AttachWithOrigin { session, .. } => {
+                Some(session.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    for session in attaching {
+        commands.extend(
+            live_pass(
+                driver,
+                model,
+                Some(LiveReply::Attached {
+                    attachment: haider_rpc::AttachmentId::new(format!(
+                        "f2-att-{}",
+                        session.as_str()
+                    )),
+                    session,
+                    worker_generation: 7,
+                    replay_through_seq: 0,
+                    launch_origin: None,
+                }),
+                std::time::Instant::now(),
+            )
+            .commands,
+        );
+    }
+    commands
 }
 
 /// MUTATION CHECK (F2a): route bare `/model` back to the old flash list.
@@ -762,6 +796,8 @@ fn live_selection_is_receipted_and_renders_the_resolved_pair() {
         &mut driver,
         &mut model,
         Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
             command_id,
             session: sid(),
             provider: "openai-oauth".to_owned(),
@@ -848,6 +884,8 @@ fn provider_stage_selection_preserves_pending_and_resolved_truth() {
         &mut driver,
         &mut model,
         Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
             command_id,
             session: sid(),
             provider: "resolved-stage".to_owned(),
@@ -882,6 +920,8 @@ fn clamped_user_output_budget_shows_a_notice_on_model_switch() {
         &mut driver,
         &mut model,
         Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
             command_id,
             session: sid(),
             provider: "openai".to_owned(),
@@ -1052,7 +1092,7 @@ fn launcher_selection_sets_the_default_pair() {
     );
     assert_eq!(model.identity.provider, "local");
     assert_eq!(model.identity.model_short, "qwen3-coder");
-    assert!(model.identity_pinned, "an explicit choice pins");
+    assert!(model.launcher_identity_pinned, "an explicit choice pins");
     assert!(
         !model
             .requests

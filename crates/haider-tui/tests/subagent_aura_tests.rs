@@ -358,7 +358,7 @@ async fn two_subagents_question_recovery_collect_and_auto_resume() {
         assert!(
             model.projection.entries().iter().any(|entry| matches!(
                 entry,
-                TranscriptEntry::Note { text } if text == note
+                TranscriptEntry::Note { text, .. } if text == note
             )),
             "missing note: {note}"
         );
@@ -387,7 +387,7 @@ async fn two_subagents_question_recovery_collect_and_auto_resume() {
     )));
     assert!(tests_chip.transcript.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· input resolved — continuing"
+        TranscriptEntry::Note { text, .. } if text == "· input resolved — continuing"
     )));
     assert!(tests_chip.tokens > 1200, "chip token law accrued");
     let (badge, _) = model.status_badge();
@@ -414,7 +414,7 @@ async fn docs_close_arm_runs_the_close_lifecycle_and_5s_removal() {
     .await;
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text.starts_with("· subagent ") && text.ends_with(" closed — leaving the tree in 5s")
     )));
     // The closed row renders ⊘ with the closing activity.
@@ -452,7 +452,7 @@ async fn respond_chip_steers_queue_when_blocked_and_delegates_nested_when_asked(
             chip.transcript.entries().iter().any(|entry| {
                 matches!(
                     entry,
-                    TranscriptEntry::Note { text }
+                    TranscriptEntry::Note { text, .. }
                         if text == "· steer queued — delivered when the pending question resolves"
                 )
             })
@@ -486,7 +486,7 @@ async fn respond_chip_steers_queue_when_blocked_and_delegates_nested_when_asked(
     assert!(nested.transcript.entries().iter().any(|entry| matches!(
         entry,
         // one honour roll (TUI4.1 D2-2): chip claims interleave with head claims
-        TranscriptEntry::Note { text } if text == "· spawned by Husayn — nested delegation"
+        TranscriptEntry::Note { text, .. } if text == "· spawned by Husayn — nested delegation"
     )));
     assert_eq!(
         nested.state,
@@ -589,13 +589,13 @@ async fn aura_orchestrates_spawn_and_status_with_talk_and_toggles() {
     model.handle_hit(Hit::AuraEngine);
     assert!(model.aura.transcript.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· engine hot-swapped → whisper → gpt-5.6 → openai · dialogue kept"
     )));
     model.handle_hit(Hit::AuraMute);
     assert!(model.aura.transcript.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· audio output muted — orchestrating silently, activity still shown"
     )));
     // Muted runs stream unspoken (`■ aura · muted`).

@@ -76,7 +76,11 @@ pub enum TranscriptEntry {
     Item(ItemBlock),
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
     /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
-    Note { text: String },
+    Note {
+        text: String,
+        /// Stable identity for a selection warning echoed by reply and journal.
+        selection_notice_epoch: Option<u64>,
+    },
     /// A daemon-enforced provider capability refusal. This is deliberately
     /// neither a failed run nor a generic note: the model can adapt and the
     /// turn remains healthy.
@@ -699,6 +703,9 @@ pub struct SessionProjection {
     /// journal's `context_footprint_v1` extension items — never a
     /// transcript row (one arrives per provider round).
     latest_footprint: Option<haider_protocol::context::ContextFootprint>,
+    /// Current selection's resolved denominator supplied by the owning
+    /// session before an event is reduced. `None` yields a count-free note.
+    compaction_note_window: Option<u64>,
     /// B2b-m3: the durable node → display-entry association, in commit
     /// order — `(entry index, node id)`. Recorded when a `NodeCommitted`
     /// applies (see [`Self::record_node_anchor`]); the `/tree` rows and the
@@ -1142,6 +1149,7 @@ impl SessionProjection {
                             };
                             self.entries.push(TranscriptEntry::Note {
                                 text: format!("permission {result} · {}", menu.title),
+                                selection_notice_epoch: None,
                             });
                         }
                     }
@@ -2164,7 +2172,24 @@ impl SessionProjection {
     /// interrupt, mid-turn input echoes. Never sourced from envelopes.
     pub fn push_note(&mut self, text: String) {
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::Note { text });
+        self.entries.push(TranscriptEntry::Note {
+            text,
+            selection_notice_epoch: None,
+        });
+    }
+
+    /// Store a selection warning in the transcript itself. The journal and
+    /// RPC reply can arrive in either order without creating duplicate notes.
+    pub fn push_selection_notice(&mut self, epoch: Option<u64>, text: String) {
+        if epoch.is_some() && self.entries.iter().any(|entry| matches!(entry,
+            TranscriptEntry::Note { selection_notice_epoch, .. } if *selection_notice_epoch == epoch)) {
+            return;
+        }
+        self.render_revision = self.render_revision.wrapping_add(1);
+        self.entries.push(TranscriptEntry::Note {
+            text,
+            selection_notice_epoch: epoch,
+        });
     }
 
     /// Append one peer-message block from daemon event truth.
@@ -2526,12 +2551,9 @@ impl SessionProjection {
         // Pre-announce (research §Q2: the sim's `· context at 85% —
         // compacting` line): percent from the latest snapshot when the
         // window is known; the honest count-free line otherwise.
-        let note = self
-            .latest_footprint
-            .as_ref()
+        let note = self.latest_footprint.as_ref()
             .and_then(|footprint| {
-                let window = footprint.context_window?;
-                (window > 0).then(|| {
+                self.compaction_note_window.map(|window| {
                     format!(
                         "· context at {}% — compacting · planned cache epoch transition; next turn history cold (summary retained · originals stay in /tree)",
                         crate::context_meter::percent_of(footprint.used_tokens, window)
@@ -2543,6 +2565,10 @@ impl SessionProjection {
             });
         self.push_note(note);
         true
+    }
+
+    pub fn set_compaction_note_window(&mut self, window: Option<u64>) {
+        self.compaction_note_window = window.filter(|window| *window > 0);
     }
 
     /// Latest context-occupancy snapshot (W7b) — the meter and /tokens

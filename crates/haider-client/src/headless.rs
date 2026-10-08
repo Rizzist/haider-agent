@@ -3319,7 +3319,11 @@ async fn run_headless_inner(
                         }
                         if (!resolve_provider && metadata.provider != create_provider)
                             || (!resolve_model && metadata.model != create_model)
-                            || metadata.account_alias != session_config.account
+                            // An omitted account lets the daemon pin the
+                            // provider's active account for this new session.
+                            || session_config.account.as_ref().is_some_and(|requested| {
+                                metadata.account_alias.as_ref() != Some(requested)
+                            })
                             || metadata.effort != session_config.effort
                             || metadata.fast != session_config.fast.unwrap_or(false)
                         {

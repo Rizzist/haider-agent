@@ -490,6 +490,7 @@ fn live_presentation_gate_matches_visible_and_hidden_extension_rows() {
     );
 
     let footprint = ContextFootprint {
+        selection_epoch: None,
         input_tokens: 800,
         output_tokens: 100,
         cached_input_tokens: 100,

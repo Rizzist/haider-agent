@@ -89,6 +89,24 @@ pub struct SessionState {
     pub workspace_cwd: Option<String>,
     /// Latest replaceable launch-origin revision and optional sanitised display.
     pub launch_origin: Option<(u64, Option<String>)>,
+    /// This session's context-meter epoch — its committed model pair and
+    /// budget (973-context-meter-fixes B1). Restored with the projection on
+    /// checkout; a parked session's background model change lands here.
+    pub meter_epoch: crate::context_meter::MeterEpoch,
+    /// Explicit credential pin and last served route from this session's
+    /// typed metadata. The global active account is only its initial default.
+    pub account_alias: Option<String>,
+    pub account_provider: Option<String>,
+    /// Endpoint and epoch belong to the same cached account coordinates.
+    pub account_base_url: Option<String>,
+    pub account_metadata_epoch: Option<u64>,
+    pub route_reset_epoch: Option<u64>,
+    pub resolved_route_alias: Option<String>,
+    pub resolved_route_seen: bool,
+    /// A known fresh routing selection can display a future default until a
+    /// request starts. Missing route provenance on old history is insufficient.
+    pub account_default_epoch: Option<u64>,
+    pub account_request_epoch: Option<u64>,
     pub projection: SessionProjection,
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
@@ -154,6 +172,9 @@ pub struct SessionState {
     /// older daemon never sets it and the row degrades to its
     /// projection-derived display (never a fabricated count).
     pub summary_counts: Option<SummaryCounts>,
+    /// A summary can establish that the child exists without reporting
+    /// counts or a selection. Its spawn manifest is no longer authority.
+    pub summary_seen: bool,
     /// W-flow inline identity: the session's bound Loom agent-type id from
     /// its `session.list` summary (`SessionSummary.agent_type`). Hydrated
     /// only from a daemon serving `session_agent_type_select_v1` — absence
@@ -186,9 +207,37 @@ pub struct SummaryCounts {
     /// (`SessionSummary::footprint_truth`) — present exactly when the
     /// token figure is.
     pub footprint_truth: Option<haider_protocol::context::ContextFootprintTruth>,
+    pub latest_context_footprint: Option<haider_protocol::context::ContextFootprint>,
 }
 
 impl SessionState {
+    /// A committed provider change invalidates every cached route coordinate.
+    /// Leaving an old alias here would revive it on A→B→A before the List.
+    pub(crate) fn reset_account_route(&mut self, provider: &str, epoch: Option<u64>) {
+        self.account_alias = None;
+        self.account_provider = Some(provider.to_owned());
+        self.account_base_url = None;
+        self.account_metadata_epoch = epoch;
+        self.resolved_route_alias = None;
+        self.resolved_route_seen = false;
+        self.route_reset_epoch = epoch;
+        self.account_default_epoch = epoch;
+    }
+
+    /// A route fact proves a request was served even before its RunState.
+    /// A newer route epoch invalidates the old account until its List arrives;
+    /// same-epoch metadata may already contain the actual served account.
+    pub(crate) fn observe_route_commit(&mut self, epoch: Option<u64>, previous: Option<u64>) {
+        if epoch != previous {
+            self.account_alias = None;
+            self.account_metadata_epoch = None;
+            self.resolved_route_alias = None;
+            self.resolved_route_seen = false;
+        }
+        self.account_request_epoch = epoch;
+        self.account_default_epoch = None;
+    }
+
     /// A neutral scratch slot — what the model's live fields hold when no
     /// session is attached, and what a checked-out slot holds meanwhile.
     #[must_use]
@@ -203,6 +252,16 @@ impl SessionState {
             dir: String::new(),
             workspace_cwd: None,
             launch_origin: None,
+            meter_epoch: crate::context_meter::MeterEpoch::default(),
+            account_alias: None,
+            account_provider: None,
+            account_base_url: None,
+            account_metadata_epoch: None,
+            route_reset_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
+            account_default_epoch: None,
+            account_request_epoch: None,
             projection: SessionProjection::new(),
             prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
@@ -230,6 +289,7 @@ impl SessionState {
             branches_offset: 1,
             turns_offset: 0,
             summary_counts: None,
+            summary_seen: false,
             agent_type: None,
             lockdown_provider: None,
             lockdown_boundary_known: false,
@@ -355,6 +415,21 @@ impl SessionState {
             return Some(live);
         }
         summary_tokens
+    }
+
+    /// Latest own-session durable footprint, preferring the fresher list
+    /// summary until this row has replayed through its head.
+    #[must_use]
+    pub fn latest_context_footprint(&self) -> Option<&haider_protocol::context::ContextFootprint> {
+        let summary = self
+            .summary_counts
+            .as_ref()
+            .and_then(|counts| counts.latest_context_footprint.as_ref());
+        if self.summary_is_fresher() {
+            summary.or_else(|| self.projection.latest_footprint())
+        } else {
+            self.projection.latest_footprint().or(summary)
+        }
     }
 
     /// Route one RAW envelope into this (non-attached) session — the

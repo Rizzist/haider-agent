@@ -1,6 +1,6 @@
 //! Anthropic Messages API adapter.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -15,6 +15,7 @@ use reqwest::header::{
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 /// Anthropic documents this as a limit on the complete JSON request, not the
 /// decoded PDF. Check the final payload because base64 expansion and prompt
@@ -192,31 +193,383 @@ pub(crate) fn thinking_binding_drop_required(request: &TurnRequest) -> bool {
             .rewrites_earlier_tool_results()
 }
 
-/// Routes (auth mode, URL, model) whose endpoint rejected the thinking
-/// binding opt-in with a 400 naming `block_binding` or its beta. Process-wide
-/// so a rebuilt adapter for the same route never repeats the rejected
-/// request; see [`AnthropicProvider::send_request_with_binding_fallback`].
-fn thinking_binding_rejected_routes() -> &'static Mutex<HashSet<String>> {
-    static ROUTES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    ROUTES.get_or_init(|| Mutex::new(HashSet::new()))
+/// A route is recorded only after its policy-free resend decodes a complete
+/// `message_stop` and its Finish is ready to be forwarded. Entries expire so
+/// changing endpoint capabilities are probed again after one hour.
+const THINKING_BINDING_ROUTE_TTL: Duration = Duration::from_secs(60 * 60);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ThinkingBindingRoute {
+    auth_mode: AnthropicAuthMode,
+    api_url: String,
+    model: String,
+    account: Option<CredentialAlias>,
 }
 
-/// Whether a 400 body rejects exactly Haider's prefix-binding opt-in (the
-/// `thinking.block_binding` field or the binding-controls beta), as an
-/// endpoint without thinking-binding controls answers. A prefix-mismatch
-/// rejection or any other invalid request never matches.
-pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
-    let message = serde_json::from_slice::<ErrorEnvelope>(body).map_or_else(
-        |_| String::from_utf8_lossy(body).to_ascii_lowercase(),
-        |envelope| envelope.error.message.to_ascii_lowercase(),
-    );
+fn thinking_binding_rejected_routes() -> &'static Mutex<HashMap<ThinkingBindingRoute, Instant>> {
+    static ROUTES: OnceLock<Mutex<HashMap<ThinkingBindingRoute, Instant>>> = OnceLock::new();
+    ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Keep the established ASCII word-token contract: hyphens (including `-v2`)
+// separate tokens, as do dots/brackets. ASCII letters, digits and underscores
+// extend a word. Gateway prose is not an exact schema-path parser.
+fn contains_opt_in_token(message: &str) -> bool {
     [
         "block_binding",
         "prefix_mismatch_behavior",
         ANTHROPIC_THINKING_BINDING_BETA,
     ]
     .iter()
-    .any(|needle| message.contains(needle))
+    .any(|token| {
+        message.match_indices(token).any(|(start, _)| {
+            let before = message[..start].chars().next_back();
+            let after = message[start + token.len()..].chars().next();
+            let boundary = |c: Option<char>| {
+                c.is_none_or(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_')
+            };
+            boundary(before) && boundary(after)
+        })
+    })
+}
+
+// Preserve repeated diagnostic keys instead of Value's last-key-wins behavior.
+// Repeated values form a flat group, so a bounded flat body cannot create a
+// deeply nested synthetic tree while retaining every diagnostic occurrence.
+struct BindingDiagnosticValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for BindingDiagnosticValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DiagnosticVisitor;
+        impl<'de> serde::de::Visitor<'de> for DiagnosticVisitor {
+            type Value = BindingDiagnosticValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON diagnostic body")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<BindingDiagnosticValue>()? {
+                    values.push(value.0);
+                }
+                Ok(BindingDiagnosticValue(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                let mut repeated = std::collections::HashSet::new();
+                while let Some((key, value)) = map.next_entry::<String, BindingDiagnosticValue>()? {
+                    match fields.entry(key) {
+                        serde_json::map::Entry::Vacant(entry) => {
+                            entry.insert(value.0);
+                        }
+                        serde_json::map::Entry::Occupied(mut entry) => {
+                            if repeated.insert(entry.key().clone()) {
+                                let previous =
+                                    std::mem::replace(entry.get_mut(), serde_json::Value::Null);
+                                *entry.get_mut() =
+                                    serde_json::Value::Array(vec![previous, value.0]);
+                            } else if let serde_json::Value::Array(values) = entry.get_mut() {
+                                values.push(value.0);
+                            } else {
+                                return Err(serde::de::Error::custom(
+                                    "invalid diagnostic value group",
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(BindingDiagnosticValue(serde_json::Value::Object(fields)))
+            }
+        }
+        deserializer.deserialize_any(DiagnosticVisitor)
+    }
+}
+
+/// Collect only diagnostic fields, including the common gateway alternatives.
+/// Request/input echoes are not diagnostics, even inside `details`.
+#[derive(Default)]
+struct BindingDiagnostic {
+    text: String,
+    exclusion_text: String,
+    has_message: bool,
+    has_unparsed_fields: bool,
+    prefix_or_signature: bool,
+}
+
+impl BindingDiagnostic {
+    fn collect(&mut self, value: &serde_json::Value, message: bool, all_fields: bool) {
+        match value {
+            serde_json::Value::String(text) => {
+                self.has_message |= message && !text.trim().is_empty();
+                self.text.push('\n');
+                let text = text.to_ascii_lowercase();
+                // Preserve the primary message's conservative signature guard.
+                // Details retain their context and use the specific phrases below.
+                self.prefix_or_signature |= message && !all_fields && text.contains("signature");
+                self.text.push_str(&text);
+                if message {
+                    self.exclusion_text.push('\n');
+                    self.exclusion_text.push_str(&text);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.collect(value, message, all_fields);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    if binding_diagnostic_echo_field(key) {
+                        continue;
+                    }
+                    match key.as_str() {
+                        "type" | "__type" => {
+                            self.collect_kind(value, message && !all_fields);
+                        }
+                        "message" | "Message" | "msg" | "error" => {
+                            self.collect(value, true, all_fields)
+                        }
+                        "detail" | "details" | "errors" => self.collect(value, true, true),
+                        "param" | "field" | "path" | "loc" => self.collect(value, false, true),
+                        _ if all_fields => {
+                            // Some validators encode a field name as the key.
+                            self.collect(&serde_json::Value::String(key.clone()), false, false);
+                            self.collect(value, true, true);
+                        }
+                        _ => {
+                            // The key itself may carry a diagnostic, even when
+                            // its value is a number, boolean or null.
+                            self.has_unparsed_fields = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn collect_kind(&mut self, value: &serde_json::Value, primary: bool) {
+        match value {
+            serde_json::Value::String(kind) => {
+                let kind = kind.to_ascii_lowercase();
+                self.prefix_or_signature |= binding_kind_excludes_rejection(&kind, primary);
+                // Keep literal opt-in tokens as well as normalized error-code wording.
+                self.collect(&serde_json::Value::String(kind.clone()), false, false);
+                self.collect(
+                    &serde_json::Value::String(kind.replace(['_', '-'], " ")),
+                    false,
+                    false,
+                );
+            }
+            serde_json::Value::Array(values) => {
+                self.has_unparsed_fields = true;
+                for value in values {
+                    self.collect_kind(value, primary);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                self.has_unparsed_fields = true;
+                for (key, value) in fields {
+                    if !binding_diagnostic_echo_field(key) {
+                        self.collect_kind(&serde_json::Value::String(key.clone()), primary);
+                        self.collect_kind(value, primary);
+                    }
+                }
+            }
+            _ => self.has_unparsed_fields |= !value.is_null(),
+        }
+    }
+}
+
+fn binding_kind_excludes_rejection(kind: &str, primary_kind: bool) -> bool {
+    // Type aliases can be snake case, camel case or qualified SDK names.
+    // A type naming the optional policy field is not a prefix diagnostic.
+    let compact: String = kind.chars().filter(char::is_ascii_alphanumeric).collect();
+    if primary_kind
+        && (compact.contains("signature")
+            || compact.contains("prefix") && !compact.contains("prefixmismatchbehavior"))
+    {
+        return true;
+    }
+    compact.contains("prefixbindingmismatch")
+        || compact.contains("prefixmismatch") && !compact.contains("prefixmismatchbehavior")
+        || [
+            "signaturevalidation",
+            "invalidsignature",
+            "signatureinvalid",
+            "signaturemismatch",
+            "signatureverification",
+            "signatureerror",
+        ]
+        .iter()
+        .any(|marker| compact.contains(marker))
+}
+
+fn binding_diagnostic_echo_field(key: &str) -> bool {
+    ["request", "input", "signature"]
+        .iter()
+        .any(|field| key.eq_ignore_ascii_case(field))
+}
+
+fn strip_binding_diagnostic_echoes(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.retain(|key, _| !binding_diagnostic_echo_field(key));
+            for value in fields.values_mut() {
+                strip_binding_diagnostic_echoes(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                strip_binding_diagnostic_echoes(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn binding_diagnostic_excludes_rejection(text: &str) -> bool {
+    // A signature word/key inside details or an echoed signature must not
+    // invalidate an independent field rejection. Exclude the actual diagnostic
+    // phrases, including Anthropic's remedy for a signed-prefix mismatch.
+    [
+        "invalid signature",
+        "invalid `signature`",
+        "signature mismatch",
+        "signature verification failed",
+        "signature is invalid",
+        "bound to a different conversation",
+        "prefix_binding_mismatch",
+        "prefix mismatch",
+        "remove the block",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+fn binding_diagnostic_rejects(text: &str) -> bool {
+    contains_opt_in_token(text)
+        && [
+            "extra inputs are not permitted",
+            "extra input is not permitted",
+            "extraneous key",
+            "is not permitted",
+            "not permitted",
+            "unknown name",
+            "cannot find field",
+            "unrecognized request argument",
+            "unrecognized field",
+            "unrecognized",
+            "not recognized",
+            "unknown parameter",
+            "unknown field",
+            "unknown beta",
+            "unexpected field",
+            "unexpected keyword",
+            "unexpected value",
+            "additional properties are not allowed",
+            "not allowed",
+            "unsupported",
+            "not supported",
+            "invalid beta",
+            "not a valid beta",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
+}
+
+/// Whether a 400 explicitly rejects the binding field or beta opt-in.
+/// Diagnostic containers are decoded rather than silently discarded by a
+/// permissive envelope. Incomplete/unknown envelopes also use the bounded raw
+/// body, while a complete typed inner error protects against unrelated outer echoes.
+/// Signed-prefix errors recommending the setting as a remedy never qualify.
+pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
+    // A body at the read ceiling may have lost a later diagnostic exclusion.
+    if body.len() >= crate::HTTP_ERROR_BODY_LIMIT {
+        return false;
+    }
+    let mut diagnostic = BindingDiagnostic::default();
+    let mut inner_message = false;
+    let mut raw_exclusion = None;
+    if let Ok(BindingDiagnosticValue(mut value)) = serde_json::from_slice(body) {
+        if let Some(fields) = value.as_object_mut() {
+            // Preserve the prior complete wire envelope's message authority.
+            // Missing/null/non-string typed fields must not hide the outer message.
+            inner_message = fields.get("error").is_some_and(|error| {
+                ["type", "message"]
+                    .iter()
+                    .all(|key| error.get(key).is_some_and(serde_json::Value::is_string))
+            });
+            if inner_message {
+                // Preserve the established inner-message authority, including
+                // explicit empty strings. Alternative/empty wrapper fields do
+                // not by themselves establish complete diagnostic coverage.
+                diagnostic.has_message = true;
+                for key in ["message", "Message", "msg"] {
+                    fields.remove(key);
+                }
+            }
+        }
+        diagnostic.collect(&value, true, false);
+        // Raw compatibility matching still sees the entire body. Its veto
+        // must retain diagnostic provenance so an echoed signature/remedy
+        // cannot suppress an independent field rejection.
+        strip_binding_diagnostic_echoes(&mut value);
+        raw_exclusion = Some(value.to_string().to_ascii_lowercase());
+    }
+    if !diagnostic.has_message || diagnostic.has_unparsed_fields && !inner_message {
+        // Serde accepting a JSON object does not prove diagnostic coverage:
+        // empty and partly populated envelopes still need the legacy fallback.
+        diagnostic.text.push(' ');
+        let raw = String::from_utf8_lossy(body).to_ascii_lowercase();
+        if raw_exclusion.is_none() && raw.contains("signature") {
+            return false;
+        }
+        diagnostic
+            .text
+            .push_str(raw_exclusion.as_deref().unwrap_or(&raw));
+        diagnostic.exclusion_text.push('\n');
+        diagnostic
+            .exclusion_text
+            .push_str(raw_exclusion.as_deref().unwrap_or(&raw));
+    }
+    !diagnostic.prefix_or_signature
+        && !binding_diagnostic_excludes_rejection(&diagnostic.exclusion_text)
+        && binding_diagnostic_rejects(&diagnostic.text)
 }
 
 /// Removes the binding opt-in from a rendered payload. The beta header is
@@ -373,7 +726,7 @@ pub const fn select_anthropic_cache_ttl(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AnthropicAuthMode {
     ApiKey,
     None,
@@ -1180,14 +1533,31 @@ impl AnthropicProvider {
         })
     }
 
-    fn thinking_binding_route(&self) -> String {
-        format!("{:?}|{}|{}", self.auth_mode, self.api_url, self.model)
+    fn thinking_binding_route(&self) -> ThinkingBindingRoute {
+        // The account alias is an opaque ID, never the credential secret.
+        ThinkingBindingRoute {
+            auth_mode: self.auth_mode,
+            api_url: self.api_url.clone(),
+            model: self.model.clone(),
+            account: self.account.clone(),
+        }
     }
 
     fn thinking_binding_rejected(&self) -> bool {
         thinking_binding_rejected_routes()
             .lock()
-            .is_ok_and(|routes| routes.contains(&self.thinking_binding_route()))
+            .is_ok_and(|mut routes| {
+                let route = self.thinking_binding_route();
+                if routes
+                    .get(&route)
+                    .is_some_and(|published| published.elapsed() < THINKING_BINDING_ROUTE_TTL)
+                {
+                    true
+                } else {
+                    routes.remove(&route);
+                    false
+                }
+            })
     }
 
     async fn send_request(
@@ -1203,14 +1573,14 @@ impl AnthropicProvider {
     /// Sends one turn. When the payload carries the prefix-binding drop
     /// policy and the endpoint answers 400 rejecting exactly that opt-in
     /// (e.g. a gateway or route without thinking-binding controls), the route
-    /// is latched as unsupported for this process and the SAME prepared wire
-    /// is resent once without the policy, restoring the pre-policy request.
-    /// Later requests on the route render without it, so the fallback never
-    /// repeats or loops; any other status or 400 is returned unchanged.
+    /// is classified, the SAME prepared wire is resent once without the
+    /// policy. A successful HTTP status returns a pending route decision;
+    /// only the streaming producer publishes it just before forwarding a
+    /// decoded Finish. Other statuses and incomplete streams never publish.
     async fn send_request_with_binding_fallback(
         &self,
         request: &TurnRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(reqwest::Response, Option<ThinkingBindingRoute>), ProviderError> {
         let mut prepared = self.take_or_render_prepared(request)?;
         if self.thinking_binding_rejected() {
             strip_thinking_binding_drop(&mut prepared.payload);
@@ -1218,12 +1588,15 @@ impl AnthropicProvider {
         if !payload_uses_thinking_binding_drop(&prepared.payload) {
             let built = self.request_body_prepared_for_send(&prepared).await?;
             drop(prepared);
-            return self.execute_prepared_send(built).await;
+            return self
+                .execute_prepared_send(built)
+                .await
+                .map(|response| (response, None));
         }
         let built = self.request_body_prepared_for_send(&prepared).await?;
         let response = self.execute_prepared_send(built).await?;
         if response.status().as_u16() != 400 {
-            return Ok(response);
+            return Ok((response, None));
         }
         let request_id = anthropic_request_id(&response);
         let retry_after = response
@@ -1236,25 +1609,31 @@ impl AnthropicProvider {
                 .with_http_metadata(400, request_id.as_deref())
         })?;
         if !anthropic_rejects_thinking_binding(&body) {
+            // Includes the documented prefix-mismatch error: the route keeps
+            // its policy and the original error is returned unchanged.
             return Err(
                 replay_anthropic_http_error(400, retry_after.as_deref(), &body)
                     .with_http_metadata(400, request_id.as_deref()),
             );
-        }
-        if let Ok(mut routes) = thinking_binding_rejected_routes().lock() {
-            routes.insert(self.thinking_binding_route());
         }
         tracing::warn!(
             target: "haider.provider",
             model = %self.model,
             auth_mode = ?self.auth_mode,
             request_id = request_id.as_deref().unwrap_or(""),
-            "Anthropic route rejected the thinking prefix-binding drop policy; resending once without it and disabling it for this route"
+            "Anthropic route rejected the thinking prefix-binding opt-in as unsupported; resending once without it"
         );
         strip_thinking_binding_drop(&mut prepared.payload);
         let built = self.request_body_prepared_for_send(&prepared).await?;
         drop(prepared);
-        self.execute_prepared_send(built).await
+        let response = self.execute_prepared_send(built).await?;
+        // Headers alone cannot establish acceptance. Keep this decision
+        // pending until the decoder validates message_stop.
+        let pending = response
+            .status()
+            .is_success()
+            .then(|| self.thinking_binding_route());
+        Ok((response, pending))
     }
 
     async fn execute_prepared_send(
@@ -1312,7 +1691,8 @@ impl AnthropicProvider {
     ) -> Result<ProviderStream, ProviderError> {
         let native_computer = anthropic_computer_tool_version(&request.model).is_some()
             && request.tools.iter().any(|tool| tool.name == "computer");
-        let response = self.send_request_with_binding_fallback(request).await?;
+        let (response, pending_binding_route) =
+            self.send_request_with_binding_fallback(request).await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -1333,7 +1713,10 @@ impl AnthropicProvider {
         let account = self.account.clone();
         let chunk_idle_timeout = self.transport_config.chunk_idle_timeout;
         let semantic_progress_timeout = self.transport_config.semantic_progress_timeout;
-        let context = crate::SseRequestContext::capture(self.route_gating());
+        let context = AnthropicStreamContext {
+            sse: crate::SseRequestContext::capture(self.route_gating()),
+            pending_binding_route,
+        };
         let producer = tokio::spawn(async move {
             stream_response(
                 response,
@@ -1832,6 +2215,11 @@ fn model_capabilities(model: &str) -> ModelCapabilities {
     }
 }
 
+struct AnthropicStreamContext {
+    sse: crate::SseRequestContext,
+    pending_binding_route: Option<ThinkingBindingRoute>,
+}
+
 async fn stream_response(
     response: reqwest::Response,
     account: Option<CredentialAlias>,
@@ -1839,7 +2227,7 @@ async fn stream_response(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     native_computer: bool,
-    context: crate::SseRequestContext,
+    context: AnthropicStreamContext,
 ) {
     stream_sse_source_with_native(
         response,
@@ -1887,7 +2275,10 @@ pub(crate) async fn stream_sse_source<S: SseChunkSource>(
         chunk_idle_timeout,
         semantic_progress_timeout,
         false,
-        crate::SseRequestContext::capture(route_gating),
+        AnthropicStreamContext {
+            sse: crate::SseRequestContext::capture(route_gating),
+            pending_binding_route: None,
+        },
     )
     .await;
 }
@@ -1899,13 +2290,17 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     native_computer: bool,
-    context: crate::SseRequestContext,
+    context: AnthropicStreamContext,
 ) {
+    let AnthropicStreamContext {
+        sse,
+        mut pending_binding_route,
+    } = context;
     let crate::SseRequestContext {
         route_gating,
         turn_trace,
         idle_deadline,
-    } = context;
+    } = sse;
     let mut decoder = SseDecoder::with_native_computer(account, native_computer);
     let mut progress = crate::ProviderProgressClock::new(
         chunk_idle_timeout,
@@ -1923,7 +2318,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
                 if let Some(idle) = &idle_deadline {
                     idle.observe_items(&items);
                 }
-                send_items(&sender, items).await;
+                send_items(&sender, items, &mut pending_binding_route).await;
                 return;
             }
             Ok(Some(Err(error))) => {
@@ -1963,7 +2358,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
         if crate::has_semantic_progress(&items) {
             progress.observe_semantic_progress();
         }
-        if !send_items(&sender, items).await || decoder.is_terminal() {
+        if !send_items(&sender, items, &mut pending_binding_route).await || decoder.is_terminal() {
             return;
         }
     }
@@ -1972,9 +2367,32 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
 async fn send_items(
     sender: &mpsc::Sender<ProviderStreamItem>,
     items: Vec<ProviderStreamItem>,
+    pending_binding_route: &mut Option<ThinkingBindingRoute>,
 ) -> bool {
     for item in items {
-        if sender.send(item).await.is_err() {
+        if matches!(&item, Ok(crate::StreamEvent::Finish { .. })) && pending_binding_route.is_some()
+        {
+            // Reserve capacity first: a dropped receiver cannot publish a
+            // capability. Every decoded Finish reason is success here because
+            // the policy-free Messages stream completed, regardless of why
+            // the model stopped (tool use, limit, refusal, etc.).
+            let Ok(permit) = sender.reserve().await else {
+                return false;
+            };
+            if sender.is_closed() {
+                return false;
+            }
+            if let Some(route) = pending_binding_route.take()
+                && let Ok(mut routes) = thinking_binding_rejected_routes().lock()
+            {
+                routes.insert(route, Instant::now());
+                tracing::warn!(
+                    target: "haider.provider",
+                    "Anthropic policy-free fallback completed; binding opt-in disabled for this route for one hour"
+                );
+            }
+            permit.send(item);
+        } else if sender.send(item).await.is_err() {
             return false;
         }
     }

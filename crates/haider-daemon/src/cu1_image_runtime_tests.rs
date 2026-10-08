@@ -584,6 +584,7 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
         },
     ]));
     let compactor = super::DaemonContextCompactor {
+        selection_epoch: None,
         store: lease,
         provider: Arc::clone(&provider) as Arc<dyn Provider>,
         model: "fake-model".into(),
@@ -736,6 +737,7 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
     }];
     let provider = Arc::new(RejectFirstReplayProvider::new());
     let compactor = super::DaemonContextCompactor {
+        selection_epoch: None,
         store: lease,
         provider: Arc::clone(&provider) as Arc<dyn Provider>,
         model: "fake-model".into(),
