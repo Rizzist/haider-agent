@@ -124,14 +124,14 @@ fn same_run_has_zero_publication_io_but_a_new_run_is_fully_synced() {
                 .bind_and_activate_turn("profile", "session", "first", "provider", false, false)
                 .expect("same frozen run after restart");
         });
-        assert_eq!(counts.writes.load(Ordering::Relaxed), 3);
+        assert_eq!(counts.writes.load(Ordering::Relaxed), 4);
         assert_eq!(
             counts.syncs.load(Ordering::Relaxed),
-            3 * full_syncs_per_publication
+            4 * full_syncs_per_publication
         );
         assert_eq!(
             counts.full_syncs.load(Ordering::Relaxed),
-            3 * full_syncs_per_publication
+            4 * full_syncs_per_publication
         );
     }
 }
@@ -202,15 +202,15 @@ fn activating_an_already_active_frozen_run_has_zero_publication_io() {
 
         let restarted = LockdownManager::initialize(root).expect("restart manager");
         activate(&restarted, "first");
-        assert_counts(3);
+        assert_counts(4);
         if lockdown && !auto_hermetic {
             restarted
                 .bind_turn("profile", "session", "first", "provider", true, true)
                 .expect("narrow durable record before activation");
             activate(&restarted, "first");
-            assert_counts(4);
+            assert_counts(5);
             activate(&restarted, "first");
-            assert_counts(4);
+            assert_counts(5);
             assert_eq!(
                 restarted
                     .active_session_binding("profile", "session")

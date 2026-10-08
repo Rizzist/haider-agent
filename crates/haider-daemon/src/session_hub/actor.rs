@@ -1829,6 +1829,7 @@ pub(super) async fn run_session_actor(
                 cancellation_wake,
                 completed,
             } => {
+                hooks.lockdown_saves.fence(Some(&session_id), None);
                 // Replacement revokes the old token in this serialized step
                 // before the successor can append or register a wake target.
                 worker = Some(RegisteredWorker {
@@ -1885,6 +1886,7 @@ pub(super) async fn run_session_actor(
                     .as_ref()
                     .is_some_and(|current| current.lease_id == lease_id)
                 {
+                    hooks.lockdown_saves.fence(Some(&session_id), None);
                     worker = None;
                 }
                 let _ = completed.send(());

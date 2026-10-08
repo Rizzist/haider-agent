@@ -906,8 +906,12 @@ impl DelegationHandle {
             let child_session = record.child_session_id.clone();
             let child_run = record.child_run_id.clone();
             let provider = coordinates.metadata.provider.clone();
+            let save_guard = hub
+                .begin_lockdown_save(&child_session, &child_run)
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), true))?;
+            let save = save_guard.permit();
             crate::lockdown::on_blocking_pool_result(move || {
-                hub.bind_lockdown_turn(
+                hub.bind_lockdown_turn_owned(
                     &child_session,
                     &child_run,
                     &provider,
@@ -915,6 +919,7 @@ impl DelegationHandle {
                         persisted_lockdown,
                         persisted_auto_hermetic,
                     ),
+                    &save,
                 )
             })
             .await

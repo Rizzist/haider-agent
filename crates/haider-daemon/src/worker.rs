@@ -7309,6 +7309,11 @@ async fn perform_manual_compaction(
         |receipt| receipt.run_id.clone(),
     );
 
+    let save_guard = lease
+        .hub()
+        .begin_lockdown_save(lease.session_id(), &boundary_run_id)
+        .map_err(hub_error)?;
+    let save = save_guard.permit();
     let delegation = dependencies.delegation.clone().ok_or_else(|| {
         HaiderError::new(
             ErrorCode::Internal,
@@ -7349,6 +7354,7 @@ async fn perform_manual_compaction(
                 lease.session_id(),
                 &boundary_run_id,
                 &metadata.provider,
+                &save,
             )
             .await
             {
@@ -7367,6 +7373,7 @@ async fn perform_manual_compaction(
             lease.session_id(),
             &boundary_run_id,
             &metadata.provider,
+            &save,
         )
         .await;
         return Err(HaiderError::new(
@@ -7393,6 +7400,7 @@ async fn perform_manual_compaction(
                     &run_id,
                     &provider,
                     provider_policy,
+                    &save,
                 )
             })
             .await
@@ -8642,6 +8650,11 @@ async fn start_turn(
         recovery_ready: _,
         recovering: _,
     } = pending;
+    let save_guard = lease
+        .hub()
+        .begin_lockdown_save(lease.session_id(), &accepted.run_id)
+        .map_err(hub_error)?;
+    let save = save_guard.permit();
     let turn_trace = turn_trace_enabled().then(|| {
         registered_turn_trace(&accepted.session_id, &accepted.run_id).unwrap_or_else(|| {
             // Recovery and lost-response receipt paths can reach the worker
@@ -8996,6 +9009,7 @@ async fn start_turn(
                 lease.session_id(),
                 &accepted.run_id,
                 &metadata.provider,
+                &save,
             )
             .await
             {
@@ -9014,6 +9028,7 @@ async fn start_turn(
             lease.session_id(),
             &accepted.run_id,
             &metadata.provider,
+            &save,
         )
         .await;
         return Err(HaiderError::new(
@@ -9035,13 +9050,14 @@ async fn start_turn(
         haider_platform::phase_trace::Phase::LockdownBindActivate,
         async move {
             crate::lockdown::on_blocking_pool_result(move || {
-                provider_rebind::rebound_active_turn_lockdown_snapshot(
+                provider_rebind::rebound_active_turn_lockdown_snapshot_owned(
                     &hub,
                     &session_id,
                     &run_id,
                     explicitly_rebound,
                     &provider,
                     provider_policy,
+                    &save,
                 )
             })
             .await
@@ -16412,9 +16428,10 @@ fn active_lockdown_turn_snapshot(
     run_id: &RunId,
     provider: &str,
     policy: crate::auto_hermetic::ProviderLockdownPolicy,
+    save: &crate::session_hub::lockdown_save::SavePermit,
 ) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
     let bound_policy = hub
-        .bind_activate_lockdown_turn(session_id, run_id, provider, policy)
+        .bind_activate_lockdown_turn_owned(session_id, run_id, provider, policy, save)
         .map_err(hub_error)?;
     if !bound_policy.is_lockdown() {
         return Ok(None);
@@ -16431,17 +16448,20 @@ async fn bind_unknown_provider_boundary(
     session_id: &SessionId,
     run_id: &RunId,
     provider: &str,
+    save: &crate::session_hub::lockdown_save::SavePermit,
 ) -> Result<(), HaiderError> {
     let hub = hub.clone();
     let session_id = session_id.clone();
     let run_id = run_id.clone();
     let provider = provider.to_owned();
+    let save = save.clone();
     crate::lockdown::on_blocking_pool_result(move || {
-        hub.bind_lockdown_turn(
+        hub.bind_lockdown_turn_owned(
             &session_id,
             &run_id,
             &provider,
             crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
+            &save,
         )
         .map(|_| ())
     })

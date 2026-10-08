@@ -100,6 +100,9 @@ mod lockdown;
 #[cfg(test)]
 #[path = "lockdown_binding_tests.rs"]
 mod lockdown_binding_tests;
+
+#[cfg(test)]
+mod lockdown_save_tests;
 #[cfg(test)]
 #[path = "lockdown_tests.rs"]
 mod lockdown_tests;
