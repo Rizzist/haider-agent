@@ -1751,7 +1751,7 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
                 driver,
                 model,
                 LiveReply::DefaultModelSet {
-                    command_id: haider_protocol::ids::CommandId::new("catalog-default-reply"),
+                    command_id: haider_rpc::CommandId::new("catalog-default-reply"),
                     provider: summary,
                     revision,
                 },
@@ -1760,7 +1760,7 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
                 driver,
                 model,
                 LiveReply::ProviderTrustSet {
-                    command_id: haider_protocol::ids::CommandId::new("catalog-trust-reply"),
+                    command_id: haider_rpc::CommandId::new("catalog-trust-reply"),
                     provider: summary,
                     revision,
                 },
@@ -1916,7 +1916,7 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
             1,
         );
         assert_eq!(model.identity.model_short, "private-A");
-        let command_id = haider_protocol::ids::CommandId::new("catalog-removal-reply");
+        let command_id = haider_rpc::CommandId::new("catalog-removal-reply");
         let reply = if remove_provider {
             LiveReply::ProviderRemoved {
                 command_id,
