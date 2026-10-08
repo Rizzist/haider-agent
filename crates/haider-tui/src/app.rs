@@ -13000,7 +13000,22 @@ impl AppModel {
         let provider = summary.provider.clone();
         let model = summary.default_model.clone().unwrap_or_default();
         if self.providers.apply_default_set(summary, revision) {
-            self.providers.message = Some(format!("✓ {provider} default → {model}"));
+            if self.mode == RuntimeMode::Live {
+                self.bootstrap_identity_from_daemon();
+                self.refresh_context_window();
+                let current = self
+                    .providers
+                    .providers
+                    .iter()
+                    .find(|summary| summary.provider == provider)
+                    .and_then(|summary| summary.default_model.as_deref());
+                self.providers.message = Some(current.map_or_else(
+                    || format!("{provider} default selection retired — fetch models"),
+                    |current| format!("✓ {provider} default → {current}"),
+                ));
+            } else {
+                self.providers.message = Some(format!("✓ {provider} default → {model}"));
+            }
         }
         self.dirty = true;
     }

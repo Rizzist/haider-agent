@@ -1747,10 +1747,24 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
                     revision,
                 },
             ),
-            _ => {
-                model.apply_default_model_set(summary, revision);
-                model.bootstrap_identity_from_daemon();
-            }
+            2 => pass(
+                driver,
+                model,
+                LiveReply::DefaultModelSet {
+                    command_id: haider_protocol::ids::CommandId::new("catalog-default-reply"),
+                    provider: summary,
+                    revision,
+                },
+            ),
+            _ => pass(
+                driver,
+                model,
+                LiveReply::ProviderTrustSet {
+                    command_id: haider_protocol::ids::CommandId::new("catalog-trust-reply"),
+                    provider: summary,
+                    revision,
+                },
+            ),
         }
     }
 
@@ -1777,7 +1791,158 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
         );
     }
 
-    for kind in 0..3 {
+    // Exercise receipt reducers themselves: an older success can arrive
+    // after the active account changed, before its provider list arrives.
+    for kind in 0..4 {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("late-provider-receipt");
+        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+        publish(
+            &mut driver,
+            &mut model,
+            0,
+            private_summary(1, "private-A"),
+            1,
+        );
+        account(
+            &mut driver,
+            &mut model,
+            "second",
+            2,
+            CredentialStatus::Ok,
+            3,
+        );
+        publish(
+            &mut driver,
+            &mut model,
+            kind,
+            private_summary(1, "private-A"),
+            2,
+        );
+        assert!(
+            model.providers.providers[0].models.is_empty(),
+            "late receipt={kind}"
+        );
+        assert!(model.identity.model_short.is_empty(), "late receipt={kind}");
+        assert_eq!(model.identity.context_window, 0, "late receipt={kind}");
+        assert!(
+            !model
+                .providers
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("private-A"),
+            "late receipt message={kind}"
+        );
+    }
+
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("late-configure-receipt");
+    account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+    publish(
+        &mut driver,
+        &mut model,
+        0,
+        private_summary(1, "private-A"),
+        1,
+    );
+    let configure = driver.handle_request(
+        &mut model,
+        AppRequest::ProviderConfigure {
+            attempt: 1,
+            name: "custom".into(),
+            origin: "http://127.0.0.1:9/v1".into(),
+            model: "deployment".into(),
+            keyless: false,
+            secret: None,
+            family: haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
+            models: vec![],
+            default_model: None,
+            expected_revision: 1,
+        },
+    );
+    let command_id = configure
+        .into_iter()
+        .find_map(|command| match command {
+            LiveCommand::ConfigureProvider { command_id, .. } => Some(command_id),
+            _ => None,
+        })
+        .expect("correlated configure command");
+    account(
+        &mut driver,
+        &mut model,
+        "second",
+        2,
+        CredentialStatus::Ok,
+        3,
+    );
+    let mut summary = private_summary(1, "private-A");
+    summary.configured_models = vec!["deployment".into()];
+    summary.default_model = Some("deployment".into());
+    summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::ProviderConfigured {
+            command_id,
+            provider: summary,
+            revision: 2,
+        },
+    );
+    assert!(
+        !model.providers.providers[0]
+            .models
+            .iter()
+            .any(|name| name == "private-A")
+    );
+    assert!(
+        model.providers.providers[0]
+            .model_details
+            .iter()
+            .all(|detail| detail.context_window.is_none() && detail.max_output_tokens.is_none())
+    );
+    assert!(model.identity.model_short.is_empty());
+    assert_eq!(model.identity.context_window, 0);
+
+    for remove_provider in [false, true] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("removed-current-identity");
+        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+        publish(
+            &mut driver,
+            &mut model,
+            0,
+            private_summary(1, "private-A"),
+            1,
+        );
+        assert_eq!(model.identity.model_short, "private-A");
+        let command_id = haider_protocol::ids::CommandId::new("catalog-removal-reply");
+        let reply = if remove_provider {
+            LiveReply::ProviderRemoved {
+                command_id,
+                provider: "custom".into(),
+                revision: 2,
+            }
+        } else {
+            LiveReply::AccountRemoved {
+                command_id,
+                removed_alias: "work".into(),
+                replacement_active_alias: None,
+                revision: 2,
+            }
+        };
+        pass(&mut driver, &mut model, reply);
+        assert!(
+            model.identity.model_short.is_empty(),
+            "removed provider={remove_provider}"
+        );
+        assert_eq!(
+            model.identity.context_window, 0,
+            "removed provider={remove_provider}"
+        );
+    }
+
+    for kind in 0..4 {
         for catalog in [
             haider_rpc::ProviderCatalogKindWire::Custom,
             haider_rpc::ProviderCatalogKindWire::Public,
@@ -1909,10 +2074,10 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
         "a new account cannot restore the retired credential baseline"
     );
 
-    // Accepted full, refresh, and default publications supersede buffered
+    // Accepted full, refresh, default, and trust publications supersede buffered
     // evidence even when their revision is equal. Rejected older replies do
     // not erase a valid pending projection.
-    for kind in 0..3 {
+    for kind in 0..4 {
         for publication_revision in [1, 2, 3] {
             let mut model = live_model();
             let mut driver = LiveDriver::new("superseded-listing-proof");
@@ -2018,7 +2183,7 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
 
     // A partial publication for a different provider preserves this one's
     // pending proof, even though it advances the global management revision.
-    for kind in [1, 2] {
+    for kind in [1, 2, 3] {
         let mut model = live_model();
         let mut driver = LiveDriver::new("independent-provider-proof");
         let mut previous = oauth_descriptor("custom", "previous", true);

@@ -4122,6 +4122,8 @@ impl LiveDriver {
                     }
                     None => format!("removed `{removed_alias}`"),
                 });
+                model.bootstrap_identity_from_daemon();
+                model.refresh_context_window();
                 model.dirty = true;
                 vec![LiveCommand::AccountList, LiveCommand::ProviderList]
             }
@@ -4139,6 +4141,8 @@ impl LiveDriver {
                     .min(model.providers.providers.len().saturating_sub(1));
                 model.providers.revision = Some(revision);
                 model.providers.message = Some(format!("removed `{provider}`"));
+                model.bootstrap_identity_from_daemon();
+                model.refresh_context_window();
                 model.dirty = true;
                 vec![LiveCommand::ProviderList]
             }
@@ -4150,7 +4154,10 @@ impl LiveDriver {
                 self.retire(&command_id);
                 let name = provider.provider.clone();
                 let trust = provider.trust;
-                model.providers.apply_models_refresh(provider, revision);
+                if model.providers.apply_models_refresh(provider, revision) {
+                    model.bootstrap_identity_from_daemon();
+                    model.refresh_context_window();
+                }
                 model.providers.message = Some(format!(
                     "{name} trust → {}",
                     match trust {
@@ -4838,7 +4845,10 @@ impl LiveDriver {
                 };
                 // Upsert semantics — the created profile joins the list
                 // under the commit's revision.
-                model.providers.apply_models_refresh(provider, revision);
+                if model.providers.apply_models_refresh(provider, revision) {
+                    model.bootstrap_identity_from_daemon();
+                    model.refresh_context_window();
+                }
                 let credential_staged = pending.vault_reference.is_some();
                 let login_attempt = model.custom_add_committed(pending.attempt, credential_staged);
                 model.dirty = true;
