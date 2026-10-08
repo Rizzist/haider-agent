@@ -118,16 +118,36 @@ exec /usr/bin/hdiutil "$@"
         for point in owned:
             if (point.name == 'mount' and point.parent.name.startswith('tmp.')
                     and point.parent.exists()):
-                self.assertFalse(any(mount.is_relative_to(point.parent) for mount in remaining),
-                                 'unrecorded mount inside builder work directory')
-                shutil.rmtree(point.parent)
+                self.remove_clear_directory(point.parent, remaining, 'builder work directory')
+
+    def remove_clear_directory(self, directory, inventory, label):
+        if not directory.exists():
+            return
+        self.assertFalse(any(mount.is_relative_to(directory.resolve()) for mount in inventory),
+                         f'unrecorded mount inside {label}')
+        device = directory.stat().st_dev
+        self.assertEqual(device, directory.parent.stat().st_dev,
+                         f'mounted filesystem at {label}')
+
+        def fail_walk(error):
+            raise error
+
+        # Check before deleting any files. This also catches mounts omitted from
+        # the inventory or represented there with a different case/Unicode alias.
+        for current, names, _ in os.walk(directory, onerror=fail_walk, followlinks=False):
+            for name in names:
+                child = Path(current) / name
+                if not child.is_symlink():
+                    self.assertEqual(child.stat().st_dev, device,
+                                     f'mounted filesystem inside {label}')
+        shutil.rmtree(directory)
 
     def cleanup_fixtures(self):
         # Keep fixtures if detach/audit fails: deleting them can traverse a mount.
         self.detach_leftover_test_mounts()
+        remaining = self.disk_image_mountpoints()
         for directory in reversed(self.temporary_directories):
-            if directory.exists():
-                shutil.rmtree(directory)
+            self.remove_clear_directory(directory, remaining, 'fixture directory')
 
     def build(self, operation, failures, error='Resource busy', error_exit=16):
         output = self.base / f'output-{operation}'
@@ -358,6 +378,35 @@ exec /bin/rm "$@"
             self.detach_leftover_test_mounts()
         self.assert_no_test_mounts()
         self.assertTrue(all(not point.parent.exists() for point in points))
+
+    def test_unrecorded_mount_in_fixture_preserves_data_without_inventory(self):
+        # This image belongs to an independent caller, not the builder tracker.
+        self.unrecorded_mountpoint = self.base / 'tmp.unrecorded' / 'mount'
+        self.unrecorded_mountpoint.mkdir(parents=True)
+        foreign_image = self.base / 'foreign.dmg'
+        marker = self.unrecorded_mountpoint / 'foreign-data.txt'
+        try:
+            subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                            '-volname', 'Foreign973', str(foreign_image)], check=True,
+                           capture_output=True, timeout=60)
+            subprocess.run(['/usr/bin/hdiutil', 'attach', str(foreign_image), '-nobrowse',
+                            '-mountpoint', str(self.unrecorded_mountpoint)], check=True,
+                           capture_output=True, timeout=60)
+            marker.write_text('foreign fixture data\n')
+            # The physical preflight must protect an unrecorded writable volume
+            # even when an inventory spelling mismatch makes it absent here.
+            with patch.object(self, 'disk_image_mountpoints', return_value=set()):
+                with self.assertRaisesRegex(AssertionError, 'mounted filesystem inside fixture'):
+                    self.cleanup_fixtures()
+                self.assertEqual(marker.read_text(), 'foreign fixture data\n')
+                self.assertTrue(self.payload.is_dir())
+        finally:
+            # The independent caller cleans its own exact mount, even on failure.
+            if (self.unrecorded_mountpoint.exists()
+                    and self.unrecorded_mountpoint.stat().st_dev
+                    != self.unrecorded_mountpoint.parent.stat().st_dev):
+                subprocess.run(['/usr/bin/hdiutil', 'detach', str(self.unrecorded_mountpoint)],
+                               check=True, capture_output=True, timeout=60)
 
     def test_external_builder_directory_with_spaces_tmpdir_set_and_unset(self):
         external = Path(tempfile.mkdtemp(prefix='hdiutil builder with spaces '))
