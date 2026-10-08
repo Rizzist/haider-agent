@@ -794,6 +794,10 @@ fn a_foreign_member_refuses_the_destroy_honestly() {
     let mut stale_live = fleet_model(snapshot(mixed_tree()));
     stale_live.mode = RuntimeMode::Live;
     stale_live.active_session = Some(sid());
+    // Reach the missing-method control after the semantic capability check.
+    stale_live
+        .daemon_features
+        .insert(haider_rpc::FEATURE_HELPER_STOP_V1.to_owned());
     stale_live.fleet.detail = Some(AgentId::new("ag-recon"));
     stale_live.handle(key(KeyCode::Char('d')));
     stale_live.handle(key(KeyCode::Char('d')));
