@@ -1778,9 +1778,9 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
             summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
             summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
             publish(&mut driver, &mut model, 0, summary.clone(), 2);
-            summary.models.clear();
-            summary.model_details.clear();
-            summary.inventory = haider_rpc::ModelInventoryWire::NeverFetched;
+            // The new projection can look exactly like the retired buffer.
+            // Equality of visible rows cannot preserve old listing evidence.
+            summary.retire_fetched_catalog();
             publish(&mut driver, &mut model, kind, summary, publication_revision);
             let mut current = oauth_descriptor("custom", "work", true);
             current.incarnation = 2;
@@ -1859,6 +1859,44 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
             ["latest-A"],
             "replacement={kind}"
         );
+    }
+
+    // A partial publication for a different provider preserves this one's
+    // pending proof, even though it advances the global management revision.
+    for kind in [1, 2] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("independent-provider-proof");
+        let mut previous = oauth_descriptor("custom", "previous", true);
+        previous.incarnation = 1;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![previous],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        publish(&mut driver, &mut model, 0, private_summary(2, "pending"), 2);
+        publish(
+            &mut driver,
+            &mut model,
+            kind,
+            provider_summary("other", &["other-model"], "other-model"),
+            3,
+        );
+        let mut current = oauth_descriptor("custom", "work", true);
+        current.incarnation = 2;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![current],
+                revision: Some(3),
+                sources: vec![],
+            },
+        );
+        assert_eq!(model.providers.providers[0].models, ["pending"]);
     }
 
     // A same/older publication cannot assert a different active owner.
