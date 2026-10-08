@@ -12102,6 +12102,10 @@ impl AppModel {
         if self.accounts.revision.is_none() {
             return;
         }
+        // Publication order comes from management revisions. Incarnations
+        // identify an account; activating an older account does not make its
+        // incarnation larger than the previously active account's value.
+        let catalogs_ahead = self.providers.revision > self.accounts.revision;
         let active = self
             .accounts
             .rows
@@ -12134,7 +12138,7 @@ impl AppModel {
                 }
                 return false;
             }
-            owner.is_some_and(|(_, incarnation)| current.is_some_and(|(_, now)| incarnation > *now))
+            owner.is_some() && catalogs_ahead
         });
         for summary in &mut self.providers.providers {
             let Some(scope) = summary.catalog_scope.as_ref() else {
@@ -12149,7 +12153,9 @@ impl AppModel {
             if current == Some(&(alias.clone(), incarnation)) {
                 continue;
             }
-            if current.is_some_and(|(_, now)| incarnation > *now) && !summary.models.is_empty() {
+            // Empty listings carry successful-discovery evidence too. Hold
+            // the complete projection until its exact active owner arrives.
+            if catalogs_ahead {
                 let already_fenced =
                     self.pending_catalogs
                         .get(&summary.provider)

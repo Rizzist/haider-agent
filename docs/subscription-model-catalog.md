@@ -177,3 +177,5 @@ context, output limits, effort/speed and vision/thinking declarations. Both the
 picker and daemon selection authority use it; the authority also removes the old
 producer key, so a queued choice cannot become explicit configuration. Unsupported
 Azure-listing evidence belongs to its route and cannot authorize another account.
+
+TUI snapshots use management revisions to hold a provider projection that arrives before its active-account proof. The whole projection is retained, including an empty successful list. Account incarnations are compared for exact ownership, never ordered to infer which account will become active. This also preserves stale-success selection when an existing account with an older incarnation is activated.
