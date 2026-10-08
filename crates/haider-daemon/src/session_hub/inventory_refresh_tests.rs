@@ -1,8 +1,7 @@
 use super::*;
 
-#[test]
-fn configured_advisory_inventory_probes_once_but_azure_unsupported_does_not() {
-    let mut summary = ProviderSummaryWire {
+fn inventory_summary() -> ProviderSummaryWire {
+    ProviderSummaryWire {
         provider: "compatible".into(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:8080".into()),
@@ -13,7 +12,7 @@ fn configured_advisory_inventory_probes_once_but_azure_unsupported_does_not() {
         default_model: None,
         enabled: true,
         catalog_scope: None,
-        configured_models: vec!["configured-model".into()],
+        configured_models: vec![],
         static_models: Vec::new(),
         model_details: Vec::new(),
         catalog: haider_rpc::ProviderCatalogKindWire::Custom,
@@ -23,8 +22,13 @@ fn configured_advisory_inventory_probes_once_but_azure_unsupported_does_not() {
         auth_methods: Vec::new(),
         availability_reason: None,
         trust: haider_rpc::ProviderTrustWire::Full,
-    };
-    assert!(provider_inventory_needs_refresh(
+    }
+}
+
+#[test]
+fn selectable_uncertainty_does_not_refresh_during_admission() {
+    let mut summary = inventory_summary();
+    assert!(!provider_inventory_needs_refresh(
         &summary,
         "configured-model"
     ));
@@ -40,6 +44,28 @@ fn configured_advisory_inventory_probes_once_but_azure_unsupported_does_not() {
         "configured-model"
     ));
     assert!(provider_inventory_needs_refresh(&summary, "new-model"));
+    summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "server returned 503 for /models".into(),
+    };
+    assert!(!provider_inventory_needs_refresh(
+        &summary,
+        "configured-model"
+    ));
+    assert!(!provider_inventory_needs_refresh(&summary, "new-model"));
+    summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Authoritative;
+    assert!(!provider_inventory_needs_refresh(
+        &summary,
+        "configured-model"
+    ));
+    assert!(provider_inventory_needs_refresh(&summary, "new-model"));
+    summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+    assert!(provider_inventory_needs_refresh(
+        &summary,
+        "configured-model"
+    ));
+    assert!(!summary.model_is_selectable("configured-model"));
+    summary.availability = haider_rpc::ProviderAvailabilityWire::Available;
     summary.inventory = haider_rpc::ModelInventoryWire::Static;
     assert!(!provider_inventory_needs_refresh(&summary, "new-model"));
     summary.inventory = haider_rpc::ModelInventoryWire::Configured;
@@ -48,4 +74,51 @@ fn configured_advisory_inventory_probes_once_but_azure_unsupported_does_not() {
         &summary,
         "configured-model"
     ));
+}
+
+#[test]
+fn configured_model_eligibility_does_not_trigger_admission_discovery() {
+    for catalog in [
+        haider_rpc::ProviderCatalogKindWire::Custom,
+        haider_rpc::ProviderCatalogKindWire::Public,
+        haider_rpc::ProviderCatalogKindWire::Authenticated,
+        haider_rpc::ProviderCatalogKindWire::Offline,
+        haider_rpc::ProviderCatalogKindWire::Adapter,
+    ] {
+        for inventory in [
+            haider_rpc::ModelInventoryWire::NeverFetched,
+            haider_rpc::ModelInventoryWire::Configured,
+            haider_rpc::ModelInventoryWire::Fetched {
+                fetched_at_ms: u64::MAX,
+            },
+            haider_rpc::ModelInventoryWire::Stale {
+                fetched_at_ms: 1,
+                reason: "refresh due".into(),
+            },
+        ] {
+            for availability in [
+                haider_rpc::ProviderAvailabilityWire::Available,
+                haider_rpc::ProviderAvailabilityWire::Unavailable,
+            ] {
+                let mut summary = inventory_summary();
+                summary.catalog = catalog;
+                summary.inventory = inventory.clone();
+                summary.availability = availability;
+                summary.configured_models = vec!["deployment".into()];
+                summary.models = vec!["other".into()];
+                assert!(
+                    !provider_inventory_needs_refresh(&summary, "deployment"),
+                    "{summary:?}"
+                );
+                if availability == haider_rpc::ProviderAvailabilityWire::Unavailable
+                    || matches!(inventory, haider_rpc::ModelInventoryWire::Fetched { .. })
+                {
+                    assert!(
+                        !summary.model_is_selectable("deployment"),
+                        "negative proof is still enforced"
+                    );
+                }
+            }
+        }
+    }
 }

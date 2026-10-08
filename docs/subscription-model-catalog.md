@@ -143,7 +143,9 @@ inventory is advisory for every provider kind. That unverified
 inventory remains excluded from automatic failover and promotion. Maintained
 offline and OAuth catalogs retain their permanent rows with healthy credentials.
 
-Staleness schedules background refresh with bounded backoff; it never blocks
+Successful empty listings retain their discovery timestamp when a later refresh fails.
+Configured IDs use the published shared availability decision without awaiting
+admission-time discovery. Staleness schedules background refresh with bounded backoff; it never blocks
 new sessions or turns of existing sessions. The daemon's admission, CLI, TUI
 picker and summaries use `ProviderSummaryWire::selection_availability` and its
 shared reason projection. A fresh empty list does not authorize configured rows.

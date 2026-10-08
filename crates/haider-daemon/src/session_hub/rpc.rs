@@ -1209,10 +1209,31 @@ fn fleet_now_ms() -> u64 {
 }
 
 pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, model: &str) -> bool {
+    // Explicit deployments use the shared availability decision as published.
+    // A rejected selection must not silently fetch its way around that proof;
+    // manual refresh and the stale-catalog actor update discovery separately.
+    let requested_is_configured = summary.configured_models.iter().any(|name| name == model);
+    if requested_is_configured {
+        return false;
+    }
+    let listed = summary.models.iter().any(|known| known == model);
+    let advisory = summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    let selectable_uncertainty = matches!(
+        summary.inventory,
+        haider_rpc::ModelInventoryWire::Stale { .. }
+    ) || matches!(
+        summary.inventory,
+        haider_rpc::ModelInventoryWire::Configured
+    ) && advisory;
+    // The actor already refreshes stale inventory with bounded backoff. An
+    // eligible cached row or advisory passthrough never waits for that work.
+    if selectable_uncertainty && summary.model_is_selectable(model) && (listed || advisory) {
+        return false;
+    }
     summary.inventory.needs_refresh()
-        // User declarations are not discovery evidence for a compatible
-        // endpoint. Azure's unsupported-listing projection is terminal and
-        // already permits an explicitly configured, unverified deployment.
+        // An unavailable legacy configured inventory can still probe on a
+        // miss. Declared deployments were handled above; Azure unsupported
+        // discovery remains terminal.
         || matches!(summary.inventory, haider_rpc::ModelInventoryWire::Configured)
             && summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory
             && !summary.endpoint.as_deref().is_some_and(haider_provider::azure_openai_origin)
@@ -1220,7 +1241,7 @@ pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, mo
             summary.inventory,
             haider_rpc::ModelInventoryWire::Fetched { .. }
                 | haider_rpc::ModelInventoryWire::Stale { .. }
-        ) && !summary.models.iter().any(|known| known == model)
+        ) && !listed
 }
 
 /// Projects one replayed truth into the summary's additive wire fields.

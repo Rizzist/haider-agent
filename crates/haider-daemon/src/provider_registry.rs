@@ -603,15 +603,14 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
                 models,
                 fetched_at_ms,
                 ..
-            } if !models.is_empty() => ProviderInventory::Stale {
+            } => ProviderInventory::Stale {
                 models,
                 fetched_at_ms,
                 reason,
             },
-            ProviderInventory::NeverFetched
-            | ProviderInventory::Unavailable { .. }
-            | ProviderInventory::Fetched { .. }
-            | ProviderInventory::Stale { .. } => ProviderInventory::Unavailable { reason },
+            ProviderInventory::NeverFetched | ProviderInventory::Unavailable { .. } => {
+                ProviderInventory::Unavailable { reason }
+            }
             #[cfg(test)]
             ProviderInventory::Configured { .. } => ProviderInventory::Unavailable { reason },
         };
