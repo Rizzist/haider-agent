@@ -184,14 +184,28 @@ fn workspace_root_cannot_shorten_away_another_account_mask() {
     }
 }
 
+fn assert_registered_home_workspace_labels(workspace: &str, home: &str) {
+    let mut context = PathContext {
+        workspace: Some(workspace.to_owned()),
+        homes: vec![home.into()],
+    };
+    let path = format!("{home}/project/notes.txt");
+    assert_eq!(context.shorten(&path), "~/project/notes.txt", "{workspace}");
+    assert_eq!(
+        tv::header_args("fs_read", &json!({"path": path}), &context),
+        "~/project/notes.txt",
+        "{workspace}"
+    );
+    context.workspace = Some(home.to_owned());
+    assert_eq!(context.shorten(home), ".", "home is the workspace");
+    assert_eq!(context.shorten(&path), "project/notes.txt");
+    context.workspace = Some(format!("{home}/project"));
+    assert_eq!(context.shorten(&path), "notes.txt");
+}
+
 #[test]
 fn registered_home_ancestors_keep_home_labels_and_narrow_workspaces_shorten() {
     for (workspace, home) in [
-        ("/srv/profiles", "/srv/profiles/team/display-fixture-owner"),
-        (
-            "/srv/profiles/team",
-            "/srv/profiles/team/display-fixture-owner",
-        ),
         ("D:/Profiles/team", "D:/Profiles/team/display-fixture-owner"),
         ("d:/profiles/TEAM", "D:/Profiles/team/display-fixture-owner"),
         (
@@ -199,48 +213,41 @@ fn registered_home_ancestors_keep_home_labels_and_narrow_workspaces_shorten() {
             r"\\srv\Profiles\team\display-fixture-owner",
         ),
     ] {
-        let mut context = PathContext {
-            workspace: Some(workspace.to_owned()),
-            homes: vec![home.into()],
-        };
-        let path = format!("{home}/project/notes.txt");
-        assert_eq!(context.shorten(&path), "~/project/notes.txt", "{workspace}");
-        assert_eq!(
-            tv::header_args("fs_read", &json!({"path": path}), &context),
-            "~/project/notes.txt",
-            "{workspace}"
-        );
-        context.workspace = Some(home.to_owned());
-        assert_eq!(context.shorten(home), ".", "home is the workspace");
-        assert_eq!(context.shorten(&path), "project/notes.txt");
-        context.workspace = Some(format!("{home}/project"));
-        assert_eq!(context.shorten(&path), "notes.txt");
+        assert_registered_home_workspace_labels(workspace, home);
     }
-    #[cfg(unix)]
-    {
-        let temp = tempfile::tempdir().expect("registered home fixture");
-        let profiles = temp.path().join("profiles");
-        let home = profiles.join("display-fixture-owner");
-        std::fs::create_dir_all(home.join("project")).expect("home workspace");
-        let alias = temp.path().join("profiles alias");
-        std::os::unix::fs::symlink(&profiles, &alias).expect("profile parent alias");
-        let mut context = PathContext {
-            workspace: Some(alias.display().to_string()),
-            homes: vec![home.clone()],
-        };
-        let path = home.join("project/notes.txt");
-        assert_eq!(
-            context.shorten(&path.to_string_lossy()),
-            "~/project/notes.txt"
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_registered_home_ancestors_and_aliases_keep_home_labels() {
+    for workspace in ["/srv/profiles", "/srv/profiles/team"] {
+        assert_registered_home_workspace_labels(
+            workspace,
+            "/srv/profiles/team/display-fixture-owner",
         );
-        context.workspace = Some(
-            alias
-                .join("display-fixture-owner/project")
-                .display()
-                .to_string(),
-        );
-        assert_eq!(context.shorten(&path.to_string_lossy()), "notes.txt");
     }
+    let temp = tempfile::tempdir().expect("registered home fixture");
+    let profiles = temp.path().join("profiles");
+    let home = profiles.join("display-fixture-owner");
+    std::fs::create_dir_all(home.join("project")).expect("home workspace");
+    let alias = temp.path().join("profiles alias");
+    std::os::unix::fs::symlink(&profiles, &alias).expect("profile parent alias");
+    let mut context = PathContext {
+        workspace: Some(alias.display().to_string()),
+        homes: vec![home.clone()],
+    };
+    let path = home.join("project/notes.txt");
+    assert_eq!(
+        context.shorten(&path.to_string_lossy()),
+        "~/project/notes.txt"
+    );
+    context.workspace = Some(
+        alias
+            .join("display-fixture-owner/project")
+            .display()
+            .to_string(),
+    );
+    assert_eq!(context.shorten(&path.to_string_lossy()), "notes.txt");
 }
 
 #[test]
