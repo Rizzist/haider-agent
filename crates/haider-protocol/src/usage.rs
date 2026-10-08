@@ -17,6 +17,10 @@ pub const USAGE_HISTORY_SLOTS_PER_DAY: usize = 96;
 /// The largest heatmap range accepted by the v1 history RPC.
 pub const USAGE_HISTORY_MAX_RANGE_DAYS: u16 = 366;
 
+/// Session extension kind carrying the terminal provider result of a
+/// deferred reset-credit approval.
+pub const USAGE_RESET_APPLY_RESULT_EXTENSION: &str = "usage_reset_apply_result_v1";
+
 /// Root-vs-delegated accounting lane for one usage-history row.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -321,6 +325,14 @@ pub struct AccountUsageReportV1 {
     pub plan: Option<String>,
     pub auth_method: AuthMethod,
     pub meter: AccountMeterStateV1,
+    /// Provider-published reset-credit inventory. Absent means the provider
+    /// did not publish this capability; it must never be rendered as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<UsageResetCreditsV1>,
+    /// Exact prior reset instants. Provider records win when available;
+    /// otherwise entries are explicitly labelled as this device's journal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_resets: Vec<UsageResetHistoryEntryV1>,
     pub local: LocalUsageStatsV1,
 }
 
@@ -336,10 +348,109 @@ pub enum AccountMeterStateV1 {
         windows: Vec<UsageWindowV1>,
     },
     /// The meter endpoint exists but this reading failed (auth, HTTP, parse).
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+        /// Exact retry instant derived from a provider `Retry-After` header.
+        /// Absent unless the provider supplied one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_at_ms: Option<u64>,
+    },
     /// API-key/custom providers: no server meter exists; local counters are
     /// the only truth.
     LocalOnly,
+}
+
+/// Provenance for a prior reset. Unknown future values remain carryable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UsageResetHistorySourceV1 {
+    Provider,
+    #[default]
+    DeviceJournal,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One exact prior reset instant, never a cadence-derived estimate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageResetHistoryEntryV1 {
+    pub reset_at_ms: u64,
+    pub source: UsageResetHistorySourceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// Provider-published detail for one earned reset credit. The provider's
+/// opaque credit id is deliberately not exposed in usage reports: apply uses
+/// the provider's oldest-applicable selection and an independent idempotency
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageResetCreditV1 {
+    pub reset_type: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeemed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Exact reset-credit counts and details published by a provider. Optional
+/// counters remain absent unless the response carried that named field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageResetCreditsV1 {
+    pub available_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applicable_available_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_earned_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credits: Vec<UsageResetCreditV1>,
+    /// True only where Haider implements a verified provider operation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub apply_supported: bool,
+}
+
+/// Lifecycle state returned by the reset-apply RPC and agent tool. Applying
+/// is intentionally two-phase: the initial request always returns
+/// `approval_pending` immediately, and a later status read observes the
+/// human decision and provider result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UsageResetApplyStatusV1 {
+    ApprovalPending,
+    Applied,
+    Denied,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed, secret-free receipt for a provider reset-credit request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageResetApplyResultV1 {
+    pub approval_id: String,
+    pub account: CredentialAlias,
+    pub status: UsageResetApplyStatusV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_reset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One provider-reported rate-limit window, normalized.

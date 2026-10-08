@@ -660,7 +660,13 @@ pub struct SessionProjection {
     /// fallback row until the call-id join proves whether the inline row owns
     /// the same failure.
     pending_effect_failures: Vec<PendingEffectFailure>,
-    menu: Option<Menu>,
+    /// Unresolved decisions in arrival order. A blocking question owns input
+    /// ahead of a deferred approval, while the newest decision of equal
+    /// priority is shown until it is resolved.
+    menus: Vec<Menu>,
+    /// Answered locally and hidden at once, retained only until the daemon
+    /// acknowledges so permission outcome notes still use the original row.
+    retired_menus: std::collections::HashMap<haider_protocol::ids::MenuId, Menu>,
     /// Menu-id → opening scope (report R11 cut 2). Stream-scoped: hydration
     /// starts it empty, and a menu with no recorded opening falls back to
     /// the pre-W3c3 broadcast.
@@ -865,7 +871,7 @@ impl SessionProjection {
             user_entries,
             screen_control_items,
             has_tool_entries,
-            menu,
+            menus: menu.into_iter().collect(),
             todos,
             usage,
             interrupted,
@@ -1022,6 +1028,10 @@ impl SessionProjection {
         self.menu_owner.get(menu)
     }
 
+    pub fn forget_menu_owner(&mut self, menu: &haider_protocol::ids::MenuId) {
+        self.menu_owner.remove(menu);
+    }
+
     /// The greatest FULLY APPLIED sequence — the only reattach cursor there
     /// is (R9's cursor law: server telemetry like `last_queued_seq` is never
     /// resume authority). `None` before the first envelope.
@@ -1111,15 +1121,22 @@ impl SessionProjection {
                 self.run = Some(run.clone());
             }
             EventPayload::IdleDecayed => self.interrupted = false,
-            EventPayload::MenuOpened(menu) => self.menu = Some(menu.clone()),
+            EventPayload::MenuOpened(menu) => {
+                self.menus.retain(|open| open.id != menu.id);
+                self.retired_menus.remove(&menu.id);
+                self.menus.push(menu.clone());
+            }
             EventPayload::MenuAnswered(answer) => {
-                if self.menu.as_ref().is_some_and(|m| m.id == answer.menu) {
-                    if let Some(menu) = self.menu.as_ref()
-                        && matches!(
-                            menu.kind,
-                            haider_protocol::menu::MenuKind::Permission { .. }
-                        )
-                    {
+                if let Some(menu) = self
+                    .menus
+                    .iter()
+                    .find(|menu| menu.id == answer.menu)
+                    .or_else(|| self.retired_menus.get(&answer.menu))
+                {
+                    if matches!(
+                        menu.kind,
+                        haider_protocol::menu::MenuKind::Permission { .. }
+                    ) {
                         let option = answer
                             .option_key
                             .as_ref()
@@ -1144,13 +1161,15 @@ impl SessionProjection {
                             });
                         }
                     }
-                    self.menu = None;
+                    self.menus.retain(|menu| menu.id != answer.menu);
+                    self.retired_menus.remove(&answer.menu);
+                    self.menu_owner.remove(&answer.menu);
                 }
             }
             EventPayload::MenuClosed { menu, .. } => {
-                if self.menu.as_ref().is_some_and(|open| open.id == *menu) {
-                    self.menu = None;
-                }
+                self.menus.retain(|open| open.id != *menu);
+                self.retired_menus.remove(menu);
+                self.menu_owner.remove(menu);
             }
             EventPayload::UserMessage {
                 text, attachments, ..
@@ -2642,7 +2661,27 @@ impl SessionProjection {
 
     #[must_use]
     pub fn open_menu(&self) -> Option<&Menu> {
-        self.menu.as_ref()
+        self.menus
+            .iter()
+            .rev()
+            .find(|menu| {
+                menu.blocking
+                    && !matches!(
+                        menu.kind,
+                        haider_protocol::menu::MenuKind::DeferredApproval { .. }
+                    )
+            })
+            .or_else(|| self.menus.last())
+    }
+
+    /// Hide an answer immediately without treating it as a daemon receipt.
+    /// Repeated local gestures cannot queue a second answer for this menu.
+    pub fn retire_local_answer(&mut self, id: &haider_protocol::ids::MenuId) {
+        if let Some(index) = self.menus.iter().position(|menu| &menu.id == id) {
+            let menu = self.menus.remove(index);
+            self.retired_menus.insert(id.clone(), menu);
+            self.render_revision = self.render_revision.wrapping_add(1);
+        }
     }
 
     /// The active computer OS-permission grant card, if any.

@@ -2883,6 +2883,20 @@ impl Store {
         )
     }
 
+    pub fn usage_meter_samples_range(
+        &self,
+        through_date: &str,
+        days: u16,
+    ) -> StoreResult<Vec<haider_protocol::usage::UsageHistoryMeterSampleV1>> {
+        let expected_device_id = self.profile_installation_id()?;
+        crate::usage_ledger::read_usage_meter_samples_for_device(
+            &self.root,
+            through_date,
+            days,
+            &expected_device_id,
+        )
+    }
+
     pub fn append_usage_meter_sample(
         &self,
         sample: &haider_protocol::usage::UsageHistoryMeterSampleV1,
@@ -4614,8 +4628,9 @@ impl Store {
         let keep: HashSet<&str> = keep_account_keys.iter().map(String::as_str).collect();
         let legacy: HashSet<&str> = authenticated_providers.iter().map(String::as_str).collect();
         for key in keys {
-            let unread_account =
-                key.starts_with(ACCOUNT_SCOPED_PREFIX) || key.starts_with("account:");
+            let unread_account = key.starts_with(ACCOUNT_SCOPED_PREFIX)
+                || key.starts_with("account-v2:")
+                || key.starts_with("account:");
             if (unread_account && !keep.contains(key.as_str())) || legacy.contains(key.as_str()) {
                 transaction
                     .execute("DELETE FROM provider_models WHERE provider = ?1", [&key])
@@ -4648,6 +4663,18 @@ impl Store {
                     etag,
                     to_sqlite_integer(fetched_at_ms)?
                 ],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    /// Removes one catalog coordinate after a configuration boundary.
+    pub fn delete_provider_models(&self, provider: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "DELETE FROM provider_models WHERE provider = ?1",
+                [provider],
             )
             .map_err(map_sqlite_error)?;
         Ok(())
@@ -11919,10 +11946,10 @@ impl Store {
             &command.request_digest,
             &command.request_json,
         )?;
-        if command.text.is_empty() {
+        if command.text.is_empty() && command.attachments.is_empty() {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
-                "turn text must not be empty",
+                "turn message content must not be empty",
                 false,
             ));
         }

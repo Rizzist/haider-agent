@@ -77,6 +77,8 @@ mod connection;
 #[cfg(test)]
 mod context_core_tests;
 mod cu_presence;
+#[cfg(debug_assertions)]
+mod debug_fake_usage;
 mod delegation;
 #[cfg(all(test, unix))]
 mod delegation_rollup_tests;
@@ -145,6 +147,9 @@ mod typed_agent_executor;
 mod typed_agent_installer;
 mod typed_agent_runtime;
 mod usage_report;
+mod usage_reset;
+#[cfg(all(test, unix))]
+mod usage_reset_policy_tests;
 #[cfg(test)]
 mod wb_web_runtime_tests;
 mod web_search;

@@ -476,6 +476,17 @@ impl PermissionPolicy {
         self.denylist.iter().map(|rule| &rule.class)
     }
 
+    /// Checks explicit and daemon deny rules without recording an effect or
+    /// opening a broker menu. Deferred human approvals use this before they
+    /// journal their own nonblocking menu; ordinary allows still require a
+    /// fresh human answer for a finite usage reset credit.
+    pub fn denial_reason(&self, intent: &EffectIntent) -> Option<String> {
+        match self.decision(intent) {
+            PolicyDecision::Deny { reason } => Some(reason),
+            PolicyDecision::Allow | PolicyDecision::Ask => None,
+        }
+    }
+
     fn remove_class(&mut self, class: &EffectClass) {
         self.allowlist.retain(|listed| listed != class);
         self.asklist.retain(|listed| listed != class);
@@ -500,6 +511,14 @@ impl PermissionPolicy {
             return PolicyDecision::Deny {
                 reason: rule.reason.clone(),
             };
+        }
+        // A reset credit is a finite account resource. Session grants,
+        // class-wide allow rules, and autonomous/auto-allow mode must never
+        // spend one without a fresh human decision. An exact committed
+        // one-shot answer can still authorize the bound intent through
+        // `authorization_decision`.
+        if intent.class == EffectClass::UsageResetApply {
+            return PolicyDecision::Ask;
         }
         if self
             .always_allow
@@ -549,6 +568,7 @@ fn denied_effect_error(
                 EffectClass::MobileControl => "mobile_control",
                 EffectClass::ReadSms => "read_sms",
                 EffectClass::PeerMessage => "peer_send",
+                EffectClass::UsageResetApply => "usage_reset_apply",
             }
             .to_owned(),
             reason,

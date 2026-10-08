@@ -1308,6 +1308,8 @@ fn seed_cli_account(command: &mut HaiderCommand, alias: &str) -> Vec<u8> {
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("TMPDIR", runtime_dir);
     let descriptors = vec![haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new(alias),
         provider: "anthropic".into(),
         base_url: Some("https://SECRET-ENDPOINT.invalid/TOKEN-SENTINEL".into()),

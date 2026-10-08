@@ -101,6 +101,20 @@ pub enum MenuKind {
         run_id: RunId,
         state_digest: String,
     },
+    /// A sensitive action is parked without blocking the owning run. The
+    /// committed menu answer is the human authorization fact; the subsystem
+    /// named by `effect` performs the action after approval and publishes a
+    /// typed result into the same session journal.
+    DeferredApproval {
+        approval_id: String,
+        effect: crate::effect::EffectClass,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<CredentialAlias>,
+        /// Present for spending cards opened after account binding was added.
+        /// Legacy pending cards without it fail closed on answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<crate::credential::UsageResetAccountBinding>,
+    },
 }
 
 /// Visual/behavioral class for [`MenuKind::ErrorRecovery`]. New classes are

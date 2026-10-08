@@ -1647,6 +1647,8 @@ pub fn transcript() -> Vec<WireFrame> {
                                     },
                                 ],
                             },
+                            reset_credits: None,
+                            previous_resets: Vec::new(),
                             local: LocalUsageStatsV1 {
                                 sessions: 2,
                                 total_duration_ms: 3_600_000,
@@ -1670,7 +1672,10 @@ pub fn transcript() -> Vec<WireFrame> {
                             auth_method: AuthMethod::OAuth,
                             meter: AccountMeterStateV1::Unavailable {
                                 reason: "http_status_429".into(),
+                                retry_at_ms: None,
                             },
+                            reset_credits: None,
+                            previous_resets: Vec::new(),
                             local: LocalUsageStatsV1::default(),
                         },
                         AccountUsageReportV1 {
@@ -1680,6 +1685,8 @@ pub fn transcript() -> Vec<WireFrame> {
                             plan: None,
                             auth_method: AuthMethod::ApiKey,
                             meter: AccountMeterStateV1::LocalOnly,
+                            reset_credits: None,
+                            previous_resets: Vec::new(),
                             local: LocalUsageStatsV1 {
                                 sessions: 1,
                                 total_duration_ms: 600_000,
@@ -2718,6 +2725,8 @@ fn append_workspace_allocation_tail(frames: &mut Vec<WireFrame>) {
 /// identity in `identity`, never secret material.
 pub fn golden_descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("anthropic-0123456789abcdef01234567"),
         provider: "anthropic".into(),
         base_url: None,
@@ -2751,6 +2760,8 @@ pub fn golden_account_source() -> AccountSourceWire {
 
 pub fn golden_oauth_descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("fake-oauth-0123456789abcdef01234567"),
         provider: "fake-oauth".into(),
         base_url: None,

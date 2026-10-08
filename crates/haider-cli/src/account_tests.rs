@@ -44,6 +44,8 @@ impl AccountClient for FakeAccountClient {
 
 fn descriptor(alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: "anthropic".into(),
         base_url: None,
@@ -90,6 +92,7 @@ fn codex_candidate() -> haider_rpc::DeviceCredentialCandidateWire {
         source_label: "Codex".into(),
         account_label: Some("owner@example.invalid".into()),
         identity: Some(haider_protocol::credential::AccountIdentity {
+            subject_hash: None,
             email: Some("owner@example.invalid".into()),
             display_name: None,
             account_id: Some("acct-964".into()),

@@ -8,6 +8,10 @@
 //!   `Sources/.../CodexOAuth/CodexOAuthUsageFetcher.swift` (field-for-field
 //!   `CodingKeys`) and the sample payload in luisleineweber/usagebar
 //!   `docs/providers/codex.md`.
+//! - `usage/openai_wham_usage_live_redacted.json` — captured through Haider's
+//!   authenticated meter flow on 2026-09-24. Every string value (including
+//!   identities) was replaced before the fixture was written; numeric/null
+//!   response structure is exact.
 //! - `usage/anthropic_oauth_usage_live.json` — captured LIVE from
 //!   `GET https://api.anthropic.com/api/oauth/usage` with a real Claude Max
 //!   account on 2026-08-05 (HTTP 200; token redacted at capture time; the
@@ -37,8 +41,8 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 /// LAW (openai_wham_fixture_yields_primary_secondary_and_named_extra_windows):
-/// the codex meter parse maps `rate_limit.primary_window`/`secondary_window`
-/// to human `5h`/`weekly` windows (percent → 0–1 fraction, `reset_at`
+/// the codex meter parse maps exact window duration fields to human `5h`/`weekly`
+/// windows (percent → 0–1 fraction, `reset_at`
 /// seconds → ms), surfaces each `additional_rate_limits[]` entry under its
 /// `limit_name` label, and reports the subscription `plan_type` — while
 /// tolerating unknown siblings such as `code_review_rate_limit`.
@@ -74,10 +78,11 @@ fn openai_wham_fixture_yields_primary_secondary_and_named_extra_windows() {
 
 /// LAW: OpenAI plans may publish either subscription window independently.
 /// Relative resets are anchored to the fetch instant, and an absent/null
-/// primary window never suppresses a valid weekly window.
+/// primary window never suppresses a valid secondary window. A relative
+/// reset is exact even when the duration is unknown.
 ///
 /// MUTATION CHECK: require `primary_window` before examining secondary; the
-/// secondary-only case changes from one weekly window to an error.
+/// secondary-only case changes from one window to an error.
 #[test]
 fn openai_optional_window_matrix_keeps_every_window_that_exists() {
     const FETCHED_AT_MS: u64 = 1_800_000_000_000;
@@ -89,7 +94,7 @@ fn openai_optional_window_matrix_keeps_every_window_that_exists() {
         )
         .expect("secondary-only fixture parses");
     assert_eq!(secondary.windows.len(), 1);
-    assert_eq!(secondary.windows[0].window, "weekly");
+    assert_eq!(secondary.windows[0].window, "secondary");
     assert!((secondary.windows[0].utilization - 0.08).abs() < 1e-9);
     assert_eq!(
         secondary.windows[0].resets_at_ms,
@@ -121,6 +126,111 @@ fn openai_optional_window_matrix_keeps_every_window_that_exists() {
     assert_eq!(
         UsageMeterEndpoint::OpenAiOauth.parse(200, &fixture("openai_wham_malformed.json")),
         Err(MeterUnavailable::new("malformed_response"))
+    );
+}
+
+#[test]
+fn openai_live_redacted_shape_keeps_exact_weekly_window_and_reset_counts() {
+    let reading = UsageMeterEndpoint::OpenAiOauth
+        .parse(200, &fixture("openai_wham_usage_live_redacted.json"))
+        .expect("current live WHAM shape parses");
+    assert_eq!(reading.windows.len(), 1, "no absent 5h window is invented");
+    assert_eq!(reading.windows[0].window, "weekly");
+    assert!((reading.windows[0].utilization - 0.41).abs() < 1e-9);
+    assert_eq!(reading.windows[0].resets_at_ms, Some(1_790_662_309_000));
+    let credits = reading.reset_credits.expect("provider reset summary");
+    assert_eq!(credits.available_count, 1);
+    assert_eq!(credits.applicable_available_count, Some(0));
+    assert!(credits.apply_supported);
+}
+
+#[test]
+fn openai_missing_duration_keeps_provider_window_name() {
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&fixture("openai_wham_usage_live_redacted.json"))
+            .expect("fixture JSON");
+    let primary = &mut body["rate_limit"]["primary_window"];
+    primary
+        .as_object_mut()
+        .expect("primary window")
+        .remove("limit_window_seconds");
+    primary
+        .as_object_mut()
+        .expect("primary window")
+        .remove("window_duration_mins");
+    let reading = UsageMeterEndpoint::OpenAiOauth
+        .parse(200, &serde_json::to_vec(&body).expect("JSON"))
+        .expect("duration-unknown meter parses");
+    assert_eq!(reading.windows.len(), 1);
+    assert_eq!(reading.windows[0].window, "primary");
+    assert_eq!(reading.windows[0].resets_at_ms, Some(1_790_662_309_000));
+}
+
+#[test]
+fn openai_reset_credit_details_publish_only_provider_fields() {
+    let body = br#"{
+        "available_count": 2,
+        "applicable_available_count": 1,
+        "total_earned_count": 4,
+        "used_count": 2,
+        "remaining_count": 2,
+        "credits": [{
+            "reset_type": "weekly",
+            "status": "redeemed",
+            "granted_at": "2026-09-01T00:00:00Z",
+            "expires_at": null,
+            "redeem_started_at": null,
+            "redeemed_at": null,
+            "title": "Reset",
+            "description": "One reset"
+        }]
+    }"#;
+    let (credits, history) = haider_provider::parse_openai_reset_credits(body)
+        .expect("official reset-credit detail shape parses");
+    assert_eq!(credits.available_count, 2);
+    assert_eq!(credits.total_earned_count, Some(4));
+    assert_eq!(credits.used_count, Some(2));
+    assert_eq!(credits.remaining_count, Some(2));
+    assert_eq!(credits.credits.len(), 1);
+    assert!(
+        history.is_empty(),
+        "the confirmed contract has no reset history"
+    );
+}
+
+#[test]
+fn openai_reset_credit_details_require_the_available_count_and_keep_absent_counters_absent() {
+    let missing = haider_provider::parse_openai_reset_credits(br#"{"credits":[]}"#)
+        .expect_err("available_count is required");
+    assert_eq!(missing.reason, "malformed_response");
+
+    let (credits, history) = haider_provider::parse_openai_reset_credits(
+        br#"{
+            "available_count": 1,
+            "credits": [{
+                "reset_type": "weekly",
+                "status": "redeemed",
+                "redeemed_at": "2026-09-02T00:00:00Z"
+            }]
+        }"#,
+    )
+    .expect("minimal detail shape parses");
+    assert_eq!(credits.available_count, 1);
+    assert_eq!(credits.applicable_available_count, None);
+    assert_eq!(credits.total_earned_count, None);
+    assert_eq!(credits.used_count, None);
+    assert_eq!(credits.remaining_count, None);
+    assert!(credits.apply_supported);
+    assert_eq!(
+        credits.credits[0].redeemed_at_ms,
+        Some(1_788_307_200_000),
+        "RFC 3339 redemption instant is copied exactly"
+    );
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].reset_at_ms, 1_788_307_200_000);
+    assert_eq!(
+        history[0].source,
+        haider_protocol::usage::UsageResetHistorySourceV1::Provider
     );
 }
 

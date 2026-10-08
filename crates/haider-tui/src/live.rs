@@ -3177,7 +3177,6 @@ impl LiveDriver {
 
     /// Reduce one inbound fact, mutating the model, and return the RPCs the
     /// shell must now issue.
-    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
         let reply = match reply {
             LiveReply::ListedAt {
@@ -3232,6 +3231,16 @@ impl LiveDriver {
             | LiveReply::ModelsRefreshFailedAt { .. } => return Vec::new(),
             other => other,
         };
+        let commands = self.apply_inner(model, reply);
+        // A daemon reply may replace an overlay without a keyboard event.
+        // Retire old Apply navigation immediately when the card loses paint.
+        model.retire_hidden_spend_card_navigation();
+        commands
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_inner(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
+
         match reply {
             LiveReply::ListedAt { .. } | LiveReply::ListFailedAt { .. } => {
                 unreachable!("normalized above")
@@ -6207,23 +6216,31 @@ impl LiveDriver {
                 // live input surface: the session is active and a session
                 // surface is on screen. Anything else ignores the op — the
                 // absence of a republish tells the injector it did not land.
-                // rev933c/d finding 4: an injected op lands only when the
-                // PLAIN session composer is the live Enter target — the
-                // single predicate that mirrors key-dispatch precedence
-                // (no login/talk-setup/engaged-talk card, no menu, no help,
-                // not the child-messaging subagent view). A synthesized
-                // Submit can therefore never activate a card row.
+                // Edits may target the composer while a deferred card is
+                // showing. Submit requires the composer to own Enter.
                 if model.active_session.as_ref() == Some(&session) && model.accepts_injected_input()
                 {
                     match op {
                         haider_rpc::SurfaceInjectOp::Set { text } => {
+                            model.retire_spend_card_navigation();
                             model.composer.set_text(text);
                         }
                         haider_rpc::SurfaceInjectOp::Insert { text } => {
+                            model.retire_spend_card_navigation();
                             model.composer.insert_str(&text);
                         }
-                        haider_rpc::SurfaceInjectOp::Clear => model.composer.clear(),
+                        haider_rpc::SurfaceInjectOp::Clear => {
+                            model.retire_spend_card_navigation();
+                            model.composer.clear();
+                        }
                         haider_rpc::SurfaceInjectOp::Submit => {
+                            if model.visible_spend_card().is_some()
+                                || model.theme_picker.is_some()
+                                || model.effort_picker.is_some()
+                                || model.model_picker.is_some()
+                            {
+                                return Vec::new();
+                            }
                             // Exactly the Enter path — mid-turn queue modes,
                             // command dispatch, and drafts all keep their
                             // ordinary meaning.

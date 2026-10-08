@@ -1,4 +1,4 @@
-//! Interest-gated Haider Code account-plan polling.
+//! Haider Code account-plan polling.
 //!
 //! The endpoint is provider authority: cadence and allowance state are
 //! published, never inferred. The loop resolves the active account afresh on
@@ -99,6 +99,19 @@ impl ProductionHaiderCodePlanHttp {
 #[async_trait::async_trait]
 impl HaiderCodePlanHttp for ProductionHaiderCodePlanHttp {
     async fn get_account(&self, credential: &SecretHandle) -> PlanFetchOutcome {
+        #[cfg(debug_assertions)]
+        let url = match crate::debug_fake_usage::route(
+            HAIDER_CODE_ACCOUNT_URL,
+            credential.expose_secret(),
+        ) {
+            crate::debug_fake_usage::Route::Live(url) => std::borrow::Cow::Borrowed(url),
+            crate::debug_fake_usage::Route::Fake(url) => std::borrow::Cow::Owned(url),
+            crate::debug_fake_usage::Route::Refused(_) => {
+                return PlanFetchOutcome::Transient(PlanTransientFailure::CredentialUnavailable);
+            }
+        };
+        #[cfg(not(debug_assertions))]
+        let url = std::borrow::Cow::Borrowed(HAIDER_CODE_ACCOUNT_URL);
         let Some(client) = self.transport.client() else {
             return PlanFetchOutcome::Transient(PlanTransientFailure::Network);
         };
@@ -116,7 +129,7 @@ impl HaiderCodePlanHttp for ProductionHaiderCodePlanHttp {
         header.set_sensitive(true);
 
         let response = match client
-            .get(HAIDER_CODE_ACCOUNT_URL)
+            .get(url.as_ref())
             .timeout(PLAN_REQUEST_TIMEOUT)
             .header(AUTHORIZATION, header)
             .send()
@@ -431,19 +444,6 @@ pub(crate) async fn run_plan_poller(
         }
 
         let recipients = interest_source.recipients().await;
-        if recipients.is_empty() {
-            if !wait_until_due_or_changed(
-                None,
-                &mut stop,
-                &mut account_changes,
-                &mut interest_changes,
-            )
-            .await
-            {
-                break;
-            }
-            continue;
-        }
         let Some(account) = account_source.active_account() else {
             if let Some(descriptor) = observed_account.as_ref() {
                 interest_source.clear(&descriptor.alias).await;
@@ -575,9 +575,8 @@ pub(crate) async fn run_plan_poller(
             }
         }
 
-        let wait_deadline = (!recipients.is_empty()).then_some(deadline).flatten();
         if !wait_until_due_or_changed(
-            wait_deadline,
+            deadline,
             &mut stop,
             &mut account_changes,
             &mut interest_changes,

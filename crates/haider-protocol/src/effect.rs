@@ -66,6 +66,10 @@ pub enum EffectClass {
     MobileControl,
     /// Read SMS data from an explicitly activated mobile capability.
     ReadSms,
+    /// Spend one provider-issued rate-limit reset credit. This effect is
+    /// deliberately distinct from ordinary network access: it consumes a
+    /// limited account resource and can never be auto-approved.
+    UsageResetApply,
 }
 
 /// Journaled BEFORE dispatch — the durable pre-image of every side effect.

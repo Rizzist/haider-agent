@@ -2405,6 +2405,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_TURN_RETRACT_V1.to_owned(),
         FEATURE_RESIDENT_TURN_SUBMIT_V1.to_owned(),
         haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
+        haider_rpc::FEATURE_USAGE_RESET_APPLY_V1.to_owned(),
         haider_rpc::FEATURE_USAGE_HISTORY_V1.to_owned(),
         haider_rpc::FEATURE_QUEUE_CONTROL_V1.to_owned(),
         haider_rpc::FEATURE_PEER_MESSAGING_V1.to_owned(),

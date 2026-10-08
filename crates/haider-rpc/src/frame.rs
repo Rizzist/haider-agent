@@ -483,6 +483,9 @@ pub const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
 /// per-account OAuth meters (normalized 0–1 utilization) plus journal-derived
 /// local counters. Never carries secret material.
 pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
+/// Daemon supports the human-only, nonblocking deferred approval flow for a
+/// provider-issued usage reset credit.
+pub const FEATURE_USAGE_RESET_APPLY_V1: &str = "usage_reset_apply_v1";
 /// Daemon serves device-local append-only usage history by UTC day and a
 /// bounded, absence-preserving daily-total range.
 pub const FEATURE_USAGE_HISTORY_V1: &str = "usage_history_v1";
@@ -4488,6 +4491,14 @@ pub enum RequestBody {
     /// and parameterless in v1.
     #[serde(rename = "usage.report")]
     UsageReport,
+    /// Parks a sensitive reset-credit operation for an explicit human
+    /// decision. The response is immediate and never applies the reset.
+    #[serde(rename = "usage.reset_apply")]
+    UsageResetApply {
+        command_id: CommandId,
+        session_id: SessionId,
+        account: haider_protocol::ids::CredentialAlias,
+    },
     /// Reads one device-local UTC day. `YYYY-MM-DD` validation is performed
     /// by the store; a missing day is a successful `day: null` response.
     #[serde(rename = "usage.history_day")]
@@ -4840,6 +4851,7 @@ impl RequestBody {
                 Some(FEATURE_AGENT_CLI_V1)
             }
             Self::ProviderModelsProbe { .. } => Some(FEATURE_PROVIDER_MODELS_PROBE_V1),
+            Self::UsageResetApply { .. } => Some(FEATURE_USAGE_RESET_APPLY_V1),
             Self::PeerInject { .. } | Self::PeerNotifyWhenIdle { .. } => {
                 Some(FEATURE_PEER_AGENT_INJECTION_V1)
             }
@@ -5613,6 +5625,13 @@ pub enum ResponseBody {
         /// `generated_at_ms: 0` report as subsystem absence when omitted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         availability: Option<SnapshotAvailabilityWire>,
+    },
+    #[serde(rename = "usage.reset_apply")]
+    UsageResetApply {
+        result: haider_protocol::usage::UsageResetApplyResultV1,
+        menu_id: haider_protocol::ids::MenuId,
+        request_seq: u64,
+        worker_generation: u64,
     },
     #[serde(rename = "usage.history_day")]
     UsageHistoryDay {

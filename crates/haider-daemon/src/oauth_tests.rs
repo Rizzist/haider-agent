@@ -1733,6 +1733,8 @@ async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
         "fallback remains approximately 15 minutes"
     );
     let imported_descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("openai-oauth"),
         provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -1774,6 +1776,8 @@ async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
 
     let pkce_alias = CredentialAlias::new("openai-oauth-2");
     let pkce_descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: pkce_alias.clone(),
         provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -1854,7 +1858,11 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
     );
     assert_eq!(
         bundle.identity.subject_hash,
-        blake3::hash(b"fake-account-id-1").to_hex().to_string()
+        blake3::hash(
+            format!("grant:{}", blake3::hash(b"fake-refresh-token-1").to_hex()).as_bytes()
+        )
+        .to_hex()
+        .to_string()
     );
     let account_identity = bundle
         .account_identity
@@ -3769,6 +3777,8 @@ impl Vault for ResolveCountingVault {
 
 fn oauth_descriptor_for_test() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("work-oauth"),
         provider: "fake-oauth".into(),
         base_url: None,
@@ -6054,6 +6064,8 @@ async fn auth_aware_broker_keeps_api_keys_raw_and_never_treats_bundle_as_bearer(
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let vault = Arc::new(MemoryVault::new());
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("fake-api"),
         provider: "fake-oauth".into(),
         base_url: None,
@@ -6230,6 +6242,8 @@ async fn late_refresh_failure_after_remove_readd_cannot_expire_the_replacement()
 
     broker.invalidate(&descriptor.alias);
     let replacement = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: descriptor.alias.clone(),
         provider: "replacement-provider".into(),
         base_url: Some("https://replacement.invalid".into()),
@@ -6355,4 +6369,70 @@ fn registered_redirects_match_provider_clients_and_others_stay_hardened() {
 #[test]
 fn default_flow_ttl_is_at_least_ten_minutes() {
     assert!(OAuthCoordinatorConfig::default().flow_ttl >= Duration::from_secs(600));
+}
+
+#[test]
+fn vault_publication_cannot_pair_a_new_principal_with_an_old_account_record() {
+    let catalog = OAuthProviderCatalog::default();
+    let registration = catalog
+        .registration(haider_provider::OPENAI_OAUTH_PROVIDER_NAME)
+        .expect("synthetic OpenAI registration");
+    let bundle = |subject: &str, workspace: &str, access: &str| {
+        OAuthTokenBundleV1::new(
+            registration.provider_id.clone(),
+            registration.issuer.clone(),
+            registration.audience.clone(),
+            registration.resource.clone(),
+            "Bearer".into(),
+            Zeroizing::new(access.as_bytes().to_vec()),
+            Some(Zeroizing::new(b"synthetic-refresh".to_vec())),
+            4_102_444_800_000,
+            None,
+            registration.scopes.clone(),
+            OAuthIdentityV1 {
+                subject_hash: subject.into(),
+                display_identity: "shared-display".into(),
+            },
+            1,
+        )
+        .expect("synthetic bundle")
+        .with_account_identity(AccountIdentity {
+            subject_hash: None,
+            email: None,
+            display_name: None,
+            account_id: Some(workspace.into()),
+            plan: None,
+            issuer: Some(registration.issuer.clone()),
+            captured_at: 1,
+            verified: false,
+        })
+    };
+    let original = bundle("member-a", "workspace-a", "old-access");
+    let restored = OAuthTokenBundleV1::decode(&original.encode().expect("encode saved bundle"))
+        .expect("decode saved bundle");
+    assert_eq!(
+        restored
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.subject_hash.as_deref()),
+        Some("member-a")
+    );
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = registration.provider_id.clone();
+    descriptor.identity = original.identity.display_identity.clone();
+    descriptor.account_identity = original.account_identity.clone();
+    descriptor.incarnation = 41;
+    assert!(validate_bundle_against(&registration, &descriptor, &original).is_ok());
+    for (subject, workspace) in [("member-a", "workspace-b"), ("member-b", "workspace-a")] {
+        let switched = bundle(subject, workspace, "new-access");
+        assert!(
+            validate_bundle_against(&registration, &descriptor, &switched).is_err(),
+            "a saved sign-in for {workspace} must not satisfy the old descriptor"
+        );
+    }
+    let refreshed = bundle("member-a", "workspace-a", "rotated-access");
+    assert!(
+        validate_bundle_against(&registration, &descriptor, &refreshed).is_ok(),
+        "a token refresh for the same principal retains its binding"
+    );
 }

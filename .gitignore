@@ -1,4 +1,5 @@
 /target
+/.priv-target/
 **/*.rs.bk
 .DS_Store
 /dist

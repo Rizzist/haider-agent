@@ -1,7 +1,7 @@
 //! Cross-provider `usage.report` assembly (U1).
 //!
 //! One service, two truths, honestly separated:
-//! - **OAuth meters** — the three researched endpoints
+//! - **OAuth meters** — the researched provider endpoints
 //!   ([`haider_provider::UsageMeterEndpoint`]) fetched with broker-resolved
 //!   access tokens through an injected [`UsageMeterHttp`], cached per
 //!   account, and never polled more often than each endpoint's floor
@@ -10,7 +10,7 @@
 //!   failures cannot turn into hammering, and never replaced by stale
 //!   "good" numbers.
 //! - **Haider Code plan meter** — no independent probe exists. The
-//!   active-session `/v1/account` plan-status push deposits the held snapshot
+//!   active-account `/v1/account` plan-status poll deposits the held snapshot
 //!   here and appends its exact-integer weekly allowance opportunistically.
 //!   With no held status, the API-key account remains honest `local_only`.
 //! - **Local accounting** — a journal fold per session: cumulative
@@ -38,6 +38,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentMetricsSnapshot, AgentUsageBreakdown, AgentUsageMetrics};
 use haider_protocol::credential::{
     AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
+    UsageResetAccountBinding,
 };
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
@@ -54,7 +55,8 @@ use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, CacheUsageBreakdownV1, CacheUsageRequestScopeV1,
     CacheUsageRequestV1, CacheUsageStatsV1, HaiderCodePlanSnapshotV1, LocalUsageStatsV1,
-    UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1, UsageReportV1, UsageWindowV1,
+    USAGE_HISTORY_MAX_RANGE_DAYS, UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1, UsageReportV1,
+    UsageResetCreditsV1, UsageResetHistoryEntryV1, UsageResetHistorySourceV1, UsageWindowV1,
 };
 use haider_provider::{MeterReading, MeterUnavailable, UsageMeterEndpoint};
 use serde::Deserialize;
@@ -119,8 +121,9 @@ fn credential_meter_unavailable_reason(status: &CredentialStatus) -> Option<&'st
     }
 }
 
-/// Injected HTTP seam for meter fetches: one authenticated GET, no retries
-/// (the cache floor owns pacing). Every failure is a typed reason.
+/// Injected HTTP seam for meter fetches (one authenticated GET, no retries;
+/// the cache floor owns pacing) and the single reset-credit POST. Every
+/// failure is a typed reason.
 #[async_trait::async_trait]
 pub(crate) trait UsageMeterHttp: Send + Sync {
     async fn get(
@@ -129,7 +132,26 @@ pub(crate) trait UsageMeterHttp: Send + Sync {
         bearer: &SecretHandle,
         extra_headers: &[(&'static str, &'static str)],
         chatgpt_account_id: Option<&str>,
-    ) -> Result<(u16, Vec<u8>), MeterUnavailable>;
+    ) -> Result<UsageMeterHttpResponse, MeterUnavailable>;
+
+    async fn post_json(
+        &self,
+        url: &str,
+        bearer: &SecretHandle,
+        extra_headers: &[(&'static str, &'static str)],
+        chatgpt_account_id: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+        let _ = (url, bearer, extra_headers, chatgpt_account_id, body);
+        Err(MeterUnavailable::new("transport_unavailable"))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageMeterHttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub retry_after: Option<String>,
 }
 
 /// Production transport: pinned-policy reqwest client (no proxy, no
@@ -155,42 +177,149 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         bearer: &SecretHandle,
         extra_headers: &[(&'static str, &'static str)],
         chatgpt_account_id: Option<&str>,
-    ) -> Result<(u16, Vec<u8>), MeterUnavailable> {
+    ) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+        let url = routed_url(url, bearer)?;
         let Some(client) = self.transport.client() else {
             return Err(MeterUnavailable::new("transport_unavailable"));
         };
-        let token = std::str::from_utf8(bearer.expose_secret())
-            .map_err(|_| MeterUnavailable::new("credential_not_utf8"))?;
-        let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| MeterUnavailable::new("credential_not_header_safe"))?;
-        authorization.set_sensitive(true);
-        let mut request = client
-            .get(url)
-            .timeout(Duration::from_secs(15))
-            .header(reqwest::header::AUTHORIZATION, authorization);
-        for (name, value) in extra_headers {
-            request = request.header(*name, *value);
-        }
-        if let Some(account_id) = chatgpt_account_id {
-            let mut account_id = reqwest::header::HeaderValue::from_str(account_id)
-                .map_err(|_| MeterUnavailable::new("credential_account_id_not_header_safe"))?;
-            account_id.set_sensitive(true);
-            request = request.header(haider_provider::OPENAI_OAUTH_ACCOUNT_ID_HEADER, account_id);
-        }
-        let response = request.send().await.map_err(|error| {
-            if error.is_timeout() {
-                MeterUnavailable::new("transport_timeout")
-            } else {
-                MeterUnavailable::new("transport_error")
-            }
-        })?;
-        let status = response.status().as_u16();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|_| MeterUnavailable::new("transport_error"))?;
-        Ok((status, body.to_vec()))
+        send_authorized(
+            client.get(url.as_ref()),
+            bearer,
+            extra_headers,
+            chatgpt_account_id,
+        )
+        .await
     }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        bearer: &SecretHandle,
+        extra_headers: &[(&'static str, &'static str)],
+        chatgpt_account_id: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+        let url = routed_url(url, bearer)?;
+        let Some(client) = self.transport.client() else {
+            return Err(MeterUnavailable::new("transport_unavailable"));
+        };
+        send_authorized(
+            client.post(url.as_ref()).json(body),
+            bearer,
+            extra_headers,
+            chatgpt_account_id,
+        )
+        .await
+    }
+}
+
+/// The live URL, or under the debug-only fake usage hook the fake-server URL
+/// (a real credential is refused there and sent nowhere).
+fn routed_url<'a>(
+    url: &'a str,
+    bearer: &SecretHandle,
+) -> Result<std::borrow::Cow<'a, str>, MeterUnavailable> {
+    #[cfg(debug_assertions)]
+    {
+        match crate::debug_fake_usage::route(url, bearer.expose_secret()) {
+            crate::debug_fake_usage::Route::Live(url) => Ok(std::borrow::Cow::Borrowed(url)),
+            crate::debug_fake_usage::Route::Fake(url) => Ok(std::borrow::Cow::Owned(url)),
+            crate::debug_fake_usage::Route::Refused(reason) => Err(MeterUnavailable::new(reason)),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = bearer;
+        Ok(std::borrow::Cow::Borrowed(url))
+    }
+}
+
+/// Adds the bearer, fixed provider headers and the optional ChatGPT account
+/// coordinate (both credentials marked sensitive), sends once, and reads the
+/// whole body.
+async fn send_authorized(
+    request: reqwest::RequestBuilder,
+    bearer: &SecretHandle,
+    extra_headers: &[(&'static str, &'static str)],
+    chatgpt_account_id: Option<&str>,
+) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+    let token = std::str::from_utf8(bearer.expose_secret())
+        .map_err(|_| MeterUnavailable::new("credential_not_utf8"))?;
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| MeterUnavailable::new("credential_not_header_safe"))?;
+    authorization.set_sensitive(true);
+    // The workspace reqwest build has no response-decompression features, so
+    // a compressed body would be unparseable (the original WHAM
+    // `malformed_response`). Ask for an uncompressed representation.
+    let mut request = request
+        .timeout(Duration::from_secs(15))
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .header(reqwest::header::AUTHORIZATION, authorization);
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    if let Some(account_id) = chatgpt_account_id {
+        let mut account_id = reqwest::header::HeaderValue::from_str(account_id)
+            .map_err(|_| MeterUnavailable::new("credential_account_id_not_header_safe"))?;
+        account_id.set_sensitive(true);
+        request = request.header(haider_provider::OPENAI_OAUTH_ACCOUNT_ID_HEADER, account_id);
+    }
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            MeterUnavailable::new("transport_timeout")
+        } else {
+            MeterUnavailable::new("transport_error")
+        }
+    })?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| MeterUnavailable::new("transport_error"))?;
+    Ok(UsageMeterHttpResponse {
+        status,
+        body: body.to_vec(),
+        retry_after,
+    })
+}
+
+/// Maps the HTTP statuses that need a specific, actionable reason: 401 asks
+/// for a re-login, 403 names the refusal, and 429 carries the exact
+/// `Retry-After` instant when the provider supplied one. Other statuses are
+/// left to the caller's own classification.
+fn http_failure(
+    response: &UsageMeterHttpResponse,
+    received_at_ms: u64,
+) -> Option<MeterUnavailable> {
+    match response.status {
+        401 => Some(MeterUnavailable::new("credential_expired")),
+        403 => Some(MeterUnavailable::new("http_403_forbidden_relogin")),
+        429 => Some(
+            MeterUnavailable::new("http_429_rate_limited").with_retry_at_ms(
+                haider_provider::parse_retry_after_at_ms(
+                    response.retry_after.as_deref(),
+                    received_at_ms,
+                ),
+            ),
+        ),
+        _ => None,
+    }
+}
+
+fn classify_meter_response(
+    endpoint: UsageMeterEndpoint,
+    response: UsageMeterHttpResponse,
+    fetched_at_ms: u64,
+) -> Result<MeterReading, MeterUnavailable> {
+    if let Some(failure) = http_failure(&response, fetched_at_ms) {
+        return Err(failure);
+    }
+    endpoint.parse_at(response.status, &response.body, fetched_at_ms)
 }
 
 /// Stable meter reason for a supervised-agent provider whose protocol exposes
@@ -230,6 +359,7 @@ pub(crate) fn agent_owned_meter_state(status: &CredentialStatus) -> AccountMeter
     if let Some(reason) = credential_meter_unavailable_reason(status) {
         return AccountMeterStateV1::Unavailable {
             reason: reason.to_owned(),
+            retry_at_ms: None,
         };
     }
     match status {
@@ -248,6 +378,7 @@ pub(crate) fn agent_owned_meter_state(status: &CredentialStatus) -> AccountMeter
         | CredentialStatus::Revoked
         | CredentialStatus::NeedsAttention { .. } => AccountMeterStateV1::Unavailable {
             reason: ACP_AGENT_NO_QUOTA_REASON.to_owned(),
+            retry_at_ms: None,
         },
     }
 }
@@ -449,11 +580,178 @@ impl UsageReportService {
         self.haider_code_plans.lock().await.remove(account_alias);
     }
 
+    /// Applies one provider-issued reset credit. The caller must already hold
+    /// a committed menu approval; this service deliberately has no policy
+    /// bypass or auto-approval path of its own.
+    pub(crate) async fn apply_bound_reset(
+        &self,
+        account_alias: &CredentialAlias,
+        approval_id: &str,
+        binding: &UsageResetAccountBinding,
+    ) -> Result<u64, MeterUnavailable> {
+        let descriptor = self
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| &descriptor.alias == account_alias)
+            .ok_or_else(|| MeterUnavailable::new(crate::usage_reset::ACCOUNT_CHANGED_REASON))?;
+        if self.binding_for_descriptor(&descriptor).as_ref() != Some(binding) {
+            return Err(MeterUnavailable::new(
+                crate::usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        }
+        if !supports_reset_apply(&descriptor) {
+            return Err(MeterUnavailable::new("provider_reset_not_supported"));
+        }
+        let Some(tokens) = &self.tokens else {
+            return Err(MeterUnavailable::new("credential_broker_unavailable"));
+        };
+        // Select the descriptor again before resolving the bearer. An import
+        // may replace its vault entry before publishing the new descriptor;
+        // resolving from the freshest descriptor narrows that handoff.
+        let current = self
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| &descriptor.alias == account_alias)
+            .ok_or_else(|| MeterUnavailable::new(crate::usage_reset::ACCOUNT_CHANGED_REASON))?;
+        if self.binding_for_descriptor(&current).as_ref() != Some(binding) {
+            return Err(MeterUnavailable::new(
+                crate::usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        }
+        let token = tokens.bearer(&current).await?;
+        // Token resolution can await refresh. Re-read after that await too:
+        // the same bound account must still supply the request header.
+        let current = self
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| &descriptor.alias == account_alias)
+            .ok_or_else(|| MeterUnavailable::new(crate::usage_reset::ACCOUNT_CHANGED_REASON))?;
+        if self.binding_for_descriptor(&current).as_ref() != Some(binding) {
+            return Err(MeterUnavailable::new(
+                crate::usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        }
+        let account_id = current
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref())
+            .and_then(openai_workspace_account_id)
+            .ok_or_else(|| MeterUnavailable::new("credential_identity_incomplete"))?;
+        if account_id != binding.account_id.as_str() {
+            return Err(MeterUnavailable::new(
+                crate::usage_reset::ACCOUNT_CHANGED_REASON,
+            ));
+        }
+        let response = self
+            .http
+            .post_json(
+                haider_provider::OPENAI_OAUTH_RESET_CONSUME_URL,
+                &token,
+                UsageMeterEndpoint::OpenAiOauth.extra_headers(),
+                Some(account_id),
+                &serde_json::json!({ "redeem_request_id": approval_id }),
+            )
+            .await?;
+        if let Some(failure) = http_failure(&response, (self.clock)()) {
+            return Err(failure);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(MeterUnavailable::new(format!(
+                "http_status_{}",
+                response.status
+            )));
+        }
+        #[derive(Deserialize)]
+        struct ResetApplied {
+            code: String,
+            #[serde(default)]
+            windows_reset: u64,
+        }
+        let applied: ResetApplied = serde_json::from_slice(&response.body)
+            .map_err(|_| MeterUnavailable::new("malformed_response"))?;
+        let windows_reset = match applied.code.as_str() {
+            "reset" | "already_redeemed" => applied.windows_reset,
+            "nothing_to_reset" => {
+                return Err(MeterUnavailable::new("no_eligible_window"));
+            }
+            "no_credit" => return Err(MeterUnavailable::new("no_reset_credit")),
+            _ => return Err(MeterUnavailable::new("unexpected_response")),
+        };
+        self.cache
+            .lock()
+            .await
+            .remove(&(descriptor.provider, descriptor.alias));
+        Ok(windows_reset)
+    }
+
     fn descriptors(&self) -> Vec<CredentialDescriptor> {
         self.snapshot
             .lock()
             .map(|descriptors| descriptors.clone())
             .unwrap_or_default()
+    }
+
+    fn binding_for_descriptor(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Option<UsageResetAccountBinding> {
+        let account_id = descriptor
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref())
+            .and_then(openai_workspace_account_id)?;
+        let subject_hash = descriptor
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.subject_hash.as_ref())?;
+        (descriptor.incarnation != 0 && supports_reset_apply(descriptor)).then(|| {
+            UsageResetAccountBinding {
+                provider: descriptor.provider.clone(),
+                account_id: account_id.to_owned(),
+                incarnation: descriptor.incarnation,
+                subject_hash: Some(subject_hash.clone()),
+            }
+        })
+    }
+
+    pub(crate) fn reset_binding(
+        &self,
+        account_alias: &CredentialAlias,
+    ) -> Option<UsageResetAccountBinding> {
+        self.descriptors()
+            .iter()
+            .find(|descriptor| &descriptor.alias == account_alias)
+            .and_then(|descriptor| self.binding_for_descriptor(descriptor))
+    }
+
+    pub(crate) fn reset_binding_matches(
+        &self,
+        account_alias: &CredentialAlias,
+        binding: &UsageResetAccountBinding,
+    ) -> bool {
+        self.reset_binding(account_alias).as_ref() == Some(binding)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn apply_reset(
+        &self,
+        account_alias: &CredentialAlias,
+        approval_id: &str,
+    ) -> Result<u64, MeterUnavailable> {
+        if !self.reset_apply_supported(account_alias) {
+            return Err(MeterUnavailable::new("provider_reset_not_supported"));
+        }
+        let binding = self
+            .reset_binding(account_alias)
+            .ok_or_else(|| MeterUnavailable::new("credential_identity_incomplete"))?;
+        self.apply_bound_reset(account_alias, approval_id, &binding)
+            .await
+    }
+
+    pub(crate) fn reset_apply_supported(&self, account_alias: &CredentialAlias) -> bool {
+        self.descriptors().iter().any(|descriptor| {
+            &descriptor.alias == account_alias && supports_reset_apply(descriptor)
+        })
     }
 
     /// Assembles the full report. Store failures propagate (the caller owns
@@ -464,10 +762,14 @@ impl UsageReportService {
         store: &haider_core::SqliteStoreHandle,
     ) -> Result<UsageReportV1, haider_protocol::error::HaiderError> {
         let local = collect_local_stats(store).await?;
+        let generated_at_ms = (self.clock)();
+        let mut journal_resets = collect_device_reset_history(store, generated_at_ms).await?;
         let haider_code_plans = self.haider_code_plans.lock().await.clone();
         let mut accounts = Vec::new();
         for descriptor in self.descriptors() {
             let mut plan = None;
+            let mut reset_credits: Option<UsageResetCreditsV1> = None;
+            let mut previous_resets = journal_resets.remove(&descriptor.alias).unwrap_or_default();
             let mut identity = Some(descriptor.identity.clone()).filter(|id| !id.is_empty());
             let meter = if descriptor.provider == haider_provider::HAIDER_CODE_PROVIDER_NAME {
                 match haider_code_plans.get(&descriptor.alias) {
@@ -495,6 +797,11 @@ impl UsageReportService {
                         plan = entry.token_identity.plan;
                         match entry.outcome {
                             Ok(reading) => {
+                                reset_credits = reading.reset_credits.clone();
+                                prefer_provider_reset_history(
+                                    &mut previous_resets,
+                                    reading.previous_resets.clone(),
+                                );
                                 if reading.plan.is_some() {
                                     plan.clone_from(&reading.plan);
                                 }
@@ -526,6 +833,7 @@ impl UsageReportService {
                             }
                             Err(unavailable) => AccountMeterStateV1::Unavailable {
                                 reason: unavailable.reason,
+                                retry_at_ms: unavailable.retry_at_ms,
                             },
                         }
                     }
@@ -538,6 +846,8 @@ impl UsageReportService {
                 plan,
                 auth_method: descriptor.auth_method,
                 meter,
+                reset_credits,
+                previous_resets,
                 local: local.get(&descriptor.alias).cloned().unwrap_or_default(),
             });
         }
@@ -546,7 +856,7 @@ impl UsageReportService {
             merge_orchestration_usage(&mut orchestration, &account.local.orchestration);
         }
         Ok(UsageReportV1 {
-            generated_at_ms: (self.clock)(),
+            generated_at_ms,
             accounts,
             orchestration,
         })
@@ -629,7 +939,7 @@ impl UsageReportService {
                 .account_identity
                 .as_ref()
                 .and_then(|identity| identity.account_id.as_deref())
-                .filter(|account_id| !account_id.is_empty())
+                .and_then(openai_workspace_account_id)
             {
                 Some(account_id) => Some(account_id),
                 None => {
@@ -642,7 +952,7 @@ impl UsageReportService {
         } else {
             None
         };
-        let outcome = match self
+        let mut outcome = match self
             .http
             .get(
                 endpoint.url(),
@@ -652,11 +962,187 @@ impl UsageReportService {
             )
             .await
         {
-            Ok((status, body)) => endpoint.parse_at(status, &body, (self.clock)()),
+            Ok(response) => classify_meter_response(endpoint, response, (self.clock)()),
             Err(unavailable) => Err(unavailable),
         };
+        if endpoint == UsageMeterEndpoint::OpenAiOauth
+            && let Ok(reading) = &mut outcome
+            && reading.reset_credits.is_some()
+            && let Ok(response) = self
+                .http
+                .get(
+                    haider_provider::OPENAI_OAUTH_RESET_CREDITS_URL,
+                    &token,
+                    endpoint.extra_headers(),
+                    chatgpt_account_id,
+                )
+                .await
+            && (200..300).contains(&response.status)
+            && let Ok((credits, previous_resets)) =
+                haider_provider::parse_openai_reset_credits(&response.body)
+        {
+            reading.reset_credits = Some(credits);
+            reading.previous_resets = previous_resets;
+        }
         (outcome, token_identity)
     }
+}
+
+/// The raw ChatGPT workspace/account id the WHAM endpoints expect in
+/// `chatgpt-account-id`. Accepts both the stored forms:
+/// - a bare workspace id (current descriptors);
+/// - the length-prefixed user/workspace coordinate
+///   `user:<n>:<user>;workspace:<m>:<workspace>` (accounts-ux dedupe key).
+///
+/// Anything malformed yields `None` (typed `credential_identity_incomplete`),
+/// never the whole coordinate. INTEGRATION: equivalent to accounts-ux's
+/// `haider_provider::openai_workspace_from_account_coordinate`; collapse onto
+/// that helper when both lanes land.
+fn openai_workspace_account_id(coordinate: &str) -> Option<&str> {
+    let Some(rest) = coordinate.strip_prefix("user:") else {
+        return (!coordinate.trim().is_empty()).then_some(coordinate);
+    };
+    let (length, rest) = rest.split_once(':')?;
+    let length = length.parse::<usize>().ok()?;
+    let suffix = rest.get(length..)?.strip_prefix(";workspace:")?;
+    let (workspace_length, workspace) = suffix.split_once(':')?;
+    let workspace_length = workspace_length.parse::<usize>().ok()?;
+    (workspace_length == workspace.len() && !workspace.trim().is_empty()).then_some(workspace)
+}
+
+#[cfg(test)]
+mod account_coordinate_tests {
+    use super::openai_workspace_account_id;
+
+    /// MUTATION CHECK: send the raw stored value (drop the parser); the
+    /// combined coordinate then reaches the `chatgpt-account-id` header.
+    #[test]
+    fn workspace_id_is_extracted_from_both_stored_forms() {
+        assert_eq!(openai_workspace_account_id("acct-1"), Some("acct-1"));
+        assert_eq!(
+            openai_workspace_account_id("user:6:user-1;workspace:6:acct-1"),
+            Some("acct-1")
+        );
+        assert_eq!(
+            openai_workspace_account_id("user:3:a;b;workspace:16:shared-workspace"),
+            Some("shared-workspace"),
+            "the user part is length-delimited, so it may contain separators"
+        );
+        for malformed in [
+            "",
+            "   ",
+            "user:1:u;workspace:1: ",
+            "user:9:only-user;workspace:0:",
+            "user:x:u;workspace:1:w",
+            "user:1:u;workspace:2:w",
+            "user:1:u",
+            "user:99:u;workspace:1:w",
+        ] {
+            assert_eq!(openai_workspace_account_id(malformed), None, "{malformed}");
+        }
+    }
+}
+
+/// Accounts are OpenAI ChatGPT OAuth logins: the only provider with a
+/// verified reset-credit consume operation.
+fn supports_reset_apply(descriptor: &CredentialDescriptor) -> bool {
+    descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME
+        && descriptor.auth_method == AuthMethod::OAuth
+}
+
+const MILLIS_PER_DAY: u64 = 86_400_000;
+/// Newest-first bound on published prior resets per account.
+const PREVIOUS_RESETS_LIMIT: usize = 128;
+
+async fn collect_device_reset_history(
+    store: &haider_core::SqliteStoreHandle,
+    now_ms: u64,
+) -> Result<
+    HashMap<CredentialAlias, Vec<UsageResetHistoryEntryV1>>,
+    haider_protocol::error::HaiderError,
+> {
+    // The ledger rejects dates before 1970. Synthetic clocks near the epoch
+    // still have a valid report; limit the lookback to elapsed calendar days.
+    let max_days = USAGE_HISTORY_MAX_RANGE_DAYS;
+    let elapsed_days = (now_ms / MILLIS_PER_DAY).saturating_add(1);
+    let days = u16::try_from(elapsed_days.min(u64::from(max_days))).unwrap_or(max_days);
+    let samples = store
+        .usage_meter_samples_range(haider_store::slot_address(now_ms).date, days)
+        .await?;
+    let mut by_window = HashMap::<(String, String), Vec<UsageHistoryMeterSampleV1>>::new();
+    for sample in samples {
+        by_window
+            .entry((sample.account.clone(), sample.window.clone()))
+            .or_default()
+            .push(sample);
+    }
+    let mut seen = HashSet::<(String, String, u64)>::new();
+    let mut histories = HashMap::<CredentialAlias, Vec<UsageResetHistoryEntryV1>>::new();
+    for ((account, window), mut window_samples) in by_window {
+        window_samples.sort_by_key(|sample| sample.sampled_at_ms);
+        for (index, sample) in window_samples.iter().enumerate() {
+            let Some(reset_at_ms) = sample.resets_at_ms.filter(|reset| *reset <= now_ms) else {
+                continue;
+            };
+            // A scheduled instant merely passing is not proof that the reset
+            // happened. Require a later device sample, taken at or after the
+            // instant, that observes this exact window on a different reset
+            // cycle. That is still explicitly device-journal provenance.
+            let Some(confirmed_at_ms) = window_samples[index + 1..]
+                .iter()
+                .find(|later| {
+                    later.sampled_at_ms >= reset_at_ms
+                        && later.resets_at_ms.is_some()
+                        && later.resets_at_ms != Some(reset_at_ms)
+                })
+                .map(|later| later.sampled_at_ms)
+            else {
+                continue;
+            };
+            let key = (account.clone(), window.clone(), reset_at_ms);
+            if !seen.insert(key) {
+                continue;
+            }
+            histories
+                .entry(CredentialAlias::new(account.clone()))
+                .or_default()
+                .push(UsageResetHistoryEntryV1 {
+                    reset_at_ms,
+                    source: UsageResetHistorySourceV1::DeviceJournal,
+                    window: Some(window.clone()),
+                    observed_at_ms: Some(confirmed_at_ms),
+                    kind: Some("window_reset".into()),
+                });
+        }
+    }
+    for entries in histories.values_mut() {
+        entries.sort_by(|left, right| {
+            right
+                .reset_at_ms
+                .cmp(&left.reset_at_ms)
+                .then_with(|| left.window.cmp(&right.window))
+                .then_with(|| left.observed_at_ms.cmp(&right.observed_at_ms))
+        });
+        entries.truncate(PREVIOUS_RESETS_LIMIT);
+    }
+    Ok(histories)
+}
+
+/// Provider-published history wins over this device's journal whenever the
+/// provider supplied any exact entry; the two sources are never interleaved.
+fn prefer_provider_reset_history(
+    existing: &mut Vec<UsageResetHistoryEntryV1>,
+    mut provider: Vec<UsageResetHistoryEntryV1>,
+) {
+    if provider.is_empty() {
+        return;
+    }
+    let mut seen = HashSet::<(u64, Option<String>, Option<String>)>::new();
+    provider
+        .retain(|entry| seen.insert((entry.reset_at_ms, entry.window.clone(), entry.kind.clone())));
+    provider.sort_by_key(|entry| std::cmp::Reverse(entry.reset_at_ms));
+    provider.truncate(PREVIOUS_RESETS_LIMIT);
+    *existing = provider;
 }
 
 fn haider_code_windows(snapshot: &HaiderCodePlanSnapshotV1) -> Vec<UsageWindowV1> {

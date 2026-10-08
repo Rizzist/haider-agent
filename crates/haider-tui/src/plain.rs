@@ -909,9 +909,10 @@ pub fn usage_plain(model: &crate::app::AppModel) -> String {
                         )
                     },
                 ),
-            AccountMeterStateV1::Unavailable { reason } => {
+            AccountMeterStateV1::Unavailable { reason, .. } => {
                 format!("meter unavailable — {}", fmt_meter_reason_friendly(reason))
             }
+
             AccountMeterStateV1::LocalOnly => "local only".to_owned(),
         };
         let local = &account.local;

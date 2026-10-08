@@ -1922,8 +1922,9 @@ impl ChipModel {
     /// The chip's question card, per the sim's `chipMenu` gate
     /// (tui.js:2360-2364): open only while the chip is `input_required`/
     /// `error` AND holds an UNRESOLVED question. A closed chip has its
-    /// question force-resolved, so its view shows the composer again even
-    /// though the protocol Menu in its projection is still open.
+    /// question force-resolved, so its view shows the composer again. Live
+    /// child menus need no demo-only `ChipQuestion` mirror: the chip's own
+    /// projection retains every unresolved decision.
     #[must_use]
     pub fn question_menu(&self) -> Option<&Menu> {
         if self.closed
@@ -1931,7 +1932,6 @@ impl ChipModel {
                 self.state,
                 ChipDisplayState::InputRequired | ChipDisplayState::Error
             )
-            || self.question.as_ref().is_none_or(|q| q.resolved)
         {
             return None;
         }
@@ -4454,6 +4454,35 @@ impl VoiceState {
     }
 }
 
+/// Keyboard focus of the frame the terminal actually showed. Rechecking the
+/// full owner prevents queued keys from crossing picker, search, history,
+/// composer, menu, and session transitions before another frame is painted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputOwner {
+    Menu(haider_protocol::ids::MenuId),
+    ModelPicker(u64),
+    ThemePicker(u64),
+    EffortPicker(u64),
+    Search,
+    History,
+    Help,
+    Inbox,
+    Lockdown,
+    ToolDetail,
+    CustomProvider,
+    SshForm,
+    Talk,
+    Palette,
+    MentionCompletion,
+    Shells,
+    Ssh,
+    Monitors,
+    Login,
+    TalkSetup,
+    Composer(Screen),
+    Surface(Screen),
+}
+
 /// A clickable region's action (hit-testing: render reports regions, the
 /// runtime maps clicks back through [`AppModel::handle_hit`]).
 ///
@@ -4519,9 +4548,8 @@ pub enum Hit {
     },
     /// Persistent provider-lockdown status segment.
     LockdownStatus,
-    /// One `/usage` account tab chip (U2). VALUE-CARRYING: the provider +
-    /// the index WITHIN its group, so a stale hit map can never select a
-    /// different account.
+    /// One `/usage` account tab chip (U2). The press also snapshots its
+    /// account alias; a refreshed report may reorder this provider's rows.
     UsageAccountTab {
         provider: String,
         index: usize,
@@ -5762,6 +5790,10 @@ pub struct AppModel {
     pub demo_requests: Vec<DemoRequest>,
     /// Selected option index while a blocking menu replaces the composer.
     pub menu_selection: usize,
+    /// The menu whose selection the user moved with the arrow keys. A
+    /// spend-approval card honours a non-default selection on Enter only
+    /// for this exact menu, so a stale index can never pre-select `approve`.
+    pub menu_selection_owner: Option<haider_protocol::ids::MenuId>,
     /// D4: scroll offset into the open `plan` proposal document (the plan
     /// menu's markdown body renders full-height in the transcript area).
     /// A Cell because RENDER owns the new-proposal reset (review round 2:
@@ -5914,6 +5946,12 @@ pub struct AppModel {
     /// frame) has replaced is unrepresentable — the geometry twin of the
     /// text-revision guard.
     pub geometry_epoch: std::cell::Cell<u64>,
+    /// Menu identity of the last frame actually rendered. Terminal input
+    /// cannot acquire a menu merely because a later reducer event opened it.
+    pub presented_input_owner: std::cell::RefCell<InputOwner>,
+    pub presented_input_seen: std::cell::Cell<bool>,
+    pub presented_input_epoch: std::cell::Cell<u64>,
+    pub presented_menu: std::cell::RefCell<Option<Menu>>,
     /// 971 F2 — the LAST frame's shared bottom-band geometry: the composer
     /// rows a surface drew (`None` when the surface draws no composer) and
     /// the status line under them. Written by `render` under the same
@@ -5965,6 +6003,12 @@ pub struct AppModel {
     /// movement the click dispatches from THESE coordinates; a drag that
     /// selected suppresses it (owner item 9's disambiguation law).
     pub mouse_down: Option<(u16, u16)>,
+    /// Exact painted target and surface that began the current click. A
+    /// release may not reinterpret the press cell through a newer hit map.
+    pub mouse_press_target: Option<(Hit, UiGeneration, Screen, InputOwner, u64, Option<String>)>,
+    /// Reopening a local picker mints a new input owner even if its rows are
+    /// identical to the picker that was closed during a mouse press.
+    pub picker_epoch: u64,
     /// TUI5 item 5 — a left button went down INSIDE the composer text: the
     /// drag (if any) is a COMPOSER selection, never the transcript's
     /// screen-space drag (region disambiguation by drag START). Transient
@@ -6227,6 +6271,7 @@ impl Default for AppModel {
             )),
             demo_requests: Vec::new(),
             menu_selection: 0,
+            menu_selection_owner: None,
             plan_scroll: std::cell::Cell::new(0),
             plan_scroll_max: std::cell::Cell::new(0),
             plan_menu_seen: std::cell::RefCell::new(None),
@@ -6282,6 +6327,10 @@ impl Default for AppModel {
             transcript_view: std::cell::Cell::new(ratatui::layout::Rect::default()),
             status_width: std::cell::Cell::new(0),
             geometry_epoch: std::cell::Cell::new(0),
+            presented_input_owner: std::cell::RefCell::new(InputOwner::Surface(Screen::Boot)),
+            presented_input_seen: std::cell::Cell::new(false),
+            presented_input_epoch: std::cell::Cell::new(0),
+            presented_menu: std::cell::RefCell::new(None),
             composer_rect: std::cell::Cell::new(None),
             status_rect: std::cell::Cell::new(None),
             band_rect: std::cell::Cell::new(None),
@@ -6291,6 +6340,8 @@ impl Default for AppModel {
             hovered: None,
             selection: None,
             mouse_down: None,
+            mouse_press_target: None,
+            picker_epoch: 0,
             composer_drag: false,
             should_quit: false,
             dirty: true,
@@ -6388,6 +6439,7 @@ impl AppModel {
         session: SessionId,
         attachments: Vec<haider_protocol::hook::HookAttachmentMetadata>,
     ) {
+        self.retire_spend_card_navigation();
         self.mirrored_input_attachments = Some((session, attachments));
         self.dirty = true;
     }
@@ -6437,6 +6489,7 @@ impl AppModel {
         kind: crate::composer::PendingKind,
         label: String,
     ) {
+        self.retire_spend_card_navigation();
         self.upload_seq += 1;
         let upload = self.upload_seq;
         self.composer
@@ -7066,11 +7119,13 @@ impl AppModel {
             && self
                 .projection
                 .open_menu()
-                .is_some_and(|menu| !menu.options.is_empty())
+                .is_some_and(|menu| !menu.options.is_empty() && !is_deferred_approval(menu))
         {
             // A SELECT menu replaces the composer; a zero-option free-text
             // ask KEEPS it — the composer is the answer line (owner
-            // report: the resistor question rendered unanswerable).
+            // report: the resistor question rendered unanswerable). A
+            // deferred spend-approval card leaves text editing with the
+            // composer and takes only local card gestures while visible.
             return false;
         }
         !(self.screen == Screen::Subagent
@@ -7683,6 +7738,13 @@ impl AppModel {
 
     /// Deterministic clock seam for rapid Esc backtracking laws.
     pub fn handle_at(&mut self, event: AppEvent, now: std::time::Instant) {
+        // Freeze the painted card owner before this event can close an
+        // overlay. A key delivered to a picker must never become a card key
+        // merely because that picker closed during dispatch.
+        let spend_card_at_event = self.visible_spend_card();
+        // A card that ceased to own the painted input slot cannot carry its
+        // old Apply navigation into a later appearance.
+        self.retire_hidden_spend_card_navigation();
         match event {
             AppEvent::Key(key) => {
                 self.dirty = true;
@@ -7770,7 +7832,7 @@ impl AppModel {
                 // A keypress clears a finished selection's highlight
                 // (owner item 9's clearing law; clicks clear via Down).
                 self.selection = None;
-                self.handle_key(key, now);
+                self.handle_key(key, now, spend_card_at_event.as_ref());
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
@@ -7842,10 +7904,11 @@ impl AppModel {
                     && self
                         .projection
                         .open_menu()
-                        .is_some_and(|menu| !menu.options.is_empty())
+                        .is_some_and(|menu| !menu.options.is_empty() && !is_deferred_approval(menu))
                 {
                     return;
                 }
+                self.retire_spend_card_navigation();
                 if self.screen == Screen::Loom {
                     if self
                         .loom_authoring
@@ -7887,6 +7950,7 @@ impl AppModel {
                 if self.screen == Screen::Loom {
                     return;
                 }
+                self.retire_spend_card_navigation();
                 self.composer.set_text(text);
                 self.dirty = true;
             }
@@ -8652,7 +8716,12 @@ impl AppModel {
         self.dirty = true;
     }
 
-    fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
+    fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+        spend_card_at_event: Option<&haider_protocol::ids::MenuId>,
+    ) {
         if self.ssh_terminal.is_some() {
             self.handle_ssh_terminal_key(key);
             return;
@@ -9033,16 +9102,10 @@ impl AppModel {
         }
         // The `/model` picker owns EVERY key while it is showing (F2a —
         // heeded history: ⏎ selects the HIGHLIGHTED row, never an
-        // exact-match jump; esc closes without selecting). A daemon menu
-        // outranks it: local chrome never shadows a live ask.
+        // exact-match jump; esc closes without selecting). A non-spend daemon
+        // menu outranks it, while a deferred spend card waits below it.
         if self.model_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if menu_owns {
+            if self.non_spend_menu_owns_picker() {
                 self.model_picker = None;
                 self.dirty = true;
             } else {
@@ -9051,34 +9114,26 @@ impl AppModel {
             }
         }
         // The `/effort` picker owns the keys while it is showing (G3) —
-        // the same input-replacement law as `/theme`; a daemon card
-        // outranks it and closes it.
+        // the same input-replacement law as `/theme`; a non-spend daemon menu
+        // outranks it, while a deferred spend card waits below it.
         if self.effort_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if !menu_owns && matches!(self.screen, Screen::Session | Screen::Subagent) {
+            let forward_to_menu = self.non_spend_menu_owns_picker();
+            if !forward_to_menu && matches!(self.screen, Screen::Session | Screen::Subagent) {
                 self.handle_effort_picker_key(key.code);
                 return;
             }
             self.effort_picker = None;
             self.dirty = true;
+            if !forward_to_menu {
+                return;
+            }
         }
         // The `/theme` picker owns the keys while it is showing. A daemon
-        // card or a navigation away from its surfaces outranks it: the
-        // picker then closes (reverting any preview) and the key proceeds
-        // to its normal owner — local chrome never shadows a live ask.
+        // non-spend menu or navigation away from its surfaces outranks it.
+        // A deferred spend card waits below the picker until it closes.
         if self.theme_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if !menu_owns
+            let forward_to_menu = self.non_spend_menu_owns_picker();
+            if !forward_to_menu
                 && matches!(
                     self.screen,
                     Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
@@ -9090,6 +9145,9 @@ impl AppModel {
             if let Some(picker) = self.theme_picker.take() {
                 self.theme = picker.prior.resolve(self.detected_system);
                 self.dirty = true;
+            }
+            if !forward_to_menu {
+                return;
             }
         }
         // Subagent view (§2.10): esc ALWAYS walks back to the session (the
@@ -9104,11 +9162,13 @@ impl AppModel {
                 self.scroll_back.set(0);
                 return;
             }
-            if self
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some())
+            if let Some(menu) = self.viewed_chip().and_then(ChipModel::question_menu)
+                && (!is_deferred_approval(menu)
+                    || (spend_card_at_event == Some(&menu.id)
+                        && self.visible_spend_card().as_ref() == Some(&menu.id)
+                        && self.deferred_card_takes(menu, key)))
             {
-                self.handle_chip_menu_key(key.code);
+                self.handle_chip_menu_key(key.code, spend_card_at_event);
                 return;
             }
         }
@@ -9459,7 +9519,7 @@ impl AppModel {
                 }
                 _ => {}
             }
-            self.handle_menu_key(key.code);
+            self.handle_menu_key(key.code, spend_card_at_event);
             return;
         }
         // D4: an open `plan` proposal owns the scroll keys — the document
@@ -9516,18 +9576,21 @@ impl AppModel {
                 }
                 _ => {}
             }
-            self.handle_menu_key(key.code);
+            self.handle_menu_key(key.code, spend_card_at_event);
             return;
         }
         // A SELECT menu replaces the composer (sim §3 law); a zero-option
-        // free-text ask leaves the keys to the composer.
+        // free-text ask leaves the keys to the composer. A deferred
+        // spend-approval card never steals composer keystrokes: it takes
+        // only its navigation keys, and only while the composer is empty.
         if self.screen == Screen::Session
-            && self
-                .projection
-                .open_menu()
-                .is_some_and(|menu| !menu.options.is_empty())
+            && let Some(menu) = self.select_menu()
+            && (!is_deferred_approval(menu)
+                || (spend_card_at_event == Some(&menu.id)
+                    && self.visible_spend_card().as_ref() == Some(&menu.id)
+                    && self.deferred_card_takes(menu, key)))
         {
-            self.handle_menu_key(key.code);
+            self.handle_menu_key(key.code, spend_card_at_event);
             return;
         }
         // The prompt chooser is session chrome. A turn that started while
@@ -9927,17 +9990,10 @@ impl AppModel {
         }
     }
 
-    /// The composer is the live input target: no boot screen, no help
-    /// overlay, no blocking menu owning the keys (session card or the
-    /// viewed chip's question). Gates the TUI5 editing keys so ⌃K on a
-    /// menu can never eat a hidden draft.
+    /// Injection may edit the session composer beneath a deferred card.
+    /// Submit separately refuses while the visible card owns confirmation;
+    /// blocking menus and modals exclude composer injection altogether.
     #[must_use]
-    /// rev933d finding 4: injection from an embedding client applies only
-    /// when the PLAIN session composer is the live Enter target — no card
-    /// (login, `/talk` setup, an engaged talk session), no menu, no help,
-    /// and never the subagent view (whose composer messages the child).
-    /// This mirrors the key-dispatch precedence exactly, so a synthesized
-    /// Submit can never activate a card row or answer a question.
     pub fn accepts_injected_input(&self) -> bool {
         self.screen == Screen::Session
             && self.login.is_none()
@@ -9974,23 +10030,85 @@ impl AppModel {
             && self
                 .projection
                 .open_menu()
-                .is_some_and(|menu| !menu.options.is_empty())
+                .is_some_and(|menu| !menu.options.is_empty() && !is_deferred_approval(menu))
         {
             // A SELECT menu replaces the composer; a zero-option free-text
             // ask KEEPS it — the composer is the answer line (owner
-            // report: the resistor question rendered unanswerable).
+            // report: the resistor question rendered unanswerable). A
+            // deferred spend-approval card never takes the composer.
             return false;
         }
         !(self.screen == Screen::Subagent
-            && self
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
+            && self.viewed_chip().is_some_and(|chip| {
+                chip.question_menu()
+                    .is_some_and(|menu| !is_deferred_approval(menu))
+            }))
+    }
+
+    /// Non-spend daemon menus outrank local pickers. Deferred spending cards
+    /// wait beneath them until the picker is closed by its own gesture.
+    pub(crate) fn non_spend_menu_owns_picker(&self) -> bool {
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        menu.is_some_and(|menu| !is_deferred_approval(menu))
+    }
+
+    /// The spending card that owns the painted input band right now. This
+    /// single predicate is the future `InputOwner::SpendCard { menu }` seam.
+    /// A draft, attachment, or higher overlay makes the card unanswerable.
+    #[must_use]
+    pub(crate) fn visible_spend_card(&self) -> Option<haider_protocol::ids::MenuId> {
+        if self.help_open
+            || self.inbox_open
+            || self.shells_open
+            || self.ssh_open
+            || self.ssh_form.is_some()
+            || self.ssh_terminal.is_some()
+            || self.monitors_open
+            || self.lockdown_overlay
+            || self.login.is_some()
+            || self.talk_setup.is_some()
+            || self.talk.engaged()
+            || self.model_picker.is_some()
+            || self.theme_picker.is_some()
+            || self.effort_picker.is_some()
+            || self.backtrack.is_some()
+            || self.transcript_search.is_some()
+            || !self.composer.is_empty()
+            || !self.mirrored_input_attachments().is_empty()
+        {
+            return None;
+        }
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        }?;
+        (is_deferred_approval(menu) && !menu.options.is_empty()).then(|| menu.id.clone())
+    }
+
+    pub(crate) fn retire_spend_card_navigation(&mut self) {
+        self.menu_selection_owner = None;
+    }
+
+    pub(crate) fn retire_hidden_spend_card_navigation(&mut self) {
+        if self.menu_selection_owner.is_some()
+            && self.visible_spend_card().as_ref() != self.menu_selection_owner.as_ref()
+        {
+            self.retire_spend_card_navigation();
+        }
     }
 
     /// The composer-edit epilogue every text-changing key shares (the sim
     /// resets suggestion state on any change): palette selection/scroll
     /// reset + a dismissed palette re-opens.
     fn note_composer_edit(&mut self) {
+        if !self.composer.is_empty() {
+            self.retire_spend_card_navigation();
+        }
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
@@ -10226,6 +10344,7 @@ impl AppModel {
         // Slash submits take SILENTLY — execute_slash records the
         // canonical form (review P3-9, one entry per invocation).
         let is_slash = self.composer.text().trim().starts_with('/');
+        let has_attachments = self.composer.has_attachments();
         // escretract: a `turn.retract` is on the wire and its outcome is not
         // known yet. The prompt may still be accepted, so a second Enter here
         // would resend a turn that is still in flight — and the retract
@@ -10239,7 +10358,7 @@ impl AppModel {
         if !is_slash
             && self.retract_pending
             && self.screen == Screen::Session
-            && self.projection.open_menu().is_none()
+            && self.select_menu().is_none()
         {
             self.flash = Some("· retracting the prompt — a moment".to_owned());
             self.dirty = true;
@@ -10253,7 +10372,7 @@ impl AppModel {
         if !is_slash
             && self.screen == Screen::Session
             && !self.mode.fabricates_locally()
-            && self.projection.open_menu().is_none()
+            && self.select_menu().is_none()
             && self.composer.has_uploading_attachment()
         {
             self.flash = Some("· attachment still uploading — a moment".to_owned());
@@ -10270,7 +10389,7 @@ impl AppModel {
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
-        if display.is_empty() {
+        if display.is_empty() && !has_attachments {
             // Empty ⏎ on the launcher re-attaches the most recently left
             // session (a port law; the detach model keeps it honest by id).
             if self.screen == Screen::Launcher
@@ -15624,7 +15743,11 @@ impl AppModel {
 
     /// Keys while the viewed chip's question menu replaces its composer
     /// (§2.10): digits/arrows/enter answer; the parent is never blocked.
-    fn handle_chip_menu_key(&mut self, code: KeyCode) {
+    fn handle_chip_menu_key(
+        &mut self,
+        code: KeyCode,
+        spend_card_at_event: Option<&haider_protocol::ids::MenuId>,
+    ) {
         let Some(menu) = self
             .viewed_chip()
             .and_then(ChipModel::question_menu)
@@ -15633,7 +15756,31 @@ impl AppModel {
             return;
         };
         let option_count = menu.options.len();
+        let deferred = is_deferred_approval(&menu);
+        if deferred
+            && (spend_card_at_event != Some(&menu.id)
+                || self.visible_spend_card().as_ref() != Some(&menu.id))
+        {
+            return;
+        }
+        let shown = self.menu_display_selection(&menu);
         match code {
+            // A spend-approval card never wraps and ignores digits; Enter
+            // answers option 0 (deny) unless the user moved the selection on
+            // this card — the same rules as the session card.
+            KeyCode::Up if deferred && option_count > 0 && shown > 0 => {
+                self.menu_selection = shown.min(option_count - 1).saturating_sub(1);
+                self.menu_selection_owner = Some(menu.id.clone());
+            }
+            KeyCode::Down if deferred && option_count > 0 => {
+                self.menu_selection = (shown + 1).min(option_count - 1);
+                self.menu_selection_owner = Some(menu.id.clone());
+            }
+            KeyCode::Char('1'..='9') if deferred => {}
+            KeyCode::Enter if deferred => {
+                self.menu_selection = shown;
+                self.answer_chip_menu(&menu);
+            }
             KeyCode::Up if option_count > 0 => {
                 self.menu_selection =
                     (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
@@ -15654,6 +15801,9 @@ impl AppModel {
     }
 
     fn answer_chip_menu(&mut self, menu: &Menu) {
+        if is_deferred_approval(menu) && self.visible_spend_card().as_ref() != Some(&menu.id) {
+            return;
+        }
         let Some(option) = menu.options.get(self.menu_selection) else {
             return;
         };
@@ -15668,6 +15818,12 @@ impl AppModel {
                 via: AnswerVia::Tui,
             },
         });
+        if is_deferred_approval(menu)
+            && let Some(agent) = self.view_path.last().cloned()
+            && let Some(chip) = find_chip_mut(&mut self.chips, &agent)
+        {
+            chip.transcript.retire_local_answer(&menu.id);
+        }
         self.menu_selection = 0;
     }
 
@@ -17845,10 +18001,20 @@ impl AppModel {
         }
     }
 
-    fn handle_menu_key(&mut self, code: KeyCode) {
+    fn handle_menu_key(
+        &mut self,
+        code: KeyCode,
+        spend_card_at_event: Option<&haider_protocol::ids::MenuId>,
+    ) {
         let Some(menu) = self.projection.open_menu() else {
             return;
         };
+        if is_deferred_approval(menu)
+            && (spend_card_at_event != Some(&menu.id)
+                || self.visible_spend_card().as_ref() != Some(&menu.id))
+        {
+            return;
+        }
         let option_count = menu.options.len();
         // OWNER DIRECTIVE (supersedes the sim's swallow law): esc on a
         // blocking card INTERRUPTS the run — the daemon's cancellation
@@ -17883,15 +18049,33 @@ impl AppModel {
             self.dirty = true;
             return;
         }
+        let deferred = is_deferred_approval(menu);
+        let shown = self.menu_display_selection(menu);
+        let menu_id = menu.id.clone();
         match code {
+            // A spend-approval card never wraps: ↑ stops at `deny`
+            // (option 0) and ↓ stops at the last option, so only an
+            // explicit ↓ can ever reach `approve` (973-usage-data ruling).
+            KeyCode::Up if deferred && option_count > 0 => {
+                self.menu_selection = shown.min(option_count - 1).saturating_sub(1);
+                self.menu_selection_owner = Some(menu_id);
+            }
+            KeyCode::Down if deferred && option_count > 0 => {
+                self.menu_selection = (shown + 1).min(option_count - 1);
+                self.menu_selection_owner = Some(menu_id);
+            }
             // Selection wraps around (sim, tui.js:2441-2449).
             KeyCode::Up if option_count > 0 => {
                 self.menu_selection =
                     (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
+                self.menu_selection_owner = Some(menu_id);
             }
             KeyCode::Down if option_count > 0 => {
                 self.menu_selection = (self.menu_selection + 1) % option_count;
+                self.menu_selection_owner = Some(menu_id);
             }
+            // A spend-approval card is never answered by a typed digit.
+            KeyCode::Char('1'..='9') if deferred => {}
             KeyCode::Char(c @ '1'..='9') => {
                 let index = (c as usize) - ('1' as usize);
                 if index < option_count {
@@ -17899,8 +18083,137 @@ impl AppModel {
                     self.submit_menu_answer();
                 }
             }
-            KeyCode::Enter => self.submit_menu_answer(),
+            KeyCode::Enter => {
+                // Enter on a spend-approval card answers the default (deny,
+                // option 0) unless the user moved the selection on THIS card.
+                if deferred {
+                    self.menu_selection = shown;
+                }
+                self.submit_menu_answer();
+            }
             _ => {}
+        }
+    }
+
+    /// The selection a menu shows and Enter answers. On a spend-approval
+    /// card only arrow navigation on THIS card counts; anything else (a
+    /// stale index from an earlier menu) shows and answers option 0, `deny`.
+    #[must_use]
+    pub fn menu_display_selection(&self, menu: &Menu) -> usize {
+        if is_deferred_approval(menu) && self.menu_selection_owner.as_ref() != Some(&menu.id) {
+            0
+        } else {
+            self.menu_selection
+        }
+    }
+
+    /// Whether a key goes to the visible deferred spend-approval card rather
+    /// than the (empty) composer. ↑ belongs to the card only while the user
+    /// has moved THIS card's selection off `deny`; otherwise it keeps its
+    /// composer meaning (history recall), so ↑ then Enter can never approve.
+    fn deferred_card_takes(&self, menu: &Menu, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Up => self.menu_display_selection(menu) > 0,
+            KeyCode::Enter => !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL),
+            KeyCode::Down | KeyCode::Esc => true,
+            _ => false,
+        }
+    }
+
+    /// The SELECT menu that currently replaces the composer. A deferred
+    /// spend-approval card yields to a non-empty composer entirely (neither
+    /// rendered in its place nor fed keys), so text being typed when the
+    /// card arrives — and its Enter — stays a composer message.
+    #[must_use]
+    pub fn select_menu(&self) -> Option<&Menu> {
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        menu.filter(|menu| {
+            !menu.options.is_empty()
+                && (!is_deferred_approval(menu)
+                    || self.visible_spend_card().as_ref() == Some(&menu.id))
+        })
+    }
+
+    pub(crate) fn input_owner(&self) -> InputOwner {
+        if self.lockdown_overlay {
+            return InputOwner::Lockdown;
+        }
+        if self.tool_detail.is_some() {
+            return InputOwner::ToolDetail;
+        }
+        if self.custom_add.is_some() {
+            return InputOwner::CustomProvider;
+        }
+        if self.ssh_form.is_some() {
+            return InputOwner::SshForm;
+        }
+        if self.talk.engaged() {
+            return InputOwner::Talk;
+        }
+        if self.help_open {
+            return InputOwner::Help;
+        }
+        if self.inbox_open {
+            return InputOwner::Inbox;
+        }
+        if self.transcript_search.is_some() {
+            return InputOwner::Search;
+        }
+        if self.shells_open {
+            return InputOwner::Shells;
+        }
+        if self.ssh_open || self.ssh_terminal.is_some() {
+            return InputOwner::Ssh;
+        }
+        if self.monitors_open {
+            return InputOwner::Monitors;
+        }
+        if self.login.is_some() {
+            return InputOwner::Login;
+        }
+        if self.talk_setup.is_some() {
+            return InputOwner::TalkSetup;
+        }
+        if let Some(menu) = self
+            .select_menu()
+            .filter(|menu| !is_deferred_approval(menu))
+        {
+            return InputOwner::Menu(menu.id.clone());
+        }
+        if self.model_picker.is_some() {
+            return InputOwner::ModelPicker(self.picker_epoch);
+        }
+        if self.effort_picker.is_some() {
+            return InputOwner::EffortPicker(self.picker_epoch);
+        }
+        if self.theme_picker.is_some() {
+            return InputOwner::ThemePicker(self.picker_epoch);
+        }
+        if self.backtrack.is_some() {
+            return InputOwner::History;
+        }
+        if let Some(menu) = self.select_menu() {
+            return InputOwner::Menu(menu.id.clone());
+        }
+        if self.mention_completion.is_some() {
+            return InputOwner::MentionCompletion;
+        }
+        if self.palette_open() {
+            return InputOwner::Palette;
+        }
+        if matches!(
+            self.screen,
+            Screen::Launcher | Screen::Session | Screen::Subagent | Screen::Aura | Screen::Loom
+        ) {
+            InputOwner::Composer(self.screen)
+        } else {
+            InputOwner::Surface(self.screen)
         }
     }
 
@@ -17908,6 +18221,9 @@ impl AppModel {
         let Some(menu) = self.projection.open_menu() else {
             return;
         };
+        if is_deferred_approval(menu) && self.visible_spend_card().as_ref() != Some(&menu.id) {
+            return;
+        }
         let Some(option) = menu.options.get(self.menu_selection) else {
             return;
         };
@@ -17940,11 +18256,16 @@ impl AppModel {
             value: None,
             via: AnswerVia::Tui,
         };
+        let retire = is_deferred_approval(menu).then(|| menu.id.clone());
         self.outbox.push(OutboundAnswer {
             origin: self.ui_generation(),
             branch: self.branch_state.active().cloned(),
             answer,
         });
+        if let Some(menu_id) = retire {
+            self.projection.retire_local_answer(&menu_id);
+            self.retire_spend_card_navigation();
+        }
         self.menu_selection = 0;
     }
 
@@ -19911,11 +20232,70 @@ impl AppModel {
             .find(|entry| entry.ui_gen == generation)
     }
 
+    pub(crate) fn menu_hit_is_live(&self, id: &haider_protocol::ids::MenuId, index: usize) -> bool {
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        menu.is_some_and(|menu| {
+            menu.id == *id
+                && index < menu.options.len()
+                && (!is_deferred_approval(menu) || self.visible_spend_card().as_ref() == Some(id))
+        })
+    }
+
+    /// Index-bearing hits also keep the option value painted at press. A
+    /// same-id menu update or changed effort ladder cannot retarget a click.
+    pub(crate) fn mouse_hit_semantics(&self, hit: &Hit) -> Option<String> {
+        match hit {
+            Hit::MenuOption { menu, index } => {
+                let current = match self.screen {
+                    Screen::Session => self.projection.open_menu(),
+                    Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+                    _ => None,
+                }?;
+                (current.id == *menu)
+                    .then_some(current.options.get(*index)?)
+                    .map(|option| format!("{option:?}"))
+            }
+            Hit::EffortOption(index) => self
+                .effort_picker_rows()
+                .get(*index)
+                .map(|row| format!("{:?}", row.effort)),
+            Hit::PermissionRetry | Hit::PermissionOpenSettings => self
+                .projection
+                .permission_card()
+                .map(|card| format!("{}:{:?}", card.request_id, card.permission)),
+            Hit::UsageAccountTab { provider, index } => {
+                let group = self
+                    .usage
+                    .groups()
+                    .into_iter()
+                    .find(|group| group.provider == *provider)?;
+                let slot = *group.accounts.get(*index)?;
+                self.usage
+                    .report
+                    .as_ref()?
+                    .accounts
+                    .get(slot)
+                    .map(|account| account.alias.as_str().to_owned())
+            }
+            _ => None,
+        }
+    }
+
     /// A left-click resolved through the frame's hit map. The map may be
     /// one frame stale (review r2 P2-2): hits carry values and every
     /// context-sensitive hit re-checks its context — activate exactly what
     /// was clicked, or drop the click.
     pub fn handle_hit(&mut self, hit: Hit) {
+        self.retire_hidden_spend_card_navigation();
+        if let Hit::MenuOption { ref menu, index } = hit
+            && !self.menu_hit_is_live(menu, index)
+        {
+            return;
+        }
         self.dirty = true;
         self.flash = None;
         // A visible overlay owns the screen; hits from the covered frame
@@ -20062,9 +20442,8 @@ impl AppModel {
             Hit::ProviderAccounts if self.screen == Screen::Providers => {
                 self.enter_accounts();
             }
-            // U2: a click on an account tab chip selects exactly the
-            // account the rect was rendered for (value-carrying) and moves
-            // the cursor to its group.
+            // U2: the runtime checks the pressed alias before this index is
+            // interpreted against the current report.
             Hit::UsageAccountTab { provider, index } if self.screen == Screen::Usage => {
                 let groups = self.usage.groups();
                 let Some(position) = groups.iter().position(|group| group.provider == provider)
@@ -20087,11 +20466,15 @@ impl AppModel {
             Hit::PaletteRow(item) if self.palette_open() => self.activate_palette_item(item),
             // A `/theme` picker row: click commits (the hover already
             // previewed it). A stale hit after the picker closed drops.
-            Hit::ThemeOption(index) if self.theme_picker.is_some() => {
+            Hit::ThemeOption(index)
+                if self.theme_picker.is_some() && !self.non_spend_menu_owns_picker() =>
+            {
                 self.commit_theme_row(index);
             }
             // G3: an `/effort` row click commits exactly that row.
-            Hit::EffortOption(index) if self.effort_picker.is_some() => {
+            Hit::EffortOption(index)
+                if self.effort_picker.is_some() && !self.non_spend_menu_owns_picker() =>
+            {
                 self.commit_effort_row(index);
             }
             // F2a: a picker row click selects exactly the pair the rect
@@ -20101,7 +20484,7 @@ impl AppModel {
                 provider,
                 model,
                 api_group,
-            } if self.model_picker.is_some() => {
+            } if self.model_picker.is_some() && !self.non_spend_menu_owns_picker() => {
                 let in_provider_stage = self
                     .model_picker
                     .as_ref()
@@ -20115,32 +20498,19 @@ impl AppModel {
                     self.activate_model_picker_row(&row);
                 }
             }
-            Hit::MenuOption { menu, index } => {
-                // Only the SAME menu the row was rendered for may answer —
-                // and on the subagent screen that menu is the CHIP's card,
-                // which the session projection knows nothing about (review
-                // P2-7: chip-question clicks were silently dead).
+            Hit::MenuOption { index, .. } => {
+                // The event-time ownership check above already matched the
+                // card id, option row, surface, and deferred visibility.
                 if self.screen == Screen::Subagent {
                     let card = self
                         .viewed_chip()
                         .and_then(ChipModel::question_menu)
-                        .filter(|m| m.id == menu && index < m.options.len())
                         .cloned();
                     if let Some(card) = card {
                         self.menu_selection = index;
                         self.answer_chip_menu(&card);
                     }
-                } else if self.screen == Screen::Session
-                    && self
-                        .projection
-                        .open_menu()
-                        .is_some_and(|m| m.id == menu && index < m.options.len())
-                {
-                    // The card is only answerable while its own surface is
-                    // showing: Back leaves the projection (and its card)
-                    // intact, so without this a queued click on the old
-                    // option rect would answer an invisible card and start
-                    // its parked continuation (review r2 P1-2).
+                } else if self.screen == Screen::Session {
                     self.menu_selection = index;
                     self.submit_menu_answer();
                 }
@@ -20652,6 +21022,12 @@ impl AppModel {
     /// on hover (sim onMouseEnter, tui.js:2992/3073); everything else is
     /// hover chrome the renderer paints from [`Self::hovered`].
     pub fn handle_hover(&mut self, hit: Option<Hit>) {
+        self.retire_hidden_spend_card_navigation();
+        if let Some(Hit::MenuOption { ref menu, index }) = hit
+            && !self.menu_hit_is_live(menu, index)
+        {
+            return;
+        }
         // TUI6.2c (verifier finding 4): modals own hover exactly as they
         // own hits and keys — with the help overlay or the login card up,
         // hover must not move palette/menu selections beneath the modal.
@@ -20673,24 +21049,9 @@ impl AppModel {
                     self.scroll_palette_into_view(count);
                 }
             }
-            Some(Hit::MenuOption { menu, index }) => {
-                // Hover moves the selection on BOTH card surfaces (sim
-                // `onMouseEnter` on `.imo`, tui.js:3093 — review P2-7).
-                let valid = if self.screen == Screen::Subagent {
-                    self.viewed_chip()
-                        .and_then(ChipModel::question_menu)
-                        .is_some_and(|m| m.id == menu && index < m.options.len())
-                } else {
-                    // Same surface gate as the click (review r2 P1-2).
-                    self.screen == Screen::Session
-                        && self
-                            .projection
-                            .open_menu()
-                            .is_some_and(|m| m.id == menu && index < m.options.len())
-                };
-                if valid {
-                    self.menu_selection = index;
-                }
+            Some(Hit::MenuOption { index, .. }) => {
+                // The ownership check above rejects stale or hidden cards.
+                self.menu_selection = index;
             }
             // Hover moves the `/theme` picker's highlight — and with it
             // the live PREVIEW (the picker's whole point).
@@ -20760,6 +21121,7 @@ impl AppModel {
     /// Pushes a registry refresh so the roster is as fresh as the daemon
     /// serves; rows render from the snapshot in hand meanwhile.
     pub fn open_model_picker(&mut self, query: String) {
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
         self.model_picker = Some(ModelPicker {
             query,
             ..ModelPicker::default()
@@ -22136,6 +22498,7 @@ impl AppModel {
             return;
         }
         let Some(requested) = requested else {
+            self.picker_epoch = self.picker_epoch.wrapping_add(1);
             self.effort_picker = Some(EffortPicker::default());
             return;
         };
@@ -22422,6 +22785,7 @@ impl AppModel {
             .iter()
             .position(|choice| *choice == self.theme_choice)
             .unwrap_or(0);
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
         self.theme_picker = Some(ThemePicker {
             selection,
             prior: self.theme_choice,
@@ -22618,6 +22982,68 @@ pub fn tools_card(seq: u64) -> Menu {
         origin: "tools".to_owned(),
         ttl_ms: None,
         timeout_option: None,
+    }
+}
+
+/// A nonblocking, agent-initiated human decision (e.g. spending a usage
+/// reset credit). Such a card must never capture composer keystrokes.
+pub(crate) fn is_deferred_approval(menu: &Menu) -> bool {
+    matches!(menu.kind, MenuKind::DeferredApproval { .. })
+}
+
+#[cfg(test)]
+mod spend_event_snapshot_tests {
+    use super::*;
+    use haider_protocol::effect::EffectClass;
+    use haider_protocol::menu::{DecisionKind, MenuOption, MenuScope};
+
+    #[test]
+    fn late_visibility_cannot_replace_the_event_entry_card_owner() {
+        let mut model = AppModel::new();
+        model.screen = Screen::Session;
+        let card = Menu {
+            id: haider_protocol::ids::MenuId::new("event-snapshot-card"),
+            kind: MenuKind::DeferredApproval {
+                approval_id: "event-snapshot".into(),
+                effect: EffectClass::UsageResetApply,
+                account: None,
+                binding: None,
+            },
+            title: "Spend one credit?".into(),
+            body: Vec::new(),
+            options: vec![
+                MenuOption {
+                    key: "deny".into(),
+                    label: "Deny".into(),
+                    detail: None,
+                    decision: Some(DecisionKind::RejectOnce),
+                },
+                MenuOption {
+                    key: "approve".into(),
+                    label: "Apply".into(),
+                    detail: None,
+                    decision: Some(DecisionKind::AllowOnce),
+                },
+            ],
+            blocking: false,
+            scope: MenuScope::Session,
+            origin: "deferred_approval_v1".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        };
+        model
+            .projection
+            .apply(&EventPayload::MenuOpened(card.clone()));
+        assert_eq!(model.visible_spend_card(), Some(card.id.clone()));
+        // The menu is visible NOW, but was hidden when the event began.
+        model.handle_menu_key(KeyCode::Down, None);
+        assert_eq!(model.menu_display_selection(&card), 0);
+        assert!(model.outbox.is_empty());
+        model.handle_menu_key(KeyCode::Enter, None);
+        assert!(model.outbox.is_empty());
+        // Negative control: a fresh event that starts on this card owns it.
+        model.handle_menu_key(KeyCode::Down, Some(&card.id));
+        assert_eq!(model.menu_display_selection(&card), 1);
     }
 }
 

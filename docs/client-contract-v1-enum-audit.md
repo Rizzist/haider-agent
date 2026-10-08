@@ -244,7 +244,7 @@ appendix list every spelling in context.
 ### `crates/haider-protocol/src/effect.rs`
 
 - `EffectClass` (`crates/haider-protocol/src/effect.rs:34`; `class` tag):
-  `"fs_read"` | `"fs_write"` | `"process_exec"` | `"network"` | `"git_op"` | `"agent_spawn"` | `"credential_access"` | `"gui_act"` | `"screen_observe"` | `"screen_control"`.
+  `"fs_read"` | `"fs_write"` | `"process_exec"` | `"remote_execution"` | `"network"` | `"git_op"` | `"agent_spawn"` | `"peer_message"` | `"credential_access"` | `"gui_act"` | `"screen_observe"` | `"screen_control"` | `"mobile_observe"` | `"mobile_control"` | `"read_sms"` | `"usage_reset_apply"`.
 - `AuthorizationVerdict` (`crates/haider-protocol/src/effect.rs:68`; `verdict` tag):
   `"allow"` | `"pre_authorized"` | `"ask"` | `"deny"`.
 - `AuthorizationSource` (`crates/haider-protocol/src/effect.rs:86`): `"user_typed"`.
@@ -368,7 +368,7 @@ appendix list every spelling in context.
 ### `crates/haider-protocol/src/menu.rs`
 
 - `MenuKind` (`crates/haider-protocol/src/menu.rs:35`; `kind` tag):
-  `"permission"` | `"recovery"` | `"error_recovery"` | `"exhausted"` | `"trust_hook"` | `"update"` | `"question"` | `"choice"` | `"secret"` | `"file"` | `"conflict"` | `"graph_human_confirm"` | `"graph_abandon_confirm"`.
+  `"permission"` | `"recovery"` | `"error_recovery"` | `"exhausted"` | `"trust_hook"` | `"update"` | `"question"` | `"choice"` | `"secret"` | `"file"` | `"conflict"` | `"graph_human_confirm"` | `"graph_abandon_confirm"` | `"deferred_approval"`.
 - `ErrorRecoveryCardKind` (`crates/haider-protocol/src/menu.rs:106`):
   `"oauth_expired"` | `"invalid_api_key"` | `"account_revoked"` | `"account_deleted"` | `"rate_limit"` | `"quota_exhausted"` | `"partial_stream"` | `"keychain_relink"` | `"store_unwritable"` | `"generic"`.
 - `EffectRecoveryAction` (`crates/haider-protocol/src/menu.rs:124`):
@@ -564,9 +564,9 @@ appendix list every spelling in context.
 - `HookTrustStateWire` (`crates/haider-rpc/src/frame.rs:1565`):
   `"trusted"` | `"untrusted"` | `"revoked_by_edit"`.
 - `RequestBody` (`crates/haider-rpc/src/frame.rs`; `method` tag):
-  the v0.0.963 spellings remain in their original order; the additive tail is `"account.refresh"` | `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | unknown. The exhaustive 104-method spelling pin is `wire_golden_tests::every_request_method_has_a_golden_request_and_success_response`; any other string → Rust `Unknown`.
+  the v0.0.963 spellings remain in their original order; the additive tail includes `"account.refresh"` | `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | `"usage.reset_apply"` | unknown. The exhaustive 137-method spelling pin is `wire_golden_tests::every_request_method_has_a_golden_request_and_success_response`; any other string → Rust `Unknown`.
 - `ResponseBody` (`crates/haider-rpc/src/frame.rs`; `method` tag):
-  the v0.0.963 response spellings remain in their original order; the additive tail is `"account.refresh"` | `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | unknown. Any other string → Rust `Unknown`.
+  the v0.0.963 response spellings remain in their original order; the additive tail includes `"account.refresh"` | `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | `"usage.reset_apply"` | unknown. Any other string → Rust `Unknown`.
 - `SubmitDisposition` (`crates/haider-rpc/src/frame.rs:3953`):
   `"started"` | `"queued"` | `"steer_pending"` | `"subturn_pending"` | `"unknown"`; any other string → Rust `Unknown`.
 - `CancelStatus` (`crates/haider-rpc/src/frame.rs:3966`):

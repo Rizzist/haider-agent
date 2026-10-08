@@ -1088,13 +1088,14 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .collect()
     }
 
-    /// Selection accepts only known catalog entries: fetched remote rows or
-    /// an offline provider's authoritative static/configured catalog.
+    /// Selection accepts fetched rows, offline rows, or an explicit custom
+    /// model list while discovery has not produced usable inventory.
     fn selectable_slugs(&self, provider: &str) -> Vec<String> {
         let discovered = self.discovered_slugs(provider);
         if discovered.is_empty()
             && let Some(profile) = self.get(provider)
-            && offline_inventory(profile)
+            && (offline_inventory(profile)
+                || configured_catalog_fallback(profile, &self.model_source.inventory(provider)))
         {
             return configured_rows(profile)
                 .into_iter()
@@ -1121,7 +1122,8 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         // Offline catalogs are authoritative without a network request.
         // An empty remote result never falls back to configured rows.
         let offline_catalog = never_fetched && offline_inventory(profile);
-        let rows = if offline_catalog {
+        let configured_catalog = configured_catalog_fallback(profile, &inventory);
+        let rows = if offline_catalog || configured_catalog {
             configured_rows(profile)
         } else {
             merged_catalog_rows(&profile.provider_id, inventory.models().as_deref())
@@ -1135,6 +1137,8 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 && haider_provider::has_subscription_static_catalog(&profile.provider_id))
         {
             haider_rpc::ModelInventoryWire::Static
+        } else if configured_catalog {
+            haider_rpc::ModelInventoryWire::Configured
         } else {
             inventory.provenance()
         };
@@ -1142,10 +1146,20 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             profile,
             model_details,
             offline_catalog,
+            configured_catalog,
             has_credential(&profile.provider_id),
             inventory_wire,
         )
     }
+}
+
+fn configured_catalog_fallback(profile: &ProviderProfileV1, inventory: &ProviderInventory) -> bool {
+    matches!(profile.provenance, ProviderProvenance::Custom)
+        && !profile.configured_models.is_empty()
+        && matches!(
+            inventory,
+            ProviderInventory::NeverFetched | ProviderInventory::Unavailable { .. }
+        )
 }
 
 /// One pickable model and where it came from.
@@ -1374,6 +1388,7 @@ fn provider_summary(
     profile: &ProviderProfileV1,
     model_details: Vec<ModelDetailWire>,
     offline_catalog: bool,
+    configured_fallback: bool,
     credentialed: bool,
     inventory: haider_rpc::ModelInventoryWire,
 ) -> ProviderSummaryWire {
@@ -1407,6 +1422,7 @@ fn provider_summary(
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
         && !discovered_models.is_empty()
         && seeded_ready
+        && !configured_fallback
         && (inventory_is_current || static_subscription);
     let default_model = if matches!(profile.provenance, ProviderProvenance::Custom)
         && matches!(

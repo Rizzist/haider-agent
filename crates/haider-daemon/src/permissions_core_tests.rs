@@ -456,10 +456,10 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
     }
 }
 
-/// Autonomous mode resolves every registry Ask to ordinary Allow. Explicit
-/// deny rules are applied separately by the broker and still win.
+/// Autonomous mode resolves ordinary registry asks to Allow. Spending a
+/// finite reset credit remains Ask, and explicit deny rules still win.
 #[test]
-fn autonomous_effect_defaults_allow_every_ask_class() {
+fn autonomous_effect_defaults_keep_sensitive_reset_human_only() {
     let metadata = |permission_overrides| SessionMetadataV1 {
         selection_epoch: None,
         route_reset_epoch: None,
@@ -496,6 +496,10 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
 
     let baseline = metadata(None);
     for (class, default) in effective_permission_defaults(&baseline) {
+        if class == EffectClass::UsageResetApply {
+            assert_eq!(default, ToolPermissionDefault::Ask);
+            continue;
+        }
         assert_ne!(
             default,
             ToolPermissionDefault::Ask,
@@ -576,6 +580,11 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
         ToolPermissionDefault::Deny,
         "read-only must not delegate mutation to an existing writable peer"
     );
+    assert_eq!(
+        decision(&read_only, EffectClass::UsageResetApply),
+        ToolPermissionDefault::Deny,
+        "read-only must refuse spending a reset credit"
+    );
     for class in [EffectClass::GitOp, EffectClass::GuiAct] {
         assert_eq!(
             decision(&read_only, class.clone()),
@@ -587,10 +596,10 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
 
 /// MUTATION CHECK: make `auto_allow` a no-op, scope it to only writes/exec, or
 /// let it promote a `NotApplicable` class into an effect. Expected RUNTIME
-/// failure: a class still on `Ask` under auto-allow (computer/screen/fetch), or
-/// a non-effect class fabricated as `Allow`.
+/// failure: an ordinary class remains `Ask`, a non-effect is fabricated as
+/// `Allow`, or the sensitive reset class is promoted.
 #[test]
-fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
+fn auto_allow_promotes_ordinary_asks_but_not_sensitive_reset() {
     let metadata = |permission_overrides| SessionMetadataV1 {
         selection_epoch: None,
         route_reset_epoch: None,
@@ -656,6 +665,11 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         decision(EffectClass::ProcessExec),
         ToolPermissionDefault::Allow
     );
+    assert_eq!(
+        decision(EffectClass::UsageResetApply),
+        ToolPermissionDefault::Ask,
+        "auto-allow must never spend a finite reset credit"
+    );
     // Web fetch is a Network effect (class-family, host-agnostic here).
     let network_allowed = defaults.iter().any(|(class, default)| {
         matches!(class, EffectClass::Network { .. }) && *default == ToolPermissionDefault::Allow
@@ -668,9 +682,12 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         "auto-allow must promote the network/fetch class to Allow"
     );
 
-    // Auto-allow only ever promotes `Ask`: it leaves no class on the Ask path,
-    // while `NotApplicable` non-effects are neither promoted nor removed.
-    for (_, default) in &defaults {
+    // Auto-allow promotes ordinary asks; the sensitive reset class is the
+    // intentional human-only exception.
+    for (class, default) in &defaults {
+        if *class == EffectClass::UsageResetApply {
+            continue;
+        }
         assert_ne!(
             *default,
             ToolPermissionDefault::Ask,
@@ -868,6 +885,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "monitor",
             "list_models",
             "session_transcript",
+            "usage_reset_apply",
             "peer_list",
             "peer_send",
             "ssh_list",
@@ -1655,8 +1673,8 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     let registry = registered_tools();
     assert_eq!(
         authorized.len(),
-        31,
-        "27 former tools plus session_transcript, task_outcome, test_run, and tool_script"
+        32,
+        "31 prior tools plus usage_reset_apply"
     );
     let full_prefix: usize = authorized
         .iter()
@@ -1673,21 +1691,22 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         })
         .sum();
     // Union full-pack pin: 971 redaction, 972 task_outcome/output ergonomics,
-    // 972-ax-testrun, and the frozen typed `tool_script` DAG schema. The
+    // 972-ax-testrun, the frozen typed `tool_script` DAG schema, and the
+    // platform-invariant 1,237 bytes of the usage-reset manifest. The
     // default instruct-pipe pack is unchanged: the large orchestration schema
     // remains discovery-only until explicitly promoted. The full pack lost
     // six bytes when the optional spawn_subagent.request_budget description
     // changed from 154 to 148 bytes; only its description is in this pin.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_397;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_634;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_348;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_585;
     #[cfg(target_os = "windows")]
     // `tool_script` nests the platform-specific `process_exec` schema, so
     // Windows carries the historical 3-byte command-description delta twice.
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_344;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_581;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_342;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_579;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1706,7 +1725,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         - 2;
     let expected_pipe_bytes =
         EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
-    assert_eq!(registered_tools().len(), 34);
+    assert_eq!(registered_tools().len(), 35);
     assert_eq!(
         tools.len(),
         10,

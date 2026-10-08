@@ -63,6 +63,8 @@ fn factory(
 ) {
     let alias = CredentialAlias::new("upgrade-fixture");
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: summary.provider.clone(),
         base_url: None,

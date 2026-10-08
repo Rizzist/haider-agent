@@ -190,6 +190,8 @@ struct CodexClaims {
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
     chatgpt_account_id: Option<String>,
     #[serde(default, rename = "https://api.openai.com/auth")]
     openai_auth: Option<CodexAuthClaims>,
@@ -206,6 +208,7 @@ struct CodexAuthClaims {
 /// One source-owned credential generation. `encoded_bundle` is an ephemeral
 /// access-only broker input: external refresh credentials are never copied.
 pub(crate) struct LinkedSourceMaterial {
+    pub credential_digest: Option<String>,
     pub identity: Option<AccountIdentity>,
     pub display_identity: String,
     pub last_refreshed_at_ms: Option<u64>,
@@ -248,12 +251,13 @@ pub(crate) fn read_linked_source(
         return Err(LinkedSourceReadFailure::RequiresOriginClient);
     }
     let (path, bytes, metadata) = read_enrolled_file(source)?;
+    let source_digest = blake3::hash(&bytes).to_hex().to_string();
     let last_refreshed_at_ms = metadata
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-    match source.kind {
+    let mut material = match source.kind {
         CredentialSourceKind::CodexHome => {
             linked_codex_material(&path, bytes, store_mode, last_refreshed_at_ms)
         }
@@ -266,7 +270,9 @@ pub(crate) fn read_linked_source(
         CredentialSourceKind::KimiCodeHome => {
             linked_kimi_material(bytes, store_mode, last_refreshed_at_ms, &source.id)
         }
-    }
+    }?;
+    material.credential_digest = Some(source_digest);
+    Ok(material)
 }
 
 /// Whether a linked kind yields a read-through access bundle at resolution
@@ -398,6 +404,7 @@ fn linked_codex_material(
         .as_ref()
         .and_then(|token| decode_jwt::<CodexClaims>(&token.0))
         .unwrap_or_default();
+    let member_subject = id.sub.clone().and_then(nonempty);
     let email = id.email.and_then(nonempty);
     let account_id = id
         .chatgpt_account_id
@@ -422,7 +429,12 @@ fn linked_codex_material(
         .or_else(|| account_id.clone())
         .unwrap_or_else(|| "Codex login".to_owned());
     let captured_at = last_refreshed_at_ms.unwrap_or(0);
+    let subject = member_subject
+        .or_else(|| email.clone())
+        .unwrap_or_else(|| blake3::hash(access_token.0.as_slice()).to_hex().to_string());
+    let subject_hash = blake3::hash(subject.as_bytes()).to_hex().to_string();
     let identity = AccountIdentity {
+        subject_hash: Some(subject_hash.clone()),
         email,
         display_name: None,
         account_id: account_id.clone(),
@@ -435,7 +447,6 @@ fn linked_codex_material(
     let expires_at_ms = expires_at_ms.ok_or(LinkedSourceReadFailure::MissingFields)?;
     let observed_at_ms = now_ms().ok_or(LinkedSourceReadFailure::Invalid)?;
     let generation = last_refreshed_at_ms.unwrap_or(1).max(1);
-    let subject = account_id.as_deref().unwrap_or(display_identity.as_str());
     let bundle = OAuthTokenBundleV1::new(
         haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         "https://auth.openai.com".to_owned(),
@@ -448,7 +459,7 @@ fn linked_codex_material(
         None,
         Vec::new(),
         OAuthIdentityV1 {
-            subject_hash: blake3::hash(subject.as_bytes()).to_hex().to_string(),
+            subject_hash,
             display_identity: display_identity.clone(),
         },
         generation,
@@ -464,7 +475,8 @@ fn linked_codex_material(
         CredentialSourceHealth::Ready
     };
     Ok(LinkedSourceMaterial {
-        identity: Some(identity),
+        credential_digest: None,
+        identity: bundle.account_identity.clone(),
         display_identity,
         last_refreshed_at_ms,
         access_expires_at_ms: Some(expires_at_ms),
@@ -493,7 +505,9 @@ fn linked_claude_metadata(
         &source_id[source_id.len().saturating_sub(16)..]
     );
     Ok(LinkedSourceMaterial {
+        credential_digest: None,
         identity: Some(AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: Some(display_name.to_owned()),
             account_id: Some(synthetic),
@@ -610,6 +624,7 @@ fn linked_grok_material(
             |(issuer, client)| (issuer.to_owned(), client.to_owned()),
         );
     let identity = AccountIdentity {
+        subject_hash: None,
         email,
         display_name: None,
         account_id: Some(account_id.clone()),
@@ -658,6 +673,7 @@ fn linked_kimi_material(
         // `scope`/`token_type`. A reader that only checks "file exists"
         // would report a logged-out store as a usable credential.
         return Ok(LinkedSourceMaterial {
+            credential_digest: None,
             identity: Some(kimi_identity(&account_id, last_refreshed_at_ms)),
             display_identity: account_id,
             last_refreshed_at_ms,
@@ -707,6 +723,7 @@ fn linked_kimi_material(
 
 fn kimi_identity(account_id: &str, last_refreshed_at_ms: Option<u64>) -> AccountIdentity {
     AccountIdentity {
+        subject_hash: None,
         email: None,
         display_name: Some("Kimi Code subscription".to_owned()),
         account_id: Some(account_id.to_owned()),
@@ -753,6 +770,7 @@ pub(crate) fn source_owned_refresh_bundle(
         identity,
         generation,
     )
+    .map(|bundle| bundle.with_refresh_after(expires_at_unix_ms.saturating_sub(300_000)))
 }
 
 /// Builds the ACCESS-ONLY broker input shared by every read-through kind.
@@ -794,7 +812,8 @@ fn linked_access_material(
         .encode()
         .map_err(|_| LinkedSourceReadFailure::Invalid)?;
     Ok(LinkedSourceMaterial {
-        identity: Some(identity),
+        credential_digest: None,
+        identity: bundle.account_identity.clone(),
         display_identity,
         last_refreshed_at_ms,
         access_expires_at_ms: Some(expires_at_ms),
@@ -918,6 +937,7 @@ fn discover_codex() -> Option<DeviceCandidate> {
         })
         .or_else(|| {
             (email.is_some() || account_id.is_some()).then(|| AccountIdentity {
+                subject_hash: None,
                 email,
                 display_name: None,
                 account_id,
@@ -969,6 +989,7 @@ fn discover_claude_file_at(path: &Path) -> Option<DeviceCandidate> {
         "Claude Code credential file (read-only)",
         None,
         Some(AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: Some(display_name.to_owned()),
             account_id: None,

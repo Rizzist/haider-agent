@@ -4,7 +4,7 @@
 //! Visual authority: the `/tui` sim — typography, chips, and row shapes are
 //! copied from it deliberately.
 
-use crate::app::{AppModel, Hit, LauncherRow, LoomPane, Screen, update_version_label};
+use crate::app::{AppModel, Hit, InputOwner, LauncherRow, LoomPane, Screen, update_version_label};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_INTRO_TEXT, PALETTE_MAX_ROWS, help_catalog_lines};
 use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
@@ -1366,12 +1366,13 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     // rect; a surface that draws none leaves it cleared.
     model.composer_rect.set(None);
     model.status_rect.set((status_height > 0).then_some(status));
-    // F2a: the full-screen /model picker COVERS the body while open —
-    // it owns the keys, so it owns the pixels and the hit map too.
+    // F2a: the full-screen /model picker covers the body only while it owns
+    // input. A blocking daemon menu outranks it and must own the painted
+    // pixels and hit map as well as the keys.
     if model.ssh_terminal.is_some() {
         render_ssh_terminal(model, theme, frame, body);
         hits.clear();
-    } else if model.model_picker.is_some() {
+    } else if model.model_picker.is_some() && !model.non_spend_menu_owns_picker() {
         render_model_picker(model, theme, frame, body, &mut hits);
     } else {
         match model.screen {
@@ -1429,6 +1430,25 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             && rect.x.saturating_add(rect.width) <= area.x.saturating_add(area.width)
             && rect.y.saturating_add(rect.height) <= area.y.saturating_add(area.height)
     });
+    let mut owner = model.input_owner();
+    if let InputOwner::Menu(id) = &owner
+        && !hits
+            .iter()
+            .any(|(_, hit)| matches!(hit, Hit::MenuOption { menu, .. } if menu == id))
+    {
+        owner = InputOwner::Surface(model.screen);
+    }
+    let menu = matches!(&owner, InputOwner::Menu(_))
+        .then(|| model.select_menu().cloned())
+        .flatten();
+    if *model.presented_input_owner.borrow() != owner || *model.presented_menu.borrow() != menu {
+        model
+            .presented_input_epoch
+            .set(model.presented_input_epoch.get().wrapping_add(1));
+    }
+    *model.presented_input_owner.borrow_mut() = owner;
+    *model.presented_menu.borrow_mut() = menu;
+    model.presented_input_seen.set(true);
     hits
 }
 
@@ -4627,6 +4647,7 @@ fn calendar_instant(timestamp_ms: u64) -> (i64, String) {
     )
 }
 
+
 /// U2 — the `/usage` screen: one block per provider group showing the
 /// SELECTED account (←/→ tabs), its meter state rendered per the wire's
 /// tag — `metered` limit bars with % + reset times, `unavailable` the
@@ -5129,7 +5150,9 @@ fn render_usage(
                                 ));
                             }
                         }
-                        haider_protocol::usage::AccountMeterStateV1::Unavailable { reason } => {
+                        haider_protocol::usage::AccountMeterStateV1::Unavailable {
+                            reason, ..
+                        } => {
                             spans.push(Span::styled(
                                 format!(
                                     "meter unavailable · {}",
@@ -5291,7 +5314,7 @@ fn render_usage(
                         lines.push(Line::from(spans));
                     }
                 }
-                AccountMeterStateV1::Unavailable { reason } => {
+                AccountMeterStateV1::Unavailable { reason, .. } => {
                     // The typed reason, honestly — NEVER a fabricated bar.
                     lines.push(Line::from(vec![
                         Span::styled("    meter unavailable · ", theme.warn_style()),
@@ -5999,11 +6022,9 @@ fn render_session(
     } else {
         // A zero-option ask never REPLACES the composer — the composer is
         // its answer line (owner report: select-only chrome rendered an
-        // unanswerable question). Its title/body render above the input.
-        model
-            .projection
-            .open_menu()
-            .filter(|menu| !menu.options.is_empty())
+        // unanswerable question). Its title/body render above the input. A
+        // deferred spend-approval card yields to a composer being typed in.
+        model.select_menu()
     };
     let ask_menu = if model.login.is_some() {
         None
@@ -7317,7 +7338,18 @@ fn render_session(
             .style(theme.text_style()),
             rule_area,
         );
-        let footer = if crate::app::menu_file_review(menu).is_some() {
+        let footer = if crate::app::is_deferred_approval(menu) {
+            // A spend-approval card takes no digits and never wraps: only an
+            // explicit ↓ reaches the spending option.
+            let default = menu
+                .options
+                .first()
+                .map_or("", |option| option.label.as_str());
+            format!(
+                " ↓↑ choose · ⏎ confirm (default {default}) · esc later · menu {}",
+                menu.id
+            )
+        } else if crate::app::menu_file_review(menu).is_some() {
             format!(
                 " ←→ hunks · ↑↓ scroll · Tab decision · ⏎ apply · 1-{} quick",
                 menu.options.len()
@@ -7332,7 +7364,7 @@ fn render_session(
         };
         let (menu_lines, option_rows) = menu_block(
             menu,
-            model.menu_selection,
+            model.menu_display_selection(menu),
             theme,
             composer_area,
             &footer,
@@ -11031,7 +11063,10 @@ fn render_subagent(
     let menu = if model.login.is_some() {
         None
     } else {
-        chip.question_menu()
+        chip.question_menu().filter(|menu| {
+            !crate::app::is_deferred_approval(menu)
+                || model.visible_spend_card().as_ref() == Some(&menu.id)
+        })
     };
     let needed_input = menu.map_or_else(
         || composer_height(model, area.width),
@@ -11428,13 +11463,21 @@ fn render_subagent(
             .style(theme.text_style()),
             rule_area,
         );
-        let footer = format!(
-            " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
-            menu.options.len()
-        );
+        let footer = if crate::app::is_deferred_approval(menu) {
+            let default = menu
+                .options
+                .first()
+                .map_or("", |option| option.label.as_str());
+            format!(" ↓↑ choose · ⏎ confirm (default {default}) · esc back to session")
+        } else {
+            format!(
+                " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
+                menu.options.len()
+            )
+        };
         let (menu_lines, option_rows) = menu_block(
             menu,
-            model.menu_selection,
+            model.menu_display_selection(menu),
             theme,
             composer_area,
             &footer,
@@ -12630,20 +12673,16 @@ fn span_row_width(spans: &[Span<'_>]) -> usize {
 const THEME_PICKER_ROWS: u16 = 8;
 
 /// Whether the `/theme` picker renders THIS frame: open, on a surface
-/// that hosts it, with no daemon card holding the input slot (the menu /
-/// ask branches outrank it — local chrome never sits on a live ask).
+/// that hosts it, with no ordinary daemon menu holding the input slot.
+/// A deferred spend card stays hidden beneath the picker.
 fn theme_picker_showing(model: &AppModel) -> bool {
     model.theme_picker.is_some()
         && matches!(
             model.screen,
             Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
         )
-        && model.projection.open_menu().is_none()
+        && !model.non_spend_menu_owns_picker()
         && model.login.is_none()
-        && !(model.screen == Screen::Subagent
-            && model
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
 }
 
 /// The `/theme` picker (owner spec §3): a numbered arrow-highlight card in
@@ -12737,12 +12776,8 @@ fn render_theme_picker(
 fn effort_picker_showing(model: &AppModel) -> bool {
     model.effort_picker.is_some()
         && matches!(model.screen, Screen::Session | Screen::Subagent)
-        && model.projection.open_menu().is_none()
+        && !model.non_spend_menu_owns_picker()
         && model.login.is_none()
-        && !(model.screen == Screen::Subagent
-            && model
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
 }
 
 /// Rows the `/effort` picker card needs: title + body + the option rows +

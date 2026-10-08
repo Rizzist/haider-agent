@@ -66,3 +66,16 @@ then email, then display identity. If an OAuth refresh later adds an account
 ID or changes the email without a user account switch, the key changes: a
 restart loads a cold catalog and an in-flight refresh can return Busy once.
 This identity drift does not expose the previous account's fetched rows.
+
+An OAuth identity counts as the account only when it carries a provider-issued
+email or an independently verified ID token. Otherwise (a Kimi Code home's
+`kimi:<source>` coordinate, a Claude Code import's plan label, a login whose
+provider returns no account coordinate) the key also carries the intake epoch,
+exactly like an API key: the login/import time, kept by token refresh, or the
+linked source file's modification time. A different account signing in at the
+same source therefore starts a new catalog: its live rows clear, a flight
+started under the old key is fenced, the old durable row is swept, and even an
+unswept row can never be read under the new key. Logins without an account
+coordinate (Kimi, Grok without an ID token, Anthropic) get a synthetic
+per-grant identity, stable across refresh. Source enrollment, scans and
+reconciliation publish the account view and provider summaries together.

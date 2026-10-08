@@ -24,6 +24,21 @@ fn task_outcome_catalog_is_actor_owned_and_respects_the_grant_ceiling() {
     assert!(limited.iter().all(|tool| tool.name != "task_outcome"));
 }
 
+#[test]
+fn usage_reset_tool_is_root_only_and_declares_the_human_only_effect() {
+    let tool = registered_tool_by_name("usage_reset_apply").expect("registered reset tool");
+    assert_eq!(tool.route, RegisteredToolRoute::UsageResetApply);
+    assert_eq!(tool.default, ToolPermissionDefault::Ask);
+    assert_eq!(tool.manifest.effects, vec![EffectClass::UsageResetApply]);
+    assert!(
+        !default_child_grant()
+            .tools
+            .iter()
+            .any(|name| name == "usage_reset_apply"),
+        "a delegated child cannot spend the parent account's reset credit"
+    );
+}
+
 #[tokio::test]
 async fn unavailable_workspace_tool_call_is_a_typed_rejection_without_an_effect() {
     let dispatcher = WorkspaceUnavailableToolDispatcher {
@@ -305,6 +320,7 @@ fn lockdown_turn_advertises_only_the_fixed_reduced_pack() {
         "monitor",
         "computer",
         "mobile",
+        "usage_reset_apply",
         "loom_register",
         "graph_evidence",
     ] {

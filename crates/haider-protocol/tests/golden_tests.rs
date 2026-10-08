@@ -1535,6 +1535,8 @@ fn golden_credentials() {
     golden(
         "credential_descriptor_oauth",
         &CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("personal-max"),
             provider: "anthropic".into(),
             base_url: None,
@@ -1550,6 +1552,8 @@ fn golden_credentials() {
     golden(
         "credential_descriptor_keychain_locked",
         &CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("claude-code"),
             provider: "anthropic-oauth".into(),
             base_url: None,
@@ -1654,6 +1658,8 @@ fn golden_usage_report_v1() {
                             },
                         ],
                     },
+                    reset_credits: None,
+                    previous_resets: Vec::new(),
                     local: LocalUsageStatsV1 {
                         sessions: 3,
                         total_duration_ms: 5_400_000,
@@ -1676,6 +1682,8 @@ fn golden_usage_report_v1() {
                     plan: None,
                     auth_method: haider_protocol::credential::AuthMethod::ApiKey,
                     meter: AccountMeterStateV1::LocalOnly,
+                    reset_credits: None,
+                    previous_resets: Vec::new(),
                     local: LocalUsageStatsV1 {
                         sessions: 1,
                         total_duration_ms: 600_000,
@@ -1699,6 +1707,7 @@ fn golden_usage_report_v1() {
         "usage_meter_unavailable",
         &AccountMeterStateV1::Unavailable {
             reason: "http_status_429".into(),
+            retry_at_ms: None,
         },
     );
 }
@@ -1728,7 +1737,8 @@ fn usage_report_fields_are_tolerant_and_additive() {
     assert_eq!(
         entry.meter,
         AccountMeterStateV1::Unavailable {
-            reason: "not_yet_polled".into()
+            reason: "not_yet_polled".into(),
+            retry_at_ms: None,
         }
     );
     assert_eq!(entry.local.reasoning_tokens, 0);
@@ -2580,4 +2590,51 @@ fn additive_permission_grant_resolved_event_shape() {
             retrying_parked_action: true,
         }),
     );
+}
+
+#[test]
+fn deferred_approval_menu_is_explicitly_nonblocking_and_account_scoped() {
+    let menu = Menu {
+        id: MenuId::new("deferred-reset-redacted"),
+        kind: MenuKind::DeferredApproval {
+            approval_id: "approval-redacted".into(),
+            effect: haider_protocol::effect::EffectClass::UsageResetApply,
+            account: Some(CredentialAlias::new("openai-oauth")),
+            binding: Some(haider_protocol::credential::UsageResetAccountBinding {
+                provider: "openai-oauth".into(),
+                account_id: "synthetic-workspace".into(),
+                incarnation: 7,
+                subject_hash: Some("synthetic-subject".into()),
+            }),
+        },
+        title: "Apply a usage reset credit?".into(),
+        body: Vec::new(),
+        options: Vec::new(),
+        blocking: false,
+        scope: MenuScope::Session,
+        origin: "deferred_approval_v1".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let value = serde_json::to_value(&menu).expect("menu json");
+    assert_eq!(value["kind"]["kind"], "deferred_approval");
+    assert_eq!(value["kind"]["effect"]["class"], "usage_reset_apply");
+    assert_eq!(
+        value["kind"]["binding"]["account_id"],
+        "synthetic-workspace"
+    );
+    assert_eq!(value["kind"]["binding"]["incarnation"], 7);
+    assert_eq!(value["blocking"], false);
+    let decoded: Menu = serde_json::from_value(value).expect("menu round trip");
+    assert_eq!(decoded, menu);
+    let mut legacy = serde_json::to_value(&menu).expect("legacy menu json");
+    legacy["kind"]
+        .as_object_mut()
+        .expect("kind object")
+        .remove("binding");
+    let legacy: Menu = serde_json::from_value(legacy).expect("legacy menu round trip");
+    assert!(matches!(
+        legacy.kind,
+        MenuKind::DeferredApproval { binding: None, .. }
+    ));
 }

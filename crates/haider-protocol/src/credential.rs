@@ -6,11 +6,18 @@ use serde::{Deserialize, Serialize};
 
 /// Informational, secret-free account facts captured at credential intake.
 ///
-/// These fields are never authentication authority. In particular,
-/// `verified = false` is the only honest value for claims decoded from a JWT
-/// without checking its signature against the issuer.
+/// These fields cannot authenticate on their own. The saved OAuth bundle
+/// must match the subject digest and account coordinate before a token is
+/// handed to a reset action. `verified = false` is the only honest value for
+/// claims decoded from a JWT without checking its signature against the issuer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountIdentity {
+    /// Stable, non-secret OAuth principal digest. It binds a saved token
+    /// bundle to the account record through a vault-before-record update.
+    /// Older records omit it and cannot authorize a usage reset until the
+    /// account is re-established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -26,6 +33,9 @@ pub struct AccountIdentity {
 }
 
 impl AccountIdentity {
+    /// Maximum number of characters retained from one identity claim.
+    pub const MAX_FIELD_CHARS: usize = 512;
+
     /// Normalizes one untrusted informational claim before it can reach a
     /// descriptor or operator surface.
     #[must_use]
@@ -33,7 +43,7 @@ impl AccountIdentity {
         let value: String = value
             .chars()
             .filter(|character| !character.is_control())
-            .take(512)
+            .take(Self::MAX_FIELD_CHARS)
             .collect();
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_owned())
@@ -85,6 +95,29 @@ pub struct CredentialDescriptor {
     /// written before v0.0.964 retain `None` rather than inventing a date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
+    /// Durable account generation. Zero denotes a pre-incarnation record and
+    /// is replaced on load before an authenticated catalog can be hydrated.
+    #[serde(default, skip_serializing_if = "incarnation_is_zero")]
+    pub incarnation: u64,
+    /// Digest of credential bytes observed at intake. Equality proves
+    /// byte-identical intake; it is never exposed in a catalog key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_digest: Option<String>,
+}
+
+fn incarnation_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Immutable reset target captured when a spending card opens. The alias is
+/// carried separately by the menu for display; this is the dispatch fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageResetAccountBinding {
+    pub provider: String,
+    pub account_id: String,
+    pub incarnation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

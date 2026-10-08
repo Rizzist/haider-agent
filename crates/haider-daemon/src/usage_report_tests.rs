@@ -49,6 +49,7 @@ const ANTHROPIC_LIVE_BODY: &str = r#"{"five_hour":{"utilization":60.0,"resets_at
 
 fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> CredentialDescriptor {
     CredentialDescriptor {
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.into(),
         base_url: None,
@@ -58,6 +59,7 @@ fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> Credentia
         active: true,
         label: None,
         account_identity: None,
+        incarnation: 1,
         created_at_ms: None,
     }
 }
@@ -65,6 +67,7 @@ fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> Credentia
 fn openai_descriptor(alias: &str, account_id: &str) -> CredentialDescriptor {
     let mut descriptor = descriptor("openai-oauth", alias, AuthMethod::OAuth);
     descriptor.account_identity = Some(AccountIdentity {
+        subject_hash: Some(format!("synthetic-subject-{alias}")),
         email: Some(format!("{alias}@example.invalid")),
         display_name: None,
         account_id: Some(account_id.to_owned()),
@@ -156,6 +159,7 @@ struct StubHttp {
     calls: AtomicU64,
     responses: HashMap<String, (u16, Vec<u8>)>,
     requests: std::sync::Mutex<Vec<CapturedMeterRequest>>,
+    retry_after: Option<String>,
 }
 
 impl StubHttp {
@@ -164,7 +168,13 @@ impl StubHttp {
             calls: AtomicU64::new(0),
             responses: responses.into_iter().collect(),
             requests: std::sync::Mutex::new(Vec::new()),
+            retry_after: None,
         }
+    }
+
+    fn with_retry_after(mut self, value: &str) -> Self {
+        self.retry_after = Some(value.to_owned());
+        self
     }
 
     fn calls(&self) -> u64 {
@@ -184,7 +194,7 @@ impl UsageMeterHttp for StubHttp {
         _bearer: &SecretHandle,
         extra_headers: &[(&'static str, &'static str)],
         chatgpt_account_id: Option<&str>,
-    ) -> Result<(u16, Vec<u8>), MeterUnavailable> {
+    ) -> Result<super::UsageMeterHttpResponse, MeterUnavailable> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().expect("request capture").push((
             url.to_owned(),
@@ -194,6 +204,11 @@ impl UsageMeterHttp for StubHttp {
         self.responses
             .get(url)
             .cloned()
+            .map(|(status, body)| super::UsageMeterHttpResponse {
+                status,
+                body,
+                retry_after: self.retry_after.clone(),
+            })
             .ok_or_else(|| MeterUnavailable::new("transport_error"))
     }
 }
@@ -250,7 +265,8 @@ async fn api_key_and_custom_accounts_are_local_only_and_never_probe_http() {
     assert_eq!(
         report.accounts[3].meter,
         AccountMeterStateV1::Unavailable {
-            reason: "credential_broker_unavailable".into()
+            reason: "credential_broker_unavailable".into(),
+            retry_at_ms: None,
         }
     );
     assert_eq!(http.calls(), 0, "no meter endpoint may be probed");
@@ -341,6 +357,109 @@ async fn haider_code_held_plan_is_metered_and_arrival_appends_one_exact_sample()
         1,
         "report rendering must not duplicate an arrival sample"
     );
+}
+
+#[tokio::test]
+async fn prior_resets_fall_back_to_exact_device_journal_timestamps() {
+    let now = 1_777_075_200_000;
+    let service = service_with_clock(
+        vec![descriptor("openai", "billing-key", AuthMethod::ApiKey)],
+        None,
+        Arc::new(StubHttp::new([])),
+        Arc::new(AtomicU64::new(now)),
+    );
+    let (_root, store) = empty_store().await;
+    store
+        .append_usage_meter_sample(haider_protocol::usage::UsageHistoryMeterSampleV1 {
+            account: "billing-key".into(),
+            window: "weekly".into(),
+            basis_points: 2_500,
+            resets_at_ms: Some(now - 86_400_000),
+            grace_until_ms: None,
+            sampled_at_ms: now - 172_800_000,
+            plan: None,
+            credits: None,
+            hold: None,
+            stale: None,
+        })
+        .await
+        .expect("append prior sample");
+    let report = service
+        .report(&store)
+        .await
+        .expect("report before confirmation");
+    assert!(
+        report.accounts[0].previous_resets.is_empty(),
+        "a passed scheduled timestamp alone is not reset history"
+    );
+    store
+        .append_usage_meter_sample(haider_protocol::usage::UsageHistoryMeterSampleV1 {
+            account: "billing-key".into(),
+            window: "weekly".into(),
+            basis_points: 1_000,
+            resets_at_ms: Some(now + 6 * 86_400_000),
+            grace_until_ms: None,
+            sampled_at_ms: now - 1_000,
+            plan: None,
+            credits: None,
+            hold: None,
+            stale: None,
+        })
+        .await
+        .expect("append confirming sample");
+    let report = service.report(&store).await.expect("report");
+    assert_eq!(report.accounts[0].previous_resets.len(), 1);
+    let reset = &report.accounts[0].previous_resets[0];
+    assert_eq!(reset.reset_at_ms, now - 86_400_000);
+    assert_eq!(
+        reset.source,
+        haider_protocol::usage::UsageResetHistorySourceV1::DeviceJournal
+    );
+    assert_eq!(reset.window.as_deref(), Some("weekly"));
+    assert_eq!(reset.observed_at_ms, Some(now - 1_000));
+}
+
+#[tokio::test]
+async fn same_millisecond_device_resets_have_stable_window_order() {
+    let now = 1_777_075_200_000;
+    let service = service_with_clock(
+        vec![descriptor("openai", "billing-key", AuthMethod::ApiKey)],
+        None,
+        Arc::new(StubHttp::new([])),
+        Arc::new(AtomicU64::new(now)),
+    );
+    let (_root, store) = empty_store().await;
+    for window in ["weekly", "five_hour"] {
+        for (sampled_at_ms, resets_at_ms) in [
+            (now - 172_800_000, now - 86_400_000),
+            (now - 1_000, now + 86_400_000),
+        ] {
+            store
+                .append_usage_meter_sample(haider_protocol::usage::UsageHistoryMeterSampleV1 {
+                    account: "billing-key".into(),
+                    window: window.into(),
+                    basis_points: 1_000,
+                    resets_at_ms: Some(resets_at_ms),
+                    grace_until_ms: None,
+                    sampled_at_ms,
+                    plan: None,
+                    credits: None,
+                    hold: None,
+                    stale: None,
+                })
+                .await
+                .expect("append sample");
+        }
+    }
+    for _ in 0..10 {
+        let report = service.report(&store).await.expect("report");
+        let windows = report.accounts[0]
+            .previous_resets
+            .iter()
+            .map(|entry| entry.window.as_deref().expect("window"))
+            .collect::<Vec<_>>();
+        assert_eq!(windows, ["five_hour", "weekly"]);
+    }
 }
 
 /// MUTATION CHECK: drop `meter.credits` at the capture-to-ledger seam.
@@ -583,7 +702,7 @@ async fn oauth_meter_reading_normalizes_and_respects_the_poll_floor() {
 }
 
 /// LAW (meter_failures_are_typed_cached_and_never_hammered): an HTTP 429
-/// reading is a typed `unavailable` (`http_status_429`) that is CACHED like
+/// reading is a typed `unavailable` (`http_429_rate_limited`) that is CACHED like
 /// a success — an immediate second report does not hammer the endpoint —
 /// and a token-source failure surfaces its own typed reason without any
 /// HTTP call.
@@ -607,14 +726,16 @@ async fn meter_failures_are_typed_cached_and_never_hammered() {
     assert_eq!(
         report.accounts[0].meter,
         AccountMeterStateV1::Unavailable {
-            reason: "http_status_429".into()
+            reason: "http_429_rate_limited".into(),
+            retry_at_ms: None,
         }
     );
     let again = service.report(&store).await.expect("second report");
     assert_eq!(
         again.accounts[0].meter,
         AccountMeterStateV1::Unavailable {
-            reason: "http_status_429".into()
+            reason: "http_429_rate_limited".into(),
+            retry_at_ms: None,
         }
     );
     assert_eq!(http.calls(), 1, "failures are cached, not hammered");
@@ -629,10 +750,444 @@ async fn meter_failures_are_typed_cached_and_never_hammered() {
     assert_eq!(
         report.accounts[0].meter,
         AccountMeterStateV1::Unavailable {
-            reason: "credential_unavailable".into()
+            reason: "credential_unavailable".into(),
+            retry_at_ms: None,
         }
     );
     assert_eq!(http.calls(), 1, "no HTTP without a token");
+}
+
+#[tokio::test]
+async fn rate_limit_retry_after_is_published_as_an_exact_retry_instant() {
+    let clock = Arc::new(AtomicU64::new(5_000_000));
+    let http = Arc::new(
+        StubHttp::new([(
+            haider_provider::ANTHROPIC_OAUTH_USAGE_URL.to_owned(),
+            (429, b"{}".to_vec()),
+        )])
+        .with_retry_after("30"),
+    );
+    let service = service_with_clock(
+        vec![descriptor("anthropic-oauth", "max-sub", AuthMethod::OAuth)],
+        Some(Arc::new(StubTokens {
+            bytes: b"redacted-test-token".to_vec(),
+        })),
+        http,
+        clock,
+    );
+    let (_root, store) = empty_store().await;
+    let report = service.report(&store).await.expect("report");
+    assert_eq!(
+        report.accounts[0].meter,
+        AccountMeterStateV1::Unavailable {
+            reason: "http_429_rate_limited".into(),
+            retry_at_ms: Some(5_030_000),
+        }
+    );
+}
+
+#[tokio::test]
+async fn authorization_failures_publish_specific_relogin_reasons() {
+    for (status, expected) in [
+        (401, "credential_expired"),
+        (403, "http_403_forbidden_relogin"),
+    ] {
+        let http = Arc::new(StubHttp::new([(
+            haider_provider::ANTHROPIC_OAUTH_USAGE_URL.to_owned(),
+            (status, b"{}".to_vec()),
+        )]));
+        let service = service_with_clock(
+            vec![descriptor(
+                "anthropic-oauth",
+                "stale-subscription",
+                AuthMethod::OAuth,
+            )],
+            Some(Arc::new(StubTokens {
+                bytes: b"redacted-test-token".to_vec(),
+            })),
+            http,
+            Arc::new(AtomicU64::new(5_000_000)),
+        );
+        let (_root, store) = empty_store().await;
+        let report = service.report(&store).await.expect("report");
+        assert_eq!(
+            report.accounts[0].meter,
+            AccountMeterStateV1::Unavailable {
+                reason: expected.into(),
+                retry_at_ms: None,
+            }
+        );
+    }
+}
+
+struct ApplyHttp {
+    post: std::sync::Mutex<Vec<(String, Option<String>, serde_json::Value)>>,
+    status: u16,
+    response_body: Vec<u8>,
+    retry_after: Option<String>,
+}
+
+impl ApplyHttp {
+    fn replying(status: u16, body: &[u8]) -> Self {
+        Self {
+            post: std::sync::Mutex::new(Vec::new()),
+            status,
+            response_body: body.to_vec(),
+            retry_after: None,
+        }
+    }
+
+    fn posts(&self) -> usize {
+        self.post.lock().expect("post capture").len()
+    }
+}
+
+#[async_trait::async_trait]
+impl UsageMeterHttp for ApplyHttp {
+    async fn get(
+        &self,
+        _url: &str,
+        _bearer: &SecretHandle,
+        _extra_headers: &[(&'static str, &'static str)],
+        _chatgpt_account_id: Option<&str>,
+    ) -> Result<super::UsageMeterHttpResponse, MeterUnavailable> {
+        Err(MeterUnavailable::new("unexpected_get"))
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        _bearer: &SecretHandle,
+        _extra_headers: &[(&'static str, &'static str)],
+        chatgpt_account_id: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<super::UsageMeterHttpResponse, MeterUnavailable> {
+        self.post.lock().expect("post capture").push((
+            url.to_owned(),
+            chatgpt_account_id.map(str::to_owned),
+            body.clone(),
+        ));
+        Ok(super::UsageMeterHttpResponse {
+            status: self.status,
+            body: self.response_body.clone(),
+            retry_after: self.retry_after.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn reset_apply_uses_verified_endpoint_account_scope_and_idempotency_key() {
+    let http = Arc::new(ApplyHttp::replying(
+        200,
+        br#"{"code":"reset","windows_reset":2}"#,
+    ));
+    let service = service_with_clock(
+        vec![openai_descriptor(
+            "work-chatgpt",
+            "redacted-account-coordinate",
+        )],
+        Some(Arc::new(StubTokens {
+            bytes: b"redacted-test-token".to_vec(),
+        })),
+        Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+        Arc::new(AtomicU64::new(9_000_000)),
+    );
+    assert_eq!(
+        service
+            .apply_reset(
+                &CredentialAlias::new("work-chatgpt"),
+                "approval-idempotency-key"
+            )
+            .await
+            .expect("apply reset"),
+        2
+    );
+    let post = http.post.lock().expect("post capture");
+    assert_eq!(post.len(), 1);
+    assert_eq!(post[0].0, haider_provider::OPENAI_OAUTH_RESET_CONSUME_URL);
+    assert_eq!(post[0].1.as_deref(), Some("redacted-account-coordinate"));
+    assert_eq!(
+        post[0].2,
+        serde_json::json!({"redeem_request_id": "approval-idempotency-key"})
+    );
+}
+
+#[tokio::test]
+async fn bound_reset_rejects_changed_id_or_incarnation_before_post() {
+    let http = Arc::new(ApplyHttp::replying(
+        200,
+        br#"{"code":"reset","windows_reset":1}"#,
+    ));
+    let service = reset_apply_service(
+        Arc::clone(&http),
+        openai_descriptor("work-chatgpt", "workspace-b"),
+    );
+    let alias = CredentialAlias::new("work-chatgpt");
+    let mut binding = service.reset_binding(&alias).expect("current binding");
+    binding.account_id = "workspace-a".into();
+    assert_eq!(
+        service
+            .apply_bound_reset(&alias, "approval-old", &binding)
+            .await
+            .expect_err("changed account id")
+            .reason,
+        "account_changed"
+    );
+    binding.account_id = "workspace-b".into();
+    binding.incarnation += 1;
+    assert_eq!(
+        service
+            .apply_bound_reset(&alias, "approval-old", &binding)
+            .await
+            .expect_err("changed incarnation")
+            .reason,
+        "account_changed"
+    );
+    assert_eq!(http.posts(), 0);
+}
+
+struct PausingTokens {
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait::async_trait]
+impl MeterTokenSource for PausingTokens {
+    async fn bearer(
+        &self,
+        _descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, MeterUnavailable> {
+        self.entered.wait().await;
+        self.release.wait().await;
+        Ok(secret(b"synthetic-token"))
+    }
+}
+
+#[tokio::test]
+async fn bound_reset_rechecks_replacement_or_removal_after_token_resolution() {
+    for change in ["incarnation", "account_id", "subject_hash", "remove"] {
+        let descriptors = snapshot(vec![openai_descriptor("work-chatgpt", "workspace-a")]);
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let http = Arc::new(ApplyHttp::replying(
+            200,
+            br#"{"code":"reset","windows_reset":1}"#,
+        ));
+        let service = super::UsageReportService::with_clock(
+            Arc::clone(&descriptors),
+            Some(Arc::new(PausingTokens {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })),
+            Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+            Box::new(|| 9_000_000),
+        );
+        let alias = CredentialAlias::new("work-chatgpt");
+        let binding = service.reset_binding(&alias).expect("original binding");
+        let mutate = async {
+            entered.wait().await;
+            {
+                let mut rows = descriptors.lock().expect("snapshot lock");
+                if change == "remove" {
+                    rows.clear();
+                } else {
+                    if change == "account_id" {
+                        rows[0] = openai_descriptor("work-chatgpt", "workspace-b");
+                    } else if change == "subject_hash" {
+                        rows[0]
+                            .account_identity
+                            .as_mut()
+                            .expect("identity")
+                            .subject_hash = Some("another-member-of-the-same-workspace".into());
+                    } else {
+                        rows[0].incarnation = binding.incarnation + 1;
+                    }
+                }
+            }
+            release.wait().await;
+        };
+        let (result, ()) = tokio::join!(
+            service.apply_bound_reset(&alias, "approval-old", &binding),
+            mutate,
+        );
+        assert_eq!(result.expect_err("stale binding").reason, "account_changed");
+        assert_eq!(http.posts(), 0, "change={change}");
+    }
+}
+
+#[tokio::test]
+async fn reset_binding_requires_subject_and_survives_same_account_refresh() {
+    let alias = CredentialAlias::new("work-chatgpt");
+    let mut row = openai_descriptor(alias.as_str(), "workspace-a");
+    let descriptors = snapshot(vec![row.clone()]);
+    let http = Arc::new(ApplyHttp::replying(
+        200,
+        br#"{"code":"reset","windows_reset":1}"#,
+    ));
+    let service = super::UsageReportService::with_clock(
+        Arc::clone(&descriptors),
+        Some(Arc::new(StubTokens {
+            bytes: b"synthetic-token".to_vec(),
+        })),
+        Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+        Box::new(|| 9_000_000),
+    );
+    let binding = service.reset_binding(&alias).expect("bound principal");
+    row.account_identity.as_mut().expect("identity").captured_at += 1;
+    row.credential_digest = Some("rotated-synthetic-refresh".into());
+    *descriptors.lock().expect("snapshot") = vec![row];
+    service
+        .apply_bound_reset(&alias, "same-member", &binding)
+        .await
+        .expect("same principal refresh");
+    assert_eq!(http.posts(), 1);
+
+    descriptors.lock().expect("snapshot")[0]
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .subject_hash = None;
+    assert!(
+        service.reset_binding(&alias).is_none(),
+        "legacy unbound record cannot mint a reset approval"
+    );
+    assert_eq!(
+        service
+            .apply_bound_reset(&alias, "legacy", &binding)
+            .await
+            .expect_err("unbound record")
+            .reason,
+        "account_changed"
+    );
+    assert_eq!(http.posts(), 1);
+}
+
+#[tokio::test]
+async fn reset_apply_idempotent_replay_accepts_already_redeemed_without_a_count() {
+    let http = Arc::new(ApplyHttp::replying(200, br#"{"code":"already_redeemed"}"#));
+    let service = service_with_clock(
+        vec![openai_descriptor(
+            "work-chatgpt",
+            "redacted-account-coordinate",
+        )],
+        Some(Arc::new(StubTokens {
+            bytes: b"redacted-test-token".to_vec(),
+        })),
+        http,
+        Arc::new(AtomicU64::new(9_000_000)),
+    );
+    assert_eq!(
+        service
+            .apply_reset(
+                &CredentialAlias::new("work-chatgpt"),
+                "approval-idempotency-key"
+            )
+            .await
+            .expect("idempotent replay"),
+        0
+    );
+}
+
+fn reset_apply_service(
+    http: Arc<ApplyHttp>,
+    descriptor: CredentialDescriptor,
+) -> UsageReportService {
+    service_with_clock(
+        vec![descriptor],
+        Some(Arc::new(StubTokens {
+            bytes: b"redacted-test-token".to_vec(),
+        })),
+        http,
+        Arc::new(AtomicU64::new(9_000_000)),
+    )
+}
+
+/// Pins every typed apply failure: the auth/rate-limit reasons are shared
+/// with the meter, other statuses and provider codes stay distinct.
+#[tokio::test]
+async fn reset_apply_failures_are_typed_and_bounded() {
+    for (status, body, retry_after, expected, expected_retry_at) in [
+        (401, &b"{}"[..], None, "credential_expired", None),
+        (403, &b"{}"[..], None, "http_403_forbidden_relogin", None),
+        (
+            429,
+            &b"{}"[..],
+            Some("30"),
+            "http_429_rate_limited",
+            Some(9_030_000),
+        ),
+        (500, &b"{}"[..], None, "http_status_500", None),
+        (200, &b"not json"[..], None, "malformed_response", None),
+        (
+            200,
+            &br#"{"code":"nothing_to_reset"}"#[..],
+            None,
+            "no_eligible_window",
+            None,
+        ),
+        (
+            200,
+            &br#"{"code":"no_credit"}"#[..],
+            None,
+            "no_reset_credit",
+            None,
+        ),
+        (
+            200,
+            &br#"{"code":"surprise"}"#[..],
+            None,
+            "unexpected_response",
+            None,
+        ),
+    ] {
+        let mut http = ApplyHttp::replying(status, body);
+        http.retry_after = retry_after.map(str::to_owned);
+        let http = Arc::new(http);
+        let service = reset_apply_service(
+            Arc::clone(&http),
+            openai_descriptor("work-chatgpt", "redacted-account-coordinate"),
+        );
+        let error = service
+            .apply_reset(&CredentialAlias::new("work-chatgpt"), "approval-key")
+            .await
+            .expect_err("typed failure");
+        assert_eq!(error.reason, expected, "status {status}");
+        assert_eq!(error.retry_at_ms, expected_retry_at, "status {status}");
+        assert_eq!(http.posts(), 1, "exactly one consume request");
+    }
+}
+
+#[tokio::test]
+async fn reset_apply_refuses_unsupported_accounts_before_any_request() {
+    for (descriptor, expected) in [
+        (
+            descriptor("anthropic-oauth", "max-sub", AuthMethod::OAuth),
+            "provider_reset_not_supported",
+        ),
+        (
+            descriptor("openai-oauth", "max-sub", AuthMethod::ApiKey),
+            "provider_reset_not_supported",
+        ),
+        (
+            descriptor("openai-oauth", "max-sub", AuthMethod::OAuth),
+            "credential_identity_incomplete",
+        ),
+    ] {
+        let http = Arc::new(ApplyHttp::replying(200, br#"{"code":"reset"}"#));
+        let service = reset_apply_service(Arc::clone(&http), descriptor);
+        let error = service
+            .apply_reset(&CredentialAlias::new("max-sub"), "approval-key")
+            .await
+            .expect_err("refused");
+        assert_eq!(error.reason, expected);
+        assert_eq!(http.posts(), 0, "no consume request may be sent");
+    }
+    let service = reset_apply_service(
+        Arc::new(ApplyHttp::replying(200, b"{}")),
+        descriptor("openai-oauth", "api-key", AuthMethod::ApiKey),
+    );
+    assert!(!service.reset_apply_supported(&CredentialAlias::new("api-key")));
+    assert!(!service.reset_apply_supported(&CredentialAlias::new("missing")));
 }
 
 fn jwt_with_claims(claims: &serde_json::Value) -> Vec<u8> {
@@ -706,6 +1261,62 @@ async fn openai_token_claims_supply_email_and_plan_with_meter_precedence() {
     );
 }
 
+#[tokio::test]
+async fn openai_meter_enriches_reset_inventory_from_the_verified_detail_endpoint() {
+    let usage = br#"{
+        "plan_type":"plus",
+        "rate_limit":{"primary_window":{"used_percent":41,"reset_at":1790662309,"limit_window_seconds":604800}},
+        "rate_limit_reset_credits":{"available_count":1,"applicable_available_count":1}
+    }"#;
+    let details = br#"{
+        "available_count":1,
+        "applicable_available_count":1,
+        "total_earned_count":3,
+        "used_count":2,
+        "remaining_count":1,
+        "credits":[]
+    }"#;
+    let http = Arc::new(StubHttp::new([
+        (
+            haider_provider::OPENAI_OAUTH_USAGE_URL.to_owned(),
+            (200, usage.to_vec()),
+        ),
+        (
+            haider_provider::OPENAI_OAUTH_RESET_CREDITS_URL.to_owned(),
+            (200, details.to_vec()),
+        ),
+    ]));
+    let service = service_with_clock(
+        vec![openai_descriptor(
+            "work-chatgpt",
+            "redacted-account-coordinate",
+        )],
+        Some(Arc::new(StubTokens {
+            bytes: b"redacted-test-token".to_vec(),
+        })),
+        Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+        Arc::new(AtomicU64::new(9_000_000)),
+    );
+    let (_root, store) = empty_store().await;
+    let report = service.report(&store).await.expect("report");
+    let AccountMeterStateV1::Metered { windows } = &report.accounts[0].meter else {
+        panic!("OpenAI weekly usage must be metered");
+    };
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].window, "weekly");
+    assert!((windows[0].utilization - 0.41).abs() < 1e-12);
+    let credits = report.accounts[0]
+        .reset_credits
+        .as_ref()
+        .expect("reset credits");
+    assert_eq!(credits.available_count, 1);
+    assert_eq!(credits.total_earned_count, Some(3));
+    assert_eq!(credits.used_count, Some(2));
+    assert_eq!(credits.remaining_count, Some(1));
+    assert!(credits.apply_supported);
+    assert_eq!(http.calls(), 2);
+}
+
 /// The WHAM request must never guess an OpenAI organization or omit the
 /// ID-token-derived ChatGPT account coordinate. Missing identity fails before
 /// HTTP and remains branchable in the report row.
@@ -732,7 +1343,8 @@ async fn openai_meter_requires_the_chatgpt_account_id_claim_before_http() {
     assert_eq!(
         report.accounts[0].meter,
         AccountMeterStateV1::Unavailable {
-            reason: "credential_identity_incomplete".into()
+            reason: "credential_identity_incomplete".into(),
+            retry_at_ms: None,
         }
     );
     assert_eq!(
@@ -1934,6 +2546,7 @@ async fn linked_grok_source_row_reports_its_tier_from_the_live_meter() {
     let mut linked = descriptor("grok-oauth", "grok-2f8c1d0a4b6e", AuthMethod::OAuth);
     linked.identity = "pilot@example.test".into();
     linked.account_identity = Some(AccountIdentity {
+        subject_hash: None,
         email: Some("pilot@example.test".into()),
         display_name: None,
         account_id: Some("xai:user-linked".into()),
@@ -2006,7 +2619,8 @@ async fn a_supervised_agent_account_reports_unavailable_not_zero_usage() {
     assert_eq!(
         account.meter,
         AccountMeterStateV1::Unavailable {
-            reason: "provider_exposes_no_quota".into()
+            reason: "provider_exposes_no_quota".into(),
+            retry_at_ms: None,
         }
     );
     assert!(
@@ -2109,7 +2723,8 @@ fn a_supervised_agent_keeps_the_typed_credential_reasons() {
         assert_eq!(
             agent_owned_meter_state(&status),
             AccountMeterStateV1::Unavailable {
-                reason: expected.into()
+                reason: expected.into(),
+                retry_at_ms: None,
             },
             "{status:?}"
         );
