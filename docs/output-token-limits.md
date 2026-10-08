@@ -80,6 +80,50 @@ of an older native run uses its reconstructed started pair, then writes the
 pin under the same lock so later selections cannot replace its pair or route.
 Provider rebind, child inheritance and recovery read this same run record,
 including subsequent automatic pair switches and explicit rebind facts.
+Native pickup currently reduces the whole journal while holding the selection
+lock. The merged wave has no indexed run-pair reader; that optimization is
+deferred to 974.
+
+A restored explicit route carries its own resolved account, seen flag and
+selection epoch for that run. Resolving or rotating it writes a silent
+`run_output_route_resolved_v1` journal fact, without updating session-level
+resolved-route metadata. The fact uses the branch of the durable run pin or
+legacy accepted run, including fork branches. Releasing the session pin advances
+`route_reset_epoch`; the next turn resolves the current session selection.
+Recovery reads the same run facts, so a running turn cannot inherit the next
+turn's resolved account or publish its restored account as next-turn truth.
+
+Rebind always advances the selection epoch, including when the provider and
+endpoint stay the same but the output budget clamps or restores. Context-meter
+clients therefore invalidate the previous budget with the same epoch rule.
+An explicit child provider selector starts under that provider's own account
+and endpoint and re-applies the budget source, even when the provider and model
+are unchanged. A model-only selection within the inherited provider keeps its
+route; omitting a selector preserves the admitted pair, route and budget.
+Delegated-create receipts bind both budget intent and inherited route. Replay
+uses the original admitted budget; exact legacy schemas may add those fields
+only when the original response and parent history prove the same choices.
+An old explicit same-provider child selector can have retained its parent's
+route. An unchanged retry keeps that committed route and budget, even when
+the current selector would clear the route or a catalog edit changes the cap.
+Current receipts and changed provider, model, budget intent or nonempty route
+coordinates remain strict.
+Route choices recorded in the legacy digest take precedence over an old reply
+that omitted route fields. For a pre-route digest, the frozen child response
+takes precedence over the parent's next-turn state; creation-bounded parent
+history supplies choices only when that reply did not record a route. It uses
+the original delegation's run pin and subsequent run changes, bounded by the child's original creation,
+so a next-turn pick cannot supply a running parent's route. Before the durable
+delegation link exists, an implicit route requires a unique running parent;
+queued runs do not supply active inheritance, and ambiguous histories cannot
+upgrade the receipt.
+
+An explicit rebind of a queued headless run has no active-run budget receipt.
+Recovery intentionally applies its pinned budget source to the rebound route
+using the current catalog, just as pickup does; the original headless spec
+and admitted source remain durable. This permits a refreshed model ceiling to
+bound the request without changing the user's requested budget. Active runs
+instead retain the effective budget recorded in the rebind fact.
 
 ## Provider-stated maxima
 

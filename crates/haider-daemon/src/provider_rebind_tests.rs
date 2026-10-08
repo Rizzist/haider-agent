@@ -72,6 +72,46 @@ async fn create_rebind_test_session(hub: &SessionHub, session_id: &SessionId) {
         .expect("activate frozen policy");
 }
 
+// These resolver fixtures model legacy running turns without a durable pin.
+// Their route resolution still belongs to an accepted run and its branch.
+async fn start_legacy_rebind_test_run(hub: &SessionHub, session_id: &SessionId, generation: u64) {
+    let run = RunId::new("rebind-test-run");
+    let device = DeviceId::new("rebind-test-device");
+    hub.accept_internal_turn(haider_core::TurnAcceptCommand {
+        command_id: format!("accept-{session_id}"),
+        request_digest: format!("accept-{session_id}"),
+        request_json: "{}".into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        run_id: run.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: "legacy rebind turn".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+        queued_event_id: EventId::new(format!("queued-{session_id}")),
+        user_event_id: EventId::new(format!("user-{session_id}")),
+        active_event_id: EventId::new(format!("active-{session_id}")),
+        device_id: device.clone(),
+    })
+    .await
+    .expect("accept legacy run");
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("lease");
+    append_payloads(
+        &lease,
+        &device,
+        &run,
+        None,
+        &EventIdGenerator::new("legacy-start"),
+        vec![EventPayload::RunState(RunState::Thinking)],
+    )
+    .await
+    .expect("start legacy run");
+}
+
 async fn commit_test_rebind(
     hub: &SessionHub,
     session_id: &SessionId,
@@ -109,6 +149,7 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
         .expect("hub");
     let session_id = SessionId::new("rebind-live-model");
     create_rebind_test_session(&hub, &session_id).await;
+    start_legacy_rebind_test_run(&hub, &session_id, store.worker_generation()).await;
     hub.install_creatable_providers(std::collections::BTreeSet::from(["fake".to_owned()]))
         .expect("creatable provider");
     let profile = serde_json::from_value::<haider_rpc::ProviderSummaryWire>(serde_json::json!({
@@ -169,6 +210,7 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
             provider: "fake".into(),
             model: model.into(),
             expected_pair,
+            account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("selected-{ordinal}")),
             device_id: DeviceId::new("rebind-test-device"),
@@ -230,6 +272,7 @@ async fn provider_rebind_new_identity_rebuilds_same_route_using_current_model() 
         .expect("hub");
     let session_id = SessionId::new("rebind-same-route");
     create_rebind_test_session(&hub, &session_id).await;
+    start_legacy_rebind_test_run(&hub, &session_id, store.worker_generation()).await;
     let lease = hub
         .acquire_worker_lease(session_id.clone())
         .await
@@ -283,6 +326,7 @@ async fn provider_rebind_rejects_keyless_adapter_resolved_after_full_policy_rece
         .expect("hub");
     let session_id = SessionId::new("rebind-account-disappeared");
     create_rebind_test_session(&hub, &session_id).await;
+    start_legacy_rebind_test_run(&hub, &session_id, store.worker_generation()).await;
     let lease = hub
         .acquire_worker_lease(session_id.clone())
         .await
@@ -435,6 +479,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 }),
                 event_id: EventId::new(format!("{id}-event")),
                 device_id: device_id.clone(),
+                account_alias: None,
             };
         if native_pickup {
             hub.select_session_model(select_native("native-admission", "initial-model", 20000))
@@ -590,6 +635,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 expected_pair: None,
                 event_id: EventId::new("pending-model-selected"),
                 device_id: device_id.clone(),
+                account_alias: None,
             })
             .await
             .expect("pending ordinary model selection");
@@ -979,6 +1025,7 @@ async fn astra_divergent_headless_recovery_reapplies_active_limit() {
                 model: "pending-next-turn-model".into(),
                 output_budget: None,
                 expected_pair: None,
+                account_alias: None,
                 event_id: EventId::new("pending-model-selected"),
                 device_id: device_id.clone(),
             })
@@ -1149,4 +1196,239 @@ async fn astra_divergent_headless_recovery_reapplies_active_limit() {
         hub.shutdown().await.expect("hub shutdown");
         store.close().await.expect("store close");
     }
+}
+
+/// The same model on a later route must not lend its alias or epoch to an
+/// already pinned turn, including after the daemon has reopened its Store.
+#[tokio::test]
+async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
+    let root = tempfile::tempdir().expect("profile");
+    let session = SessionId::new("route-scope");
+    let run = RunId::new("active-route-scope");
+    let device = DeviceId::new("scope-device");
+    let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+        .await
+        .expect("hub");
+    create_rebind_test_session(&hub, &session).await;
+    commit_test_rebind(&hub, &session, store.worker_generation(), 1).await;
+    hub.accept_internal_turn(haider_core::TurnAcceptCommand {
+        command_id: "scope-accept".into(),
+        request_digest: "scope-accept".into(),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: run.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: "run-scoped route request".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+        queued_event_id: EventId::new("scope-queued"),
+        user_event_id: EventId::new("scope-user"),
+        active_event_id: EventId::new("scope-active"),
+        device_id: device.clone(),
+    })
+    .await
+    .expect("accepted run");
+    let lease = hub
+        .acquire_worker_lease(session.clone())
+        .await
+        .expect("lease");
+    let metadata = lease
+        .session_metadata()
+        .await
+        .expect("metadata")
+        .expect("typed");
+    let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        provider: metadata.provider.clone(),
+        model: metadata.model.clone(),
+        max_tokens: metadata.max_tokens,
+        source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(&metadata),
+    };
+    let route_fact = |mut route: haider_protocol::session::RunOutputProviderRouteV1,
+                      alias: &str| {
+        route.resolved_alias = Some(alias.to_owned());
+        route.resolved_seen = true;
+        EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new(format!("scope-{alias}")),
+            item: haider_protocol::item::TurnItem::Extension {
+                kind: haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND.into(),
+                data: serde_json::to_value(route).expect("route fact"),
+            },
+        })
+    };
+    append_payloads(
+        &lease,
+        &device,
+        &run,
+        None,
+        &EventIdGenerator::new("scope-pin"),
+        vec![
+            route_fact(pin.provider_route.clone().expect("route"), "pre-pin-alias"),
+            pin.to_event(&run).expect("pin"),
+            EventPayload::RunState(RunState::Thinking),
+        ],
+    )
+    .await
+    .expect("pin run");
+    let mut initial = metadata.clone();
+    hub.run_output_pair(&session, &run)
+        .await
+        .expect("initial pair")
+        .expect("initial pair")
+        .restore_route(&mut initial);
+    assert_eq!(
+        initial.resolved_route_alias, None,
+        "pre-pin facts are excluded"
+    );
+    assert!(!initial.resolved_route_seen);
+    lease
+        .commit_turn_resolved_route(&run, &metadata, Some("active-alias"))
+        .await
+        .expect("resolve active");
+    let untouched = lease
+        .session_metadata()
+        .await
+        .expect("session")
+        .expect("typed");
+    assert!(
+        !untouched.resolved_route_seen,
+        "run resolution never publishes session truth"
+    );
+    assert_eq!(untouched.resolved_route_alias, None);
+    let selected = hub
+        .select_session_model(haider_store::SessionSelectModelCommand {
+            command_id: "next-route".into(),
+            request_digest: "next-route".into(),
+            request_json: "{}".into(),
+            session_id: session.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "fake-next".into(),
+            model: metadata.model.clone(),
+            expected_pair: None,
+            account_alias: None,
+            output_budget: None,
+            event_id: EventId::new("next-route"),
+            device_id: device.clone(),
+        })
+        .await
+        .expect("release pin for next turn");
+    let epoch = match selected {
+        haider_store::SessionSelectModelOutcome::Committed { selected, .. }
+        | haider_store::SessionSelectModelOutcome::IdempotentReplay { selected } => {
+            selected.selected_seq
+        }
+    };
+    let next = lease
+        .session_metadata()
+        .await
+        .expect("next")
+        .expect("typed");
+    assert_eq!(next.route_reset_epoch, Some(epoch));
+    assert!(next.provider_rebind_id.is_none());
+    lease
+        .commit_resolved_route(&next, Some("next-alias"))
+        .await
+        .expect("resolve next");
+    drop(lease);
+    hub.shutdown().await.expect("shutdown");
+    drop(hub);
+    store.close().await.expect("close");
+    let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+        .await
+        .expect("restart");
+    let lease = hub
+        .acquire_worker_lease(session.clone())
+        .await
+        .expect("new lease");
+    let next = lease
+        .session_metadata()
+        .await
+        .expect("next")
+        .expect("typed");
+    assert_eq!(next.provider, "fake-next");
+    assert_eq!(next.resolved_route_alias.as_deref(), Some("next-alias"));
+    let pair = hub
+        .run_output_pair(&session, &run)
+        .await
+        .expect("pin")
+        .expect("durable");
+    let mut active = next.clone();
+    pair.restore_route(&mut active);
+    active.provider = pair.provider;
+    assert_eq!(active.provider, "fake");
+    assert_eq!(active.resolved_route_alias.as_deref(), Some("active-alias"));
+    assert!(active.resolved_route_seen);
+    assert_ne!(active.selection_epoch, next.selection_epoch);
+    lease
+        .commit_turn_resolved_route(&run, &active, Some("rotated-active-alias"))
+        .await
+        .expect("rotate restored run");
+    assert_eq!(
+        lease
+            .session_metadata()
+            .await
+            .expect("session")
+            .expect("typed"),
+        next,
+        "even a restored rotation cannot change next-turn metadata"
+    );
+    let mut again = next.clone();
+    hub.run_output_pair(&session, &run)
+        .await
+        .expect("pair")
+        .expect("pair")
+        .restore_route(&mut again);
+    assert_eq!(
+        again.resolved_route_alias.as_deref(),
+        Some("rotated-active-alias")
+    );
+    // Only a historical fixture can contain a trailing fact: the worker
+    // append door correctly refuses anything after its terminal state.
+    let event_ids = EventIdGenerator::new("scope-terminal");
+    let mut historical = [
+        EventPayload::RunState(RunState::Done),
+        route_fact(
+            haider_protocol::session::RunOutputProviderRouteV1::capture(&again).expect("route"),
+            "post-terminal-alias",
+        ),
+    ]
+    .into_iter()
+    .map(|payload| {
+        supervisor_envelope(
+            &lease,
+            &device,
+            None,
+            Some(run.clone()),
+            event_ids.next(),
+            payload,
+        )
+        .expect("historical envelope")
+    })
+    .collect::<Vec<_>>();
+    haider_core::StoreHandle::append(&store, &mut historical)
+        .await
+        .expect("historical terminal control");
+    let mut completed = next.clone();
+    hub.run_output_pair(&session, &run)
+        .await
+        .expect("completed pair")
+        .expect("completed pair")
+        .restore_route(&mut completed);
+    assert_eq!(
+        completed.resolved_route_alias, again.resolved_route_alias,
+        "post-terminal facts are excluded"
+    );
+    assert_eq!(
+        lease
+            .session_metadata()
+            .await
+            .expect("session")
+            .expect("typed"),
+        next
+    );
+    drop(lease);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
 }

@@ -63,6 +63,7 @@ async fn public_workflow_catalog_human_templates_have_explicit_headless_refusal(
 async fn public_spawn_establishment_restart(
     fail_before_accept: bool,
     parent_cancelled: Option<bool>,
+    upgrade_fixture: u8,
 ) {
     use haider_protocol::ids::ItemId;
     let root = tempfile::tempdir().expect("profile");
@@ -176,6 +177,42 @@ async fn public_spawn_establishment_restart(
     hub.shutdown().await.expect("hub close");
     drop(hub);
     store.close().await.expect("store close");
+    if upgrade_fixture > 0 {
+        let db = rusqlite::Connection::open(root.path().join("store.sqlite"))
+            .expect("synthetic upgrade fixture");
+        let (id, json): (String, String) = db.query_row(
+            "SELECT command_id, request_json FROM command_receipts WHERE method = 'session.create' AND session_id = ?1",
+            [record.child_session_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).expect("original child receipt");
+        let mut body: serde_json::Value = serde_json::from_str(&json).expect("body");
+        for key in [
+            "inherited_account_alias",
+            "inherited_provider_base_url",
+            "inherited_provider_rebind_id",
+            "inheritance_parent_session_id",
+            "max_tokens_source",
+        ] {
+            body.as_object_mut().expect("object").remove(key);
+        }
+        assert_eq!(body.as_object().expect("exact 8ffc5866 key set").len(), 10);
+        let old_json = body.to_string();
+        db.execute(
+            "UPDATE command_receipts SET request_json=?2, request_digest=?3 WHERE command_id=?1",
+            rusqlite::params![
+                id,
+                old_json,
+                blake3::hash(old_json.as_bytes()).to_hex().to_string()
+            ],
+        )
+        .expect("old schema receipt");
+        if upgrade_fixture == 2 {
+            db.execute(
+                "DELETE FROM delegations WHERE agent_id=?1",
+                [record.agent_id.as_str()],
+            )
+            .expect("crash before relation commit");
+        }
+    }
     let store = SqliteStoreHandle::open(root.path()).await.expect("reopen");
     let work = crate::turn_recovery::recover_interrupted_turns(&store, &DeviceId::new("restart"))
         .await
@@ -310,21 +347,36 @@ async fn public_spawn_establishment_restart(
 
 #[tokio::test]
 async fn public_spawn_restart_finishes_row_committed_before_child_acceptance() {
-    public_spawn_establishment_restart(true, None).await;
+    public_spawn_establishment_restart(true, None, 0).await;
 }
 
 #[tokio::test]
 async fn public_spawn_restart_fences_accepted_child_until_broker_completion() {
-    public_spawn_establishment_restart(false, None).await;
+    public_spawn_establishment_restart(false, None, 0).await;
 }
 
 #[tokio::test]
 async fn public_spawn_restart_cancels_unlaunched_child_for_abandoned_parent() {
     for terminal in [false, true] {
         for fail_before_accept in [false, true] {
-            public_spawn_establishment_restart(fail_before_accept, Some(terminal)).await;
+            public_spawn_establishment_restart(fail_before_accept, Some(terminal), 0).await;
         }
     }
+}
+
+#[tokio::test]
+async fn public_spawn_upgrade_replays_create_before_child_acceptance() {
+    public_spawn_establishment_restart(true, None, 1).await;
+}
+
+#[tokio::test]
+async fn public_spawn_upgrade_replays_create_after_child_acceptance() {
+    public_spawn_establishment_restart(false, None, 1).await;
+}
+
+#[tokio::test]
+async fn public_spawn_upgrade_recovers_crash_after_create_before_relation() {
+    public_spawn_establishment_restart(true, None, 2).await;
 }
 
 // These scripts exercise delegation lifecycle and authority directly. Declare
@@ -1099,13 +1151,18 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
-        provider_base_url: None,
-        provider_rebind_id: None,
+        provider_base_url: Some("https://synthetic.invalid".into()),
+        provider_rebind_id: Some("parent-rebind".into()),
         cwd,
         provider: "fake".into(),
-        account_alias: None,
+        account_alias: Some("parent-pin".into()),
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1192,6 +1249,20 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         .await
         .expect("parent delegations");
     assert_eq!(records.len(), 1);
+    let child_metadata = store
+        .session_metadata(&records[0].child_session_id)
+        .await
+        .expect("derived child metadata")
+        .expect("typed child");
+    assert_eq!(child_metadata.account_alias.as_deref(), Some("parent-pin"));
+    assert_eq!(
+        child_metadata.provider_base_url.as_deref(),
+        Some("https://synthetic.invalid")
+    );
+    assert_eq!(
+        child_metadata.provider_rebind_id.as_deref(),
+        Some("parent-rebind")
+    );
     assert_eq!(records[0].parent_branch_id, Some(parent_branch));
     assert_eq!(
         records[0]
@@ -1558,6 +1629,11 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -1815,6 +1891,11 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -1870,6 +1951,11 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
+                selection_epoch: None,
+                route_reset_epoch: None,
+                budget_clamp_notice_epoch: None,
+                resolved_route_alias: None,
+                resolved_route_seen: false,
                 launch_origin: None,
                 workspace_allocation: None,
                 provider_base_url: None,
@@ -2086,6 +2172,11 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -2271,6 +2362,11 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -2806,6 +2902,8 @@ async fn accept_parent_with_interaction_mode(
             device_id: DeviceId::new("w6c-test-device"),
         },
         interaction_mode,
+        None,
+        None,
     )
     .await
     .expect("create parent");
@@ -5860,6 +5958,11 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         cwd,
@@ -6272,7 +6375,26 @@ async fn astra_legacy_child_receipt_replay_is_compatible() {
 #[tokio::test]
 async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_catalog_edits() {
     use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
-    for variant in ["absent_source", "absent_clamp_display", "changed_catalog"] {
+    for (variant, selector_pin, omitted_route) in [
+        ("absent_source", false, 0_u8),
+        ("absent_clamp_display", false, 0_u8),
+        ("changed_catalog", false, 0_u8),
+        ("pre_route_digest", false, 0_u8),
+        ("pre_classified_source", false, 0_u8),
+        ("absent_source", true, 0_u8),
+        ("absent_clamp_display", true, 0_u8),
+        ("pre_route_digest", true, 0_u8),
+        ("pre_classified_source", true, 0_u8),
+        ("pre_witness_digest", true, 0_u8),
+        ("pre_witness_reply_missing_route", true, 1_u8),
+        ("pre_witness_reply_missing_route", true, 2_u8),
+        ("pre_witness_reply_missing_route", true, 3_u8),
+        ("pre_witness_reply_missing_route", true, 4_u8),
+        ("pre_witness_reply_missing_route", true, 5_u8),
+        ("pre_witness_reply_missing_route", true, 6_u8),
+        ("pre_witness_reply_missing_route", true, 7_u8),
+        ("current_receipt_selector_clear", true, 0_u8),
+    ] {
         let root = tempfile::tempdir().expect("profile");
         let store = SqliteStoreHandle::open(root.path()).await.expect("store");
         let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
@@ -6292,21 +6414,28 @@ async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_ca
             .expect("metadata")
             .expect("parent");
         child_metadata.model = "small".into();
-        child_metadata.max_tokens = if variant == "absent_source" {
+        child_metadata.max_tokens = if matches!(variant, "absent_source" | "pre_classified_source")
+        {
             4096
         } else {
             8192
         };
-        child_metadata.max_tokens_source = if variant == "absent_source" {
-            None
-        } else {
-            Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 })
-        };
+        child_metadata.max_tokens_source =
+            if matches!(variant, "absent_source" | "pre_classified_source") {
+                None
+            } else {
+                Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 })
+            };
+        if selector_pin {
+            child_metadata.account_alias = Some("legacy-pin".into());
+            child_metadata.provider_base_url = Some("http://127.0.0.1:8011/v1".into());
+            child_metadata.provider_rebind_id = Some("legacy-rebind".into());
+        }
         let original_metadata = child_metadata.clone();
-        let request = SpawnSubagent::from_tool_args(serde_json::json!({
-            "task":"replay", "prompt":"same call", "provider":"fake", "model":"small"
-        }))
-        .expect("spawn args");
+        let args = serde_json::json!({
+            "task":"replay", "prompt":"same call", "provider":" fake ", "model":"small"
+        });
+        let request = SpawnSubagent::from_tool_args(args).expect("spawn args");
         let coordinates = |metadata| SpawnCoordinates {
             parent_session_id: parent.clone(),
             parent_run_id: run.clone(),
@@ -6339,18 +6468,82 @@ async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_ca
         drop(hub);
         store.close().await.expect("close");
         let db = rusqlite::Connection::open(root.path().join("store.sqlite")).expect("fixture db");
-        if variant == "absent_source" {
+        if matches!(
+            variant,
+            "absent_source"
+                | "pre_route_digest"
+                | "pre_classified_source"
+                | "pre_witness_digest"
+                | "pre_witness_reply_missing_route"
+        ) || (selector_pin && variant == "absent_clamp_display")
+        {
             let (command, request_json): (String, String) = db.query_row(
                 "SELECT command_id, request_json FROM command_receipts WHERE session_id=?1 AND method='session.create'",
                 [&child], |row| Ok((row.get(0)?, row.get(1)?))).expect("receipt");
             let mut json: serde_json::Value = serde_json::from_str(&request_json).expect("json");
-            json.as_object_mut()
-                .expect("object")
-                .remove("max_tokens_source");
+            let fields = json.as_object_mut().expect("object");
+            if variant == "absent_source" {
+                fields.remove("max_tokens_source");
+            } else if variant == "pre_classified_source" {
+                fields.insert(
+                    "max_tokens_source".into(),
+                    serde_json::json!(original_metadata.max_tokens_source),
+                );
+            }
+            if matches!(variant, "pre_route_digest" | "pre_classified_source")
+                || (selector_pin && matches!(variant, "absent_source" | "absent_clamp_display"))
+            {
+                for key in [
+                    "inheritance_parent_session_id",
+                    "inherited_account_alias",
+                    "inherited_provider_base_url",
+                    "inherited_provider_rebind_id",
+                ] {
+                    fields.remove(key);
+                }
+            } else if matches!(
+                variant,
+                "pre_witness_digest" | "pre_witness_reply_missing_route"
+            ) {
+                fields.remove("inheritance_parent_session_id");
+            }
             let old = serde_json::to_string(&json).expect("canonical");
             db.execute("UPDATE command_receipts SET request_json=?1, request_digest=?2 WHERE command_id=?3",
                 rusqlite::params![old, blake3::hash(old.as_bytes()).to_hex().to_string(), command])
                 .expect("old-format receipt");
+            if variant == "pre_witness_reply_missing_route" {
+                let response: String = db
+                    .query_row(
+                        "SELECT response_json FROM command_receipts WHERE command_id=?1",
+                        [&command],
+                        |row| row.get(0),
+                    )
+                    .expect("original reply");
+                let mut response: serde_json::Value =
+                    serde_json::from_str(&response).expect("reply json");
+                // Every nonempty subset can be omitted by old replies. The
+                // digest must retain all three original choices on replay.
+                for (bit, key) in ["account_alias", "provider_base_url", "provider_rebind_id"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if omitted_route & (1 << bit) == 0 {
+                        continue;
+                    }
+                    assert!(
+                        response["metadata"]
+                            .as_object_mut()
+                            .expect("metadata")
+                            .remove(key)
+                            .is_some()
+                    );
+                }
+                db.execute(
+                    "UPDATE command_receipts SET response_json=?1 WHERE command_id=?2",
+                    rusqlite::params![serde_json::to_string(&response).expect("reply"), command],
+                )
+                .expect("old reply missing route fields");
+            }
         }
         if variant == "absent_clamp_display" {
             let manifest: String = db
@@ -6383,6 +6576,68 @@ async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_ca
             child_metadata.max_tokens = 16_384;
         }
         let delegation = DelegationHandle::new(hub.clone());
+        if selector_pin {
+            // The current selector clears the old route and a catalog edit
+            // re-derives 16384. Both derived changes must keep the original
+            // legacy admission, while a current receipt remains byte strict.
+            install_child_selection_test_catalog(&hub, 16_384);
+            child_metadata = delegation
+                .resolve_child_metadata(&child_metadata, &request)
+                .expect("resolve current selector")
+                .expect("selected metadata");
+            assert_eq!(child_metadata.max_tokens, 16_384);
+            assert_eq!(child_metadata.account_alias, None);
+            assert_eq!(child_metadata.provider_base_url, None);
+            assert_eq!(child_metadata.provider_rebind_id, None);
+            if variant == "current_receipt_selector_clear" {
+                assert!(
+                    delegation
+                        .establish(coordinates(child_metadata), request.clone())
+                        .await
+                        .is_err(),
+                    "a current receipt must reject a changed route"
+                );
+                drop(delegation);
+                hub.shutdown().await.expect("shutdown");
+                store.close().await.expect("close");
+                continue;
+            }
+            for change in [
+                "budget", "provider", "model", "alias", "endpoint", "rebind", "task", "prompt",
+            ] {
+                let mut changed = child_metadata.clone();
+                let mut changed_request = request.clone();
+                match change {
+                    "budget" => {
+                        changed.max_tokens_source =
+                            Some(SessionOutputBudgetSourceV1::UserSet { requested: 10_000 })
+                    }
+                    "provider" => {
+                        changed.provider = "fake-next".into();
+                        changed_request.provider = Some("fake-next".into());
+                    }
+                    "model" => {
+                        changed.model = "changed-model".into();
+                        changed_request.model = Some("changed-model".into());
+                    }
+                    "alias" => changed.account_alias = Some("changed-pin".into()),
+                    "endpoint" => {
+                        changed.provider_base_url = Some("http://127.0.0.1:8022/v1".into())
+                    }
+                    "rebind" => changed.provider_rebind_id = Some("changed-rebind".into()),
+                    "task" => changed_request.task = "changed-task".into(),
+                    "prompt" => changed_request.prompt = "changed-prompt".into(),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    delegation
+                        .establish(coordinates(changed), changed_request)
+                        .await
+                        .is_err(),
+                    "{variant}: changed {change} must not borrow the original admission"
+                );
+            }
+        }
         let replay = delegation
             .establish(coordinates(child_metadata), request.clone())
             .await
@@ -6391,6 +6646,23 @@ async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_ca
             replay.ticket.manifest.budget_tokens,
             Some(original_metadata.max_tokens)
         );
+        if selector_pin {
+            let admitted = hub
+                .session_metadata(&SessionId::new(child.clone()))
+                .await
+                .expect("child metadata")
+                .expect("child");
+            assert_eq!(admitted.account_alias, original_metadata.account_alias);
+            assert_eq!(
+                admitted.provider_base_url,
+                original_metadata.provider_base_url
+            );
+            assert_eq!(
+                admitted.provider_rebind_id,
+                original_metadata.provider_rebind_id
+            );
+            assert_eq!(admitted.max_tokens, original_metadata.max_tokens);
+        }
         if variant == "absent_clamp_display" {
             assert!(
                 replay
@@ -6420,4 +6692,136 @@ async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_ca
         hub.shutdown().await.expect("shutdown");
         store.close().await.expect("close");
     }
+}
+
+fn install_child_selection_test_catalog(hub: &SessionHub, limit: u64) {
+    hub.install_creatable_providers(std::collections::BTreeSet::from([
+        "fake".into(),
+        "fake-next".into(),
+    ]))
+    .expect("providers");
+    let profiles = ["fake", "fake-next"].into_iter().map(|provider| {
+        serde_json::from_value::<haider_rpc::ProviderSummaryWire>(serde_json::json!({
+            "provider": provider, "api_family":"openai_responses", "availability":"available",
+            "enabled":true, "trust":"full", "inventory":{"state":"static"},
+            "models":["small"], "model_details":[{"name":"small","context_window":1048576,"max_output_tokens":limit}]
+        })).expect("summary")
+    }).collect();
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(1, Vec::new(), profiles),
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+        vault: None,
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })
+    .expect("accounts");
+}
+
+#[tokio::test]
+async fn explicit_child_provider_pick_clears_inherited_route_and_reapplies_budget() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent = SessionId::new("child-route-parent");
+    accept_parent_with_interaction_mode(
+        &hub,
+        &parent,
+        &RunId::new("child-route-run"),
+        "route",
+        haider_protocol::session::SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    install_child_selection_test_catalog(&hub, 8192);
+    let mut metadata = hub
+        .session_metadata(&parent)
+        .await
+        .expect("metadata")
+        .expect("parent");
+    metadata.account_alias = Some("parent-pin".into());
+    metadata.provider_base_url = Some("http://127.0.0.1:8011/v1".into());
+    metadata.provider_rebind_id = Some("parent-route".into());
+    metadata.resolved_route_alias = Some("parent-resolved".into());
+    metadata.resolved_route_seen = true;
+    metadata.max_tokens = 20_000;
+    let delegation = DelegationHandle::new(hub.clone());
+    for source in [
+        SessionOutputBudgetSourceV1::Derived,
+        SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+    ] {
+        metadata.max_tokens_source = Some(source);
+        for parent_model in [metadata.model.as_str(), "small"] {
+            for provider in ["fake", " fake ", "fake-next", " fake-next "] {
+                let mut routed_parent = metadata.clone();
+                routed_parent.model = parent_model.into();
+                let request = SpawnSubagent::from_tool_args(serde_json::json!({
+                    "task":"route", "prompt":"fake", "provider":provider, "model":"small"
+                }))
+                .expect("args");
+                let child = delegation
+                    .resolve_child_metadata(&routed_parent, &request)
+                    .expect("resolve")
+                    .expect("selection");
+                assert_eq!(
+                    child.max_tokens, 8192,
+                    "an explicit unchanged pair reapplies the budget"
+                );
+                assert_eq!(child.max_tokens_source, Some(source));
+                assert_eq!(child.account_alias, None);
+                assert_eq!(child.provider_base_url, None);
+                assert_eq!(child.provider_rebind_id, None);
+                assert_eq!(child.resolved_route_alias, None);
+                assert!(!child.resolved_route_seen);
+                assert_eq!(child.provider, provider.trim());
+            }
+        }
+        let request = SpawnSubagent::from_tool_args(serde_json::json!({
+            "task":"inherit", "prompt":"fake",
+        }))
+        .expect("args");
+        let inherited = delegation
+            .resolve_child_metadata(&metadata, &request)
+            .expect("resolve")
+            .expect("inheritance");
+        assert_eq!(
+            inherited, metadata,
+            "an absent selector inherits the admitted route and budget"
+        );
+        for provider in ["", "   "] {
+            assert!(
+                SpawnSubagent::from_tool_args(serde_json::json!({
+                    "task":"invalid", "prompt":"fake", "provider":provider,
+                }))
+                .is_err(),
+                "the public parser rejects an empty provider instead of selecting a route"
+            );
+        }
+        assert!(
+            SpawnSubagent::from_tool_args(serde_json::json!({
+                "task":"invalid", "prompt":"fake", "provider":"fake",
+            }))
+            .is_err(),
+            "a provider selector must disambiguate an explicit model"
+        );
+        let request = SpawnSubagent::from_tool_args(
+            serde_json::json!({"task":"route", "prompt":"fake", "model":"small"}),
+        )
+        .expect("args");
+        let inherited = delegation
+            .resolve_child_metadata(&metadata, &request)
+            .expect("resolve")
+            .expect("selection");
+        assert_eq!(
+            inherited.account_alias, metadata.account_alias,
+            "same-provider model pick keeps route"
+        );
+        assert_eq!(inherited.max_tokens, 8192);
+    }
+    drop(delegation);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
 }

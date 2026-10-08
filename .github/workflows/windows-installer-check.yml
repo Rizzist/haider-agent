@@ -399,6 +399,21 @@ jobs:
           EXT=tar.xz; [ "$RUNNER_OS" = "Windows" ] && EXT=zip
           NAME=haider-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}-split
           python scripts/release_packaging.py verify-bundle --artifact "dist/$NAME.$EXT" --target "${{ matrix.target }}"
+      # Registry #176: a PE linked against the dynamic MSVC CRT imports
+      # VCRUNTIME140.dll and dies with 0xC0000135 on clean Windows (hosted
+      # runners preinstall the VC++ redistributable, so nothing else sees it).
+      - name: Windows binaries must not need the VC++ redistributable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          NAME=haider-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}-split
+          python scripts/release_packaging.py verify-windows-imports "dist/$NAME.zip"
+      - name: clean launch of the exact Windows release ZIP on Server Core
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Name = "haider-${env:GITHUB_REF_NAME}-${{ matrix.target }}-split.zip"
+          ./scripts/release/check-windows-clean-launch.ps1 -Artifact "dist/$Name"
       - name: package compatibility assets for installed two-member macOS updaters
         if: runner.os == 'macOS'
         shell: bash
@@ -502,6 +517,10 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: bash packaging/installers/macos-build.sh payload installers "$INSTALLER_VERSION" '${{ matrix.target }}'
+      - name: Windows payload must not need the VC++ redistributable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/release_packaging.py verify-windows-imports archives/*.zip payload
       - name: Install Inno Setup
         if: runner.os == 'Windows'
         shell: pwsh

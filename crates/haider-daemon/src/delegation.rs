@@ -424,6 +424,10 @@ impl DelegationHandle {
             .map(|view| view.providers)
             .unwrap_or_default();
         let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        let explicit_provider = request
+            .provider
+            .as_deref()
+            .is_some_and(|provider| !provider.trim().is_empty());
         Ok(authority
             .resolve_child_selector(
                 &parent.provider,
@@ -433,7 +437,7 @@ impl DelegationHandle {
             )
             .and_then(|(provider, model)| {
                 let mut child = parent.clone();
-                if child.provider != provider || child.model != model {
+                if explicit_provider || child.provider != provider || child.model != model {
                     let validated = authority.validate_selection_with_status(
                         &parent.provider,
                         Some(&provider),
@@ -450,6 +454,15 @@ impl DelegationHandle {
                         );
                     child.max_tokens = budget.max_tokens;
                     child.max_tokens_source = Some(budget.source);
+                }
+                if explicit_provider || child.provider != provider {
+                    // An explicit provider pick starts under that provider's
+                    // own account and endpoint, even when the pair is unchanged.
+                    child.account_alias = None;
+                    child.provider_base_url = None;
+                    child.provider_rebind_id = None;
+                    child.resolved_route_alias = None;
+                    child.resolved_route_seen = false;
                 }
                 child.provider = provider;
                 child.model = model;
@@ -505,6 +518,7 @@ impl DelegationHandle {
             .child_create_admission(
                 format!("delegation-session-{identity}"),
                 child_session_id.clone(),
+                coordinates.parent_session_id.clone(),
             )
             .await?;
         if existing_spawn.is_some() && original_admission.is_none() {
@@ -514,7 +528,7 @@ impl DelegationHandle {
                 false,
             ));
         }
-        let original_create = if let Some((original, admitted)) = original_admission {
+        if let Some((original, admitted)) = original_admission {
             let old: serde_json::Value =
                 serde_json::from_str(&original).map_err(internal_serialization)?;
             let old_max = old
@@ -540,10 +554,27 @@ impl DelegationHandle {
                 ));
             }
             coordinates.metadata.max_tokens = old_max;
-            Some((original, old))
-        } else {
-            None
-        };
+            // Old explicit same-provider selectors retained the parent's
+            // route. Clearing now applies to new child admissions; an
+            // unchanged retry keeps the Store-proven original route, from
+            // its digest, frozen reply or creation-bounded parent history.
+            // Current receipts and nonempty changed routes remain strict.
+            if old.get("inheritance_parent_session_id").is_none()
+                && request
+                    .provider
+                    .as_deref()
+                    .is_some_and(|provider| provider.trim() == admitted.provider)
+                && coordinates.metadata.provider == admitted.provider
+                && coordinates.metadata.model == admitted.model
+                && coordinates.metadata.account_alias.is_none()
+                && coordinates.metadata.provider_base_url.is_none()
+                && coordinates.metadata.provider_rebind_id.is_none()
+            {
+                coordinates.metadata.account_alias = admitted.account_alias;
+                coordinates.metadata.provider_base_url = admitted.provider_base_url;
+                coordinates.metadata.provider_rebind_id = admitted.provider_rebind_id;
+            }
+        }
         let registered_workflow = match request.workflow.as_ref() {
             Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name))
                 if graph_template(name).is_none() =>
@@ -861,12 +892,15 @@ impl DelegationHandle {
         } else {
             haider_protocol::session::SessionInteractionModeV1::Interactive
         };
-        let mut create_value = serde_json::json!({
+        let create_value = serde_json::json!({
             "cwd": coordinates.metadata.cwd,
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
             "max_tokens": coordinates.metadata.max_tokens,
-            "max_tokens_source": coordinates.metadata.max_tokens_source,
+            // The effective cap can hide a changed user request. Digest its
+            // canonical source too, including legacy default classification.
+            "max_tokens_source": haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                coordinates.metadata.max_tokens_source, coordinates.metadata.max_tokens),
             "permission_overrides": child_overrides,
             "delegation_agent": agent_id,
             // G3 (LE6): the child inherits the parent's CURRENT tuning; the
@@ -876,23 +910,15 @@ impl DelegationHandle {
             "fast": coordinates.metadata.fast,
             "cache_policy": coordinates.metadata.cache_policy,
             "interaction_mode": child_interaction_mode,
+            "inheritance_parent_session_id": coordinates.parent_session_id,
+            "inherited_account_alias": coordinates.metadata.account_alias,
+            "inherited_provider_base_url": coordinates.metadata.provider_base_url,
+            "inherited_provider_rebind_id": coordinates.metadata.provider_rebind_id,
         });
-        let create_json = if let Some((original, old)) = original_create {
-            if old.get("max_tokens_source").is_none()
-                && let Some(fields) = create_value.as_object_mut()
-            {
-                fields.remove("max_tokens_source");
-            }
-            if create_value != old {
-                return Err(workflow_rejection(
-                    "changed_child_admission",
-                    "child creation coordinates differ from the durable admission",
-                ));
-            }
-            original
-        } else {
-            serde_json::to_string(&create_value).map_err(internal_serialization)?
-        };
+        // Store owns the one legacy digest-equivalence rule. Its historical
+        // route witness and frozen response validate additions without changing
+        // the original receipt; the effective budget above stays admitted.
+        let create_json = serde_json::to_string(&create_value).map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
         self.hub
             .create_internal_session_with_interaction_mode(
@@ -915,6 +941,8 @@ impl DelegationHandle {
                     device_id: self.hub.device_id(),
                 },
                 child_interaction_mode,
+                None,
+                Some(coordinates.metadata.clone()),
             )
             .await?;
 

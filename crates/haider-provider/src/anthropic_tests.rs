@@ -3114,9 +3114,26 @@ async fn binding_rejection_falls_back_once_and_latches_the_route() {
         "drop_block",
         "the route is not latched before its first rejection"
     );
-    drain_turn(&provider, elided.clone())
+    let mut first = provider
+        .stream_turn(elided.clone())
         .await
-        .expect("one bounded fallback resend succeeds");
+        .expect("fallback stream");
+    let mut finished = false;
+    while let Some(item) = first.recv().await {
+        if matches!(item.as_ref(), Ok(StreamEvent::Finish { .. })) {
+            assert!(
+                provider
+                    .request_payload(&elided)
+                    .expect("payload")
+                    .get("thinking")
+                    .is_none(),
+                "the latch is visible when Finish reaches the consumer"
+            );
+            finished = true;
+        }
+        item.expect("decoded event");
+    }
+    assert!(finished, "a complete stream is required to latch");
     assert!(
         provider
             .request_payload(&elided)
@@ -3151,39 +3168,1231 @@ async fn binding_rejection_falls_back_once_and_latches_the_route() {
     );
 }
 
-/// Only a 400 naming the binding opt-in triggers the fallback; a
-/// prefix-mismatch rejection or any other invalid request never does.
+/// Anthropic's documented prefix-mismatch 400 (preserved-thinking docs,
+/// "What the API does with an invalid block"). Its remedy text names
+/// `block_binding`, `prefix_mismatch_behavior` and, without the beta header,
+/// the beta itself. It must never read as "the route rejects the opt-in".
+const DOCUMENTED_PREFIX_MISMATCH: &str = "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header. The `system` prompt differs from when the block was created.";
+
+fn error_envelope(message: &str) -> Vec<u8> {
+    serde_json::json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": message},
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Only an explicit unknown-field / unsupported-beta validation error of the
+/// opt-in triggers the fallback. Prefix/signature diagnostics never do, even
+/// when their remedy recommends exactly these settings.
 #[test]
 fn only_binding_opt_in_rejections_trigger_the_fallback() {
-    let envelope = |message: &str| {
-        serde_json::json!({
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": message},
-        })
-        .to_string()
-        .into_bytes()
-    };
     for rejected in [
         format!("Unexpected value(s) `{THINKING_BINDING_BETA}` for the `anthropic-beta` header."),
+        "block_binding: Extra inputs are not permitted".to_owned(),
         "thinking.block_binding: Extra inputs are not permitted".to_owned(),
         "thinking.block_binding.prefix_mismatch_behavior: unsupported".to_owned(),
+        // Gateway wordings (verifier F1): Bedrock, Vertex/Google JSON,
+        // OpenAI-compatible proxies, generic validators.
+        "Malformed input request: #/thinking: extraneous key [block_binding] is not permitted, please reformat your input and try again.".to_owned(),
+        "Invalid JSON payload received. Unknown name \"block_binding\" at 'thinking': Cannot find field.".to_owned(),
+        "Unrecognized request argument supplied: block_binding".to_owned(),
+        "Unknown parameter: 'thinking.block_binding'.".to_owned(),
+        "thinking.block_binding: field not allowed".to_owned(),
+        "#/thinking: Additional properties are not allowed ('block_binding' was unexpected)".to_owned(),
+        // The same wordings aimed at the beta header value.
+        format!("anthropic-beta: extraneous value [{THINKING_BINDING_BETA}] is not permitted"),
+        format!("Unknown name \"{THINKING_BINDING_BETA}\" in anthropic-beta: Cannot find field."),
+        format!("Unrecognized request argument supplied: anthropic-beta={THINKING_BINDING_BETA}"),
+        format!("Unknown parameter: anthropic-beta '{THINKING_BINDING_BETA}'."),
+        format!("anthropic-beta `{THINKING_BINDING_BETA}`: value not allowed"),
+        format!("Beta `{THINKING_BINDING_BETA}` is not supported on this route"),
     ] {
         assert!(
-            crate::anthropic::anthropic_rejects_thinking_binding(&envelope(&rejected)),
+            crate::anthropic::anthropic_rejects_thinking_binding(&error_envelope(&rejected)),
             "{rejected}"
         );
     }
     assert!(crate::anthropic::anthropic_rejects_thinking_binding(
         b"gateway: unknown field block_binding"
     ));
+    let without_beta_sentence = DOCUMENTED_PREFIX_MISMATCH
+        .replace(
+            " That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header.",
+            "",
+        );
     for other in [
+        DOCUMENTED_PREFIX_MISMATCH,
+        without_beta_sentence.as_str(),
+        "messages.1.content.0: Invalid `signature` in `thinking` block. Prefix mismatch; set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\".",
         "messages.2.content.0: Invalid `signature` in `thinking` block.",
+        "thinking.block_binding.prefix_mismatch_behavior: must be one of \"error\" or \"drop_block\"",
         "max_tokens: must be positive",
         "prompt is too long",
     ] {
         assert!(
-            !crate::anthropic::anthropic_rejects_thinking_binding(&envelope(other)),
+            !crate::anthropic::anthropic_rejects_thinking_binding(&error_envelope(other)),
             "{other}"
+        );
+    }
+    // A gateway relaying the documented diagnostic as raw text is excluded too.
+    assert!(!crate::anthropic::anthropic_rejects_thinking_binding(
+        DOCUMENTED_PREFIX_MISMATCH.as_bytes()
+    ));
+}
+
+#[test]
+fn binding_classifier_structured_tokens_and_bounded_controls() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    for body in [
+        serde_json::json!({"error":{"type":"invalid_request_error","message":"Request validation failed","details":[{"field":"thinking.block_binding","message":"Unknown field"}]}}).to_string(),
+        serde_json::json!({"error":{"type":"invalid_request_error","message":"Unknown parameter","param":"thinking.block_binding"}}).to_string(),
+        serde_json::json!({"error":{"type":"unknown_field","message":"Validation failed","param":"thinking.block_binding"}}).to_string(),
+        serde_json::json!({"error":{"type":"unsupported_beta","message":"Validation failed","param":"thinking-binding-controls-2026-08-01"}}).to_string(),
+        r#"{"message":"Unknown field block\u005fbinding"}"#.to_owned(),
+        "Unknown field thinking.block_binding".to_owned(),
+        "Unknown field [block_binding]".to_owned(),
+        "Unknown field 'block_binding'".to_owned(),
+        "Unknown field /block_binding".to_owned(),
+        "Unknown field `block_binding`".to_owned(),
+        "Unknown field\nblock_binding".to_owned(),
+        "Unknown field\tblock_binding".to_owned(),
+        "Unknown field thinking.block_binding.prefix_mismatch_behavior".to_owned(),
+        "UNKNOWN FIELD THINKING.BLOCK_BINDING".to_owned(),
+    ] {
+        assert!(rejects(body.as_bytes()), "positive: {body}");
+    }
+    for body in [
+        serde_json::json!({"error":{"type":"prefix_binding_mismatch","message":"Unsupported conversation prefix; set thinking.block_binding.prefix_mismatch_behavior to drop_block"}}).to_string(),
+        serde_json::json!({"error":{"type":"signature_validation_error","message":"Unknown field block_binding"}}).to_string(),
+        "Unknown field user_block_binding_metadata".to_owned(),
+        "Unknown field my_prefix_mismatch_behavior_extra".to_owned(),
+        "Unknown field xthinking-binding-controls-2026-08-01x".to_owned(),
+        format!("unsupported media type; request has block_binding; {}signature abc", "x".repeat(65536)),
+    ] {
+        assert!(!rejects(body.as_bytes()), "negative: {}", &body[..body.len().min(100)]);
+    }
+    assert!(!rejects(
+        &b"unknown field block_binding".repeat(3000)[..65536]
+    ));
+}
+
+#[test]
+fn binding_classifier_preserves_alternative_diagnostic_containers() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    for body in [
+        r#"{"detail":[{"type":"extra_forbidden","loc":["body","thinking","block_binding"],"msg":"Extra inputs are not permitted","input":{}}]}"#,
+        r#"{"__type":"ValidationException","Message":"extraneous key [block_binding] is not permitted"}"#,
+        r#"{"errors":[{"message":"Unknown field block_binding"}]}"#,
+        r#"{"errors":[{"message":"Unknown field","param":"thinking.block_binding"}]}"#,
+        r#"{"error":{"type":"invalid_request_error"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"invalid_request_error","message":null},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"details":{"field":"thinking.block_binding","msg":"Request validation failed"}},"message":"Unknown field"}"#,
+        r#"{"detail":"Unknown field block_binding"}"#,
+        r#"{"detail":{"message":"Unknown field block_binding"}}"#,
+        r#"{"message":"Validation failed","detail":{"block_binding":"Extra inputs are not permitted"}}"#,
+        r#"{"message":"Validation failed","details":{"diagnostic":"Unknown field block_binding"}}"#,
+        r#"{"details":[{"message":"Unknown field block_binding"}]}"#,
+        r#"{"msg":"Unknown field block_binding"}"#,
+        r#"{"error":{"Message":"Unknown field block_binding"}}"#,
+        r#"{"error":{"msg":"Unknown field block_binding"}}"#,
+        r#"{"error":{"errors":[{"message":"Unknown field block_binding"}]}}"#,
+        r#"{"error":{"type":"invalid_request_error","param":"thinking.block_binding","msg":"Unknown field"}}"#,
+        r#"{"error":{"type":"invalid_request_error","details":{"field":"thinking.block_binding"},"msg":"Unknown field"}}"#,
+        r#"{"error":{"type":"invalid_request_error","details":{"field":"thinking.block_binding"},"Message":"Unknown field"}}"#,
+        r#"{"message":"Request validation failed","detail":[{"loc":["body","thinking","block_binding"],"msg":"Extra inputs are not permitted"}]}"#,
+        r#"{"message":"Request validation failed","errors":[{"param":"thinking.block_binding","msg":"Unknown field"}]}"#,
+        r#"{"message":"Request validation failed","Message":"Unknown field block_binding"}"#,
+        r#"{"error":{"message":"Request validation failed","errors":[{"message":"Unknown field block_binding"}]}}"#,
+        r#"{"error":"Unknown field block_binding"}"#,
+        r#"{"error":[{"message":"Unknown field block_binding"}]}"#,
+        r#"{"error":null,"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"unsupported_prefix_mismatch_behavior","message":"Unknown field prefix_mismatch_behavior"}}"#,
+        r#"{"error":{"type":"unknown_prefix_mismatch_behavior","message":"Unknown field thinking.block_binding.prefix_mismatch_behavior"}}"#,
+        r#"{"detail":{"details":[{"errors":[{"msg":"UNKNOWN FIELD","loc":["thinking","BLOCK_BINDING"]}]}]}}"#,
+        r#"{"msg":"Unknown field block\u005fbinding"}"#,
+        r#"{"__type":"Unknown field block_binding","Message":"Validation failed"}"#,
+        r#"{"message":"Unknown field block_binding","message":"Validation failed"}"#,
+        r#"{"message":"Unknown field block_binding","mes\u0073age":"Validation failed"}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"Unknown field block_binding","message":"Validation failed"}}"#,
+        r#"{"error":{"type":"Unknown field block_binding","type":"invalid_request_error","message":"Validation failed"}}"#,
+        r#"{"error":{"msg":"Unknown field block_binding"},"error":{"msg":"Validation failed"}}"#,
+        r#"{"detail":[{"msg":"Unknown field block_binding"}],"detail":[{"msg":"Validation failed"}]}"#,
+        r#"{"details":"Unknown field block_binding","details":"Validation failed"}"#,
+        r#"{"errors":[{"msg":"Unknown field block_binding"}],"errors":[{"msg":"Validation failed"}]}"#,
+    ] {
+        assert!(rejects(body.as_bytes()), "diagnostic container: {body}");
+    }
+    // Structured locations may name the rejected field in a map key.
+    for key in ["param", "field", "path", "loc"] {
+        let body = serde_json::json!({"error":{
+            "type":"invalid_request_error", "message":"Unknown field",
+            key:{"thinking.block_binding":null}
+        }});
+        assert!(
+            rejects(body.to_string().as_bytes()),
+            "mapped location: {body}"
+        );
+    }
+    // Container shapes compose at the top level and inside an error envelope.
+    for key in ["detail", "details", "errors"] {
+        for value in [
+            serde_json::json!("Unknown field block_binding"),
+            serde_json::json!({"param":"thinking.block_binding","msg":"Unknown field"}),
+            serde_json::json!([{"field":"thinking.block_binding","Message":"Unknown field"}]),
+        ] {
+            let diagnostic = serde_json::json!({"message":"Request validation failed", key:value});
+            for body in [diagnostic.clone(), serde_json::json!({"error":diagnostic})] {
+                assert!(
+                    rejects(body.to_string().as_bytes()),
+                    "composed container: {body}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn binding_classifier_falls_back_on_empty_and_partial_envelopes() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    for body in [
+        r#"{"gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"message":"","gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"message":"Request validation failed","gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"error":{"param":"thinking.block_binding"},"message":"Request validation failed","reason":"Unknown field"}"#,
+        r#"{"message":"   ","gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"detail":"","gateway_diagnostic":"Unknown field block_binding"}"#,
+        r#"{"error":{"msg":""},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"message":""},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":null,"message":"Request validation failed"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":400,"message":"Request validation failed"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":{"msg":"Unknown field block_binding"},"message":"Request validation failed"}}"#,
+        r#"{"error":{"Message":"Request validation failed"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"param":"thinking.block_binding","reason":"Unknown field"}}"#,
+        r#"{"error":{"type":"invalid_request_error","reason":"Unknown field block_binding"}}"#,
+        "gateway: Unknown field block_binding",
+        r#"{"error": { malformed: "Unknown field block_binding"}"#,
+    ] {
+        assert!(rejects(body.as_bytes()), "bounded raw fallback: {body}");
+    }
+    // Unknown keys themselves are diagnostic text, irrespective of value type.
+    for value in [
+        serde_json::json!(400),
+        serde_json::json!(false),
+        serde_json::Value::Null,
+    ] {
+        let body =
+            serde_json::json!({"message":"Validation failed", "Unknown field block_binding":value});
+        assert!(
+            rejects(body.to_string().as_bytes()),
+            "diagnostic key: {body}"
+        );
+    }
+    // Flat duplicate keys stay flat and preserve the first diagnostic.
+    let mut repeated = String::from("{\"message\":\"Unknown field block_binding\"");
+    for _ in 0..2_500 {
+        repeated.push_str(",\"message\":\"ok\"");
+    }
+    repeated.push('}');
+    assert!(repeated.len() < crate::HTTP_ERROR_BODY_LIMIT);
+    assert!(rejects(repeated.as_bytes()));
+    assert!(rejects(b"\xff Unknown field block_binding"));
+    for body in [b"{}".as_slice(), b"null", b"[]", b"", b"{", b"{\xff}"] {
+        assert!(!rejects(body), "empty/non-diagnostic: {body:?}");
+    }
+    for length in [65_535, 65_536, 65_537] {
+        let mut body = b"Unknown field block_binding ".to_vec();
+        body.resize(length, b'x');
+        assert_eq!(rejects(&body), length < 65_536, "length {length}");
+    }
+}
+
+#[test]
+fn binding_classifier_scopes_signature_and_echo_exclusions() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    for body in [
+        r#"{"error":{"message":"Unknown field block_binding","details":{"request":{"signature":"synthetic"}}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":"signature synthetic"}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"message":"signature synthetic"}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"request":{"signature":"Invalid signature; remove the block"}}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"signature":"Invalid signature"}}}"#,
+        r#"{"request_id":"synthetic","error":{"message":"Unknown field block_binding","details":{"request":{"signature":"Invalid signature; remove the block"}}}}"#,
+        r#"{"message":"Request validation failed","reason":"Unknown field block_binding","details":{"Request":{"Signature":"Invalid signature; remove the block"}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"type":"signature_metadata"}}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":[{"field":"signature","message":"metadata"}]}}"#,
+        r#"{"error":{"message":"Unknown field block_binding"},"request":{"signature":"synthetic"}}"#,
+    ] {
+        assert!(
+            rejects(body.as_bytes()),
+            "signature echo cannot veto: {body}"
+        );
+    }
+    for body in [
+        r#"{"error":{"message":"unsupported media type"},"request":{"block_binding":{}}}"#,
+        r#"{"error":{"message":"unsupported media type","details":{"input":{"block_binding":{}}}}}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"unsupported media type"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"invalid_request_error","message":""},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"   "},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"prefix_binding_mismatch"},"message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"signature_validation_error","msg":"Unknown field block_binding"}}"#,
+        r#"{"error":{"type":"PrefixBindingMismatch","message":"Unsupported conversation prefix; set thinking.block_binding.prefix_mismatch_behavior to drop_block"}}"#,
+        r#"{"error":{"type":"prefix-binding-mismatch","message":"Unknown field block_binding"}}"#,
+        r#"{"__type":"vendor#InvalidSignatureException","Message":"Unknown field block_binding"}"#,
+        r#"{"error":{"type":"SignatureError","message":"Unknown field block_binding"}}"#,
+        r#"{"error":{"type":"signature_invalid","message":"Unknown field block_binding"}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"type":"signature_invalid"}}}"#,
+        r#"{"error":{"type":"prefix_error","message":"Unsupported conversation prefix; set thinking.block_binding.prefix_mismatch_behavior to drop_block"}}"#,
+        r#"{"detail":{"msg":"Invalid signature; remove the block or set thinking.block_binding.prefix_mismatch_behavior"}}"#,
+        r#"{"error":{"message":"Unknown field block_binding","details":{"message":"Invalid signature in thinking block; remove the block"}}}"#,
+        r#"{"detail":{"msg":"Unsupported image type","loc":["body","image"]}}"#,
+        r#"{"message":"Request validation failed","reason":"Invalid signature; remove the block or set thinking.block_binding.prefix_mismatch_behavior"}"#,
+        r#"{"errors":[{"msg":"max_tokens must be positive","param":"max_tokens"}]}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"unsupported content block. Request: {\"thinking\":{\"block_binding\":{}},\"messages\":[{\"content\":[{\"type\":\"thinking\",\"signature\":\"abc\"}]}]}"}}"#,
+        r#"unsupported content block. Request: {"thinking":{"block_binding":{}},"messages":[{"content":[{"type":"thinking","signature":"abc"}]}]}"#,
+        r#"{"signature":"Unknown field block_binding"}"#,
+        r#"{"request":{"message":"Unknown field block_binding"}}"#,
+        r#"{"message":"Validation failed","details":{"input":"Unknown field block_binding"}}"#,
+        r#"{"message":"Unknown","details":{"msg":"field","param":"thinking.block_binding"}}"#,
+        r#"{"error":{"type":"prefix_binding_mismatch","type":"invalid_request_error","message":"Unknown field block_binding"}}"#,
+        r#"{"error":{"type":"signature_validation_error","type":"invalid_request_error","message":"Unknown field block_binding"}}"#,
+    ] {
+        assert!(
+            !rejects(body.as_bytes()),
+            "negative diagnostic control: {body}"
+        );
+    }
+}
+
+#[test]
+fn binding_classifier_hyphens_follow_the_ascii_token_contract() {
+    use crate::anthropic::anthropic_rejects_thinking_binding as rejects;
+    // Deliberately retain the established contract: a hyphen is a boundary,
+    // so gateway prose mentioning block_binding-v2 still names the token.
+    for token in [
+        "block_binding-v2",
+        "my-block_binding",
+        "block_bindingé",
+        "préblock_binding",
+        "thinking-binding-controls-2026-08-01-preview",
+    ] {
+        assert!(
+            rejects(format!("Unknown field {token}").as_bytes()),
+            "{token}"
+        );
+    }
+    for token in [
+        "block_bindings",
+        "user_block_binding_metadata",
+        "prefix_mismatch_behaviors",
+    ] {
+        assert!(
+            !rejects(format!("Unknown field {token}").as_bytes()),
+            "{token}"
+        );
+    }
+}
+
+const VALID_BINDING_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+#[tokio::test]
+async fn every_decoded_finish_reason_confirms_binding_fallback() {
+    use tokio::io::AsyncWriteExt;
+    for reason in [
+        "end_turn",
+        "stop_sequence",
+        "tool_use",
+        "max_tokens",
+        "pause_turn",
+        "refusal",
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let sse = VALID_BINDING_SSE.replace("end_turn", reason);
+        let server = tokio::spawn(async move {
+            let mut policies = Vec::new();
+            for ordinal in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let (_, payload) = read_http_request(&mut socket).await;
+                policies.push(payload.pointer("/thinking/block_binding").is_some());
+                let (status, body) = if ordinal == 0 {
+                    (
+                        400,
+                        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}",
+                    )
+                } else {
+                    (200, sse.as_str())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+            policies
+        });
+        let provider = prefix_fake_adapter(reason, &url);
+        let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+        let mut stream = provider
+            .stream_turn(request.clone())
+            .await
+            .expect("fallback");
+        let mut finished = false;
+        while let Some(item) = stream.recv().await {
+            if matches!(item.as_ref(), Ok(StreamEvent::Finish { .. })) {
+                assert!(
+                    provider
+                        .request_payload(&request)
+                        .expect("payload")
+                        .get("thinking")
+                        .is_none(),
+                    "{reason}: published before Finish"
+                );
+                finished = true;
+            }
+            item.expect("decoded event");
+        }
+        assert!(finished, "{reason}");
+        assert_eq!(server.await.expect("server"), vec![true, false]);
+    }
+}
+
+async fn binding_stream_case(case: &str, fallback_status: u16, fallback_body: &str) {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let body = fallback_body.to_owned();
+    let echoed = case == "echo-sse";
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        for ordinal in 0..4 {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("physical request missing")
+                .expect("accept");
+            let (headers, payload) = read_http_request(&mut socket).await;
+            let policy = payload.pointer("/thinking/block_binding").is_some();
+            let beta = headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().contains(THINKING_BINDING_BETA));
+            policies.push((policy, beta));
+            let (status, content) = if ordinal == 1 {
+                (fallback_status, body.as_str())
+            } else if ordinal == 0 {
+                if echoed {
+                    (
+                        400,
+                        "messages.5.content.1.source.media_type: unsupported image type 'image/bmp'. Request body: {\"thinking\":{\"block_binding\":{}}}",
+                    )
+                } else {
+                    (
+                        400,
+                        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}",
+                    )
+                }
+            } else {
+                (
+                    400,
+                    "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}",
+                )
+            };
+            let content_type = if content.starts_with("<html>") {
+                "text/html"
+            } else {
+                "text/event-stream"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{content}",
+                content.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("respond");
+        }
+        policies
+    });
+    let provider = prefix_fake_adapter(case, &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("failed fallback must surface an error");
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "{case}: same adapter"
+    );
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("same adapter retains policy");
+    let rebuilt = prefix_fake_adapter("next-session", &url);
+    assert!(
+        rebuilt
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "{case}: next session"
+    );
+    drain_turn(&rebuilt, request)
+        .await
+        .expect_err("new adapter retains policy");
+    assert_eq!(
+        server.await.expect("server"),
+        vec![(true, true), (false, false), (true, true), (true, true)],
+        "{case}: physical sends"
+    );
+}
+
+#[tokio::test]
+async fn failed_streamed_binding_fallbacks_never_latch() {
+    let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n";
+    let error = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}\n\n";
+    for (case, status, body) in [
+        (
+            "partial-error",
+            200,
+            format!(
+                "{start}event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"partial\"}}}}\n\n{error}"
+            ),
+        ),
+        (
+            "partial-thinking-error",
+            200,
+            format!(
+                "{start}event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"partial\"}}}}\n\n{error}"
+            ),
+        ),
+        (
+            "wrong-shape",
+            200,
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":1}\n\n".to_owned(),
+        ),
+        (
+            "stop-no-reason",
+            200,
+            format!("{start}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"),
+        ),
+        (
+            "partial-eof",
+            200,
+            format!(
+                "{start}event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"partial\"}}}}\n\n"
+            ),
+        ),
+        (
+            "stop-open-block",
+            200,
+            format!(
+                "{start}event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+        ),
+        ("empty", 200, String::new()),
+        ("html", 200, "<html>bad upstream</html>".to_owned()),
+        ("empty202", 202, String::new()),
+        ("empty206", 206, String::new()),
+    ] {
+        binding_stream_case(case, status, &body).await;
+    }
+}
+
+#[tokio::test]
+async fn binding_fallback_sseerror_before_start_never_latches() {
+    binding_stream_case("sseerror", 200, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature\"}}\n\n").await;
+}
+
+#[tokio::test]
+async fn binding_fallback_sseerror_after_start_never_latches() {
+    binding_stream_case("sseafterstart", 200, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature\"}}\n\n").await;
+}
+
+#[tokio::test]
+async fn binding_fallback_malformed_sse_never_latches() {
+    binding_stream_case(
+        "malformed",
+        200,
+        "event: message_start\ndata: {bad json}\n\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn binding_fallback_truncated_sse_never_latches() {
+    binding_stream_case("truncated", 200, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n").await;
+}
+
+#[tokio::test]
+async fn binding_fallback_empty_204_never_latches() {
+    binding_stream_case("empty204", 204, "").await;
+}
+
+#[tokio::test]
+async fn binding_fallback_echoed_error_then_sseerror_never_latches() {
+    binding_stream_case("echo-sse", 200, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature\"}}\n\n").await;
+}
+
+#[tokio::test]
+async fn binding_latch_is_scoped_to_credential_alias() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(binding_rejecting_fake(listener, 4));
+    let first =
+        prefix_fake_adapter("account-a", &url).with_account(CredentialAlias::new("account-a"));
+    let second =
+        prefix_fake_adapter("account-b", &url).with_account(CredentialAlias::new("account-b"));
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    drain_turn(&first, request.clone())
+        .await
+        .expect("first fallback");
+    assert!(
+        first
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none()
+    );
+    assert!(
+        second
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some()
+    );
+    drain_turn(&second, request)
+        .await
+        .expect("second credential reprobes");
+    assert_eq!(
+        server
+            .await
+            .expect("server")
+            .iter()
+            .map(|v| (v.status, v.drop_policy))
+            .collect::<Vec<_>>(),
+        vec![(400, true), (200, false), (400, true), (200, false)]
+    );
+}
+
+#[tokio::test]
+async fn binding_latch_expires_and_reprobes_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(binding_rejecting_fake(listener, 5));
+    let provider = prefix_fake_adapter("ttl", &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    drain_turn(&provider, request.clone())
+        .await
+        .expect("first fallback");
+    drain_turn(&provider, request.clone())
+        .await
+        .expect("cached route");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(3599)).await;
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none(),
+        "route remains cached just before expiry"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "expired route reprobes with the policy"
+    );
+    tokio::time::resume();
+    drain_turn(&provider, request.clone())
+        .await
+        .expect("expired route reprobes");
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none()
+    );
+    assert_eq!(
+        server
+            .await
+            .expect("server")
+            .iter()
+            .map(|v| (v.status, v.drop_policy))
+            .collect::<Vec<_>>(),
+        vec![
+            (400, true),
+            (200, false),
+            (200, false),
+            (400, true),
+            (200, false)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn binding_latch_waits_for_finish_before_concurrent_render() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        let mut held = None;
+        let mut release_rx = Some(release_rx);
+        for ordinal in 0..4 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let (_, payload) = read_http_request(&mut socket).await;
+            policies.push(payload.pointer("/thinking/block_binding").is_some());
+            if ordinal == 1 {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    VALID_BINDING_SSE.len()
+                );
+                socket.write_all(header.as_bytes()).await.expect("headers");
+                let release = release_rx.take().expect("one held response");
+                held = Some(tokio::spawn(async move {
+                    release.await.expect("release");
+                    socket
+                        .write_all(VALID_BINDING_SSE.as_bytes())
+                        .await
+                        .expect("finish body");
+                }));
+            } else {
+                let (status, body) = match ordinal {
+                    0 => (
+                        400,
+                        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}",
+                    ),
+                    2 => (
+                        400,
+                        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}",
+                    ),
+                    _ => (200, VALID_BINDING_SSE),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+        }
+        held.expect("held fallback").await.expect("held task");
+        policies
+    });
+    let provider = prefix_fake_adapter("concurrent", &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    let mut first = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("fallback headers");
+    let second = prefix_fake_adapter("concurrent-second", &url);
+    assert!(
+        second
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "headers alone cannot latch"
+    );
+    drain_turn(&second, request.clone())
+        .await
+        .expect_err("concurrent request still carries policy");
+    release_tx.send(()).expect("release fallback");
+    let mut finished = false;
+    while let Some(item) = first.recv().await {
+        if matches!(item.as_ref(), Ok(StreamEvent::Finish { .. })) {
+            assert!(
+                second
+                    .request_payload(&request)
+                    .expect("payload")
+                    .get("thinking")
+                    .is_none(),
+                "Finish publishes before delivery"
+            );
+            finished = true;
+        }
+        item.expect("first stream");
+    }
+    assert!(finished);
+    drain_turn(&second, request)
+        .await
+        .expect("latched request goes direct");
+    assert_eq!(
+        server.await.expect("server"),
+        vec![true, false, true, false]
+    );
+}
+
+#[tokio::test]
+async fn failed_concurrent_fallback_cannot_erase_confirmed_latch() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let (a_tx, a_rx) = tokio::sync::oneshot::channel::<()>();
+    let (c_tx, c_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        let mut a_release = Some(a_rx);
+        let mut c_release = Some(c_rx);
+        let mut held = Vec::new();
+        for ordinal in 0..5 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let (_, payload) = read_http_request(&mut socket).await;
+            policies.push(payload.pointer("/thinking/block_binding").is_some());
+            if ordinal == 1 || ordinal == 3 {
+                let body = if ordinal == 1 {
+                    VALID_BINDING_SSE
+                } else {
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature\"}}\n\n"
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(headers.as_bytes()).await.expect("headers");
+                let release = if ordinal == 1 {
+                    a_release.take().expect("A release")
+                } else {
+                    c_release.take().expect("C release")
+                };
+                held.push(tokio::spawn(async move {
+                    release.await.expect("release held stream");
+                    socket.write_all(body.as_bytes()).await.expect("body");
+                }));
+            } else {
+                let (status, body) = if ordinal == 4 {
+                    (200, VALID_BINDING_SSE)
+                } else {
+                    (
+                        400,
+                        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+        }
+        for task in held {
+            task.await.expect("held task");
+        }
+        policies
+    });
+    let provider = prefix_fake_adapter("parallel-a", &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    let mut a = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("A pending");
+    let mut c = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("C pending");
+    a_tx.send(()).expect("release A");
+    let mut a_finished = false;
+    while let Some(item) = a.recv().await {
+        if matches!(item.as_ref(), Ok(StreamEvent::Finish { .. })) {
+            a_finished = true;
+        }
+        item.expect("A event");
+    }
+    assert!(a_finished);
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none()
+    );
+    c_tx.send(()).expect("release C");
+    let mut c_failed = false;
+    while let Some(item) = c.recv().await {
+        if item.is_err() {
+            c_failed = true;
+        }
+    }
+    assert!(c_failed);
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .get("thinking")
+            .is_none(),
+        "C cannot roll back A"
+    );
+    let second = prefix_fake_adapter("parallel-new-session", &url);
+    drain_turn(&second, request)
+        .await
+        .expect("latch survives failed C");
+    assert_eq!(
+        server.await.expect("server"),
+        vec![true, false, true, false, false]
+    );
+}
+
+#[tokio::test]
+async fn cancelled_binding_fallback_does_not_publish() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        let mut held = None;
+        let mut release_rx = Some(release_rx);
+        for ordinal in 0..4 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let (_, payload) = read_http_request(&mut socket).await;
+            policies.push(payload.pointer("/thinking/block_binding").is_some());
+            if ordinal == 1 {
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    VALID_BINDING_SSE.len()
+                );
+                socket.write_all(headers.as_bytes()).await.expect("headers");
+                let release = release_rx.take().expect("one held response");
+                held = Some(tokio::spawn(async move {
+                    release.await.expect("release");
+                    // The peer has cancelled; a failed write is expected.
+                    let _ = socket.write_all(VALID_BINDING_SSE.as_bytes()).await;
+                }));
+            } else {
+                let body = if ordinal == 0 {
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}"
+                } else {
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}"
+                };
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+        }
+        held.expect("held response").await.expect("held task");
+        policies
+    });
+    let provider = prefix_fake_adapter("cancel", &url);
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    let stream = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("fallback headers");
+    drop(stream); // aborts the owned producer before its pending Finish
+    release_tx.send(()).expect("release");
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some()
+    );
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("same adapter policy");
+    let second = prefix_fake_adapter("cancel-second", &url);
+    drain_turn(&second, request)
+        .await
+        .expect_err("new adapter policy");
+    assert_eq!(server.await.expect("server"), vec![true, false, true, true]);
+}
+
+async fn binding_unfinished_transport_case(case: &str, timed_out: bool, semantic: bool) {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        let mut held = None;
+        let mut heartbeat = None;
+        for ordinal in 0..4 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let (_, payload) = read_http_request(&mut socket).await;
+            policies.push(payload.pointer("/thinking/block_binding").is_some());
+            if ordinal == 1 {
+                let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n";
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{start}",
+                    start.len() + if semantic { 10000 } else { 100 }
+                );
+                socket
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("partial body");
+                if semantic {
+                    heartbeat = Some(tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            if socket.write_all(b": ping\n\n").await.is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                } else if timed_out {
+                    held = Some(socket);
+                }
+                // Otherwise drop with an incomplete Content-Length: real body
+                // transport failure after headers and decoded message_start.
+            } else {
+                let body = if ordinal == 0 {
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unknown field block_binding\"}}"
+                } else {
+                    "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}"
+                };
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("respond");
+            }
+        }
+        drop(held);
+        if let Some(task) = heartbeat {
+            task.abort();
+        }
+        policies
+    });
+    let mut provider = prefix_fake_adapter(case, &url);
+    if timed_out {
+        provider = provider
+            .with_transport_config(AnthropicTransportConfig {
+                retry_policy: AnthropicRetryPolicy::Never,
+                connect_timeout: Duration::from_secs(5),
+                response_open_timeout: Duration::from_secs(30),
+                chunk_idle_timeout: Duration::from_secs(if semantic { 5 } else { 1 }),
+                semantic_progress_timeout: Duration::from_secs(2),
+            })
+            .expect("fixture clocks");
+    }
+    let request = projected_turn("claude-opus-5-5", &two_screenshot_history());
+    let mut stream = provider
+        .stream_turn(request.clone())
+        .await
+        .expect("fallback headers");
+    if timed_out {
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        if semantic {
+            for _ in 0..15 {
+                tokio::time::advance(Duration::from_millis(200)).await;
+                tokio::task::yield_now().await;
+            }
+        } else {
+            tokio::time::advance(Duration::from_secs(3)).await;
+        }
+    }
+    let mut failure = None;
+    while let Some(item) = stream.recv().await {
+        if let Err(error) = item {
+            failure = Some(error);
+        }
+    }
+    let failure = failure.expect("incomplete transport must fail");
+    if timed_out {
+        tokio::time::resume();
+    }
+    if semantic {
+        assert!(
+            failure.message.contains("no model content"),
+            "{case}: {failure:?}"
+        );
+    } else if timed_out {
+        assert!(failure.message.contains("no data"), "{case}: {failure:?}");
+    }
+    assert!(
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding")
+            .is_some()
+    );
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("same adapter policy");
+    let rebuilt = prefix_fake_adapter("transport-new-session", &url);
+    drain_turn(&rebuilt, request)
+        .await
+        .expect_err("new adapter policy");
+    assert_eq!(server.await.expect("server"), vec![true, false, true, true]);
+}
+
+#[tokio::test]
+async fn binding_fallback_body_reset_never_latches() {
+    binding_unfinished_transport_case("body-reset", false, false).await;
+}
+
+#[tokio::test]
+async fn binding_fallback_chunk_timeout_never_latches() {
+    binding_unfinished_transport_case("chunk-timeout", true, false).await;
+}
+
+#[tokio::test]
+async fn binding_fallback_semantic_timeout_never_latches() {
+    binding_unfinished_transport_case("semantic-timeout", true, true).await;
+}
+
+/// Loopback route answering EVERY request with one fixed 400 body; records
+/// whether each physical request carried the binding policy.
+async fn fixed_error_fake(
+    listener: tokio::net::TcpListener,
+    message: &'static str,
+    requests: usize,
+) -> Vec<bool> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut policies = Vec::new();
+    for _ in 0..requests {
+        let Ok(accepted) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+        else {
+            break;
+        };
+        let (mut socket, _) = accepted.expect("accept wire request");
+        let (_, payload) = read_http_request(&mut socket).await;
+        policies.push(payload.pointer("/thinking/block_binding").is_some());
+        let body = String::from_utf8(error_envelope(message)).expect("UTF-8 envelope");
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write error");
+    }
+    policies
+}
+
+fn two_screenshot_history() -> Vec<Message> {
+    let mut durable = vec![Message::user_text("synthetic screenshot history")];
+    for name in ["a", "b"] {
+        durable.push(Message::assistant(vec![computer_screenshot_call(name)]));
+        durable.push(screenshot_result(name, name));
+    }
+    durable
+}
+
+/// Astra B1 regression: the documented prefix-mismatch 400 (remedy text
+/// included) is returned unchanged after ONE physical request, with no
+/// unsupported-beta resend, and the route keeps its policy for later requests
+/// on the same adapter and for a second session (rebuilt adapter).
+#[tokio::test]
+async fn documented_prefix_mismatch_never_disables_the_binding_policy() {
+    const MODEL: &str = "claude-opus-5-5";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind prefix-mismatch fake");
+    let base_url = format!("http://{}", listener.local_addr().expect("fake address"));
+    let server = tokio::spawn(fixed_error_fake(listener, DOCUMENTED_PREFIX_MISMATCH, 3));
+    let provider = prefix_fake_adapter("prefix-mismatch-first", &base_url);
+    let request = projected_turn(MODEL, &two_screenshot_history());
+
+    let error = drain_turn(&provider, request.clone())
+        .await
+        .expect_err("prefix mismatch is surfaced");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert_eq!(error.presentation.provider_http_status, Some(400));
+    let has_policy = |provider: &AnthropicProvider| {
+        provider
+            .request_payload(&request)
+            .expect("payload")
+            .pointer("/thinking/block_binding/prefix_mismatch_behavior")
+            .and_then(serde_json::Value::as_str)
+            == Some("drop_block")
+    };
+    assert!(has_policy(&provider), "later request keeps the policy");
+
+    // A later request on the same adapter and a second session on the same
+    // route both still send the policy (one physical request each).
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("second prefix mismatch");
+    let second_session = prefix_fake_adapter("prefix-mismatch-second", &base_url);
+    assert!(
+        has_policy(&second_session),
+        "second session keeps the policy"
+    );
+    drain_turn(&second_session, request.clone())
+        .await
+        .expect_err("third prefix mismatch");
+    assert_eq!(
+        server.await.expect("fake server"),
+        vec![true, true, true],
+        "every request carried the policy and none was an unsupported-beta resend"
+    );
+}
+
+/// An explicit unsupported-beta rejection whose resend ALSO fails must not
+/// latch the route: exactly two physical requests, and the next request (and
+/// a second session) still opt in.
+#[tokio::test]
+async fn failed_fallback_resend_does_not_latch_the_route() {
+    const MODEL: &str = "claude-opus-5-5";
+    const UNSUPPORTED: &str = "Unexpected value(s) `thinking-binding-controls-2026-08-01` for the `anthropic-beta` header.";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind always-rejecting fake");
+    let base_url = format!("http://{}", listener.local_addr().expect("fake address"));
+    let server = tokio::spawn(fixed_error_fake(listener, UNSUPPORTED, 2));
+    let provider = prefix_fake_adapter("failed-resend", &base_url);
+    let request = projected_turn(MODEL, &two_screenshot_history());
+
+    drain_turn(&provider, request.clone())
+        .await
+        .expect_err("resend is rejected as well");
+    assert_eq!(
+        server.await.expect("fake server"),
+        vec![true, false],
+        "one policy request, one bounded resend without it"
+    );
+    for adapter in [
+        &provider,
+        &prefix_fake_adapter("failed-resend-second", &base_url),
+    ] {
+        assert_eq!(
+            adapter.request_payload(&request).expect("payload")["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block",
+            "an unconfirmed fallback never disables the policy"
         );
     }
 }

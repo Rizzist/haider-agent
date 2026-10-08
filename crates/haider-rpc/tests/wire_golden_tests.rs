@@ -2618,6 +2618,7 @@ fn session_summary_roster_truth_fields_are_additive_and_tolerated() {
 #[test]
 fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
     let current = haider_rpc::SessionSummary {
+        latest_context_footprint: None,
         session_id: haider_protocol::ids::SessionId::new("session-workspace"),
         head_seq: 17,
         worker_generation: 15,
@@ -4176,12 +4177,14 @@ fn session_select_model_output_budget_fields_are_golden() {
                     max_output_tokens: 16_384,
                 }),
             }),
+            cleared_account_pin: Some("bed-b".into()),
+            cleared_provider_endpoint: None,
         },
     };
     let encoded = serde_json::to_string(&response).expect("encode budget response");
     assert_eq!(
         encoded,
-        r#"{"v":1,"kind":"response","request_id":"request-select-budget","body":{"method":"session.select_model","session_id":"session-1","provider":"openai","model":"gpt-4o","selected_seq":43,"worker_generation":7,"output_budget":{"max_tokens":16384,"source":{"kind":"user_set","requested":30000},"clamped":{"requested":30000,"max_output_tokens":16384}}}}"#
+        r#"{"v":1,"kind":"response","request_id":"request-select-budget","body":{"method":"session.select_model","session_id":"session-1","provider":"openai","model":"gpt-4o","selected_seq":43,"worker_generation":7,"output_budget":{"max_tokens":16384,"source":{"kind":"user_set","requested":30000},"clamped":{"requested":30000,"max_output_tokens":16384}},"cleared_account_pin":"bed-b"}}"#
     );
     assert_eq!(
         serde_json::from_str::<WireFrame>(&encoded).expect("decode budget response"),
@@ -4281,6 +4284,8 @@ fn session_select_model_pair_request_and_response_are_golden() {
             selected_seq: 42,
             worker_generation: 7,
             output_budget: None,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
         },
     };
     let encoded = serde_json::to_string(&response).expect("encode selection response");
@@ -4476,6 +4481,7 @@ fn session_rename_frames_are_additive_and_golden() {
     // SessionSummary.title is additive: absent stays OFF the wire, and a
     // summary WITH a title round-trips.
     let bare = serde_json::to_value(SessionSummary {
+        latest_context_footprint: None,
         session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
         head_seq: 9,
         worker_generation: 7,
@@ -4508,6 +4514,35 @@ fn session_rename_frames_are_additive_and_golden() {
     assert!(
         bare.get("title").is_none(),
         "absent title must be omitted: {bare}"
+    );
+    assert!(bare.get("latest_context_footprint").is_none());
+    let older: SessionSummary = serde_json::from_value(bare.clone()).expect("old summary decodes");
+    assert!(older.latest_context_footprint.is_none());
+    let mut with_footprint = bare;
+    with_footprint["latest_context_footprint"] = serde_json::json!({
+        "selection_epoch": 9,
+        "input_tokens": 40,
+        "output_tokens": 2,
+        "cached_input_tokens": 0,
+        "used_tokens": 42,
+        "reserved_output_tokens": 8,
+        "truth": "exact"
+    });
+    let current: SessionSummary =
+        serde_json::from_value(with_footprint).expect("new summary decodes");
+    assert_eq!(
+        current
+            .latest_context_footprint
+            .as_ref()
+            .and_then(|item| item.selection_epoch),
+        Some(9)
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(
+            serde_json::to_value(&current).expect("encode new summary")
+        )
+        .expect("decode new summary"),
+        current
     );
     let titled: SessionSummary = serde_json::from_value(serde_json::json!({
         "session_id": "session-1",
@@ -5315,6 +5350,7 @@ fn session_descendant_stream_is_additive_tagged_and_golden() {
 #[test]
 fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
     let child = haider_rpc::SessionSummary {
+        latest_context_footprint: None,
         session_id: haider_protocol::ids::SessionId::new("session-lineage-child"),
         head_seq: 4,
         worker_generation: 2,
@@ -5350,6 +5386,7 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
     assert_eq!(value["parent_session_id"], "session-lineage-parent");
 
     let root = haider_rpc::SessionSummary {
+        latest_context_footprint: None,
         parent_session_id: None,
         kind: Some(haider_rpc::SessionKindWire::Root),
         ..child.clone()

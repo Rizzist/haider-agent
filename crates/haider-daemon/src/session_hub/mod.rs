@@ -920,6 +920,7 @@ struct ModelSelectionBudgetPause {
 }
 
 pub(crate) struct ActiveRunOutputPairSnapshot {
+    branch_id: Option<BranchId>,
     pub durably_pinned: bool,
     pub run_id: RunId,
     pub provider: String,
@@ -935,8 +936,18 @@ impl ActiveRunOutputPairSnapshot {
             metadata.provider_base_url.clone_from(&rebound.base_url);
             metadata.account_alias.clone_from(&rebound.account);
             metadata.provider_rebind_id = Some(rebound.rebind_id.clone());
+            metadata
+                .resolved_route_alias
+                .clone_from(&rebound.resolved_alias);
+            metadata.resolved_route_seen = rebound.resolved_seen;
+            metadata.selection_epoch = rebound.selection_epoch;
+            metadata.route_reset_epoch = rebound.reset_epoch;
         } else if metadata.provider != self.provider {
             metadata.provider_base_url = None;
+            metadata.provider_rebind_id = None;
+            metadata.account_alias = None;
+            metadata.resolved_route_alias = None;
+            metadata.resolved_route_seen = false;
         }
     }
 }
@@ -948,6 +959,10 @@ enum RunOutputPairChange {
         model: String,
     },
     Rebind(Box<haider_protocol::session::SessionProviderRebound>),
+    Route {
+        run_id: RunId,
+        route: haider_protocol::session::RunOutputProviderRouteV1,
+    },
 }
 
 struct HubInner {
@@ -1590,6 +1605,7 @@ impl AppendCommitter {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let byte_weight = command
             .request_json
@@ -1605,6 +1621,7 @@ impl AppendCommitter {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             },
             byte_weight,
             AppendCommitCompletion::CreateSession(completed),
@@ -1873,6 +1890,7 @@ enum ActorCommand {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
     },
     CreateBranch {
@@ -1882,6 +1900,14 @@ enum ActorCommand {
     CommitCheckpoint {
         command: CheckpointCommitCommand,
         completed: oneshot::Sender<Result<CheckpointCommitOutcome, HaiderError>>,
+    },
+    ResolvedRoute {
+        provider: String,
+        model: String,
+        epoch: u64,
+        alias: Option<String>,
+        device_id: DeviceId,
+        completed: oneshot::Sender<Result<u64, HaiderError>>,
     },
     SelectModel {
         command: SessionSelectModelCommand,
@@ -4276,6 +4302,8 @@ impl SessionHub {
         self.create_internal_session_with_interaction_mode(
             command,
             haider_protocol::session::SessionInteractionModeV1::Interactive,
+            None,
+            None,
         )
         .await
     }
@@ -4284,6 +4312,8 @@ impl SessionHub {
         &self,
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<CreatedSession, HaiderError> {
         if let Some(created) = self
             .inner
@@ -4298,7 +4328,13 @@ impl SessionHub {
             return Ok(created);
         }
         match self
-            .create_session_with_interaction_mode(command, interaction_mode, None, None)
+            .create_session_with_interaction_mode(
+                command,
+                interaction_mode,
+                account_alias,
+                None,
+                inherited_route,
+            )
             .await
             .map_err(hub_error_as_store)?
         {
@@ -4311,10 +4347,11 @@ impl SessionHub {
         &self,
         command_id: String,
         session_id: SessionId,
+        parent_session_id: SessionId,
     ) -> Result<Option<(String, haider_protocol::session::SessionMetadataV1)>, HaiderError> {
         self.inner
             .store
-            .child_create_admission(command_id, session_id)
+            .child_create_admission(command_id, session_id, parent_session_id)
             .await
     }
 
@@ -4900,6 +4937,7 @@ impl SessionHub {
             haider_protocol::session::SessionInteractionModeV1::Interactive,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4910,6 +4948,7 @@ impl SessionHub {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<SessionCreateOutcome, SessionHubError> {
         if crate::android_policy::enabled() {
             crate::android_workspace::validate(std::path::Path::new(&command.cwd))?;
@@ -4923,6 +4962,7 @@ impl SessionHub {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
                 completed,
             })
             .await
@@ -6762,6 +6802,7 @@ impl SessionHub {
         use haider_protocol::session::RunOutputPairPinnedV1;
         let mut cursor = 0;
         let mut states = HashMap::<RunId, RunState>::new();
+        let mut branches = HashMap::<RunId, Option<BranchId>>::new();
         let mut admitted = HashMap::<RunId, u64>::new();
         let mut started = HashMap::<RunId, u64>::new();
         let mut specs = HashMap::new();
@@ -6803,6 +6844,9 @@ impl SessionHub {
                     specs.insert(run_id.clone(), spec);
                 }
                 if let Ok(EventPayload::RunState(state)) = event.payload.decode_event() {
+                    branches
+                        .entry(run_id.clone())
+                        .or_insert_with(|| event.branch_id.clone());
                     if matches!(state, RunState::Queued) {
                         admitted.entry(run_id.clone()).or_insert(event.seq);
                     } else {
@@ -6831,6 +6875,7 @@ impl SessionHub {
                         pairs
                             .entry(run_id.clone())
                             .or_insert(ActiveRunOutputPairSnapshot {
+                                branch_id: event.branch_id.clone(),
                                 durably_pinned: true,
                                 run_id: run_id.clone(),
                                 provider: pin.provider,
@@ -6839,6 +6884,23 @@ impl SessionHub {
                                 source: Some(pin.source),
                                 rebound_route: pin.provider_route,
                             });
+                    } else if kind
+                        == haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND
+                    {
+                        let route = serde_json::from_value(data).map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("invalid run output route: {error}"),
+                                false,
+                            )
+                        })?;
+                        changes.push((
+                            event.seq,
+                            RunOutputPairChange::Route {
+                                run_id: run_id.clone(),
+                                route,
+                            },
+                        ));
                     } else if kind == "run_worker_pickup_v1" {
                         started.entry(run_id.clone()).or_insert(event.seq);
                     } else if kind == "provider_pair_switch_v1"
@@ -6904,6 +6966,7 @@ impl SessionHub {
                 pairs.insert(
                     run_id.clone(),
                     ActiveRunOutputPairSnapshot {
+                        branch_id: branches.get(run_id).cloned().flatten(),
                         durably_pinned: false,
                         run_id: run_id.clone(),
                         provider: spec.map_or(snapshot.provider, |spec| spec.provider.clone()),
@@ -6935,6 +6998,21 @@ impl SessionHub {
                         pair.model = model;
                     }
                 }
+                RunOutputPairChange::Route { run_id, route } => {
+                    if pinned_at.get(&run_id).is_none_or(|pin| *pin >= seq)
+                        || terminal_at.get(&run_id).is_some_and(|end| *end < seq)
+                    {
+                        continue;
+                    }
+                    if let Some(pair) = pairs.get_mut(&run_id)
+                        && pair
+                            .rebound_route
+                            .as_ref()
+                            .is_some_and(|old| old.rebind_id == route.rebind_id)
+                    {
+                        pair.rebound_route = Some(route);
+                    }
+                }
                 RunOutputPairChange::Rebind(rebound) => {
                     for (run_id, pair) in &mut pairs {
                         if pinned_at.get(run_id).is_none_or(|pin| *pin >= seq)
@@ -6948,6 +7026,10 @@ impl SessionHub {
                                 rebind_id: rebound.rebind_id.clone(),
                                 base_url: rebound.base_url.clone(),
                                 account: rebound.account.clone(),
+                                resolved_alias: None,
+                                resolved_seen: false,
+                                selection_epoch: rebound.selection_epoch,
+                                reset_epoch: rebound.selection_epoch,
                             });
                         if let Some(active) = rebound
                             .active_output_budget
@@ -8800,6 +8882,98 @@ impl HubStoreHandle {
             .store
             .session_metadata(&self.session_id)
             .await
+    }
+
+    /// A restored explicit route belongs to this logical run, even when a
+    /// next-turn selection has cleared or replaced the session route.
+    pub(crate) async fn commit_turn_resolved_route(
+        &self,
+        run_id: &RunId,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        alias: Option<&str>,
+    ) -> Result<u64, HaiderError> {
+        let Some(mut route) = haider_protocol::session::RunOutputProviderRouteV1::capture(metadata)
+        else {
+            return self.commit_resolved_route(metadata, alias).await;
+        };
+        let current = metadata.selection_epoch.unwrap_or(0);
+        if route.resolved_seen && route.resolved_alias.as_deref() == alias {
+            return Ok(current);
+        }
+        let epoch = if route.resolved_seen {
+            self.latest_seq(&self.session_id)
+                .await?
+                .max(current)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    HaiderError::new(ErrorCode::StoreCorrupt, "run route epoch exhausted", false)
+                })?
+        } else {
+            current
+        };
+        route.selection_epoch = Some(epoch);
+        route.resolved_alias = alias.map(str::to_owned);
+        route.resolved_seen = true;
+        let branch_id = self
+            .hub
+            .run_output_pair(&self.session_id, run_id)
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::RunNotActive,
+                    "resolved route has no admitted run",
+                    false,
+                )
+            })?
+            .branch_id;
+        let event_ids =
+            haider_core::EventIdGenerator::new(random_id("run-route").map_err(hub_error_as_store)?);
+        crate::worker::append_payloads(
+            self,
+            &self.hub.inner.device_id,
+            run_id,
+            branch_id.as_ref(),
+            &event_ids,
+            vec![EventPayload::Item(ItemEvent::Completed {
+                item_id: haider_protocol::ids::ItemId::new(format!("run-route-{run_id}-{epoch}")),
+                item: TurnItem::Extension {
+                    kind: haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND.into(),
+                    data: serde_json::to_value(route).map_err(|error| {
+                        HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                    })?,
+                },
+            })],
+        )
+        .await?;
+        Ok(epoch)
+    }
+
+    pub(crate) async fn commit_resolved_route(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        alias: Option<&str>,
+    ) -> Result<u64, HaiderError> {
+        let actor = self
+            .hub
+            .actor_for(self.session_id.clone())
+            .await
+            .map_err(hub_error_as_store)?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::ResolvedRoute {
+                provider: metadata.provider.clone(),
+                model: metadata.model.clone(),
+                epoch: metadata.selection_epoch.unwrap_or(0),
+                alias: alias.map(str::to_owned),
+                device_id: self.hub.inner.device_id.clone(),
+                completed,
+            })
+            .await
+            .map_err(|_| hub_error_as_store(SessionHubError::Closed))?;
+        response
+            .await
+            .map_err(|_| hub_error_as_store(SessionHubError::Closed))?
     }
 
     /// Installs this lease's harness. The receiver cannot name another

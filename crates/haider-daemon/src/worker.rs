@@ -85,12 +85,13 @@ use haider_core::{
     ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
     ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit, ProviderDeadlineGuard,
     ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
-    ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint, RouteWaitCheckpoint,
-    SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    TurnTraceContext, UserCommandOutput, build_cache_request_diagnostic, build_context_accounting,
-    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
+    ProviderRouteCommitter, ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint,
+    RouteWaitCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult,
+    ToolDispatcher, TurnHandle, TurnTraceContext, UserCommandOutput,
+    build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
+    context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
     presentation_for_haider_error, register_turn_trace, registered_turn_trace,
     sanitized_failure_message,
@@ -371,6 +372,66 @@ struct DaemonProviderPairSwitchCommitter {
     branch_id: Option<BranchId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
+    turn_selection: Arc<Mutex<haider_protocol::session::SessionMetadataV1>>,
+}
+
+struct DaemonProviderRouteCommitter {
+    store: HubStoreHandle,
+    run_id: RunId,
+    /// The pair and epoch admitted for this turn, including its initial
+    /// resolved route. A later selection must not donate its new epoch to
+    /// this older turn's rotation.
+    selection: Arc<Mutex<haider_protocol::session::SessionMetadataV1>>,
+}
+
+impl std::fmt::Debug for DaemonProviderRouteCommitter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonProviderRouteCommitter")
+            .field("session_id", self.store.session_id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
+    async fn commit(
+        &self,
+        provider: &str,
+        model: &str,
+        to: &haider_protocol::ids::CredentialAlias,
+    ) -> Result<u64, HaiderError> {
+        let mut selection = self.selection.lock().await.clone();
+        if let Some(pair) = self
+            .store
+            .hub()
+            .run_output_pair(self.store.session_id(), &self.run_id)
+            .await?
+            && pair.provider == provider
+            && pair.model == model
+        {
+            pair.restore_route(&mut selection);
+            selection.provider = pair.provider;
+            selection.model = pair.model;
+        }
+        if selection.provider != provider || selection.model != model {
+            return Ok(selection.selection_epoch.unwrap_or(0));
+        }
+        let epoch = self
+            .store
+            .commit_turn_resolved_route(&self.run_id, &selection, Some(to.as_str()))
+            .await?;
+        let mut current = self.selection.lock().await;
+        if current.provider == selection.provider
+            && current.model == selection.model
+            && current.selection_epoch == selection.selection_epoch
+        {
+            current.selection_epoch = Some(epoch);
+            current.resolved_route_alias = Some(to.as_str().to_owned());
+            current.resolved_route_seen = true;
+        }
+        Ok(epoch)
+    }
 }
 
 impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
@@ -384,7 +445,7 @@ impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
 
 #[async_trait]
 impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
-    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError> {
         let live_source_policy = self
             .store
             .hub()
@@ -477,6 +538,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             // rev933b finding 7: the automatic switch observed this exact
             // pair; a concurrent explicit selection moves it and must win.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
+            account_alias: None,
             // No validated model row exists on this path: keep the stored
             // budget. An oversized budget on the fallback model is recovered
             // by the provider's one-shot `max_tokens too large` retry.
@@ -488,9 +550,15 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
         let _selection = hub.lock_workflow_selection(self.store.session_id()).await;
         match hub.select_session_model(command).await {
             Ok(
-                SessionSelectModelOutcome::Committed { .. }
-                | SessionSelectModelOutcome::IdempotentReplay { .. },
-            ) => Ok(()),
+                SessionSelectModelOutcome::Committed { selected, .. }
+                | SessionSelectModelOutcome::IdempotentReplay { selected },
+            ) => {
+                let mut current = self.turn_selection.lock().await;
+                current.provider = selected.provider;
+                current.model = selected.model;
+                current.selection_epoch = Some(selected.selected_seq);
+                Ok(selected.selected_seq)
+            }
             Err(error) => Err(hub_error(error)),
         }
     }
@@ -506,6 +574,7 @@ fn lockdown_pair_switch_allowed(
 
 #[derive(Clone)]
 struct DaemonContextCompactor {
+    selection_epoch: Option<u64>,
     store: HubStoreHandle,
     provider: Arc<dyn Provider>,
     model: String,
@@ -2421,6 +2490,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 &[],
             );
             let footprint = ContextFootprint {
+                selection_epoch: self.selection_epoch,
                 input_tokens: post_compaction_input,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -7704,6 +7774,11 @@ pub(crate) async fn perform_manual_compaction(
     .await?
     .cache_cohort();
     let compactor = DaemonContextCompactor {
+        selection_epoch: Some(
+            lease
+                .commit_resolved_route(metadata, resolved.account_alias.as_deref())
+                .await?,
+        ),
         store: lease.clone(),
         provider: resolved.provider,
         model: resolved.model,
@@ -9565,6 +9640,26 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
+    let route_epoch = lease
+        .commit_turn_resolved_route(
+            &accepted.run_id,
+            metadata,
+            resolved.account_alias.as_deref(),
+        )
+        .await?;
+    config.selection_epoch = Some(route_epoch);
+    let mut route_selection = metadata.clone();
+    route_selection.selection_epoch = Some(route_epoch);
+    route_selection
+        .resolved_route_alias
+        .clone_from(&resolved.account_alias);
+    route_selection.resolved_route_seen = true;
+    let turn_selection = Arc::new(Mutex::new(route_selection));
+    config.provider_route_committer = Some(Arc::new(DaemonProviderRouteCommitter {
+        store: lease.clone(),
+        run_id: accepted.run_id.clone(),
+        selection: Arc::clone(&turn_selection),
+    }));
     config.turn_trace = turn_trace.clone();
     config.agent_spawn = headless
         .as_ref()
@@ -9780,6 +9875,7 @@ async fn start_turn(
     // take the degraded fallback) — a cost edge, never a correctness one.
     // Re-resolving at compact time needs live-lane threading; tracked.
     config.context_compactor = Some(Arc::new(DaemonContextCompactor {
+        selection_epoch: config.selection_epoch,
         store: lease.clone(),
         provider: Arc::clone(&resolved.provider),
         model: config.model.clone(),
@@ -9838,6 +9934,7 @@ async fn start_turn(
         branch_id: accepted.branch_id.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
+        turn_selection,
     }));
     config.supervisor_commits_cancelled = true;
     config.prompt_retraction_enabled = true;
@@ -12848,7 +12945,7 @@ async fn append_session_idle(
     store.settle_idle(envelope).await.map(|_| ())
 }
 
-async fn append_payloads(
+pub(crate) async fn append_payloads(
     store: &HubStoreHandle,
     device_id: &DeviceId,
     run_id: &RunId,
@@ -12866,7 +12963,7 @@ async fn append_payloads(
             (!matches!(payload, EventPayload::SessionState(_))).then(|| run_id.clone());
         let bookkeeping = matches!(&payload,
             EventPayload::Item(ItemEvent::Completed { item: TurnItem::Extension { kind, .. }, .. })
-            if kind == haider_protocol::session::RunOutputPairPinnedV1::KIND || kind == "run_worker_pickup_v1");
+            if kind == haider_protocol::session::RunOutputPairPinnedV1::KIND || kind == "run_worker_pickup_v1" || kind == haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND);
         let mut envelope = supervisor_envelope(
             store,
             device_id,
@@ -23675,16 +23772,34 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     };
                     // A capturable indicator (Linux notification popup) is
                     // taken off screen for the model-facing capture.
-                    let _revealed_after_capture = if matches!(
+                    let revealed_after_capture = if matches!(
                         operation.action(),
                         haider_protocol::computer::ComputerAction::Screenshot
                             | haider_protocol::computer::ComputerAction::Inspect { .. }
                     ) {
-                        self.cu_presence.conceal_for_capture().await
+                        match self.cu_presence.conceal_for_capture().await {
+                            Ok(guard) => Some(guard),
+                            Err(message) => {
+                                let error = ComputerError::Backend { message };
+                                broker
+                                    .journal_computer_outcome(
+                                        &intent,
+                                        EffectOutcome::Failed {
+                                            error: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                return Ok(computer_failure_result(&error));
+                            }
+                        }
                     } else {
                         None
                     };
-                    match self.computer.execute(operation.action(), &action_cancel).await {
+                    let execution = self.computer.execute(operation.action(), &action_cancel).await;
+                    // The model-facing pixels exist when execute returns. Restore
+                    // Stop before redaction, bounding, journaling or recording.
+                    drop(revealed_after_capture);
+                    match execution {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
                             let stored = self
                                 .admit_computer_screenshot_region(png, &action_cancel, operation.region())

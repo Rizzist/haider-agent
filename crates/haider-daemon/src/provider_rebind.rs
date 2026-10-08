@@ -405,6 +405,15 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
                 true,
             ));
         }
+        let epoch = self
+            .store
+            .commit_turn_resolved_route(&self.run_id, &metadata, resolved.account_alias.as_deref())
+            .await?;
+        metadata.selection_epoch = Some(epoch);
+        metadata
+            .resolved_route_alias
+            .clone_from(&resolved.account_alias);
+        metadata.resolved_route_seen = true;
         let capabilities = resolved.provider.capabilities().await;
         let request_state = provider_derived_request_state(
             &resolved.provider_name,

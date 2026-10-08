@@ -32,6 +32,13 @@ children reduce the pin together with later pair-switch and rebind facts.
 The optional `provider_route` field retains the explicit rebind id, endpoint
 and account alias at that boundary, including when an older run is migrated
 after its rebind. It contains no credentials; older extension readers ignore it.
+Optional route fields retain that run's `resolved_alias`, `resolved_seen`,
+`selection_epoch` and `reset_epoch`. The hidden, prompt-omitted extension
+`run_output_route_resolved_v1` updates those fields for that run only, after
+its pin and before completion. It never writes session-level resolved-route
+metadata; a later turn resolves the current session selection independently.
+These remain existing Extension items with additive JSON fields, decodable
+by the schema-33 wave base.
 
 ### v0.0.973 — provider-request budgets become opt-in
 

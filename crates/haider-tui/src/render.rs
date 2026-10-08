@@ -6795,14 +6795,31 @@ fn render_session(
             accent.add_modifier(Modifier::BOLD),
         ));
     }
-    header_bottom.push(Span::styled(
+    let account = model.attached_account_label();
+    let has_session_row = model
+        .active_session
+        .as_ref()
+        .and_then(|session| model.sessions.iter().find(|row| &row.id == session))
+        .is_some();
+    let route_identity = if model.mode.fabricates_locally() || !has_session_row {
         format!(
             " · branch {} · {}",
             model.active_branch_name(),
             identity.device
-        ),
-        theme.dim_style(),
-    ));
+        )
+    } else if area.width <= 90 {
+        // At owner-narrow widths the account remains visible. The branch is
+        // still present in the session controls below this fixed header.
+        format!(" · @{account}")
+    } else {
+        format!(
+            " · branch {} · account {} · {}",
+            model.active_branch_name(),
+            account,
+            identity.device
+        )
+    };
+    header_bottom.push(Span::styled(route_identity, theme.dim_style()));
     // Shed chrome renders nothing: a 1-row header keeps only the product
     // line (the area clips line 2), a 0-row header/rule disappears whole.
     let header_top_used = u16::try_from(Line::from(header_top.clone()).width()).unwrap_or(0);
@@ -7832,26 +7849,66 @@ fn render_token_panel(
         main_meter,
         main_detail,
     )];
+    let mut unknown_children = Vec::new();
     for (_, chip) in crate::app::flatten_chips(&model.chips) {
-        // A child's window is ITS model's: its own snapshot, else the
-        // catalog row for its model — never the parent's figure.
-        let declared = model
-            .providers
-            .declared_window(&identity.provider, &chip.model)
+        let manifest_label = chip.provider.as_deref().map_or_else(
+            || chip.model.clone(),
+            |provider| format!("{} · {provider}", chip.model),
+        );
+        let child_label = chip
+            .child_session
+            .as_deref()
+            .and_then(|session| model.sessions.iter().find(|row| row.id.as_str() == session))
+            .map_or_else(
+                || manifest_label.clone(),
+                |row| {
+                    row.meter_epoch.pair.as_ref().map_or_else(
+                        || {
+                            if row.summary_seen {
+                                "unknown".to_owned()
+                            } else {
+                                manifest_label.clone()
+                            }
+                        },
+                        |(provider, child_model)| format!("{child_model} · {provider}"),
+                    )
+                },
+            );
+        if let Some(meter) = model.child_context_meter(chip) {
+            rows.push((
+                format!("└ {} · {child_label}", chip.name),
+                meter,
+                Vec::new(),
+            ));
+            continue;
+        }
+        if !model.mode.fabricates_locally() && chip.child_session.is_some() {
+            unknown_children.push(format!("└ {} · {child_label}  usage unknown", chip.name));
+            continue;
+        }
+        // A child's window is ITS model's (973-context-meter-fixes B2): its
+        // own valid snapshot first, else the catalog row for its model
+        // under ITS provider. The same slug on another provider may declare
+        // a different window, so without the child's provider provenance
+        // no catalog row is borrowed — never the parent's.
+        let child_detail = |lookup: fn(&crate::app::ProvidersState, &str, &str) -> Option<u64>| {
+            chip.provider
+                .as_deref()
+                .and_then(|provider| lookup(&model.providers, provider, &chip.model))
+        };
+        let footprint = chip.transcript.latest_footprint();
+        let window = footprint
+            .and_then(|footprint| footprint.context_window)
+            .filter(|window| *window > 0)
+            .or_else(|| child_detail(crate::app::ProvidersState::declared_window))
             .unwrap_or(0);
+        let output_limit = child_detail(crate::app::ProvidersState::declared_output_limit);
         let meter = crate::context_meter::ContextMeter::resolve(
-            chip.transcript.latest_footprint(),
+            footprint,
             chip.tokens,
-            declared,
-            true,
-            |window| {
-                crate::context_meter::derived_reserved_output(
-                    model
-                        .providers
-                        .declared_output_limit(&identity.provider, &chip.model),
-                    window,
-                )
-            },
+            window,
+            crate::context_meter::SnapshotEpoch::Current,
+            |window| crate::context_meter::derived_reserved_output(output_limit, window),
         );
         rows.push((
             format!("└ {} · {}", chip.name, chip.model),
@@ -7872,6 +7929,9 @@ fn render_token_panel(
         for fact in detail {
             lines.push(Line::styled(format!("    {fact}"), theme.dim_style()));
         }
+    }
+    for label in unknown_children {
+        lines.push(Line::styled(label, theme.text_style()));
     }
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let width = area.width.saturating_sub(2).max(24);
@@ -9281,13 +9341,13 @@ fn render_subtree(
                         accent_style.add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
-                        format!(" · {remainder} · {}", chip.model),
+                        format!(" · {remainder} · {}", model.child_display_model(chip)),
                         ink,
                     ));
                 }
                 _ => {
                     spans.push(Span::styled(
-                        format!(" · {} · {}", chip.name, chip.model),
+                        format!(" · {} · {}", chip.name, model.child_display_model(chip)),
                         ink,
                     ));
                 }
@@ -11487,7 +11547,10 @@ fn render_subagent(
     let mut header_bottom = vec![Span::styled(
         format!(
             " {} · {} · {} · {}  ",
-            chip.full, chip.name, chip.model, chip.device
+            chip.full,
+            chip.name,
+            model.child_display_model(chip),
+            chip.device
         ),
         theme.dim_style(),
     )];
@@ -12067,7 +12130,7 @@ fn render_aura(
                 theme,
                 transcript_area.width,
             ),
-            TranscriptEntry::Note { text } => {
+            TranscriptEntry::Note { text, .. } => {
                 lines.push(Line::from(vec![
                     Span::raw("   "),
                     Span::styled(text.as_str(), theme.dim_style()),
@@ -15264,7 +15327,10 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
     // durable occupancy snapshot beats the usage fallback, an ESTIMATED
     // snapshot wears `~`, and an unknown window reads unknown — never a
     // percentage of a guessed (or output-budget) window.
-    let meter = model.context_meter().status_text(METER_CELLS_DEFAULT);
+    let meter = model.viewed_context_meter().map_or_else(
+        || "context unknown".to_owned(),
+        |meter| meter.status_text(METER_CELLS_DEFAULT),
+    );
 
     // F2c: token usage sits DIRECTLY right of the state — the identity
     // block (model / auth / reasoning) moved to the composer's top rule.
@@ -15655,7 +15721,7 @@ fn transcript_lines<'a>(
             receipt,
             ..
         } => peer_entry_lines(lines, sender, sender_kind, text, *receipt, theme, width),
-        TranscriptEntry::Note { text } => {
+        TranscriptEntry::Note { text, .. } => {
             // Sim NoteRow (tui.js:4572-4577): dim, indented off the margin.
             lines.push(Line::from(vec![
                 Span::raw("   "),
