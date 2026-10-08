@@ -157,6 +157,13 @@ impl PathContext {
         let broad_workspace = protected
             && self.workspace.as_deref().is_some_and(|root| {
                 haider_client::launch_origin::is_multiuser_workspace_root(Path::new(root))
+                    || self.homes.iter().any(|home| {
+                        haider_client::launch_origin::workspace_relative_display(
+                            home,
+                            Path::new(root),
+                        )
+                        .is_some_and(|label| label != ".")
+                    })
             });
         if broad_workspace {
             return display;
