@@ -217,6 +217,29 @@ fn registered_home_ancestors_keep_home_labels_and_narrow_workspaces_shorten() {
     }
 }
 
+#[test]
+fn nested_registered_home_does_not_hide_other_workspace_relative_paths() {
+    let mut context = PathContext {
+        workspace: Some("D:/Profiles/team/display-fixture-owner".to_owned()),
+        homes: vec![
+            "D:/Profiles/team/display-fixture-owner".into(),
+            "D:/Profiles/team/display-fixture-owner/VirtualProfile".into(),
+        ],
+    };
+    let ordinary = "D:/Profiles/team/display-fixture-owner/project/notes.txt";
+    let nested = "D:/Profiles/team/display-fixture-owner/VirtualProfile/notes.txt";
+    assert_eq!(context.shorten(ordinary), "project/notes.txt");
+    assert_eq!(context.shorten(nested), "~/notes.txt");
+    assert_eq!(
+        tv::header_args("fs_read", &json!({"path": ordinary}), &context),
+        "project/notes.txt"
+    );
+    assert_eq!(context.shorten(context.workspace.as_deref().unwrap()), ".");
+    context.workspace = Some("D:/Profiles/team".to_owned());
+    assert_eq!(context.shorten(ordinary), "~/project/notes.txt");
+    assert_eq!(context.shorten(nested), "~/notes.txt");
+}
+
 #[cfg(unix)]
 #[test]
 fn posix_registered_home_ancestors_and_aliases_keep_home_labels() {

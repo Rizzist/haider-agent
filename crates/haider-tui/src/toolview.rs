@@ -163,6 +163,11 @@ impl PathContext {
                             Path::new(root),
                         )
                         .is_some_and(|label| label != ".")
+                            && haider_client::launch_origin::workspace_relative_display(
+                                Path::new(path),
+                                home,
+                            )
+                            .is_some()
                     })
             });
         if broad_workspace {
