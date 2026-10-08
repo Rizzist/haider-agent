@@ -1134,6 +1134,11 @@ pub struct ProvidersState {
     /// Complete projections waiting for their active account proof. A new
     /// accepted publication supersedes the buffered projection it replaces.
     pending_catalogs: HashMap<String, haider_rpc::ProviderSummaryWire>,
+    publication_revisions: HashMap<String, u64>,
+    /// Account replies can temporarily supersede a provider's credential
+    /// evidence. Keep the publication's value for same-producer recovery.
+    credential_availability:
+        HashMap<String, (haider_rpc::ProviderAvailabilityWire, Option<String>)>,
     pub revision: Option<u64>,
     pub message: Option<String>,
     /// In-flight `account.set_default_model`: (provider, model).
@@ -1161,6 +1166,10 @@ fn provider_inventory_now_ms() -> u64 {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+fn catalog_publication_is_ahead(publication: Option<u64>, accounts: Option<u64>) -> bool {
+    publication > accounts
 }
 
 /// Normalize wire compatibility projections at the client snapshot boundary.
@@ -1204,6 +1213,13 @@ fn provider_inventory_can_fetch(summary: &haider_rpc::ProviderSummaryWire) -> bo
 }
 
 impl ProvidersState {
+    fn replace_catalog_publication(&mut self, provider: &str, revision: u64) {
+        self.pending_catalogs.remove(provider);
+        self.credential_availability.remove(provider);
+        self.publication_revisions
+            .insert(provider.to_owned(), revision);
+    }
+
     fn focus_provider(&mut self, provider: &str) {
         self.focus_after_refresh = Some(provider.to_owned());
         if let Some(cursor) = self
@@ -1228,6 +1244,11 @@ impl ProvidersState {
             return false;
         }
         self.pending_catalogs.clear();
+        self.credential_availability.clear();
+        self.publication_revisions = providers
+            .iter()
+            .map(|summary| (summary.provider.clone(), revision))
+            .collect();
         self.providers = providers
             .into_iter()
             .map(normalize_provider_inventory)
@@ -1267,7 +1288,7 @@ impl ProvidersState {
         {
             return false;
         }
-        self.pending_catalogs.remove(&summary.provider);
+        self.replace_catalog_publication(&summary.provider, revision);
         if let Some(slot) = self
             .providers
             .iter_mut()
@@ -1293,7 +1314,7 @@ impl ProvidersState {
         {
             return false;
         }
-        self.pending_catalogs.remove(&summary.provider);
+        self.replace_catalog_publication(&summary.provider, revision);
         if let Some(slot) = self
             .providers
             .iter_mut()
@@ -12090,10 +12111,37 @@ impl AppModel {
                         )
                 });
             if !credential_ready {
+                if self.accounts.revision.is_some()
+                    && !catalog_publication_is_ahead(
+                        self.providers
+                            .publication_revisions
+                            .get(&summary.provider)
+                            .copied(),
+                        self.accounts.revision,
+                    )
+                {
+                    self.providers
+                        .credential_availability
+                        .entry(summary.provider.clone())
+                        .or_insert_with(|| {
+                            (summary.availability, summary.availability_reason.clone())
+                        });
+                    summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+                    summary.availability_reason =
+                        Some("active account credentials unavailable".into());
+                }
                 // A later healthy account reply may establish readiness for
                 // this same producer. Keep its original listing timestamp
                 // rather than consuming the freshness transition first.
                 continue;
+            }
+            if let Some((availability, reason)) = self
+                .providers
+                .credential_availability
+                .remove(&summary.provider)
+            {
+                summary.availability = availability;
+                summary.availability_reason = reason;
             }
             summary.project_inventory_at_time_with_credential_ready(now_ms, credential_ready);
         }
@@ -12109,7 +12157,6 @@ impl AppModel {
         // Publication order comes from management revisions. Incarnations
         // identify an account; activating an older account does not make its
         // incarnation larger than the previously active account's value.
-        let catalogs_ahead = self.providers.revision > self.accounts.revision;
         let active = self
             .accounts
             .rows
@@ -12140,9 +12187,14 @@ impl AppModel {
                 {
                     *slot = summary.clone();
                 }
+                self.providers.credential_availability.remove(provider);
                 return false;
             }
-            owner.is_some() && catalogs_ahead
+            owner.is_some()
+                && catalog_publication_is_ahead(
+                    self.providers.publication_revisions.get(provider).copied(),
+                    self.accounts.revision,
+                )
         });
         for summary in &mut self.providers.providers {
             let Some(scope) = summary.catalog_scope.as_ref() else {
@@ -12157,6 +12209,13 @@ impl AppModel {
             if current == Some(&(alias.clone(), incarnation)) {
                 continue;
             }
+            let catalogs_ahead = catalog_publication_is_ahead(
+                self.providers
+                    .publication_revisions
+                    .get(&summary.provider)
+                    .copied(),
+                self.accounts.revision,
+            );
             // Empty listings carry successful-discovery evidence too. Hold
             // the complete projection until its exact active owner arrives.
             if catalogs_ahead {
@@ -12175,6 +12234,9 @@ impl AppModel {
                         .insert(summary.provider.clone(), summary.clone());
                 }
             }
+            self.providers
+                .credential_availability
+                .remove(&summary.provider);
             retire_fetched_catalog(summary);
         }
     }

@@ -1754,6 +1754,161 @@ fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
         }
     }
 
+    fn account(
+        driver: &mut LiveDriver,
+        model: &mut AppModel,
+        alias: &str,
+        incarnation: u64,
+        status: CredentialStatus,
+        revision: u64,
+    ) {
+        let mut descriptor = oauth_descriptor("custom", alias, true);
+        descriptor.auth_method = AuthMethod::ApiKey;
+        descriptor.incarnation = incarnation;
+        descriptor.status = status;
+        pass(
+            driver,
+            model,
+            LiveReply::Accounts {
+                descriptors: vec![descriptor],
+                revision: Some(revision),
+                sources: vec![],
+            },
+        );
+    }
+
+    for kind in 0..3 {
+        for catalog in [
+            haider_rpc::ProviderCatalogKindWire::Custom,
+            haider_rpc::ProviderCatalogKindWire::Public,
+            haider_rpc::ProviderCatalogKindWire::Authenticated,
+            haider_rpc::ProviderCatalogKindWire::Offline,
+            haider_rpc::ProviderCatalogKindWire::Adapter,
+        ] {
+            for aged in [false, true] {
+                for anonymous in [false, true] {
+                    for status in [
+                        CredentialStatus::Ok,
+                        CredentialStatus::Limited { until_ms: u64::MAX },
+                        CredentialStatus::Expired,
+                        CredentialStatus::Revoked,
+                        CredentialStatus::NeedsAttention {
+                            reason: haider_protocol::credential::CredentialAttentionReason::SourceUnreadable,
+                        },
+                    ] {
+                        let mut model = live_model();
+                        let mut driver = LiveDriver::new("credential-proof-order");
+                        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+                        let mut summary = private_summary(1, "deployment");
+                        summary.catalog = catalog;
+                        summary.configured_models = vec!["deployment".into()];
+                        summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+                        summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+                        summary.auth_methods = if anonymous { vec![] } else { vec![AuthMethod::ApiKey] };
+                        summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+                            fetched_at_ms: if aged { 1 } else { u64::MAX },
+                        };
+                        publish(&mut driver, &mut model, 0, summary.clone(), 1);
+                        assert!(model.providers.providers[0].model_is_selectable("deployment"));
+                        let expected = anonymous || matches!(status, CredentialStatus::Ok | CredentialStatus::Limited { .. });
+                        account(&mut driver, &mut model, "work", 1, status.clone(), 2);
+                        let context = format!("publication={kind} catalog={catalog:?} aged={aged} anonymous={anonymous} status={status:?}");
+                        assert_eq!(model.providers.providers[0].model_is_selectable("deployment"), expected, "{context}");
+                        assert_eq!(model.model_picker_rows().into_iter().find(|row| row.model=="deployment").expect("configured row").available, expected, "{context}");
+                        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 3);
+                        assert!(model.providers.providers[0].model_is_selectable("deployment"), "recovery {context}");
+
+                        account(&mut driver, &mut model, "work", 1, CredentialStatus::Expired, 4);
+                        summary.inventory = haider_rpc::ModelInventoryWire::Unavailable { reason: "synthetic catalog authentication failure".into() };
+                        summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+                        publish(&mut driver, &mut model, kind, summary, 5);
+                        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 6);
+                        assert!(!model.providers.providers[0].model_is_selectable("deployment"), "new negative publication {context}");
+                    }
+                }
+            }
+        }
+
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("newer-provider-credential-proof");
+        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+        let summary = private_summary(1, "deployment");
+        publish(&mut driver, &mut model, 0, summary.clone(), 1);
+        account(
+            &mut driver,
+            &mut model,
+            "work",
+            1,
+            CredentialStatus::Expired,
+            2,
+        );
+        assert!(!model.providers.providers[0].model_is_selectable("deployment"));
+        publish(&mut driver, &mut model, kind, summary, 3);
+        assert!(
+            model.providers.providers[0].model_is_selectable("deployment"),
+            "new provider proof publication={kind}"
+        );
+        account(
+            &mut driver,
+            &mut model,
+            "work",
+            1,
+            CredentialStatus::Expired,
+            3,
+        );
+        assert!(!model.providers.providers[0].model_is_selectable("deployment"));
+        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 4);
+        assert!(model.providers.providers[0].model_is_selectable("deployment"));
+        if kind != 0 {
+            publish(
+                &mut driver,
+                &mut model,
+                kind,
+                provider_summary("other", &["other-model"], "other-model"),
+                6,
+            );
+            account(
+                &mut driver,
+                &mut model,
+                "work",
+                1,
+                CredentialStatus::Expired,
+                5,
+            );
+            assert!(
+                !model.providers.providers[0].model_is_selectable("deployment"),
+                "other provider must not hide credential proof publication={kind}"
+            );
+        }
+    }
+
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("retired-credential-proof");
+    account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+    let mut summary = private_summary(1, "deployment");
+    summary.configured_models = vec!["deployment".into()];
+    publish(&mut driver, &mut model, 0, summary, 1);
+    account(
+        &mut driver,
+        &mut model,
+        "work",
+        1,
+        CredentialStatus::Expired,
+        2,
+    );
+    account(
+        &mut driver,
+        &mut model,
+        "second",
+        2,
+        CredentialStatus::Ok,
+        3,
+    );
+    assert!(
+        !model.providers.providers[0].model_is_selectable("deployment"),
+        "a new account cannot restore the retired credential baseline"
+    );
+
     // Accepted full, refresh, and default publications supersede buffered
     // evidence even when their revision is equal. Rejected older replies do
     // not erase a valid pending projection.
