@@ -561,7 +561,7 @@ impl SessionExport {
         }
         out.push_str(&format!(
             "- workspace: `{}`\n- model: `{}` · `{}`\n- created: {}\n\n",
-            self.meta.cwd,
+            display_path(Path::new(&self.meta.cwd)),
             self.meta.provider,
             self.meta.model,
             iso8601_ms(self.meta.created_at_ms),
