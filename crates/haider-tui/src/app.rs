@@ -11917,7 +11917,7 @@ impl AppModel {
             descriptor.provider,
             descriptor.alias,
             auth_label(descriptor.auth_method)
-)));
+        )));
         // Account selection supplies the launcher default for future
         // sessions. An attached session retains its own committed pair.
         self.adopt_identity(&descriptor.provider, descriptor.alias.as_str(), true);
