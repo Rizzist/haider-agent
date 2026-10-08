@@ -606,7 +606,7 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             tool_reason: block.tool_reason.clone(),
             spoken: block.spoken,
         },
-        TranscriptEntry::Note { text } => EntryDto::Note { text: text.clone() },
+        TranscriptEntry::Note { text, .. } => EntryDto::Note { text: text.clone() },
         TranscriptEntry::Refusal {
             provider,
             tool,
@@ -886,7 +886,10 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
                 agent_line_starts,
             })
         }
-        EntryDto::Note { text } => TranscriptEntry::Note { text },
+        EntryDto::Note { text } => TranscriptEntry::Note {
+            text,
+            selection_notice_epoch: None,
+        },
         EntryDto::Shell { cmd, out } => TranscriptEntry::Shell { cmd, out },
     }
 }
@@ -900,6 +903,7 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
         full: dto.full,
         name: dto.name,
         model: dto.model,
+        provider: None,
         lockdown: false,
         device: dto.device,
         state: chip_state_from_label(&dto.state),
