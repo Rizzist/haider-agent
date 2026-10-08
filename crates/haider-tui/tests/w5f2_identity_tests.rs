@@ -1723,6 +1723,59 @@ fn picker_and_daemon_share_configured_availability_for_every_provider_kind() {
 
 #[test]
 fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
+    // A same/older publication cannot assert a different active owner.
+    // A later account reply must not revive that discarded listing proof.
+    for previous_incarnation in [1, 42] {
+        for publication_revision in [1, 2] {
+            let mut model = live_model();
+            let mut driver = LiveDriver::new("nonfuture-catalog-proof");
+            let mut previous = oauth_descriptor("custom", "previous", true);
+            previous.auth_method = AuthMethod::ApiKey;
+            previous.incarnation = previous_incarnation;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![previous],
+                    revision: Some(2),
+                    sources: vec![],
+                },
+            );
+            let mut summary = private_summary(1, "deployment");
+            summary.auth_methods = vec![AuthMethod::ApiKey];
+            summary.models.clear();
+            summary.model_details.clear();
+            summary.configured_models = vec!["deployment".into()];
+            summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+            summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+            summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+            summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Providers {
+                    providers: vec![summary],
+                    revision: publication_revision,
+                },
+            );
+            let mut current = oauth_descriptor("custom", "work", true);
+            current.auth_method = AuthMethod::ApiKey;
+            current.incarnation = 1;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![current],
+                    revision: Some(3),
+                    sources: vec![],
+                },
+            );
+            assert!(
+                !model.providers.providers[0].model_is_selectable("deployment"),
+                "discarded publication={publication_revision} previous={previous_incarnation}"
+            );
+        }
+    }
     for previous_incarnation in [None, Some(1), Some(42)] {
         for catalog in [
             haider_rpc::ProviderCatalogKindWire::Custom,
