@@ -12266,10 +12266,26 @@ impl HubConnection {
         }
         let resolved_provider = validated.provider;
         let resolved_model = validated.model;
-        let target_descriptor = descriptors
-            .iter()
-            .find(|descriptor| descriptor.provider == resolved_provider && descriptor.active)
-            .cloned();
+        let target_descriptor = if current.provider == resolved_provider {
+            if let Some(alias) = current.account_alias.as_deref() {
+                descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.alias.as_str() == alias)
+                    .cloned()
+            } else {
+                descriptors
+                    .iter()
+                    .find(|descriptor| {
+                        descriptor.provider == resolved_provider && descriptor.active
+                    })
+                    .cloned()
+            }
+        } else {
+            descriptors
+                .iter()
+                .find(|descriptor| descriptor.provider == resolved_provider && descriptor.active)
+                .cloned()
+        };
         let mut changed_fields = Vec::new();
         if current.provider != resolved_provider {
             changed_fields.push("provider".to_owned());
@@ -12322,6 +12338,10 @@ impl HubConnection {
             provider: resolved_provider,
             model: resolved_model,
             expected_pair: None,
+            // A model or output-budget choice never selects an account. The
+            // descriptor above is only for cache preflight; passing it to the
+            // store would turn an unpinned session into a durable pin.
+            account_alias: None,
             output_budget: Some(output_budget),
             event_id: EventId::new(random_id("model-selected")?),
             device_id: self.hub.inner.device_id.clone(),
@@ -12383,6 +12403,8 @@ impl HubConnection {
                 selected_seq: selected.selected_seq,
                 worker_generation: selected.worker_generation,
                 output_budget: selected.output_budget,
+                cleared_account_pin: selected.cleared_account_pin,
+                cleared_provider_endpoint: selected.cleared_provider_endpoint,
             },
         })
     }
@@ -16576,6 +16598,7 @@ impl HubConnection {
         if resolve_model {
             request_coordinates["resolve_model"] = serde_json::Value::Bool(true);
         }
+
         if let Some(alias) = &account_alias {
             if alias.as_str().trim().is_empty() {
                 return self.respond_error(
@@ -16954,6 +16977,7 @@ impl HubConnection {
                 interaction_mode,
                 account_alias.map(|alias| alias.as_str().to_owned()),
                 workspace_allocation,
+                None,
             )
             .await
         {
@@ -19934,6 +19958,7 @@ async fn session_summaries_with_recency(
             turn_count: Some(turns),
             footprint_tokens,
             footprint_truth,
+            latest_context_footprint: footprint,
             title,
             agent_metrics,
             parent_session_id,
@@ -20211,6 +20236,7 @@ mod roster_wave_tests {
 
     fn summary(index: usize) -> SessionSummary {
         SessionSummary {
+            latest_context_footprint: None,
             session_id: SessionId::new(format!("session-{index:03}")),
             head_seq: u64::try_from(index).expect("test index fits") + 1,
             worker_generation: 1,

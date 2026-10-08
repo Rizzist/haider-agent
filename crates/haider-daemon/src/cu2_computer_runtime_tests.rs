@@ -340,6 +340,8 @@ async fn create_session_with_interaction_mode(
             device_id: device_id.clone(),
         },
         interaction_mode,
+        None,
+        None,
     )
     .await
     .expect("create CU-2 session");
