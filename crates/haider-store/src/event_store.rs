@@ -16,6 +16,8 @@
 //!   open while the exclusive profile lock is held, fencing actor identities
 //!   across process restarts even when the wall clock repeats.
 
+mod create_receipt_compat;
+
 use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
@@ -130,6 +132,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::provider_model_cache_key::ACCOUNT_SCOPED_PREFIX;
+
 #[path = "event_text_cas.rs"]
 mod event_text_cas;
 
@@ -140,6 +144,10 @@ mod event_store_append_tests;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound the reusable WAL allocation after a checkpoint/reset cycle.
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1_024 * 1_024;
+/// The original 1,000-page budget bounds each automatic WAL checkpoint to
+/// roughly 4 MiB plus the committing transaction. The compact journal keeps
+/// ordinary turns below this budget for multiple turns.
+const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1_000;
 const REPLAY_PAGE_SIZE: usize = 1_024;
 /// Keep the complete current `prepare_cached` census without the previous 2x
 /// headroom. This cache is an optimization only; eviction reparses SQL and
@@ -149,6 +157,21 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
 /// pattern is indexed and serialized, so a 512 KiB ceiling retains the hot
 /// B-tree path without pinning SQLite's 2 MiB default page cache at idle.
 const SQLITE_PAGE_CACHE_KIB: i64 = -512;
+/// Keep statement journals and temporary B-trees in memory (`2` = MEMORY).
+/// Group commits nest a savepoint per request, so a turn's batch can modify
+/// more than SQLite's 64 KiB in-memory statement-journal budget. With the
+/// desktop default (file), that spill is an unlinked `etilqs_*` file whose
+/// pages still reach the disk: 72–320 KiB on otherwise 4–8 KiB turns. These
+/// journals only support statement/savepoint rollback, never crash recovery,
+/// so WAL durability is unchanged. Android's bundled SQLite already compiles
+/// with `SQLITE_TEMP_STORE=3` (always memory).
+const SQLITE_TEMP_STORE_MEMORY: i64 = 2;
+/// File-backed temp store (`1`) for work whose statement journals, sorters
+/// and temporary tables scale with the profile instead of one turn: schema
+/// migrations and open-time backfills/sweeps, and whole-session deletes.
+/// Memory temp storage has no size bound, so these spill to disk above
+/// SQLite's in-memory budget instead of holding a profile-sized copy in RAM.
+const SQLITE_TEMP_STORE_FILE: i64 = 1;
 const CACHE_DIAGNOSTIC_KEY_FILE: &str = "cache-diagnostic.key";
 /// A v25 upgrade may need old graph facts, but profile open must never retain
 /// an unbounded copy of the journal. `envelope_weight_bytes` conservatively
@@ -769,6 +792,9 @@ pub struct SessionCreateCommand {
     pub provider: String,
     pub model: String,
     pub max_tokens: u64,
+    /// Whether `max_tokens` was derived or user-set; `None` leaves legacy
+    /// classification to readers (`SessionOutputBudgetSourceV1::classify`).
+    pub max_tokens_source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
     pub permission_overrides: Option<SessionPermissionOverridesV1>,
     /// Creation-time effort selection (G3). `None` — the wire `session.create`
     /// path — means the provider default; delegation passes the parent's
@@ -1075,6 +1101,13 @@ pub struct SessionSelectModelCommand {
     /// it (a concurrent explicit selection wins). Explicit selections pass
     /// `None` — the user's latest word is unconditional.
     pub expected_pair: Option<(String, String)>,
+    /// Resolved account binding for this selection. An absent value keeps
+    /// a same-provider binding; a provider change clears the old binding.
+    pub account_alias: Option<String>,
+    /// Output budget resolved by the daemon for the selected model. `None`
+    /// (the automatic pair-switch path, which has no validated model row)
+    /// keeps the stored budget unchanged.
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub event_id: EventId,
     pub device_id: DeviceId,
 }
@@ -1087,6 +1120,14 @@ pub struct SelectedModel {
     pub model: String,
     pub selected_seq: u64,
     pub worker_generation: u64,
+    /// Budget committed with this selection; absent in pre-973 receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+    /// Explicit pin removed because this selection changed providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_account_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_provider_endpoint: Option<String>,
 }
 
 /// Result of the atomic metadata-update/event/receipt transaction.
@@ -2092,6 +2133,7 @@ pub enum JournalCommitBatch {
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -2381,6 +2423,7 @@ impl Store {
         } = lease;
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection_with(&database_path, synchronous)?;
+        set_temp_store(&connection, SQLITE_TEMP_STORE_FILE)?;
         let migration = migrations::migrate(&mut connection)?;
         migrations::ensure_event_authority_triggers(&mut connection)?;
         let publication_pending = boot_publication_pending(&connection)?;
@@ -2410,6 +2453,7 @@ impl Store {
         let worker_generation = next_worker_generation(&mut connection)?;
         backfill_workflow_graph_journals(&mut connection, &cas, worker_generation)?;
         let graph_telemetry = rebuild_graph_telemetry_cache(&connection)?;
+        set_temp_store(&connection, SQLITE_TEMP_STORE_MEMORY)?;
 
         Ok(Self {
             root,
@@ -4545,6 +4589,42 @@ impl Store {
             .transpose()
     }
 
+    /// Sweep catalog rows that cannot be read by any current descriptor.
+    /// `account:<len>:` was an unreleased key format; authenticated bare
+    /// provider rows predate account scoping and are likewise never read.
+    pub fn prune_provider_model_caches(
+        &self,
+        keep_account_keys: &[String],
+        authenticated_providers: &[String],
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let keys = {
+            let mut statement = transaction
+                .prepare("SELECT provider FROM provider_models")
+                .map_err(map_sqlite_error)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite_error)?
+        };
+        let keep: HashSet<&str> = keep_account_keys.iter().map(String::as_str).collect();
+        let legacy: HashSet<&str> = authenticated_providers.iter().map(String::as_str).collect();
+        for key in keys {
+            let unread_account =
+                key.starts_with(ACCOUNT_SCOPED_PREFIX) || key.starts_with("account:");
+            if (unread_account && !keep.contains(key.as_str())) || legacy.contains(key.as_str()) {
+                transaction
+                    .execute("DELETE FROM provider_models WHERE provider = ?1", [&key])
+                    .map_err(map_sqlite_error)?;
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
     /// Replaces one provider's last-known model catalog.
     pub fn put_provider_models(
         &self,
@@ -4925,30 +5005,9 @@ impl Store {
     /// daemon; this store operation owns only referentially complete removal.
     pub fn delete_session(&self, session_id: &SessionId) -> StoreResult<()> {
         let mut connection = self.connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite_error)?;
-        require_session(&transaction, session_id)?;
-        for statement in [
-            "DELETE FROM run_heads WHERE session_id = ?1",
-            "DELETE FROM run_head_sessions WHERE session_id = ?1",
-            "DELETE FROM session_projection_checkpoints WHERE session_id = ?1",
-            "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
-            "DELETE FROM graph_telemetry_projection WHERE session_id = ?1",
-            "DELETE FROM workflow_node_states WHERE session_id = ?1",
-            "DELETE FROM workflow_graph_instances WHERE session_id = ?1",
-            "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1",
-            "DELETE FROM menu_resolutions WHERE session_id = ?1",
-            "DELETE FROM branches WHERE session_id = ?1",
-            "DELETE FROM delegations WHERE parent_session_id = ?1 OR child_session_id = ?1",
-            "DELETE FROM events WHERE session_id = ?1",
-            "DELETE FROM sessions WHERE id = ?1",
-        ] {
-            transaction
-                .execute(statement, [session_id.as_str()])
-                .map_err(map_sqlite_error)?;
-        }
-        transaction.commit().map_err(map_sqlite_error)?;
+        with_file_temp_store(&mut connection, |connection| {
+            delete_session_rows(connection, session_id)
+        })?;
         self.invalidate_graph_reduction(session_id);
         Ok(())
     }
@@ -4970,10 +5029,174 @@ impl Store {
             )
             .optional()
             .map_err(map_sqlite_error)?;
-        match metadata {
-            Some(json) => decode_session_metadata(session_id, &json),
-            None => Ok(None),
+        let Some(json) = metadata else {
+            return Ok(None);
+        };
+        let Some(metadata) = decode_session_metadata(session_id, &json)? else {
+            return Ok(None);
+        };
+        if metadata.selection_epoch.is_some() {
+            return Ok(Some(metadata));
         }
+        drop(connection);
+        // The rare pre-epoch migration takes a write transaction and
+        // re-reads under its lock so a concurrent selection cannot be lost.
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut metadata = typed_session_metadata(&transaction, session_id)?;
+        if metadata.selection_epoch.is_none() {
+            metadata.selection_epoch = Some(latest_seq_in_connection(&transaction, session_id)?);
+            transaction
+                .execute(
+                    "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                    params![
+                        session_id.as_str(),
+                        serde_json::to_string(&metadata).map_err(|error| {
+                            store_error(ErrorCode::StoreCorrupt, error.to_string(), false)
+                        })?
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(Some(metadata))
+    }
+
+    /// Record this session's serving route. The first route keeps the request
+    /// selection epoch; account rotation advances it. Both produce a durable
+    /// route-only fact without changing the selected model or output budget.
+    pub fn commit_resolved_route(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &DeviceId,
+    ) -> StoreResult<u64> {
+        self.commit_resolved_route_fact(
+            session_id,
+            expected_provider,
+            expected_model,
+            expected_epoch,
+            resolved_alias,
+            device_id,
+        )
+        .map(|(epoch, _)| epoch)
+    }
+
+    /// Return committed route facts for the session actor to publish in order.
+    /// A stale captured selection cannot change metadata or append a fact.
+    pub fn commit_resolved_route_fact(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &DeviceId,
+    ) -> StoreResult<(u64, Vec<RawEnvelope>)> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut metadata = typed_session_metadata(&transaction, session_id)?;
+        if metadata.provider != expected_provider
+            || metadata.model != expected_model
+            || metadata.selection_epoch.unwrap_or(0) != expected_epoch
+        {
+            // A selection committed after this request captured metadata.
+            // Its request keeps the old epoch and cannot acquire the new one.
+            return Ok((expected_epoch, Vec::new()));
+        }
+        let current = metadata
+            .selection_epoch
+            .unwrap_or(latest_seq_in_connection(&transaction, session_id)?);
+        let first_route = !metadata.resolved_route_seen;
+        let unreported_clamp = match (
+            metadata.budget_clamp_notice_epoch,
+            metadata.max_tokens_source,
+        ) {
+            (
+                None,
+                Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                    requested,
+                }),
+            ) if requested > metadata.max_tokens => {
+                Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                    requested,
+                    max_output_tokens: metadata.max_tokens,
+                })
+            }
+            _ => None,
+        };
+        let changed = metadata.resolved_route_seen
+            && metadata.resolved_route_alias.as_deref() != resolved_alias;
+        let epoch = if changed {
+            current
+                .max(latest_seq_in_connection(&transaction, session_id)?)
+                .checked_add(1)
+                .ok_or_else(|| corrupt("session selection epoch space is exhausted"))?
+        } else {
+            current
+        };
+        if !metadata.resolved_route_seen
+            || metadata.selection_epoch != Some(epoch)
+            || metadata.resolved_route_alias.as_deref() != resolved_alias
+            || unreported_clamp.is_some()
+        {
+            if unreported_clamp.is_some() {
+                metadata.budget_clamp_notice_epoch = Some(epoch);
+            }
+            metadata.selection_epoch = Some(epoch);
+            metadata.resolved_route_alias = resolved_alias.map(str::to_owned);
+            metadata.resolved_route_seen = true;
+            transaction
+                .execute(
+                    "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                    params![
+                        session_id.as_str(),
+                        serde_json::to_string(&metadata).map_err(|error| {
+                            store_error(ErrorCode::StoreCorrupt, error.to_string(), false)
+                        })?
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+        let mut envelopes = Vec::new();
+        if first_route || changed || unreported_clamp.is_some() {
+            let fact_seq = latest_seq_in_connection(&transaction, session_id)?
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+            envelopes = vec![unstamped_raw_command_envelope(
+                EventId::new(format!(
+                    "route-selection-{}-{epoch}-{fact_seq}",
+                    session_id.as_str()
+                )),
+                session_id,
+                None,
+                None,
+                device_id.clone(),
+                self.worker_generation,
+                ModelSelected {
+                    selection_epoch: Some(epoch),
+                    provider: metadata.provider.clone(),
+                    model: metadata.model.clone(),
+                    route_only: true,
+                    cleared_account_pin: None,
+                    cleared_provider_endpoint: None,
+                    output_budget_clamp: unreported_clamp,
+                }
+                .to_payload_value()
+                .map_err(|error| store_error(ErrorCode::StoreCorrupt, error.to_string(), false))?,
+                PromptRender::Omit,
+            )?];
+            append_transaction_envelopes(&transaction, session_id, now_ms()?, &mut envelopes)?;
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok((epoch, envelopes))
     }
 
     /// Monotonically persists conversation-level savings after the matching
@@ -8192,12 +8415,14 @@ impl Store {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             } => self
                 .create_session_with_workspace_configuration(
                     command,
                     *interaction_mode,
                     account_alias.clone(),
                     workspace_allocation.clone(),
+                    inherited_route.clone(),
                 )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
@@ -8236,6 +8461,7 @@ impl Store {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             } => self
                 .create_session_in_transaction(
                     transaction,
@@ -8243,6 +8469,7 @@ impl Store {
                     *interaction_mode,
                     account_alias.clone(),
                     workspace_allocation.clone(),
+                    inherited_route.clone(),
                 )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
@@ -8501,18 +8728,21 @@ impl Store {
             interaction_mode,
             account_alias,
             None,
+            None,
         )
     }
 
-    /// Atomic session creation with an optional resolved dated allocation.
-    /// The allocation is metadata only: this transaction performs no
-    /// filesystem materialisation.
+    /// Atomic session creation with an optional resolved dated allocation and
+    /// explicit route inherited by a delegated child. The route's provider
+    /// must match the child's selected provider. The allocation is metadata
+    /// only: this transaction performs no filesystem materialisation.
     pub fn create_session_with_workspace_configuration(
         &self,
         command: &SessionCreateCommand,
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     ) -> StoreResult<SessionCreateOutcome> {
         let mut connection = self.connection()?;
         let transaction = connection
@@ -8524,6 +8754,7 @@ impl Store {
             interaction_mode,
             account_alias,
             workspace_allocation,
+            inherited_route,
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(outcome)
@@ -8536,6 +8767,7 @@ impl Store {
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     ) -> StoreResult<SessionCreateOutcome> {
         validate_command_identity(
             &command.command_id,
@@ -8573,14 +8805,36 @@ impl Store {
             created_at_ms,
         )?;
 
+        if inherited_route
+            .as_ref()
+            .is_some_and(|parent| parent.provider != command.provider)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "inherited route provider differs from child provider",
+                false,
+            ));
+        }
         let metadata = SessionMetadataV1 {
-            provider_base_url: None,
-            provider_rebind_id: None,
+            selection_epoch: Some(0),
+            route_reset_epoch: Some(0),
+            budget_clamp_notice_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
+            provider_base_url: inherited_route
+                .as_ref()
+                .and_then(|parent| parent.provider_base_url.clone()),
+            provider_rebind_id: inherited_route
+                .as_ref()
+                .and_then(|parent| parent.provider_rebind_id.clone()),
             cwd: command.cwd.clone(),
             provider: command.provider.clone(),
-            account_alias,
+            account_alias: inherited_route
+                .as_ref()
+                .map_or(account_alias, |parent| parent.account_alias.clone()),
             model: command.model.clone(),
             max_tokens: command.max_tokens,
+            max_tokens_source: command.max_tokens_source,
             system_prompt_version: Some(command.system_prompt_version.clone()),
             permission_overrides: command.permission_overrides,
             interaction_mode,
@@ -9081,6 +9335,10 @@ impl Store {
             decode_session_metadata(command.source_session_id, &source_metadata_json)?
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
+        metadata.budget_clamp_notice_epoch = None;
+        // Explicit account and endpoint choices are part of the copied
+        // session configuration. Unpinned parents still follow the mutable
+        // provider default because their account_alias is already None.
         // A fork inherits prompt history, not the source session's operational
         // savings ledger. Its first model-view reduction starts a fresh total.
         metadata.context_economy = ContextEconomy::default();
@@ -9730,6 +9988,16 @@ impl Store {
                 false,
             ));
         }
+        if command
+            .output_budget
+            .is_some_and(|budget| budget.max_tokens == 0)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "model selection output budget must be positive",
+                false,
+            ));
+        }
 
         let mut connection = self.connection()?;
         let transaction = connection
@@ -9774,18 +10042,57 @@ impl Store {
                 false,
             ));
         }
+        let no_op = metadata.provider == command.provider
+            && metadata.model == command.model
+            && command
+                .account_alias
+                .as_ref()
+                .is_none_or(|alias| metadata.account_alias.as_ref() == Some(alias))
+            && command.output_budget.is_none_or(|budget| {
+                metadata.max_tokens == budget.max_tokens
+                    && haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                        metadata.max_tokens_source,
+                        metadata.max_tokens,
+                    ) == budget.source
+            });
+        let selection_epoch = if no_op {
+            metadata.selection_epoch.unwrap_or(0)
+        } else {
+            latest_seq_in_connection(&transaction, &command.session_id)?
+                .max(metadata.selection_epoch.unwrap_or(0))
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?
+        };
+        let cleared_account_pin = if metadata.provider != command.provider {
+            metadata.account_alias.clone()
+        } else {
+            None
+        };
+        let cleared_provider_endpoint = (metadata.provider != command.provider)
+            .then(|| metadata.provider_base_url.clone())
+            .flatten();
         if metadata.provider != command.provider {
-            // A route override belongs to its selected provider. A later
-            // ordinary model selection must never carry that endpoint or a
-            // rebind-pinned account into a different adapter.
-            if metadata.provider_rebind_id.is_some() {
-                metadata.account_alias = None;
-            }
+            // Accounts and route overrides belong to their selected
+            // provider. A cross-provider model choice cannot carry either
+            // into the next adapter.
+            metadata.account_alias = None;
             metadata.provider_base_url = None;
             metadata.provider_rebind_id = None;
+            metadata.resolved_route_alias = None;
+            metadata.resolved_route_seen = false;
+            metadata.route_reset_epoch = Some(selection_epoch);
+        }
+        if let Some(alias) = &command.account_alias {
+            metadata.account_alias = Some(alias.clone());
         }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
+        metadata.selection_epoch = Some(selection_epoch);
+        if let Some(budget) = command.output_budget {
+            metadata.max_tokens = budget.max_tokens;
+            metadata.max_tokens_source = Some(budget.source);
+            metadata.budget_clamp_notice_epoch = budget.clamped.map(|_| selection_epoch);
+        }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -9820,8 +10127,13 @@ impl Store {
             command.device_id.clone(),
             self.worker_generation,
             ModelSelected {
+                selection_epoch: Some(selection_epoch),
                 provider: command.provider.clone(),
                 model: command.model.clone(),
+                route_only: false,
+                cleared_account_pin: cleared_account_pin.clone(),
+                cleared_provider_endpoint: cleared_provider_endpoint.clone(),
+                output_budget_clamp: command.output_budget.and_then(|budget| budget.clamped),
             }
             .to_payload_value()
             .map_err(|error| {
@@ -9838,15 +10150,18 @@ impl Store {
             session_id: command.session_id.clone(),
             provider: command.provider.clone(),
             model: command.model.clone(),
-            selected_seq: envelopes[0].seq,
+            selected_seq: selection_epoch,
             worker_generation: self.worker_generation,
+            output_budget: command.output_budget,
+            cleared_account_pin,
+            cleared_provider_endpoint,
         };
         finalize_command_receipt(
             &transaction,
             &command.command_id,
             command.session_id.as_str(),
             None,
-            Some(selected.selected_seq),
+            Some(envelopes[0].seq),
             &selected,
             now,
             "session-select-model",
@@ -10840,6 +11155,7 @@ impl Store {
         command: &SessionProviderRebindCommand,
     ) -> StoreResult<SessionProviderRebindOutcome> {
         let rebound = SessionProviderRebound {
+            selection_epoch: None,
             rebind_id: command.command_id.clone(),
             provider: command.provider.clone(),
             base_url: command.base_url.clone(),
@@ -10895,7 +11211,7 @@ impl Store {
     fn select_session_config<R: serde::Serialize + serde::de::DeserializeOwned>(
         &self,
         selection: SessionConfigSelection<'_>,
-        fact_payload: serde_json::Value,
+        mut fact_payload: serde_json::Value,
         validate: impl FnOnce(&Connection) -> StoreResult<()>,
         mutate: impl FnOnce(&mut SessionMetadataV1),
         respond: impl FnOnce(u64) -> R,
@@ -10944,7 +11260,32 @@ impl Store {
                 false,
             ));
         };
+        let previous_route = (selection.method == "session.provider.rebind").then(|| {
+            (
+                metadata.provider.clone(),
+                metadata.provider_base_url.clone(),
+                metadata.account_alias.clone(),
+            )
+        });
         mutate(&mut metadata);
+        if selection.method == "session.provider.rebind" {
+            let epoch = latest_seq_in_connection(&transaction, selection.session_id)?
+                .max(metadata.selection_epoch.unwrap_or(0))
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+            metadata.selection_epoch = Some(epoch);
+            if previous_route
+                .as_ref()
+                .is_some_and(|(provider, endpoint, account)| {
+                    provider != &metadata.provider
+                        || endpoint != &metadata.provider_base_url
+                        || account != &metadata.account_alias
+                })
+            {
+                metadata.route_reset_epoch = Some(epoch);
+            }
+            fact_payload["selection_epoch"] = serde_json::Value::from(epoch);
+        }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -12992,6 +13333,11 @@ impl Store {
     /// The first row is always returned when `limit > 0`, even when that one
     /// envelope exceeds `byte_budget`. This preserves forward progress while
     /// bounding ordinary pages by `byte_budget` plus at most one decoded row.
+    /// Pending rows are read in global journal commit order (the `events`
+    /// rowid), as before v33, so one busy session whose id sorts first cannot
+    /// starve other sessions under `limit`. Within a session this is its
+    /// sequence order. The transient outbox is small, so the sort is cheap and
+    /// the outbox keeps its primary-key-only storage.
     pub fn pending_hook_dispatches_bounded(
         &self,
         limit: usize,
@@ -13012,7 +13358,7 @@ impl Store {
                  FROM hook_dispatch_outbox AS o
                  JOIN events AS e
                    ON e.session_id = o.session_id AND e.seq = o.seq
-                 ORDER BY o.rowid ASC
+                 ORDER BY e.rowid ASC
                  LIMIT ?1",
             )
             .map_err(map_sqlite_error)?;
@@ -14916,8 +15262,17 @@ fn lookup_session_create_receipt(
     else {
         return Ok(None);
     };
-    if method != "session.create" || stored_digest != request_digest || stored_json != request_json
-    {
+    let same_request = stored_digest == request_digest && stored_json == request_json;
+    let compatible_legacy = method == "session.create"
+        && !same_request
+        && state == "committed"
+        && create_receipt_compat::legacy_delegated_create_matches(
+            connection,
+            &stored_json,
+            request_json,
+            response_json.as_deref(),
+        )?;
+    if method != "session.create" || (!same_request && !compatible_legacy) {
         return Err(store_error(
             ErrorCode::InvalidArgument,
             "command id was already used with a different method or semantic request body",
@@ -23466,11 +23821,15 @@ fn validate_worker_run_transitions(
                 && next != RunState::Cancelled
                 && !budget_terminal_wins
             {
-                return Err(store_error(
+                let mut refusal = store_error(
                     ErrorCode::RunNotActive,
                     format!("worker run {run_id} is durably cancelling; only Cancelled may follow"),
                     false,
-                ));
+                );
+                refusal.details = Some(serde_json::json!({
+                    "durable_run_state": crate::DURABLY_CANCELLING_DETAIL,
+                }));
+                return Err(refusal);
             }
             states.insert(run_id.clone(), (next, 0, accepted_branch));
         }
@@ -25517,7 +25876,9 @@ fn same_session_batch(envelopes: &[RawEnvelope]) -> StoreResult<(SessionId, u64)
 }
 
 /// Opens the profile's long-lived journal connection with the required pragmas
-/// (WAL, configured synchronous policy, foreign keys, busy timeout).
+/// (busy timeout, foreign keys, WAL with its size limit and checkpoint
+/// interval, page-cache ceiling, in-memory temp store, configured synchronous
+/// policy). [`open_connection_with`] is the single place they are set.
 #[cfg(test)]
 fn open_connection(path: &Path) -> StoreResult<Connection> {
     open_connection_with(path, configured_store_synchronous()?)
@@ -25538,12 +25899,67 @@ fn open_connection_with(path: &Path, synchronous: StoreSynchronous) -> StoreResu
         .pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)
         .map_err(map_sqlite_error)?;
     connection
+        .pragma_update(None, "wal_autocheckpoint", WAL_AUTO_CHECKPOINT_PAGES)
+        .map_err(map_sqlite_error)?;
+    connection
         .pragma_update(None, "cache_size", SQLITE_PAGE_CACHE_KIB)
+        .map_err(map_sqlite_error)?;
+    connection
+        .pragma_update(None, "temp_store", SQLITE_TEMP_STORE_MEMORY)
         .map_err(map_sqlite_error)?;
     connection
         .pragma_update(None, "synchronous", synchronous.pragma_value())
         .map_err(map_sqlite_error)?;
     Ok(connection)
+}
+
+/// Switches where SQLite keeps statement journals, sorters and temporary
+/// tables. Must run outside a transaction; it drops TEMP objects.
+fn set_temp_store(connection: &Connection, mode: i64) -> StoreResult<()> {
+    connection
+        .pragma_update(None, "temp_store", mode)
+        .map_err(map_sqlite_error)
+}
+
+/// Runs profile-sized bulk work with a file-backed temp store, then restores
+/// the per-turn in-memory setting even when the work fails.
+fn with_file_temp_store<T>(
+    connection: &mut Connection,
+    work: impl FnOnce(&mut Connection) -> StoreResult<T>,
+) -> StoreResult<T> {
+    set_temp_store(connection, SQLITE_TEMP_STORE_FILE)?;
+    let outcome = work(connection);
+    let restored = set_temp_store(connection, SQLITE_TEMP_STORE_MEMORY);
+    let value = outcome?;
+    restored?;
+    Ok(value)
+}
+/// Deletes every row one session owns in a single transaction.
+fn delete_session_rows(connection: &mut Connection, session_id: &SessionId) -> StoreResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    require_session(&transaction, session_id)?;
+    for statement in [
+        "DELETE FROM run_heads WHERE session_id = ?1",
+        "DELETE FROM run_head_sessions WHERE session_id = ?1",
+        "DELETE FROM session_projection_checkpoints WHERE session_id = ?1",
+        "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
+        "DELETE FROM graph_telemetry_projection WHERE session_id = ?1",
+        "DELETE FROM workflow_node_states WHERE session_id = ?1",
+        "DELETE FROM workflow_graph_instances WHERE session_id = ?1",
+        "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1",
+        "DELETE FROM menu_resolutions WHERE session_id = ?1",
+        "DELETE FROM branches WHERE session_id = ?1",
+        "DELETE FROM delegations WHERE parent_session_id = ?1 OR child_session_id = ?1",
+        "DELETE FROM events WHERE session_id = ?1",
+        "DELETE FROM sessions WHERE id = ?1",
+    ] {
+        transaction
+            .execute(statement, [session_id.as_str()])
+            .map_err(map_sqlite_error)?;
+    }
+    transaction.commit().map_err(map_sqlite_error)
 }
 
 fn configured_store_synchronous() -> StoreResult<StoreSynchronous> {
@@ -28520,7 +28936,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v31 and reopen.
+    /// v23's run-head backfill remains untouched through v33 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -28557,6 +28973,9 @@ mod run_head_projection_tests {
              DROP TABLE workflow_graph_instances;
              ALTER TABLE profile_meta DROP COLUMN boot_publication_pending;
              ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
+             DROP TABLE provider_view_request_history;
+             DROP TABLE provider_view_history_blocks;
+             DROP TABLE provider_view_history_segments;
              DROP TABLE provider_view_gc;
              DROP TABLE provider_view_blocks;
              DROP TABLE provider_view_requests;
@@ -28571,7 +28990,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 31);
+            assert_eq!(store.schema_version().expect("schema version"), 33);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))
@@ -29207,8 +29626,8 @@ mod store_synchronous_tests {
         );
         assert_eq!(
             queried_i64_pragma(&connection, "wal_autocheckpoint"),
-            1_000,
-            "the existing 1000-frame autocheckpoint must remain unchanged"
+            WAL_AUTO_CHECKPOINT_PAGES,
+            "every store connection must retain the bounded checkpoint interval"
         );
 
         connection
@@ -29275,6 +29694,86 @@ mod store_synchronous_tests {
             queried_i64_pragma(&connection, "cache_size"),
             SQLITE_PAGE_CACHE_KIB,
             "every store connection must install the measured page-cache ceiling"
+        );
+    }
+
+    /// MUTATION CHECK: removing the `temp_store` pragma (desktop default
+    /// FILE) must fail the MEMORY pin, and the savepoint below would again
+    /// spill its statement journal to an unlinked temporary file.
+    #[test]
+    fn statement_journals_stay_in_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut connection = open_connection_with(
+            &dir.path().join("temp-store.sqlite"),
+            StoreSynchronous::Normal,
+        )
+        .expect("open store");
+        assert_eq!(
+            queried_i64_pragma(&connection, "temp_store"),
+            SQLITE_TEMP_STORE_MEMORY,
+            "every store connection must keep statement journals in memory"
+        );
+        connection
+            .execute_batch(
+                "CREATE TABLE savepoint_pressure (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
+            )
+            .expect("create pressure table");
+        let payload = vec![0x5A_u8; 2 * 1_024];
+        for id in 0..256_i64 {
+            connection
+                .execute(
+                    "INSERT INTO savepoint_pressure(id, payload) VALUES (?1, ?2)",
+                    params![id, payload.as_slice()],
+                )
+                .expect("seed pressure row");
+        }
+        // A savepoint rewriting ~128 existing pages exceeds SQLite's 64 KiB
+        // in-memory statement-journal budget; rollback must still restore it.
+        let mut transaction = connection.transaction().expect("begin");
+        {
+            let savepoint = transaction.savepoint().expect("savepoint");
+            savepoint
+                .execute("UPDATE savepoint_pressure SET payload = zeroblob(2048)", [])
+                .expect("rewrite rows");
+            savepoint.finish().expect("roll back savepoint");
+        }
+        let preserved: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM savepoint_pressure WHERE payload = ?1",
+                params![payload.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("count preserved rows");
+        transaction.commit().expect("commit");
+        assert_eq!(preserved, 256, "savepoint rollback must restore every page");
+    }
+
+    /// MUTATION CHECK: skip the restore in `with_file_temp_store` or at the
+    /// end of `Store::open`, or drop the file-backed switch. Expected runtime
+    /// failure: a pragma pin below reports the wrong temp store.
+    #[test]
+    fn bulk_work_uses_a_file_temp_store_and_restores_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut connection = store.connection().expect("connection");
+        assert_eq!(
+            queried_i64_pragma(&connection, "temp_store"),
+            SQLITE_TEMP_STORE_MEMORY,
+            "open-time bulk work must hand back the per-turn in-memory setting"
+        );
+        let failed: StoreResult<()> = with_file_temp_store(&mut connection, |connection| {
+            assert_eq!(
+                queried_i64_pragma(connection, "temp_store"),
+                SQLITE_TEMP_STORE_FILE,
+                "bulk work spills temporary storage to disk"
+            );
+            Err(store_error(ErrorCode::Internal, "bulk work failed", false))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            queried_i64_pragma(&connection, "temp_store"),
+            SQLITE_TEMP_STORE_MEMORY,
+            "a failed bulk operation still restores the in-memory setting"
         );
     }
 

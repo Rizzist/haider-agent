@@ -2927,11 +2927,10 @@ impl ResponsesDecoder {
         self.pending_tool_events.push(StreamEvent::ToolCallEnd {
             call_id: call.call_id.clone(),
         });
-        if self.open_calls.values().all(|call| call.ended) {
-            Ok(std::mem::take(&mut self.pending_tool_events))
-        } else {
-            Ok(Vec::new())
-        }
+        // The response-level terminal arrives after output-item completion
+        // and is the first point where `completed` can be distinguished from
+        // an output-limit `incomplete`. Keep the executable End buffered.
+        Ok(Vec::new())
     }
 
     fn response_terminal(
@@ -2946,16 +2945,6 @@ impl ResponsesDecoder {
             return Err(malformed(
                 "OpenAI response.completed arrived before a function call was finalized",
             ));
-        }
-        if incomplete {
-            self.pending_tool_events.clear();
-        }
-        let mut events = Vec::new();
-        if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
-            events.push(StreamEvent::UsageUpdate(openai_usage(
-                usage,
-                self.account.clone(),
-            )?));
         }
         let reason = if incomplete {
             match response
@@ -2974,6 +2963,20 @@ impl ResponsesDecoder {
         } else {
             FinishReason::EndTurn
         };
+        let mut events = if reason == FinishReason::MaxTokens {
+            output_limited_tool_events(&mut self.pending_tool_events)
+        } else if incomplete {
+            self.pending_tool_events.clear();
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.pending_tool_events)
+        };
+        if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
+            events.push(StreamEvent::UsageUpdate(openai_usage(
+                usage,
+                self.account.clone(),
+            )?));
+        }
         if let Some(writer) = self.text.take() {
             drop(writer.seal());
         }
@@ -3751,8 +3754,9 @@ impl ChatDecoder {
         // G4a LK8 tolerance: some OSS servers emit tool-call deltas yet
         // close with finish_reason "stop" instead of "tool_calls". The calls
         // are real — complete them and finish as tool use rather than
-        // silently discarding a tool invocation the model asked for. Every
-        // other non-tool reason (max tokens, refusal) still drops partials.
+        // silently discarding a tool invocation the model asked for. A
+        // max-token stop surfaces the partial calls without an End marker;
+        // every other reason drops them.
         let reason = if reason == FinishReason::EndTurn && !self.open_calls.is_empty() {
             FinishReason::ToolUse
         } else {
@@ -3760,6 +3764,8 @@ impl ChatDecoder {
         };
         let mut events = if reason == FinishReason::ToolUse {
             self.close_calls()
+        } else if reason == FinishReason::MaxTokens {
+            output_limited_tool_events(&mut self.pending_tool_events)
         } else {
             self.pending_tool_events.clear();
             Vec::new()
@@ -3778,6 +3784,17 @@ impl ChatDecoder {
         self.terminal = true;
         vec![Err(error)]
     }
+}
+
+/// Drains buffered tool events at an output-limit terminal. Start and argument
+/// deltas cross so the actor can classify each open call as an output-limit
+/// truncation; End markers never do, because partial arguments must not
+/// execute. Shared by the Responses and chat decoders.
+fn output_limited_tool_events(pending: &mut Vec<StreamEvent>) -> Vec<StreamEvent> {
+    std::mem::take(pending)
+        .into_iter()
+        .filter(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }))
+        .collect()
 }
 
 /// Replays native Responses SSE bytes through the live incremental decoder.
@@ -3996,15 +4013,23 @@ pub fn replay_openai_http_error(
     body: &[u8],
 ) -> ProviderError {
     let parsed = serde_json::from_slice::<OpenAiErrorEnvelope>(body).ok();
-    let provider_detail = crate::error_detail::http_error_detail(body);
+    // Raw, untrusted prose: classified here, published only through
+    // `with_provider_detail`'s shape policy.
+    let raw_detail = crate::error_detail::http_error_prose(body);
     let error_type = parsed
         .as_ref()
         .and_then(|envelope| envelope.error.kind.as_deref());
     let error_code = parsed
         .as_ref()
         .and_then(|envelope| envelope.error.code.as_deref());
+    let safe_type = error_type.and_then(crate::error_detail::safe_error_type);
+    let safe_code = error_code.and_then(crate::error_detail::safe_error_type);
+    // An allowlisted code is the most specific classifier. Unknown codes are
+    // ignored, then an allowlisted type can classify the response. The public
+    // identity below instead prefers type, matching the provider's type field.
+    let error_tag = safe_code.or(safe_type);
     let context_exceeded = matches!(
-        error_code.or(error_type),
+        error_tag,
         Some(
             "context_length_exceeded"
                 | "context_window_exceeded"
@@ -4014,7 +4039,7 @@ pub fn replay_openai_http_error(
         )
     );
     let quota_exhausted = matches!(
-        error_code.or(error_type),
+        error_tag,
         Some("insufficient_quota" | "billing_hard_limit_reached" | "credit_balance_too_low")
     );
     let kind = match status {
@@ -4025,18 +4050,18 @@ pub fn replay_openai_http_error(
         503 => ProviderErrorKind::Overloaded,
         408 | 500..=599 => ProviderErrorKind::Transport,
         _ if context_exceeded => ProviderErrorKind::ContextExceeded,
-        _ => match error_code.or(error_type) {
+        _ => match error_tag {
             Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
             Some("permission_denied") => ProviderErrorKind::PermissionDenied,
             Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
             Some("server_error" | "timeout") => ProviderErrorKind::Transport,
-            _ if provider_detail
+            _ if raw_detail
                 .as_deref()
                 .is_some_and(openai_error_message_is_authentication) =>
             {
                 ProviderErrorKind::Authentication
             }
-            _ if provider_detail
+            _ if raw_detail
                 .as_deref()
                 .is_some_and(openai_error_message_is_overload) =>
             {
@@ -4059,7 +4084,7 @@ pub fn replay_openai_http_error(
     } else {
         format!("OpenAI HTTP {status} returned {}", provider_kind_name(kind))
     };
-    let error = match error_code.or(error_type) {
+    let error = match error_tag {
         Some("account_deleted" | "account_not_found") => ProviderError::new_with_presentation(
             kind,
             message,
@@ -4074,11 +4099,12 @@ pub fn replay_openai_http_error(
         }
         _ => ProviderError::new(kind, message),
     };
-    let error = match provider_detail.as_deref() {
+    let error = match raw_detail.as_deref() {
         Some(detail) => error.with_provider_detail(detail),
         None => error,
     };
     error
+        .with_provider_error_type(safe_type.or(safe_code))
         .with_retry_after_ms(retry_after_ms)
         .with_http_metadata(status, None)
 }
@@ -4118,12 +4144,14 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
                 .and_then(|response| response.get("error"))
         })
         .unwrap_or(value);
-    let kind = error
-        .get("code")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| error.get("type").and_then(serde_json::Value::as_str));
-    let provider_detail = crate::error_detail::provider_error_message(error)
-        .and_then(crate::error_detail::sanitize_provider_error_detail);
+    let code = error.get("code").and_then(serde_json::Value::as_str);
+    let error_type = error.get("type").and_then(serde_json::Value::as_str);
+    let safe_code = code.and_then(crate::error_detail::safe_error_type);
+    let safe_type = error_type.and_then(crate::error_detail::safe_error_type);
+    // Match HTTP precedence: safe code, then safe type. Raw values never
+    // classify or enter the public presentation.
+    let kind = safe_code.or(safe_type);
+    let raw_detail = crate::error_detail::provider_error_message(error);
     let provider_kind = match kind {
         Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
         Some("permission_denied") => ProviderErrorKind::PermissionDenied,
@@ -4140,20 +4168,14 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
             | "input_too_large",
         ) => ProviderErrorKind::ContextExceeded,
         Some("server_error" | "timeout") => ProviderErrorKind::Transport,
-        _ if provider_detail
-            .as_deref()
-            .is_some_and(openai_error_message_is_authentication) =>
-        {
+        _ if raw_detail.is_some_and(openai_error_message_is_authentication) => {
             ProviderErrorKind::Authentication
         }
         // The codex backend returns overload under codes the arms above
         // don't know — the prose is the only stable marker. Misclassifying
         // it as InvalidRequest made a RETRYABLE condition error whole runs
         // (nine journaled failures before daemon.log named the cause).
-        _ if provider_detail
-            .as_deref()
-            .is_some_and(openai_error_message_is_overload) =>
-        {
+        _ if raw_detail.is_some_and(openai_error_message_is_overload) => {
             ProviderErrorKind::Overloaded
         }
         _ => ProviderErrorKind::InvalidRequest,
@@ -4164,24 +4186,18 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
             "OpenAI stream returned {}",
             provider_kind_name(provider_kind)
         ),
-    );
-    match provider_detail.as_deref() {
+    )
+    .with_provider_error_type(kind);
+    match raw_detail {
         Some(detail) => provider_error.with_provider_detail(detail),
         None => provider_error,
     }
 }
 
 fn openai_stream_error_prose(detail: &str) -> ProviderError {
-    let provider_detail = crate::error_detail::sanitize_provider_error_detail(detail);
-    let provider_kind = if provider_detail
-        .as_deref()
-        .is_some_and(openai_error_message_is_authentication)
-    {
+    let provider_kind = if openai_error_message_is_authentication(detail) {
         ProviderErrorKind::Authentication
-    } else if provider_detail
-        .as_deref()
-        .is_some_and(openai_error_message_is_overload)
-    {
+    } else if openai_error_message_is_overload(detail) {
         ProviderErrorKind::Overloaded
     } else {
         ProviderErrorKind::InvalidRequest
@@ -4193,11 +4209,15 @@ fn openai_stream_error_prose(detail: &str) -> ProviderError {
             provider_kind_name(provider_kind)
         ),
     );
-    match provider_detail.as_deref() {
-        Some(detail) => provider_error.with_provider_detail(detail),
-        None => provider_error,
-    }
+    provider_error.with_provider_detail(detail)
 }
+
+/// Stand-in for a native computer screenshot that request-time elision
+/// removed because a newer screenshot superseded it. OpenAI's Responses
+/// contract requires a `computer_screenshot` on every replayed
+/// `computer_call_output`, but only the latest screen needs full fidelity; the
+/// real capture stays durable in CAS. A 16x16 mid-gray PNG (72 bytes).
+pub(crate) const OPENAI_ELIDED_COMPUTER_SCREENSHOT_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAAAAAA6mKC9AAAAD0lEQVR42mNoQAMMI1sAAAUMgAHjM1mKAAAAAElFTkSuQmCC";
 
 fn responses_request_json(
     request: &TurnRequest,
@@ -4412,28 +4432,39 @@ fn responses_request_json_neutral_with_boundary(
                                 )));
                             }
                         }
-                        let image = images.last().ok_or_else(|| {
-                            invalid_request(format!(
+                        let image_url = if let Some(image) = images.last() {
+                            if !crate::tool_image_media_type_supported(&image.media_type) {
+                                return Err(invalid_request(format!(
+                                    "tool image {} has unsupported media type",
+                                    image.artifact
+                                )));
+                            }
+                            let data = resolved_attachment(&attachments, image.artifact.as_str())?;
+                            format!("data:{};base64,{data}", image.media_type)
+                        } else if request
+                            .tool_result_image_projection
+                            .elided_all_images(call_id)
+                        {
+                            // Superseded by a newer screenshot and elided from
+                            // this request (typed projection record, never
+                            // inferred from text). The native contract still
+                            // requires an image on every replayed output.
+                            OPENAI_ELIDED_COMPUTER_SCREENSHOT_URL.to_owned()
+                        } else {
+                            return Err(invalid_request(format!(
                                 "OpenAI native computer call `{}` completed without its required updated screenshot",
                                 target.provider_call_id
-                            ))
-                        })?;
-                        if !crate::tool_image_media_type_supported(&image.media_type) {
-                            return Err(invalid_request(format!(
-                                "tool image {} has unsupported media type",
-                                image.artifact
                             )));
-                        }
-                        let data = resolved_attachment(&attachments, image.artifact.as_str())?;
+                        };
                         let screenshot = match target.kind {
                             OpenAiComputerToolKind::Ga => serde_json::json!({
                                 "type": "computer_screenshot",
-                                "image_url": format!("data:{};base64,{data}", image.media_type),
+                                "image_url": image_url,
                                 "detail": "original",
                             }),
                             OpenAiComputerToolKind::Preview => serde_json::json!({
                                 "type": "computer_screenshot",
-                                "image_url": format!("data:{};base64,{data}", image.media_type),
+                                "image_url": image_url,
                             }),
                             OpenAiComputerToolKind::Generic => {
                                 return Err(internal(
@@ -5703,17 +5734,9 @@ fn resolved_attachment<'a>(
 }
 
 fn native_capabilities(model: &str) -> CapabilityDoc {
-    let context_limit = if model.starts_with("gpt-5.4")
-        || model.starts_with("gpt-5.5")
-        || model.starts_with("gpt-5.6")
-        || model.starts_with("gpt-4.1")
-    {
-        1_000_000
-    } else if model.starts_with("gpt-5") {
-        400_000
-    } else {
-        128_000
-    };
+    let context_limit = crate::static_model_limits(OPENAI_PROVIDER_NAME, model)
+        .context_window
+        .unwrap_or(128_000);
     CapabilityDoc {
         provider: OPENAI_PROVIDER_NAME.into(),
         parallel_tools: FeatureResolve::Native,
@@ -6720,8 +6743,10 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
+/// Malformed-frame messages interpolate provider-controlled values (event
+/// names, ids, decoder text), so they are published only via templates.
 fn malformed(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+    ProviderError::new(ProviderErrorKind::MalformedFrame, message).with_untrusted_message()
 }
 
 fn stream_interrupted(message: impl Into<String>) -> ProviderError {

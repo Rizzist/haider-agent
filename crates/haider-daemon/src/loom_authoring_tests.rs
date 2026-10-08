@@ -86,6 +86,11 @@ async fn response(sink: &CapturingSink, request_id: &str) -> ResponseBody {
 
 fn metadata() -> SessionMetadataV1 {
     SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -95,6 +100,7 @@ fn metadata() -> SessionMetadataV1 {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4_096,
+        max_tokens_source: None,
         system_prompt_version: Some("test-system".into()),
         permission_overrides: None,
         interaction_mode: Default::default(),
@@ -185,6 +191,7 @@ async fn authoring_rpc_registers_and_executes_each_confirmed_hash() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4_096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

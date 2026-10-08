@@ -5,8 +5,9 @@ use super::{
     HeadlessAttachment, HeadlessEvent, HeadlessEventLedgerWriter, HeadlessEventMode,
     HeadlessEventOutput, HeadlessFailureCode, HeadlessInterrupt, HeadlessOutcome, HeadlessReducer,
     HeadlessRunError, HeadlessRunEventStorage, HeadlessRunFailure, HeadlessSessionConfig,
-    HeadlessTerminalKind, headless_submit_body, load_attachment, load_pdf_attachment,
-    normalize_session_config_features, terminal_kind, try_take_pending_interrupt,
+    HeadlessTerminalKind, finalize, headless_submit_body, load_attachment, load_pdf_attachment,
+    normalize_session_config_features, public_headless_envelope, terminal_kind,
+    try_take_pending_interrupt,
 };
 use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
@@ -64,6 +65,161 @@ fn spool_test_envelope(seq: u64, payload: serde_json::Value) -> RawEnvelope {
     .expect("raw spool envelope")
 }
 
+/// Round-4 oracles: run output must not carry exact digests, byte counts, or
+/// keyed freshness of redacted content; the journal event keeps them and
+/// unredacted provenance is unchanged.
+#[test]
+fn headless_projection_withholds_redacted_integrity_and_keeps_public_provenance() {
+    let digest = "blake3:synthetic-content-digest";
+    let checkpoint = serde_json::json!({
+        "type": "checkpoint_recorded", "kind": "move", "checkpoint_id": "checkpoint:raw",
+        "post_digest": digest, "redacted_content": true, "paths": [{"path": "victim.txt",
+            "pre_digest": digest, "post_digest": digest, "pre_artifact": digest,
+            "truncated_reason": "pre-image is 24 bytes"}]
+    });
+    let original = spool_test_envelope(1, checkpoint.clone());
+    let public = public_headless_envelope(original.clone())
+        .payload
+        .to_string();
+    assert!(original.payload.to_string().contains(digest));
+    assert!(
+        !public.contains(digest) && !public.contains("24") && !public.contains("checkpoint:raw")
+    );
+    assert!(public.contains("\"checkpoint_recorded\"") && public.contains("victim.txt"));
+    let mut unredacted = checkpoint;
+    unredacted["redacted_content"] = serde_json::Value::Bool(false);
+    let kept = spool_test_envelope(2, unredacted);
+    assert_eq!(
+        public_headless_envelope(kept.clone()).payload.to_string(),
+        kept.payload.to_string()
+    );
+
+    let effect = spool_test_envelope(
+        3,
+        serde_json::json!({
+            "type": "effect", "phase": "outcome", "effect": "effect:synthetic",
+            "freshness": {"path": "victim.txt", "digest": digest},
+            "workspace_mutation": {"effect_id": "effect:synthetic", "mutation_digest": digest,
+                "subject_digest": "blake3:subject", "redacted_content": true},
+            "outcome": {"outcome": "ok"}
+        }),
+    );
+    let public = public_headless_envelope(effect).payload.to_string();
+    assert!(
+        !public.contains(digest) && !public.contains("blake3:subject"),
+        "{public}"
+    );
+    let keyed = spool_test_envelope(
+        4,
+        serde_json::json!({
+            "type": "effect", "phase": "outcome", "effect": "effect:read",
+            "freshness": {"path": "victim.txt", "digest": "blake3k:profile:abcd"},
+            "outcome": {"outcome": "ok"}
+        }),
+    );
+    assert!(
+        !public_headless_envelope(keyed)
+            .payload
+            .to_string()
+            .contains("blake3k")
+    );
+    let public_read = spool_test_envelope(
+        5,
+        serde_json::json!({
+            "type": "effect", "phase": "outcome", "effect": "effect:public",
+            "freshness": {"path": "public.txt", "digest": digest},
+            "outcome": {"outcome": "ok"}
+        }),
+    );
+    assert!(
+        public_headless_envelope(public_read)
+            .payload
+            .to_string()
+            .contains(digest)
+    );
+
+    let preview = r#"{"redacted_content":true,"result":"copied","workspace_revision":"r"}"#;
+    let tool = spool_test_envelope(
+        6,
+        serde_json::json!({
+            "type": "tool_result", "call_id": "copy", "effects": [{"bytes": 24}],
+            "result": {"preview": preview, "effects": [{"bytes": 24}]}
+        }),
+    );
+    let safe = public_headless_envelope(tool).payload.to_string();
+    assert!(!safe.contains("\"bytes\""), "{safe}");
+    assert!(safe.contains("copied"));
+
+    let review = spool_test_envelope(
+        7,
+        serde_json::json!({
+            "type": "menu_opened", "kind": {"kind": "permission",
+                "file_review": {"old_digest": digest, "new_digest": digest}}
+        }),
+    );
+    assert!(review.payload.to_string().contains(digest));
+    assert!(
+        !public_headless_envelope(review)
+            .payload
+            .to_string()
+            .contains(digest)
+    );
+}
+
+/// A stale-read refusal's digests (keyed for a redacted file) leave run
+/// output exactly as the provider projection drops them; kind and remedy
+/// stay, and the journal envelope keeps the digests.
+#[test]
+fn headless_projection_strips_stale_read_digests() {
+    let preview = serde_json::json!({
+        "status": "conflict",
+        "error": {"kind": "stale_read", "message": "refusing to mutate stale file victim.txt; re-read before editing",
+            "details": {"current_digest": "blake3k:profile:synthetic-current",
+                "recorded_digest": "blake3k:profile:synthetic-recorded",
+                "remedy": "re-read before editing"}}
+    })
+    .to_string();
+    let original = spool_test_envelope(
+        1,
+        serde_json::json!({
+            "type": "tool_result", "call_id": "edit",
+            "result": {"preview": preview, "status": "conflict"}
+        }),
+    );
+    assert!(original.payload.to_string().contains("synthetic-current"));
+    let public = public_headless_envelope(original).payload;
+    let text = public.to_string();
+    assert!(
+        !text.contains("synthetic-current") && !text.contains("synthetic-recorded"),
+        "{text}"
+    );
+    let shown: serde_json::Value = serde_json::from_str(
+        public["result"]["preview"]
+            .as_str()
+            .expect("preview stays a string"),
+    )
+    .expect("preview stays JSON");
+    assert_eq!(shown["error"]["kind"], "stale_read");
+    assert_eq!(
+        shown["error"]["details"]["remedy"],
+        "re-read before editing"
+    );
+    assert!(shown["error"]["details"].get("current_digest").is_none());
+
+    // Any other refusal is unchanged.
+    let other = spool_test_envelope(
+        2,
+        serde_json::json!({
+            "type": "tool_result", "call_id": "edit",
+            "result": {"preview": r#"{"status":"rejected","error":{"kind":"unread_file","message":"stale_read current_digest"}}"#}
+        }),
+    );
+    assert_eq!(
+        public_headless_envelope(other.clone()).payload.to_string(),
+        other.payload.to_string()
+    );
+}
+
 #[test]
 fn memory_and_forced_spool_ledgers_serialize_to_identical_bytes() {
     let run_id = RunId::new("spool-run");
@@ -93,6 +249,41 @@ fn memory_and_forced_spool_ledgers_serialize_to_identical_bytes() {
         serde_json::to_vec(&memory).expect("serialize memory ledger"),
         serde_json::to_vec(&spool).expect("serialize spool ledger")
     );
+}
+
+/// `haider run --replay` and SDK `headless_run_events` serialize this ledger
+/// to shareable JSON: memory and spooled records both lose owner-local text.
+#[test]
+fn replay_ledgers_strip_owner_local_provider_detail() {
+    let run_failed = || {
+        spool_test_envelope(
+            1,
+            serde_json::json!({
+                "type": "run_failed",
+                "code": "provider_error",
+                "message": "PermissionDenied: OpenAI HTTP 403 returned a permission error",
+                "retryable": false,
+                "presentation": {
+                    "subcode": "permission-denied",
+                    "title": "Provider access denied",
+                    "detail": "The active account is not allowed to make this request. · details withheld",
+                    "scope": "account",
+                    "allowed_actions": ["switch_account"],
+                    "provider_raw_detail": "Denied for organization quillreplay.",
+                },
+            }),
+        )
+    };
+    for spool_immediately in [false, true] {
+        let mut writer = HeadlessEventLedgerWriter::new(spool_immediately);
+        writer.record(&run_failed());
+        writer.record_owned(run_failed());
+        let ledger = writer.finish(RunId::new("spool-run"), 2).expect("ledger");
+        let bytes = serde_json::to_vec(&ledger).expect("serialize ledger");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("quillreplay"), "{text}");
+        assert!(text.contains("details withheld"), "{text}");
+    }
 }
 
 #[test]
@@ -327,6 +518,72 @@ async fn durable_request_deadline_reason_wins_terminal_race_as_timeout() {
             ..
         })
     ));
+}
+
+/// Headless/SDK/JSONL output is a shareable surface: the owner-local raw
+/// provider text leaves every streamed/retained envelope and the failure
+/// presentation, and survives only in the explicitly typed local field.
+#[tokio::test]
+async fn owner_local_provider_detail_is_stripped_from_shareable_projections() {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let output = HeadlessEventOutput::new(sender, HeadlessEventMode::Stream);
+    let mut reducer = HeadlessReducer::new(SessionId::new("spool-session"), output);
+    reducer.run_id = Some(RunId::new("spool-run"));
+    let presentation = haider_rpc::haider_protocol::error::ErrorPresentation::new(
+        "permission-denied",
+        "Provider access denied",
+        "The active account is not allowed to make this request. · details withheld",
+        haider_rpc::haider_protocol::error::ErrorScope::Account,
+        [haider_rpc::haider_protocol::error::ErrorAction::SwitchAccount],
+    )
+    .with_provider_raw_detail(Some("Denied for organization quillmere."));
+    for (seq, payload) in [
+        (
+            1,
+            serde_json::to_value(EventPayload::RunFailed {
+                code: ErrorCode::ProviderError,
+                message: "PermissionDenied: OpenAI HTTP 403 returned a permission error".into(),
+                retryable: false,
+                presentation: Some(presentation),
+            })
+            .expect("run failure serializes"),
+        ),
+        (
+            2,
+            serde_json::to_value(EventPayload::RunState(RunState::Errored))
+                .expect("terminal state serializes"),
+        ),
+    ] {
+        assert_eq!(
+            reducer.apply(spool_test_envelope(seq, payload)).await,
+            ApplyStatus::Applied
+        );
+    }
+    let result = finalize(
+        reducer,
+        RunId::new("spool-run"),
+        "openai".into(),
+        "gpt-4o".into(),
+        Vec::new(),
+        None,
+    )
+    .expect("finalized run");
+    assert_eq!(
+        result.provider_raw_detail_local.as_deref(),
+        Some("Denied for organization quillmere.")
+    );
+    let failure = result.failure.expect("failure");
+    let failure_presentation = failure.presentation.expect("presentation");
+    assert!(failure_presentation.provider_raw_detail.is_none());
+    assert!(!failure.message.contains("quillmere"));
+    while let Ok(event) = receiver.try_recv() {
+        if let HeadlessEvent::Envelope(envelope) = event {
+            let mut bytes = Vec::new();
+            haider_rpc::haider_protocol::envelope::write_envelope_json(&mut bytes, &envelope)
+                .expect("json");
+            assert!(!String::from_utf8_lossy(&bytes).contains("quillmere"));
+        }
+    }
 }
 
 /// MUTATION CHECK: ignore the run-scoped trust bit or change ordinary turn

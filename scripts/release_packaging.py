@@ -627,6 +627,320 @@ def _verify_release_bundle(artifact: Path, target: str, *, legacy: bool) -> None
         raise PackagingError(f"{sidecar}: archive checksum mismatch")
 
 
+# Diagnostic labels for known redistributable runtime families. The release
+# decision is made by the OS allowlist below, not by completeness of this table.
+# This avoids accepting a new third-party runtime whose name we have not seen.
+# Registry #176: haider 0.0.972 failed to start on clean Server 2019 because
+# it imported the dynamic MSVC CRT (STATUS_DLL_NOT_FOUND, 0xC0000135).
+# api-ms-win-crt-* and ucrtbase are intentionally rejected even where Windows
+# provides them: an import indicates the dynamic-CRT configuration in this gate.
+# Sources: https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute
+# and https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features
+FORBIDDEN_WINDOWS_IMPORT_FAMILIES = (
+    # VC 1.x/2.x and VC 4/5 debug CRT: archived KB115082, KB130384,
+    # KB154753, and KB165685 (VC 2.x: https://ftp.zx.net.nz/pub/mirror/ftp.microsoft.com/MISC/KB/en-us/130/384.HTM).
+    (r"msvcrt\d+d?(?:_[a-z0-9_]+)?\.dll", "VC 1.x/2.x CRT and versioned debug siblings", "https://ftp.zx.net.nz/pub/archive/ftp.microsoft.com/MISC/KB/en-us/115/082.HTM"),
+    (r"msvcrtd\.dll", "VC 4/5 debug CRT", "https://ftp.zx.net.nz/pub/archive/ftp.microsoft.com/MISC/KB/en-us/154/753.HTM"),
+    (r"msvcirtd\.dll", "VC 4/5 debug iostreams", "https://ftp.zx.net.nz/pub/archive/ftp.microsoft.com/MISC/KB/en-us/165/685.HTM"),
+    (r"msvcr\d+d?(?:_[a-z0-9_]+)?\.dll", "versioned VC CRT", "https://learn.microsoft.com/en-us/visualstudio/releases/2012/2012-redistribution-vs"),
+    (r"msvcp\d+d?(?:_[a-z0-9_]+)?\.dll", "VC C++ library and satellites", "https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features"),
+    (r"msvci\d+d?(?:_[a-z0-9_]+)?\.dll", "VC iostreams", "https://support.sas.com/documentation/installcenter/eguide/4.1/sreq.pdf"),
+    (r"msvcm\d+d?(?:_[a-z0-9_]+)?\.dll", "mixed-mode C++/CLI CRT", "https://learn.microsoft.com/en-us/cpp/dotnet/create-a-partially-trusted-application"),
+    (r"vcruntime\d+d?(?:_[a-z0-9_]+)?\.dll", "VC runtime and satellites", "https://learn.microsoft.com/en-us/cpp/parallel/concrt/overview-of-the-concurrency-runtime"),
+    (r"(?:appcrt|desktopcrt)\d+d?(?:_[a-z0-9_]+)?\.dll", "VS14 preview split CRT", "https://devblogs.microsoft.com/cppblog/the-great-c-runtime-crt-refactoring/"),
+    (r"concrt\d+d?(?:_[a-z0-9_]+)?\.dll", "Concurrency Runtime", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
+    (r"vccorlib\d+d?(?:_[a-z0-9_]+)?\.dll", "C++/CX runtime", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
+    (r"vcamp\d+d?(?:_[a-z0-9_]+)?\.dll", "C++ AMP runtime", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
+    (r"vcomp(?:d(?:_[a-z0-9_]+)?|\d+d?(?:_[a-z0-9_]+)?)?\.dll", "VC OpenMP, including VC8 unversioned", "https://jacobfilipp.com/MSDN/2005_10/OpenMP/chm.htm"),
+    (r"vcomp\d+ui(?:_[a-z0-9_]+)?\.dll", "VC OpenMP UI resources", "https://support.microsoft.com/en-us/topic/visual-studio-fix-module-state-is-corrupted-in-a-visual-c-2010-mfc-application-that-is-running-in-windows-8-774d1687-eb29-3468-b68a-df5d8517300e"),
+    (r"pgort\d+d?(?:_[a-z0-9_]+)?\.dll", "VC PGO instrumentation runtime", "https://learn.microsoft.com/en-us/windows/uwp/debug-test-perf/pgo-for-uwp"),
+    (r"libomp[a-z0-9_.-]*\.dll", "LLVM OpenMP", "https://devblogs.microsoft.com/cppblog/openmp-updates-and-fixes-for-cpp-in-visual-studio-2019-16-10/"),
+    (r"mfc\d+(?:u|d|ud|[a-z]{3})?(?:_[a-z0-9_]+)?\.dll", "MFC, Unicode, debug, and localized resources", "https://learn.microsoft.com/en-us/cpp/windows/redistributing-the-mfc-library"),
+    (r"mfcm\d+(?:u|d|ud)?(?:_[a-z0-9_]+)?\.dll", "managed MFC", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
+    (r"mfc[don]\d+(?:u?d?)(?:_[a-z0-9_]+)?\.dll", "split VC4/5 MFC", "https://ftp.zx.net.nz/pub/archive/ftp.microsoft.com/MISC/KB/en-us/165/685.HTM"),
+    (r"mfcmifc\d+d?(?:_[a-z0-9_]+)?\.dll", "managed MFC interface assembly", "https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute"),
+    (r"atl\d+d?(?:_[a-z0-9_]+)?\.dll", "versioned ATL", "https://learn.microsoft.com/en-us/security-updates/securitybulletins/2007/ms07-012"),
+    (r"clang_rt\.asan_(?:dbg_)?dynamic-[a-z0-9_]+\.dll", "VS AddressSanitizer runtime", "https://learn.microsoft.com/en-us/cpp/sanitizers/asan-runtime"),
+    (r"ucrtbased?(?:_[a-z0-9_]+)?\.dll", "UCRT and debug UCRT; /MD policy", "https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features"),
+    (r"api-ms-win-crt-[a-z0-9-]+\.dll", "UCRT API sets; /MD policy", "https://learn.microsoft.com/en-us/uwp/win32-and-com/win32-extension-apis"),
+)
+FORBIDDEN_WINDOWS_IMPORT = re.compile(
+    "|".join(f"(?:{pattern})" for pattern, _, _ in FORBIDDEN_WINDOWS_IMPORT_FAMILIES),
+    re.IGNORECASE,
+)
+# Reviewed Windows modules. Each group and its Microsoft documentation are
+# recorded in docs/release-chain.md. Additions require review of the new
+# release import, an OS provenance citation, tests, and clean-Windows evidence.
+# Do not use a wildcard for ordinary DLL names.
+WINDOWS_OS_IMPORTS = frozenset({
+    # Actual 973 release imports (31 entries across three executables).
+    "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "combase.dll",
+    "crypt32.dll", "gdi32.dll", "kernel32.dll", "ntdll.dll", "ole32.dll",
+    "oleaut32.dll", "shell32.dll", "user32.dll", "userenv.dll", "ws2_32.dll",
+    # Reviewed Windows modules plausibly needed by the desktop/daemon code.
+    "kernelbase.dll", "secur32.dll", "ncrypt.dll", "iphlpapi.dll",
+    "dwmapi.dll", "uxtheme.dll", "shlwapi.dll", "winhttp.dll", "dnsapi.dll",
+    "powrprof.dll", "psapi.dll", "version.dll", "setupapi.dll",
+    "cfgmgr32.dll", "rpcrt4.dll", "shcore.dll",
+    "netapi32.dll", "wtsapi32.dll", "comctl32.dll",
+})
+WINDOWS_OS_API_SET = re.compile(
+    r"(?:api-ms-win-core-[a-z0-9-]+|ext-ms-win-[a-z0-9-]+)\.dll",
+    re.IGNORECASE,
+)
+_PE_IMPORT_DIRECTORY = 1
+_PE_DELAY_IMPORT_DIRECTORY = 13
+_PE_IMPORT_NAME_WINDOW = 512
+
+
+class _PeImage:
+    """Just enough of the PE/COFF format to read import and delay-import names."""
+
+    def __init__(self, data: bytes, source: str) -> None:
+        self.data = data
+        self.source = source
+        if len(data) < 0x40 or data[:2] != b"MZ":
+            raise PackagingError(f"{source}: not a PE image (missing MZ header)")
+        pe = self._u32(0x3C)
+        if data[pe : pe + 4] != b"PE\0\0":
+            raise PackagingError(f"{source}: not a PE image (missing PE signature)")
+        coff = pe + 4
+        sections = self._u16(coff + 2)
+        optional_size = self._u16(coff + 16)
+        optional = coff + 20
+        magic = self._u16(optional)
+        if magic == 0x10B:
+            directories = optional + 96
+        elif magic == 0x20B:
+            directories = optional + 112
+        else:
+            raise PackagingError(f"{source}: unknown PE optional-header magic {magic:#x}")
+        fixed_size = directories - optional
+        if optional_size < fixed_size or optional + optional_size > len(data):
+            raise PackagingError(f"{source}: truncated PE optional header")
+        self.image_base = (
+            self._u32(optional + 28) if magic == 0x10B else self._u64(optional + 24)
+        )
+        self.directory_count = self._u32(directories - 4)
+        if self.directory_count > 16 or fixed_size + self.directory_count * 8 > optional_size:
+            raise PackagingError(
+                f"{source}: PE optional header cannot hold {self.directory_count} data directories"
+            )
+        self.directories = directories
+        table = optional + optional_size
+        self.sections = []
+        for index in range(sections):
+            entry = table + index * 40
+            virtual_size, virtual_address, raw_size, raw_pointer = (
+                self._u32(entry + 8),
+                self._u32(entry + 12),
+                self._u32(entry + 16),
+                self._u32(entry + 20),
+            )
+            self.sections.append(
+                (virtual_address, max(virtual_size, raw_size), raw_pointer, raw_size)
+            )
+
+    def _read(self, offset: int, size: int) -> bytes:
+        if offset < 0 or offset + size > len(self.data):
+            raise PackagingError(f"{self.source}: truncated PE structure at {offset:#x}")
+        return self.data[offset : offset + size]
+
+    def _u16(self, offset: int) -> int:
+        return int.from_bytes(self._read(offset, 2), "little")
+
+    def _u32(self, offset: int) -> int:
+        return int.from_bytes(self._read(offset, 4), "little")
+
+    def _u64(self, offset: int) -> int:
+        return int.from_bytes(self._read(offset, 8), "little")
+
+    def directory(self, index: int) -> tuple[int, int]:
+        if index >= self.directory_count:
+            # An undeclared directory is absent to the loader too:
+            # RtlImageDirectoryEntryToData returns NULL for that index.
+            return 0, 0
+        entry = self.directories + index * 8
+        rva, size = self._u32(entry), self._u32(entry + 4)
+        if rva and not size:
+            # The loader walks descriptors from the address until a null entry
+            # regardless of size; never treat a sized-zero table as absent.
+            raise PackagingError(
+                f"{self.source}: data directory {index} has address {rva:#x} but size 0"
+            )
+        return rva, size
+
+    def offset(self, rva: int) -> int:
+        for virtual_address, size, raw_pointer, raw_size in self.sections:
+            if virtual_address <= rva < virtual_address + size:
+                delta = rva - virtual_address
+                if delta >= raw_size:
+                    break
+                return raw_pointer + delta
+        raise PackagingError(f"{self.source}: RVA {rva:#x} is outside every PE section")
+
+    def string(self, rva: int) -> str:
+        start = self.offset(rva)
+        for virtual_address, size, raw_pointer, raw_size in self.sections:
+            delta = rva - virtual_address
+            if 0 <= delta < size and delta < raw_size:
+                limit = min(
+                    start + _PE_IMPORT_NAME_WINDOW,
+                    raw_pointer + raw_size,
+                    len(self.data),
+                )
+                break
+        end = self.data.find(b"\0", start, limit)
+        if end < 0:
+            raise PackagingError(f"{self.source}: unterminated PE import name at RVA {rva:#x}")
+        name = self.data[start:end]
+        if not name:
+            raise PackagingError(f"{self.source}: empty PE import name at RVA {rva:#x}")
+        if any(byte < 0x20 or byte > 0x7E for byte in name):
+            raise PackagingError(f"{self.source}: non-printable ASCII PE import name at RVA {rva:#x}")
+        return name.decode("ascii")
+
+    def imports(self) -> tuple[list[str], list[str]]:
+        """Return (imported DLLs, delay-loaded DLLs) in table order."""
+        normal: list[str] = []
+        rva, size = self.directory(_PE_IMPORT_DIRECTORY)
+        if rva:
+            cursor = self.offset(rva)
+            while True:
+                descriptor = self._read(cursor, 20)
+                if descriptor == bytes(20):
+                    break
+                normal.append(self.string(int.from_bytes(descriptor[12:16], "little")))
+                cursor += 20
+        delayed: list[str] = []
+        rva, size = self.directory(_PE_DELAY_IMPORT_DIRECTORY)
+        if rva:
+            cursor = self.offset(rva)
+            while True:
+                descriptor = self._read(cursor, 32)
+                if descriptor == bytes(32):
+                    break
+                attributes = int.from_bytes(descriptor[0:4], "little")
+                name = int.from_bytes(descriptor[4:8], "little")
+                if not attributes & 1:
+                    # Pre-VC7 delay descriptors hold virtual addresses.
+                    name -= self.image_base
+                delayed.append(self.string(name))
+                cursor += 32
+        return normal, delayed
+
+
+def windows_pe_imports(data: bytes, source: str) -> dict[str, list[str]]:
+    normal, delayed = _PeImage(data, source).imports()
+    return {"imports": normal, "delay_imports": delayed}
+
+
+def _windows_import_component(segment: str) -> str:
+    component = segment.rstrip(" .").casefold()
+    return component + ".dll" if component and "." not in component else component
+
+
+def _is_windows_os_import(component: str) -> bool:
+    return component in WINDOWS_OS_IMPORTS or WINDOWS_OS_API_SET.fullmatch(component) is not None
+
+
+def _windows_import_rejection(name: str) -> str | None:
+    # A PE import must name a bare module. Colons introduce a drive or stream
+    # separator, regardless of whether any component resembles an OS DLL.
+    if ":" in name:
+        return "rejected: import name contains a stream/drive separator"
+    qualified = "/" in name or "\\" in name
+    # Inspect path components for a useful VC-runtime diagnostic, but never
+    # grant permission based on an allowed basename inside a path.
+    raw_segments = [
+        segment for segment in re.split(r"[/\\]", name.rstrip(" "))
+        if segment and segment not in (".", "..")
+    ]
+    segments = [_windows_import_component(segment) for segment in raw_segments]
+    basename = re.split(r"[/\\]", name.rstrip(" "))[-1]
+    target = _windows_import_component(basename)
+    if not qualified and _is_windows_os_import(target):
+        return None
+    # This table describes the failure; it never grants an import permission.
+    for component in segments:
+        if component.startswith("api-ms-win-crt-"):
+            return "rejected: VC runtime family UCRT API set"
+        for pattern, family, _ in FORBIDDEN_WINDOWS_IMPORT_FAMILIES:
+            if re.fullmatch(pattern, component, re.IGNORECASE):
+                return f"rejected: VC runtime family {family}"
+    return "rejected: not an allowlisted OS DLL"
+
+
+def rejected_windows_imports(imports: dict[str, list[str]]) -> list[tuple[str, str]]:
+    names = {name for values in imports.values() for name in values}
+    return [
+        (name, reason)
+        for name in sorted(names, key=str.lower)
+        if (reason := _windows_import_rejection(name)) is not None
+    ]
+
+
+def forbidden_windows_imports(imports: dict[str, list[str]]) -> list[str]:
+    """Compatibility helper: names rejected by the release import policy."""
+    return [name for name, _ in rejected_windows_imports(imports)]
+
+
+def _windows_pe_inputs(path: Path) -> list[tuple[str, bytes]]:
+    suffixes = (".exe", ".dll")
+    if path.is_dir():
+        return [
+            (str(item), item.read_bytes())
+            for item in sorted(path.rglob("*"))
+            if item.is_file() and item.suffix.lower() in suffixes
+        ]
+    if path.suffix.lower() == ".zip":
+        try:
+            with zipfile.ZipFile(path) as archive:
+                return [
+                    (f"{path}!{item.filename}", archive.read(item))
+                    for item in archive.infolist()
+                    if not item.is_dir() and item.filename.lower().endswith(suffixes)
+                ]
+        except zipfile.BadZipFile as error:
+            raise PackagingError(f"{path}: invalid ZIP: {error}") from error
+    if not path.is_file():
+        raise PackagingError(f"{path}: Windows PE input does not exist")
+    return [(str(path), path.read_bytes())]
+
+
+def verify_windows_imports(paths: list[Path]) -> list[str]:
+    """Fail unless every shipped PE imports only reviewed Windows OS DLLs.
+
+    Accepts PE files, directories (every nested .exe/.dll) and ZIP bundles
+    (every .exe/.dll member). Returns one report line per inspected PE.
+    """
+    report: list[str] = []
+    failures: list[str] = []
+    for path in paths:
+        inputs = _windows_pe_inputs(path)
+        if not inputs:
+            raise PackagingError(f"{path}: contains no .exe or .dll to inspect")
+        for source, data in inputs:
+            imports = windows_pe_imports(data, source)
+            rejected = rejected_windows_imports(imports)
+            report.append(
+                f"{source}: imports={','.join(imports['imports']) or '-'} "
+                f"delay={','.join(imports['delay_imports']) or '-'}"
+            )
+            if rejected:
+                failures.append(
+                    f"{source}: imports "
+                    + ", ".join(f"{name!r} ({reason})" for name, reason in rejected)
+                )
+    if failures:
+        raise PackagingError(
+            "Windows PE imports a DLL outside the reviewed OS allowlist "
+            "(dynamic CRT builds should use -C target-feature=+crt-static):\n  "
+            + "\n  ".join(failures)
+        )
+    return report
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -656,6 +970,14 @@ def _parser() -> argparse.ArgumentParser:
     repin.add_argument("--sha-linux-x64", required=True)
     repin.add_argument("--sha-windows-x64", required=True)
 
+    imports = commands.add_parser(
+        "verify-windows-imports",
+        help="fail if a Windows PE imports VCRUNTIME/MSVCP/api-ms-win-crt DLLs",
+    )
+    imports.add_argument(
+        "paths", type=Path, nargs="+", help="PE files, directories or ZIP bundles"
+    )
+
     npm = commands.add_parser("verify-npm")
     npm.add_argument("--package", type=Path, required=True)
     npm.add_argument("--version", required=True)
@@ -681,6 +1003,9 @@ def main(argv: list[str] | None = None) -> int:
             repin_homebrew_scoop(
                 args.packaging_root, args.version, _release_shas(args)
             )
+        elif args.command == "verify-windows-imports":
+            for line in verify_windows_imports(args.paths):
+                print(line)
         elif args.command == "verify-npm":
             verify_npm_archive(args.package, args.version)
         else:  # pragma: no cover - argparse makes this unreachable.

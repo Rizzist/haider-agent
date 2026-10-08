@@ -578,7 +578,7 @@ fn committed_api_key_add_on_accounts_refreshes_the_roster_once() {
         committed
             .commands
             .iter()
-            .filter(|command| matches!(command, LiveCommand::AccountList))
+            .filter(|command| matches!(command, LiveCommand::AccountListAt { .. }))
             .count(),
         1,
         "one committed add asks once for the daemon-owned roster"
@@ -645,7 +645,7 @@ fn failed_api_key_add_on_accounts_does_not_refresh_or_clear_the_error() {
         !failed
             .commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::AccountList)),
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. })),
         "a rejected add must not refresh the roster"
     );
     assert!(matches!(

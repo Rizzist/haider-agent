@@ -1,6 +1,7 @@
 package ai.diffforge.haider.transport
 
 import ai.diffforge.haider.BuildConfig
+import ai.diffforge.haider.service.presence.CuPresence
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -119,6 +120,9 @@ class TransportClient(
                         CapabilityBus.granted.drop(1).collect { granted ->
                             sendPush(CapabilityBus.toPush(granted))
                         }
+                    }
+                    launch {
+                        CuPresence.stops.collect { sendPush(CuPresence.stopPush()) }
                     }
                     reconnectLoop()
                 }

@@ -37,6 +37,7 @@ fn attachment(n: usize) -> AttachmentId {
 
 fn summary(n: usize, head_seq: u64) -> SessionSummary {
     SessionSummary {
+        latest_context_footprint: None,
         session_id: sid(n),
         head_seq,
         worker_generation: 7,
@@ -420,7 +421,10 @@ fn reconnect_restores_the_working_set_after_each_sessions_last_applied_cursor() 
     let commands = driver.apply(&mut model, LiveReply::Reconnected);
     assert_eq!(
         commands.first(),
-        Some(&LiveCommand::List { cursor: None }),
+        Some(&LiveCommand::ListAt {
+            cursor: None,
+            epoch: driver.connection_epoch()
+        }),
         "a fresh connection re-lists first"
     );
     let attaches: Vec<(SessionId, u64)> = commands
@@ -720,6 +724,7 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
             worker_generation: 7,
             cwd: "/tmp/created-workspace".to_owned(),
             model: "fable-5".to_owned(),
+            metadata: None,
         },
     );
     assert_eq!(model.sessions.len(), 1, "the daemon's session became a row");
@@ -731,11 +736,17 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
     );
     assert_eq!(
         after,
-        vec![LiveCommand::Attach {
-            session: sid(1),
-            after_seq: 0
-        }],
-        "the create response asks for the ATTACHMENT and nothing else"
+        vec![
+            LiveCommand::Attach {
+                session: sid(1),
+                after_seq: 0
+            },
+            LiveCommand::ListAt {
+                cursor: None,
+                epoch: 0
+            }
+        ],
+        "the create response attaches and reads current metadata; it cannot submit yet"
     );
     assert!(
         !after
@@ -1256,6 +1267,7 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     };
     model.cwd = first.leaf.clone();
     model.pending_workspace_allocation = Some(first.clone());
+    model.pending_workspace_display = Some(first.leaf.clone());
     let mut driver = LiveDriver::new("allocation-test");
     assert!(!daily_root.exists());
     assert!(!first_leaf.exists());
@@ -1279,6 +1291,10 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     assert_ne!(second.leaf, first.leaf);
     assert_eq!(second.daily_root, first.daily_root);
     assert_eq!(model.cwd, second.leaf);
+    assert_eq!(
+        model.pending_workspace_display.as_deref(),
+        Some(second.leaf.as_str())
+    );
     assert!(!daily_root.exists());
     assert!(!std::path::Path::new(&first.leaf).exists());
     assert!(!std::path::Path::new(&second.leaf).exists());
@@ -1304,10 +1320,257 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     assert_ne!(third.leaf, second.leaf);
     assert_eq!(third.daily_root, first.daily_root);
     assert_eq!(model.cwd, third.leaf);
+    assert_eq!(
+        model.pending_workspace_display.as_deref(),
+        Some(third.leaf.as_str())
+    );
     assert!(!daily_root.exists());
     assert!(!std::path::Path::new(&first.leaf).exists());
     assert!(!std::path::Path::new(&second.leaf).exists());
     assert!(!std::path::Path::new(&third.leaf).exists());
+}
+
+#[test]
+fn an_attached_dated_session_speaks_uncreated_until_its_leaf_exists() {
+    let mut model = live_model();
+    let workspace_base = tempfile::tempdir().expect("temporary workspace base");
+    let daily_root = workspace_base.path().join("Haider").join("1448-04-11");
+    let leaf = daily_root.join("s-00112233445566778899aabbccddeeff");
+    let leaf_text = leaf.to_str().expect("UTF-8 leaf").to_owned();
+    let allocation = haider_protocol::session::WorkspaceAllocationV1 {
+        daily_root: daily_root.to_str().expect("UTF-8 root").into(),
+        leaf: leaf_text.clone(),
+        allocation_id: "00112233445566778899aabbccddeeff".into(),
+        calendar_id: "islamic-civil".into(),
+        hijri_date: "1448-04-11".into(),
+        gregorian_date: "2026-09-24".into(),
+        allocated_at_ms: 1,
+        offset_seconds: 0,
+    };
+    model.cwd = leaf_text.clone();
+    model.pending_workspace_allocation = Some(allocation);
+    let mut driver = LiveDriver::new("presence-test").with_launch_origin_path(Some(
+        haider_protocol::session::LaunchOriginPathV1 {
+            kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+            display: Some("~".into()),
+        },
+    ));
+    let issued = driver.handle_request(
+        &mut model,
+        AppRequest::CreateSession {
+            text: "just chat".into(),
+        },
+    );
+    let command_id = issued
+        .iter()
+        .find_map(LiveCommand::command_id)
+        .cloned()
+        .expect("session.create is durable");
+    driver.apply(
+        &mut model,
+        LiveReply::Created {
+            command_id,
+            session: sid(1),
+            worker_generation: 3,
+            cwd: leaf_text.clone(),
+            model: "fable-5".to_owned(),
+            metadata: None,
+        },
+    );
+    assert_eq!(
+        model.session_workspace_cwd.as_deref(),
+        Some(leaf_text.as_str())
+    );
+
+    // Chat-only: the surface switch alone re-judges, and the leaf is absent.
+    let base = std::time::Instant::now();
+    driver.set_now(base);
+    driver.sync_workspace_presence(&mut model, false);
+    assert!(
+        model.session_workspace_uncreated,
+        "absent dated leaf wears the cue"
+    );
+    assert!(
+        !leaf.exists(),
+        "judging presence must never create the leaf"
+    );
+    assert!(!driver.workspace_probe_due());
+
+    // A streaming reply only marks a probe due; inside the throttle window
+    // it does not touch the disk, and the loop is woken when it may.
+    driver.sync_workspace_presence(&mut model, true);
+    assert!(model.session_workspace_uncreated);
+    assert!(driver.workspace_probe_due(), "reply marks the probe due");
+    assert_eq!(
+        driver.next_deadline(),
+        Some(base + std::time::Duration::from_millis(500)),
+        "the throttled probe folds its wake-up into the loop deadline"
+    );
+
+    // The first write materialises the leaf, but a burst of replies inside
+    // the window still does not probe.
+    std::fs::create_dir_all(&leaf).expect("simulate the daemon's first write");
+    for _ in 0..50 {
+        driver.sync_workspace_presence(&mut model, true);
+    }
+    assert!(
+        model.session_workspace_uncreated,
+        "throttled: no probe inside the window"
+    );
+    // Once the window elapses the due probe runs without a new reply.
+    driver.set_now(base + std::time::Duration::from_millis(600));
+    driver.sync_workspace_presence(&mut model, false);
+    assert!(
+        !model.session_workspace_uncreated,
+        "materialised leaf loses the cue"
+    );
+    assert!(!driver.workspace_probe_due());
+    assert_eq!(driver.next_deadline(), None);
+
+    // Materialisation is one-way: a later disappearance is not "uncreated".
+    std::fs::remove_dir_all(&leaf).expect("remove leaf");
+    driver.sync_workspace_presence(&mut model, true);
+    assert!(!model.session_workspace_uncreated);
+}
+
+#[test]
+fn rapid_session_switches_cannot_exceed_the_probe_bound() {
+    let mut model = live_model();
+    let workspace_base = tempfile::tempdir().expect("temporary workspace base");
+    let daily_root = workspace_base.path().join("Haider").join("1448-04-11");
+    let allocation = haider_protocol::session::WorkspaceAllocationV1 {
+        daily_root: daily_root.to_str().expect("UTF-8 root").into(),
+        leaf: daily_root
+            .join("s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .to_str()
+            .expect("UTF-8 leaf")
+            .into(),
+        allocation_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        calendar_id: "islamic-civil".into(),
+        hijri_date: "1448-04-11".into(),
+        gregorian_date: "2026-09-24".into(),
+        allocated_at_ms: 1,
+        offset_seconds: 0,
+    };
+    model.cwd = allocation.leaf.clone();
+    model.pending_workspace_allocation = Some(allocation);
+    let mut driver = LiveDriver::new("probe-bound").with_launch_origin_path(Some(
+        haider_protocol::session::LaunchOriginPathV1 {
+            kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+            display: Some("~".into()),
+        },
+    ));
+    // Two dated sessions, each on its own fresh (absent) leaf.
+    let mut leaves = Vec::new();
+    for (n, text) in [(1, "first"), (2, "second")] {
+        let leaf = model.cwd.clone();
+        let issued =
+            driver.handle_request(&mut model, AppRequest::CreateSession { text: text.into() });
+        let command_id = issued
+            .iter()
+            .find_map(LiveCommand::command_id)
+            .cloned()
+            .expect("session.create is durable");
+        driver.apply(
+            &mut model,
+            LiveReply::Created {
+                command_id,
+                session: sid(n),
+                worker_generation: 1,
+                cwd: leaf.clone(),
+                model: "fable-5".to_owned(),
+                metadata: None,
+            },
+        );
+        leaves.push(std::path::PathBuf::from(leaf));
+    }
+    assert_ne!(leaves[0], leaves[1]);
+    let base = std::time::Instant::now();
+    driver.set_now(base);
+    driver.sync_workspace_presence(&mut model, false);
+    assert_eq!(
+        driver.workspace_probe_count(),
+        1,
+        "the first surface probes at once"
+    );
+    assert!(model.session_workspace_uncreated);
+
+    // The final target (session 2) materialises mid-storm; the storm itself
+    // must not buy extra stats.
+    std::fs::create_dir_all(&leaves[1]).expect("simulate session 2's first write");
+    // 20 switches inside one second (every 50 ms), each with a reply.
+    for i in 0..20u64 {
+        driver.set_now(base + std::time::Duration::from_millis(i * 50));
+        let target = if i % 2 == 0 { sid(1) } else { sid(2) };
+        model.open_session(&target);
+        driver.sync_workspace_presence(&mut model, true);
+        if !driver.workspace_probe_due() && model.active_session == Some(sid(1)) {
+            assert!(
+                model.session_workspace_uncreated,
+                "absent leaf keeps its cue"
+            );
+        }
+    }
+    assert!(
+        driver.workspace_probe_count() <= 2,
+        "20 switches in 1 s must stay within the 2 probes/s bound, got {}",
+        driver.workspace_probe_count()
+    );
+    // The storm ends on session 2 (i = 19). Its due probe is scheduled at
+    // the window boundary and runs without any further input.
+    assert_eq!(model.active_session, Some(sid(2)));
+    let deadline = driver
+        .next_deadline()
+        .expect("the final surface's probe is scheduled");
+    assert!(
+        deadline <= base + std::time::Duration::from_millis(950 + 500),
+        "the final session is probed within one window of its switch"
+    );
+    let before = driver.workspace_probe_count();
+    driver.set_now(deadline);
+    driver.sync_workspace_presence(&mut model, false);
+    assert_eq!(driver.workspace_probe_count(), before + 1);
+    assert!(
+        !model.session_workspace_uncreated,
+        "the final session's materialisation is observed, never skipped"
+    );
+    assert_eq!(driver.next_deadline(), None);
+}
+
+#[test]
+fn an_absent_non_dated_workspace_never_claims_the_uncreated_cue() {
+    let mut model = live_model();
+    model.cwd = "/definitely/not/a/real/haider/workspace".into();
+    let mut driver = LiveDriver::new("presence-legacy").with_launch_origin_path(Some(
+        haider_protocol::session::LaunchOriginPathV1 {
+            kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+            display: Some("~".into()),
+        },
+    ));
+    let issued = driver.handle_request(
+        &mut model,
+        AppRequest::CreateSession {
+            text: "legacy".into(),
+        },
+    );
+    let command_id = issued
+        .iter()
+        .find_map(LiveCommand::command_id)
+        .cloned()
+        .expect("session.create is durable");
+    driver.apply(
+        &mut model,
+        LiveReply::Created {
+            command_id,
+            session: sid(2),
+            worker_generation: 1,
+            cwd: "/definitely/not/a/real/haider/workspace".to_owned(),
+            model: "fable-5".to_owned(),
+            metadata: None,
+        },
+    );
+    driver.sync_workspace_presence(&mut model, true);
+    assert!(!model.session_workspace_uncreated);
 }
 
 // ---- menu coordinates -------------------------------------------------

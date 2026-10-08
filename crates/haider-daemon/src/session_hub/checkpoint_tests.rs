@@ -32,6 +32,7 @@ fn checkpoint_command_effect_batch_keeps_outcome_before_checkpoint() {
         }],
         post_digest: "blake3:checkpoint-order".into(),
         recorded_at_ms: 0,
+        redacted_content: false,
     };
     let envelopes = checkpoint_effect_envelopes(CheckpointEffectEnvelopeInput {
         session_id,

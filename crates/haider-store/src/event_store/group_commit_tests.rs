@@ -50,6 +50,7 @@ fn session_create_command(session_id: &SessionId, suffix: &str) -> SessionCreate
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4_096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -417,6 +418,7 @@ fn receipts_append_and_hook_ack_share_one_outer_commit() {
             interaction_mode: SessionInteractionModeV1::Interactive,
             account_alias: None,
             workspace_allocation: None,
+            inherited_route: None,
         },
         JournalCommitBatch::AcceptTurn {
             command: turn_command(&store, &accepted_session, "grouped"),

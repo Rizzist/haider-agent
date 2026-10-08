@@ -6,10 +6,11 @@
   "presentation": {
     "subcode": "rate-limited",
     "title": "Rate limit reached",
-    "detail": "The provider asked Haider to wait before trying again.",
+    "detail": "The provider asked Haider to wait before trying again. · details withheld",
     "provider_http_status": 429,
     "retry_after_ms": 3000,
     "scope": "account",
-    "allowed_actions": ["wait", "retry", "switch_account"]
+    "allowed_actions": ["wait", "retry", "switch_account"],
+    "provider_error_type": "rate_limit_error"
   }
 }

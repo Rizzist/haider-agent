@@ -55,6 +55,7 @@ fn seeded_session() -> AppModel {
     let mut model = seeded_launcher();
     model.sessions.clear();
     model.upsert_live_session(&sid());
+    model.note_session_metadata_at(&sid(), "anthropic", "fable-5", 30_000, Some(0), None);
     model.open_session(&sid());
     assert_eq!(model.screen, Screen::Session);
     model.requests.clear();
@@ -130,7 +131,40 @@ fn pass(
     model: &mut AppModel,
     reply: Option<LiveReply>,
 ) -> Vec<LiveCommand> {
-    live_pass(driver, model, reply, std::time::Instant::now()).commands
+    let mut commands = live_pass(driver, model, reply, std::time::Instant::now()).commands;
+    // Session selection now waits for that session's control attachment.
+    // Advance the synthetic wire through the attach before looking for the
+    // selection command, exactly as the live link does.
+    let attaching: Vec<_> = commands
+        .iter()
+        .filter_map(|command| match command {
+            LiveCommand::Attach { session, .. } | LiveCommand::AttachWithOrigin { session, .. } => {
+                Some(session.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    for session in attaching {
+        commands.extend(
+            live_pass(
+                driver,
+                model,
+                Some(LiveReply::Attached {
+                    attachment: haider_rpc::AttachmentId::new(format!(
+                        "f2-att-{}",
+                        session.as_str()
+                    )),
+                    session,
+                    worker_generation: 7,
+                    replay_through_seq: 0,
+                    launch_origin: None,
+                }),
+                std::time::Instant::now(),
+            )
+            .commands,
+        );
+    }
+    commands
 }
 
 /// MUTATION CHECK (F2a): route bare `/model` back to the old flash list.
@@ -762,11 +796,14 @@ fn live_selection_is_receipted_and_renders_the_resolved_pair() {
         &mut driver,
         &mut model,
         Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
             command_id,
             session: sid(),
             provider: "openai-oauth".to_owned(),
             model: "o4-mini".to_owned(),
             worker_generation: 7,
+            output_budget: None,
         }),
     );
     assert!(commands.is_empty());
@@ -847,16 +884,67 @@ fn provider_stage_selection_preserves_pending_and_resolved_truth() {
         &mut driver,
         &mut model,
         Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
             command_id,
             session: sid(),
             provider: "resolved-stage".to_owned(),
             model: "stage-model-v2".to_owned(),
             worker_generation: 9,
+            output_budget: None,
         }),
     );
     assert!(model.model_picker.is_none());
     assert_eq!(model.identity.provider, "resolved-stage");
     assert_eq!(model.identity.model_short, "stage-model-v2");
+}
+
+/// D1 (973 output cap): a user-set output budget that does not fit the newly
+/// selected model is clamped by the daemon; the TUI shows the typed notice
+/// next to the model flash instead of refusing the switch.
+#[test]
+fn clamped_user_output_budget_shows_a_notice_on_model_switch() {
+    let mut model = seeded_session();
+    let mut driver = LiveDriver::new("test");
+    run_slash(&mut model, "/model o4-mini");
+    model.handle(key(KeyCode::Enter));
+    let commands = pass(&mut driver, &mut model, None);
+    let command_id = commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::SelectModel { command_id, .. } => Some(command_id.clone()),
+            _ => None,
+        })
+        .expect("session.select_model issued");
+    pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
+            command_id,
+            session: sid(),
+            provider: "openai".to_owned(),
+            model: "gpt-4o".to_owned(),
+            worker_generation: 8,
+            output_budget: Some(haider_protocol::output_budget::SessionOutputBudgetV1 {
+                max_tokens: 16_384,
+                source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                    requested: 30_000,
+                },
+                clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                    requested: 30_000,
+                    max_output_tokens: 16_384,
+                }),
+            }),
+        }),
+    );
+    assert_eq!(model.identity.model_short, "gpt-4o", "the switch committed");
+    let flash = model.flash.as_deref().unwrap_or_default();
+    assert!(
+        flash.contains("gpt-4o") && flash.contains("30000") && flash.contains("16384"),
+        "the flash names the model and the clamp: {flash:?}"
+    );
 }
 
 /// A typed refusal lands INLINE with the public code; the pending mark
@@ -1004,7 +1092,7 @@ fn launcher_selection_sets_the_default_pair() {
     );
     assert_eq!(model.identity.provider, "local");
     assert_eq!(model.identity.model_short, "qwen3-coder");
-    assert!(model.identity_pinned, "an explicit choice pins");
+    assert!(model.launcher_identity_pinned, "an explicit choice pins");
     assert!(
         !model
             .requests

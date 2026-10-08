@@ -40,7 +40,9 @@ pub const PROFILE_CONFIG_FILE: &str = "config.json";
 /// W3c default provider for new sessions.
 pub const DEFAULT_PROVIDER: &str = "anthropic";
 /// W3c default max output tokens for new sessions.
-pub const DEFAULT_MAX_TOKENS: u64 = 4096;
+/// Shared daemon-side per-response default. Clients without an explicit
+/// override send zero so the daemon can bound it by the chosen model.
+pub use haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT as DEFAULT_MAX_TOKENS;
 /// Release-owned packaged default: a FULL Anthropic model ID (never a short
 /// product label). Verified by the ignored live smoke, which is evidence,
 /// never the merge gate.
@@ -126,7 +128,7 @@ pub struct ResolvedProfile {
     pub default_provider: String,
     /// Release-owned full model ID for new sessions and login validation.
     pub default_model: String,
-    /// Default max output tokens for new sessions.
+    /// Zero asks the daemon to derive a new session's output budget.
     pub default_max_tokens: u64,
 }
 
@@ -374,7 +376,7 @@ fn resolve_profile_with_store_mode(
             endpoint_path,
             default_provider: DEFAULT_PROVIDER.to_owned(),
             default_model,
-            default_max_tokens: DEFAULT_MAX_TOKENS,
+            default_max_tokens: 0,
         },
         runtime_dir_resolution,
     ))

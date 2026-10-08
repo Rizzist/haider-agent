@@ -105,6 +105,190 @@ fn live_session_model() -> AppModel {
 }
 
 #[test]
+fn launcher_shows_the_resolved_lazy_workspace_instead_of_the_launch_cwd() {
+    let mut model = live_model();
+    model.launcher_dir = "~".into();
+    model.pending_workspace_display =
+        Some("~/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef".into());
+    let (rows, _) = draw(&model, 120, 30);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains(
+            "dir ~/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef · created on first write"
+        ),
+        "the 120-column launcher must show the exact resolved leaf and its lazy state: {frame}"
+    );
+    assert!(
+        !frame.contains("dir ~ · mesh off"),
+        "the launch cwd must not masquerade as the next session workspace: {frame}"
+    );
+
+    let (wide_rows, _) = draw(&model, 220, 30);
+    let wide_frame = wide_rows.join("\n");
+    assert!(
+        wide_frame.contains("created on first write · provider anthropic · model fable-5"),
+        "wide launchers must retain provider identity after the workspace preview: {wide_frame}"
+    );
+}
+
+#[test]
+fn narrow_launchers_keep_the_dated_leaf_and_its_uncreated_state_visible() {
+    let mut model = live_model();
+    model.launcher_dir = "~".into();
+    let leaf = "~/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef";
+    model.pending_workspace_display = Some(leaf.into());
+    // Rows carry symbols only (no styles): this is also the no-colour view,
+    // so the lazy state must be spoken, never merely tinted.
+    for (cols, rows, expected) in [
+        (
+            80,
+            24,
+            "dir …/1448-04-10/s-01234567… · created on first write".to_owned(),
+        ),
+        (118, 36, format!("dir {leaf} · not created yet")),
+    ] {
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let row = frame_rows
+            .iter()
+            .find(|row| row.contains("dir "))
+            .unwrap_or_else(|| panic!("{cols}x{rows}: no dir row: {frame_rows:#?}"));
+        assert_eq!(
+            row.trim_end().split("  ").last().map(str::trim),
+            Some(expected.as_str()),
+            "{cols}x{rows} launcher dir row: {row:?}"
+        );
+        assert!(!row.trim_end().ends_with('…'), "{cols}x{rows}: {row:?}");
+    }
+
+    // A long, unabbreviated isolated home keeps the date/leaf and the state.
+    model.pending_workspace_display = Some(
+        "/private/var/folders/zz/isolated-profile-0123456789/home/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef".into(),
+    );
+    for (cols, rows) in [(80, 24), (118, 36)] {
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let row = frame_rows
+            .iter()
+            .find(|row| row.contains("dir "))
+            .expect("dir row");
+        assert!(row.contains("1448-04-10/s-01234567"), "{cols}: {row:?}");
+        assert!(
+            row.contains(" · created on first write") || row.contains(" · not created yet"),
+            "{cols}: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn an_uncreated_dated_session_keeps_its_cue_until_the_first_write() {
+    let leaf = "~/Documents/Haider/1448-04-11/s-0123456789abcdef0123456789abcdef";
+    let mut model = live_session_model();
+    model.launch_origin = Some((1, Some("~".into())));
+    model.session_dir = leaf.into();
+    for (cols, rows) in [(80, 24), (118, 36)] {
+        model.session_workspace_uncreated = true;
+        let (frame_rows, _) = draw(&model, cols, rows);
+        // The origin line wraps: judge the joined, space-normalised text.
+        let flat = frame_rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(&format!(
+                "Workspace: {leaf} · not created yet (created on first write)"
+            )),
+            "{cols}x{rows} chat-only session must speak the uncreated leaf: {frame_rows:#?}"
+        );
+        model.session_workspace_uncreated = false;
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let flat = frame_rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(&format!("Workspace: {leaf}")),
+            "{cols}x{rows}"
+        );
+        assert!(
+            !flat.contains("not created yet") && !flat.contains("created on first write"),
+            "{cols}x{rows} a materialised leaf must drop the cue: {frame_rows:#?}"
+        );
+    }
+    // At 118 the header itself also carries the fitted cue.
+    model.session_workspace_uncreated = true;
+    let (frame_rows, _) = draw(&model, 118, 36);
+    assert!(
+        frame_rows[0].contains("· …/1448-04-11/s-0123456789abcdef01234… · created on first write"),
+        "{:?}",
+        frame_rows[0]
+    );
+}
+
+#[test]
+fn the_uncreated_cue_lives_in_fixed_chrome_through_a_long_chat() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::ids::ItemId;
+    use haider_protocol::item::{ItemEvent, TurnItem};
+    let leaf = "~/Documents/Haider/1448-04-11/s-0123456789abcdef0123456789abcdef";
+    let mut model = live_session_model();
+    model.launch_origin = Some((1, Some("~".into())));
+    model.session_dir = leaf.into();
+    model.session_workspace_uncreated = true;
+    // One ordinary long text-only answer: far more rows than 80x24 holds,
+    // so the origin line scrolls out of the transcript viewport.
+    let answer = (1..=60)
+        .map(|n| format!("line {n} of a long text-only answer"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("long-answer"),
+            item: TurnItem::AgentMessage {
+                text: answer.into(),
+            },
+        }));
+    for (cols, rows, expected) in [
+        (80, 24, "· 1448-04-11/s-0123… · new"),
+        (
+            118,
+            36,
+            "· …/1448-04-11/s-0123456789abcdef01234… · created on first write",
+        ),
+    ] {
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let flat = frame_rows.join("\n");
+        assert!(
+            flat.contains("line 60 of a long text-only answer") && !flat.contains("Opened from"),
+            "{cols}x{rows}: the transcript must have scrolled the origin line away: {flat}"
+        );
+        assert!(
+            frame_rows[0].contains(expected),
+            "{cols}x{rows}: the fixed header must keep the uncreated cue: {:?}",
+            frame_rows[0]
+        );
+    }
+    // After the first write the fixed header returns to the plain path.
+    model.session_workspace_uncreated = false;
+    for (cols, rows) in [(80, 24), (118, 36)] {
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let flat = frame_rows.join("\n");
+        assert!(
+            !flat.contains(" · new")
+                && !flat.contains("created on first write")
+                && !flat.contains("not created yet"),
+            "{cols}x{rows}: {flat}"
+        );
+        assert!(
+            frame_rows[0].contains("· ~/Documents/Haider/1448-"),
+            "{:?}",
+            frame_rows[0]
+        );
+    }
+}
+
+#[test]
 fn session_transcript_renders_the_sanitized_origin_and_workspace_slot() {
     let mut model = live_session_model();
     model.launch_origin = Some((7, Some("/Users/<user>/private-project".into())));

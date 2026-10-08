@@ -2366,6 +2366,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
         FEATURE_SESSION_CONFIG_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),
+        haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1.to_owned(),
         FEATURE_SESSION_MUTATION_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_RENAME_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_WORKSPACE_SET_V1.to_owned(),

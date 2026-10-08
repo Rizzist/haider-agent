@@ -13,9 +13,8 @@
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode};
-use haider_tui::live::{
-    LiveCommand, LiveDriver, LiveReply, SESSION_OUTPUT_CAP, session_output_cap,
-};
+use haider_tui::link::command_required_features;
+use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::live_pass;
 
 mod common;
@@ -52,9 +51,11 @@ fn provider_summary(
         model_details: models
             .iter()
             .map(|slug| haider_rpc::ModelDetailWire {
+                source: None,
                 name: (*slug).to_owned(),
                 display_name: None,
                 context_window: None,
+                max_output_tokens: Some(30_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -130,13 +131,60 @@ fn an_unpinned_identity_follows_the_imported_active_account() {
     assert_eq!(model.identity.account, "openai-oauth");
     assert_eq!(model.identity.model_short, "gpt-5.6-codex");
     assert!(
-        !model.identity_pinned,
+        !model.launcher_identity_pinned,
         "a bootstrap is not a user choice — later daemon truth may still move it"
     );
 }
 
+#[test]
+fn fresh_oauth_login_adopts_static_model_after_catalog_403() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let seed_provider = model.identity.provider.clone();
+
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![oauth_descriptor("anthropic-oauth", "work", true)],
+            revision: Some(1),
+            sources: Vec::new(),
+        },
+    );
+    assert_eq!(model.identity.provider, seed_provider);
+
+    let mut summary = provider_summary(
+        "anthropic-oauth",
+        &["claude-fable-5-1", "claude-sonnet-4-5"],
+        "claude-fable-5-1",
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "GET /v1/models returned (403)".to_owned(),
+    };
+    for detail in &mut summary.model_details {
+        detail.source = Some(haider_rpc::ModelDetailSourceWire::Static);
+    }
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 1,
+        },
+    );
+
+    assert_eq!(model.identity.provider, "anthropic-oauth");
+    assert_eq!(model.identity.account, "work");
+    assert_eq!(model.identity.model_short, "claude-fable-5-1");
+    assert!(!model.launcher_identity_pinned);
+    model.open_model_picker(String::new());
+    assert!(model.model_picker_rows().iter().any(|row| {
+        row.provider == "anthropic-oauth" && row.model == "claude-fable-5-1" && row.selectable
+    }));
+}
+
 /// MUTATION CHECK (W5f-2): make `bootstrap_identity_from_daemon` ignore
-/// `identity_pinned`. Expected runtime failure: the snapshot below
+/// `launcher_identity_pinned`. Expected runtime failure: the snapshot below
 /// overwrites the user's explicit `/model` pick.
 /// Verified by revert on 2026-07-30.
 #[test]
@@ -161,7 +209,10 @@ fn a_pinned_choice_survives_every_later_snapshot() {
     run_slash(&mut model, "/model o4-mini");
     model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
     assert_eq!(model.identity.model_short, "o4-mini");
-    assert!(model.identity_pinned, "/model is an explicit choice");
+    assert!(
+        model.launcher_identity_pinned,
+        "/model is an explicit choice"
+    );
 
     pass(
         &mut driver,
@@ -232,22 +283,47 @@ fn session_create_requests_an_output_budget_not_the_context_window() {
         text: "hello".to_owned(),
     });
     let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
-    let created = pass
+    let create = pass
         .commands
         .iter()
-        .find_map(|command| match command {
-            LiveCommand::Create { max_tokens, .. } => Some(*max_tokens),
-            _ => None,
-        })
+        .find(|command| matches!(command, LiveCommand::Create { .. }))
         .expect("create command");
-    assert_eq!(created, SESSION_OUTPUT_CAP);
-
-    // A tinier declared window still wins.
-    assert_eq!(session_output_cap(4_096), 4_096);
+    let LiveCommand::Create {
+        max_tokens: created,
+        ..
+    } = create
+    else {
+        unreachable!()
+    };
     assert_eq!(
-        session_output_cap(0),
-        1,
-        "zero never reaches the daemon's reject"
+        *created, 0,
+        "the daemon derives the selected model's output budget"
+    );
+    assert!(
+        command_required_features(create).contains(&haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1)
+    );
+}
+
+#[test]
+fn session_create_before_model_details_requests_daemon_derivation() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("unknown-detail");
+    model.identity.provider = "gemini".into();
+    model.identity.model_short = "gemini-2.0-flash".into();
+    model.identity.context_window = 0;
+    model.requests.push(AppRequest::CreateSession {
+        text: "hello".into(),
+    });
+    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Create { max_tokens: 0, .. }))
+    );
+    assert!(
+        haider_tui::render::status_left_segments(&model, 120)
+            .iter()
+            .any(|segment| segment.text.contains("window unknown"))
     );
 }
 
@@ -267,12 +343,12 @@ fn connecting_asks_for_account_and_provider_truth() {
     let boot = driver.boot();
     assert!(
         boot.iter()
-            .any(|command| matches!(command, LiveCommand::AccountList)),
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. })),
         "boot must ask for account truth: {boot:?}"
     );
     assert!(
         boot.iter()
-            .any(|command| matches!(command, LiveCommand::ProviderList)),
+            .any(|command| matches!(command, LiveCommand::ProviderListAt { .. })),
         "and provider truth: {boot:?}"
     );
 
@@ -286,14 +362,14 @@ fn connecting_asks_for_account_and_provider_truth() {
     assert!(
         pass.commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::AccountList)),
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. })),
         "a reconnect must ask for account truth: {:?}",
         pass.commands
     );
     assert!(
         pass.commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::ProviderList)),
+            .any(|command| matches!(command, LiveCommand::ProviderListAt { .. })),
         "and provider truth: {:?}",
         pass.commands
     );
@@ -322,7 +398,7 @@ fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
     assert!(
         pass.commands.iter().any(|command| matches!(
             command,
-            LiveCommand::RefreshProviderModels { provider } if provider == "openai-oauth"
+            LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai-oauth"
         )),
         "the active OAuth provider must have its catalog discovered: {:?}",
         pass.commands
@@ -344,7 +420,7 @@ fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
         !again
             .commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::RefreshProviderModels { .. })),
+            .any(|command| matches!(command, LiveCommand::RefreshProviderModelsAt { .. })),
         "discovery must not storm on every snapshot: {:?}",
         again.commands
     );
@@ -407,7 +483,7 @@ fn never_fetched_state_refreshes_even_when_legacy_rows_are_nonempty() {
         }),
         std::time::Instant::now(),
     );
-    assert!(pass.commands.iter().any(|command| matches!(command, LiveCommand::RefreshProviderModels { provider } if provider == "openai-oauth")));
+    assert!(pass.commands.iter().any(|command| matches!(command, LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai-oauth")));
     assert_eq!(
         model.identity.model_short, before,
         "never adopt a legacy seed before discovery"

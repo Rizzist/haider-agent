@@ -159,7 +159,7 @@ async fn interrupt_leaves_chips_running_and_their_card_still_resolves() {
     let chip = haider_tui::app::find_chip(&model.chips, "t1-tests").expect("chip");
     assert!(chip.transcript.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· input resolved — continuing"
+        TranscriptEntry::Note { text, .. } if text == "· input resolved — continuing"
     )));
     assert!(
         chip.question.as_ref().is_some_and(|q| q.resolved),
@@ -208,7 +208,7 @@ async fn closing_a_chip_stops_its_script_at_once() {
     assert!(
         model.projection.entries().iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Note { text }
+            TranscriptEntry::Note { text, .. }
                 if text.starts_with("· subagent ") && text.ends_with("closed — leaving the tree in 5s")
         )),
         "the close note still lands"
@@ -962,7 +962,7 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptEntry::Note { text } => Some(text.clone()),
+            TranscriptEntry::Note { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect();
@@ -992,7 +992,7 @@ async fn a_card_answered_in_its_own_session_still_applies() {
     assert_eq!(model.voice.tts, "elevenlabs");
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text.starts_with("· voice enabled · deepgram-nova-3 → elevenlabs")
+        TranscriptEntry::Note { text, .. } if text.starts_with("· voice enabled · deepgram-nova-3 → elevenlabs")
     )));
 }
 
@@ -1121,7 +1121,7 @@ async fn the_auto_title_micro_call_lands_after_an_interrupt() {
     );
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text }
+        TranscriptEntry::Note { text, .. }
             if text == "· session titled — “Please fix the flaky boundary test suite” (background micro-call · never enters the prompt)"
     )));
 }
@@ -1145,7 +1145,7 @@ async fn the_auto_title_micro_call_never_names_a_replacement_session() {
     assert!(
         !model.projection.entries().iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Note { text } if text.starts_with("· session titled")
+            TranscriptEntry::Note { text, .. } if text.starts_with("· session titled")
         )),
         "and takes no note from the dead session's micro-call"
     );

@@ -50,6 +50,7 @@ fn draw(model: &AppModel, width: u16, height: u16) -> (Vec<String>, Vec<(Rect, H
 
 fn footprint(truth: ContextFootprintTruth) -> ContextFootprint {
     ContextFootprint {
+        selection_epoch: None,
         input_tokens: 90_000,
         output_tokens: 8_000,
         cached_input_tokens: 2_000,
@@ -140,6 +141,8 @@ fn the_compaction_intent_becomes_the_preannounce_note() {
         .extension_item()
         .expect("carrier");
     apply_extension(&mut model, "fp-2", footprint_item);
+    let current_window = model.context_meter().window;
+    model.projection.set_compaction_note_window(current_window);
     apply_extension(
         &mut model,
         "intent-1",
@@ -173,17 +176,15 @@ fn the_token_panel_prints_footprint_splits_with_truth_honesty() {
     apply_extension(&mut model, "fp-3", item);
     model.token_panel = true;
     let (rows, _) = draw(&model, 130, 40);
-    let panel_row = rows
-        .iter()
-        .find(|row| row.contains("in ") && row.contains("cached "))
-        .expect("panel row");
+    // 973-context-meter vocabulary: the prompt (uncached 90k + cached
+    // 2.0k) and the reply, each fact on its own panel line.
+    let panel = rows.join("\n");
     assert!(
-        panel_row.contains("in 90k")
-            && panel_row.contains("out 8.0k")
-            && panel_row.contains("cached 2.0k")
-            && panel_row.contains("≈7 turns to auto-compaction")
-            && !panel_row.contains('~'),
-        "exact splits print plainly with the turns estimate: {panel_row}"
+        panel.contains("last prompt 92k (cached 2.0k) + reply 8.0k")
+            && panel.contains("auto-compact at 170k (85%)")
+            && panel.contains("≈7 turns to auto-compaction")
+            && !panel.contains("~92k"),
+        "exact splits print plainly with the trigger and turns estimate: {panel}"
     );
     assert!(
         rows.iter().any(|row| row.contains("context by model")),

@@ -1,0 +1,128 @@
+== anthropic-oauth undeclared · no snapshot @ 118x36
+status:  [ IDLE ]  0 tok · window unknown  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● claude-opus-5-5 · anthropic-oauth  0 tok · window unknown                                                       │
+ │    no request snapshot yet                                                                                       │
+ │    window unknown — no auto-compaction trigger                                                                   │
+ [ IDLE ]  0 tok · window unknown  · main
+== anthropic-oauth undeclared · no snapshot @ 80x24
+status:  [ IDLE ]  0 tok · window unknown  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● claude-opus-5-5 · anthropic-oauth  0 tok · window unknown                 │
+ │    no request snapshot yet                                                 │
+ │    window unknown — no auto-compaction trigger                             │
+ [ IDLE ]  0 tok · window unknown  · main
+== anthropic-oauth undeclared · snapshot @ 118x36
+status:  [ IDLE ]  20k tok · window unknown  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● claude-opus-5-5 · anthropic-oauth  20k tok · window unknown                                                     │
+ │    last prompt 19k (cached 18k) + reply 400                                                                      │
+ │    window unknown — no auto-compaction trigger                                                                   │
+ [ IDLE ]  20k tok · window unknown  · main
+== anthropic-oauth undeclared · snapshot @ 80x24
+status:  [ IDLE ]  20k tok · window unknown  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● claude-opus-5-5 · anthropic-oauth  20k tok · window unknown               │
+ │    last prompt 19k (cached 18k) + reply 400                                │
+ │    window unknown — no auto-compaction trigger                             │
+ [ IDLE ]  20k tok · window unknown  · main
+== claude-opus-5-5 · session start @ 118x36
+status:  [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 1M  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● claude-opus-5-5 · anthropic-oauth  ▱▱▱▱▱▱▱▱▱▱▱▱ 0%  0/1M                                                        │
+ │    no request snapshot yet                                                                                       │
+ │    auto-compact at 850k (85%) (projected until this model's first turn)                                          │
+ [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 1M  · main
+== claude-opus-5-5 · session start @ 80x24
+status:  [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 1M  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● claude-opus-5-5 · anthropic-oauth  ▱▱▱▱▱▱▱▱▱▱▱▱ 0%  0/1M                  │
+ │    no request snapshot yet                                                 │
+ │    auto-compact at 850k (85%) (projected until this model's first turn)    │
+ [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 1M  · main
+== claude-opus-5-5 · after a turn @ 118x36
+status:  [ IDLE ]  103k tok · ▰▱▱▱▱▱▱▱▱▱ 10% of 1M · compact at 85%  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● claude-opus-5-5 · anthropic-oauth  ▰▱▱▱▱▱▱▱▱▱▱▱ 10%  103k/1M                                                    │
+ │    last prompt 102k (cached 100k) + reply 1.0k                                                                   │
+ │    auto-compact at 850k (85%)                                                                                    │
+ [ IDLE ]  103k tok · ▰▱▱▱▱▱▱▱▱▱ 10% of 1M · compact at 85%  · main
+== claude-opus-5-5 · after a turn @ 80x24
+status:  [ IDLE ]  103k tok · ▰▱▱▱▱▱▱▱▱▱ 10% of 1M · compact at 85%  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● claude-opus-5-5 · anthropic-oauth  ▰▱▱▱▱▱▱▱▱▱▱▱ 10%  103k/1M              │
+ │    last prompt 102k (cached 100k) + reply 1.0k                             │
+ │    auto-compact at 850k (85%)                                              │
+ [ IDLE ]  103k tok · ▰▱▱▱▱▱▱▱▱▱ 10% of 1M · compact at 85%  · main
+== claude-opus-5-5 · turns estimate @ 118x36
+status:  [ IDLE ]  53k tok · ▰▱▱▱▱▱▱▱▱▱ 5% of 1M · compact at 85%  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● claude-opus-5-5 · anthropic-oauth  ▰▱▱▱▱▱▱▱▱▱▱▱ 5%  53k/1M                                                      │
+ │    last prompt 53k (cached 50k) + reply 700                                                                      │
+ │    auto-compact at 850k (85%)                                                                                    │
+ │    ≈1139 turns to auto-compaction                                                                                │
+ [ IDLE ]  53k tok · ▰▱▱▱▱▱▱▱▱▱ 5% of 1M · compact at 85%  · main
+== claude-opus-5-5 · turns estimate @ 80x24
+status:  [ IDLE ]  53k tok · ▰▱▱▱▱▱▱▱▱▱ 5% of 1M · compact at 85%  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● claude-opus-5-5 · anthropic-oauth  ▰▱▱▱▱▱▱▱▱▱▱▱ 5%  53k/1M                │
+ │    last prompt 53k (cached 50k) + reply 700                                │
+ │    auto-compact at 850k (85%)                                              │
+ │    ≈1139 turns to auto-compaction                                          │
+ [ IDLE ]  53k tok · ▰▱▱▱▱▱▱▱▱▱ 5% of 1M · compact at 85%  · main
+== my-custom-model · after switch (unknown window) @ 118x36
+status:  [ IDLE ]  53k tok · window unknown  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● my-custom-model · anthropic-oauth  53k tok · window unknown                                                     │
+ │    last prompt 53k (cached 50k) + reply 700                                                                      │
+ │    window unknown — no auto-compaction trigger                                                                   │
+ [ IDLE ]  53k tok · window unknown  · main
+== my-custom-model · after switch (unknown window) @ 80x24
+status:  [ IDLE ]  53k tok · window unknown  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● my-custom-model · anthropic-oauth  53k tok · window unknown               │
+ │    last prompt 53k (cached 50k) + reply 700                                │
+ │    window unknown — no auto-compaction trigger                             │
+ [ IDLE ]  53k tok · window unknown  · main
+== claude-sonnet-4-6 · after switch @ 118x36
+status:  [ IDLE ]  53k tok · ▰▰▰▱▱▱▱▱▱▱ 27% of 200k  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● claude-sonnet-4-6 · anthropic-oauth  ▰▰▰▱▱▱▱▱▱▱▱▱ 27%  53k/200k                                                 │
+ │    last prompt 53k (cached 50k) + reply 700                                                                      │
+ │    auto-compact at 170k (85%) (projected until this model's first turn)                                          │
+ [ IDLE ]  53k tok · ▰▰▰▱▱▱▱▱▱▱ 27% of 200k  · main
+== claude-sonnet-4-6 · after switch @ 80x24
+status:  [ IDLE ]  53k tok · ▰▰▰▱▱▱▱▱▱▱ 27% of 200k  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● claude-sonnet-4-6 · anthropic-oauth  ▰▰▰▱▱▱▱▱▱▱▱▱ 27%  53k/200k           │
+ │    last prompt 53k (cached 50k) + reply 700                                │
+ │    auto-compact at 170k (85%) (projected until this model's first turn)    │
+ [ IDLE ]  53k tok · ▰▰▰▱▱▱▱▱▱▱ 27% of 200k  · main
+== gpt-6-sol · after a turn @ 118x36
+status:  [ IDLE ]  105k tok · ▰▰▰▱▱▱▱▱▱▱ 26% of 400k · compact at 85%  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● gpt-6-sol · openai-oauth  ▰▰▰▱▱▱▱▱▱▱▱▱ 26%  105k/400k                                                           │
+ │    last prompt 103k (cached 100k) + reply 1.5k                                                                   │
+ │    auto-compact at 340k (85%)                                                                                    │
+ [ IDLE ]  105k tok · ▰▰▰▱▱▱▱▱▱▱ 26% of 400k · compact at 85%  · main
+== gpt-6-sol · after a turn @ 80x24
+status:  [ IDLE ]  105k tok · ▰▰▰▱▱▱▱▱▱▱ 26% of 400k · compact at 85%  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● gpt-6-sol · openai-oauth  ▰▰▰▱▱▱▱▱▱▱▱▱ 26%  105k/400k                     │
+ │    last prompt 103k (cached 100k) + reply 1.5k                             │
+ │    auto-compact at 340k (85%)                                              │
+ [ IDLE ]  105k tok · ▰▰▰▱▱▱▱▱▱▱ 26% of 400k · compact at 85%  · main
+== gpt-6-sol · after compaction @ 118x36
+status:  [ IDLE ]  ~9.0k tok · ▱▱▱▱▱▱▱▱▱▱ 2% of 400k · compact at 85%  
+ │context by model — ⌃G · /tokens · esc closes                                                                      │
+ │● gpt-6-sol · openai-oauth  ▱▱▱▱▱▱▱▱▱▱▱▱ 2%  ~9.0k/400k                                                           │
+ │    last prompt ~9.0k (cached ~0) + reply ~0                                                                      │
+ │    auto-compact at 340k (85%)                                                                                    │
+ [ IDLE ]  ~9.0k tok · ▱▱▱▱▱▱▱▱▱▱ 2% of 400k · compact at 85%  · main
+== gpt-6-sol · after compaction @ 80x24
+status:  [ IDLE ]  ~9.0k tok · ▱▱▱▱▱▱▱▱▱▱ 2% of 400k · compact at 85%  
+ │context by model — ⌃G · /tokens · esc closes                                │
+ │● gpt-6-sol · openai-oauth  ▱▱▱▱▱▱▱▱▱▱▱▱ 2%  ~9.0k/400k                     │
+ │    last prompt ~9.0k (cached ~0) + reply ~0                                │
+ │    auto-compact at 340k (85%)                                              │
+ [ IDLE ]  ~9.0k tok · ▱▱▱▱▱▱▱▱▱▱ 2% of 400k · compact at 85%  · main

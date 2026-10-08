@@ -92,6 +92,225 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     }
 }
 
+#[test]
+fn session_output_limit_validation_is_exact_and_typed() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = crate::model_select::ValidatedModelSelection {
+        provider: "anthropic-oauth".into(),
+        model: "claude-fable-5-1".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+        context_window: Some(1_000_000),
+        max_output_tokens: 128_000,
+        explicit_max_output_tokens: 128_000,
+    };
+
+    let derived = super::rpc::resolve_session_output_limit(0, &selection).expect("derived default");
+    assert_eq!(derived.max_tokens, 30_000);
+    assert_eq!(derived.source, SessionOutputBudgetSourceV1::Derived);
+    // A SOURCED 8,192 row (e.g. Gemini 2.0): the explicit ceiling is exact.
+    let smaller = crate::model_select::ValidatedModelSelection {
+        max_output_tokens: 8_192,
+        explicit_max_output_tokens: 8_192,
+        ..selection.clone()
+    };
+    assert_eq!(
+        super::rpc::resolve_session_output_limit(0, &smaller)
+            .expect("model-bounded default")
+            .max_tokens,
+        8_192
+    );
+    assert!(
+        matches!(
+            super::rpc::resolve_session_output_limit(30_000, &smaller),
+            Err((
+                _,
+                haider_rpc::ErrorData::ModelOutputLimit {
+                    requested: 30_000,
+                    max_output_tokens: 8_192,
+                    ..
+                }
+            ))
+        ),
+        "an explicit request above the model maximum receives a typed refusal"
+    );
+    let exact = super::rpc::resolve_session_output_limit(128_000, &selection)
+        .expect("exact explicit limit");
+    assert_eq!(exact.max_tokens, 128_000);
+    assert_eq!(
+        exact.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 128_000 }
+    );
+    let (message, data) = super::rpc::resolve_session_output_limit(128_001, &selection)
+        .expect_err("over-limit refusal");
+    assert!(message.contains("claude-fable-5-1"));
+    assert!(message.contains("128000"));
+    assert!(matches!(
+        data,
+        haider_rpc::ErrorData::ModelOutputLimit {
+            requested: 128_001,
+            max_output_tokens: 128_000,
+            context_window: Some(1_000_000),
+            ..
+        }
+    ));
+}
+
+/// D1: a model switch re-applies the STORED budget. Derived (recorded, or a
+/// legacy client default) re-derives; user-set (recorded, or a legacy
+/// non-default value) clamps with a typed notice and never refuses.
+#[test]
+fn model_switch_reapplies_derived_and_user_set_budgets() {
+    use haider_protocol::output_budget::{OutputBudgetClampV1, SessionOutputBudgetSourceV1};
+    let gpt_4o = crate::model_select::ValidatedModelSelection {
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+        context_window: Some(128_000),
+        max_output_tokens: 16_384,
+        explicit_max_output_tokens: 16_384,
+    };
+    let custom = crate::model_select::ValidatedModelSelection {
+        provider: "custom973".into(),
+        model: "custom-unknown".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Unlisted,
+        context_window: None,
+        max_output_tokens: 8_192,
+        explicit_max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+    };
+    let metadata = |max_tokens, source| {
+        let mut metadata: haider_protocol::session::SessionMetadataV1 =
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/workspace",
+                "provider": "anthropic-oauth",
+                "model": "claude-fable-5-1",
+                "max_tokens": max_tokens,
+                "created_at_ms": 1_u64,
+            }))
+            .expect("metadata fixture");
+        metadata.max_tokens_source = source;
+        metadata
+    };
+
+    for current in [
+        metadata(30_000, Some(SessionOutputBudgetSourceV1::Derived)),
+        metadata(30_000, None),
+        metadata(4_096, None),
+    ] {
+        let budget = super::rpc::reapply_session_output_budget(&current, &gpt_4o);
+        assert_eq!(budget.max_tokens, 16_384);
+        assert_eq!(budget.source, SessionOutputBudgetSourceV1::Derived);
+        assert_eq!(budget.clamped, None);
+        assert_eq!(
+            super::rpc::reapply_session_output_budget(&current, &custom).max_tokens,
+            8_192
+        );
+    }
+
+    let user = metadata(
+        30_000,
+        Some(SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }),
+    );
+    let budget = super::rpc::reapply_session_output_budget(&user, &gpt_4o);
+    assert_eq!(budget.max_tokens, 16_384);
+    assert_eq!(
+        budget.clamped,
+        Some(OutputBudgetClampV1 {
+            requested: 30_000,
+            max_output_tokens: 16_384
+        })
+    );
+    let legacy_override = metadata(12_000, None);
+    let budget = super::rpc::reapply_session_output_budget(&legacy_override, &gpt_4o);
+    assert_eq!(budget.max_tokens, 12_000);
+    assert_eq!(
+        budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 12_000 },
+        "a legacy non-default value is the user's own"
+    );
+    assert_eq!(budget.clamped, None);
+    let legacy_large = metadata(20_000, None);
+    let budget = super::rpc::reapply_session_output_budget(&legacy_large, &gpt_4o);
+    assert_eq!(budget.max_tokens, 16_384);
+    assert!(budget.clamped.is_some());
+    // S1: an unverified 8,192 guess does not clamp the user's own budget.
+    let budget = super::rpc::reapply_session_output_budget(&legacy_large, &custom);
+    assert_eq!(budget.max_tokens, 20_000);
+    assert_eq!(budget.clamped, None);
+}
+
+/// S1: when the row maximum is only the unverified 8,192 fallback, an
+/// explicit budget up to `MAX_OUTPUT_LIMIT` (strictly below a known context
+/// window) is admitted; the derived default still follows the guess.
+#[test]
+fn unverified_fallback_rows_admit_larger_explicit_budgets() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = |provider: &str, model: &str, context_window: Option<u64>| {
+        let max_output_tokens =
+            haider_provider::model_output_limit(provider, model, None, context_window);
+        crate::model_select::ValidatedModelSelection {
+            provider: provider.into(),
+            model: model.into(),
+            inventory_status: haider_rpc::ModelInventoryStatusWire::Unlisted,
+            context_window,
+            max_output_tokens,
+            explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
+                provider,
+                model,
+                max_output_tokens,
+                context_window,
+            ),
+        }
+    };
+    for custom in [
+        selection("custom973", "custom-unknown", None),
+        selection("anthropic", "claude-sonnet-4-20250514", None),
+        selection("gemini", "gemini-9-unlisted", None),
+        selection("openai", "gpt-unknown", None),
+    ] {
+        assert_eq!(
+            custom.max_output_tokens,
+            haider_provider::UNKNOWN_OUTPUT_LIMIT
+        );
+        let derived = super::rpc::resolve_session_output_limit(0, &custom).expect("derived");
+        assert_eq!(derived.max_tokens, haider_provider::UNKNOWN_OUTPUT_LIMIT);
+        let explicit = super::rpc::resolve_session_output_limit(30_000, &custom)
+            .expect("explicit budget above the unverified guess");
+        assert_eq!(explicit.max_tokens, 30_000);
+        assert_eq!(
+            explicit.source,
+            SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }
+        );
+        assert_eq!(
+            super::rpc::resolve_session_output_limit(haider_provider::MAX_OUTPUT_LIMIT, &custom)
+                .expect("up to the adapter maximum")
+                .max_tokens,
+            haider_provider::MAX_OUTPUT_LIMIT
+        );
+        assert!(matches!(
+            super::rpc::resolve_session_output_limit(
+                haider_provider::MAX_OUTPUT_LIMIT + 1,
+                &custom
+            ),
+            Err((
+                _,
+                haider_rpc::ErrorData::ModelOutputLimit {
+                    max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+                    ..
+                }
+            ))
+        ));
+    }
+    // A known context window still bounds the explicit ceiling strictly below it.
+    let windowed = selection("custom973", "custom-unknown", Some(64_000));
+    assert_eq!(windowed.explicit_max_output_tokens, 32_000);
+    assert!(super::rpc::resolve_session_output_limit(32_000, &windowed).is_ok());
+    assert!(super::rpc::resolve_session_output_limit(32_001, &windowed).is_err());
+    // A sourced row keeps its exact maximum.
+    let sourced = selection("anthropic", "claude-sonnet-4-5", Some(200_000));
+    assert_eq!(sourced.explicit_max_output_tokens, 64_000);
+    assert!(super::rpc::resolve_session_output_limit(64_001, &sourced).is_err());
+}
+
 /// The attachment replay preflight must keep immutable-blob validation out of
 /// an idempotent retry while still entering the fused acceptance transaction
 /// that repairs a legacy first-turn receipt with no title.
@@ -358,6 +577,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -659,6 +879,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -783,6 +1004,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -1066,6 +1288,61 @@ async fn create_fork_ready_source(
         })
         .expect("fork source node");
     (source, node_id, seq)
+}
+
+#[tokio::test]
+async fn daemon_fork_keeps_the_explicit_account_and_endpoint_route() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let (source, node, seq) = create_fork_ready_source(&hub, &store, "explicit-route-fork").await;
+    let rebind_json =
+        r#"{"provider":"fake","base_url":"https://synthetic.invalid","account":"bed-b"}"#
+            .to_owned();
+    hub.rebind_session_provider(haider_store::SessionProviderRebindCommand {
+        command_id: "explicit-route-parent-rebind".into(),
+        request_digest: blake3::hash(rebind_json.as_bytes()).to_hex().to_string(),
+        request_json: rebind_json,
+        session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "fake".into(),
+        base_url: Some("https://synthetic.invalid".into()),
+        account: Some("bed-b".into()),
+        event_id: EventId::new("explicit-route-parent-rebound"),
+        device_id: DeviceId::new("worker-law-test"),
+    })
+    .await
+    .expect("explicit parent rebind");
+    let parent = store
+        .session_metadata(&source)
+        .await
+        .expect("parent metadata")
+        .expect("typed");
+    let child = SessionId::new("explicit-route-fork-child");
+    hub.fork_session(private_fork_command(
+        &store,
+        "explicit-route",
+        source.clone(),
+        child.clone(),
+        node,
+        seq,
+    ))
+    .await
+    .expect("daemon fork");
+    let copied = store
+        .session_metadata(&child)
+        .await
+        .expect("child metadata")
+        .expect("typed");
+    assert_eq!(copied.account_alias, parent.account_alias);
+    assert_eq!(copied.provider_base_url, parent.provider_base_url);
+    assert_eq!(copied.provider_rebind_id, parent.provider_rebind_id);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 async fn observe_fork_outcome(
@@ -2157,11 +2434,16 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         created_at_ms: None,
     };
     let mut provider = provider_summary("fake");
-    provider.models = vec!["fake-v1".into()];
+    provider.models = vec!["fake-v1".into(), "fake-v2".into()];
     provider.default_model = Some("fake-v1".into());
     let active_other = haider_protocol::credential::CredentialDescriptor {
         alias: haider_protocol::ids::CredentialAlias::new("active-other"),
         provider: "other".into(),
+        active: true,
+        ..descriptor.clone()
+    };
+    let active_fake = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("active-fake"),
         active: true,
         ..descriptor.clone()
     };
@@ -2171,10 +2453,14 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
         oauth: None,
-        snapshot: Arc::new(Mutex::new(vec![descriptor.clone(), active_other.clone()])),
+        snapshot: Arc::new(Mutex::new(vec![
+            descriptor.clone(),
+            active_fake.clone(),
+            active_other.clone(),
+        ])),
         management: crate::accounts::ManagementSnapshot::new(
             0,
-            vec![descriptor, active_other],
+            vec![descriptor, active_fake, active_other],
             vec![provider, other_provider],
         ),
         vault_supported: false,
@@ -2247,10 +2533,305 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         metadata.interaction_mode,
         haider_protocol::session::SessionInteractionModeV1::Autonomous
     );
+    let pinned_id = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { session_id, .. },
+            } if request_id.as_str() == "resolved-create" => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("pinned id");
+
+    // An ordinary create follows the provider's active account on each
+    // turn. The RPC must not turn that mutable default into an explicit pin.
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("ordinary-create"),
+            RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: haider_rpc::CommandId::new("ordinary-create-command"),
+                cwd: std::env::current_dir()
+                    .expect("cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                provider: "fake".into(),
+                model: "fake-v1".into(),
+                max_tokens: 4_096,
+                permission_overrides: None,
+                workspace_allocation: None,
+                cache_policy: None,
+                interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
+                ssh_scope: None,
+                account_alias: None,
+                resolve_provider: false,
+                resolve_model: false,
+                effort: None,
+                fast: None,
+            },
+        )
+        .await
+        .expect("ordinary create request");
+    let ordinary = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { metadata, .. },
+            } if request_id.as_str() == "ordinary-create" => Some(metadata.clone()),
+            _ => None,
+        })
+        .expect("ordinary create response");
+    assert_eq!(ordinary.account_alias, None);
+
+    let ordinary_id = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { session_id, .. },
+            } if request_id.as_str() == "ordinary-create" => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("ordinary session id");
+    connection
+        .request(
+            RequestId::new("ordinary-attach"),
+            RequestBody::SessionAttach {
+                session_id: ordinary_id.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attach");
+    let select = |command: &str, provider: Option<&str>, model: &str, max_tokens| {
+        RequestBody::SessionSelectModel {
+            command_id: haider_rpc::CommandId::new(command),
+            session_id: ordinary_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: provider.map(str::to_owned),
+            model: model.to_owned(),
+            confirm_new_epoch: true,
+            max_tokens,
+        }
+    };
+    let initial_epoch = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("initial metadata")
+        .expect("typed metadata")
+        .selection_epoch;
+    connection
+        .request(
+            RequestId::new("ordinary-noop"),
+            select("ordinary-noop-command", None, "fake-v1", None),
+        )
+        .await
+        .expect("no-op selection");
+    let no_op = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("no-op metadata")
+        .expect("typed metadata");
+    assert_eq!(no_op.account_alias, None);
+    assert_eq!(no_op.selection_epoch, initial_epoch);
+    connection
+        .request(
+            RequestId::new("ordinary-budget"),
+            select("ordinary-budget-command", None, "fake-v1", Some(2_048)),
+        )
+        .await
+        .expect("budget selection");
+    let budget = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("budget metadata")
+        .expect("typed metadata");
+    assert_eq!(budget.account_alias, None);
+    assert_eq!(budget.max_tokens, 2_048);
+    connection
+        .request(
+            RequestId::new("ordinary-model"),
+            select("ordinary-model-command", None, "fake-v2", None),
+        )
+        .await
+        .expect("model selection");
+    let model = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("model metadata")
+        .expect("typed metadata");
+    assert_eq!(model.account_alias, None);
+    assert_eq!(model.model, "fake-v2");
+    connection
+        .request(
+            RequestId::new("ordinary-provider"),
+            select("ordinary-provider-command", Some("other"), "other-v1", None),
+        )
+        .await
+        .expect("provider selection");
+    let provider = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("provider metadata")
+        .expect("typed metadata");
+    assert_eq!(provider.account_alias, None);
+    assert_eq!(
+        (&*provider.provider, &*provider.model),
+        ("other", "other-v1")
+    );
+
+    // A separate explicit create pin survives a same-provider model choice.
+    // Changing providers clears that pin, because the alias belongs to fake.
+    connection
+        .request(
+            RequestId::new("pinned-attach"),
+            RequestBody::SessionAttach {
+                session_id: pinned_id.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("pinned attach");
+    for (name, provider, model, expected_alias) in [
+        ("same", None, "fake-v2", Some("selected-fake")),
+        ("cross", Some("other"), "other-v1", None),
+    ] {
+        connection
+            .request(
+                RequestId::new(format!("pinned-{name}")),
+                RequestBody::SessionSelectModel {
+                    command_id: haider_rpc::CommandId::new(format!("pinned-{name}-command")),
+                    session_id: pinned_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    provider: provider.map(str::to_owned),
+                    model: model.to_owned(),
+                    confirm_new_epoch: true,
+                    max_tokens: None,
+                },
+            )
+            .await
+            .expect("pinned selection");
+        let metadata = store
+            .session_metadata(&pinned_id)
+            .await
+            .expect("pinned metadata")
+            .expect("typed metadata");
+        assert_eq!(metadata.account_alias.as_deref(), expected_alias);
+    }
 
     drop(connection);
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn account_switch_preflight_does_not_pin_archived_or_child_sessions() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let archived = SessionId::new("archived-account-route");
+    store
+        .create_session(create_command(&archived, "archived-account-route"))
+        .await
+        .expect("archive fixture");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let child = SessionId::new("child-account-route");
+    hub.create_internal_session(create_command(&child, "child-account-route"))
+        .await
+        .expect("child fixture");
+    let before_archived = store
+        .session_metadata(&archived)
+        .await
+        .expect("archived metadata");
+    let before_child = store
+        .session_metadata(&child)
+        .await
+        .expect("child metadata");
+    let old = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("old-fake"),
+        provider: "fake".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "old fake account".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let new = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("new-fake"),
+        active: false,
+        ..old.clone()
+    };
+    let (login, mut queued) = tokio::sync::mpsc::channel(1);
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: Some(login),
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+        management: crate::accounts::ManagementSnapshot::new(
+            0,
+            vec![old, new],
+            vec![provider_summary("fake")],
+        ),
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(Mutex::new(Vec::new())),
+        vault: None,
+    })
+    .expect("accounts");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+            sink,
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("switch-preflight"),
+            RequestBody::AccountSetActive {
+                command_id: haider_rpc::CommandId::new("switch-preflight-command"),
+                alias: "new-fake".into(),
+                confirm_new_epoch: true,
+            },
+        )
+        .await
+        .expect("switch request");
+    assert!(matches!(
+        queued.try_recv(),
+        Ok(crate::accounts::AccountCommand::SetActive(_))
+    ));
+    assert_eq!(
+        store
+            .session_metadata(&archived)
+            .await
+            .expect("archived after"),
+        before_archived
+    );
+    assert_eq!(
+        store.session_metadata(&child).await.expect("child after"),
+        before_child
+    );
+    drop(connection);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
 }
 
 /// R2-03: absent storage is the canonical default `All` scope. A later
@@ -3954,6 +4535,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -5318,6 +5900,7 @@ pub(super) fn create_command(session_id: &SessionId, suffix: &str) -> SessionCre
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4_096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -5596,8 +6179,13 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
     );
     fact.run_id = None;
     *fact.payload = haider_protocol::session::ModelSelected {
+        selection_epoch: None,
         provider: "fake-b".into(),
         model: "model-b".into(),
+        route_only: false,
+        cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     }
     .to_payload_value()
     .expect("fact serializes");

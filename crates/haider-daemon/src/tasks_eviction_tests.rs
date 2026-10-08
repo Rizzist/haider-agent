@@ -4,6 +4,46 @@ use super::*;
 use crate::session_hub::SessionHubConfig;
 use haider_core::SqliteStoreHandle;
 
+#[test]
+fn capture_cache_stays_small_after_one_hundred_thousand_handles() {
+    let registry = TaskRegistry::default();
+    let session = SessionId::new("capture-stress");
+    let started = std::time::Instant::now();
+    for index in 0..100_000 {
+        registry.retain_capture(
+            &session,
+            format!("capture:effect-{index:032x}"),
+            haider_protocol::ids::ArtifactRef::new(format!("blake3:{index:064x}")),
+        );
+    }
+    let sessions = registry.lock();
+    let captures = &sessions.get(&session).expect("session").captures;
+    assert_eq!(captures.len(), 256);
+    let heap_bytes = captures.capacity()
+        * std::mem::size_of::<(String, haider_protocol::ids::ArtifactRef)>()
+        + captures
+            .iter()
+            .map(|(handle, artifact)| handle.capacity() + artifact.0.capacity())
+            .sum::<usize>();
+    eprintln!(
+        "100k capture cache: {} handles, <= {heap_bytes} estimated heap bytes, elapsed {:?}",
+        captures.len(),
+        started.elapsed()
+    );
+    assert!(heap_bytes < 64 * 1024, "capture cache grew: {heap_bytes}");
+    drop(sessions);
+    assert!(
+        registry
+            .capture(&session, &format!("capture:effect-{:032x}", 0))
+            .is_none()
+    );
+    assert!(
+        registry
+            .capture(&session, &format!("capture:effect-{:032x}", 99_999))
+            .is_some()
+    );
+}
+
 #[tokio::test]
 async fn session_join_drains_cleanup_registered_by_a_joined_producer() {
     let registry = Arc::new(TaskRegistry::default());
@@ -245,6 +285,7 @@ async fn toolshape_task_output_original_hash_survives_completion_eviction_and_ad
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

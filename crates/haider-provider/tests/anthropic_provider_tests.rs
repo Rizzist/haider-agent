@@ -109,6 +109,7 @@ fn constructor_transport_config_disables_retries_and_bounds_connects_and_chunk_i
 
     assert_eq!(config.retry_policy, AnthropicRetryPolicy::Never);
     assert_eq!(config.connect_timeout, Duration::from_secs(10));
+    assert_eq!(config.response_open_timeout, Duration::from_secs(60));
     assert_eq!(config.chunk_idle_timeout, Duration::from_secs(90));
 }
 
@@ -212,10 +213,12 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
                     call_id: "toolu_sanitized".into(),
                     preview: "sunny".into(),
                     truncated: false,
+                    completion_status: None,
                     images: Vec::new(),
                 }],
             },
         ],
+        tool_result_image_projection: Default::default(),
     };
 
     let payload = provider
@@ -283,6 +286,7 @@ fn image_bearing_tool_result_uses_native_nested_content_or_named_placeholder() {
             data_base64: "iVBORw0KGgo=".into(),
         }],
         cache_metadata: None,
+        tool_result_image_projection: Default::default(),
     };
 
     let payload = provider
@@ -418,6 +422,7 @@ fn native_pdf_enforces_anthropics_complete_request_size_limit() {
                 delivery: PdfDeliveryMode::NativeDocument,
             })],
         }],
+        tool_result_image_projection: Default::default(),
     };
 
     let error = provider
@@ -450,6 +455,7 @@ fn missing_image_data_is_a_typed_invalid_request() {
                 height: None,
             })],
         }],
+        tool_result_image_projection: Default::default(),
     };
 
     let error = provider
@@ -485,6 +491,92 @@ fn context_exceeded_http_and_sse_fixtures_are_distinct_from_max_tokens() {
             })
         )
     }));
+}
+
+#[test]
+fn max_tokens_keeps_partial_tool_open_for_actor_classification() {
+    let wire = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_partial","type":"message","role":"assistant","content":[],"model":"claude-fable-5-1","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_partial","name":"fs_write","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"large.html\",\"content\":\""}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":4096}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+    let items = replay_anthropic_sse(wire);
+
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallStart { call_id, name })
+            if call_id == "toolu_partial" && name == "fs_write"
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallArgsDelta { call_id, .. }) if call_id == "toolu_partial"
+    )));
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "toolu_partial"
+    )));
+    assert!(matches!(
+        items.last(),
+        Some(Ok(StreamEvent::Finish {
+            reason: FinishReason::MaxTokens
+        }))
+    ));
+}
+
+#[test]
+fn usage_only_delta_does_not_release_a_held_tool_end() {
+    let wire = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"held\",\"name\":\"fs_read\",\"input\":{}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"x\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let items = replay_anthropic_sse(wire);
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::Finish {
+            reason: FinishReason::MaxTokens
+        })
+    )));
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. })))
+    );
+}
+
+#[test]
+fn max_tokens_keeps_a_completed_tool_call_and_drops_only_the_open_one() {
+    let wire = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"complete\",\"name\":\"fs_read\",\"input\":{}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"x\\\"}\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"open\",\"name\":\"fs_write\",\"input\":{}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let items = replay_anthropic_sse(wire);
+    assert_eq!(items.iter().filter(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "complete")).count(), 1);
+    assert!(
+        !items.iter().any(
+            |item| matches!(item, Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "open")
+        )
+    );
 }
 
 #[tokio::test]
@@ -812,6 +904,7 @@ fn thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_reject
             },
             Message::tool_result("toolu_capture", "file contents", false),
         ],
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider("claude-fable-5")
         .request_payload(&request)
@@ -863,6 +956,7 @@ fn web_tools_declaration_is_exact_and_absent_without_the_flag() {
         attachments: Vec::new(),
         cache_metadata: None,
         messages: vec![Message::user_text("search the web")],
+        tool_result_image_projection: Default::default(),
     };
 
     let with_tools = provider("claude-fable-5")
@@ -1121,6 +1215,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
             },
             Message::user_text("thanks — continue"),
         ],
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider("claude-fable-5")
         .with_web_tools(true)
@@ -1157,6 +1252,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
             Message::assistant(vec![opaque(&signed_text)]),
             Message::user_text("next question"),
         ],
+        tool_result_image_projection: Default::default(),
     };
     let payload = provider("claude-fable-5")
         .request_payload(&rehydrated)
@@ -1187,6 +1283,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
                 opaque(&signed_text),
             ]),
         ],
+        tool_result_image_projection: Default::default(),
     };
     let error = provider("claude-fable-5")
         .request_payload(&disagreeing)

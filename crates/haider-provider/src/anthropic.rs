@@ -1,7 +1,8 @@
 //! Anthropic Messages API adapter.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,9 +10,12 @@ use haider_accounts::SecretHandle;
 use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{CapabilityDoc, FeatureResolve};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, RETRY_AFTER,
+};
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 /// Anthropic documents this as a limit on the complete JSON request, not the
 /// decoded PDF. Check the final payload because base64 expansion and prompt
@@ -84,19 +88,21 @@ pub const ANTHROPIC_FAST_BETA_VALUE: &str = "fast-mode-2026-02-01";
 /// `anthropic-beta` header with OAuth subscription identity and fast mode.
 pub const ANTHROPIC_COMPUTER_BETA_20251124: &str = "computer-use-2025-11-24";
 pub const ANTHROPIC_COMPUTER_BETA_20250124: &str = "computer-use-2025-01-24";
+/// Required alongside `thinking.block_binding` (Anthropic "Preserved
+/// thinking" controls); without it that body field is a 400.
+const ANTHROPIC_THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const STREAM_CAPACITY: usize = 32;
 const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
     retry_policy: AnthropicRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
-    response_open_timeout: Duration::from_secs(30),
+    response_open_timeout: Duration::from_secs(60),
     chunk_idle_timeout: Duration::from_secs(90),
     semantic_progress_timeout: Duration::from_secs(5 * 60),
 };
 
 static ANTHROPIC_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 /// Anthropic's model-keyed native computer tool dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnthropicComputerToolVersion {
@@ -152,6 +158,445 @@ fn anthropic_computer_beta_from_payload(payload: &serde_json::Value) -> Option<&
                 _ => None,
             },
         )
+}
+
+/// Models on which Anthropic binds replayed signed thinking to the exact
+/// preceding prefix (system, tools, earlier messages). Fable 5.1 and Opus 5.5
+/// are documented as enforcing. Mythos 5.1 is included defensively: Anthropic
+/// documents that models without the check accept `block_binding` and report
+/// only model-check drops, so the opt-in cannot cause a rejection there.
+pub(crate) fn prefix_binding_model(model: &str) -> bool {
+    matches!(
+        crate::effort::base_model(model),
+        "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1"
+    )
+}
+
+/// Whether this request must carry Anthropic's documented
+/// `prefix_mismatch_behavior: "drop_block"` policy.
+///
+/// Haider's request-time image elision (stale computer screenshots, the
+/// oldest-first turn image budget) rewrites an EARLIER tool result, which
+/// invalidates every later signed thinking block on prefix-binding models;
+/// accounts created on/after 2026-08-31 otherwise receive a 400. Anthropic's
+/// computer-use guidance: "If you must prune, keep
+/// `prefix_mismatch_behavior: \"drop_block\"` set from then on". The
+/// condition is derived only from the model and the request's TYPED image
+/// projection record (never from tool-result text), and that elision is
+/// monotonic, so it holds on every later request and is reconstructed
+/// identically after resume/restart. Ordinary append-only conversations keep
+/// their exact prior wire and the API's default check.
+pub(crate) fn thinking_binding_drop_required(request: &TurnRequest) -> bool {
+    prefix_binding_model(&request.model)
+        && request
+            .tool_result_image_projection
+            .rewrites_earlier_tool_results()
+}
+
+/// A route is recorded only after its policy-free resend decodes a complete
+/// `message_stop` and its Finish is ready to be forwarded. Entries expire so
+/// changing endpoint capabilities are probed again after one hour.
+const THINKING_BINDING_ROUTE_TTL: Duration = Duration::from_secs(60 * 60);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ThinkingBindingRoute {
+    auth_mode: AnthropicAuthMode,
+    api_url: String,
+    model: String,
+    account: Option<CredentialAlias>,
+}
+
+fn thinking_binding_rejected_routes() -> &'static Mutex<HashMap<ThinkingBindingRoute, Instant>> {
+    static ROUTES: OnceLock<Mutex<HashMap<ThinkingBindingRoute, Instant>>> = OnceLock::new();
+    ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Keep the established ASCII word-token contract: hyphens (including `-v2`)
+// separate tokens, as do dots/brackets. ASCII letters, digits and underscores
+// extend a word. Gateway prose is not an exact schema-path parser.
+fn contains_opt_in_token(message: &str) -> bool {
+    [
+        "block_binding",
+        "prefix_mismatch_behavior",
+        ANTHROPIC_THINKING_BINDING_BETA,
+    ]
+    .iter()
+    .any(|token| {
+        message.match_indices(token).any(|(start, _)| {
+            let before = message[..start].chars().next_back();
+            let after = message[start + token.len()..].chars().next();
+            let boundary = |c: Option<char>| {
+                c.is_none_or(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_')
+            };
+            boundary(before) && boundary(after)
+        })
+    })
+}
+
+// Preserve repeated diagnostic keys instead of Value's last-key-wins behavior.
+// Repeated values form a flat group, so a bounded flat body cannot create a
+// deeply nested synthetic tree while retaining every diagnostic occurrence.
+struct BindingDiagnosticValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for BindingDiagnosticValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DiagnosticVisitor;
+        impl<'de> serde::de::Visitor<'de> for DiagnosticVisitor {
+            type Value = BindingDiagnosticValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON diagnostic body")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(value.into()))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(BindingDiagnosticValue(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<BindingDiagnosticValue>()? {
+                    values.push(value.0);
+                }
+                Ok(BindingDiagnosticValue(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                let mut repeated = std::collections::HashSet::new();
+                while let Some((key, value)) = map.next_entry::<String, BindingDiagnosticValue>()? {
+                    match fields.entry(key) {
+                        serde_json::map::Entry::Vacant(entry) => {
+                            entry.insert(value.0);
+                        }
+                        serde_json::map::Entry::Occupied(mut entry) => {
+                            if repeated.insert(entry.key().clone()) {
+                                let previous =
+                                    std::mem::replace(entry.get_mut(), serde_json::Value::Null);
+                                *entry.get_mut() =
+                                    serde_json::Value::Array(vec![previous, value.0]);
+                            } else if let serde_json::Value::Array(values) = entry.get_mut() {
+                                values.push(value.0);
+                            } else {
+                                return Err(serde::de::Error::custom(
+                                    "invalid diagnostic value group",
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(BindingDiagnosticValue(serde_json::Value::Object(fields)))
+            }
+        }
+        deserializer.deserialize_any(DiagnosticVisitor)
+    }
+}
+
+/// Collect only diagnostic fields, including the common gateway alternatives.
+/// Request/input echoes are not diagnostics, even inside `details`.
+#[derive(Default)]
+struct BindingDiagnostic {
+    text: String,
+    exclusion_text: String,
+    has_message: bool,
+    has_unparsed_fields: bool,
+    prefix_or_signature: bool,
+}
+
+impl BindingDiagnostic {
+    fn collect(&mut self, value: &serde_json::Value, message: bool, all_fields: bool) {
+        match value {
+            serde_json::Value::String(text) => {
+                self.has_message |= message && !text.trim().is_empty();
+                self.text.push('\n');
+                let text = text.to_ascii_lowercase();
+                // Preserve the primary message's conservative signature guard.
+                // Details retain their context and use the specific phrases below.
+                self.prefix_or_signature |= message && !all_fields && text.contains("signature");
+                self.text.push_str(&text);
+                if message {
+                    self.exclusion_text.push('\n');
+                    self.exclusion_text.push_str(&text);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.collect(value, message, all_fields);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    if binding_diagnostic_echo_field(key) {
+                        continue;
+                    }
+                    match key.as_str() {
+                        "type" | "__type" => {
+                            self.collect_kind(value, message && !all_fields);
+                        }
+                        "message" | "Message" | "msg" | "error" => {
+                            self.collect(value, true, all_fields)
+                        }
+                        "detail" | "details" | "errors" => self.collect(value, true, true),
+                        "param" | "field" | "path" | "loc" => self.collect(value, false, true),
+                        _ if all_fields => {
+                            // Some validators encode a field name as the key.
+                            self.collect(&serde_json::Value::String(key.clone()), false, false);
+                            self.collect(value, true, true);
+                        }
+                        _ => {
+                            // The key itself may carry a diagnostic, even when
+                            // its value is a number, boolean or null.
+                            self.has_unparsed_fields = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn collect_kind(&mut self, value: &serde_json::Value, primary: bool) {
+        match value {
+            serde_json::Value::String(kind) => {
+                let kind = kind.to_ascii_lowercase();
+                self.prefix_or_signature |= binding_kind_excludes_rejection(&kind, primary);
+                // Keep literal opt-in tokens as well as normalized error-code wording.
+                self.collect(&serde_json::Value::String(kind.clone()), false, false);
+                self.collect(
+                    &serde_json::Value::String(kind.replace(['_', '-'], " ")),
+                    false,
+                    false,
+                );
+            }
+            serde_json::Value::Array(values) => {
+                self.has_unparsed_fields = true;
+                for value in values {
+                    self.collect_kind(value, primary);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                self.has_unparsed_fields = true;
+                for (key, value) in fields {
+                    if !binding_diagnostic_echo_field(key) {
+                        self.collect_kind(&serde_json::Value::String(key.clone()), primary);
+                        self.collect_kind(value, primary);
+                    }
+                }
+            }
+            _ => self.has_unparsed_fields |= !value.is_null(),
+        }
+    }
+}
+
+fn binding_kind_excludes_rejection(kind: &str, primary_kind: bool) -> bool {
+    // Type aliases can be snake case, camel case or qualified SDK names.
+    // A type naming the optional policy field is not a prefix diagnostic.
+    let compact: String = kind.chars().filter(char::is_ascii_alphanumeric).collect();
+    if primary_kind
+        && (compact.contains("signature")
+            || compact.contains("prefix") && !compact.contains("prefixmismatchbehavior"))
+    {
+        return true;
+    }
+    compact.contains("prefixbindingmismatch")
+        || compact.contains("prefixmismatch") && !compact.contains("prefixmismatchbehavior")
+        || [
+            "signaturevalidation",
+            "invalidsignature",
+            "signatureinvalid",
+            "signaturemismatch",
+            "signatureverification",
+            "signatureerror",
+        ]
+        .iter()
+        .any(|marker| compact.contains(marker))
+}
+
+fn binding_diagnostic_echo_field(key: &str) -> bool {
+    ["request", "input", "signature"]
+        .iter()
+        .any(|field| key.eq_ignore_ascii_case(field))
+}
+
+fn strip_binding_diagnostic_echoes(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.retain(|key, _| !binding_diagnostic_echo_field(key));
+            for value in fields.values_mut() {
+                strip_binding_diagnostic_echoes(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                strip_binding_diagnostic_echoes(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn binding_diagnostic_excludes_rejection(text: &str) -> bool {
+    // A signature word/key inside details or an echoed signature must not
+    // invalidate an independent field rejection. Exclude the actual diagnostic
+    // phrases, including Anthropic's remedy for a signed-prefix mismatch.
+    [
+        "invalid signature",
+        "invalid `signature`",
+        "signature mismatch",
+        "signature verification failed",
+        "signature is invalid",
+        "bound to a different conversation",
+        "prefix_binding_mismatch",
+        "prefix mismatch",
+        "remove the block",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+fn binding_diagnostic_rejects(text: &str) -> bool {
+    contains_opt_in_token(text)
+        && [
+            "extra inputs are not permitted",
+            "extra input is not permitted",
+            "extraneous key",
+            "is not permitted",
+            "not permitted",
+            "unknown name",
+            "cannot find field",
+            "unrecognized request argument",
+            "unrecognized field",
+            "unrecognized",
+            "not recognized",
+            "unknown parameter",
+            "unknown field",
+            "unknown beta",
+            "unexpected field",
+            "unexpected keyword",
+            "unexpected value",
+            "additional properties are not allowed",
+            "not allowed",
+            "unsupported",
+            "not supported",
+            "invalid beta",
+            "not a valid beta",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
+}
+
+/// Whether a 400 explicitly rejects the binding field or beta opt-in.
+/// Diagnostic containers are decoded rather than silently discarded by a
+/// permissive envelope. Incomplete/unknown envelopes also use the bounded raw
+/// body, while a complete typed inner error protects against unrelated outer echoes.
+/// Signed-prefix errors recommending the setting as a remedy never qualify.
+pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
+    // A body at the read ceiling may have lost a later diagnostic exclusion.
+    if body.len() >= crate::HTTP_ERROR_BODY_LIMIT {
+        return false;
+    }
+    let mut diagnostic = BindingDiagnostic::default();
+    let mut inner_message = false;
+    let mut raw_exclusion = None;
+    if let Ok(BindingDiagnosticValue(mut value)) = serde_json::from_slice(body) {
+        if let Some(fields) = value.as_object_mut() {
+            // Preserve the prior complete wire envelope's message authority.
+            // Missing/null/non-string typed fields must not hide the outer message.
+            inner_message = fields.get("error").is_some_and(|error| {
+                ["type", "message"]
+                    .iter()
+                    .all(|key| error.get(key).is_some_and(serde_json::Value::is_string))
+            });
+            if inner_message {
+                // Preserve the established inner-message authority, including
+                // explicit empty strings. Alternative/empty wrapper fields do
+                // not by themselves establish complete diagnostic coverage.
+                diagnostic.has_message = true;
+                for key in ["message", "Message", "msg"] {
+                    fields.remove(key);
+                }
+            }
+        }
+        diagnostic.collect(&value, true, false);
+        // Raw compatibility matching still sees the entire body. Its veto
+        // must retain diagnostic provenance so an echoed signature/remedy
+        // cannot suppress an independent field rejection.
+        strip_binding_diagnostic_echoes(&mut value);
+        raw_exclusion = Some(value.to_string().to_ascii_lowercase());
+    }
+    if !diagnostic.has_message || diagnostic.has_unparsed_fields && !inner_message {
+        // Serde accepting a JSON object does not prove diagnostic coverage:
+        // empty and partly populated envelopes still need the legacy fallback.
+        diagnostic.text.push(' ');
+        let raw = String::from_utf8_lossy(body).to_ascii_lowercase();
+        if raw_exclusion.is_none() && raw.contains("signature") {
+            return false;
+        }
+        diagnostic
+            .text
+            .push_str(raw_exclusion.as_deref().unwrap_or(&raw));
+        diagnostic.exclusion_text.push('\n');
+        diagnostic
+            .exclusion_text
+            .push_str(raw_exclusion.as_deref().unwrap_or(&raw));
+    }
+    !diagnostic.prefix_or_signature
+        && !binding_diagnostic_excludes_rejection(&diagnostic.exclusion_text)
+        && binding_diagnostic_rejects(&diagnostic.text)
+}
+
+/// Removes the binding opt-in from a rendered payload. The beta header is
+/// derived from the payload, so it disappears with it.
+fn strip_thinking_binding_drop(payload: &mut serde_json::Value) {
+    let Some(thinking) = payload
+        .get_mut("thinking")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    thinking.remove("block_binding");
+    // `adaptive` without further settings is exactly what these models do
+    // when `thinking` is omitted, which restores the pre-policy wire.
+    if thinking.len() == 1
+        && thinking.get("type").and_then(serde_json::Value::as_str) == Some("adaptive")
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.remove("thinking");
+    }
+}
+
+fn payload_uses_thinking_binding_drop(payload: &serde_json::Value) -> bool {
+    payload
+        .pointer("/thinking/block_binding/prefix_mismatch_behavior")
+        .and_then(serde_json::Value::as_str)
+        == Some("drop_block")
 }
 
 fn build_anthropic_client(
@@ -281,7 +726,7 @@ pub const fn select_anthropic_cache_ttl(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AnthropicAuthMode {
     ApiKey,
     None,
@@ -692,6 +1137,32 @@ impl AnthropicProvider {
                 cache_ttl,
             );
         }
+        // Request-time image elision rewrote an earlier tool result: ask the
+        // API to drop the signed thinking bound to the old prefix instead of
+        // rejecting the request (see `thinking_binding_drop_required`).
+        // `adaptive` is these models' only thinking mode and equals omission.
+        // A route that already rejected the opt-in keeps the pre-policy wire.
+        if thinking_binding_drop_required(request) && !self.thinking_binding_rejected() {
+            let object = payload.as_object_mut().ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    "Anthropic request payload was not a JSON object",
+                )
+            })?;
+            let thinking = object
+                .entry("thinking")
+                .or_insert_with(|| serde_json::json!({"type": "adaptive"}));
+            let Some(thinking) = thinking.as_object_mut() else {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    "Anthropic thinking configuration was not a JSON object",
+                ));
+            };
+            thinking.insert(
+                "block_binding".into(),
+                serde_json::json!({"prefix_mismatch_behavior": "drop_block"}),
+            );
+        }
         // G4b Vertex wire deltas (LV1): the model is URL-addressed, so the
         // body DROPS `model` and carries `anthropic_version` in its place.
         if self.endpoint_shape == AnthropicEndpointShape::Vertex {
@@ -904,6 +1375,7 @@ impl AnthropicProvider {
         .await
     }
 
+    #[cfg(test)]
     async fn request_body_prepared(
         &self,
         prepared: crate::PreparedWire,
@@ -911,6 +1383,38 @@ impl AnthropicProvider {
         let request = self.request_builder(&prepared.payload).await?;
         let body = crate::serialize_prepared_json_body(prepared)?;
         request.body(body).build().map_err(transport_error)
+    }
+
+    async fn request_body_prepared_for_send(
+        &self,
+        prepared: &crate::PreparedWire,
+    ) -> Result<(reqwest::Request, crate::RequestUploadBoundary, Duration), ProviderError> {
+        // Endpoint validation and OAuth credential refresh inside the builder
+        // are network work that stays on the logical idle clock. The pause
+        // starts right after it: serializing a multi-megabyte body (e.g. a
+        // screenshot) is local CPU work and, like the upload itself, is not
+        // provider silence.
+        let request = self.request_builder(&prepared.payload).await?;
+        let boundary = crate::RequestUploadBoundary::new();
+        let body = match crate::serialize_prepared_json_body_ref(prepared) {
+            Ok(body) => body,
+            Err(error) => {
+                boundary.complete();
+                return Err(error);
+            }
+        };
+        let upload_budget = crate::request_upload::request_upload_budget(body.len());
+        match request
+            .header(CONTENT_LENGTH, body.len())
+            .body(boundary.body(body))
+            .build()
+        {
+            Ok(request) => Ok((request, boundary, upload_budget)),
+            Err(error) => {
+                boundary.complete();
+                Err(transport_error(error))
+            }
+        }
     }
 
     async fn request_builder(
@@ -949,6 +1453,8 @@ impl AnthropicProvider {
             request = request.header("anthropic-version", ANTHROPIC_VERSION);
         }
         let computer_beta = anthropic_computer_beta_from_payload(payload);
+        let thinking_binding_beta =
+            payload_uses_thinking_binding_drop(payload).then_some(ANTHROPIC_THINKING_BINDING_BETA);
         request = match self.auth_mode {
             AnthropicAuthMode::ApiKey => {
                 let request = request.header("x-api-key", self.api_key_header()?);
@@ -957,13 +1463,20 @@ impl AnthropicProvider {
                     betas.push(ANTHROPIC_FAST_BETA_VALUE);
                 }
                 betas.extend(computer_beta);
+                betas.extend(thinking_binding_beta);
                 if betas.is_empty() {
                     request
                 } else {
                     request.header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
                 }
             }
-            AnthropicAuthMode::None => request,
+            AnthropicAuthMode::None => {
+                if let Some(beta) = thinking_binding_beta {
+                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, beta)
+                } else {
+                    request
+                }
+            }
             AnthropicAuthMode::OAuthBearer => {
                 // Optional feature betas APPEND after the OAuth identity in
                 // ONE comma-joined header — the subscription token must
@@ -981,6 +1494,7 @@ impl AnthropicProvider {
                     betas.push(ANTHROPIC_FAST_BETA_VALUE);
                 }
                 betas.extend(computer_beta);
+                betas.extend(thinking_binding_beta);
                 request
                     .header(AUTHORIZATION, self.authorization_header()?)
                     .header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
@@ -991,8 +1505,12 @@ impl AnthropicProvider {
             // Fast remains Claude-API-only and the factory never sets it here.
             AnthropicAuthMode::CloudBearer => {
                 let request = request.header(AUTHORIZATION, self.authorization_header()?);
-                if let Some(computer_beta) = computer_beta {
-                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, computer_beta)
+                let betas = computer_beta
+                    .into_iter()
+                    .chain(thinking_binding_beta)
+                    .collect::<Vec<_>>();
+                if !betas.is_empty() {
+                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
                 } else {
                     request
                 }
@@ -1001,29 +1519,159 @@ impl AnthropicProvider {
         crate::apply_provider_request_headers(request)
     }
 
-    async fn send_request(
+    fn take_or_render_prepared(
         &self,
         request: &TurnRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
-        let prepared = match crate::take_prepared_wire_payload() {
+    ) -> Result<crate::PreparedWire, ProviderError> {
+        Ok(match crate::take_prepared_wire_payload() {
             Some(prepared) => prepared,
             None => crate::PreparedWire {
                 payload: self.request_payload(request)?,
                 history_boundary: None,
                 reply_bindings: crate::PreparedReplyBindings::default(),
             },
-        };
-        let request = self.request_body_prepared(prepared).await?;
+        })
+    }
+
+    fn thinking_binding_route(&self) -> ThinkingBindingRoute {
+        // The account alias is an opaque ID, never the credential secret.
+        ThinkingBindingRoute {
+            auth_mode: self.auth_mode,
+            api_url: self.api_url.clone(),
+            model: self.model.clone(),
+            account: self.account.clone(),
+        }
+    }
+
+    fn thinking_binding_rejected(&self) -> bool {
+        thinking_binding_rejected_routes()
+            .lock()
+            .is_ok_and(|mut routes| {
+                let route = self.thinking_binding_route();
+                if routes
+                    .get(&route)
+                    .is_some_and(|published| published.elapsed() < THINKING_BINDING_ROUTE_TTL)
+                {
+                    true
+                } else {
+                    routes.remove(&route);
+                    false
+                }
+            })
+    }
+
+    async fn send_request(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let prepared = self.take_or_render_prepared(request)?;
+        let built = self.request_body_prepared_for_send(&prepared).await?;
+        drop(prepared);
+        self.execute_prepared_send(built).await
+    }
+
+    /// Sends one turn. When the payload carries the prefix-binding drop
+    /// policy and the endpoint answers 400 rejecting exactly that opt-in
+    /// (e.g. a gateway or route without thinking-binding controls), the route
+    /// is classified, the SAME prepared wire is resent once without the
+    /// policy. A successful HTTP status returns a pending route decision;
+    /// only the streaming producer publishes it just before forwarding a
+    /// decoded Finish. Other statuses and incomplete streams never publish.
+    async fn send_request_with_binding_fallback(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<(reqwest::Response, Option<ThinkingBindingRoute>), ProviderError> {
+        let mut prepared = self.take_or_render_prepared(request)?;
+        if self.thinking_binding_rejected() {
+            strip_thinking_binding_drop(&mut prepared.payload);
+        }
+        if !payload_uses_thinking_binding_drop(&prepared.payload) {
+            let built = self.request_body_prepared_for_send(&prepared).await?;
+            drop(prepared);
+            return self
+                .execute_prepared_send(built)
+                .await
+                .map(|response| (response, None));
+        }
+        let built = self.request_body_prepared_for_send(&prepared).await?;
+        let response = self.execute_prepared_send(built).await?;
+        if response.status().as_u16() != 400 {
+            return Ok((response, None));
+        }
+        let request_id = anthropic_request_id(&response);
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = read_error_body_bounded(response).await.map_err(|error| {
+            classify_http_body_read_error(400, retry_after.as_deref(), error)
+                .with_http_metadata(400, request_id.as_deref())
+        })?;
+        if !anthropic_rejects_thinking_binding(&body) {
+            // Includes the documented prefix-mismatch error: the route keeps
+            // its policy and the original error is returned unchanged.
+            return Err(
+                replay_anthropic_http_error(400, retry_after.as_deref(), &body)
+                    .with_http_metadata(400, request_id.as_deref()),
+            );
+        }
+        tracing::warn!(
+            target: "haider.provider",
+            model = %self.model,
+            auth_mode = ?self.auth_mode,
+            request_id = request_id.as_deref().unwrap_or(""),
+            "Anthropic route rejected the thinking prefix-binding opt-in as unsupported; resending once without it"
+        );
+        strip_thinking_binding_drop(&mut prepared.payload);
+        let built = self.request_body_prepared_for_send(&prepared).await?;
+        drop(prepared);
+        let response = self.execute_prepared_send(built).await?;
+        // Headers alone cannot establish acceptance. Keep this decision
+        // pending until the decoder validates message_stop.
+        let pending = response
+            .status()
+            .is_success()
+            .then(|| self.thinking_binding_route());
+        Ok((response, pending))
+    }
+
+    async fn execute_prepared_send(
+        &self,
+        (request, upload, upload_budget): (
+            reqwest::Request,
+            crate::RequestUploadBoundary,
+            Duration,
+        ),
+    ) -> Result<reqwest::Response, ProviderError> {
         let route_gating = self.route_gating();
-        let opening = self.client.execute(request);
-        crate::route_gated_timeout(
-            self.transport_config.response_open_timeout,
-            opening,
-            route_gating,
-        )
-        .await
-        .map_err(|_| response_open_timeout_error(self.transport_config.response_open_timeout))?
-        .map_err(|error| transport_error_for_route(error, route_gating))
+        // The response-open budget covers only the wait after the body
+        // producer reaches EOF; a response that opens mid-upload (e.g. an
+        // early error status) is taken as-is.
+        let mut opening = Box::pin(self.client.execute(request));
+        let opened_during_upload = tokio::select! {
+            response = &mut opening => Some(response),
+            () = upload.wait() => None,
+            () = tokio::time::sleep(upload_budget) => {
+                upload.complete();
+                return Err(request_upload_timeout_error(upload_budget));
+            },
+        };
+        let response = match opened_during_upload {
+            Some(response) => response,
+            None => crate::route_gated_timeout(
+                self.transport_config.response_open_timeout,
+                opening,
+                route_gating,
+            )
+            .await
+            .map_err(|_| {
+                upload.complete();
+                response_open_timeout_error(self.transport_config.response_open_timeout)
+            })?,
+        };
+        upload.complete();
+        response.map_err(|error| transport_error_for_route(error, route_gating))
     }
 
     fn route_gating(&self) -> crate::RouteGating {
@@ -1043,16 +1691,12 @@ impl AnthropicProvider {
     ) -> Result<ProviderStream, ProviderError> {
         let native_computer = anthropic_computer_tool_version(&request.model).is_some()
             && request.tools.iter().any(|tool| tool.name == "computer");
-        let response = self.send_request(request).await?;
+        let (response, pending_binding_route) =
+            self.send_request_with_binding_fallback(request).await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let request_id = response
-                .headers()
-                .get("request-id")
-                .or_else(|| response.headers().get("x-request-id"))
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
+            let request_id = anthropic_request_id(&response);
             let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
@@ -1069,7 +1713,10 @@ impl AnthropicProvider {
         let account = self.account.clone();
         let chunk_idle_timeout = self.transport_config.chunk_idle_timeout;
         let semantic_progress_timeout = self.transport_config.semantic_progress_timeout;
-        let context = crate::SseRequestContext::capture(self.route_gating());
+        let context = AnthropicStreamContext {
+            sse: crate::SseRequestContext::capture(self.route_gating()),
+            pending_binding_route,
+        };
         let producer = tokio::spawn(async move {
             stream_response(
                 response,
@@ -1084,6 +1731,15 @@ impl AnthropicProvider {
         });
         Ok(ProviderStream::owned(receiver, producer))
     }
+}
+
+fn anthropic_request_id(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("request-id")
+        .or_else(|| response.headers().get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn anthropic_cache_control(ttl: AnthropicCacheTtl) -> serde_json::Value {
@@ -1539,25 +2195,29 @@ fn model_capabilities(model: &str) -> ModelCapabilities {
     // the same models — normalize before the family match so a Bedrock or
     // Vertex slug reports its real context window.
     let model = crate::effort::base_model(model);
+    let context_limit = crate::static_model_limits(ANTHROPIC_PROVIDER_NAME, model)
+        .context_window
+        .unwrap_or(100_000);
     if model == "claude-fable-5"
         || model.starts_with("claude-opus-5")
         || model.starts_with("claude-sonnet-5")
+        || model.starts_with("claude-haiku-4-5")
     {
         ModelCapabilities {
-            context_limit: 1_000_000,
-            thinking_visible: FeatureResolve::Native,
-        }
-    } else if model.starts_with("claude-haiku-4-5") {
-        ModelCapabilities {
-            context_limit: 200_000,
+            context_limit,
             thinking_visible: FeatureResolve::Native,
         }
     } else {
         ModelCapabilities {
-            context_limit: 100_000,
+            context_limit,
             thinking_visible: FeatureResolve::Unsupported,
         }
     }
+}
+
+struct AnthropicStreamContext {
+    sse: crate::SseRequestContext,
+    pending_binding_route: Option<ThinkingBindingRoute>,
 }
 
 async fn stream_response(
@@ -1567,7 +2227,7 @@ async fn stream_response(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     native_computer: bool,
-    context: crate::SseRequestContext,
+    context: AnthropicStreamContext,
 ) {
     stream_sse_source_with_native(
         response,
@@ -1615,7 +2275,10 @@ pub(crate) async fn stream_sse_source<S: SseChunkSource>(
         chunk_idle_timeout,
         semantic_progress_timeout,
         false,
-        crate::SseRequestContext::capture(route_gating),
+        AnthropicStreamContext {
+            sse: crate::SseRequestContext::capture(route_gating),
+            pending_binding_route: None,
+        },
     )
     .await;
 }
@@ -1627,13 +2290,17 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     native_computer: bool,
-    context: crate::SseRequestContext,
+    context: AnthropicStreamContext,
 ) {
+    let AnthropicStreamContext {
+        sse,
+        mut pending_binding_route,
+    } = context;
     let crate::SseRequestContext {
         route_gating,
         turn_trace,
         idle_deadline,
-    } = context;
+    } = sse;
     let mut decoder = SseDecoder::with_native_computer(account, native_computer);
     let mut progress = crate::ProviderProgressClock::new(
         chunk_idle_timeout,
@@ -1651,7 +2318,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
                 if let Some(idle) = &idle_deadline {
                     idle.observe_items(&items);
                 }
-                send_items(&sender, items).await;
+                send_items(&sender, items, &mut pending_binding_route).await;
                 return;
             }
             Ok(Some(Err(error))) => {
@@ -1691,7 +2358,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
         if crate::has_semantic_progress(&items) {
             progress.observe_semantic_progress();
         }
-        if !send_items(&sender, items).await || decoder.is_terminal() {
+        if !send_items(&sender, items, &mut pending_binding_route).await || decoder.is_terminal() {
             return;
         }
     }
@@ -1700,9 +2367,32 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
 async fn send_items(
     sender: &mpsc::Sender<ProviderStreamItem>,
     items: Vec<ProviderStreamItem>,
+    pending_binding_route: &mut Option<ThinkingBindingRoute>,
 ) -> bool {
     for item in items {
-        if sender.send(item).await.is_err() {
+        if matches!(&item, Ok(crate::StreamEvent::Finish { .. })) && pending_binding_route.is_some()
+        {
+            // Reserve capacity first: a dropped receiver cannot publish a
+            // capability. Every decoded Finish reason is success here because
+            // the policy-free Messages stream completed, regardless of why
+            // the model stopped (tool use, limit, refusal, etc.).
+            let Ok(permit) = sender.reserve().await else {
+                return false;
+            };
+            if sender.is_closed() {
+                return false;
+            }
+            if let Some(route) = pending_binding_route.take()
+                && let Ok(mut routes) = thinking_binding_rejected_routes().lock()
+            {
+                routes.insert(route, Instant::now());
+                tracing::warn!(
+                    target: "haider.provider",
+                    "Anthropic policy-free fallback completed; binding opt-in disabled for this route for one hour"
+                );
+            }
+            permit.send(item);
+        } else if sender.send(item).await.is_err() {
             return false;
         }
     }
@@ -1731,13 +2421,27 @@ fn stream_idle_error(timeout: Duration) -> ProviderError {
 }
 
 fn response_open_timeout_error(timeout: Duration) -> ProviderError {
+    let budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     ProviderError::new(
         ProviderErrorKind::Transport,
         format!(
-            "Anthropic response did not open within {} seconds",
-            timeout.as_secs()
+            "Anthropic response did not open within the configured response-open budget after request upload completed; budget_ms={budget_ms}"
         ),
     )
+    .with_presentation(crate::provider_timeout_presentation())
+    .with_timeout_budget(budget_ms, budget_ms)
+    .with_timeout_reason(crate::ProviderTimeoutReason::ResponseOpen)
+}
+
+fn request_upload_timeout_error(timeout: Duration) -> ProviderError {
+    let budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!("Anthropic request upload did not complete within its configured budget; budget_ms={budget_ms}"),
+    )
+    .with_presentation(crate::provider_timeout_presentation())
+    .with_timeout_budget(budget_ms, budget_ms)
+    .with_timeout_reason(crate::ProviderTimeoutReason::RequestUpload)
 }
 
 fn anthropic_connect_timeout_error(timeout: Duration) -> ProviderError {
@@ -1972,14 +2676,11 @@ pub fn replay_anthropic_http_error(
             _ => ProviderError::new(kind, message),
         }
     };
-    let detail = crate::error_detail::http_error_detail(body);
-    if kind == ProviderErrorKind::InvalidRequest
-        && !hosted_web_rejected
-        && let Some(detail) = detail
-    {
-        error = error.with_provider_detail(&detail);
+    if let Some(prose) = crate::error_detail::http_error_prose(body) {
+        error = error.with_provider_detail(&prose);
     }
     error
+        .with_provider_error_type(body_kind)
         .with_retry_after_ms(retry_after_ms)
         .with_http_metadata(status, None)
 }
@@ -2039,6 +2740,7 @@ mod oauth_cache_tests {
                 stable_prefix_tokens: 4_096,
                 ..PromptCacheMetadata::default()
             }),
+            tool_result_image_projection: Default::default(),
         }
     }
 
@@ -2152,6 +2854,7 @@ mod cache_reuse_tests {
                 stable_prefix_tokens: 2048,
                 ..Default::default()
             }),
+            tool_result_image_projection: Default::default(),
         };
         for turn in 0..3 {
             request.messages[0] = Message::user_text(format!("accepted turn {turn}"));

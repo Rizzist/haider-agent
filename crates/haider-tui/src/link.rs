@@ -633,6 +633,7 @@ async fn issue(
 #[must_use]
 pub fn command_required_features(command: &LiveCommand) -> &'static [&'static str] {
     match command {
+        LiveCommand::Create { .. } => &[haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1],
         LiveCommand::LoomAuthorDraft { .. } | LiveCommand::LoomAuthorRevise { .. } => {
             &[haider_rpc::FEATURE_LOOM_AUTHORING_V1]
         }
@@ -704,6 +705,10 @@ type CheckpointListContext = (
 /// daemon — the workspace forbids inline test modules, and an unmapped
 /// response body is a silently swallowed reply.
 pub struct CommandContext {
+    list: bool,
+    list_epoch: Option<u64>,
+    catalog_epoch: Option<u64>,
+    selection_connection_epoch: Option<u64>,
     /// The OAuth start's attempt id, so the reply is identity-tagged.
     pub oauth_attempt: Option<String>,
     command_id: Option<haider_rpc::CommandId>,
@@ -785,6 +790,26 @@ impl CommandContext {
             _ => None,
         };
         Self {
+            list: matches!(
+                command,
+                LiveCommand::List { .. } | LiveCommand::ListAt { .. }
+            ),
+            list_epoch: match command {
+                LiveCommand::ListAt { epoch, .. } => Some(*epoch),
+                _ => None,
+            },
+            catalog_epoch: match command {
+                LiveCommand::AccountListAt { epoch }
+                | LiveCommand::ProviderListAt { epoch }
+                | LiveCommand::RefreshProviderModelsAt { epoch, .. } => Some(*epoch),
+                _ => None,
+            },
+            selection_connection_epoch: match command {
+                LiveCommand::SelectModel {
+                    connection_epoch, ..
+                } => Some(*connection_epoch),
+                _ => None,
+            },
             command_id: command.command_id().cloned(),
             login: match command {
                 LiveCommand::Stage {
@@ -807,7 +832,8 @@ impl CommandContext {
                 _ => None,
             },
             models_provider: match command {
-                LiveCommand::RefreshProviderModels { provider } => Some(provider.clone()),
+                LiveCommand::RefreshProviderModels { provider }
+                | LiveCommand::RefreshProviderModelsAt { provider, .. } => Some(provider.clone()),
                 _ => None,
             },
             attach: match command {
@@ -945,15 +971,17 @@ pub fn request_body_for_features(
     match command {
         // Reconnect is consumed by the IO shell before RPC conversion.
         LiveCommand::Reconnect => unreachable!("reconnect retires the socket before RPC mapping"),
-        LiveCommand::List { cursor } => RequestBody::SessionList {
-            cursor,
-            limit: crate::live::LIST_PAGE,
-            order: if daemon_features.contains(haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1) {
-                haider_rpc::SessionListOrderWire::RecencyDesc
-            } else {
-                haider_rpc::SessionListOrderWire::IdAsc
-            },
-        },
+        LiveCommand::List { cursor } | LiveCommand::ListAt { cursor, .. } => {
+            RequestBody::SessionList {
+                cursor,
+                limit: crate::live::LIST_PAGE,
+                order: if daemon_features.contains(haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1) {
+                    haider_rpc::SessionListOrderWire::RecencyDesc
+                } else {
+                    haider_rpc::SessionListOrderWire::IdAsc
+                },
+            }
+        }
         LiveCommand::Attach { session, after_seq } => RequestBody::SessionAttach {
             session_id: session,
             after_seq,
@@ -1001,6 +1029,7 @@ pub fn request_body_for_features(
             command_id,
             cwd,
             workspace_allocation,
+            account_alias,
             provider,
             model,
             max_tokens,
@@ -1032,7 +1061,7 @@ pub fn request_body_for_features(
             interaction_mode:
                 haider_rpc::haider_protocol::session::SessionInteractionModeV1::Interactive,
             ssh_scope: None,
-            account_alias: None,
+            account_alias,
             resolve_provider: false,
             resolve_model: false,
             effort: None,
@@ -1619,7 +1648,10 @@ pub fn request_body_for_features(
             validation_model: None,
             replace_existing: false,
         },
-        LiveCommand::AccountList => RequestBody::AccountList { provider: None },
+        LiveCommand::AccountList | LiveCommand::AccountListAt { .. } => {
+            RequestBody::AccountList { provider: None }
+        }
+        LiveCommand::AccountListWatch => RequestBody::AccountListWatch {},
         // D2: the read carries nothing; the import carries ONLY the opaque
         // candidate id — the daemon re-reads the local store itself, so no
         // credential bytes exist to send.
@@ -1640,8 +1672,11 @@ pub fn request_body_for_features(
             alias,
             confirm_new_epoch,
         },
-        LiveCommand::ProviderList => RequestBody::ProviderList { provider: None },
-        LiveCommand::RefreshProviderModels { provider } => {
+        LiveCommand::ProviderList | LiveCommand::ProviderListAt { .. } => {
+            RequestBody::ProviderList { provider: None }
+        }
+        LiveCommand::RefreshProviderModels { provider }
+        | LiveCommand::RefreshProviderModelsAt { provider, .. } => {
             RequestBody::ProviderModelsRefresh { provider }
         }
         LiveCommand::SetDefaultModel {
@@ -1665,6 +1700,7 @@ pub fn request_body_for_features(
             model,
             provider,
             confirm_new_epoch,
+            ..
         } => RequestBody::SessionSelectModel {
             command_id,
             session_id: session,
@@ -1672,6 +1708,7 @@ pub fn request_body_for_features(
             model,
             provider: Some(provider),
             confirm_new_epoch,
+            max_tokens: None,
         },
         // G2: the /rename command's receipted title. Always `Some` — bare
         // clearing is deliberately not offered by this client.
@@ -1855,9 +1892,16 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionList {
             sessions,
             next_cursor,
-        } => vec![LiveReply::Listed {
-            sessions,
-            next_cursor,
+        } => vec![match context.list_epoch {
+            Some(epoch) => LiveReply::ListedAt {
+                sessions,
+                next_cursor,
+                epoch,
+            },
+            None => LiveReply::Listed {
+                sessions,
+                next_cursor,
+            },
         }],
         ResponseBody::SessionAttach {
             attachment_id,
@@ -1908,8 +1952,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 command_id: id,
                 session: session_id,
                 worker_generation,
-                cwd: metadata.cwd,
-                model: metadata.model,
+                cwd: metadata.cwd.clone(),
+                model: metadata.model.clone(),
+                metadata: Some(metadata),
             }]
         }),
         // The branch-pinned response shape carries the same driver facts as
@@ -2341,10 +2386,8 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             revision,
             sources,
             ..
-        } => vec![LiveReply::Accounts {
-            descriptors,
-            revision,
-            sources: sources
+        } => {
+            let sources: Vec<_> = sources
                 .into_iter()
                 .map(|source| crate::app::AccountSourceRow {
                     source_id: source.source_id,
@@ -2361,8 +2404,22 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     plan: source.plan,
                     masked_identity: source.masked_identity,
                 })
-                .collect(),
-        }],
+                .collect();
+            vec![if let Some(epoch) = context.catalog_epoch {
+                LiveReply::AccountsAt {
+                    descriptors,
+                    revision,
+                    sources,
+                    epoch,
+                }
+            } else {
+                LiveReply::Accounts {
+                    descriptors,
+                    revision,
+                    sources,
+                }
+            }]
+        }
         ResponseBody::AccountDeviceCandidates {
             discovery_disabled,
             candidates,
@@ -2397,12 +2454,28 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             providers,
             revision,
             ..
-        } => vec![LiveReply::Providers {
-            providers,
-            revision,
+        } => vec![if let Some(epoch) = context.catalog_epoch {
+            LiveReply::ProvidersAt {
+                providers,
+                revision,
+                epoch,
+            }
+        } else {
+            LiveReply::Providers {
+                providers,
+                revision,
+            }
         }],
         ResponseBody::ProviderModelsRefresh { provider, revision } => {
-            vec![LiveReply::ProviderModelsRefreshed { provider, revision }]
+            vec![if let Some(epoch) = context.catalog_epoch {
+                LiveReply::ProviderModelsRefreshedAt {
+                    provider,
+                    revision,
+                    epoch,
+                }
+            } else {
+                LiveReply::ProviderModelsRefreshed { provider, revision }
+            }]
         }
         ResponseBody::AccountSetDefaultModel { provider, revision } => {
             context.command_id.clone().map_or_else(Vec::new, |id| {
@@ -2419,15 +2492,20 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             session_id,
             provider,
             model,
+            selected_seq,
             worker_generation,
+            output_budget,
             ..
         } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::ModelSelected {
+                connection_epoch: context.selection_connection_epoch,
+                selected_seq,
                 command_id: id,
                 session: session_id,
                 provider,
                 model,
                 worker_generation,
+                output_budget,
             }]
         }),
         // G2: the NORMALIZED committed title — the reply reports daemon
@@ -2663,9 +2741,17 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     }];
                 }
                 if let Some(provider) = context.models_provider.clone() {
-                    return vec![LiveReply::ModelsRefreshFailed {
-                        provider,
-                        message: message.clone(),
+                    return vec![if let Some(epoch) = context.catalog_epoch {
+                        LiveReply::ModelsRefreshFailedAt {
+                            provider,
+                            message: message.clone(),
+                            epoch,
+                        }
+                    } else {
+                        LiveReply::ModelsRefreshFailed {
+                            provider,
+                            message: message.clone(),
+                        }
                     }];
                 }
                 // H4: a `hooks.list` error is identity-tagged the same way
@@ -2772,6 +2858,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                         message: message.clone(),
                     }];
                 }
+                if context.list {
+                    return vec![context.list_epoch.map_or(LiveReply::ListFailed, |epoch| {
+                        LiveReply::ListFailedAt { epoch }
+                    })];
+                }
                 vec![LiveReply::Failed {
                     command_id: context.command_id.clone(),
                     code: code.clone(),
@@ -2831,6 +2922,7 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             high_water_seq,
         }],
         WireFrame::ServerDraining { reason, .. } => vec![LiveReply::Draining { reason }],
+        WireFrame::AccountsChanged { revision } => vec![LiveReply::AccountsChanged { revision }],
         WireFrame::SessionSurfaceDelta {
             session_id,
             input: Some(input),
@@ -2907,7 +2999,6 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         | WireFrame::Request { .. }
         | WireFrame::Response { .. }
         | WireFrame::SessionRosterDelta { .. }
-        | WireFrame::AccountsChanged { .. }
         | WireFrame::HaiderCodePlanStatus { .. }
         | WireFrame::SessionSurfaceDelta { input: None, .. }
         | WireFrame::MenuAnswer { .. }

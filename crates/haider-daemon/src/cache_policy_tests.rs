@@ -10,6 +10,11 @@ use crate::cache_policy::{assess_cache_change, blocks_change, combine_cache_chan
 
 fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -19,6 +24,7 @@ fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
         account_alias: None,
         model: "gpt-5.6-terra".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         system_prompt_version: Some("haider-system-v2".into()),
         permission_overrides: None,
         interaction_mode: Default::default(),

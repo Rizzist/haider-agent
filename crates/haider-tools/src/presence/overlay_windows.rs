@@ -1,0 +1,541 @@
+//! Windows desktop presence overlay (`haiderd.exe --cu-presence-overlay`).
+//!
+//! Three layered, topmost, tool (no taskbar button), no-activate popups:
+//!
+//! * the agent pointer and the click ring are `WS_EX_TRANSPARENT`
+//!   (click-through) and drawn with `UpdateLayeredWindow` from the shared
+//!   premultiplied art;
+//! * the "Haider is controlling this screen · Stop" badge is clickable but
+//!   answers `WM_MOUSEACTIVATE` with `MA_NOACTIVATE`, so pressing Stop never
+//!   takes keyboard focus from the app under control.
+//!
+//! Every window calls `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`
+//! (Windows 10 2004+), which removes it from screen capture, including the
+//! backend's `BitBlt` of the desktop DC. When the OS refuses,
+//! `Ready.capture_excluded` is `false` and the daemon logs it.
+//!
+//! A Stop click whose `GetMessageExtraInfo()` equals
+//! [`SYNTHETIC_INPUT_TAG`] was injected by Haider's own `SendInput` and is
+//! ignored. Every FFI call is confined to the `win` module; each unsafe block
+//! states its invariant.
+
+use super::overlay_windows_logic::{BadgeText, Overlay, OverlayWindow};
+use super::{
+    PresenceCommand, PresenceEvent, SYNTHETIC_INPUT_TAG, art, encode_event, parse_command_line,
+};
+use std::collections::VecDeque;
+use std::io::{BufRead as _, Write as _};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Set by the badge's window procedure; drained by the main loop.
+static STOP_CLICKED: AtomicBool = AtomicBool::new(false);
+static SYNTHETIC_STOP_IGNORED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn run() -> i32 {
+    win::per_monitor_dpi_awareness();
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let closed = Arc::new(AtomicBool::new(false));
+    let reader_queue = Arc::clone(&queue);
+    let reader_closed = Arc::clone(&closed);
+    let spawned = std::thread::Builder::new()
+        .name("presence-stdin".into())
+        .spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                match parse_command_line(&line) {
+                    Some(Ok(command)) => {
+                        if let Ok(mut queue) = reader_queue.lock() {
+                            queue.push_back(command);
+                        }
+                    }
+                    Some(Err(message)) => emit(&PresenceEvent::Error {
+                        message: format!("ignored malformed presence command: {message}"),
+                    }),
+                    None => {}
+                }
+            }
+            reader_closed.store(true, Ordering::Release);
+        });
+    if spawned.is_err() {
+        return 70;
+    }
+    let mut overlay = match create_overlay() {
+        Ok(overlay) => overlay,
+        Err(message) => {
+            emit(&PresenceEvent::Error { message });
+            return 70;
+        }
+    };
+    emit(&PresenceEvent::Ready {
+        platform: "windows".into(),
+        capture_excluded: overlay.capture_excluded,
+    });
+    loop {
+        win::pump_messages_for(Duration::from_millis(16));
+        if STOP_CLICKED.swap(false, Ordering::AcqRel) && overlay.visible && !overlay.stopping {
+            overlay.stopping = true;
+            emit(&PresenceEvent::Stop);
+        }
+        if SYNTHETIC_STOP_IGNORED.swap(false, Ordering::AcqRel) {
+            emit(&PresenceEvent::Error {
+                message: "ignored a Stop click synthesised by Haider".into(),
+            });
+        }
+        let pending: Vec<PresenceCommand> = queue
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default();
+        for command in pending {
+            overlay.apply(command, Instant::now());
+        }
+        overlay.animate(Instant::now());
+        for event in overlay.take_events() {
+            emit(&event);
+        }
+        if closed.load(Ordering::Acquire) {
+            overlay.hide();
+            for event in overlay.take_events() {
+                emit(&event);
+            }
+            return 0;
+        }
+    }
+}
+
+fn emit(event: &PresenceEvent) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{}", encode_event(event));
+    let _ = stdout.flush();
+}
+
+fn create_overlay() -> Result<Overlay<win::Layered>, String> {
+    let scale = win::system_scale();
+    let pointer = win::Layered::create(true)?;
+    let ring = win::Layered::create(true)?;
+    let badge = win::Layered::create(false)?;
+    let capture_excluded = [&pointer, &ring, &badge]
+        .iter()
+        .all(|window| window.exclude_from_capture());
+    Overlay::new(
+        scale,
+        win::work_area,
+        pointer,
+        ring,
+        badge,
+        capture_excluded,
+    )
+}
+
+impl OverlayWindow for win::Layered {
+    fn show_at(&self, x: i32, y: i32) {
+        win::Layered::show_at(self, x, y);
+    }
+    fn hide(&self) {
+        win::Layered::hide(self);
+    }
+    fn is_hidden(&self) -> bool {
+        win::Layered::is_hidden(self)
+    }
+    fn flush_capture(&self, deadline: Instant) -> bool {
+        win::Layered::flush_capture(deadline)
+    }
+    fn set_image(&self, bitmap: &art::Bitmap, alpha: u8) -> Result<(), String> {
+        win::Layered::set_image(self, bitmap, alpha)
+    }
+    fn set_image_with_text(
+        &self,
+        bitmap: &art::Bitmap,
+        texts: &[BadgeText<'_>],
+        font_px: i32,
+    ) -> Result<(), String> {
+        win::Layered::set_image_with_text(self, bitmap, texts, font_px)
+    }
+}
+
+/// All Win32 FFI for the overlay.
+mod win {
+    use super::{BadgeText, STOP_CLICKED, SYNTHETIC_INPUT_TAG, SYNTHETIC_STOP_IGNORED, art};
+    use std::ptr;
+    use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+    use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+    use windows_sys::Win32::Graphics::Gdi::{
+        AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+        BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+        DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE,
+        DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FW_SEMIBOLD, GetDC, OUT_DEFAULT_PRECIS,
+        ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageExtraInfo, HWND_TOPMOST,
+        IsWindowVisible, MA_NOACTIVATE, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW,
+        QS_ALLINPUT, RegisterClassExW, SPI_GETWORKAREA, SW_HIDE, SWP_NOACTIVATE, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow, SystemParametersInfoW,
+        TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_LBUTTONDOWN,
+        WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    };
+
+    static BADGE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
+    static BADGE_SCALE_MILLI: AtomicU32 = AtomicU32::new(1000);
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub(super) fn per_monitor_dpi_awareness() {
+        // SAFETY: process-wide flag set before any window exists; failure
+        // (already set) is harmless.
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    }
+
+    pub(super) fn system_scale() -> f64 {
+        // SAFETY: no arguments; returns the system DPI.
+        let dpi = unsafe { GetDpiForSystem() };
+        if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 }
+    }
+
+    /// Primary work area (left, top, right, bottom) in physical pixels.
+    pub(super) fn work_area() -> (i32, i32, i32, i32) {
+        let mut rect = RECT::default();
+        // SAFETY: `rect` is valid writable storage for SPI_GETWORKAREA.
+        let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&raw mut rect).cast(), 0) };
+        if ok == 0 {
+            (0, 0, 1920, 1080)
+        } else {
+            (rect.left, rect.top, rect.right, rect.bottom)
+        }
+    }
+
+    /// Dispatches this thread's window messages for up to `budget`.
+    pub(super) fn pump_messages_for(budget: Duration) {
+        let deadline = Instant::now() + budget;
+        loop {
+            let mut message = MSG::default();
+            // SAFETY: `message` is valid storage; a null HWND drains every
+            // window of this thread; each MSG is dispatched on this thread.
+            unsafe {
+                while PeekMessageW(&raw mut message, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&raw const message);
+                    DispatchMessageW(&raw const message);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let millis = u32::try_from(remaining.as_millis()).unwrap_or(16);
+            // SAFETY: zero handles; waits only for input or the timeout.
+            unsafe { MsgWaitForMultipleObjects(0, ptr::null(), 0, millis, QS_ALLINPUT) };
+        }
+    }
+
+    extern "system" fn window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == WM_MOUSEACTIVATE {
+            return MA_NOACTIVATE as LRESULT;
+        }
+        if message == WM_LBUTTONDOWN && hwnd == BADGE.load(Ordering::Acquire) {
+            // SAFETY: reads the extra info of the message being processed.
+            let extra = unsafe { GetMessageExtraInfo() };
+            if i64::try_from(extra).is_ok_and(|extra| extra == SYNTHETIC_INPUT_TAG) {
+                SYNTHETIC_STOP_IGNORED.store(true, Ordering::Release);
+                return 0;
+            }
+            let scale = f64::from(BADGE_SCALE_MILLI.load(Ordering::Acquire)) / 1000.0;
+            let x = f64::from((lparam & 0xFFFF) as u16 as i16) / scale;
+            let y = f64::from(((lparam >> 16) & 0xFFFF) as u16 as i16) / scale;
+            if art::badge_stop_hit(x, y) {
+                STOP_CLICKED.store(true, Ordering::Release);
+            }
+            return 0;
+        }
+        // SAFETY: default processing for this window's own message.
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    fn class_name() -> Vec<u16> {
+        let name = wide("HaiderPresenceOverlay");
+        let class = WNDCLASSEXW {
+            cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>()).unwrap_or(0),
+            lpfnWndProc: Some(window_proc),
+            // SAFETY: a null module name returns this executable's handle.
+            hInstance: unsafe { GetModuleHandleW(ptr::null()) },
+            lpszClassName: name.as_ptr(),
+            ..WNDCLASSEXW::default()
+        };
+        // SAFETY: `class` and the name it points to outlive the call; a
+        // repeated registration fails harmlessly (the class already exists).
+        unsafe { RegisterClassExW(&raw const class) };
+        name
+    }
+
+    /// One layered popup.
+    pub(super) struct Layered {
+        hwnd: HWND,
+    }
+
+    impl Layered {
+        pub(super) fn create(click_through: bool) -> Result<Self, String> {
+            let class = class_name();
+            let mut ex_style = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            if click_through {
+                ex_style |= WS_EX_TRANSPARENT;
+            }
+            let title = wide("Haider presence");
+            // SAFETY: class/title are NUL-terminated and outlive the call;
+            // null parent/menu/param are valid for a top-level popup.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    ex_style,
+                    class.as_ptr(),
+                    title.as_ptr(),
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    GetModuleHandleW(ptr::null()),
+                    ptr::null(),
+                )
+            };
+            if hwnd.is_null() {
+                return Err("Windows refused to create the presence overlay window".into());
+            }
+            if !click_through {
+                BADGE.store(hwnd, Ordering::Release);
+            }
+            Ok(Self { hwnd })
+        }
+
+        pub(super) fn exclude_from_capture(&self) -> bool {
+            // SAFETY: `hwnd` is this thread's live top-level window.
+            unsafe { SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE) != 0 }
+        }
+
+        pub(super) fn set_image(&self, bitmap: &art::Bitmap, alpha: u8) -> Result<(), String> {
+            self.update(bitmap, &[], 0, alpha)
+        }
+
+        pub(super) fn set_image_with_text(
+            &self,
+            bitmap: &art::Bitmap,
+            texts: &[BadgeText<'_>],
+            font_px: i32,
+        ) -> Result<(), String> {
+            BADGE_SCALE_MILLI.store(
+                (f64::from(bitmap.width) / art::BADGE_SIZE.0 * 1000.0).round() as u32,
+                Ordering::Release,
+            );
+            self.update(bitmap, texts, font_px, 255)
+        }
+
+        fn update(
+            &self,
+            bitmap: &art::Bitmap,
+            texts: &[BadgeText<'_>],
+            font_px: i32,
+            alpha: u8,
+        ) -> Result<(), String> {
+            let width = i32::try_from(bitmap.width).map_err(|_| "overlay too wide".to_owned())?;
+            let height = i32::try_from(bitmap.height).map_err(|_| "overlay too tall".to_owned())?;
+            let pixels = bitmap.premultiplied_bgra();
+            // The DIB section below holds exactly `width * height * 4` bytes;
+            // `art::Bitmap`'s fields are public, so check its invariant here
+            // rather than trusting every constructor.
+            let expected = usize::try_from(bitmap.width)
+                .ok()
+                .zip(usize::try_from(bitmap.height).ok())
+                .and_then(|(w, h)| w.checked_mul(h))
+                .and_then(|n| n.checked_mul(4));
+            if expected != Some(pixels.len()) {
+                return Err("overlay bitmap size does not match its dimensions".into());
+            }
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).unwrap_or(40),
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..BITMAPINFOHEADER::default()
+                },
+                ..BITMAPINFO::default()
+            };
+            let face = wide("Segoe UI");
+            let wide_texts: Vec<(Vec<u16>, RECT, bool)> = texts
+                .iter()
+                .map(|(text, (left, top, right, bottom), centered)| {
+                    (
+                        text.encode_utf16().collect(),
+                        RECT {
+                            left: left.round() as i32,
+                            top: top.round() as i32,
+                            right: right.round() as i32,
+                            bottom: bottom.round() as i32,
+                        },
+                        *centered,
+                    )
+                })
+                .collect();
+            // SAFETY: the memory DC, DIB section and `bits` pointer are
+            // null-checked before use; `GetDC(NULL)` and `CreateFontW` are not
+            // (GDI treats a null DC/font as a failed no-op: DrawTextW and
+            // SelectObject return 0, they do not dereference it). Every handle
+            // is used on this thread only and released before returning.
+            // `bits` points to `width * height * 4` bytes owned by the live DIB
+            // section, which equals `pixels.len()` (checked above); it is
+            // written only while the section is alive.
+            let updated = unsafe {
+                let screen = GetDC(ptr::null_mut());
+                let memory = CreateCompatibleDC(screen);
+                let mut bits: *mut core::ffi::c_void = ptr::null_mut();
+                let dib = CreateDIBSection(
+                    screen,
+                    &raw const info,
+                    DIB_RGB_COLORS,
+                    &raw mut bits,
+                    ptr::null_mut(),
+                    0,
+                );
+                let updated = if dib.is_null() || bits.is_null() || memory.is_null() {
+                    false
+                } else {
+                    ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u8>(), pixels.len());
+                    let previous = SelectObject(memory, dib);
+                    if !wide_texts.is_empty() {
+                        let font = CreateFontW(
+                            -font_px,
+                            0,
+                            0,
+                            0,
+                            FW_SEMIBOLD as i32,
+                            0,
+                            0,
+                            0,
+                            u32::from(DEFAULT_CHARSET),
+                            u32::from(OUT_DEFAULT_PRECIS),
+                            u32::from(CLIP_DEFAULT_PRECIS),
+                            u32::from(ANTIALIASED_QUALITY),
+                            u32::from(DEFAULT_PITCH),
+                            face.as_ptr(),
+                        );
+                        let previous_font = SelectObject(memory, font);
+                        SetBkMode(memory, TRANSPARENT as i32);
+                        SetTextColor(memory, 0x00FF_FFFF);
+                        for (text, rect, centered) in &wide_texts {
+                            let mut rect = *rect;
+                            let align = if *centered { DT_CENTER } else { DT_LEFT };
+                            DrawTextW(
+                                memory,
+                                text.as_ptr(),
+                                i32::try_from(text.len()).unwrap_or(0),
+                                &raw mut rect,
+                                align | DT_VCENTER | DT_SINGLELINE,
+                            );
+                        }
+                        SelectObject(memory, previous_font);
+                        DeleteObject(font);
+                        // GDI text clears alpha; restore the art's coverage so
+                        // glyph pixels stay opaque over the pill.
+                        let written =
+                            std::slice::from_raw_parts_mut(bits.cast::<u8>(), pixels.len());
+                        for (index, chunk) in written.chunks_exact_mut(4).enumerate() {
+                            chunk[3] = pixels[index * 4 + 3];
+                        }
+                    }
+                    let origin = POINT { x: 0, y: 0 };
+                    let size = SIZE {
+                        cx: width,
+                        cy: height,
+                    };
+                    let blend = BLENDFUNCTION {
+                        BlendOp: AC_SRC_OVER as u8,
+                        BlendFlags: 0,
+                        SourceConstantAlpha: alpha,
+                        AlphaFormat: AC_SRC_ALPHA as u8,
+                    };
+                    let updated = UpdateLayeredWindow(
+                        self.hwnd,
+                        screen,
+                        ptr::null(),
+                        &raw const size,
+                        memory,
+                        &raw const origin,
+                        0,
+                        &raw const blend,
+                        ULW_ALPHA,
+                    ) != 0;
+                    SelectObject(memory, previous);
+                    updated
+                };
+                if !dib.is_null() {
+                    DeleteObject(dib);
+                }
+                if !memory.is_null() {
+                    DeleteDC(memory);
+                }
+                ReleaseDC(ptr::null_mut(), screen);
+                updated
+            };
+            if updated {
+                Ok(())
+            } else {
+                Err("UpdateLayeredWindow failed for the presence overlay".into())
+            }
+        }
+
+        pub(super) fn show_at(&self, x: i32, y: i32) {
+            // SAFETY: `hwnd` is live; the flags neither resize nor activate.
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+
+        pub(super) fn hide(&self) {
+            // SAFETY: `hwnd` is live.
+            unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        }
+
+        pub(super) fn is_hidden(&self) -> bool {
+            // SAFETY: hwnd remains live for this helper's lifetime.
+            unsafe { IsWindowVisible(self.hwnd) == 0 }
+        }
+
+        pub(super) fn flush_capture(deadline: Instant) -> bool {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let spawned = std::thread::Builder::new()
+                .name("presence-dwm-flush".into())
+                .spawn(move || {
+                    // SAFETY: DwmFlush has no pointer arguments; it waits for DWM.
+                    let _ = sender.send(unsafe { DwmFlush() } == 0);
+                });
+            spawned.is_ok()
+                && receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(false)
+        }
+    }
+}

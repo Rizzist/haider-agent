@@ -88,6 +88,11 @@ fn digest(
         head_seq: 12,
         worker_generation: 7,
         metadata: Some(SessionMetadataV1 {
+            selection_epoch: None,
+            route_reset_epoch: None,
+            budget_clamp_notice_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,
@@ -97,6 +102,7 @@ fn digest(
             account_alias: None,
             model: "gpt-observe".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             system_prompt_version: Some("v1".into()),
             permission_overrides: None,
             interaction_mode: Default::default(),
@@ -114,6 +120,7 @@ fn digest(
         task_outcome: None,
         task_outcome_version: None,
         orchestration: None,
+        request_budget: None,
         active_branch_id: Some(BranchId::new("branch-review")),
         branches: vec![BranchDescriptor {
             branch_id: BranchId::new("branch-review"),
@@ -129,6 +136,7 @@ fn digest(
         main_head_node_id: Some(NodeId::new("node-main")),
         main_head_seq: 4,
         latest_context_footprint: Some(ContextFootprint {
+            selection_epoch: None,
             input_tokens: 800,
             output_tokens: 150,
             cached_input_tokens: 50,
@@ -949,6 +957,10 @@ fn session_depth_preserves_pending_follow_ups_in_json_and_text() {
         park_reason: Some(haider_protocol::completion::CompletionParkReason::RequestRepair),
     };
     observed.pending_follow_ups.push(pending.clone());
+    observed.request_budget = Some(haider_protocol::request_budget::RequestBudgetV1 {
+        tranche: 5,
+        hard_cap: 5,
+    });
     let document = SessionDocument {
         schema: "haider.observe.v1",
         kind: "session",
@@ -958,10 +970,23 @@ fn session_depth_preserves_pending_follow_ups_in_json_and_text() {
         document.session.json()["pending_follow_ups"],
         serde_json::json!([pending])
     );
+    assert_eq!(
+        document.session.json()["request_budget"],
+        serde_json::json!({"tranche": 5, "hard_cap": 5})
+    );
+    golden(
+        "observe_session_budget.txt",
+        &format!(
+            "{}\n",
+            document.session.request_budget.expect("cap").status_label()
+        ),
+    );
+    assert!(session_human_text(&document).contains("request cap 5 (tranche 5)\n"));
     assert!(session_human_text(&document).contains(
         "pending follow-up: monitor:stable-report — attempt 1 — Reconcile the harmless marker"
     ));
     let empty = depth_view(digest("empty", ObserveRunStateWire::Idle, None));
+    assert!(empty.json().get("request_budget").is_none());
     assert!(
         empty.json().get("pending_follow_ups").is_none(),
         "older empty snapshots keep their wire shape"

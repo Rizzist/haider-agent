@@ -107,7 +107,7 @@ pub fn spawn_subagent_manifest() -> ToolManifest {
             "properties": {
                 "request_budget": {
                     "type": "object",
-                    "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+                    "description": "Optional child per-turn provider request budget. Omit it for no request-count cap. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
                     "properties": {
                         "tranche": {"type": "integer", "minimum": 1},
                         "hard_cap": {"type": "integer", "minimum": 1}

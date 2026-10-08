@@ -293,6 +293,11 @@ fn workflow_capabilities_are_sparse_and_grant_scoped() {
 #[test]
 fn session_permission_overrides_grant_only_their_named_effect_families() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -302,6 +307,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -455,6 +461,11 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
 #[test]
 fn autonomous_effect_defaults_allow_every_ask_class() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -464,6 +475,7 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: SessionInteractionModeV1::Autonomous,
         system_prompt_version: None,
@@ -580,6 +592,11 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
 #[test]
 fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -589,6 +606,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides,
         interaction_mode: Default::default(),
         system_prompt_version: None,
@@ -1068,6 +1086,7 @@ fn create_durable_session(store: &Store, session_id: &SessionId) {
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -1656,17 +1675,19 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Union full-pack pin: 971 redaction, 972 task_outcome/output ergonomics,
     // 972-ax-testrun, and the frozen typed `tool_script` DAG schema. The
     // default instruct-pipe pack is unchanged: the large orchestration schema
-    // remains discovery-only until explicitly promoted.
+    // remains discovery-only until explicitly promoted. The full pack lost
+    // six bytes when the optional spawn_subagent.request_budget description
+    // changed from 154 to 148 bytes; only its description is in this pin.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_403;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_397;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_354;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_348;
     #[cfg(target_os = "windows")]
     // `tool_script` nests the platform-specific `process_exec` schema, so
     // Windows carries the historical 3-byte command-description delta twice.
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_350;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_344;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_348;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_342;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

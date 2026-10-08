@@ -100,6 +100,7 @@ async fn exercise_admitted_turn(result: &Result<crate::worker::ResolvedTurnProvi
                 tools: Vec::new(),
                 attachments: Vec::new(),
                 cache_metadata: None,
+                tool_result_image_projection: Default::default(),
             })
             .await
             .expect("record physical provider round");

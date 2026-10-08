@@ -178,6 +178,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: Some(haider_protocol::session::SessionPermissionOverridesV1 {
             read_only: false,
             allow_writes: false,
@@ -591,6 +592,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 64,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -1035,6 +1037,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -1388,6 +1391,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     );
     assert!(reset_seq > compaction_seq);
     assert_eq!(reset.truth, ContextFootprintTruth::Estimated);
+    assert_eq!(reset.selection_epoch, Some(0));
     assert_eq!(reset.context_window, Some(32_000));
     assert!(reset.used_tokens > summary_only_tokens);
     assert!(reset.used_tokens < 32_000);
@@ -1704,6 +1708,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,

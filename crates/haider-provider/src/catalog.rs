@@ -1,8 +1,8 @@
 //! Model discovery from the PROVIDERS' OWN sources (W5e-2).
 //!
-//! The owner requirement is that model choice never comes from a hardcoded
-//! slug table: it comes from the same place the vendors' own CLIs get it,
-//! authorized with the subscription credentials the vault already holds.
+//! Remote discovery is preferred. Subscription credentials may be allowed to
+//! run turns while their `/models` request is forbidden, so a small maintained
+//! static catalog keeps those providers usable on a fresh profile.
 //!
 //! - **OpenAI subscription**: `GET {OPENAI_SUBSCRIPTION_BASE_URL}/models`,
 //!   the endpoint the installed codex CLI uses
@@ -15,10 +15,8 @@
 //!   with the OAuth bearer and the same beta headers W5b.2 already proves
 //!   work for inference.
 //!
-//! DISCOVERY IS NEVER SYNTHESIZED. When a provider will not serve a list,
-//! [`CatalogError::Unavailable`] is returned so the caller can fall back to
-//! its last-known cache or say "unavailable" — this module never invents a
-//! model that the provider did not name.
+//! Discovery never synthesizes a successful response. The maintained rows
+//! live in `subscription_catalog`; the daemon registry merges the two.
 //!
 //! Requests use fixed origins and the same W5a discipline as the token
 //! endpoints: resolve-validate-pin through [`FixedOriginGuard`], proxies
@@ -60,6 +58,11 @@ pub struct DiscoveredModel {
     /// The provider's declared context window in tokens; `None` when the
     /// provider does not declare one — never a guess.
     pub context_window: Option<u64>,
+    /// The provider's declared maximum response size in tokens. Catalogs
+    /// frequently omit this even when the inference endpoint enforces it;
+    /// daemon projection fills those gaps from pinned model-family limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     pub description: Option<String>,
     /// The provider's default reasoning effort, when it declares one.
     pub default_effort: Option<String>,
@@ -70,6 +73,10 @@ pub struct DiscoveredModel {
     pub visible: bool,
     /// Picker ordering hint; lower sorts first.
     pub priority: Option<i64>,
+    /// Codex routing declaration. The subscription adapter always sends
+    /// Responses Lite; old cached rows deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_responses_lite: Option<bool>,
     /// Provider-declared capability metadata that is richer than the common
     /// catalog contract. Absent for existing sources so their serialized
     /// cache rows stay byte-identical.
@@ -119,6 +126,13 @@ pub enum CatalogError {
     Empty,
 }
 
+/// Whether a [`CatalogError::Unavailable`] reason records a 403 answer to a
+/// fixed-origin model-list request.
+#[must_use]
+pub fn model_list_forbidden(reason: &str) -> bool {
+    reason.contains("(403)")
+}
+
 impl std::fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -158,8 +172,9 @@ pub enum CatalogSource {
     XaiApi,
 }
 
-/// Release-owned catalog taxonomy. Remote definitions cannot contain a
-/// fallback list. Offline model IDs are the catalog itself.
+/// Release-owned catalog taxonomy. Offline IDs are authoritative. The
+/// subscription fallback lives in `subscription_catalog` so discovery stays
+/// enabled for those providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCatalogDefinition {
     Offline { models: &'static [&'static str] },
@@ -571,6 +586,16 @@ pub fn compatible_model_id_is_display_safe(id: &str) -> bool {
         .all(|character| UnicodeWidthChar::width(character).is_some_and(|width| width > 0))
 }
 
+/// Reads the first PRESENT field among `keys` as a positive token count. A
+/// present field that is zero, negative, or not an integer declares nothing;
+/// it does not fall through to a later alias.
+fn declared_token_count(entry: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| entry.get(*key))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|tokens| *tokens > 0)
+}
+
 /// Parses either provider's shape. Public so the fake-server tests drive the
 /// same parser production uses.
 pub fn parse_catalog(
@@ -609,15 +634,14 @@ pub fn parse_catalog(
             models.push(DiscoveredModel {
                 slug: slug.to_owned(),
                 display_name: slug.to_owned(),
-                context_window: entry
-                    .get("inputTokenLimit")
-                    .and_then(serde_json::Value::as_u64)
-                    .filter(|window| *window > 0),
+                context_window: declared_token_count(entry, &["inputTokenLimit"]),
+                max_output_tokens: declared_token_count(entry, &["outputTokenLimit"]),
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
                 visible: true,
                 priority: None,
+                use_responses_lite: None,
                 extensions: None,
             });
             continue;
@@ -633,11 +657,11 @@ pub fn parse_catalog(
             let Some(raw_slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            if matches!(
+            let user_endpoint = matches!(
                 source,
                 CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
-            ) && !compatible_model_id_is_display_safe(raw_slug)
-            {
+            );
+            if user_endpoint && !compatible_model_id_is_display_safe(raw_slug) {
                 return Err(CatalogError::InvalidBody {
                     reason: "model catalog id contains characters that cannot be displayed safely"
                         .to_owned(),
@@ -656,12 +680,18 @@ pub fn parse_catalog(
             models.push(DiscoveredModel {
                 slug: slug.to_owned(),
                 display_name: slug.to_owned(),
-                context_window: None,
+                context_window: (!user_endpoint)
+                    .then(|| declared_token_count(entry, &["context_window", "context_length"]))
+                    .flatten(),
+                max_output_tokens: (!user_endpoint)
+                    .then(|| declared_token_count(entry, &["max_output_tokens", "max_tokens"]))
+                    .flatten(),
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
-                visible: true,
+                visible: catalog_entry_visible(&source, entry),
                 priority: None,
+                use_responses_lite: None,
                 extensions: None,
             });
             continue;
@@ -674,6 +704,14 @@ pub fn parse_catalog(
         {
             // Residual documented by B6k: the Anthropic Messages adapter is
             // intentionally not wired for Kimi until a later catalog wave.
+            continue;
+        }
+        if matches!(source, CatalogSource::AnthropicSubscription)
+            && entry
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind != "model")
+        {
             continue;
         }
         // codex names it `slug`; Anthropic names it `id`.
@@ -707,26 +745,24 @@ pub fn parse_catalog(
             })
             .unwrap_or_default();
         let context_window = match source {
-            CatalogSource::OpenAiSubscription => entry
-                .get("context_window")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|window| *window > 0),
-            CatalogSource::KimiOAuth => entry
-                .get("context_length")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|window| *window > 0),
-            CatalogSource::GrokOAuth => entry
-                .get("context_window")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|window| *window > 0),
-            CatalogSource::AnthropicSubscription
-            | CatalogSource::GeminiApiKey
+            CatalogSource::OpenAiSubscription | CatalogSource::GrokOAuth => {
+                declared_token_count(entry, &["context_window"])
+            }
+            CatalogSource::KimiOAuth => declared_token_count(entry, &["context_length"]),
+            CatalogSource::AnthropicSubscription => {
+                declared_token_count(entry, &["max_input_tokens"])
+            }
+            CatalogSource::GeminiApiKey
             | CatalogSource::OpenAiCompatible { .. }
             | CatalogSource::AnthropicCompatible { .. }
             | CatalogSource::DeepSeekApi
             | CatalogSource::HaiderCodeApi
             | CatalogSource::XaiApi => None,
         };
+        let max_output_tokens = declared_token_count(
+            entry,
+            &["max_output_tokens", "max_tokens", "outputTokenLimit"],
+        );
         let kimi_extensions =
             matches!(source, CatalogSource::KimiOAuth).then(|| DiscoveredModelExtensions {
                 protocol: entry
@@ -786,6 +822,7 @@ pub fn parse_catalog(
             slug: slug.to_owned(),
             display_name,
             context_window,
+            max_output_tokens,
             description: entry
                 .get("description")
                 .and_then(serde_json::Value::as_str)
@@ -802,6 +839,13 @@ pub fn parse_catalog(
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(|visibility| visibility == "list"),
             priority: entry.get("priority").and_then(serde_json::Value::as_i64),
+            use_responses_lite: if matches!(source, CatalogSource::OpenAiSubscription) {
+                entry
+                    .get("use_responses_lite")
+                    .and_then(serde_json::Value::as_bool)
+            } else {
+                None
+            },
             extensions: kimi_extensions.or(grok_extensions),
         });
     }
@@ -834,6 +878,19 @@ pub fn parse_catalog(
         }
     }
     Ok(models)
+}
+
+/// Fixed API catalogs can explicitly exclude rows from their serving
+/// endpoint. Custom compatible catalogs remain advisory id lists.
+fn catalog_entry_visible(source: &CatalogSource, entry: &serde_json::Value) -> bool {
+    if !matches!(source, CatalogSource::HaiderCodeApi) {
+        return true;
+    }
+    entry
+        .get("visibility")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|visibility| visibility == "list")
+        && entry.get("supported_in_api") != Some(&serde_json::Value::Bool(false))
 }
 
 pub(crate) fn apply_catalog_credential(
@@ -872,13 +929,21 @@ fn sensitive_credential_header(
     Ok(request.header(name, value))
 }
 
-/// Picker order: provider priority first, then display name. Hidden models
-/// are dropped — the provider said not to list them.
+/// Whether the provider's actual request transport can serve this row.
+/// Both remote and static catalog projections must apply this predicate at
+/// the final picker projection.
 #[must_use]
-pub fn pickable(models: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
+pub fn model_servable_by_endpoint(provider: &str, model: &DiscoveredModel) -> bool {
+    model.visible
+        && (provider != crate::OPENAI_OAUTH_PROVIDER_NAME || model.use_responses_lite == Some(true))
+}
+
+/// Picker order: provider priority first, then display name.
+#[must_use]
+pub fn pickable(provider: &str, models: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
     let mut visible: Vec<DiscoveredModel> = models
         .iter()
-        .filter(|model| model.visible)
+        .filter(|model| model_servable_by_endpoint(provider, model))
         .cloned()
         .collect();
     visible.sort_by(|left, right| {

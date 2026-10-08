@@ -833,13 +833,31 @@ fn agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs() {
 #[test]
 fn agent_spawn_provider_only_resolves_model_through_daemon_session_authority() {
     let profile = Profile::new(report_script("DAEMON_RESOLVED_MODEL_REPORT"));
-    // Publish a discovered catalog before startup; xAI has no seeded default.
-    // The injected daemon factory routes the published pair to the fake script.
+    // Authenticated inventories are account-scoped. Seed a synthetic active
+    // descriptor and its matching catalog before startup; xAI has no seeded
+    // default. The injected daemon factory routes the pair to the fake script.
+    let descriptor = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("xai-fixture"),
+        provider: "xai".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "synthetic xAI account".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let mut descriptors = serde_json::to_vec_pretty(&vec![descriptor.clone()])
+        .expect("synthetic account descriptors");
+    descriptors.push(b'\n');
+    std::fs::write(profile.profile.join("accounts.json"), descriptors)
+        .expect("seed active synthetic account");
     {
         let store = haider_store::Store::open(&profile.profile).expect("catalog store");
         store
             .put_provider_models(
-                "xai",
+                haider_store::ProviderModelCacheKey::for_account("xai", &descriptor).as_str(),
                 r#"[{"slug":"grok-4","display_name":"Grok 4","supported_efforts":[],"visible":true}]"#,
                 None,
                 u64::try_from(
@@ -938,4 +956,111 @@ fn agent_spawn_provider_without_published_default_retains_native_rejection() {
     assert_eq!(rejected["error"]["code"], "no_default_model");
     assert!(rejected["result"].is_null());
     profile.stop();
+}
+
+/// Covers the real RPC response -> CLI JSON/stderr notice path. An endpoint
+/// alone must disclose its clear, and a combined clear names both choices.
+#[test]
+fn session_config_clear_notices_survive_rpc_and_cli_projection() {
+    let fixture = Profile::new(report_script("synthetic session notice"));
+    std::fs::write(fixture.profile.join("accounts.json"), json!([
+        {"alias":"bed-synthetic","provider":"bedrock","auth_method":"api_key","identity":"synthetic-bed",
+         "status":{"status":"ok"},"active":true},
+        {"alias":"ant-synthetic","provider":"anthropic","auth_method":"api_key","identity":"synthetic-ant",
+         "status":{"status":"ok"},"active":true}
+    ]).to_string()).expect("synthetic descriptors only");
+    let spawned = fixture.spawn();
+    fixture.wait(&spawned, 0);
+    let session = field(&spawned, "child_session_id");
+    for pin in [false, true] {
+        // Move to a known pair before installing this provider's override.
+        let output = fixture.run(&[
+            "session",
+            session,
+            "config",
+            "--model",
+            "bedrock/anthropic.claude-opus-5",
+            "--max-output-tokens",
+            "100000",
+            "--confirm-epoch",
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut args = vec![
+            "session",
+            "provider",
+            "rebind",
+            "--session",
+            session,
+            "--provider",
+            "bedrock",
+            "--base-url",
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        ];
+        if pin {
+            args.extend(["--account", "bed-synthetic"]);
+        }
+        let output = fixture.run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = fixture.run(&[
+            "session",
+            session,
+            "config",
+            "--model",
+            "anthropic/claude-haiku-4-5",
+            "--confirm-epoch",
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+        assert_eq!(
+            document["cleared_provider_endpoint"],
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+        );
+        let notice = document["selection_notices"][0]
+            .as_str()
+            .expect("visible notice in JSON");
+        assert!(
+            notice.contains("endpoint https://bedrock-mantle.us-east-1.api.aws/anthropic"),
+            "{document}"
+        );
+        if pin {
+            assert!(notice.contains("account pin bed-synthetic"));
+        }
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(notice),
+            "stderr must match the typed RPC disclosure"
+        );
+        let clamp = document["selection_notices"][1]
+            .as_str()
+            .expect("clamp notice in JSON");
+        assert!(
+            clamp.contains("Output budget 100000") && clamp.contains("using 64000"),
+            "{document}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(clamp));
+        assert_eq!(document["max_tokens"], 64000);
+        assert_eq!(document["max_tokens_source"], "user_set");
+        let read = fixture.run(&["session", session, "config", "--json"]);
+        assert!(read.status.success());
+        assert!(read.stderr.is_empty());
+        let read: Value = serde_json::from_slice(&read.stdout).expect("read JSON");
+        assert!(
+            read.get("selection_notices").is_none(),
+            "no stale/spurious notices on reads"
+        );
+    }
+    fixture.stop();
 }

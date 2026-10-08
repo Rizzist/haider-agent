@@ -25,21 +25,34 @@ mod effort;
 #[cfg(test)]
 mod effort_tests;
 mod error_detail;
+mod error_templates;
 mod gemini;
 mod idle;
+mod model_limits;
+mod output_budget;
 pub use idle::{ProviderIdleDeadline, ProviderIdleTimeout};
+pub use model_limits::{StaticModelLimits, UNKNOWN_OUTPUT_LIMIT, static_model_limits};
+pub use output_budget::{
+    DEFAULT_OUTPUT_LIMIT, MAX_OUTPUT_LIMIT, explicit_output_ceiling, model_output_limit,
+    provider_stated_output_limit,
+};
 #[cfg(test)]
 mod gemini_tests;
 mod oauth_identity;
 mod openai;
 mod origin;
 mod pricing;
+mod request_upload;
+pub(crate) use request_upload::RequestUploadBoundary;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 #[path = "../tests/support/prompt_cache_fake.rs"]
 pub mod prompt_cache_fake;
 #[cfg(test)]
 mod reply_binding_tests;
+mod subscription_catalog;
+#[cfg(test)]
+mod subscription_catalog_tests;
 mod usage;
 mod webfetch;
 #[cfg(test)]
@@ -1189,7 +1202,9 @@ pub(crate) fn serialize_prepared_json_body(
     serialize_prepared_json_body_ref(&prepared)
 }
 
-fn serialize_prepared_json_body_ref(prepared: &PreparedWire) -> Result<Vec<u8>, ProviderError> {
+pub(crate) fn serialize_prepared_json_body_ref(
+    prepared: &PreparedWire,
+) -> Result<Vec<u8>, ProviderError> {
     let mut writer = CompactJsonVecWriter::new();
     write_json_value_with_replies(&mut writer, &prepared.payload, &prepared.reply_bindings)
         .map_err(|error| {
@@ -1226,7 +1241,8 @@ pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
     PUBLIC_CATALOG_PROVIDERS, ProviderCatalogDefinition, catalog_request_url,
     compatible_model_id_is_display_safe, discover_models, discover_models_with_resolver,
-    openai_compatible_catalog_endpoint, parse_catalog, pickable, provider_catalog_definition,
+    model_list_forbidden, model_servable_by_endpoint, openai_compatible_catalog_endpoint,
+    parse_catalog, pickable, provider_catalog_definition,
 };
 pub use effort::{
     anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,
@@ -1267,6 +1283,9 @@ pub use pricing::{
     estimate_cache_input_costs_for, estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd,
     estimate_chunk_cost_usd_for, estimate_normalized_usage_cost_usd,
     estimate_normalized_usage_cost_usd_for, model_rate,
+};
+pub use subscription_catalog::{
+    has_subscription_static_catalog, subscription_static_model_ids, subscription_static_models,
 };
 pub use usage::{
     ANTHROPIC_OAUTH_USAGE_URL, ANTHROPIC_OAUTH_USAGE_USER_AGENT, KIMI_OAUTH_USAGE_URL,
@@ -1524,6 +1543,28 @@ impl Message {
         truncated: bool,
         images: Vec<ImageBlockRef>,
     ) -> Self {
+        Self::tool_result_with_status(call_id, preview, truncated, images, None)
+    }
+
+    /// Retains the receipt status for local guards while provider adapters
+    /// continue to render only the result's model-facing content.
+    pub fn tool_result_with_receipt(
+        call_id: impl Into<String>,
+        preview: impl Into<String>,
+        truncated: bool,
+        images: Vec<ImageBlockRef>,
+        status: haider_protocol::tool::ToolResultStatus,
+    ) -> Self {
+        Self::tool_result_with_status(call_id, preview, truncated, images, Some(status))
+    }
+
+    fn tool_result_with_status(
+        call_id: impl Into<String>,
+        preview: impl Into<String>,
+        truncated: bool,
+        images: Vec<ImageBlockRef>,
+        completion_status: Option<haider_protocol::tool::ToolResultStatus>,
+    ) -> Self {
         let call_id = call_id.into();
         Self {
             role: MessageRole::Tool,
@@ -1532,6 +1573,7 @@ impl Message {
                 call_id,
                 preview: preview.into(),
                 truncated,
+                completion_status,
                 images,
             }],
         }
@@ -1558,7 +1600,13 @@ impl Message {
 /// Every affected tool result receives a bounded, honest text note. The note
 /// names the first omitted artifact and reports any additional count without
 /// allowing an untrusted result vector to grow prompt text without bound.
-pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
+///
+/// Returns the typed record of which tool results lost images. Callers carry
+/// it on [`TurnRequest::tool_result_image_projection`]; adapters never infer
+/// it from (untrusted) preview text.
+pub fn apply_tool_result_image_budget(messages: &mut [Message]) -> ToolResultImageProjection {
+    let mut projection = ToolResultImageProjection::default();
+    elide_stale_computer_screenshots(messages, &mut projection);
     let mut retained_count = messages
         .iter()
         .flat_map(|message| &message.blocks)
@@ -1583,7 +1631,10 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
     for message in messages {
         for block in &mut message.blocks {
             let Block::ToolResult {
-                preview, images, ..
+                call_id,
+                preview,
+                images,
+                ..
             } = block
             else {
                 continue;
@@ -1621,11 +1672,164 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
             };
             let first_omitted = bounded_context_field(first_omitted.as_str(), 96);
             preview.push_str(&tool_image_elision_marker(
-                "tool_result_image_budget",
+                ImageElisionScope::TurnBudget,
                 omitted_count,
                 omitted_bytes,
                 Some(&first_omitted),
             ));
+            projection.record(call_id, images.is_empty());
+        }
+    }
+    projection
+}
+
+/// Typed, request-local record of the tool results whose images
+/// [`apply_tool_result_image_budget`] removed: stale computer screenshots and
+/// the oldest-first turn budget. Capability degradation is not recorded: it
+/// applies identically from a result's first request and never rewrites an
+/// already-sent prefix.
+///
+/// Only the projection itself creates entries, so no tool output or page
+/// text can set it. It is recomputed from durable history on every request
+/// (the daemon's prompt compile and each actor request merge their records),
+/// and both elisions only grow as newer images arrive, so once non-empty for
+/// a conversation it stays non-empty, including after a restart or resume.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultImageProjection {
+    /// Tool results that lost at least one image, keyed by call id.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    elided: std::collections::BTreeMap<String, ToolResultImageElision>,
+}
+
+/// How much of one tool result's image list the projection removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultImageElision {
+    /// Some images remain; the oldest were dropped by the turn budget.
+    Partial,
+    /// Every image was removed from this result.
+    All,
+}
+
+impl ToolResultImageProjection {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.elided.is_empty()
+    }
+
+    /// Whether the projection rewrote an earlier tool result, invalidating
+    /// signed reasoning bound to the previously sent prefix.
+    #[must_use]
+    pub fn rewrites_earlier_tool_results(&self) -> bool {
+        !self.elided.is_empty()
+    }
+
+    /// Whether the projection removed every image of this tool result.
+    #[must_use]
+    pub fn elided_all_images(&self, call_id: &str) -> bool {
+        self.elided.get(call_id) == Some(&ToolResultImageElision::All)
+    }
+
+    /// Unions a record computed over an earlier projection of the same
+    /// history (e.g. the daemon's prompt compile) into this one.
+    pub fn merge(&mut self, other: &Self) {
+        for (call_id, elision) in &other.elided {
+            self.record(call_id, *elision == ToolResultImageElision::All);
+        }
+    }
+
+    fn record(&mut self, call_id: &str, all: bool) {
+        let elision = if all {
+            ToolResultImageElision::All
+        } else {
+            ToolResultImageElision::Partial
+        };
+        self.elided
+            .entry(call_id.to_owned())
+            .and_modify(|existing| {
+                if elision == ToolResultImageElision::All {
+                    *existing = elision;
+                }
+            })
+            .or_insert(elision);
+    }
+}
+
+/// Tool name whose image results are screenshots of the live desktop.
+const COMPUTER_TOOL_NAME: &str = "computer";
+
+fn computer_call_ids(messages: &[Message]) -> HashSet<String> {
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolCall { call_id, name, .. } if name == COMPUTER_TOOL_NAME => {
+                Some(call_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether [`apply_tool_result_image_budget`] will elide at least one older
+/// computer screenshot, i.e. more than one computer tool result still carries
+/// images. Callers use this to declare the request-only rewrite up front.
+pub fn has_stale_computer_screenshots(messages: &[Message]) -> bool {
+    let computer_calls = computer_call_ids(messages);
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| {
+            matches!(
+                block,
+                Block::ToolResult {
+                    call_id,
+                    images,
+                    ..
+                } if !images.is_empty() && computer_calls.contains(call_id)
+            )
+        })
+        .take(2)
+        .count()
+        > 1
+}
+
+/// The latest computer observation is the only full screenshot useful for
+/// subsequent coordinate decisions. Older captures remain durable and
+/// retrievable through their artifact refs, but do not grow every later
+/// provider request. On prefix-binding Anthropic models this rewrite also
+/// invalidates later signed thinking; see [`ToolResultImageProjection`].
+fn elide_stale_computer_screenshots(
+    messages: &mut [Message],
+    projection: &mut ToolResultImageProjection,
+) {
+    let computer_calls = computer_call_ids(messages);
+    let mut retained_latest = false;
+    for message in messages.iter_mut().rev() {
+        for block in message.blocks.iter_mut().rev() {
+            let Block::ToolResult {
+                call_id,
+                preview,
+                images,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if !computer_calls.contains(call_id) || images.is_empty() {
+                continue;
+            }
+            if !retained_latest {
+                retained_latest = true;
+                continue;
+            }
+            let removed = std::mem::take(images);
+            push_image_elision_marker(
+                preview,
+                ImageElisionScope::ComputerScreenshotHistory,
+                &removed,
+            );
+            projection.record(call_id, true);
         }
     }
 }
@@ -1643,21 +1847,12 @@ pub fn degrade_tool_result_images_to_placeholders(messages: &mut [Message]) {
                 continue;
             };
             let removed = std::mem::take(images);
-            let omitted_count = removed.len();
-            let omitted_bytes = removed
-                .iter()
-                .map(|image| image.byte_len)
-                .fold(0_u64, u64::saturating_add);
-            let first_omitted = removed
-                .first()
-                .map(|image| bounded_context_field(image.artifact.as_str(), 96));
-            if omitted_count > 0 {
-                preview.push_str(&tool_image_elision_marker(
-                    "tool_result_image_capability_degradation",
-                    omitted_count,
-                    omitted_bytes,
-                    first_omitted.as_deref(),
-                ));
+            if !removed.is_empty() {
+                push_image_elision_marker(
+                    preview,
+                    ImageElisionScope::CapabilityDegradation,
+                    &removed,
+                );
                 for image in removed {
                     preview.push('\n');
                     preview.push_str(&tool_image_placeholder(&image));
@@ -1667,23 +1862,68 @@ pub fn degrade_tool_result_images_to_placeholders(messages: &mut [Message]) {
     }
 }
 
+/// Why a provider-bound clone lost tool-result images. The scope string is
+/// part of the `haider_elision_v1` marker the model reads.
+#[derive(Debug, Clone, Copy)]
+enum ImageElisionScope {
+    TurnBudget,
+    ComputerScreenshotHistory,
+    CapabilityDegradation,
+}
+
+impl ImageElisionScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnBudget => "tool_result_image_budget",
+            Self::ComputerScreenshotHistory => "computer_screenshot_history",
+            Self::CapabilityDegradation => "tool_result_image_capability_degradation",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::TurnBudget => "oldest first",
+            Self::ComputerScreenshotHistory => {
+                "newest computer screenshot retained; full image retrievable from CAS"
+            }
+            Self::CapabilityDegradation => "unsupported image capability",
+        }
+    }
+}
+
+/// Appends the marker for images removed wholesale from one tool result.
+fn push_image_elision_marker(
+    preview: &mut String,
+    scope: ImageElisionScope,
+    removed: &[ImageBlockRef],
+) {
+    let omitted_bytes = removed
+        .iter()
+        .map(|image| image.byte_len)
+        .fold(0_u64, u64::saturating_add);
+    let first_omitted = removed
+        .first()
+        .map(|image| bounded_context_field(image.artifact.as_str(), 96));
+    preview.push_str(&tool_image_elision_marker(
+        scope,
+        removed.len(),
+        omitted_bytes,
+        first_omitted.as_deref(),
+    ));
+}
+
 fn tool_image_elision_marker(
-    scope: &str,
+    scope: ImageElisionScope,
     omitted_count: usize,
     omitted_bytes: u64,
     first_omitted: Option<&str>,
 ) -> String {
-    let reason = if scope == "tool_result_image_budget" {
-        "oldest first"
-    } else {
-        "unsupported image capability"
-    };
     format!(
         "\n{}\n",
         serde_json::json!({
             "haider_elision_v1": {
-                "scope": scope,
-                "reason": reason,
+                "scope": scope.as_str(),
+                "reason": scope.reason(),
                 "omitted_bytes": omitted_bytes,
                 "omitted_bytes_exact": true,
                 "omitted_images": omitted_count,
@@ -1879,6 +2119,11 @@ pub struct TurnRequest {
     /// Ephemeral cache-boundary metadata. Absent preserves the exact CM1 wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_metadata: Option<PromptCacheMetadata>,
+    /// Typed record of request-time tool-result image elision in `messages`
+    /// (see [`apply_tool_result_image_budget`]). Empty preserves the exact
+    /// prior wire.
+    #[serde(default, skip_serializing_if = "ToolResultImageProjection::is_empty")]
+    pub tool_result_image_projection: ToolResultImageProjection,
 }
 
 pub(crate) struct StagedAttachmentMove {
@@ -2715,6 +2960,8 @@ pub enum ProviderTimeoutReason {
     /// No bytes or frames within the logical operation budget, across retries.
     IdleTimeout,
     DeadlineExhausted,
+    /// Request body did not finish uploading within its size-based budget.
+    RequestUpload,
     /// Request execution began, but response headers did not open within the
     /// provider's configured transport budget.
     ResponseOpen,
@@ -2776,8 +3023,10 @@ pub enum ProviderErrorKind {
     ConnectionConfiguration,
 }
 
-/// Typed failure yielded by a provider stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Typed failure yielded by a provider stream. Equality compares the
+/// serialized (wire/journal) fields only; the owner-local raw detail and the
+/// untrusted-message marker are process-local metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
@@ -2798,11 +3047,156 @@ pub struct ProviderError {
     pub timeout_reason: Option<ProviderTimeoutReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<ProviderIdleTimeout>,
+    /// OWNER-LOCAL ONLY: credential-redacted provider text that matched no
+    /// known template. Never serialized with the error (serialized provider
+    /// errors reach journal extensions and child/peer projections); core
+    /// moves it into the RunFailed presentation's `provider_raw_detail`,
+    /// which shareable surfaces strip.
+    #[serde(skip)]
+    pub provider_raw_detail: Option<String>,
+    /// `message` interpolates provider- or child-controlled values (frame
+    /// fields, decoder errors, agent-offered ids). Such a message is
+    /// published only when it matches a known template. Not serialized: a
+    /// serialized error already carries its public message.
+    #[serde(skip)]
+    message_untrusted: bool,
+    /// Process-local: the provider prose behind `presentation.detail` and the
+    /// evidence gathered so far, so a later corroboration step (captured
+    /// request id, requested model, request tool-call ids) can re-decide
+    /// between a template rendering and "details withheld". Never serialized.
+    #[serde(skip)]
+    prose_state: Option<Box<ProseState>>,
 }
+
+/// What Haider itself sent for a failed provider request; see
+/// [`ProviderError::corroborate_slots`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderSlotEvidence {
+    pub requested_model: Option<String>,
+    pub tool_call_ids: Vec<String>,
+}
+
+impl ProviderSlotEvidence {
+    /// Model id and every tool-call id the request carries.
+    #[must_use]
+    pub fn from_request(request: &TurnRequest) -> Self {
+        let tool_call_ids = request
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                Block::ToolCall { call_id, .. } | Block::ToolResult { call_id, .. } => {
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        Self {
+            requested_model: Some(request.model.clone()),
+            tool_call_ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProseState {
+    prose: String,
+    default_detail: String,
+    raw_from_prose: bool,
+    evidence: ProviderSlotEvidence,
+    captured_request_id: Option<String>,
+}
+
+impl PartialEq for ProviderError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.message == other.message
+            && self.retryable == other.retryable
+            && self.retry_after_ms == other.retry_after_ms
+            && self.opened_within_ms == other.opened_within_ms
+            && self.budget_ms == other.budget_ms
+            && self.presentation == other.presentation
+            && self.timeout_reason == other.timeout_reason
+            && self.idle_timeout == other.idle_timeout
+    }
+}
+
+impl Eq for ProviderError {}
 
 impl ProviderError {
     pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
         Self::new_with_presentation(kind, message, provider_error_presentation(kind))
+    }
+
+    /// The only message form core may persist in `RunFailed` (and the form
+    /// every shareable projection of a provider error uses). Haider-authored
+    /// adapter messages (fixed HTTP/stream templates, local timeout
+    /// telemetry) are published as written. A message marked untrusted
+    /// ([`Self::with_untrusted_message`]) is published only when it matches a
+    /// known provider template; otherwise the provider-class default
+    /// explanation replaces it and [`Self::local_message_detail`] keeps the
+    /// raw text for owner-local surfaces.
+    #[must_use]
+    pub fn public_message(&self) -> String {
+        if !self.message_untrusted || self.timeout_reason.is_some() {
+            return self.to_string();
+        }
+        format!(
+            "{:?}: {}",
+            self.kind,
+            public_provider_message(self.kind, &self.message)
+        )
+    }
+
+    /// Marks `message` as carrying provider- or child-controlled text. An
+    /// untrusted message that matches no template is recorded once, here, as
+    /// the owner-local raw detail; clearing `provider_raw_detail` (lockdown)
+    /// therefore removes it for good — nothing re-derives it later.
+    #[must_use]
+    pub fn with_untrusted_message(mut self) -> Self {
+        self.message_untrusted = true;
+        if self.provider_raw_detail.is_none()
+            && self.timeout_reason.is_none()
+            && crate::error_templates::render_known_provider_message(&self.message).is_none()
+        {
+            self.provider_raw_detail = Some(crate::error_detail::local_raw_detail(&self.message));
+        }
+        self
+    }
+
+    /// The provider's own error prose, kept in process memory only (never
+    /// serialized, never published) for local decisions such as parsing a
+    /// stated output-token maximum.
+    #[must_use]
+    pub(crate) fn provider_prose(&self) -> Option<&str> {
+        self.prose_state.as_ref().map(|state| state.prose.as_str())
+    }
+
+    /// Owner-local raw text for this error (unknown provider prose, or an
+    /// untrusted message that matched no template; credential-redacted).
+    /// `None` once a lockdown gate cleared it.
+    #[must_use]
+    pub fn local_message_detail(&self) -> Option<String> {
+        self.provider_raw_detail.clone()
+    }
+
+    /// A copy safe for serialization into journal extensions and other
+    /// shareable projections: the message is [`Self::public_message`]'s text
+    /// and no owner-local field survives.
+    #[must_use]
+    pub fn shareable(&self) -> Self {
+        let mut shareable = self.clone();
+        if self.message_untrusted && self.timeout_reason.is_none() {
+            shareable.message = public_provider_message(self.kind, &self.message);
+        }
+        shareable.message_untrusted = false;
+        shareable.provider_raw_detail = None;
+        shareable.presentation.strip_local_only();
+        shareable.idle_timeout = self
+            .idle_timeout
+            .as_ref()
+            .map(ProviderIdleTimeout::shareable);
+        shareable
     }
 
     fn new_with_presentation(
@@ -2820,6 +3214,9 @@ impl ProviderError {
             presentation,
             timeout_reason: None,
             idle_timeout: None,
+            provider_raw_detail: None,
+            message_untrusted: false,
+            prose_state: None,
         }
     }
 
@@ -2834,10 +3231,99 @@ impl ProviderError {
 
     #[must_use]
     pub fn with_http_metadata(mut self, status: u16, request_id: Option<&str>) -> Self {
+        let captured = request_id.map(str::to_owned);
+        let request_id = request_id.and_then(crate::error_detail::safe_request_id);
         self.presentation = self
             .presentation
             .with_http_status(status)
             .with_request_id(request_id);
+        if let Some(state) = self.prose_state.as_mut() {
+            state.captured_request_id = captured;
+            self.redecide_prose();
+        }
+        self
+    }
+
+    /// Re-decides a template rendering with what Haider sent for the failed
+    /// request: `{model}` and `{tool_call_id}` slots publish only values
+    /// equal to the requested model or a tool-call id in the request.
+    /// Without this call such templates stay withheld (fail closed).
+    pub fn corroborate_slots(&mut self, evidence: &ProviderSlotEvidence) {
+        if let Some(state) = self.prose_state.as_mut() {
+            state.evidence = evidence.clone();
+            self.redecide_prose();
+        }
+    }
+
+    fn redecide_prose(&mut self) {
+        use crate::error_detail::ProviderProse;
+        let Some(state) = self.prose_state.as_ref() else {
+            return;
+        };
+        let evidence = crate::error_templates::SlotEvidence {
+            requested_model: state.evidence.requested_model.as_deref(),
+            tool_call_ids: &state.evidence.tool_call_ids,
+            captured_request_id: state.captured_request_id.as_deref(),
+        };
+        let Some(prose) =
+            crate::error_detail::classify_provider_prose_with(&state.prose, &evidence)
+        else {
+            return;
+        };
+        let withheld = format!(
+            "{} · {}",
+            state.default_detail,
+            haider_protocol::error::PROVIDER_DETAIL_WITHHELD
+        );
+        let raw_from_prose = state.raw_from_prose;
+        let (detail, local_raw) = match prose {
+            ProviderProse::Known(rendered) => (rendered, None),
+            ProviderProse::Unknown { local_raw } => (withheld, Some(local_raw)),
+            ProviderProse::Withheld => (withheld, None),
+        };
+        if raw_from_prose {
+            self.provider_raw_detail = local_raw;
+        }
+        self.replace_detail(&detail);
+    }
+
+    /// Owner-local raw text that is not the published prose itself (for
+    /// example an ACP stderr tail next to a known RPC message); later
+    /// corroboration never discards it.
+    pub(crate) fn with_local_raw_detail(mut self, raw: String) -> Self {
+        self.provider_raw_detail = Some(raw);
+        if let Some(state) = self.prose_state.as_mut() {
+            state.raw_from_prose = false;
+        }
+        self
+    }
+
+    fn replace_detail(&mut self, detail: &str) {
+        let mut presentation = ErrorPresentation::new(
+            self.presentation.subcode.as_str(),
+            &self.presentation.title,
+            detail,
+            self.presentation.scope,
+            self.presentation.allowed_actions.clone(),
+        );
+        presentation.provider_http_status = self.presentation.provider_http_status;
+        presentation
+            .provider_request_id
+            .clone_from(&self.presentation.provider_request_id);
+        presentation
+            .provider_error_type
+            .clone_from(&self.presentation.provider_error_type);
+        presentation.retry_after_ms = self.presentation.retry_after_ms;
+        presentation.reset_at_ms = self.presentation.reset_at_ms;
+        presentation.opened_within_ms = self.presentation.opened_within_ms;
+        presentation.budget_ms = self.presentation.budget_ms;
+        self.presentation = presentation;
+    }
+
+    #[must_use]
+    pub(crate) fn with_provider_error_type(mut self, error_type: Option<&str>) -> Self {
+        let error_type = error_type.and_then(crate::error_detail::safe_error_type);
+        self.presentation = self.presentation.with_provider_error_type(error_type);
         self
     }
 
@@ -2866,27 +3352,27 @@ impl ProviderError {
     }
 
     /// Replaces only the operator-facing explanation while retaining the
-    /// typed recovery contract and provider metadata. The presentation
-    /// constructor supplies the durable public-text bound and control-byte
-    /// sanitization; adapters must redact credentials before calling this.
+    /// typed recovery contract and provider metadata. This is the single
+    /// provider-prose boundary: adapters (including ACP stderr tails) pass
+    /// raw, untrusted prose here. Prose matching a known template renders
+    /// from it; anything else keeps the provider-class default explanation
+    /// plus the fixed withheld notice, and its credential-redacted raw text
+    /// is kept only in the owner-local `provider_raw_detail`. Blank prose
+    /// leaves the existing presentation untouched.
     #[must_use]
     pub(crate) fn with_provider_detail(mut self, detail: &str) -> Self {
-        let mut presentation = ErrorPresentation::new(
-            self.presentation.subcode.as_str(),
-            &self.presentation.title,
-            detail,
-            self.presentation.scope,
-            self.presentation.allowed_actions.clone(),
-        );
-        presentation.provider_http_status = self.presentation.provider_http_status;
-        presentation
-            .provider_request_id
-            .clone_from(&self.presentation.provider_request_id);
-        presentation.retry_after_ms = self.presentation.retry_after_ms;
-        presentation.reset_at_ms = self.presentation.reset_at_ms;
-        presentation.opened_within_ms = self.presentation.opened_within_ms;
-        presentation.budget_ms = self.presentation.budget_ms;
-        self.presentation = presentation;
+        let prose = detail.trim();
+        if prose.is_empty() {
+            return self;
+        }
+        self.prose_state = Some(Box::new(ProseState {
+            prose: prose.to_owned(),
+            default_detail: self.presentation.detail.clone(),
+            raw_from_prose: true,
+            evidence: ProviderSlotEvidence::default(),
+            captured_request_id: None,
+        }));
+        self.redecide_prose();
         self
     }
 }
@@ -3166,7 +3652,7 @@ pub(crate) fn reqwest_transport_error_with_route_gating(
     } else {
         ProviderError::new(
             ProviderErrorKind::Transport,
-            format!("{provider} HTTP transport failed: {error}"),
+            format!("{provider} HTTP transport failed"),
         )
     }
 }
@@ -3178,6 +3664,19 @@ impl fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+/// Publishes a `ProviderError.message` candidate that carries provider- or
+/// child-controlled text: its known-template rendering, or else the
+/// provider-class default explanation, so raw text never survives.
+pub(crate) fn public_provider_message(kind: ProviderErrorKind, raw: &str) -> String {
+    crate::error_templates::render_known_provider_message(raw)
+        .unwrap_or_else(|| provider_default_detail(kind))
+}
+
+/// The provider-class default explanation shown when prose is withheld.
+pub(crate) fn provider_default_detail(kind: ProviderErrorKind) -> String {
+    provider_error_presentation(kind).detail
+}
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -3561,6 +4060,20 @@ pub enum FakeStep {
     ExpectToolResult {
         call_id: String,
     },
+    /// Fails the request with a provider error whose message carries
+    /// provider-controlled text (as adapters' malformed-frame errors do).
+    ErrorUntrustedMessage {
+        kind: ProviderErrorKind,
+        message: String,
+    },
+    /// Fails the request with the error the real adapter classifies from a
+    /// captured HTTP error body (`family`: `anthropic`, `openai` — also
+    /// DeepSeek and other OpenAI-compatible APIs — or `gemini`).
+    ReplayHttpError {
+        family: String,
+        status: u16,
+        body: String,
+    },
     EmitText {
         text: String,
     },
@@ -3828,6 +4341,8 @@ impl FakeProvider {
                 self.script[end - 1],
                 FakeStep::Finish { .. }
                     | FakeStep::Error { .. }
+                    | FakeStep::ErrorUntrustedMessage { .. }
+                    | FakeStep::ReplayHttpError { .. }
                     | FakeStep::ErrorPresented { .. }
                     | FakeStep::Hang
                     | FakeStep::PrematureEof
@@ -4022,6 +4537,27 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 let _ = sender
                     .send(Err(
                         ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+                    ))
+                    .await;
+                return;
+            }
+            FakeStep::ReplayHttpError {
+                family,
+                status,
+                body,
+            } => {
+                let error = match family.as_str() {
+                    "anthropic" => replay_anthropic_http_error(status, None, body.as_bytes()),
+                    "gemini" => replay_gemini_http_error(status, None, body.as_bytes()),
+                    _ => replay_openai_http_error(status, None, body.as_bytes()),
+                };
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            FakeStep::ErrorUntrustedMessage { kind, message } => {
+                let _ = sender
+                    .send(Err(
+                        ProviderError::new(kind, message).with_untrusted_message()
                     ))
                     .await;
                 return;
@@ -4613,7 +5149,8 @@ mod e2_contract_tests {
 
     #[test]
     fn e2a_provider_429_presentation_carries_retry_metadata_and_safe_explanation() {
-        const DETAIL: &str = "Rate limit reached for this account.";
+        // A known template (ruling 2): unknown prose would be withheld.
+        const DETAIL: &str = "Resource has been exhausted (e.g. check quota).";
         const SECRET: &str = "RAW_SECRET_MUST_NEVER_RENDER_98c4";
         let body = format!(
             r#"{{"error":{{"type":"rate_limit_error","message":"{DETAIL}"}},"api_key":"{SECRET}"}}"#
