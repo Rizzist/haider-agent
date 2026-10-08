@@ -1723,6 +1723,144 @@ fn picker_and_daemon_share_configured_availability_for_every_provider_kind() {
 
 #[test]
 fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
+    fn publish(
+        driver: &mut LiveDriver,
+        model: &mut AppModel,
+        kind: u8,
+        summary: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+    ) {
+        match kind {
+            0 => pass(
+                driver,
+                model,
+                LiveReply::Providers {
+                    providers: vec![summary],
+                    revision,
+                },
+            ),
+            1 => pass(
+                driver,
+                model,
+                LiveReply::ProviderModelsRefreshed {
+                    provider: summary,
+                    revision,
+                },
+            ),
+            _ => {
+                model.apply_default_model_set(summary, revision);
+                model.bootstrap_identity_from_daemon();
+            }
+        }
+    }
+
+    // Accepted full, refresh, and default publications supersede buffered
+    // evidence even when their revision is equal. Rejected older replies do
+    // not erase a valid pending projection.
+    for kind in 0..3 {
+        for publication_revision in [1, 2, 3] {
+            let mut model = live_model();
+            let mut driver = LiveDriver::new("superseded-listing-proof");
+            let mut previous = oauth_descriptor("custom", "previous", true);
+            previous.incarnation = 1;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![previous],
+                    revision: Some(1),
+                    sources: vec![],
+                },
+            );
+            let mut summary = private_summary(2, "deployment");
+            summary.configured_models = vec!["deployment".into()];
+            summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+            summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+            summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+            publish(&mut driver, &mut model, 0, summary.clone(), 2);
+            summary.models.clear();
+            summary.model_details.clear();
+            summary.inventory = haider_rpc::ModelInventoryWire::NeverFetched;
+            publish(&mut driver, &mut model, kind, summary, publication_revision);
+            let mut current = oauth_descriptor("custom", "work", true);
+            current.incarnation = 2;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![current],
+                    revision: Some(3),
+                    sources: vec![],
+                },
+            );
+            assert_eq!(
+                model.providers.providers[0].model_is_selectable("deployment"),
+                publication_revision == 1,
+                "replacement={kind} publication={publication_revision}"
+            );
+        }
+
+        // Two rapid switches can publish A's newer catalog before B's
+        // delayed account reply. That reply cannot revive B's old buffer or
+        // overwrite the new A projection waiting for its own account proof.
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("superseded-account-proof");
+        let mut account_a = oauth_descriptor("custom", "work", true);
+        account_a.incarnation = 1;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account_a.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        let mut summary_b = private_summary(2, "retired-B");
+        summary_b
+            .catalog_scope
+            .as_mut()
+            .expect("scoped private summary")
+            .account_alias = Some("second".into());
+        publish(&mut driver, &mut model, 0, summary_b, 2);
+        publish(
+            &mut driver,
+            &mut model,
+            kind,
+            private_summary(1, "latest-A"),
+            3,
+        );
+        let mut account_b = oauth_descriptor("custom", "second", true);
+        account_b.incarnation = 2;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account_b],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        assert!(
+            model.providers.providers[0].models.is_empty(),
+            "replacement={kind}"
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account_a],
+                revision: Some(3),
+                sources: vec![],
+            },
+        );
+        assert_eq!(
+            model.providers.providers[0].models,
+            ["latest-A"],
+            "replacement={kind}"
+        );
+    }
+
     // A same/older publication cannot assert a different active owner.
     // A later account reply must not revive that discarded listing proof.
     for previous_incarnation in [1, 42] {

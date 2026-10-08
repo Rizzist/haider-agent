@@ -1131,6 +1131,9 @@ impl std::fmt::Debug for CustomProviderCard {
 #[derive(Debug, Default)]
 pub struct ProvidersState {
     pub providers: Vec<haider_rpc::ProviderSummaryWire>,
+    /// Complete projections waiting for their active account proof. A new
+    /// accepted publication supersedes the buffered projection it replaces.
+    pending_catalogs: HashMap<String, haider_rpc::ProviderSummaryWire>,
     pub revision: Option<u64>,
     pub message: Option<String>,
     /// In-flight `account.set_default_model`: (provider, model).
@@ -1224,6 +1227,7 @@ impl ProvidersState {
         {
             return false;
         }
+        self.pending_catalogs.clear();
         self.providers = providers
             .into_iter()
             .map(normalize_provider_inventory)
@@ -1263,6 +1267,7 @@ impl ProvidersState {
         {
             return false;
         }
+        self.pending_catalogs.remove(&summary.provider);
         if let Some(slot) = self
             .providers
             .iter_mut()
@@ -1288,6 +1293,7 @@ impl ProvidersState {
         {
             return false;
         }
+        self.pending_catalogs.remove(&summary.provider);
         if let Some(slot) = self
             .providers
             .iter_mut()
@@ -5345,7 +5351,6 @@ pub struct AppModel {
     identity_unowned_configuration: bool,
     session_catalog_keys: HashMap<SessionId, (String, String, Option<String>)>,
     session_catalog_routes: HashMap<SessionId, (Option<String>, Option<String>)>,
-    pending_catalogs: HashMap<String, haider_rpc::ProviderSummaryWire>,
     /// The ACTIVE surface's composer (TUI5): text + first-class cursor +
     /// selection + input ring. Nothing in it persists (item 8).
     pub composer: crate::composer::Composer,
@@ -6095,7 +6100,6 @@ impl Default for AppModel {
             identity_unowned_configuration: false,
             session_catalog_keys: HashMap::new(),
             session_catalog_routes: HashMap::new(),
-            pending_catalogs: HashMap::new(),
             composer: crate::composer::Composer::new(),
             mirrored_input_attachments: None,
             drafts: std::collections::HashMap::new(),
@@ -12119,7 +12123,7 @@ impl AppModel {
                     .map(|incarnation| (row.provider.clone(), (row.alias.clone(), *incarnation)))
             })
             .collect::<HashMap<_, _>>();
-        self.pending_catalogs.retain(|provider, summary| {
+        self.providers.pending_catalogs.retain(|provider, summary| {
             let Some(scope) = summary.catalog_scope.as_ref() else {
                 return false;
             };
@@ -12156,16 +12160,18 @@ impl AppModel {
             // Empty listings carry successful-discovery evidence too. Hold
             // the complete projection until its exact active owner arrives.
             if catalogs_ahead {
-                let already_fenced =
-                    self.pending_catalogs
-                        .get(&summary.provider)
-                        .is_some_and(|pending| {
-                            let mut fenced = pending.clone();
-                            retire_fetched_catalog(&mut fenced);
-                            fenced == *summary
-                        });
+                let already_fenced = self
+                    .providers
+                    .pending_catalogs
+                    .get(&summary.provider)
+                    .is_some_and(|pending| {
+                        let mut fenced = pending.clone();
+                        retire_fetched_catalog(&mut fenced);
+                        fenced == *summary
+                    });
                 if !already_fenced {
-                    self.pending_catalogs
+                    self.providers
+                        .pending_catalogs
                         .insert(summary.provider.clone(), summary.clone());
                 }
             }

@@ -179,3 +179,5 @@ producer key, so a queued choice cannot become explicit configuration. Unsupport
 Azure-listing evidence belongs to its route and cannot authorize another account.
 
 TUI snapshots use management revisions to hold a provider projection that arrives before its active-account proof. The whole projection is retained, including an empty successful list. Account incarnations are compared for exact ownership, never ordered to infer which account will become active. This also preserves stale-success selection when an existing account with an older incarnation is activated.
+
+An accepted provider publication replaces its pending projection as well as its visible summary. Full snapshots retire all prior buffers; a model refresh or default change retires only that provider's buffer. Rejected older replies preserve pending evidence. A delayed account reply therefore cannot restore evidence superseded by a newer publication, even across rapid switches back to the original account.
