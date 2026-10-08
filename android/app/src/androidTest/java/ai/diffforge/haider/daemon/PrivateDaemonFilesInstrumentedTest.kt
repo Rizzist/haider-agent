@@ -10,10 +10,81 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.io.FileInputStream
 import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class PrivateDaemonFilesInstrumentedTest {
+    private fun descriptorCount() = requireNotNull(File("/dev/fd").list()).size
+
+    private fun withFixture(use: (File) -> Unit) {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val root = File(context.cacheDir, "fd-test-${UUID.randomUUID()}").apply { mkdir() }
+        try { use(root) } finally { root.deleteRecursively() }
+    }
+
+    @Test fun privateStoresCloseDescriptorsAcrossRepeatedGenerations() = withFixture { root ->
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val fixtureContext = object : ContextWrapper(context) { override fun getNoBackupFilesDir() = root }
+        val file = File(PrivateDaemonFiles.directory(root, "keys"), "synthetic-wrapped-dek")
+        val key = object : DekWrappingKey {
+            var created = false
+            override fun exists() = created
+            override fun create() { created = true }
+            override fun wrap(dek: ByteArray) = dek.copyOf(64)
+            override fun unwrap(blob: ByteArray) = blob.copyOf(32)
+        }
+        val storage = object : WrappedDekStorage {
+            override fun exists() = PrivateDaemonFiles.exists(file)
+            override fun credentialsExist() = false
+            override fun read() = PrivateDaemonFiles.read(file, 64)
+            override fun write(blob: ByteArray) = PrivateDaemonFiles.write(file, blob)
+        }
+        fun generation() {
+            val store = FileDaemonLifecycleStore(fixtureContext)
+            val state = store.load().copy(enabled = true)
+            store.save(state.copy(active = true))
+            VaultDekStore(key, storage).withDek { 0 }
+            store.save(state.copy(active = false))
+            assertEquals(state.copy(active = false), store.load())
+        }
+        generation() // Warm class initialization and the first wrapped-file publication.
+        val baseline = descriptorCount()
+        repeat(32) {
+            generation()
+            assertEquals("Private stores leaked at generation $it", baseline, descriptorCount())
+        }
+        // Closing private store handles must not close an unrelated caller's file.
+        FileInputStream(file).use { caller ->
+            assertEquals(baseline + 1, descriptorCount())
+            generation()
+            assertTrue(caller.read() >= 0)
+            assertEquals(baseline + 1, descriptorCount())
+        }
+        assertEquals(baseline, descriptorCount())
+    }
+
+    @Test fun rejectedReadsAndFailedAtomicPublicationCloseDescriptors() = withFixture { root ->
+        val empty = File(root, "empty").apply { writeBytes(byteArrayOf()) }
+        val oversized = File(root, "oversized").apply { writeBytes(ByteArray(5)) }
+        val destinationDirectory = File(root, "directory").apply { mkdir() }
+        fun failures() {
+            for (file in listOf(empty, oversized, destinationDirectory)) {
+                try { PrivateDaemonFiles.read(file, 4); fail("Invalid read must fail") }
+                catch (_: IllegalArgumentException) { }
+            }
+            try { PrivateDaemonFiles.write(destinationDirectory, byteArrayOf(1)); fail("Rename must fail") }
+            catch (_: android.system.ErrnoException) { }
+        }
+        failures()
+        val baseline = descriptorCount()
+        repeat(32) {
+            failures()
+            assertEquals("Failure path leaked at iteration $it", baseline, descriptorCount())
+        }
+        assertEquals(setOf("empty", "oversized", "directory"), requireNotNull(root.list()).toSet())
+    }
+
     @Test fun appSelinuxAllowsPathHandlesForPrivateDirectoryAncestors() {
         val root = InstrumentationRegistry.getInstrumentation().targetContext.filesDir.canonicalFile
         // Linux O_PATH is not exposed by Android's public OsConstants API.
