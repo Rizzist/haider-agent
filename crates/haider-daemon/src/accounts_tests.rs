@@ -267,6 +267,11 @@ async fn auth_retry_refuses_non_live_issued_bundle() {
         broker,
     );
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
