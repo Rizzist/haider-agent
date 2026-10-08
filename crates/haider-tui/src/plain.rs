@@ -202,7 +202,7 @@ fn render_plain_impl_with_status(
                 }
             }
             TranscriptEntry::Item(block) => render_item(&mut out, block, paths),
-            TranscriptEntry::Note { text } => {
+            TranscriptEntry::Note { text, .. } => {
                 out.push_str(text);
                 out.push('\n');
             }

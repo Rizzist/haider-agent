@@ -1391,6 +1391,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     );
     assert!(reset_seq > compaction_seq);
     assert_eq!(reset.truth, ContextFootprintTruth::Estimated);
+    assert_eq!(reset.selection_epoch, Some(0));
     assert_eq!(reset.context_window, Some(32_000));
     assert!(reset.used_tokens > summary_only_tokens);
     assert!(reset.used_tokens < 32_000);

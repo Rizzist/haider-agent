@@ -1290,6 +1290,61 @@ async fn create_fork_ready_source(
     (source, node_id, seq)
 }
 
+#[tokio::test]
+async fn daemon_fork_keeps_the_explicit_account_and_endpoint_route() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let (source, node, seq) = create_fork_ready_source(&hub, &store, "explicit-route-fork").await;
+    let rebind_json =
+        r#"{"provider":"fake","base_url":"https://synthetic.invalid","account":"bed-b"}"#
+            .to_owned();
+    hub.rebind_session_provider(haider_store::SessionProviderRebindCommand {
+        command_id: "explicit-route-parent-rebind".into(),
+        request_digest: blake3::hash(rebind_json.as_bytes()).to_hex().to_string(),
+        request_json: rebind_json,
+        session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "fake".into(),
+        base_url: Some("https://synthetic.invalid".into()),
+        account: Some("bed-b".into()),
+        event_id: EventId::new("explicit-route-parent-rebound"),
+        device_id: DeviceId::new("worker-law-test"),
+    })
+    .await
+    .expect("explicit parent rebind");
+    let parent = store
+        .session_metadata(&source)
+        .await
+        .expect("parent metadata")
+        .expect("typed");
+    let child = SessionId::new("explicit-route-fork-child");
+    hub.fork_session(private_fork_command(
+        &store,
+        "explicit-route",
+        source.clone(),
+        child.clone(),
+        node,
+        seq,
+    ))
+    .await
+    .expect("daemon fork");
+    let copied = store
+        .session_metadata(&child)
+        .await
+        .expect("child metadata")
+        .expect("typed");
+    assert_eq!(copied.account_alias, parent.account_alias);
+    assert_eq!(copied.provider_base_url, parent.provider_base_url);
+    assert_eq!(copied.provider_rebind_id, parent.provider_rebind_id);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 async fn observe_fork_outcome(
     hub: &SessionHub,
     session: &SessionId,
@@ -2379,11 +2434,16 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         created_at_ms: None,
     };
     let mut provider = provider_summary("fake");
-    provider.models = vec!["fake-v1".into()];
+    provider.models = vec!["fake-v1".into(), "fake-v2".into()];
     provider.default_model = Some("fake-v1".into());
     let active_other = haider_protocol::credential::CredentialDescriptor {
         alias: haider_protocol::ids::CredentialAlias::new("active-other"),
         provider: "other".into(),
+        active: true,
+        ..descriptor.clone()
+    };
+    let active_fake = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("active-fake"),
         active: true,
         ..descriptor.clone()
     };
@@ -2393,10 +2453,14 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
         oauth: None,
-        snapshot: Arc::new(Mutex::new(vec![descriptor.clone(), active_other.clone()])),
+        snapshot: Arc::new(Mutex::new(vec![
+            descriptor.clone(),
+            active_fake.clone(),
+            active_other.clone(),
+        ])),
         management: crate::accounts::ManagementSnapshot::new(
             0,
-            vec![descriptor, active_other],
+            vec![descriptor, active_fake, active_other],
             vec![provider, other_provider],
         ),
         vault_supported: false,
@@ -2469,10 +2533,305 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         metadata.interaction_mode,
         haider_protocol::session::SessionInteractionModeV1::Autonomous
     );
+    let pinned_id = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { session_id, .. },
+            } if request_id.as_str() == "resolved-create" => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("pinned id");
+
+    // An ordinary create follows the provider's active account on each
+    // turn. The RPC must not turn that mutable default into an explicit pin.
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("ordinary-create"),
+            RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: haider_rpc::CommandId::new("ordinary-create-command"),
+                cwd: std::env::current_dir()
+                    .expect("cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                provider: "fake".into(),
+                model: "fake-v1".into(),
+                max_tokens: 4_096,
+                permission_overrides: None,
+                workspace_allocation: None,
+                cache_policy: None,
+                interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
+                ssh_scope: None,
+                account_alias: None,
+                resolve_provider: false,
+                resolve_model: false,
+                effort: None,
+                fast: None,
+            },
+        )
+        .await
+        .expect("ordinary create request");
+    let ordinary = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { metadata, .. },
+            } if request_id.as_str() == "ordinary-create" => Some(metadata.clone()),
+            _ => None,
+        })
+        .expect("ordinary create response");
+    assert_eq!(ordinary.account_alias, None);
+
+    let ordinary_id = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { session_id, .. },
+            } if request_id.as_str() == "ordinary-create" => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("ordinary session id");
+    connection
+        .request(
+            RequestId::new("ordinary-attach"),
+            RequestBody::SessionAttach {
+                session_id: ordinary_id.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attach");
+    let select = |command: &str, provider: Option<&str>, model: &str, max_tokens| {
+        RequestBody::SessionSelectModel {
+            command_id: haider_rpc::CommandId::new(command),
+            session_id: ordinary_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: provider.map(str::to_owned),
+            model: model.to_owned(),
+            confirm_new_epoch: true,
+            max_tokens,
+        }
+    };
+    let initial_epoch = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("initial metadata")
+        .expect("typed metadata")
+        .selection_epoch;
+    connection
+        .request(
+            RequestId::new("ordinary-noop"),
+            select("ordinary-noop-command", None, "fake-v1", None),
+        )
+        .await
+        .expect("no-op selection");
+    let no_op = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("no-op metadata")
+        .expect("typed metadata");
+    assert_eq!(no_op.account_alias, None);
+    assert_eq!(no_op.selection_epoch, initial_epoch);
+    connection
+        .request(
+            RequestId::new("ordinary-budget"),
+            select("ordinary-budget-command", None, "fake-v1", Some(2_048)),
+        )
+        .await
+        .expect("budget selection");
+    let budget = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("budget metadata")
+        .expect("typed metadata");
+    assert_eq!(budget.account_alias, None);
+    assert_eq!(budget.max_tokens, 2_048);
+    connection
+        .request(
+            RequestId::new("ordinary-model"),
+            select("ordinary-model-command", None, "fake-v2", None),
+        )
+        .await
+        .expect("model selection");
+    let model = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("model metadata")
+        .expect("typed metadata");
+    assert_eq!(model.account_alias, None);
+    assert_eq!(model.model, "fake-v2");
+    connection
+        .request(
+            RequestId::new("ordinary-provider"),
+            select("ordinary-provider-command", Some("other"), "other-v1", None),
+        )
+        .await
+        .expect("provider selection");
+    let provider = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("provider metadata")
+        .expect("typed metadata");
+    assert_eq!(provider.account_alias, None);
+    assert_eq!(
+        (&*provider.provider, &*provider.model),
+        ("other", "other-v1")
+    );
+
+    // A separate explicit create pin survives a same-provider model choice.
+    // Changing providers clears that pin, because the alias belongs to fake.
+    connection
+        .request(
+            RequestId::new("pinned-attach"),
+            RequestBody::SessionAttach {
+                session_id: pinned_id.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("pinned attach");
+    for (name, provider, model, expected_alias) in [
+        ("same", None, "fake-v2", Some("selected-fake")),
+        ("cross", Some("other"), "other-v1", None),
+    ] {
+        connection
+            .request(
+                RequestId::new(format!("pinned-{name}")),
+                RequestBody::SessionSelectModel {
+                    command_id: haider_rpc::CommandId::new(format!("pinned-{name}-command")),
+                    session_id: pinned_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    provider: provider.map(str::to_owned),
+                    model: model.to_owned(),
+                    confirm_new_epoch: true,
+                    max_tokens: None,
+                },
+            )
+            .await
+            .expect("pinned selection");
+        let metadata = store
+            .session_metadata(&pinned_id)
+            .await
+            .expect("pinned metadata")
+            .expect("typed metadata");
+        assert_eq!(metadata.account_alias.as_deref(), expected_alias);
+    }
 
     drop(connection);
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn account_switch_preflight_does_not_pin_archived_or_child_sessions() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let archived = SessionId::new("archived-account-route");
+    store
+        .create_session(create_command(&archived, "archived-account-route"))
+        .await
+        .expect("archive fixture");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let child = SessionId::new("child-account-route");
+    hub.create_internal_session(create_command(&child, "child-account-route"))
+        .await
+        .expect("child fixture");
+    let before_archived = store
+        .session_metadata(&archived)
+        .await
+        .expect("archived metadata");
+    let before_child = store
+        .session_metadata(&child)
+        .await
+        .expect("child metadata");
+    let old = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("old-fake"),
+        provider: "fake".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "old fake account".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let new = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("new-fake"),
+        active: false,
+        ..old.clone()
+    };
+    let (login, mut queued) = tokio::sync::mpsc::channel(1);
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: Some(login),
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+        management: crate::accounts::ManagementSnapshot::new(
+            0,
+            vec![old, new],
+            vec![provider_summary("fake")],
+        ),
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(Mutex::new(Vec::new())),
+        vault: None,
+    })
+    .expect("accounts");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+            sink,
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("switch-preflight"),
+            RequestBody::AccountSetActive {
+                command_id: haider_rpc::CommandId::new("switch-preflight-command"),
+                alias: "new-fake".into(),
+                confirm_new_epoch: true,
+            },
+        )
+        .await
+        .expect("switch request");
+    assert!(matches!(
+        queued.try_recv(),
+        Ok(crate::accounts::AccountCommand::SetActive(_))
+    ));
+    assert_eq!(
+        store
+            .session_metadata(&archived)
+            .await
+            .expect("archived after"),
+        before_archived
+    );
+    assert_eq!(
+        store.session_metadata(&child).await.expect("child after"),
+        before_child
+    );
+    drop(connection);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
 }
 
 /// R2-03: absent storage is the canonical default `All` scope. A later
@@ -5820,8 +6179,13 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
     );
     fact.run_id = None;
     *fact.payload = haider_protocol::session::ModelSelected {
+        selection_epoch: None,
         provider: "fake-b".into(),
         model: "model-b".into(),
+        route_only: false,
+        cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     }
     .to_payload_value()
     .expect("fact serializes");

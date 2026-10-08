@@ -93,7 +93,7 @@ fn note_texts(model: &AppModel) -> Vec<String> {
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptEntry::Note { text } => Some(text.clone()),
+            TranscriptEntry::Note { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect()

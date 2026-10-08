@@ -34,6 +34,7 @@ fn live_model() -> AppModel {
 
 fn summary(id: &str, seen_at_ms: Option<u64>, last_activity_ms: Option<u64>) -> SessionSummary {
     let mut summary = SessionSummary {
+        latest_context_footprint: None,
         session_id: SessionId::new(id),
         head_seq: 4,
         worker_generation: 7,
@@ -73,6 +74,11 @@ fn seed(model: &mut AppModel, summary: SessionSummary) {
 
 fn metadata(title: &str, cwd: &str, model: &str, created_at_ms: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,

@@ -131,7 +131,7 @@ fn an_unpinned_identity_follows_the_imported_active_account() {
     assert_eq!(model.identity.account, "openai-oauth");
     assert_eq!(model.identity.model_short, "gpt-5.6-codex");
     assert!(
-        !model.identity_pinned,
+        !model.launcher_identity_pinned,
         "a bootstrap is not a user choice — later daemon truth may still move it"
     );
 }
@@ -176,7 +176,7 @@ fn fresh_oauth_login_adopts_static_model_after_catalog_403() {
     assert_eq!(model.identity.provider, "anthropic-oauth");
     assert_eq!(model.identity.account, "work");
     assert_eq!(model.identity.model_short, "claude-fable-5-1");
-    assert!(!model.identity_pinned);
+    assert!(!model.launcher_identity_pinned);
     model.open_model_picker(String::new());
     assert!(model.model_picker_rows().iter().any(|row| {
         row.provider == "anthropic-oauth" && row.model == "claude-fable-5-1" && row.selectable
@@ -184,7 +184,7 @@ fn fresh_oauth_login_adopts_static_model_after_catalog_403() {
 }
 
 /// MUTATION CHECK (W5f-2): make `bootstrap_identity_from_daemon` ignore
-/// `identity_pinned`. Expected runtime failure: the snapshot below
+/// `launcher_identity_pinned`. Expected runtime failure: the snapshot below
 /// overwrites the user's explicit `/model` pick.
 /// Verified by revert on 2026-07-30.
 #[test]
@@ -209,7 +209,10 @@ fn a_pinned_choice_survives_every_later_snapshot() {
     run_slash(&mut model, "/model o4-mini");
     model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
     assert_eq!(model.identity.model_short, "o4-mini");
-    assert!(model.identity_pinned, "/model is an explicit choice");
+    assert!(
+        model.launcher_identity_pinned,
+        "/model is an explicit choice"
+    );
 
     pass(
         &mut driver,
@@ -340,12 +343,12 @@ fn connecting_asks_for_account_and_provider_truth() {
     let boot = driver.boot();
     assert!(
         boot.iter()
-            .any(|command| matches!(command, LiveCommand::AccountList)),
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. })),
         "boot must ask for account truth: {boot:?}"
     );
     assert!(
         boot.iter()
-            .any(|command| matches!(command, LiveCommand::ProviderList)),
+            .any(|command| matches!(command, LiveCommand::ProviderListAt { .. })),
         "and provider truth: {boot:?}"
     );
 
@@ -359,14 +362,14 @@ fn connecting_asks_for_account_and_provider_truth() {
     assert!(
         pass.commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::AccountList)),
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. })),
         "a reconnect must ask for account truth: {:?}",
         pass.commands
     );
     assert!(
         pass.commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::ProviderList)),
+            .any(|command| matches!(command, LiveCommand::ProviderListAt { .. })),
         "and provider truth: {:?}",
         pass.commands
     );
@@ -395,7 +398,7 @@ fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
     assert!(
         pass.commands.iter().any(|command| matches!(
             command,
-            LiveCommand::RefreshProviderModels { provider } if provider == "openai-oauth"
+            LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai-oauth"
         )),
         "the active OAuth provider must have its catalog discovered: {:?}",
         pass.commands
@@ -417,7 +420,7 @@ fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
         !again
             .commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::RefreshProviderModels { .. })),
+            .any(|command| matches!(command, LiveCommand::RefreshProviderModelsAt { .. })),
         "discovery must not storm on every snapshot: {:?}",
         again.commands
     );
@@ -480,7 +483,7 @@ fn never_fetched_state_refreshes_even_when_legacy_rows_are_nonempty() {
         }),
         std::time::Instant::now(),
     );
-    assert!(pass.commands.iter().any(|command| matches!(command, LiveCommand::RefreshProviderModels { provider } if provider == "openai-oauth")));
+    assert!(pass.commands.iter().any(|command| matches!(command, LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai-oauth")));
     assert_eq!(
         model.identity.model_short, before,
         "never adopt a legacy seed before discovery"
