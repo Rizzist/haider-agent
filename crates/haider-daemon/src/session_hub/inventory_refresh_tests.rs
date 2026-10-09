@@ -39,10 +39,17 @@ fn selectable_uncertainty_does_not_refresh_during_admission() {
     ));
     summary.endpoint = Some("http://127.0.0.1:8080".into());
     summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
-    assert!(!provider_inventory_needs_refresh(
-        &summary,
-        "configured-model"
-    ));
+    for model in [
+        "configured-model",
+        "CONFIGURED_MODEL",
+        "configured.model",
+        "configured\u{2003}model",
+    ] {
+        assert!(
+            !provider_inventory_needs_refresh(&summary, model),
+            "fresh listed alias: {model}"
+        );
+    }
     assert!(provider_inventory_needs_refresh(&summary, "new-model"));
     summary.inventory = haider_rpc::ModelInventoryWire::Stale {
         fetched_at_ms: 1,
@@ -54,10 +61,17 @@ fn selectable_uncertainty_does_not_refresh_during_admission() {
     ));
     assert!(!provider_inventory_needs_refresh(&summary, "new-model"));
     summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Authoritative;
-    assert!(!provider_inventory_needs_refresh(
-        &summary,
-        "configured-model"
-    ));
+    for model in [
+        "configured-model",
+        "CONFIGURED_MODEL",
+        "configured.model",
+        "configured\u{2003}model",
+    ] {
+        assert!(
+            !provider_inventory_needs_refresh(&summary, model),
+            "stale authoritative alias: {model}"
+        );
+    }
     assert!(provider_inventory_needs_refresh(&summary, "new-model"));
     summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
     assert!(provider_inventory_needs_refresh(
@@ -106,17 +120,24 @@ fn configured_model_eligibility_does_not_trigger_admission_discovery() {
                 summary.availability = availability;
                 summary.configured_models = vec!["deployment".into()];
                 summary.models = vec!["other".into()];
-                assert!(
-                    !provider_inventory_needs_refresh(&summary, "deployment"),
-                    "{summary:?}"
-                );
-                if availability == haider_rpc::ProviderAvailabilityWire::Unavailable
-                    || matches!(inventory, haider_rpc::ModelInventoryWire::Fetched { .. })
-                {
+                for model in [
+                    "deployment",
+                    "DEPLOYMENT",
+                    "de.ploy_ment",
+                    "de\u{a0}ploy\u{2003}ment",
+                ] {
                     assert!(
-                        !summary.model_is_selectable("deployment"),
-                        "negative proof is still enforced"
+                        !provider_inventory_needs_refresh(&summary, model),
+                        "{model}: {summary:?}"
                     );
+                    if availability == haider_rpc::ProviderAvailabilityWire::Unavailable
+                        || matches!(inventory, haider_rpc::ModelInventoryWire::Fetched { .. })
+                    {
+                        assert!(
+                            !summary.model_is_selectable(model),
+                            "negative proof is still enforced for {model}"
+                        );
+                    }
                 }
             }
         }

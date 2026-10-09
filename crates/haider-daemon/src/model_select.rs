@@ -27,7 +27,7 @@
 
 use haider_rpc::{
     ModelInventoryAuthorityWire, ModelInventoryStatusWire, ProviderApiFamilyWire,
-    ProviderAvailabilityWire, ProviderSummaryWire,
+    ProviderAvailabilityWire, ProviderSummaryWire, normalize_model_selector,
 };
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -623,22 +623,10 @@ impl ModelSelectionAuthority {
             });
         }
         let resolved_model = summary
-            .and_then(|summary| {
-                summary
-                    .models
-                    .iter()
-                    .find(|known| known.as_str() == requested_model)
-                    .or_else(|| {
-                        let normalized = normalize_model_selector(requested_model);
-                        let mut matches = summary
-                            .models
-                            .iter()
-                            .filter(|known| normalize_model_selector(known) == normalized);
-                        let only = matches.next()?;
-                        matches.next().is_none().then_some(only)
-                    })
+            .map_or(requested_model, |summary| {
+                summary.canonical_model_selector(requested_model)
             })
-            .map_or_else(|| requested_model.to_owned(), Clone::clone);
+            .to_owned();
         let inventory_status = summary.map_or(ModelInventoryStatusWire::Unknown, |summary| {
             summary.model_inventory_status(&resolved_model)
         });
@@ -914,16 +902,6 @@ fn append_suggestion_guidance(message: &mut String, suggestions: &[String]) {
             suggestions.join(", ")
         ));
     }
-}
-
-/// Unicode-safe model selector key: lower-case scalar expansion, dropping
-/// only the punctuation/spacing family the public selector contract names.
-pub(crate) fn normalize_model_selector(selector: &str) -> String {
-    selector
-        .chars()
-        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '_' | '.'))
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn nearest_model_rows<'a>(

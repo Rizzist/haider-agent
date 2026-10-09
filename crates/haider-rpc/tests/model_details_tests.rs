@@ -485,3 +485,124 @@ fn static_catalog_does_not_admit_unfetched_extra_deployments() {
         "credential rejection still wins"
     );
 }
+
+#[test]
+fn selector_aliases_share_configured_negative_evidence_and_uncertainty() {
+    for (declared, aliases) in [
+        (
+            "deployment",
+            vec![
+                "deployment",
+                "DEPLOYMENT",
+                "de.ploy_ment",
+                " de-ploy ment ",
+                "\tDEPLOY\r\nMENT",
+                "de\u{a0}ploy\u{2003}ment",
+            ],
+        ),
+        (
+            "MÖDEL.東京 Δ",
+            vec!["MÖDEL.東京 Δ", "mödel_東京-δ", "MÖDEL\u{2003}東京.Δ"],
+        ),
+        ("İ-model", vec!["İ-model", "i\u{307}.mo_DEL"]),
+    ] {
+        for authority in ["advisory", "authoritative"] {
+            for catalog in ["public", "authenticated", "custom", "adapter", "offline"] {
+                let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+                    "provider":"work", "api_family":"openai_chat_completions", "enabled":true,
+                    "models":["healthy"], "configured_models":[declared], "catalog":catalog,
+                    "inventory_authority":authority,
+                    "inventory":{"state":"fetched", "fetched_at_ms":u64::MAX},
+                    "availability":"available"
+                }))
+                .expect("fresh successful inventory");
+                for alias in &aliases {
+                    assert_eq!(summary.canonical_model_selector(alias), declared);
+                    assert!(!summary.model_is_selectable(alias), "{catalog}: {alias}");
+                    assert_eq!(
+                        summary.selection_reason(Some(alias)).as_deref(),
+                        Some("deployment is absent from the latest model list")
+                    );
+                }
+                assert!(summary.model_is_selectable("HEALTHY"));
+                summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+                    fetched_at_ms: 1,
+                    reason: "server returned 503 for /models".into(),
+                };
+                for alias in &aliases {
+                    assert!(summary.model_is_selectable(alias), "stale success: {alias}");
+                    assert!(
+                        summary
+                            .selection_reason(Some(alias))
+                            .expect("visible uncertainty")
+                            .contains("503")
+                    );
+                }
+                summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+                summary.availability_reason =
+                    Some("configured (unverified): server returned 405 for /models".into());
+                for alias in &aliases {
+                    assert!(summary.model_is_selectable(alias));
+                }
+                summary.availability = ProviderAvailabilityWire::Unavailable;
+                summary.availability_reason = Some("authentication failed".into());
+                for alias in &aliases {
+                    assert!(!summary.model_is_selectable(alias));
+                    assert_eq!(
+                        summary.selection_reason(Some(alias)).as_deref(),
+                        Some("authentication failed")
+                    );
+                }
+            }
+        }
+    }
+    let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider":"work", "api_family":"openai_chat_completions", "enabled":true,
+        "models":["de-ployment"], "configured_models":["deployment"], "catalog":"custom",
+        "inventory_authority":"advisory", "inventory":{"state":"fetched", "fetched_at_ms":u64::MAX},
+        "availability":"available"
+    }))
+    .expect("literal priority controls");
+    assert!(!summary.model_is_selectable("deployment"));
+    assert!(summary.model_is_selectable("de-ployment"));
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "de-ployment"
+    );
+    assert!(summary.model_is_selectable("DEPLOY.MENT"));
+    assert_eq!(
+        summary.canonical_model_selector("future/model"),
+        "future/model"
+    );
+    assert!(summary.model_is_selectable("future/model"));
+    for literal in [
+        "deploy%6dent",
+        "de\u{2010}ployment",
+        "de\u{200b}ployment",
+        "deployment/",
+    ] {
+        assert_eq!(summary.canonical_model_selector(literal), literal);
+        assert!(
+            summary.model_is_selectable(literal),
+            "non-alias advisory literal: {literal}"
+        );
+    }
+    summary.models.push("deploy_ment".into());
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "DEPLOY.MENT"
+    );
+    assert!(
+        summary.model_is_selectable("DEPLOY.MENT"),
+        "ambiguous advisory literal remains passthrough"
+    );
+    summary.models.clear();
+    summary.configured_models.push("de-ployment".into());
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "DEPLOY.MENT"
+    );
+    assert!(!summary.model_is_selectable("deployment"));
+    summary.enabled = false;
+    assert!(!summary.model_is_selectable("future/model"));
+}

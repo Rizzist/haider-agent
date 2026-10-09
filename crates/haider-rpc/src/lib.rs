@@ -146,7 +146,8 @@ pub use frame::{
     TypedAgentInstallRetryRejectionWire, TypedAgentInstallWatchOutcomeWire,
     TypedAgentInstallWatchReceiptWire, TypedAgentInstallWatchRejectionWire, WIRE_PROTOCOL_VERSION,
     WaitingWhyKindWire, WaitingWhyWire, Welcome, WireFrame, WorkflowCatalogEntryV1,
-    WorkflowInstanceSourceV1, WorkflowInstanceV1, resident_binding_token_is_valid,
+    WorkflowInstanceSourceV1, WorkflowInstanceV1, normalize_model_selector,
+    resident_binding_token_is_valid,
 };
 pub use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
 pub use negotiation::{Negotiated, ServerRange, negotiate};

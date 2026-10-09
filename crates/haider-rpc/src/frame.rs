@@ -1575,6 +1575,17 @@ pub struct ProviderSummaryWire {
     pub trust: ProviderTrustWire,
 }
 
+/// Unicode-safe model selector key: lower-case scalar expansion, dropping
+/// only the punctuation/spacing family the public selector contract names.
+#[must_use]
+pub fn normalize_model_selector(selector: &str) -> String {
+    selector
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 impl ProviderSummaryWire {
     /// Age the entire projection, including configuration-owned IDs. A list
     /// can expire between publication and read; admission must not wait for
@@ -1630,6 +1641,35 @@ impl ProviderSummaryWire {
         }
     }
 
+    /// Resolve the same unique selector before membership and admission.
+    /// Exact IDs take priority; listed aliases precede declared aliases.
+    /// Ambiguity preserves the literal request instead of guessing a row.
+    #[must_use]
+    pub fn canonical_model_selector<'a>(&'a self, model: &'a str) -> &'a str {
+        if self
+            .models
+            .iter()
+            .chain(&self.configured_models)
+            .any(|name| name == model)
+        {
+            return model;
+        }
+        let normalized = normalize_model_selector(model);
+        for rows in [&self.models, &self.configured_models] {
+            let mut matches = rows
+                .iter()
+                .filter(|name| normalize_model_selector(name) == normalized);
+            if let Some(only) = matches.next() {
+                return if matches.next().is_none() {
+                    only.as_str()
+                } else {
+                    model
+                };
+            }
+        }
+        model
+    }
+
     /// Shared admission policy for every consumer of a catalog projection.
     /// Stale successful inventory remains selectable; a fresh list that omits
     /// an explicitly configured deployment is definite negative evidence.
@@ -1643,6 +1683,7 @@ impl ProviderSummaryWire {
     /// consumers must also respect enablement and fresh negative membership.
     #[must_use]
     pub fn selection_availability(&self, model: Option<&str>) -> ProviderAvailabilityWire {
+        let model = model.map(|model| self.canonical_model_selector(model));
         if !self.enabled
             || model.is_some_and(|model| {
                 (matches!(self.inventory, ModelInventoryWire::Fetched { .. })

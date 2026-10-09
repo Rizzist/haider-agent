@@ -1165,3 +1165,59 @@ fn unsupported_azure_evidence_cannot_be_borrowed_by_a_rebound_account() {
         }
     }
 }
+
+#[test]
+fn configured_selector_aliases_cannot_bypass_fresh_absence() {
+    let mut profile = summary("custom", &["healthy"], ProviderAvailabilityWire::Available);
+    profile.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    profile.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: u64::MAX,
+    };
+    profile.configured_models = vec!["deployment".into(), "MÖDEL.東京 Δ".into(), "İ-model".into()];
+    let absent = authority(&["custom"], vec![profile.clone()]);
+    for model in [
+        "deployment",
+        "DEPLOYMENT",
+        "de.ploy_ment",
+        "de\u{a0}ploy\u{2003}ment",
+        "mödel_東京-δ",
+        "i\u{307}.mo_DEL",
+    ] {
+        assert!(
+            matches!(
+                absent.validate_selection("custom", None, model),
+                Err(SelectionRefusal::ProviderUnavailable { .. })
+            ),
+            "{model}"
+        );
+        assert!(
+            matches!(
+                absent.resolve_child_selector("custom", "healthy", Some(model), Some("custom")),
+                Err(SelectionRefusal::ProviderUnavailable { .. })
+            ),
+            "explicit child: {model}"
+        );
+    }
+    assert_eq!(
+        absent.validate_selection("custom", None, "HEALTHY"),
+        Ok(("custom".into(), "healthy".into()))
+    );
+    assert_eq!(
+        absent.validate_selection("custom", None, "future/model"),
+        Ok(("custom".into(), "future/model".into()))
+    );
+    profile.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "refresh due".into(),
+    };
+    let stale = authority(&["custom"], vec![profile]);
+    assert_eq!(
+        stale.validate_selection("custom", None, "DEPLOY.MENT"),
+        Ok(("custom".into(), "deployment".into()))
+    );
+    assert_eq!(
+        stale.validate_selection("custom", None, "mödel_東京-δ"),
+        Ok(("custom".into(), "MÖDEL.東京 Δ".into()))
+    );
+}

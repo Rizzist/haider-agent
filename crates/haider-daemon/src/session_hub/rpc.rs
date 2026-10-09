@@ -1209,6 +1209,7 @@ fn fleet_now_ms() -> u64 {
 }
 
 pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, model: &str) -> bool {
+    let model = summary.canonical_model_selector(model);
     // Explicit deployments use the shared availability decision as published.
     // A rejected selection must not silently fetch its way around that proof;
     // manual refresh and the stale-catalog actor update discovery separately.
