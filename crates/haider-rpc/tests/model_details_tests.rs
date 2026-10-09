@@ -91,7 +91,7 @@ fn aging_projection_keeps_configured_ids_selectable_at_the_exact_boundary() {
                 );
                 assert_eq!(
                     summary.model_is_selectable("explicit-unlisted"),
-                    catalog == "custom" && authority == "advisory" && ready,
+                    authority == "advisory" && ready,
                     "{catalog}/{authority}, credential_ready={ready}: {summary:?}"
                 );
                 assert!(summary.models.is_empty());

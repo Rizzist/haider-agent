@@ -1629,8 +1629,7 @@ impl ProviderSummaryWire {
         }
         if fetched
             && (!self.configured_models.is_empty()
-                || (self.catalog == ProviderCatalogKindWire::Custom
-                    && self.inventory_authority == ModelInventoryAuthorityWire::Advisory))
+                || self.inventory_authority == ModelInventoryAuthorityWire::Advisory)
             && self.enabled
             && self.api_family != ProviderApiFamilyWire::Unknown
             && self.endpoint.is_some()
