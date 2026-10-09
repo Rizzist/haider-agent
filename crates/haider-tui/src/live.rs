@@ -7076,6 +7076,11 @@ impl LiveDriver {
             haider_protocol::session::SessionConfigEventPayload::SessionLaunchOriginSelected(
                 selected,
             ) => {
+                // Copied history can contain the parent's open claim. Its
+                // revision cannot replace this session's context slot.
+                if selected.subject_session_id != session.as_str() {
+                    return model_fact;
+                }
                 let newer = model
                     .launch_origin
                     .as_ref()

@@ -113,6 +113,143 @@ fn typed_session(store: &Store, session_id: &str, cwd: &Path) -> SessionId {
     SessionId::new(session_id)
 }
 
+#[test]
+fn copied_origin_projection_from_old_daemon_is_not_child_authority() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let parent = typed_session(&store, "old-origin-parent", root.path());
+    let child = typed_session(&store, "old-origin-child", root.path());
+    must(store.register_session_launch_origin(&origin_command(
+        &store,
+        "parent-origin",
+        &parent,
+        "parent-open",
+        0,
+        home_path("~/parent"),
+    )));
+    let parent_origin = must(store.latest_launch_origin(&parent)).expect("parent origin");
+    let connection = must(rusqlite::Connection::open(store.database_path()));
+    must(connection.execute(
+        "UPDATE sessions SET meta_json = json_set(meta_json, '$.launch_origin', json(?1)) WHERE id = ?2",
+        rusqlite::params![must(serde_json::to_string(&parent_origin)), child.as_str()],
+    ));
+    drop(connection);
+    drop(store);
+    let store = must(Store::open(root.path()));
+    let before_metadata = must(store.session_metadata(&child)).expect("typed child");
+    let before_origin = must(store.latest_launch_origin(&child));
+    must(store.register_session_launch_origin(&origin_command(
+        &store,
+        "child-origin",
+        &child,
+        "child-open",
+        0,
+        home_path("~/child"),
+    )));
+    assert!(before_metadata.launch_origin.is_none());
+    assert!(before_origin.is_none());
+    let stale = origin_command(
+        &store,
+        "stale-child-origin",
+        &child,
+        "stale-open",
+        0,
+        home_path("~/stale"),
+    );
+    assert_eq!(
+        store
+            .register_session_launch_origin(&stale)
+            .expect_err("real stale child revision rejected")
+            .code,
+        ErrorCode::RevisionConflict
+    );
+    assert_eq!(
+        must(store.latest_launch_origin(&child))
+            .expect("child origin")
+            .subject_session_id,
+        child.as_str()
+    );
+    assert_eq!(
+        must(store.latest_launch_origin(&parent)),
+        Some(parent_origin)
+    );
+}
+
+fn derived_create_origin(mode: haider_protocol::session::SessionInteractionModeV1) {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let parent = typed_session(&store, "create-origin-parent", root.path());
+    must(store.register_session_launch_origin(&origin_command(
+        &store,
+        "create-parent-origin",
+        &parent,
+        "parent-open",
+        0,
+        home_path("~/parent"),
+    )));
+    let parent_metadata = must(store.session_metadata(&parent)).expect("typed parent");
+    let child = SessionId::new("create-origin-child");
+    let command = SessionCreateCommand {
+        command_id: "create-derived-child".into(),
+        request_digest: "create-derived-digest".into(),
+        request_json: "{}".into(),
+        session_id: child.clone(),
+        cwd: parent_metadata.cwd.clone(),
+        provider: parent_metadata.provider.clone(),
+        model: parent_metadata.model.clone(),
+        max_tokens: parent_metadata.max_tokens,
+        max_tokens_source: parent_metadata.max_tokens_source,
+        permission_overrides: parent_metadata.permission_overrides,
+        effort: parent_metadata.effort.clone(),
+        fast: parent_metadata.fast,
+        cache_policy: parent_metadata.cache_policy,
+        system_prompt_version: "test-system-v1".into(),
+        event_id: EventId::new("created-derived-child"),
+        device_id: DeviceId::new("daemon-test"),
+    };
+    must(store.create_session_with_workspace_configuration(
+        &command,
+        mode,
+        None,
+        None,
+        Some(parent_metadata.clone()),
+    ));
+    assert!(must(store.latest_launch_origin(&child)).is_none());
+    must(store.register_session_launch_origin(&origin_command(
+        &store,
+        "created-child-origin",
+        &child,
+        "child-open",
+        0,
+        home_path("~/child"),
+    )));
+    assert_eq!(
+        must(store.latest_launch_origin(&child))
+            .expect("child")
+            .revision,
+        1
+    );
+    assert_eq!(
+        must(store.session_metadata(&child))
+            .expect("typed child")
+            .launch_origin
+            .expect("owned projection")
+            .subject_session_id,
+        child.as_str()
+    );
+    assert_eq!(must(store.session_metadata(&parent)), Some(parent_metadata));
+}
+
+#[test]
+fn origin_child_creation_inherits_route_without_parent_open() {
+    derived_create_origin(haider_protocol::session::SessionInteractionModeV1::Interactive);
+}
+
+#[test]
+fn origin_delegated_creation_inherits_route_without_parent_open() {
+    derived_create_origin(haider_protocol::session::SessionInteractionModeV1::Autonomous);
+}
+
 /// O2/O3: one registration per open — committed once, an identical retry
 /// replays the exact receipt, and NO second event is appended by replay.
 #[test]

@@ -415,6 +415,93 @@ fn forked_reply(child: &str) -> LiveReply {
     }
 }
 
+fn origin_replay_variant(snapshot: bool) {
+    use haider_protocol::session::{
+        LaunchOriginPathKindV1, LaunchOriginPathV1, LaunchOriginV1, SessionLaunchOriginSelected,
+    };
+    let (mut model, _) = forkable_model();
+    let mut driver = LiveDriver::new("test");
+    driver.apply(&mut model, forked_reply("origin-child"));
+    let child = sid("origin-child");
+    let attachment = AttachmentId::new("origin-child-attachment");
+    let path = LaunchOriginPathV1 {
+        kind: LaunchOriginPathKindV1::HomeRelative,
+        display: Some("~/child".into()),
+    };
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: child.clone(),
+            attachment: attachment.clone(),
+            worker_generation: 11,
+            replay_through_seq: 4,
+            launch_origin: snapshot.then(|| LaunchOriginV1 {
+                subject_session_id: child.to_string(),
+                open_id: "child-open".into(),
+                revision: 1,
+                path: path.clone(),
+                recorded_at_ms: 1,
+                selected_seq: 2,
+            }),
+        },
+    );
+    let initial = model.launch_origin.clone();
+    let mut deliver = |seq, subject: &str, revision, display: &str| {
+        let fact = SessionLaunchOriginSelected {
+            subject_session_id: subject.into(),
+            open_id: format!("open-{subject}-{revision}"),
+            revision,
+            path: LaunchOriginPathV1 {
+                kind: LaunchOriginPathKindV1::HomeRelative,
+                display: Some(display.into()),
+            },
+            recorded_at_ms: seq,
+            workspace_materialized: Some(false),
+        };
+        let mut envelope = raw(&child, seq, &EventPayload::IdleDecayed);
+        envelope.worker_generation = 11;
+        envelope.render.prompt = PromptRender::Omit;
+        envelope.payload = fact.to_payload_value().expect("origin payload").into();
+        driver.apply(
+            &mut model,
+            LiveReply::Event {
+                session: child.clone(),
+                attachment: attachment.clone(),
+                envelope: Box::new(envelope),
+            },
+        );
+        model.launch_origin.clone()
+    };
+    assert_eq!(
+        deliver(1, "source", 99, "~/parent"),
+        initial,
+        "copied parent history cannot claim a child open"
+    );
+    assert_eq!(
+        deliver(2, child.as_str(), 1, "~/child"),
+        Some((1, path.display))
+    );
+    assert_eq!(
+        deliver(3, child.as_str(), 2, "~/child-reopened"),
+        Some((2, Some("~/child-reopened".into())))
+    );
+    assert_eq!(
+        deliver(4, child.as_str(), 1, "~/stale"),
+        Some((2, Some("~/child-reopened".into()))),
+        "older same-session replay cannot replace a newer revision"
+    );
+}
+
+#[test]
+fn origin_replay_ignores_parent_claim_without_attach_snapshot() {
+    origin_replay_variant(false);
+}
+
+#[test]
+fn origin_replay_ignores_parent_claim_above_child_snapshot_revision() {
+    origin_replay_variant(true);
+}
+
 /// The owner's requirement, whole: the source keeps its row, its transcript
 /// and its parked draft; the child becomes the surface.
 ///

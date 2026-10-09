@@ -9336,6 +9336,9 @@ impl Store {
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
         metadata.budget_clamp_notice_epoch = None;
+        // A fork inherits history, not a claim that the parent's TUI opened
+        // the child. The child's first foreground open starts at revision 0.
+        metadata.launch_origin = None;
         // Explicit account and endpoint choices are part of the copied
         // session configuration. Unpinned parents still follow the mutable
         // provider default because their account_alias is already None.
@@ -21696,11 +21699,23 @@ fn decode_session_metadata(
     if value.as_object().is_some_and(serde_json::Map::is_empty) {
         return Ok(None);
     }
-    serde_json::from_value(value).map(Some).map_err(|error| {
+    let mut metadata: SessionMetadataV1 = serde_json::from_value(value).map_err(|error| {
         corrupt(format!(
             "session {session_id} metadata does not match SessionMetadataV1: {error}"
         ))
-    })
+    })?;
+    // Older fork writers copied this projection along with session config.
+    // Its revision is authority only for its subject, just like origin facts
+    // in the journal. Discard a foreign claim on every metadata read so list,
+    // attach and origin CAS agree for existing children as well as new ones.
+    if metadata
+        .launch_origin
+        .as_ref()
+        .is_some_and(|origin| origin.subject_session_id != session_id.as_str())
+    {
+        metadata.launch_origin = None;
+    }
+    Ok(Some(metadata))
 }
 
 #[derive(Debug)]
