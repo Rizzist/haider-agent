@@ -1660,7 +1660,7 @@ impl ProviderSummaryWire {
                 .iter()
                 .filter(|name| normalize_model_selector(name) == normalized);
             if let Some(only) = matches.next() {
-                return if matches.next().is_none() {
+                return if matches.all(|other| other == only) {
                     only.as_str()
                 } else {
                     model

@@ -587,6 +587,15 @@ fn selector_aliases_share_configured_negative_evidence_and_uncertainty() {
             "non-alias advisory literal: {literal}"
         );
     }
+    summary.models.push("de-ployment".into());
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "de-ployment"
+    );
+    assert!(
+        summary.model_is_selectable("DEPLOY.MENT"),
+        "identical listed rows are one identity"
+    );
     summary.models.push("deploy_ment".into());
     assert_eq!(
         summary.canonical_model_selector("DEPLOY.MENT"),
@@ -603,6 +612,24 @@ fn selector_aliases_share_configured_negative_evidence_and_uncertainty() {
         "DEPLOY.MENT"
     );
     assert!(!summary.model_is_selectable("deployment"));
+    summary.models = vec!["healthy".into()];
+    summary.configured_models = vec!["deployment".into(), "deployment".into()];
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "deployment"
+    );
+    assert!(
+        !summary.model_is_selectable("DEPLOY.MENT"),
+        "repeated declared IDs cannot bypass fresh absence"
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "refresh due".into(),
+    };
+    assert!(
+        summary.model_is_selectable("DEPLOY.MENT"),
+        "duplicate IDs do not block uncertainty"
+    );
     summary.enabled = false;
     assert!(!summary.model_is_selectable("future/model"));
 }

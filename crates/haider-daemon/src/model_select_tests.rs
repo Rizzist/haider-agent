@@ -1175,6 +1175,7 @@ fn configured_selector_aliases_cannot_bypass_fresh_absence() {
         fetched_at_ms: u64::MAX,
     };
     profile.configured_models = vec!["deployment".into(), "MÖDEL.東京 Δ".into(), "İ-model".into()];
+    profile.configured_models.push("deployment".into());
     let absent = authority(&["custom"], vec![profile.clone()]);
     for model in [
         "deployment",
