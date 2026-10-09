@@ -498,6 +498,15 @@ impl DelegationHandle {
             )
             .map(|(provider, model)| {
                 let mut child = parent.clone();
+                if child.provider != provider {
+                    // A child that explicitly chooses another provider starts
+                    // under that provider's own account and endpoint.
+                    child.account_alias = None;
+                    child.provider_base_url = None;
+                    child.provider_rebind_id = None;
+                    child.resolved_route_alias = None;
+                    child.resolved_route_seen = false;
+                }
                 child.provider = provider;
                 child.model = model;
                 child
@@ -833,6 +842,10 @@ impl DelegationHandle {
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
             "max_tokens": coordinates.metadata.max_tokens,
+            // The effective cap can hide a changed user request. Digest its
+            // canonical source too, including legacy default classification.
+            "max_tokens_source": haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                coordinates.metadata.max_tokens_source, coordinates.metadata.max_tokens),
             "permission_overrides": child_overrides,
             "delegation_agent": agent_id,
             // G3 (LE6): the child inherits the parent's CURRENT tuning; the
@@ -842,6 +855,12 @@ impl DelegationHandle {
             "fast": coordinates.metadata.fast,
             "cache_policy": coordinates.metadata.cache_policy,
             "interaction_mode": child_interaction_mode,
+            // Needed only to reconstruct the implicit inheritance of a
+            // pre-route-digest receipt, from durable history at create time.
+            "inheritance_parent_session_id": coordinates.parent_session_id,
+            "inherited_account_alias": coordinates.metadata.account_alias,
+            "inherited_provider_base_url": coordinates.metadata.provider_base_url,
+            "inherited_provider_rebind_id": coordinates.metadata.provider_rebind_id,
         }))
         .map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
@@ -866,6 +885,8 @@ impl DelegationHandle {
                     device_id: self.hub.device_id(),
                 },
                 child_interaction_mode,
+                None,
+                Some(coordinates.metadata.clone()),
             )
             .await?;
 

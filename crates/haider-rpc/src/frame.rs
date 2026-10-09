@@ -2119,6 +2119,10 @@ pub struct SessionSummary {
     /// Present exactly when `footprint_tokens` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footprint_truth: Option<ContextFootprintTruth>,
+    /// The child's own durable snapshot, including its request selection
+    /// epoch. Older daemons omit it; totals above remain usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_footprint: Option<ContextFootprint>,
     /// Additive G2 field: the committed session title, so launcher rosters
     /// name rows without attaching. `None` for untitled sessions and when
     /// an older daemon omits the field — readers must not infer anything
@@ -5369,6 +5373,11 @@ pub enum ResponseBody {
         /// budget exceeded the new model's maximum.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+        /// Previous explicit account pin cleared by a cross-provider pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleared_account_pin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleared_provider_endpoint: Option<String>,
     },
     /// Durable coordinates of a committed rename (G2): the NORMALIZED title
     /// — never an echo of the request — plus the committed journal sequence

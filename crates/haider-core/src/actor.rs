@@ -2647,6 +2647,8 @@ pub fn unregister_turn_trace_for_envelopes(envelopes: &[RawEnvelope]) {
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
+    /// Frozen with this request's model and reserve, before later commits.
+    pub selection_epoch: Option<u64>,
     /// Durable operator delegation; drives the canonical tool path without
     /// requesting a parent model response.
     pub agent_spawn: Option<haider_protocol::headless::AgentSpawnSpecV1>,
@@ -2789,6 +2791,9 @@ pub struct HarnessConfig {
     /// Daemon-owned durable pair-selection seam. Automatic fallback and
     /// promotion refuse to switch unless this is installed.
     pub provider_pair_switch_committer: Option<Arc<dyn ProviderPairSwitchCommitter>>,
+    /// Commits an account-route epoch before an in-turn credential rotation.
+    /// This turn keeps its begin epoch, so its eventual footprint projects.
+    pub provider_route_committer: Option<Arc<dyn ProviderRouteCommitter>>,
     /// Optional already-resolved larger-context lane used by the compaction
     /// runaway guard. Daemons prove its credential and window ordering.
     pub compaction_promotion: Option<ProviderPairSwitchTarget>,
@@ -2894,6 +2899,7 @@ impl HarnessConfig {
     ) -> Self {
         let cache_diagnostic_key = CacheDiagnosticKey::ephemeral(&session_id, &device_id);
         Self {
+            selection_epoch: None,
             session_id,
             agent_spawn: None,
             branch_id: None,
@@ -2950,6 +2956,7 @@ impl HarnessConfig {
             provider_rebind_resolver: None,
             provider_route_epoch: None,
             provider_pair_switch_committer: None,
+            provider_route_committer: None,
             compaction_promotion: None,
             retry_sleeper: Arc::new(RealRetrySleeper),
             context_compactor: None,
@@ -3647,7 +3654,18 @@ pub struct ProviderPairSwitch {
 
 #[async_trait]
 pub trait ProviderPairSwitchCommitter: Send + Sync + std::fmt::Debug {
-    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError>;
+    /// Returns the durable selection epoch for requests made after the switch.
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError>;
+}
+
+#[async_trait]
+pub trait ProviderRouteCommitter: Send + Sync + std::fmt::Debug {
+    async fn commit(
+        &self,
+        provider: &str,
+        model: &str,
+        to: &CredentialAlias,
+    ) -> Result<u64, HaiderError>;
 }
 
 /// Result of consulting the daemon at an eligible pre-first-event failure.
@@ -9799,6 +9817,16 @@ impl HarnessActor {
                             "attempt resolver returned inconsistent rotation coordinates",
                         )));
                     }
+                    if let Some(committer) = self.config.provider_route_committer.as_ref() {
+                        committer
+                            .commit(
+                                &self.config.usage_scope.provider,
+                                &self.config.model,
+                                &resolved.account,
+                            )
+                            .await
+                            .map_err(DriveError::Store)?;
+                    }
                     self.commit_payload(
                         context.run_id,
                         EventPayload::Rotation(resolved.rotation),
@@ -9956,6 +9984,11 @@ impl HarnessActor {
                 "automatic provider/model switch did not change the active pair",
             )));
         }
+        // The actor is one accepted turn. Its request provenance was frozen
+        // before the provider call, so even an automatic mid-turn pair switch
+        // cannot relabel this turn's eventual footprint as a request begun
+        // under the newly committed selection. The next turn gets a fresh
+        // config from durable metadata and may claim the new epoch.
         committer.commit(&switch).await.map_err(DriveError::Store)?;
         *provider_pair_switch_ordinal = next_switch_ordinal;
 
@@ -16998,6 +17031,7 @@ fn context_footprint(
         })
     });
     ContextFootprint {
+        selection_epoch: config.selection_epoch,
         input_tokens,
         output_tokens,
         cached_input_tokens,

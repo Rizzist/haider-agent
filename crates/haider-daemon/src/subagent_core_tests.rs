@@ -346,6 +346,7 @@ async fn public_workflow_catalog_human_templates_have_explicit_headless_refusal(
 async fn public_spawn_establishment_restart(
     fail_before_accept: bool,
     parent_cancelled: Option<bool>,
+    upgrade_fixture: u8,
 ) {
     use haider_protocol::ids::ItemId;
     let root = tempfile::tempdir().expect("profile");
@@ -459,6 +460,42 @@ async fn public_spawn_establishment_restart(
     hub.shutdown().await.expect("hub close");
     drop(hub);
     store.close().await.expect("store close");
+    if upgrade_fixture > 0 {
+        let db = rusqlite::Connection::open(root.path().join("store.sqlite"))
+            .expect("synthetic upgrade fixture");
+        let (id, json): (String, String) = db.query_row(
+            "SELECT command_id, request_json FROM command_receipts WHERE method = 'session.create' AND session_id = ?1",
+            [record.child_session_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).expect("original child receipt");
+        let mut body: serde_json::Value = serde_json::from_str(&json).expect("body");
+        for key in [
+            "inherited_account_alias",
+            "inherited_provider_base_url",
+            "inherited_provider_rebind_id",
+            "inheritance_parent_session_id",
+            "max_tokens_source",
+        ] {
+            body.as_object_mut().expect("object").remove(key);
+        }
+        assert_eq!(body.as_object().expect("exact 8ffc5866 key set").len(), 10);
+        let old_json = body.to_string();
+        db.execute(
+            "UPDATE command_receipts SET request_json=?2, request_digest=?3 WHERE command_id=?1",
+            rusqlite::params![
+                id,
+                old_json,
+                blake3::hash(old_json.as_bytes()).to_hex().to_string()
+            ],
+        )
+        .expect("old schema receipt");
+        if upgrade_fixture == 2 {
+            db.execute(
+                "DELETE FROM delegations WHERE agent_id=?1",
+                [record.agent_id.as_str()],
+            )
+            .expect("crash before relation commit");
+        }
+    }
     let store = SqliteStoreHandle::open(root.path()).await.expect("reopen");
     let work = crate::turn_recovery::recover_interrupted_turns(&store, &DeviceId::new("restart"))
         .await
@@ -610,21 +647,36 @@ async fn public_spawn_establishment_restart(
 
 #[tokio::test]
 async fn public_spawn_restart_finishes_row_committed_before_child_acceptance() {
-    public_spawn_establishment_restart(true, None).await;
+    public_spawn_establishment_restart(true, None, 0).await;
 }
 
 #[tokio::test]
 async fn public_spawn_restart_fences_accepted_child_until_broker_completion() {
-    public_spawn_establishment_restart(false, None).await;
+    public_spawn_establishment_restart(false, None, 0).await;
 }
 
 #[tokio::test]
 async fn public_spawn_restart_cancels_unlaunched_child_for_abandoned_parent() {
     for terminal in [false, true] {
         for fail_before_accept in [false, true] {
-            public_spawn_establishment_restart(fail_before_accept, Some(terminal)).await;
+            public_spawn_establishment_restart(fail_before_accept, Some(terminal), 0).await;
         }
     }
+}
+
+#[tokio::test]
+async fn public_spawn_upgrade_replays_create_before_child_acceptance() {
+    public_spawn_establishment_restart(true, None, 1).await;
+}
+
+#[tokio::test]
+async fn public_spawn_upgrade_replays_create_after_child_acceptance() {
+    public_spawn_establishment_restart(false, None, 1).await;
+}
+
+#[tokio::test]
+async fn public_spawn_upgrade_recovers_crash_after_create_before_relation() {
+    public_spawn_establishment_restart(true, None, 2).await;
 }
 
 // These scripts exercise delegation lifecycle and authority directly. Declare
@@ -1395,13 +1447,18 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
-        provider_base_url: None,
-        provider_rebind_id: None,
+        provider_base_url: Some("https://synthetic.invalid".into()),
+        provider_rebind_id: Some("parent-rebind".into()),
         cwd,
         provider: "fake".into(),
-        account_alias: None,
+        account_alias: Some("parent-pin".into()),
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1490,6 +1547,20 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         .await
         .expect("parent delegations");
     assert_eq!(records.len(), 1);
+    let child_metadata = store
+        .session_metadata(&records[0].child_session_id)
+        .await
+        .expect("derived child metadata")
+        .expect("typed child");
+    assert_eq!(child_metadata.account_alias.as_deref(), Some("parent-pin"));
+    assert_eq!(
+        child_metadata.provider_base_url.as_deref(),
+        Some("https://synthetic.invalid")
+    );
+    assert_eq!(
+        child_metadata.provider_rebind_id.as_deref(),
+        Some("parent-rebind")
+    );
     assert_eq!(records[0].parent_branch_id, Some(parent_branch));
     assert_eq!(
         records[0]
@@ -1856,6 +1927,11 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -2115,6 +2191,11 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -2172,6 +2253,11 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
+                selection_epoch: None,
+                route_reset_epoch: None,
+                budget_clamp_notice_epoch: None,
+                resolved_route_alias: None,
+                resolved_route_seen: false,
                 launch_origin: None,
                 workspace_allocation: None,
                 provider_base_url: None,
@@ -2388,6 +2474,11 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -2575,6 +2666,11 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -3090,6 +3186,8 @@ async fn accept_parent_with_interaction_mode(
             device_id: DeviceId::new("w6c-test-device"),
         },
         interaction_mode,
+        None,
+        None,
     )
     .await
     .expect("create parent");
@@ -6562,6 +6660,11 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         cwd,

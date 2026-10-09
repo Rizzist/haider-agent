@@ -224,6 +224,25 @@ pub struct WorkspaceAllocationV1 {
 /// silently reinterpreting committed configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetadataV1 {
+    /// Durable sequence of the current model, budget, or route selection.
+    /// Zero is the initial binding before a selection fact is committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_epoch: Option<u64>,
+    /// Sequence at which this route was created or explicitly reset. Absence
+    /// on legacy metadata does not prove that the session was never served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_reset_epoch: Option<u64>,
+    /// Epoch whose durable selection fact records the current budget clamp.
+    /// Missing legacy/inherited notices can be published on first route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_clamp_notice_epoch: Option<u64>,
+    /// Last account route actually resolved for a turn. This is not an
+    /// account pin: unpinned sessions continue to follow the active account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_route_alias: Option<String>,
+    /// Distinguishes an observed keyless route from a route not yet resolved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resolved_route_seen: bool,
     /// Canonical absolute UTF-8 workspace path.
     pub cwd: String,
     /// Provider adapter name (`anthropic`, `openai`, `openai-compatible`, or
@@ -336,10 +355,47 @@ fn is_false(value: &bool) -> bool {
 /// provider attribute of that row — not a change of session identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSelected {
+    /// Selection version; may remain unchanged for a true no-op command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_epoch: Option<u64>,
     /// Provider attribute of the selected model row.
     pub provider: String,
     /// The selected full model identifier.
     pub model: String,
+    /// This fact publishes route provenance without changing the model pair.
+    /// The first resolved route keeps the captured epoch; a rotation advances it.
+    /// Older readers may still treat it as a model selection; new readers
+    /// keep their known output budget and omit the model-change note.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub route_only: bool,
+    /// Explicit account pin cleared by this cross-provider selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_account_pin: Option<String>,
+    /// Explicit endpoint override cleared by a cross-provider selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_provider_endpoint: Option<String>,
+    /// User budget reduced by this selection, retained for external clients
+    /// and replay even after a later selection restores the requested value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget_clamp: Option<crate::output_budget::OutputBudgetClampV1>,
+}
+
+/// Shared disclosure for choices automatically cleared by a model pick.
+#[must_use]
+pub fn model_selection_clear_notice(
+    account: Option<&str>,
+    endpoint: Option<&str>,
+    provider: &str,
+) -> Option<String> {
+    let choices = match (account, endpoint) {
+        (Some(alias), Some(url)) => format!("account pin {alias} cleared; endpoint {url} cleared"),
+        (Some(alias), None) => format!("account pin {alias} cleared"),
+        (None, Some(url)) => format!("endpoint {url} cleared"),
+        (None, None) => return None,
+    };
+    Some(format!(
+        "{choices} — {provider} uses its active account and default endpoint"
+    ))
 }
 
 /// Additive replay fact emitted atomically with a committed live-session
@@ -367,6 +423,9 @@ pub struct FastModeSelected {
 /// The model and conversation are unchanged. Credentials never enter this fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProviderRebound {
+    /// Durable route-selection version, equal to this fact's journal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_epoch: Option<u64>,
     pub rebind_id: String,
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,6 +592,17 @@ impl SessionProviderRebound {
 
     /// Rebuild the routing projection from a replayed committed fact.
     pub fn apply_to_metadata(&self, metadata: &mut SessionMetadataV1) {
+        if let Some(epoch) = self.selection_epoch {
+            metadata.selection_epoch = Some(epoch);
+        }
+        if metadata.provider != self.provider
+            || metadata.provider_base_url != self.base_url
+            || metadata.account_alias != self.account
+        {
+            metadata.resolved_route_alias = None;
+            metadata.resolved_route_seen = false;
+            metadata.route_reset_epoch = self.selection_epoch;
+        }
         metadata.provider_rebind_id = Some(self.rebind_id.clone());
         metadata.provider.clone_from(&self.provider);
         metadata.provider_base_url.clone_from(&self.base_url);

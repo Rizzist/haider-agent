@@ -87,6 +87,7 @@ pub enum CommitGroupBatch {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -353,6 +354,58 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.session_metadata(&session_id))).await
+    }
+
+    pub async fn commit_resolved_route(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &haider_protocol::ids::DeviceId,
+    ) -> Result<u64, HaiderError> {
+        self.commit_resolved_route_fact(
+            session_id,
+            expected_provider,
+            expected_model,
+            expected_epoch,
+            resolved_alias,
+            device_id,
+        )
+        .await
+        .map(|(epoch, _)| epoch)
+    }
+
+    /// Commit route provenance and return only durable facts for publication.
+    pub async fn commit_resolved_route_fact(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &haider_protocol::ids::DeviceId,
+    ) -> Result<(u64, Vec<haider_protocol::envelope::RawEnvelope>), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        let expected_provider = expected_provider.to_owned();
+        let expected_model = expected_model.to_owned();
+        let resolved_alias = resolved_alias.map(str::to_owned);
+        let device_id = device_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.commit_resolved_route_fact(
+                    &session_id,
+                    &expected_provider,
+                    &expected_model,
+                    expected_epoch,
+                    resolved_alias.as_deref(),
+                    &device_id,
+                )
+            })
+        })
+        .await
     }
 
     pub async fn persist_context_economy(
@@ -723,6 +776,7 @@ impl SqliteStoreHandle {
             interaction_mode,
             account_alias,
             None,
+            None,
         )
         .await
     }
@@ -733,6 +787,7 @@ impl SqliteStoreHandle {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
@@ -742,6 +797,7 @@ impl SqliteStoreHandle {
                     interaction_mode,
                     account_alias,
                     workspace_allocation,
+                    inherited_route,
                 )
             })
         })
@@ -2213,11 +2269,13 @@ impl SqliteStoreHandle {
                             interaction_mode,
                             account_alias,
                             workspace_allocation,
+                            inherited_route,
                         } => JournalCommitBatch::CreateSession {
                             command,
                             interaction_mode,
                             account_alias,
                             workspace_allocation,
+                            inherited_route,
                         },
                         CommitGroupBatch::AcceptTurn {
                             command,
