@@ -3240,15 +3240,18 @@ fn unsupported_adapters_accept_explicit_models_without_fabricating_inventory() {
 
 #[test]
 fn transient_refresh_failure_preserves_successful_empty_inventory() {
-    for origin in [
-        "https://synthetic.openai.azure.com/openai/v1",
-        "http://127.0.0.1:19373/v1",
+    for (origin, provider) in [
+        ("https://synthetic.openai.azure.com/openai/v1", "work"),
+        ("http://127.0.0.1:19373/v1", "work"),
+        ("https://synthetic.openai.azure.com/openai/v1", "openai"),
+        ("http://127.0.0.1:19373/v1", "openai"),
     ] {
         for fetched_at_ms in [1, u64::MAX] {
             for listed in [None, Some("other"), Some("deployment")] {
                 for declared in [false, true] {
                     let mut profile = removable_provider_profile_for_catalog_test();
                     profile.base_url = Some(origin.into());
+                    profile.provider_id = provider.into();
                     profile.configured_models = if declared {
                         vec!["deployment".into()]
                     } else {
@@ -3257,7 +3260,7 @@ fn transient_refresh_failure_preserves_successful_empty_inventory() {
                     profile.default_model = declared.then(|| "deployment".into());
                     let source = model_source([]);
                     source.replace(
-                        "work".into(),
+                        provider.into(),
                         ProviderInventory::Fetched {
                             models: listed
                                 .map(|name| vec![discovered(name, true, None)])
@@ -3271,7 +3274,7 @@ fn transient_refresh_failure_preserves_successful_empty_inventory() {
                         source.clone(),
                     )
                     .expect("registry");
-                    let initial = registry.summary("work", &|_| true).expect("listing");
+                    let initial = registry.summary(provider, &|_| true).expect("listing");
                     assert_eq!(
                         initial.model_is_selectable("deployment"),
                         fetched_at_ms == 1
@@ -3283,11 +3286,11 @@ fn transient_refresh_failure_preserves_successful_empty_inventory() {
                         "server returned 503 for /models",
                         "model catalog discovery timed out",
                     ] {
-                        source.unavailable("work", reason.into());
-                        assert!(matches!(source.inventory("work"),
+                        source.unavailable(provider, reason.into());
+                        assert!(matches!(source.inventory(provider),
                         ProviderInventory::Stale { fetched_at_ms: retained, .. }
                             if retained == fetched_at_ms));
-                        let summary = registry.summary("work", &|_| true).expect("uncertainty");
+                        let summary = registry.summary(provider, &|_| true).expect("uncertainty");
                         assert!(
                             summary.model_is_selectable("deployment"),
                             "{origin}: {summary:?}"
@@ -3297,7 +3300,7 @@ fn transient_refresh_failure_preserves_successful_empty_inventory() {
                                 None,
                                 Some(vec![summary.clone()]),
                             )
-                            .validate_selection_with_status("work", None, "deployment")
+                            .validate_selection_with_status(provider, None, "deployment")
                             .is_ok(),
                             "advisory uncertainty permits explicit input"
                         );
@@ -3325,19 +3328,20 @@ fn transient_refresh_failure_preserves_successful_empty_inventory() {
                             assert_eq!(detail.context_window, None);
                         }
                     }
-                    registry.models_rejected("work", "model catalog authentication failed".into());
-                    source.unavailable("work", "later timeout".into());
+                    registry
+                        .models_rejected(provider, "model catalog authentication failed".into());
+                    source.unavailable(provider, "later timeout".into());
                     assert!(
                         !registry
-                            .summary("work", &|_| true)
+                            .summary(provider, &|_| true)
                             .expect("rejected")
                             .model_is_selectable("deployment")
                     );
-                    source.remove("work");
-                    source.unavailable("work", "first fetch timed out".into());
+                    source.remove(provider);
+                    source.unavailable(provider, "first fetch timed out".into());
                     assert!(
                         !registry
-                            .summary("work", &|_| true)
+                            .summary(provider, &|_| true)
                             .expect("never succeeded")
                             .model_is_selectable("deployment")
                     );
