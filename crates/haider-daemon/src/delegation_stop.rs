@@ -691,7 +691,7 @@ impl DelegationHandle {
     /// first durable effect, so a refused primary leaves nothing changed.
     /// Monitors are removed only after it, and a final drain runs once the
     /// cancelled runs settled (B1).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn cancel_single_subagent(
         &self,
         record: &DelegationRecord,
