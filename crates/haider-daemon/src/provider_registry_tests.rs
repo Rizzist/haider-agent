@@ -3246,80 +3246,102 @@ fn transient_refresh_failure_preserves_successful_empty_inventory() {
     ] {
         for fetched_at_ms in [1, u64::MAX] {
             for listed in [None, Some("other"), Some("deployment")] {
-                let mut profile = removable_provider_profile_for_catalog_test();
-                profile.base_url = Some(origin.into());
-                profile.configured_models = vec!["deployment".into()];
-                profile.default_model = Some("deployment".into());
-                let source = model_source([]);
-                source.replace(
-                    "work".into(),
-                    ProviderInventory::Fetched {
-                        models: listed
-                            .map(|name| vec![discovered(name, true, None)])
-                            .unwrap_or_default(),
-                        fetched_at_ms,
-                    },
-                );
-                let registry = ProviderRegistry::new(
-                    MemoryProviderStore::default(),
-                    vec![profile],
-                    source.clone(),
-                )
-                .expect("registry");
-                let initial = registry.summary("work", &|_| true).expect("listing");
-                assert_eq!(
-                    initial.model_is_selectable("deployment"),
-                    fetched_at_ms == 1 || listed == Some("deployment"),
-                    "fresh absence remains definite negative evidence"
-                );
-                for reason in [
-                    "server returned 503 for /models",
-                    "model catalog discovery timed out",
-                ] {
-                    source.unavailable("work", reason.into());
-                    assert!(matches!(source.inventory("work"),
+                for declared in [false, true] {
+                    let mut profile = removable_provider_profile_for_catalog_test();
+                    profile.base_url = Some(origin.into());
+                    profile.configured_models = if declared {
+                        vec!["deployment".into()]
+                    } else {
+                        Vec::new()
+                    };
+                    profile.default_model = declared.then(|| "deployment".into());
+                    let source = model_source([]);
+                    source.replace(
+                        "work".into(),
+                        ProviderInventory::Fetched {
+                            models: listed
+                                .map(|name| vec![discovered(name, true, None)])
+                                .unwrap_or_default(),
+                            fetched_at_ms,
+                        },
+                    );
+                    let registry = ProviderRegistry::new(
+                        MemoryProviderStore::default(),
+                        vec![profile],
+                        source.clone(),
+                    )
+                    .expect("registry");
+                    let initial = registry.summary("work", &|_| true).expect("listing");
+                    assert_eq!(
+                        initial.model_is_selectable("deployment"),
+                        fetched_at_ms == 1
+                            || listed == Some("deployment")
+                            || (!declared && listed.is_some()),
+                        "fresh absence remains definite negative evidence"
+                    );
+                    for reason in [
+                        "server returned 503 for /models",
+                        "model catalog discovery timed out",
+                    ] {
+                        source.unavailable("work", reason.into());
+                        assert!(matches!(source.inventory("work"),
                         ProviderInventory::Stale { fetched_at_ms: retained, .. }
                             if retained == fetched_at_ms));
-                    let summary = registry.summary("work", &|_| true).expect("uncertainty");
-                    assert!(
-                        summary.model_is_selectable("deployment"),
-                        "{origin}: {summary:?}"
-                    );
-                    assert!(
-                        summary
-                            .selection_reason(Some("deployment"))
-                            .expect("visible reason")
-                            .contains(reason)
-                    );
-                    if listed != Some("deployment") {
-                        let detail = summary
-                            .model_details
-                            .iter()
-                            .find(|detail| detail.name == "deployment")
-                            .expect("configured row");
-                        assert_eq!(
-                            detail.source,
-                            Some(haider_rpc::ModelDetailSourceWire::Configured)
+                        let summary = registry.summary("work", &|_| true).expect("uncertainty");
+                        assert!(
+                            summary.model_is_selectable("deployment"),
+                            "{origin}: {summary:?}"
                         );
-                        assert_eq!(detail.context_window, None);
+                        assert!(
+                            crate::model_select::ModelSelectionAuthority::new(
+                                None,
+                                Some(vec![summary.clone()]),
+                            )
+                            .validate_selection_with_status("work", None, "deployment")
+                            .is_ok(),
+                            "advisory uncertainty permits explicit input"
+                        );
+                        if !declared && listed.is_none() {
+                            assert!(summary.models.is_empty());
+                            assert!(summary.model_details.is_empty());
+                            assert!(summary.default_model.is_none());
+                        }
+                        assert!(
+                            summary
+                                .selection_reason(Some("deployment"))
+                                .expect("visible reason")
+                                .contains(reason)
+                        );
+                        if declared && listed != Some("deployment") {
+                            let detail = summary
+                                .model_details
+                                .iter()
+                                .find(|detail| detail.name == "deployment")
+                                .expect("configured row");
+                            assert_eq!(
+                                detail.source,
+                                Some(haider_rpc::ModelDetailSourceWire::Configured)
+                            );
+                            assert_eq!(detail.context_window, None);
+                        }
                     }
+                    registry.models_rejected("work", "model catalog authentication failed".into());
+                    source.unavailable("work", "later timeout".into());
+                    assert!(
+                        !registry
+                            .summary("work", &|_| true)
+                            .expect("rejected")
+                            .model_is_selectable("deployment")
+                    );
+                    source.remove("work");
+                    source.unavailable("work", "first fetch timed out".into());
+                    assert!(
+                        !registry
+                            .summary("work", &|_| true)
+                            .expect("never succeeded")
+                            .model_is_selectable("deployment")
+                    );
                 }
-                registry.models_rejected("work", "model catalog authentication failed".into());
-                source.unavailable("work", "later timeout".into());
-                assert!(
-                    !registry
-                        .summary("work", &|_| true)
-                        .expect("rejected")
-                        .model_is_selectable("deployment")
-                );
-                source.remove("work");
-                source.unavailable("work", "first fetch timed out".into());
-                assert!(
-                    !registry
-                        .summary("work", &|_| true)
-                        .expect("never succeeded")
-                        .model_is_selectable("deployment")
-                );
             }
         }
     }

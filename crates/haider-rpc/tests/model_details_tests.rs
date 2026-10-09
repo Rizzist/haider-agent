@@ -59,6 +59,51 @@ fn aging_projection_keeps_configured_ids_selectable_at_the_exact_boundary() {
             assert!(!rejected.model_is_selectable("deployment"));
         }
     }
+    // An advisory custom provider need not declare picker IDs. Its empty
+    // successful list still becomes uncertainty at the same TTL boundary,
+    // permitting explicit input without inventing rows or a default.
+    for catalog in ["custom", "public", "authenticated", "adapter", "offline"] {
+        for authority in ["advisory", "authoritative"] {
+            for ready in [false, true] {
+                let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+                    "provider":"work", "api_family":"openai_chat_completions",
+                    "endpoint":"http://127.0.0.1:19373/v1", "enabled":true,
+                    "auth_methods":["api_key"], "models":[], "configured_models":[],
+                    "catalog":catalog, "inventory_authority":authority,
+                    "inventory":{"state":"fetched", "fetched_at_ms":100},
+                    "availability":"unavailable"
+                }))
+                .expect("fresh empty advisory listing");
+                let mut disabled = summary.clone();
+                disabled.enabled = false;
+                let mut rejected = summary.clone();
+                rejected.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+                    reason: "authentication failed".into(),
+                };
+                summary.project_inventory_at_time_with_credential_ready(
+                    100 + haider_rpc::MODEL_INVENTORY_TTL_MS - 1,
+                    ready,
+                );
+                assert!(!summary.model_is_selectable("explicit-unlisted"));
+                summary.project_inventory_at_time_with_credential_ready(
+                    100 + haider_rpc::MODEL_INVENTORY_TTL_MS,
+                    ready,
+                );
+                assert_eq!(
+                    summary.model_is_selectable("explicit-unlisted"),
+                    catalog == "custom" && authority == "advisory" && ready,
+                    "{catalog}/{authority}, credential_ready={ready}: {summary:?}"
+                );
+                assert!(summary.models.is_empty());
+                assert!(summary.model_details.is_empty());
+                assert!(summary.default_model.is_none());
+                for negative in [&mut disabled, &mut rejected] {
+                    negative.project_inventory_at_time_with_credential_ready(u64::MAX, true);
+                    assert!(!negative.model_is_selectable("explicit-unlisted"));
+                }
+            }
+        }
+    }
 }
 
 #[test]

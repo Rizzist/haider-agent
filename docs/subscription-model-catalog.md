@@ -144,6 +144,8 @@ inventory remains excluded from automatic failover and promotion. Maintained
 offline and OAuth catalogs retain their permanent rows with healthy credentials.
 
 Successful empty listings retain their discovery timestamp when a later refresh fails.
+For advisory custom providers, that uncertainty also permits explicit input when
+no model IDs are declared; it does not invent picker rows, metadata or a default.
 Configured IDs use the published shared availability decision without awaiting
 admission-time discovery. Staleness schedules background refresh with bounded backoff; it never blocks
 new sessions or turns of existing sessions. The daemon's admission, CLI, TUI

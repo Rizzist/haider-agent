@@ -1946,7 +1946,9 @@ fn provider_summary(
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
         && profile.provenance != ProviderProvenance::Unknown
         && (!discovered_models.is_empty()
-            || matches!(inventory, haider_rpc::ModelInventoryWire::Configured))
+            || matches!(inventory, haider_rpc::ModelInventoryWire::Configured)
+            || (matches!(profile.provenance, ProviderProvenance::Custom)
+                && matches!(inventory, haider_rpc::ModelInventoryWire::Stale { .. })))
         && seeded_ready
         && (profile.auth_requirement == ProviderAuthRequirementWire::None || credentialed)
         && !configured_unavailable
