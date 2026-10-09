@@ -504,7 +504,7 @@ async fn wait_for_run_state(
             }) {
                 break events;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
@@ -547,7 +547,7 @@ async fn abandon_active_graph_and_wait_for_done(
                 };
                 break (menu, opening.seq);
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await;
@@ -1162,8 +1162,9 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
     recovered_store.close().await.expect("store close");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post_cu1() {
+    let _clock = crate::test_clock::FrozenClock::hold();
     let root = tempfile::tempdir().expect("profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let provider = Arc::new(

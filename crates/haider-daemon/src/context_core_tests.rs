@@ -540,8 +540,9 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
 /// MUTATION CHECK: hard-code automatic compaction planning or emission to
 /// main. Expected RUNTIME failure: the oversized branch turn either compacts
 /// the wrong scope or its summary/node is emitted without branch A.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
+    let _clock = crate::test_clock::FrozenClock::hold();
     let root = tempfile::tempdir().expect("profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let session_id = SessionId::new("auto-compaction-branch-session");
