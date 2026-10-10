@@ -834,24 +834,24 @@ fn sidecar_path(root: &tempfile::TempDir, session_id: &SessionId) -> std::path::
     root.path().join("pipe").join(format!("{session_id}.pipe"))
 }
 
-/// #6 (935): sidecar maintenance runs off the publish path on a per-session
-/// writer task, so a read right after `append` can race the write. Poll the
-/// file until it is non-empty and STABLE across a tick — the atomic
-/// temp+rename rebuild converges to exactly the steady state
-/// `hub.shutdown()` guarantees, with no intermediate stable point.
-async fn stable_sidecar(path: &std::path::Path) -> String {
-    let mut prev: Option<String> = None;
+/// Warm the live writer with a complete seed projection, including coverage.
+/// An unchanged file can still precede queued work; final observations instead
+/// join the writer with `hub.shutdown()` before reading.
+async fn wait_for_sidecar(path: &std::path::Path, expected: &str) {
+    let mut observed = None;
     let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if let Ok(cur) = std::fs::read_to_string(path) {
-            if !cur.is_empty() && prev.as_deref() == Some(cur.as_str()) {
-                return cur;
+        if let Ok(body) = std::fs::read_to_string(path) {
+            if body == expected {
+                return;
             }
-            prev = Some(cur);
+            observed = Some(body);
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("sidecar did not stabilize before {deadline:?}: {prev:?}")
+    panic!(
+        "sidecar did not reach the seed projection: expected={expected:?}; observed={observed:?}"
+    )
 }
 
 async fn append_delta(
@@ -9706,9 +9706,8 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
     events[3].branch_id = Some(BranchId::new("branch-sidecar"));
 
     hub.append(&mut events).await.expect("pipe batch commits");
-    let bytes = stable_sidecar(&sidecar_path(&root, &session_id))
-        .await
-        .into_bytes();
+    hub.shutdown().await.expect("hub joins sidecar writer");
+    let bytes = std::fs::read(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     assert_eq!(
         bytes,
         expected_sidecar(&session_id, 1, &events).into_bytes()
@@ -9717,7 +9716,8 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         String::from_utf8(bytes).expect("sidecar utf8"),
         stored_sidecar(&store, &session_id, 1).await
     );
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     let values: Vec<serde_json::Value> = sidecar
         .lines()
         .skip(1)
@@ -9749,7 +9749,6 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         .filter_map(haider_protocol::pipe::sidecar_row_line)
         .collect();
     assert_eq!(row_lines, expected_rows);
-    hub.shutdown().await.expect("hub stops");
 }
 
 /// MUTATION CHECK: read sealed reasoning from `payload.delta.text` or emit the
@@ -9930,7 +9929,11 @@ async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() 
         "before",
     )];
     hub.append(&mut seed).await.expect("seed commits");
-    let _ = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    wait_for_sidecar(
+        &sidecar_path(&root, &session_id),
+        &expected_sidecar(&session_id, 1, &seed),
+    )
+    .await;
 
     let mut tool_call = pipe_event(
         &session_id,
@@ -10240,7 +10243,6 @@ async fn native_pipe_truncates_a_torn_tail_before_resume() {
     // #6 (935): drain the writer task (shutdown) before reading the settled
     // sidecar — maintenance no longer completes on the publish path.
     hub.shutdown().await.expect("second hub stops");
-    hub.shutdown().await.expect("second hub stops");
     assert_eq!(
         std::fs::read_to_string(&path).expect("settled sidecar reads"),
         expected_sidecar_batches(&session_id, 1, &[&first, &second])
@@ -10290,8 +10292,12 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         .expect("offline delta commits");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_delta(&hub, &session_id, generation, "resume-trigger").await;
+    hub.shutdown()
+        .await
+        .expect("second hub joins sidecar writer");
 
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     let rows: Vec<&str> = sidecar
         .lines()
         .filter(|line| line.contains("\"role\""))
@@ -10301,7 +10307,6 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         serde_json::from_str(sidecar.lines().last().expect("tail")).expect("tail JSON");
     assert_eq!(tail["coverage"], missed[0].seq + 1);
     assert_eq!(tail["generation"], 1);
-    hub.shutdown().await.expect("second hub stops");
 }
 
 #[tokio::test]
@@ -10327,11 +10332,10 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
-    assert_eq!(
-        stable_sidecar(&sidecar_path(&root, &session_id)).await,
-        stored_sidecar(&store, &session_id, 1).await
-    );
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    hub.shutdown().await.expect("hub joins sidecar writer");
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
+    assert_eq!(sidecar, stored_sidecar(&store, &session_id, 1).await);
     let tail: serde_json::Value =
         serde_json::from_str(sidecar.lines().last().expect("coverage tail"))
             .expect("coverage tail JSON");
