@@ -778,7 +778,7 @@ impl PeerService {
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
-    use crate::peer_tests::live_peer_fixture;
+    use crate::peer_tests::{live_peer_fixture, wait_for_peer_delivery_quiescence};
     use haider_core::StoreHandle;
 
     #[tokio::test]
@@ -1017,11 +1017,23 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, ["z-first", "a-second", "0-third"]);
+        assert!(sender.outbox.lock().await.is_empty());
+        // A sender remains active between durable terminal removal and the
+        // release of its transport/status permit, even with an empty outbox.
+        let active_send = sender
+            .sends
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold active send");
         assert!(
-            sh.daemon_is_durably_quiescent()
+            !sh.daemon_is_durably_quiescent()
                 .await
-                .expect("settled quiescence")
+                .expect("active-send quiescence"),
+            "an active send must block retirement after durable terminal removal"
         );
+        drop(active_send);
+        wait_for_peer_delivery_quiescence(&sh).await;
         sender.shutdown().await;
         target.shutdown().await;
         manager.shutdown().await.expect("worker stop");
