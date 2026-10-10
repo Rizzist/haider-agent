@@ -66,7 +66,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 
-const DEADLINE: Duration = Duration::from_secs(10);
+// This only caps a missing event; scheduler latency is not an acceptance bound.
+const DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
 fn envelope(
     session_id: &SessionId,
@@ -8431,6 +8432,24 @@ struct StalledAfterCaughtUpSink {
     saw_caught_up: AtomicBool,
     /// Admission tickets that deliberately never fire — the stuck shape.
     parked: Mutex<Vec<AdmissionTicket>>,
+    confirmed_parked: AtomicBool,
+    parked_changed: Notify,
+}
+
+impl StalledAfterCaughtUpSink {
+    async fn wait_until_parked(&self) {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let changed = self.parked_changed.notified();
+                if self.confirmed_parked.load(Ordering::Acquire) {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("stalled sink confirms busy admission before commit pressure");
+    }
 }
 
 impl FrameSink for StalledAfterCaughtUpSink {
@@ -8453,6 +8472,20 @@ impl FrameSink for StalledAfterCaughtUpSink {
             Ok(()) => SendAdmission::Sent,
             Err(FrameSendError) => SendAdmission::Refused,
         }
+    }
+
+    fn offer_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: &WireFrame,
+        _ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let admission = self.offer(attachment_id, frame);
+        if matches!(admission, SendAdmission::Busy) {
+            self.confirmed_parked.store(true, Ordering::Release);
+            self.parked_changed.notify_waiters();
+        }
+        admission
     }
 
     fn drain_ticket(&self) -> Option<AdmissionTicket> {
@@ -8484,6 +8517,8 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
         collected: CollectSink::default(),
         saw_caught_up: AtomicBool::new(false),
         parked: Mutex::new(Vec::new()),
+        confirmed_parked: AtomicBool::new(false),
+        parked_changed: Notify::new(),
     });
     let connection = hub
         .open_connection(
@@ -8517,9 +8552,9 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
         }
     ));
 
-    // Each append either fits the momentarily-empty catch-up channel or trips
-    // the byte ledger while the replay task is blocked awaiting outbox
-    // capacity that never comes; the trip converges within a few commits.
+    // The first live event establishes the genuinely stuck sink. Later
+    // commits must overflow its catch-up ledger while admission is busy;
+    // reaching caught-up alone does not establish that replay has parked.
     for index in 0..8 {
         let mut event = vec![envelope(
             &session_id,
@@ -8533,6 +8568,9 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
         hub.append(&mut event)
             .await
             .expect("pressure append commits");
+        if index == 0 {
+            sink.wait_until_parked().await;
+        }
     }
     assert!(matches!(
         sink.collected.next().await,
