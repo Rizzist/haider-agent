@@ -813,17 +813,34 @@ fn a_foreign_member_refuses_the_destroy_honestly() {
 
 #[test]
 fn older_daemon_cannot_confirm_helper_stop_and_both_controls_fit_narrow_screen() {
-    let mut model = fleet_model(snapshot(mixed_tree()));
+    let mut roots = mixed_tree();
+    roots[0].callsign = Some("background helper task d".to_owned());
+    let mut model = fleet_model(snapshot(roots));
     model.mode = RuntimeMode::Live;
     model.active_session = Some(sid());
     model
         .daemon_features
         .insert(haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned());
     model.fleet.detail = Some(AgentId::new("ag-recon"));
+    for agent in ["ag-recon", "ag-other"] {
+        let mut chip = ChipModel::from_manifest(&child_manifest(agent, "glm-5.2"));
+        chip.state = haider_tui::script::ChipDisplayState::Thinking;
+        model.chips.push(chip);
+    }
     model.handle(key(KeyCode::Char('d')));
     let flash = model.flash.as_deref().expect("armed instructions");
     assert!(flash.contains("d confirms") && flash.contains("esc cancels"));
     assert!(flash.chars().count() < 80);
+    for (width, height) in [(80, 24), (118, 36)] {
+        let rows = draw_rows(&model, width, height);
+        let footer = rows.last().expect("footer row");
+        let (badge, _) = model.status_badge();
+        assert!(footer.contains(&format!("[ {badge} ]")), "{footer}");
+        assert!(
+            footer.contains("d confirms") && footer.contains("esc cancels"),
+            "{footer}"
+        );
+    }
     model.handle(key(KeyCode::Char('d')));
     assert!(
         model.requests.is_empty(),
@@ -833,6 +850,28 @@ fn older_daemon_cannot_confirm_helper_stop_and_both_controls_fit_narrow_screen()
         model.flash.as_deref(),
         Some(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE)
     );
+    for prefix in ["", "· protocol_mismatch — ", "· cancel refused — "] {
+        model.flash = Some(format!(
+            "{prefix}{}",
+            haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE
+        ));
+        for (width, height) in [(80, 24), (118, 36)] {
+            let rows = draw_rows(&model, width, height);
+            let visible = rows
+                .iter()
+                .map(|row| row.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                visible.contains("Stop it with `haider daemon stop`, then"),
+                "{visible}"
+            );
+            assert!(
+                visible.contains("current daemon starts automatically."),
+                "{visible}"
+            );
+        }
+    }
     let cancel = LiveCommand::Cancel {
         command_id: haider_rpc::CommandId::new("cancel"),
         session: sid(),

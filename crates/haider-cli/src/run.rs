@@ -1813,6 +1813,11 @@ fn classify_headless_error(error: &HeadlessRunError) -> ClassifiedRunError {
         HeadlessRunError::Bootstrap {
             code, retryable, ..
         } => ("errored", (*code).to_owned(), *retryable),
+        HeadlessRunError::Ensure(EnsureError::MissingFeatures { missing, .. })
+            if missing.contains(haider_rpc::FEATURE_HELPER_STOP_V1) =>
+        {
+            ("errored", "protocol_mismatch".to_owned(), false)
+        }
         HeadlessRunError::Ensure(EnsureError::MissingFeatures { .. }) => {
             ("errored", "missing_feature".to_owned(), false)
         }
@@ -3408,6 +3413,17 @@ mod tests {
             assert_eq!(
                 super::stop_scope_unsupported_message(scope, &unsupported).as_deref(),
                 Some(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE)
+            );
+            let line = super::lifecycle_error_line(
+                "haider.run.stop.v1",
+                &unsupported,
+                super::stop_scope_unsupported_message(scope, &unsupported).as_deref(),
+            );
+            let document: serde_json::Value = serde_json::from_str(&line).expect("one JSON line");
+            assert_eq!(document["error"]["code"], "protocol_mismatch");
+            assert_eq!(
+                document["error"]["message"],
+                "This daemon is older than this CLI and cannot end helper tasks reliably. Stop it with `haider daemon stop`, then run your command again; the current daemon starts automatically."
             );
         }
         let missing = HeadlessRunError::Ensure(EnsureError::MissingFeatures {

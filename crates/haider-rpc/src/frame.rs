@@ -425,7 +425,7 @@ pub const FEATURE_RUN_STOP_SCOPE_V1: &str = "run_stop_scope_v1";
 /// Main-only interruption, current-incarnation named stop, and full tree stop
 /// share this negotiated semantic contract (including durable replay).
 pub const FEATURE_HELPER_STOP_V1: &str = "helper_stop_v1";
-pub const HELPER_STOP_UNSUPPORTED_MESSAGE: &str = "this daemon is older than the CLI and cannot end helper tasks reliably; restart the daemon (haider daemon restart) and try again";
+pub const HELPER_STOP_UNSUPPORTED_MESSAGE: &str = "This daemon is older than this CLI and cannot end helper tasks reliably. Stop it with `haider daemon stop`, then run your command again; the current daemon starts automatically.";
 /// Daemon implements receipt-backed per-session provider/account/endpoint
 /// routing changes (`session.provider.rebind`) at the next request boundary.
 pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";

@@ -833,7 +833,15 @@ it finishes), and `--stop-subagents` stops only the tree. The TUI's Esc is a
 main-only stop. `agent cancel --all` never stops the parent session's own main
 run (by design; stop a run with `run --stop`). Scoped stops require a daemon
 advertising `run_stop_scope_v1`; otherwise the CLI refuses them and stops
-nothing. An auto-spawned daemon stays up while any run or owed result
+nothing. All helper stops (including default `run --stop`, named and tree
+`agent cancel`, and the TUI's main-only Esc) also require `helper_stop_v1`.
+This capability promises incarnation-bound stops, durable completed-stop
+replay, and removal of the stopped helper tasks' monitors. If it is absent,
+the CLI JSON and TUI refuse with `protocol_mismatch` (CLI exit 76), without
+sending the stop. The remedy is: "This daemon is older than this CLI and
+cannot end helper tasks reliably. Stop it with `haider daemon stop`, then
+run your command again; the current daemon starts automatically."
+An auto-spawned daemon stays up while any run or owed result
 delivery is live and retires only after all work is terminal plus its idle
 TTL. `haider daemon stop` remains an explicit stop of everything, including
 subagents.

@@ -582,7 +582,12 @@ async fn issue(
             let _ = replies
                 .send(LiveReply::Failed {
                     command_id: context.command_id.clone(),
-                    code: "feature_missing".into(),
+                    code: if feature == haider_rpc::FEATURE_HELPER_STOP_V1 {
+                        "protocol_mismatch"
+                    } else {
+                        "feature_missing"
+                    }
+                    .into(),
                     message,
                     retryable: false,
                     presentation: None,

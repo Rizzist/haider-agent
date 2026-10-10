@@ -1356,8 +1356,32 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         | Screen::Loom
         | Screen::Sessions => 1,
     };
-    let [body, status] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
+    // A compatibility refusal contains a literal recovery command. Give
+    // that notice its own wrapped rows so the remedy survives narrow TUI
+    // sizes on every stop surface, including Esc and reconnect failures.
+    let helper_stop_notice = model
+        .flash
+        .as_deref()
+        .filter(|flash| flash.contains(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE));
+    let notice_height = if let Some(notice) = helper_stop_notice
+        && status_height > 0
+    {
+        u16::try_from(
+            Paragraph::new(notice)
+                .wrap(Wrap { trim: false })
+                .line_count(area.width),
+        )
+        .unwrap_or(0)
+        .min(area.height.saturating_sub(6))
+    } else {
+        0
+    };
+    let [body, notice, status] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(notice_height),
+        Constraint::Length(status_height),
+    ])
+    .areas(area);
     // 971 F2: the frame publishes the bottom geometry it actually produced
     // (the `scroll_max` discipline). `render_composer` stamps the composer
     // rect; a surface that draws none leaves it cleared.
@@ -1409,6 +1433,16 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         hits.clear();
     }
     if status_height > 0 {
+        if let Some(notice_text) = helper_stop_notice
+            && notice_height > 0
+        {
+            frame.render_widget(
+                Paragraph::new(notice_text)
+                    .wrap(Wrap { trim: false })
+                    .style(theme.dim_style()),
+                notice,
+            );
+        }
         render_status_bar(model, theme, frame, status, &mut hits);
     }
     // The in-app selection highlight (owner item 9) paints LAST, over
@@ -15600,7 +15634,13 @@ fn render_status_bar(
         .as_ref()
         .filter(|session| model.resyncing.contains(*session))
         .map(|_| "· resyncing…".to_owned());
-    let right = if let Some(flash) = resync_notice.as_ref().or(model.flash.as_ref()) {
+    let right = if model
+        .flash
+        .as_deref()
+        .is_some_and(|flash| flash.contains(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE))
+    {
+        String::new() // The complete recovery notice has its own wrapped rows.
+    } else if let Some(flash) = resync_notice.as_ref().or(model.flash.as_ref()) {
         flash.clone()
     } else if let Some(update_hint) = update_hint {
         update_hint
@@ -15612,7 +15652,13 @@ fn render_status_bar(
     } else {
         String::new()
     };
-    let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
+    // Reserve the badge's complete chrome and a separating cell before
+    // allocating a flash. Character counts mismeasure wide glyphs.
+    let badge_width =
+        u16::try_from(Line::from(format!(" [ {badge} ] ")).width()).unwrap_or(area.width);
+    let right_width = u16::try_from(Line::from(right.as_str()).width())
+        .unwrap_or(area.width)
+        .min(area.width.saturating_sub(badge_width));
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).areas(area);
     // 970 owner item 1: this strip carries NO clickable segment any more —
