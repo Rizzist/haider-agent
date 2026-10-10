@@ -146,7 +146,7 @@ fn fork_origin_variant(variant: OriginForkVariant) {
     let (_, node, seq, user_seq) = source_turn(&store, &parent, "inherited history");
     let before = source_bytes(&store, &parent);
     let branch = named_branch.then(|| BranchId::new("origin-branch"));
-    if let Some(branch) = branch.as_ref() {
+    let (node, seq, user_seq) = if let Some(branch) = branch.as_ref() {
         store
             .create_branch(&BranchCreateCommand {
                 command_id: "origin-branch-create".into(),
@@ -171,7 +171,17 @@ fn fork_origin_variant(variant: OriginForkVariant) {
                 .revision,
             2
         );
-    }
+        let (_, node, seq, user_seq) = source_turn_for_agent(
+            &store,
+            &parent,
+            None,
+            Some(branch.clone()),
+            "named branch history",
+        );
+        (node, seq, user_seq)
+    } else {
+        (node, seq, user_seq)
+    };
     let child = SessionId::new("origin-child");
     if prompt {
         store
@@ -265,38 +275,46 @@ fn origin_named_branch_keeps_parent_revision_and_forks_independent_child() {
 }
 
 fn source_turn(store: &Store, session_id: &SessionId, text: &str) -> (RunId, NodeId, u64, u64) {
-    source_turn_for_agent(store, session_id, None, text)
+    source_turn_for_agent(store, session_id, None, None, text)
 }
 
 fn source_turn_for_agent(
     store: &Store,
     session_id: &SessionId,
     agent_id: Option<AgentId>,
+    branch_id: Option<BranchId>,
     text: &str,
 ) -> (RunId, NodeId, u64, u64) {
-    let run_id = RunId::new(format!("run-{session_id}"));
-    let request_json = serde_json::json!({
+    let turn_key = branch_id.as_ref().map_or_else(
+        || session_id.to_string(),
+        |branch| format!("{session_id}-{branch}"),
+    );
+    let run_id = RunId::new(format!("run-{turn_key}"));
+    let mut request = serde_json::json!({
         "session_id": session_id,
         "worker_generation": store.worker_generation(),
         "text": text,
-    })
-    .to_string();
+    });
+    if let Some(branch) = branch_id.as_ref() {
+        request["branch_id"] = serde_json::json!(branch);
+    }
+    let request_json = request.to_string();
     let TurnAcceptOutcome::Committed { envelopes, .. } = store
         .accept_turn(&TurnAcceptCommand {
-            command_id: format!("turn-{session_id}"),
+            command_id: format!("turn-{turn_key}"),
             request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
             request_json,
             session_id: session_id.clone(),
             worker_generation: store.worker_generation(),
             run_id: run_id.clone(),
             agent_id: agent_id.clone(),
-            branch_id: None,
+            branch_id: branch_id.clone(),
             text: text.into(),
             attachments: Vec::new(),
             mode: DeliveryMode::Queue,
-            queued_event_id: EventId::new(format!("queued-{session_id}")),
-            user_event_id: EventId::new(format!("user-{session_id}")),
-            active_event_id: EventId::new(format!("active-{session_id}")),
+            queued_event_id: EventId::new(format!("queued-{turn_key}")),
+            user_event_id: EventId::new(format!("user-{turn_key}")),
+            active_event_id: EventId::new(format!("active-{turn_key}")),
             device_id: DeviceId::new("session-fork-test-device"),
         })
         .expect("accept source turn")
@@ -326,10 +344,10 @@ fn source_turn_for_agent(
         .expect("user node");
     let mut done = [EventEnvelope {
         schema_version: SCHEMA_VERSION,
-        event_id: EventId::new(format!("done-{session_id}")),
+        event_id: EventId::new(format!("done-{turn_key}")),
         seq: 0,
         session_id: session_id.clone(),
-        branch_id: None,
+        branch_id,
         run_id: Some(run_id.clone()),
         agent_id,
         device_id: DeviceId::new("session-fork-test-device"),
@@ -2315,6 +2333,7 @@ fn delegated_source_fork(with_origin: bool) {
         &store,
         &source,
         Some(agent.clone()),
+        None,
         "delegated history becomes a standalone root",
     );
     let source_before = source_storage_bytes(root.path(), &source);
