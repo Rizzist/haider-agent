@@ -1287,16 +1287,19 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
         .commit_turn_resolved_route(&run, &metadata, Some("active-alias"))
         .await
         .expect("resolve active");
-    let untouched = lease
+    let published = lease
         .session_metadata()
         .await
         .expect("session")
         .expect("typed");
     assert!(
-        !untouched.resolved_route_seen,
-        "run resolution never publishes session truth"
+        published.resolved_route_seen,
+        "a matching route publishes session truth"
     );
-    assert_eq!(untouched.resolved_route_alias, None);
+    assert_eq!(
+        published.resolved_route_alias.as_deref(),
+        Some("active-alias")
+    );
     let selected = hub
         .select_session_model(haider_store::SessionSelectModelCommand {
             command_id: "next-route".into(),
@@ -1431,4 +1434,142 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
     drop(lease);
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close");
+}
+
+/// O21 (families 1/2/7): a mid-turn credential rotation on a run whose pinned route IS the
+/// session's current rebind route. The epoch stamped on the turn's footprints must remain one
+/// the session (and so the TUI meter) can match. Paired control: same steps without a rebind.
+#[tokio::test]
+async fn matching_rebind_route_publishes_account_and_rotation_epoch() {
+    let mut rows = Vec::new();
+    for rebound in [false, true] {
+        let root = tempfile::tempdir().expect("profile");
+        let session = SessionId::new(format!("o21-rot-{rebound}"));
+        let run = RunId::new(format!("o21-rot-run-{rebound}"));
+        let device = DeviceId::new("o21-device");
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("hub");
+        create_rebind_test_session(&hub, &session).await;
+        if rebound {
+            commit_test_rebind(&hub, &session, store.worker_generation(), 1).await;
+        }
+        hub.accept_internal_turn(haider_core::TurnAcceptCommand {
+            command_id: "o21-rot-accept".into(),
+            request_digest: "o21-rot-accept".into(),
+            request_json: "{}".into(),
+            session_id: session.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "rotation".into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Queue,
+            queued_event_id: EventId::new("o21-rot-q"),
+            user_event_id: EventId::new("o21-rot-u"),
+            active_event_id: EventId::new("o21-rot-a"),
+            device_id: device.clone(),
+        })
+        .await
+        .expect("accept");
+        let lease = hub
+            .acquire_worker_lease(session.clone())
+            .await
+            .expect("lease");
+        let md = lease.session_metadata().await.expect("md").expect("typed");
+        let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+            provider: md.provider.clone(),
+            model: md.model.clone(),
+            max_tokens: md.max_tokens,
+            source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+            provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(&md),
+        };
+        append_payloads(
+            &lease,
+            &device,
+            &run,
+            None,
+            &EventIdGenerator::new("o21-rot-pin"),
+            vec![
+                pin.to_event(&run).expect("pin"),
+                EventPayload::RunState(RunState::Thinking),
+            ],
+        )
+        .await
+        .expect("pin");
+        let first = lease
+            .commit_turn_resolved_route(&run, &md, Some("acct-1"))
+            .await
+            .expect("first");
+        let mut turn_md = lease.session_metadata().await.expect("md").expect("typed");
+        hub.run_output_pair(&session, &run)
+            .await
+            .expect("p")
+            .expect("p")
+            .restore_route(&mut turn_md);
+        let unchanged = lease
+            .commit_turn_resolved_route(&run, &turn_md, Some("acct-1"))
+            .await
+            .expect("unchanged account");
+        assert_eq!(unchanged, first, "the same account preserves its epoch");
+        let rotated = lease
+            .commit_turn_resolved_route(&run, &turn_md, Some("acct-2"))
+            .await
+            .expect("rotate");
+        let after = lease.session_metadata().await.expect("md").expect("typed");
+        println!(
+            "O21-ROT rebound={rebound} first_epoch={first} rotated_epoch={rotated} session_epoch={:?} session_alias={:?} seen={:?}",
+            after.selection_epoch, after.resolved_route_alias, after.resolved_route_seen
+        );
+        rows.push((
+            rebound,
+            rotated,
+            after.selection_epoch,
+            after.resolved_route_alias.clone(),
+        ));
+        for alias in [None, Some("acct-3")] {
+            let mut turn = lease
+                .session_metadata()
+                .await
+                .expect("metadata")
+                .expect("typed");
+            hub.run_output_pair(&session, &run)
+                .await
+                .expect("pair")
+                .expect("admitted")
+                .restore_route(&mut turn);
+            let epoch = lease
+                .commit_turn_resolved_route(&run, &turn, alias)
+                .await
+                .expect("resolve rotated route");
+            let session = lease
+                .session_metadata()
+                .await
+                .expect("metadata")
+                .expect("typed");
+            assert_eq!(
+                session.selection_epoch,
+                Some(epoch),
+                "footprints and session share the rotation epoch"
+            );
+            assert_eq!(session.resolved_route_alias.as_deref(), alias);
+            assert!(session.resolved_route_seen);
+        }
+        drop(lease);
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+    for (rebound, rotated, session_epoch, alias) in &rows {
+        assert_eq!(
+            Some(*rotated),
+            *session_epoch,
+            "rebound={rebound}: turn epoch the meter can match"
+        );
+        assert_eq!(
+            alias.as_deref(),
+            Some("acct-2"),
+            "rebound={rebound}: shown account is the served one"
+        );
+    }
 }

@@ -8884,8 +8884,8 @@ impl HubStoreHandle {
             .await
     }
 
-    /// A restored explicit route belongs to this logical run, even when a
-    /// next-turn selection has cleared or replaced the session route.
+    /// Publish a current route through the session's epoch guard. A restored
+    /// route that has diverged from the session belongs only to this run.
     pub(crate) async fn commit_turn_resolved_route(
         &self,
         run_id: &RunId,
@@ -8897,10 +8897,29 @@ impl HubStoreHandle {
             return self.commit_resolved_route(metadata, alias).await;
         };
         let current = metadata.selection_epoch.unwrap_or(0);
+        let session = self.session_metadata().await?.ok_or_else(|| {
+            HaiderError::new(ErrorCode::StoreCorrupt, "run session is missing", false)
+        })?;
+        let session_epoch = if session.provider == metadata.provider
+            && session.model == metadata.model
+            && session.provider_rebind_id == metadata.provider_rebind_id
+            && session.account_alias == metadata.account_alias
+            && session.provider_base_url == metadata.provider_base_url
+            && session.selection_epoch.unwrap_or(0) <= current
+            && session.route_reset_epoch.unwrap_or(0) <= current
+        {
+            // A selection racing this read is still refused atomically by
+            // the existing actor/Store epoch guard.
+            Some(self.commit_resolved_route(metadata, alias).await?)
+        } else {
+            None
+        };
         if route.resolved_seen && route.resolved_alias.as_deref() == alias {
-            return Ok(current);
+            return Ok(session_epoch.unwrap_or(current));
         }
-        let epoch = if route.resolved_seen {
+        let epoch = if let Some(epoch) = session_epoch {
+            epoch
+        } else if route.resolved_seen {
             self.latest_seq(&self.session_id)
                 .await?
                 .max(current)

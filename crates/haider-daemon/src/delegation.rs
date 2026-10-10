@@ -558,8 +558,17 @@ impl DelegationHandle {
             // route. Clearing now applies to new child admissions; an
             // unchanged retry keeps the Store-proven original route, from
             // its digest, frozen reply or creation-bounded parent history.
-            // Current receipts and nonempty changed routes remain strict.
-            if old.get("inheritance_parent_session_id").is_none()
+            // ce9d0976 also wrote current-schema receipts with the retained
+            // route. Restore only a route identical to the frozen reply;
+            // the Store still compares the complete replay body strictly.
+            let recorded_route_matches = [
+                ("inherited_account_alias", &admitted.account_alias),
+                ("inherited_provider_base_url", &admitted.provider_base_url),
+                ("inherited_provider_rebind_id", &admitted.provider_rebind_id),
+            ]
+            .into_iter()
+            .all(|(key, value)| old.get(key) == Some(&serde_json::json!(value)));
+            if (old.get("inheritance_parent_session_id").is_none() || recorded_route_matches)
                 && request
                     .provider
                     .as_deref()

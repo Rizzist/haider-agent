@@ -6370,8 +6370,8 @@ async fn astra_legacy_child_receipt_replay_is_compatible() {
     );
 }
 
-/// Legacy absent source/display fields and a changed destination catalog are
-/// replay coordinates, not a new child request. A changed requested budget is.
+/// Historical receipt shapes, retained routes and catalog drift are replay
+/// coordinates. Changed caller intent must still be refused.
 #[tokio::test]
 async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_catalog_edits() {
     use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
@@ -6393,7 +6393,16 @@ async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_ca
         ("pre_witness_reply_missing_route", true, 5_u8),
         ("pre_witness_reply_missing_route", true, 6_u8),
         ("pre_witness_reply_missing_route", true, 7_u8),
-        ("current_receipt_selector_clear", true, 0_u8),
+        ("ce9_current_receipt_same_provider", true, 0_u8),
+        ("ce9_current_receipt_same_provider", false, 0_u8),
+        ("ce9_current_receipt_same_provider", true, 1_u8),
+        ("ce9_current_receipt_same_provider", true, 2_u8),
+        ("ce9_current_receipt_same_provider", true, 3_u8),
+        ("ce9_current_receipt_same_provider", true, 4_u8),
+        ("ce9_current_receipt_same_provider", true, 5_u8),
+        ("ce9_current_receipt_same_provider", true, 6_u8),
+        ("ce9_current_receipt_same_provider", true, 7_u8),
+        ("ce9_current_receipt_changed_model", true, 0_u8),
     ] {
         let root = tempfile::tempdir().expect("profile");
         let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -6427,9 +6436,17 @@ async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_ca
                 Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 })
             };
         if selector_pin {
-            child_metadata.account_alias = Some("legacy-pin".into());
-            child_metadata.provider_base_url = Some("http://127.0.0.1:8011/v1".into());
-            child_metadata.provider_rebind_id = Some("legacy-rebind".into());
+            let route_mask = if variant == "ce9_current_receipt_same_provider" && omitted_route != 0
+            {
+                omitted_route
+            } else {
+                7
+            };
+            child_metadata.account_alias = (route_mask & 1 != 0).then(|| "legacy-pin".into());
+            child_metadata.provider_base_url =
+                (route_mask & 2 != 0).then(|| "http://127.0.0.1:8011/v1".into());
+            child_metadata.provider_rebind_id =
+                (route_mask & 4 != 0).then(|| "legacy-rebind".into());
         }
         let original_metadata = child_metadata.clone();
         let args = serde_json::json!({
@@ -6579,29 +6596,21 @@ async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_ca
         if selector_pin {
             // The current selector clears the old route and a catalog edit
             // re-derives 16384. Both derived changes must keep the original
-            // legacy admission, while a current receipt remains byte strict.
+            // admission, including ce9d0976's current-schema receipt.
             install_child_selection_test_catalog(&hub, 16_384);
+            let mut parent_metadata = child_metadata.clone();
+            if variant == "ce9_current_receipt_changed_model" {
+                parent_metadata.model = "wide".into();
+            }
             child_metadata = delegation
-                .resolve_child_metadata(&child_metadata, &request)
+                .resolve_child_metadata(&parent_metadata, &request)
                 .expect("resolve current selector")
                 .expect("selected metadata");
+            assert_eq!(child_metadata.model, "small");
             assert_eq!(child_metadata.max_tokens, 16_384);
             assert_eq!(child_metadata.account_alias, None);
             assert_eq!(child_metadata.provider_base_url, None);
             assert_eq!(child_metadata.provider_rebind_id, None);
-            if variant == "current_receipt_selector_clear" {
-                assert!(
-                    delegation
-                        .establish(coordinates(child_metadata), request.clone())
-                        .await
-                        .is_err(),
-                    "a current receipt must reject a changed route"
-                );
-                drop(delegation);
-                hub.shutdown().await.expect("shutdown");
-                store.close().await.expect("close");
-                continue;
-            }
             for change in [
                 "budget", "provider", "model", "alias", "endpoint", "rebind", "task", "prompt",
             ] {
