@@ -2,6 +2,45 @@
 
 use super::*;
 #[test]
+fn helper_stop_remedy_respects_parsed_cancel_mode() {
+    for target in [vec!["parent", "child"], vec!["parent", "--all"]] {
+        for no_spawn in [false, true] {
+            for json in [false, true] {
+                for flags_first in [false, true] {
+                    let flags: Vec<_> =
+                        [no_spawn.then_some("--no-spawn"), json.then_some("--json")]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                    let args: Vec<_> = if flags_first {
+                        flags.iter().chain(&target)
+                    } else {
+                        target.iter().chain(&flags)
+                    }
+                    .map(|arg| (*arg).to_owned())
+                    .collect();
+                    let mut argv = vec!["cancel".to_owned()];
+                    argv.extend(args);
+                    let options = Options::parse("agent", &argv)
+                        .unwrap_or_else(|_| panic!("cancel argv: {argv:?}"));
+                    assert_eq!(options.no_spawn, no_spawn);
+                    let message = helper_stop_remedy(options.no_spawn);
+                    assert!(message.contains("`haider daemon stop`"));
+                    if no_spawn {
+                        assert!(
+                            message
+                                .ends_with("without --no-spawn so the current daemon can start.")
+                        );
+                    } else {
+                        assert!(message.ends_with("the current daemon starts automatically."));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn blocking_wait_requires_parent_report_even_after_child_terminal() {
     let agent = AgentId::new("agent-race");
     let terminal = RunState::Errored;

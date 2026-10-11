@@ -200,6 +200,7 @@ impl Options {
 struct Connection {
     client: RpcClient,
     drain: tokio::task::JoinHandle<()>,
+    no_spawn: bool,
 }
 
 impl Drop for Connection {
@@ -245,7 +246,11 @@ impl Connection {
         // Attach grants control only. Consume its replay continuously, keeping
         // memory bounded; public results use independently paged session.read.
         let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-        Ok(Self { client, drain })
+        Ok(Self {
+            client,
+            drain,
+            no_spawn: options.no_spawn,
+        })
     }
 
     fn require(&self, feature: &'static str) -> Result<(), Failure> {
@@ -254,7 +259,7 @@ impl Connection {
         } else {
             Err(Failure::protocol(
                 if feature == haider_rpc::FEATURE_HELPER_STOP_V1 {
-                    haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE.to_owned()
+                    helper_stop_remedy(self.no_spawn).to_owned()
                 } else {
                     format!("daemon does not advertise {feature}")
                 },
@@ -329,6 +334,14 @@ impl Connection {
             ResponseBody::SessionRead { result } if result.session_id == *session_id => Ok(result),
             _ => Err(Failure::protocol("session.read response mismatch")),
         }
+    }
+}
+
+fn helper_stop_remedy(no_spawn: bool) -> &'static str {
+    if no_spawn {
+        haider_rpc::HELPER_STOP_UNSUPPORTED_NO_SPAWN_MESSAGE
+    } else {
+        haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE
     }
 }
 

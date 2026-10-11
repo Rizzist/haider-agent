@@ -224,7 +224,7 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
     let provider = Arc::new(FakeProvider::new(script));
     let world = World::boot_with_scope("handoff", provider, vec![], false).await;
     let source = SessionId::new("source-session");
-    let mut source_events = [RawEnvelope {
+    let mut source_events = vec![RawEnvelope {
         schema_version: SCHEMA_VERSION,
         event_id: EventId::new("source-user"),
         seq: 0,
@@ -251,6 +251,30 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
         .expect("source payload")
         .into(),
     }];
+    // A detached result is not a normal tool-result row. Exercise the real
+    // provider tool route with its report and public delivery notice, while
+    // keeping private obligation/unknown extensions out of the tool receipt.
+    for (index, item) in [
+        serde_json::json!({"item":"child_result","report":{"agent":"child",
+            "summary":"late child report","verified":"unverified"}}),
+        serde_json::json!({"item":"extension","kind":"detached_child_result_v1","data":{
+            "agent":"child","task":"review","stopped_run_id":"stopped-run","state":"done",
+            "verified":"unverified","summary":"late child report"}}),
+        serde_json::json!({"item":"extension","kind":"detached_delivery_v1","data":{
+            "agent":"child","phase":"owed","private_extra":"must-not-appear"}}),
+        serde_json::json!({"item":"extension","kind":"unknown","data":{
+            "summary":"must-not-appear"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut envelope = source_events[0].clone();
+        envelope.event_id = EventId::new(format!("source-child-{index}"));
+        envelope.payload = serde_json::json!({"type":"item","event":"completed",
+            "item_id":format!("child-{index}"),"item":item})
+        .into();
+        source_events.push(envelope);
+    }
     world
         .store
         .append(&mut source_events)
@@ -289,6 +313,9 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
         read.preview
     );
     assert!(read.preview.contains("next_after_seq="));
+    assert!(read.preview.contains("late child report"));
+    assert!(read.preview.contains("result delivered"));
+    assert!(!read.preview.contains("must-not-appear"));
     let denied = &results
         .iter()
         .find(|(id, _)| id == "foreign")

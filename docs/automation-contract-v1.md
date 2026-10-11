@@ -572,16 +572,23 @@ controllers must not send unknown properties
 Creation is observed as `EventPayload::AgentSpawned(AgentManifest)`; the
 manifest carries the opaque agent ID and its grant/fencing coordinates
 (`crates/haider-protocol/src/lib.rs:113-120`;
-`crates/haider-protocol/src/agent.rs:11-46`). The child terminal is the
+`crates/haider-protocol/src/agent.rs:11-46`). A foreground child's collected report is the
 `TurnItem::ChildResult { report: ChildReport }` item
 (`crates/haider-protocol/src/item.rs:109-116`;
 `crates/haider-protocol/src/agent.rs:129-147`).
+Background children and later child runs are collected from their own journal
+as described in the wait contract below. Public session transcripts include
+completed `ChildResult` reports and the named `detached_child_result_v1` and
+`subagents_still_running_v1` notices. Private delivery obligations and unknown
+extensions remain excluded.
 
 For follow-up instructions, a model uses `message_subagent { agent, message }`;
 the message is bounded to 32 KiB and addresses a direct child by opaque agent
 ID (`crates/haider-tools/src/message_subagent.rs:7-36`, `:39-64`). An external
-controller uses the existing `agent.message` method above. To stop a child and
-its descendants, use `agent.cancel`.
+controller uses the existing `agent.message` method above. Named `agent.cancel`
+stops only that child's current run and its own monitors; descendants remain
+alive. To stop every child in the session's tree, use `agent.cancel_all`
+(`haider agent cancel <parent-session-id> --all`).
 
 ## 9. Provider request correlation
 
@@ -841,6 +848,10 @@ the CLI JSON and TUI refuse with `protocol_mismatch` (CLI exit 76), without
 sending the stop. The remedy is: "This daemon is older than this CLI and
 cannot end helper tasks reliably. Stop it with `haider daemon stop`, then
 run your command again; the current daemon starts automatically."
+With `--no-spawn`, the remedy instead says: "This daemon is older than this
+CLI and cannot end helper tasks reliably. Stop it with `haider daemon stop`,
+then run your command again without --no-spawn so the current daemon can start."
+The flag continues to disable automatic startup; recovery requires omitting it.
 An auto-spawned daemon stays up while any run or owed result
 delivery is live and retires only after all work is terminal plus its idle
 TTL. `haider daemon stop` remains an explicit stop of everything, including
@@ -974,15 +985,19 @@ must tolerate additive fields. Human output is not a parsing contract.
 | workflow list | `workflows`: native workflow catalog entries. |
 
 Wait selects the latest child run visible during its initial journal replay
-and keeps that target. For the initial delegation it requires both the child's
-typed terminal and its parent's completed `ChildResult`, with
-`report_source: "child_result"` and the exact `child_result_seq`. After an idle
+and keeps that target. For an initial foreground delegation it requires both
+the child's typed terminal and its parent's completed `ChildResult`, with
+`report_source: "child_result"` and the exact `child_result_seq`. An initial
+background child has no parent collector: wait reads its completed child
+message and terminal from the child journal. After an idle
 child is messaged, its follow-up turn has no new parent collector: wait reads
-the actual completed child message and terminal, reports
-`report_source: "child_journal"`, `verified: "unverified"`, and a null
-`child_result_seq`. It never substitutes the old parent's report. `agent.cancel`
-retains the native RPC's original delegation-run targeting and recursive
-cancellation semantics; its returned child-run coordinate is authoritative.
+the actual completed child message and terminal. Both journal paths report
+`report_source: "child_journal"` and a null `child_result_seq`, and derive
+verification from the terminal state (a successful run is unverified;
+failed or cancelled runs are red). Wait never substitutes the old parent's report.
+Named `agent.cancel` stops the named child's current run, including later
+messaged or monitor-woken runs, and removes its own monitors. Descendants
+remain alive; its returned child-run coordinate is authoritative.
 
 | Exit | Meaning |
 | --- | --- |
