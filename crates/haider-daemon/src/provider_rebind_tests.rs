@@ -1573,3 +1573,223 @@ async fn matching_rebind_route_publishes_account_and_rotation_epoch() {
         );
     }
 }
+
+/// Route facts belong to the pinned run's branch, including when its restored
+/// route has diverged from the next-turn session route. The unbranched control
+/// remains in pinned_route_provenance_is_run_scoped_across_restart_and_next_turn.
+#[tokio::test]
+async fn pinned_route_resolution_keeps_the_active_run_branch() {
+    let root = tempfile::tempdir().expect("profile");
+    let session = SessionId::new("branch-route-scope");
+    let source_run = RunId::new("branch-route-source");
+    let run = RunId::new("branch-route-active");
+    let branch = haider_protocol::ids::BranchId::new("route-branch");
+    let device = DeviceId::new("branch-route-device");
+    let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+        .await
+        .expect("hub");
+    create_rebind_test_session(&hub, &session).await;
+    commit_test_rebind(&hub, &session, store.worker_generation(), 1).await;
+    let generation = store.worker_generation();
+    let turn = |run: &RunId, branch_id| haider_core::TurnAcceptCommand {
+        command_id: format!("accept-{run}"),
+        request_digest: format!("accept-{run}"),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        worker_generation: generation,
+        run_id: run.clone(),
+        agent_id: None,
+        branch_id,
+        text: "branch route witness".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+        queued_event_id: EventId::new(format!("queued-{run}")),
+        user_event_id: EventId::new(format!("user-{run}")),
+        active_event_id: EventId::new(format!("active-{run}")),
+        device_id: device.clone(),
+    };
+    hub.accept_internal_turn(turn(&source_run, None))
+        .await
+        .expect("source turn");
+    let source = store.read(&session, 0, 1024).await.expect("source journal");
+    let (fork_node_id, fork_seq) = source
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::NodeCommitted(node)) if event.run_id.as_ref() == Some(&source_run) => {
+                Some((node.node, event.seq))
+            }
+            _ => None,
+        })
+        .expect("source prompt node");
+    let mut source_done = source
+        .iter()
+        .find(|event| {
+            event.run_id.as_ref() == Some(&source_run)
+                && matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::RunState(RunState::Queued))
+                )
+        })
+        .expect("source queued")
+        .clone();
+    source_done.event_id = EventId::new("branch-route-source-done");
+    source_done.seq = 0;
+    source_done.payload = serde_json::to_value(EventPayload::RunState(RunState::Done))
+        .expect("source done payload")
+        .into();
+    hub.append(&mut [source_done]).await.expect("source done");
+    store
+        .create_branch(haider_store::BranchCreateCommand {
+            command_id: "branch-route-create".into(),
+            request_digest: "branch-route-create".into(),
+            request_json: "{}".into(),
+            session_id: session.clone(),
+            worker_generation: generation,
+            branch_id: branch.clone(),
+            source_branch_id: None,
+            fork_node_id,
+            fork_seq,
+            name: Some("route branch".into()),
+            event_id: EventId::new("branch-route-created"),
+            device_id: device.clone(),
+        })
+        .await
+        .expect("create real branch");
+    hub.accept_internal_turn(turn(&run, Some(branch.clone())))
+        .await
+        .expect("branched turn");
+    let lease = hub
+        .acquire_worker_lease(session.clone())
+        .await
+        .expect("lease");
+    let metadata = lease
+        .session_metadata()
+        .await
+        .expect("metadata")
+        .expect("typed");
+    let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        provider: metadata.provider.clone(),
+        model: metadata.model.clone(),
+        max_tokens: metadata.max_tokens,
+        source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(&metadata),
+    };
+    append_payloads(
+        &lease,
+        &device,
+        &run,
+        Some(&branch),
+        &EventIdGenerator::new("branch-route-pin"),
+        vec![
+            pin.to_event(&run).expect("pin"),
+            EventPayload::RunState(RunState::Thinking),
+        ],
+    )
+    .await
+    .expect("branched pin");
+    lease
+        .commit_turn_resolved_route(&run, &metadata, Some("branch-active-alias"))
+        .await
+        .expect("matching branch resolution");
+    assert_eq!(
+        lease
+            .session_metadata()
+            .await
+            .expect("session")
+            .expect("typed")
+            .resolved_route_alias
+            .as_deref(),
+        Some("branch-active-alias"),
+        "a matching branched route still publishes session truth"
+    );
+    hub.select_session_model(haider_store::SessionSelectModelCommand {
+        command_id: "branch-route-next".into(),
+        request_digest: "branch-route-next".into(),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        worker_generation: generation,
+        provider: "fake-next".into(),
+        model: metadata.model.clone(),
+        expected_pair: None,
+        account_alias: None,
+        output_budget: None,
+        event_id: EventId::new("branch-route-next"),
+        device_id: device.clone(),
+    })
+    .await
+    .expect("next-turn route");
+    let next = lease
+        .session_metadata()
+        .await
+        .expect("next")
+        .expect("typed");
+    lease
+        .commit_resolved_route(&next, Some("branch-next-alias"))
+        .await
+        .expect("next-turn resolution");
+    let next = lease
+        .session_metadata()
+        .await
+        .expect("next")
+        .expect("typed");
+    let pair = hub
+        .run_output_pair(&session, &run)
+        .await
+        .expect("pair")
+        .expect("pin");
+    let mut active = next.clone();
+    pair.restore_route(&mut active);
+    active.provider = pair.provider;
+    active.model = pair.model;
+    lease
+        .commit_turn_resolved_route(&run, &active, Some("branch-rotated-alias"))
+        .await
+        .expect("diverged branch resolution");
+    assert_eq!(
+        lease
+            .session_metadata()
+            .await
+            .expect("session")
+            .expect("typed"),
+        next,
+        "a diverged branched resolution remains run-only"
+    );
+    let events = store.read(&session, 0, 1024).await.expect("route journal");
+    let resolved = events
+        .iter()
+        .filter(|event| {
+            event.run_id.as_ref() == Some(&run)
+                && matches!(event.payload.decode_event(),
+                Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                    item: haider_protocol::item::TurnItem::Extension { kind, .. }, ..
+                })) if kind == haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 2, "matching and diverged resolution facts");
+    for event in resolved {
+        assert_eq!(
+            event.branch_id.as_ref(),
+            Some(&branch),
+            "resolved route fact keeps the pinned run branch"
+        );
+    }
+    drop(lease);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
+    let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+        .await
+        .expect("restart");
+    let pair = hub
+        .run_output_pair(&session, &run)
+        .await
+        .expect("pair")
+        .expect("pin");
+    let mut restored = next.clone();
+    pair.restore_route(&mut restored);
+    assert_eq!(
+        restored.resolved_route_alias.as_deref(),
+        Some("branch-rotated-alias")
+    );
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
+}
