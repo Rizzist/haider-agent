@@ -12578,7 +12578,18 @@ impl AppModel {
                                 != Some((alias, incarnation))
                         })
                 });
+        // A pick's producer can only be judged against a provider view. At
+        // boot the account reply usually lands before the provider reply (or
+        // the provider's publication is still buffered for account proof);
+        // the absence of that view is not evidence that the producer changed.
+        let catalog_view_known = summary.is_some()
+            || (self.providers.revision.is_some()
+                && !self
+                    .providers
+                    .pending_catalogs
+                    .contains_key(&self.identity.provider));
         let catalog_changed = self.identity_catalog_key.is_some()
+            && catalog_view_known
             && (self.identity_catalog_key != key || producer_retired);
         let owned_session_route_changed =
             self.identity_catalog_key.is_some() && !self.current_catalog_matches_session_route();

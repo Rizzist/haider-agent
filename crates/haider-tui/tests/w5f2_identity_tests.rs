@@ -2632,3 +2632,68 @@ fn management_changes_arrive_by_watch_signal_without_polling() {
         resumed.commands
     );
 }
+
+/// MUTATION CHECK (catalog-fixes, restored pick): a persisted pick keyed to
+/// the still-active producer survives a restart in BOTH boot reply orders;
+/// the account reply usually lands first, and the absence of a provider view
+/// is not evidence that the producer changed. Expected failure without the
+/// `catalog_view_known` guard: the accounts-first order retires the pick
+/// (and clears the persisted file) before the provider reply arrives.
+/// Negative control: a different active incarnation still retires it in
+/// both orders.
+#[test]
+fn restored_pick_survives_boot_reply_order_for_the_same_producer() {
+    use haider_tui::settings::LastModelPick;
+    let summary = |incarnation: u64| {
+        let mut summary = private_summary(incarnation, "a-private-alpha");
+        summary.models.push("a-private-beta".into());
+        let mut beta = summary.model_details[0].clone();
+        beta.name = "a-private-beta".into();
+        summary.model_details.push(beta);
+        summary
+    };
+    for accounts_first in [true, false] {
+        for (active, retained) in [(71_u64, true), (72, false)] {
+            let mut model = live_model();
+            model.restore_last_model_pick(&LastModelPick {
+                provider: "custom".into(),
+                model: "a-private-beta".into(),
+                catalog_key: Some("synthetic-producer-71".into()),
+                scope_known: true,
+            });
+            let mut driver = LiveDriver::new("restored");
+            let mut account = oauth_descriptor("custom", "work", true);
+            account.incarnation = active;
+            let accounts = LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(1),
+                sources: vec![],
+            };
+            let providers = LiveReply::Providers {
+                providers: vec![summary(active)],
+                revision: 1,
+            };
+            let (first, second) = if accounts_first {
+                (accounts, providers)
+            } else {
+                (providers, accounts)
+            };
+            pass(&mut driver, &mut model, first);
+            pass(&mut driver, &mut model, second);
+            let label = format!("accounts_first={accounts_first} active={active}");
+            if retained {
+                assert_eq!(model.identity.model_short, "a-private-beta", "{label}");
+                assert_eq!(
+                    model
+                        .last_model_pick()
+                        .and_then(|pick| pick.catalog_key)
+                        .as_deref(),
+                    Some("synthetic-producer-71"),
+                    "{label}: the persisted owner is kept"
+                );
+            } else {
+                assert_ne!(model.identity.model_short, "a-private-beta", "{label}");
+            }
+        }
+    }
+}
