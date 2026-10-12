@@ -3918,8 +3918,10 @@ confirmation nodes are rejected rather than dropping those gates. `workflow list
 List reads `session.fleet`; message/cancel retain their existing Control
 attachment, direct-child ownership and receipt rules. Wait uses bounded
 `session.read` pages and the sole `RawEnvelope.seq` cursor. A successful
-initial wait requires both the exact child's terminal and the parent's
-completed `ChildResult`; fleet state alone is insufficient. Negotiated
+initial foreground wait for an operator-authored child requires both the exact
+child's terminal and the parent's completed `ChildResult`. Background and follow-up
+waits collect the report from the child journal without requiring a parent
+`ChildResult`; fleet state alone is insufficient. Negotiated
 connections continue servicing keepalive during observation. Command timeout
 or disconnect does not transfer daemon work ownership to the client.
 

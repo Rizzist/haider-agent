@@ -834,23 +834,91 @@ fn sidecar_path(root: &tempfile::TempDir, session_id: &SessionId) -> std::path::
     root.path().join("pipe").join(format!("{session_id}.pipe"))
 }
 
-/// #6 (935): sidecar maintenance runs off the publish path on a per-session
-/// writer task, so a read right after `append` can race the write. Poll the
-/// file until it is non-empty and STABLE across a tick — the atomic
-/// temp+rename rebuild converges to exactly the steady state
-/// `hub.shutdown()` guarantees, with no intermediate stable point.
-async fn stable_sidecar(path: &std::path::Path) -> String {
-    let mut prev: Option<String> = None;
-    for _ in 0..300 {
-        if let Ok(cur) = std::fs::read_to_string(path) {
-            if !cur.is_empty() && prev.as_deref() == Some(cur.as_str()) {
-                return cur;
+/// Sidecar maintenance runs on a queued writer, so even repeated equal reads
+/// can precede a pending append. Wait for its complete coverage tail to reach
+/// the expected journal head; callers still assert the actual rows and generation.
+async fn sidecar_at_coverage(path: &std::path::Path, expected_coverage: u64) -> String {
+    let mut last_read = None;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let Ok(body) = std::fs::read_to_string(path) {
+                let coverage = body
+                    .lines()
+                    .last()
+                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .and_then(|tail| tail.get("coverage").and_then(serde_json::Value::as_u64));
+                if body.ends_with('\n') && coverage == Some(expected_coverage) {
+                    return body;
+                }
+                last_read = Some(body);
             }
-            prev = Some(cur);
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "sidecar {} did not reach coverage {expected_coverage}: {last_read:?}",
+            path.display()
+        )
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn sidecar_coverage_waits_for_delayed_writer_from_unsettled_tails() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    let expected =
+        "{\"role\":\"user\",\"text\":\"kept\",\"seq\":1}\n{\"coverage\":2,\"generation\":7}\n";
+    for initial in [
+        None,
+        Some(""),
+        Some("{\"coverage\":1,\"generation\":7}\n"),
+        Some("{\"role\":\"user\",\"seq\":2}\n"),
+        Some("{\"coverage\":"),
+        Some("{\"coverage\":2,\"generation\":7}"),
+        Some("{\"coverage\":3,\"generation\":7}\n"),
+    ] {
+        if let Some(body) = initial {
+            std::fs::write(&path, body).expect("initial tail");
+        }
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            // Longer than the old helper's two equal reads, without wall-clock timing.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let temporary = writer_path.with_extension("tmp");
+            std::fs::write(&temporary, expected).expect("queued batch");
+            std::fs::rename(temporary, writer_path).expect("publish batch");
+        });
+        assert_eq!(sidecar_at_coverage(&path, 2).await, expected);
+        writer.await.expect("writer joins");
+        std::fs::remove_file(&path).expect("fixture resets");
     }
-    prev.unwrap_or_default()
+}
+
+#[tokio::test(start_paused = true)]
+async fn sidecar_coverage_returns_ready_content_without_waiting_or_rewriting() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    let expected =
+        "{\"role\":\"user\",\"text\":\"kept\",\"seq\":1}\n{\"coverage\":2,\"generation\":7}\n";
+    std::fs::write(&path, expected).expect("ready sidecar");
+    let start = tokio::time::Instant::now();
+    assert_eq!(sidecar_at_coverage(&path, 2).await, expected);
+    assert_eq!(tokio::time::Instant::now(), start);
+    assert_eq!(
+        std::fs::read_to_string(path).expect("unchanged file"),
+        expected
+    );
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "did not reach coverage 2")]
+async fn sidecar_coverage_deadline_rejects_a_stalled_writer() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    std::fs::write(&path, "{\"coverage\":1,\"generation\":7}\n").expect("stale tail");
+    sidecar_at_coverage(&path, 2).await;
 }
 
 async fn append_delta(
@@ -9705,7 +9773,7 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
     events[3].branch_id = Some(BranchId::new("branch-sidecar"));
 
     hub.append(&mut events).await.expect("pipe batch commits");
-    let bytes = stable_sidecar(&sidecar_path(&root, &session_id))
+    let bytes = sidecar_at_coverage(&sidecar_path(&root, &session_id), events[4].seq)
         .await
         .into_bytes();
     assert_eq!(
@@ -9716,7 +9784,7 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         String::from_utf8(bytes).expect("sidecar utf8"),
         stored_sidecar(&store, &session_id, 1).await
     );
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let sidecar = sidecar_at_coverage(&sidecar_path(&root, &session_id), events[4].seq).await;
     let values: Vec<serde_json::Value> = sidecar
         .lines()
         .skip(1)
@@ -9929,7 +9997,7 @@ async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() 
         "before",
     )];
     hub.append(&mut seed).await.expect("seed commits");
-    let _ = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let _ = sidecar_at_coverage(&sidecar_path(&root, &session_id), seed[0].seq).await;
 
     let mut tool_call = pipe_event(
         &session_id,
@@ -10288,9 +10356,9 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         .await
         .expect("offline delta commits");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
-    append_delta(&hub, &session_id, generation, "resume-trigger").await;
+    let head = append_delta(&hub, &session_id, generation, "resume-trigger").await;
 
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let sidecar = sidecar_at_coverage(&sidecar_path(&root, &session_id), head).await;
     let rows: Vec<&str> = sidecar
         .lines()
         .filter(|line| line.contains("\"role\""))
@@ -10326,11 +10394,9 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
-    assert_eq!(
-        stable_sidecar(&sidecar_path(&root, &session_id)).await,
-        stored_sidecar(&store, &session_id, 1).await
-    );
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let head = store.latest_seq(&session_id).await.expect("journal head");
+    let sidecar = sidecar_at_coverage(&sidecar_path(&root, &session_id), head).await;
+    assert_eq!(sidecar, stored_sidecar(&store, &session_id, 1).await);
     let tail: serde_json::Value =
         serde_json::from_str(sidecar.lines().last().expect("coverage tail"))
             .expect("coverage tail JSON");
