@@ -1793,3 +1793,472 @@ async fn pinned_route_resolution_keeps_the_active_run_branch() {
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close");
 }
+
+fn rotation_route_facts(
+    events: &[haider_protocol::envelope::RawEnvelope],
+    run: &RunId,
+) -> Vec<(String, Option<u64>, Option<String>)> {
+    events
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(run))
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                item_id,
+                item: haider_protocol::item::TurnItem::Extension { kind, data },
+            })) if kind == haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND => {
+                Some((
+                    item_id.as_str().to_owned(),
+                    data.get("selection_epoch")
+                        .and_then(serde_json::Value::as_u64),
+                    data.get("resolved_alias")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn select_rotation_test_model(
+    hub: &SessionHub,
+    session: &SessionId,
+    generation: u64,
+    id: &str,
+    provider: &str,
+    model: &str,
+    account: Option<&str>,
+    budget: Option<u64>,
+) {
+    hub.select_session_model(haider_store::SessionSelectModelCommand {
+        command_id: format!("rotation-{id}"),
+        request_digest: format!("rotation-{id}"),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        worker_generation: generation,
+        provider: provider.into(),
+        model: model.into(),
+        expected_pair: None,
+        account_alias: account.map(str::to_owned),
+        output_budget: budget.map(|max_tokens| {
+            haider_protocol::output_budget::SessionOutputBudgetV1 {
+                max_tokens,
+                source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                    requested: max_tokens,
+                },
+                clamped: None,
+            }
+        }),
+        event_id: EventId::new(format!("rotation-{id}")),
+        device_id: DeviceId::new("rotation-device"),
+    })
+    .await
+    .expect("select");
+}
+
+async fn change_rotation_test_session(
+    hub: &SessionHub,
+    session: &SessionId,
+    generation: u64,
+    model: &str,
+    variant: &str,
+) {
+    match variant {
+        "budget_reselect" => {
+            select_rotation_test_model(
+                hub,
+                session,
+                generation,
+                "b",
+                "fake",
+                model,
+                None,
+                Some(3000),
+            )
+            .await
+        }
+        "model_roundtrip" => {
+            select_rotation_test_model(
+                hub,
+                session,
+                generation,
+                "m1",
+                "fake",
+                "other-model",
+                None,
+                None,
+            )
+            .await;
+            select_rotation_test_model(hub, session, generation, "m2", "fake", model, None, None)
+                .await;
+        }
+        "cross_provider" => {
+            select_rotation_test_model(
+                hub,
+                session,
+                generation,
+                "x",
+                "fake-next",
+                model,
+                None,
+                None,
+            )
+            .await
+        }
+        "same_provider_model" => {
+            select_rotation_test_model(
+                hub,
+                session,
+                generation,
+                "s",
+                "fake",
+                "other-model",
+                None,
+                None,
+            )
+            .await
+        }
+        "account_pin" => {
+            select_rotation_test_model(
+                hub,
+                session,
+                generation,
+                "p",
+                "fake",
+                model,
+                Some("pin-b"),
+                None,
+            )
+            .await
+        }
+        "live_rebind" => commit_test_rebind(hub, session, generation, 2).await,
+        "control" => {}
+        _ => unreachable!("unknown rotation test variant: {variant}"),
+    }
+}
+
+async fn pin_rotation_test_run(
+    hub: &SessionHub,
+    session: &SessionId,
+    run: &RunId,
+    generation: u64,
+) -> (crate::session_hub::HubStoreHandle, SessionMetadataV1, u64) {
+    let device = DeviceId::new("rotation-device");
+    let variant = session.as_str();
+    hub.accept_internal_turn(haider_core::TurnAcceptCommand {
+        command_id: format!("rotation-accept-{variant}"),
+        request_digest: format!("rotation-accept-{variant}"),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        worker_generation: generation,
+        run_id: run.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: "rotation".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+        queued_event_id: EventId::new(format!("rotation-q-{variant}")),
+        user_event_id: EventId::new(format!("rotation-u-{variant}")),
+        active_event_id: EventId::new(format!("rotation-a-{variant}")),
+        device_id: device.clone(),
+    })
+    .await
+    .expect("accept");
+    let lease = hub
+        .acquire_worker_lease(session.clone())
+        .await
+        .expect("lease");
+    let md = lease.session_metadata().await.expect("md").expect("typed");
+    let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        provider: md.provider.clone(),
+        model: md.model.clone(),
+        max_tokens: md.max_tokens,
+        source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(&md),
+    };
+    append_payloads(
+        &lease,
+        &device,
+        run,
+        None,
+        &EventIdGenerator::new(format!("rotation-pin-{variant}")),
+        vec![
+            pin.to_event(run).expect("pin"),
+            EventPayload::RunState(RunState::Thinking),
+        ],
+    )
+    .await
+    .expect("pin");
+    // Turn start, exactly as worker.rs:9644 then the turn_selection set-up.
+    let e0 = lease
+        .commit_turn_resolved_route(run, &md, Some("acct-1"))
+        .await
+        .expect("turn start");
+    (lease, md, e0)
+}
+
+/// The real rotation committer and restart pickup must advance run provenance
+/// on every served-account change, even after an epoch-only session divergence.
+#[tokio::test]
+async fn matching_rebind_route_rotations_keep_distinct_provenance() {
+    use haider_core::ProviderRouteCommitter as _;
+    let mut failures = Vec::new();
+    for restart in [false, true] {
+        for variant in [
+            "control",
+            "budget_reselect",
+            "model_roundtrip",
+            "cross_provider",
+            "same_provider_model",
+            "account_pin",
+            "live_rebind",
+        ] {
+            let root = tempfile::tempdir().expect("profile");
+            let session = SessionId::new(format!("rotation-{variant}-{restart}"));
+            let run = RunId::new(format!("rotation-run-{variant}"));
+            let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+                .await
+                .expect("hub");
+            let generation = store.worker_generation();
+            create_rebind_test_session(&hub, &session).await;
+            commit_test_rebind(&hub, &session, generation, 1).await;
+            let (lease, md, e0) = pin_rotation_test_run(&hub, &session, &run, generation).await;
+            let mut turn = md.clone();
+            turn.selection_epoch = Some(e0);
+            turn.resolved_route_alias = Some("acct-1".into());
+            turn.resolved_route_seen = true;
+            let committer = crate::worker::DaemonProviderRouteCommitter {
+                store: lease.clone(),
+                run_id: run.clone(),
+                selection: Arc::new(tokio::sync::Mutex::new(turn)),
+            };
+            change_rotation_test_session(&hub, &session, generation, &md.model, variant).await;
+            let probe = hub.install_resolved_route_probe(&session, false).await;
+            let before = lease.session_metadata().await.expect("md").expect("typed");
+            let e2 = committer
+                .commit(
+                    "fake",
+                    &md.model,
+                    &haider_protocol::ids::CredentialAlias::new("acct-2"),
+                )
+                .await
+                .expect("rotate 2");
+            let mid = lease.session_metadata().await.expect("md").expect("typed");
+            let unchanged = committer
+                .commit(
+                    "fake",
+                    &md.model,
+                    &haider_protocol::ids::CredentialAlias::new("acct-2"),
+                )
+                .await
+                .expect("unchanged route");
+            assert_eq!(unchanged, e2, "same account keeps its run epoch: {variant}");
+            assert_eq!(
+                rotation_route_facts(&store.read(&session, 0, 4096).await.expect("journal"), &run)
+                    .len(),
+                2,
+                "same account appends no duplicate fact: {variant}"
+            );
+            // Restart pickup restores the durable run route onto fresh session
+            // metadata before resolving, exactly as worker.rs:8755 -> 9644.
+            drop(committer);
+            drop(lease);
+            let (store, hub, lease, probe) = if restart {
+                hub.shutdown().await.expect("shutdown before restart");
+                store.close().await.expect("close before restart");
+                let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+                    .await
+                    .expect("restart");
+                let lease = hub
+                    .acquire_worker_lease(session.clone())
+                    .await
+                    .expect("restart lease");
+                let probe = hub.install_resolved_route_probe(&session, false).await;
+                (store, hub, lease, probe)
+            } else {
+                let lease = hub
+                    .acquire_worker_lease(session.clone())
+                    .await
+                    .expect("lease");
+                (store, hub, lease, probe)
+            };
+            let mut recovered = lease.session_metadata().await.expect("md").expect("typed");
+            let pair = hub
+                .run_output_pair(&session, &run)
+                .await
+                .expect("pair")
+                .expect("durable pin");
+            assert!(pair.durably_pinned);
+            pair.restore_route(&mut recovered);
+            recovered.provider = pair.provider;
+            recovered.model = pair.model;
+            let attempts_before = probe.attempts.load(Ordering::SeqCst);
+            let committer = crate::worker::DaemonProviderRouteCommitter {
+                store: lease.clone(),
+                run_id: run.clone(),
+                selection: Arc::new(tokio::sync::Mutex::new(recovered.clone())),
+            };
+            let e3 = if restart {
+                lease
+                    .commit_turn_resolved_route(&run, &recovered, Some("acct-3"))
+                    .await
+                    .expect("recovery resolution")
+            } else {
+                committer
+                    .commit(
+                        "fake",
+                        &md.model,
+                        &haider_protocol::ids::CredentialAlias::new("acct-3"),
+                    )
+                    .await
+                    .expect("rotate 3")
+            };
+            let diverged = !matches!(variant, "control" | "live_rebind");
+            assert_eq!(
+                probe.attempts.load(Ordering::SeqCst) - attempts_before,
+                u64::from(!diverged),
+                "{variant}/{restart}: only an equal-epoch matching route may request session publication"
+            );
+            let after = lease.session_metadata().await.expect("md").expect("typed");
+            let events = store.read(&session, 0, 4096).await.expect("journal");
+            let facts = rotation_route_facts(&events, &run);
+            assert_eq!(
+                facts
+                    .iter()
+                    .map(|(_, epoch, alias)| (*epoch, alias.as_deref()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (Some(e0), Some("acct-1")),
+                    (Some(e2), Some("acct-2")),
+                    (Some(e3), Some("acct-3"))
+                ],
+                "{variant}/{restart}: every served account has its returned epoch and journal item"
+            );
+            let mut ids = facts.iter().map(|fact| fact.0.clone()).collect::<Vec<_>>();
+            let total = ids.len();
+            ids.sort();
+            ids.dedup();
+            println!(
+                "ROTATION variant={variant} restart={restart} e0={e0} e2={e2} e3={e3} before=(epoch {:?}, alias {:?}, seen {}) mid=(epoch {:?}, alias {:?}) after=(epoch {:?}, alias {:?}, seen {}) facts={facts:?}",
+                before.selection_epoch,
+                before.resolved_route_alias,
+                before.resolved_route_seen,
+                mid.selection_epoch,
+                mid.resolved_route_alias,
+                after.selection_epoch,
+                after.resolved_route_alias,
+                after.resolved_route_seen,
+            );
+            if !(e0 < e2 && e2 < e3) {
+                failures.push(format!("{variant}: acct-2 and acct-3 share epoch {e2}"));
+            }
+            if ids.len() != total {
+                failures.push(format!("{variant}: duplicate run-route item ids {facts:?}"));
+            }
+
+            if diverged && after != before {
+                failures.push(format!(
+                    "{variant}: diverged run leaked into session metadata"
+                ));
+            }
+            if matches!(variant, "control" | "live_rebind")
+                && (after.resolved_route_alias.as_deref() != Some("acct-3")
+                    || after.selection_epoch != Some(e3))
+            {
+                failures.push(format!(
+                    "{variant}: matching route did not publish acct-3 at the turn epoch"
+                ));
+            }
+            drop(committer);
+            drop(lease);
+            hub.shutdown().await.expect("shutdown");
+            store.close().await.expect("close");
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "rotation provenance failures: {failures:#?}"
+    );
+}
+
+/// A selection after the matching-route read must keep the served account
+/// run-scoped and assign a fresh epoch rather than publish a refused commit.
+#[tokio::test]
+async fn resolved_route_refusal_after_matching_read_advances_run_epoch() {
+    for variant in [
+        "budget_reselect",
+        "model_roundtrip",
+        "cross_provider",
+        "same_provider_model",
+        "account_pin",
+        "live_rebind",
+        "concurrent_resolution",
+    ] {
+        let root = tempfile::tempdir().expect("profile");
+        let session = SessionId::new(format!("route-race-{variant}"));
+        let run = RunId::new(format!("route-race-run-{variant}"));
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("hub");
+        let generation = store.worker_generation();
+        create_rebind_test_session(&hub, &session).await;
+        commit_test_rebind(&hub, &session, generation, 1).await;
+        let (lease, md, first) = pin_rotation_test_run(&hub, &session, &run, generation).await;
+        let mut turn = lease.session_metadata().await.expect("md").expect("typed");
+        hub.run_output_pair(&session, &run)
+            .await
+            .expect("pair")
+            .expect("pin")
+            .restore_route(&mut turn);
+        let probe = hub.install_resolved_route_probe(&session, true).await;
+        let racing_lease = lease.clone();
+        let racing_run = run.clone();
+        let commit = tokio::spawn(async move {
+            racing_lease
+                .commit_turn_resolved_route(&racing_run, &turn, Some("acct-2"))
+                .await
+        });
+        // This boundary is reached only after the route/equal-epoch check,
+        // but before the actor/Store's atomic compare-and-commit.
+        probe.reached.notified().await;
+        if variant == "concurrent_resolution" {
+            hub.install_resolved_route_probe(&session, false).await;
+            let current = lease.session_metadata().await.expect("md").expect("typed");
+            lease
+                .commit_resolved_route(&current, Some("session-acct"))
+                .await
+                .expect("concurrent route");
+        } else {
+            change_rotation_test_session(&hub, &session, generation, &md.model, variant).await;
+        }
+        let before = lease.session_metadata().await.expect("md").expect("typed");
+        probe.release.notify_one();
+        let epoch = commit.await.expect("task").expect("route commit");
+        let after = lease.session_metadata().await.expect("md").expect("typed");
+        let facts =
+            rotation_route_facts(&store.read(&session, 0, 4096).await.expect("journal"), &run);
+        println!("ROUTE-RACE variant={variant} first={first} epoch={epoch} facts={facts:?}");
+        assert!(
+            epoch > first,
+            "{variant}: refused session publish still advances run provenance"
+        );
+        assert_eq!(
+            before, after,
+            "{variant}: refusal cannot leak the old route into the session"
+        );
+        assert_eq!(
+            facts.len(),
+            2,
+            "{variant}: both served accounts are journaled"
+        );
+        assert_ne!(
+            facts[0].0, facts[1].0,
+            "{variant}: distinct journal item ids"
+        );
+        assert_eq!(facts[1].2.as_deref(), Some("acct-2"));
+        drop(lease);
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+}

@@ -711,7 +711,7 @@ fn first_route_is_journaled_without_advancing_request_selection_and_noop_is_sile
     let (epoch, facts) = store
         .commit_resolved_route_fact(&id, "source", "test-model", 0, None, &DeviceId::new("test"))
         .expect("first route");
-    assert_eq!(epoch, 0);
+    assert_eq!(epoch, Some(0));
     assert_eq!(facts.len(), 1);
     let fact = ModelSelected::from_payload_value(&facts[0].payload).expect("typed");
     assert!(fact.route_only);
@@ -726,20 +726,21 @@ fn first_route_is_journaled_without_advancing_request_selection_and_noop_is_sile
     );
     assert_eq!(fact.cleared_account_pin, None);
     assert_eq!(fact.cleared_provider_endpoint, None);
-    assert!(
-        store
-            .commit_resolved_route_fact(
-                &id,
-                "source",
-                "test-model",
-                epoch,
-                None,
-                &DeviceId::new("test")
-            )
-            .expect("same route")
-            .1
-            .is_empty()
+    let (accepted_epoch, facts) = store
+        .commit_resolved_route_fact(
+            &id,
+            "source",
+            "test-model",
+            epoch.expect("accepted route"),
+            None,
+            &DeviceId::new("test"),
+        )
+        .expect("same route");
+    assert_eq!(
+        accepted_epoch, epoch,
+        "an accepted no-op is distinct from refusal"
     );
+    assert!(facts.is_empty(), "same route is silent");
 }
 
 #[test]
@@ -1075,9 +1076,8 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                 )
                 .expect("late old request callback");
             assert_eq!(
-                returned_epoch,
-                captured.selection_epoch.unwrap_or(0),
-                "old request retains its epoch: {variant}"
+                returned_epoch, None,
+                "old request is explicitly refused: {variant}"
             );
             assert!(
                 facts.is_empty(),
@@ -1111,7 +1111,7 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                     &DeviceId::new("test-device"),
                 )
                 .expect("current request callback");
-            assert_eq!(epoch, current.selection_epoch.unwrap_or(0));
+            assert_eq!(epoch, current.selection_epoch);
             assert_eq!(
                 facts.len(),
                 1,
@@ -1132,7 +1132,7 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                         &id,
                         &current.provider,
                         &current.model,
-                        epoch,
+                        epoch.expect("accepted route"),
                         Some("current-request-alias"),
                         &DeviceId::new("test-device"),
                     )

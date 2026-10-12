@@ -374,7 +374,7 @@ impl SqliteStoreHandle {
             device_id,
         )
         .await
-        .map(|(epoch, _)| epoch)
+        .map(|(epoch, _)| epoch.unwrap_or(expected_epoch))
     }
 
     /// Commit route provenance and return only durable facts for publication.
@@ -386,7 +386,7 @@ impl SqliteStoreHandle {
         expected_epoch: u64,
         resolved_alias: Option<&str>,
         device_id: &haider_protocol::ids::DeviceId,
-    ) -> Result<(u64, Vec<haider_protocol::envelope::RawEnvelope>), HaiderError> {
+    ) -> Result<(Option<u64>, Vec<haider_protocol::envelope::RawEnvelope>), HaiderError> {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         let expected_provider = expected_provider.to_owned();

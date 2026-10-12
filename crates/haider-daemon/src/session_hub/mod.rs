@@ -919,6 +919,15 @@ struct ModelSelectionBudgetPause {
     release: tokio::sync::Notify,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ResolvedRouteCommitProbe {
+    pub attempts: AtomicU64,
+    pub pause: bool,
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
 pub(crate) struct ActiveRunOutputPairSnapshot {
     branch_id: Option<BranchId>,
     pub durably_pinned: bool,
@@ -1047,6 +1056,8 @@ struct HubInner {
     #[cfg(test)]
     selection_network_pauses:
         tokio::sync::Mutex<HashMap<SessionId, Arc<ModelSelectionBudgetPause>>>,
+    #[cfg(test)]
+    resolved_route_probes: tokio::sync::Mutex<HashMap<SessionId, Arc<ResolvedRouteCommitProbe>>>,
     /// Weak root-run budget authorities shared by delegated child workers.
     /// The owning parent turn controls their lifetime; stale entries cannot
     /// keep a completed run or worker lease alive.
@@ -1907,7 +1918,7 @@ enum ActorCommand {
         epoch: u64,
         alias: Option<String>,
         device_id: DeviceId,
-        completed: oneshot::Sender<Result<u64, HaiderError>>,
+        completed: oneshot::Sender<Result<Option<u64>, HaiderError>>,
     },
     SelectModel {
         command: SessionSelectModelCommand,
@@ -2574,6 +2585,8 @@ impl SessionHub {
             model_selection_budget_pauses: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             selection_network_pauses: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            resolved_route_probes: tokio::sync::Mutex::new(HashMap::new()),
             run_budget_coordinators: Mutex::new(HashMap::new()),
             checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
             replay_tasks: Mutex::new(HashMap::new()),
@@ -7137,6 +7150,24 @@ impl SessionHub {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn install_resolved_route_probe(
+        &self,
+        session_id: &SessionId,
+        pause: bool,
+    ) -> Arc<ResolvedRouteCommitProbe> {
+        let probe = Arc::new(ResolvedRouteCommitProbe {
+            pause,
+            ..Default::default()
+        });
+        self.inner
+            .resolved_route_probes
+            .lock()
+            .await
+            .insert(session_id.clone(), Arc::clone(&probe));
+        probe
+    }
+
     pub(crate) async fn lock_checkpoint_mutation(
         &self,
         session_id: &SessionId,
@@ -8905,12 +8936,13 @@ impl HubStoreHandle {
             && session.provider_rebind_id == metadata.provider_rebind_id
             && session.account_alias == metadata.account_alias
             && session.provider_base_url == metadata.provider_base_url
-            && session.selection_epoch.unwrap_or(0) <= current
+            && session.selection_epoch.unwrap_or(0) == current
             && session.route_reset_epoch.unwrap_or(0) <= current
         {
-            // A selection racing this read is still refused atomically by
-            // the existing actor/Store epoch guard.
-            Some(self.commit_resolved_route(metadata, alias).await?)
+            // A selection racing this read is refused atomically by the
+            // actor/Store guard. Only an accepted commit owns a session epoch;
+            // refusal must fall through to the run-only path below.
+            self.commit_resolved_route_outcome(metadata, alias).await?
         } else {
             None
         };
@@ -8972,6 +9004,35 @@ impl HubStoreHandle {
         metadata: &haider_protocol::session::SessionMetadataV1,
         alias: Option<&str>,
     ) -> Result<u64, HaiderError> {
+        self.commit_resolved_route_outcome(metadata, alias)
+            .await
+            .map(|epoch| epoch.unwrap_or(metadata.selection_epoch.unwrap_or(0)))
+    }
+
+    /// Preserve the Store's refusal through the actor, including when a
+    /// selection commits between the matching-route read and this request.
+    async fn commit_resolved_route_outcome(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        alias: Option<&str>,
+    ) -> Result<Option<u64>, HaiderError> {
+        #[cfg(test)]
+        let probe = self
+            .hub
+            .inner
+            .resolved_route_probes
+            .lock()
+            .await
+            .get(&self.session_id)
+            .cloned();
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe.attempts.fetch_add(1, Ordering::SeqCst);
+            if probe.pause {
+                probe.reached.notify_one();
+                probe.release.notified().await;
+            }
+        }
         let actor = self
             .hub
             .actor_for(self.session_id.clone())

@@ -5105,11 +5105,12 @@ impl Store {
             resolved_alias,
             device_id,
         )
-        .map(|(epoch, _)| epoch)
+        .map(|(epoch, _)| epoch.unwrap_or(expected_epoch))
     }
 
     /// Return committed route facts for the session actor to publish in order.
-    /// A stale captured selection cannot change metadata or append a fact.
+    /// `None` means the epoch guard refused the commit. An accepted no-op
+    /// returns `Some(epoch)` with no facts; refusal cannot masquerade as one.
     pub fn commit_resolved_route_fact(
         &self,
         session_id: &SessionId,
@@ -5118,7 +5119,7 @@ impl Store {
         expected_epoch: u64,
         resolved_alias: Option<&str>,
         device_id: &DeviceId,
-    ) -> StoreResult<(u64, Vec<RawEnvelope>)> {
+    ) -> StoreResult<(Option<u64>, Vec<RawEnvelope>)> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -5130,7 +5131,7 @@ impl Store {
         {
             // A selection committed after this request captured metadata.
             // Its request keeps the old epoch and cannot acquire the new one.
-            return Ok((expected_epoch, Vec::new()));
+            return Ok((None, Vec::new()));
         }
         let current = metadata
             .selection_epoch
@@ -5217,7 +5218,7 @@ impl Store {
             append_transaction_envelopes(&transaction, session_id, now_ms()?, &mut envelopes)?;
         }
         transaction.commit().map_err(map_sqlite_error)?;
-        Ok((epoch, envelopes))
+        Ok((Some(epoch), envelopes))
     }
 
     /// Monotonically persists conversation-level savings after the matching
