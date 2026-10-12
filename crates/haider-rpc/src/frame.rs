@@ -1587,6 +1587,20 @@ pub fn normalize_model_selector(selector: &str) -> String {
 }
 
 impl ProviderSummaryWire {
+    /// Permanent names come from an unscoped public catalog or offline
+    /// configuration. A custom profile or account-owned inventory may use
+    /// a public provider namespace without inheriting that meaning.
+    #[must_use]
+    pub fn catalog_has_permanent_names(&self) -> bool {
+        self.catalog == ProviderCatalogKindWire::Offline
+            || (self.catalog == ProviderCatalogKindWire::Public
+                && self.inventory_authority != ModelInventoryAuthorityWire::Advisory
+                && self.auth_methods.is_empty()
+                && self.catalog_scope.as_ref().is_none_or(|scope| {
+                    scope.account_alias.is_none() && scope.account_incarnation.is_none()
+                }))
+    }
+
     /// Age the entire projection, including configuration-owned IDs. A list
     /// can expire between publication and read; admission must not wait for
     /// the producer's next refresh tick to stop treating absence as proof.

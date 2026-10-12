@@ -2725,3 +2725,217 @@ fn restored_pick_survives_boot_reply_order_for_the_same_producer() {
         }
     }
 }
+
+/// A public provider name can also identify a custom or authenticated
+/// catalog. It cannot prove that a legacy saved pick is permanent.
+/// MUTATION: omit the public catalog's authority/auth/producer checks.
+#[test]
+fn legacy_restored_pick_respects_public_catalog_ownership() {
+    use haider_rpc::{ModelInventoryAuthorityWire as Authority, ProviderCatalogKindWire as Kind};
+    use haider_tui::settings::LastModelPick;
+
+    for accounts_first in [false, true] {
+        for case in [
+            "account-owned",
+            "authentication-only",
+            "alias-only-owner",
+            "incarnation-only-owner",
+            "custom-anonymous",
+            "genuine-public",
+            "legacy-public",
+            "offline-configuration",
+            "declared-configuration",
+            "static-configuration",
+        ] {
+            let mut model = live_model();
+            model.restore_last_model_pick(&LastModelPick {
+                provider: "custom".into(),
+                model: "a-private-beta".into(),
+                catalog_key: None,
+                scope_known: false,
+            });
+            let mut driver = LiveDriver::new("legacy-public");
+            let mut summary = private_summary(72, "b-current");
+            summary.catalog = Kind::Public;
+            summary.inventory_authority = Authority::Authoritative;
+            let mut descriptors = vec![];
+            if matches!(case, "account-owned" | "authentication-only") {
+                let mut account = oauth_descriptor("custom", "work", true);
+                account.incarnation = 72;
+                descriptors.push(account);
+                if case == "authentication-only" {
+                    summary.catalog_scope = None;
+                }
+            } else {
+                summary.auth_methods.clear();
+                let scope = summary.catalog_scope.as_mut().expect("scope");
+                scope.account_alias = (case == "alias-only-owner").then(|| "work".into());
+                scope.account_incarnation = (case == "incarnation-only-owner").then_some(72);
+            }
+            let retained = match case {
+                "custom-anonymous" => {
+                    summary.inventory_authority = Authority::Advisory;
+                    false
+                }
+                "account-owned"
+                | "authentication-only"
+                | "alias-only-owner"
+                | "incarnation-only-owner" => false,
+                "genuine-public" | "legacy-public" => {
+                    if case == "legacy-public" {
+                        summary.inventory_authority = Authority::Unknown;
+                    }
+                    // A genuine public listing contains the saved public ID.
+                    summary.models.push("a-private-beta".into());
+                    true
+                }
+                "offline-configuration" => {
+                    summary.catalog = Kind::Offline;
+                    summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+                    summary.models.clear();
+                    summary.model_details.clear();
+                    summary.default_model = None;
+                    true
+                }
+                "declared-configuration" => {
+                    summary.inventory_authority = Authority::Advisory;
+                    summary.configured_models.push("a-private-beta".into());
+                    true
+                }
+                "static-configuration" => {
+                    summary.inventory_authority = Authority::Advisory;
+                    summary.static_models.push("a-private-beta".into());
+                    true
+                }
+                _ => unreachable!(),
+            };
+            let accounts = LiveReply::Accounts {
+                descriptors,
+                revision: Some(1),
+                sources: vec![],
+            };
+            let providers = LiveReply::Providers {
+                providers: vec![summary],
+                revision: 1,
+            };
+            let replies = if accounts_first {
+                [accounts, providers]
+            } else {
+                [providers, accounts]
+            };
+            for reply in replies {
+                pass(&mut driver, &mut model, reply);
+            }
+            assert_eq!(
+                model.display_identity().model_short == "a-private-beta",
+                retained,
+                "{case}: accounts_first={accounts_first}"
+            );
+            if !retained {
+                assert_ne!(
+                    model.last_model_pick().map(|pick| pick.model).as_deref(),
+                    Some("a-private-beta")
+                );
+            }
+        }
+    }
+}
+
+/// MUTATION: classify every public namespace as configuration in
+/// `model_is_configuration`, or omit private account fallback when the
+/// publisher has no producer field. A real pick must retain its observed
+/// owner and retire when that owner changes, including public namespaces.
+#[test]
+fn picked_public_namespace_model_retains_its_private_producer() {
+    const PROVIDER: &str = "haider-code";
+    for with_scope in [false, true] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("public-private-pick");
+        let mut account = oauth_descriptor(PROVIDER, "work", true);
+        account.incarnation = 71;
+        let mut summary = private_summary(71, "a-private-alpha");
+        summary.models.push("a-private-beta".into());
+        let mut beta = summary.model_details[0].clone();
+        beta.name = "a-private-beta".into();
+        summary.model_details.push(beta);
+        summary.provider = PROVIDER.into();
+        summary.catalog = haider_rpc::ProviderCatalogKindWire::Public;
+        if !with_scope {
+            summary.catalog_scope = None;
+        }
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![summary.clone()],
+                revision: 1,
+            },
+        );
+        model.apply_model_selected(PROVIDER, "a-private-beta");
+        assert_eq!(model.display_identity().model_short, "a-private-beta");
+        assert_eq!(
+            model.last_model_pick().and_then(|pick| pick.catalog_key),
+            with_scope.then(|| "synthetic-producer-71".into()),
+            "a fetched pick must retain its available producer"
+        );
+
+        // Re-reading the same owner preserves an explicit beta pick rather
+        // than silently falling back to that owner's alpha default.
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account.clone()],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        assert_eq!(model.display_identity().model_short, "a-private-beta");
+
+        account.incarnation = 72;
+        let mut replacement = private_summary(72, "b-current");
+        replacement.provider = PROVIDER.into();
+        replacement.catalog = haider_rpc::ProviderCatalogKindWire::Public;
+        replacement.models.clear();
+        replacement.model_details.clear();
+        replacement.default_model = None;
+        replacement.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+            reason: "synthetic 503".into(),
+        };
+        replacement.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+        if !with_scope {
+            replacement.catalog_scope = None;
+        }
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(3),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![replacement],
+                revision: 3,
+            },
+        );
+        assert!(
+            model.display_identity().model_short.is_empty(),
+            "with_scope={with_scope}"
+        );
+        assert_eq!(model.context_meter().window, None);
+    }
+}

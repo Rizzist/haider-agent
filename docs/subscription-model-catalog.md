@@ -166,6 +166,9 @@ with polling only when the daemon does not accept the watch. Acceptance at boot
 and reconnect triggers a snapshot read to cover changes before subscription.
 Refusing a required management signal closes the connection, allowing reconnect
 to restore the snapshot and watch instead of leaving the client silently stale.
+Custom or authenticated catalogs using public provider names still fence
+legacy and restored picks by their producer. Unscoped public catalogs, offline
+configuration, and declared/static IDs retain their permanent-name semantics.
 Retiring a catalog
 producer clears every current identity projection, including the launcher and
 session headers, composer, account label and context meter. A restored private

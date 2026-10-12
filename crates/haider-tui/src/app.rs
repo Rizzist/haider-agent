@@ -11975,11 +11975,8 @@ impl AppModel {
         else {
             return true;
         };
-        matches!(
-            summary.catalog,
-            haider_rpc::ProviderCatalogKindWire::Public
-                | haider_rpc::ProviderCatalogKindWire::Offline
-        ) || summary.configured_models.iter().any(|row| row == model)
+        summary.catalog_has_permanent_names()
+            || summary.configured_models.iter().any(|row| row == model)
             || summary.static_models.iter().any(|row| row == model)
             || summary.model_details.iter().any(|row| {
                 row.name == model
@@ -12071,12 +12068,7 @@ impl AppModel {
             })
             .or_else(|| {
                 (!summary.is_some_and(|row| {
-                    row.catalog_scope.is_some()
-                        || matches!(
-                            row.catalog,
-                            haider_rpc::ProviderCatalogKindWire::Public
-                                | haider_rpc::ProviderCatalogKindWire::Offline
-                        )
+                    row.catalog_scope.is_some() || row.catalog_has_permanent_names()
                 }))
                 .then(|| {
                     self.accounts
@@ -12551,13 +12543,7 @@ impl AppModel {
         let key = summary
             .and_then(|row| row.catalog_scope.as_ref())
             .map(|scope| scope.key.clone());
-        let public_catalog = summary.is_some_and(|row| {
-            matches!(
-                row.catalog,
-                haider_rpc::ProviderCatalogKindWire::Public
-                    | haider_rpc::ProviderCatalogKindWire::Offline
-            )
-        });
+        let public_catalog = summary.is_some_and(ProviderSummaryWire::catalog_has_permanent_names);
         let account_changed = self.accounts.revision.is_some()
             && self.identity_catalog_scope.is_some()
             && self.identity_catalog_scope != current_scope;
@@ -12601,13 +12587,7 @@ impl AppModel {
                 && current_scope.is_some()
                 && self.identity_catalog_key.is_none())
                 || (self.restored_model_catalog_pending && summary.is_some()))
-            && !summary.is_some_and(|row| {
-                matches!(
-                    row.catalog,
-                    haider_rpc::ProviderCatalogKindWire::Public
-                        | haider_rpc::ProviderCatalogKindWire::Offline
-                )
-            });
+            && !public_catalog;
         if account_changed || catalog_changed || owned_session_route_changed || unknown_owner {
             let unowned_session_configuration = self
                 .active_session
