@@ -381,15 +381,14 @@ impl SshRuntime {
         let (profile_name, channel, lease) = match setup {
             Ok(setup) => setup,
             Err(error) => {
-                if !*close.borrow() {
-                    // Pending admission already replied. Preserve the setup
-                    // failure on this shell's owned output stream before exit.
-                    let _ = shell.publish_output(
-                        ShellOutputStreamWire::Stderr,
-                        format!("{error}\r\n").as_bytes(),
-                    );
-                }
-                let _ = shell.exited(None);
+                // The early admission reply lets clients cancel negotiation.
+                // Publish the same coded refusal as synchronous admission;
+                // terminal consumers print it once through their error path.
+                let _ = shell.setup_failed(haider_rpc::ShellSetupErrorWire {
+                    code: error.code().into(),
+                    message: error.to_string(),
+                    retryable: error.retryable(),
+                });
                 return Err(error);
             }
         };

@@ -150,15 +150,15 @@ pub async fn run_ssh_terminal(
                     output.write_all(bytes.as_slice())?;
                     output.flush()?;
                 }
-                Some(WireFrame::ShellState {
-                    shell:
-                        haider_rpc::ShellWire {
-                            id,
-                            status: ShellStatusWire::Exited { code },
-                            ..
-                        },
-                }) if id == shell_id => return Ok(code),
-                Some(WireFrame::ShellClosed { shell }) if shell.id == shell_id => return Ok(None),
+                Some(WireFrame::ShellState { shell })
+                    if shell.id == shell_id
+                        && matches!(shell.status, ShellStatusWire::Exited { .. }) =>
+                {
+                    return shell_exit_result(shell);
+                }
+                Some(WireFrame::ShellClosed { shell }) if shell.id == shell_id => {
+                    return shell_exit_result(shell);
+                }
                 _ => {}
             }
         }
@@ -171,6 +171,21 @@ pub async fn run_ssh_terminal(
         }
     }
     result
+}
+
+fn shell_exit_result(shell: haider_rpc::ShellWire) -> Result<Option<i32>, SshTerminalError> {
+    if let Some(error) = shell.setup_error {
+        return Err(SshTerminalError::Client(SshProfilesClientError::Refused {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+            data: None,
+        }));
+    }
+    Ok(match shell.status {
+        ShellStatusWire::Exited { code } => code,
+        _ => None,
+    })
 }
 
 fn pty_size(cols: u16, rows: u16) -> SshPtySizeWire {
@@ -218,4 +233,70 @@ fn key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
         _ => return None,
     }
     Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+
+    fn shell(status: ShellStatusWire) -> haider_rpc::ShellWire {
+        haider_rpc::ShellWire {
+            id: "owned-shell".into(),
+            kind: haider_rpc::ShellKindWire::Ssh {
+                profile: "fixture".into(),
+            },
+            status,
+            setup_error: None,
+            title: "fixture".into(),
+            cwd_or_host: "127.0.0.1".into(),
+            created_at_ms: 0,
+            last_activity_ms: 0,
+            bytes_out: 0,
+        }
+    }
+
+    #[test]
+    fn setup_refusals_preserve_codes_messages_and_retryability() {
+        for code in [
+            "ssh_connection_failed",
+            "ssh_authentication_failed",
+            "ssh_host_key_changed",
+            "ssh_agent_unavailable",
+            "ssh_channel_quota",
+            "ssh_vault_error",
+        ] {
+            for status in [
+                ShellStatusWire::Exited { code: None },
+                ShellStatusWire::Closed,
+            ] {
+                let mut shell = shell(status);
+                shell.setup_error = Some(haider_rpc::ShellSetupErrorWire {
+                    code: code.into(),
+                    message: "synthetic setup message".into(),
+                    retryable: true,
+                });
+                let error = shell_exit_result(shell).expect_err("setup is a refusal");
+                assert!(
+                    matches!(error, SshTerminalError::Client(SshProfilesClientError::Refused {
+                    code: actual, message, retryable: true, data: None,
+                }) if actual == code && message == "synthetic setup message")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_exit_and_explicit_close_are_not_setup_refusals() {
+        for code in [None, Some(0), Some(7)] {
+            assert_eq!(
+                shell_exit_result(shell(ShellStatusWire::Exited { code })).expect("remote result"),
+                code
+            );
+        }
+        assert_eq!(
+            shell_exit_result(shell(ShellStatusWire::Closed)).expect("cancel"),
+            None
+        );
+    }
 }

@@ -1736,17 +1736,14 @@ impl UsageState {
     }
 }
 
-/// Numeric quick picks and explicit one-letter option keys share routing
-/// with the dwell gate. Labels never invent an unadvertised shortcut.
+/// Only the numbered quick picks drawn beside options commit a choice.
+/// Model-supplied option keys are answer identities, not keyboard shortcuts.
 fn menu_shortcut_index(menu: &Menu, c: char) -> Option<usize> {
-    if ('1'..='9').contains(&c) {
-        let index = c as usize - '1' as usize;
-        return (index < menu.options.len()).then_some(index);
+    if !('1'..='9').contains(&c) {
+        return None;
     }
-    menu.options.iter().position(|option| {
-        let mut chars = option.key.chars();
-        chars.next().is_some_and(|key| key.eq_ignore_ascii_case(&c)) && chars.next().is_none()
-    })
+    let index = c as usize - '1' as usize;
+    (index < menu.options.len()).then_some(index)
 }
 
 /// A chip's pending question (the amber `?` / recovery `⌁`).
@@ -6032,6 +6029,9 @@ pub struct AppModel {
     pub(crate) painted_epoch: std::cell::Cell<u64>,
     pub(crate) input_rebase: Option<crate::runtime::InputRebase>,
     pub(crate) input_refused: bool,
+    /// Text lost from the pending burst. A guarded commit or passive report
+    /// cannot erase it merely because the reader observed a newer paint.
+    pub(crate) discarded_edit: bool,
     /// Foreign mirror and inject replacements own a fresh draft. Local
     /// typing keeps this revision stable so a burst can remain one cohort.
     composer_replacement_epoch: u64,
@@ -6379,6 +6379,7 @@ impl Default for AppModel {
             painted_epoch: std::cell::Cell::new(0),
             input_rebase: None,
             input_refused: false,
+            discarded_edit: false,
             composer_replacement_epoch: 0,
             pointer_presentation: std::cell::RefCell::new(None),
             text_question_presentation: std::cell::RefCell::new(None),
@@ -18624,18 +18625,19 @@ impl AppModel {
                 haider_rpc::ShellStatusWire::Exited { .. } | haider_rpc::ShellStatusWire::Closed
             );
         if closes {
-            let setup_error = self.ssh_terminal.take().and_then(|terminal| {
-                terminal
-                    .connecting
-                    .then(|| {
-                        terminal
-                            .display_text()
-                            .chars()
-                            .filter(|c| !c.is_control())
-                            .collect::<String>()
-                    })
-                    .filter(|text| !text.is_empty())
-            });
+            let terminal = self.ssh_terminal.take();
+            let setup_error = shell
+                .setup_error
+                .as_ref()
+                .map(|error| format!("{}: {}", error.code, error.message))
+                .or_else(|| {
+                    // Older daemons report setup failure as terminal output.
+                    terminal
+                        .filter(|pane| pane.connecting)
+                        .map(|pane| pane.display_text())
+                })
+                .map(|text| text.chars().filter(|c| !c.is_control()).collect::<String>())
+                .filter(|text| !text.is_empty());
             self.flash = Some(match (&shell.status, setup_error) {
                 (haider_rpc::ShellStatusWire::Exited { .. }, Some(error)) => {
                     format!("· remote terminal failed: {error}")

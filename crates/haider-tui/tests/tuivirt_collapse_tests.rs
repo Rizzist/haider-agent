@@ -279,6 +279,7 @@ fn shell_row(id: &str, title: &str) -> haider_rpc::ShellWire {
         id: id.to_owned(),
         kind: haider_rpc::ShellKindWire::Local,
         status: haider_rpc::ShellStatusWire::Running,
+        setup_error: None,
         title: title.to_owned(),
         cwd_or_host: "/workspace/haider".to_owned(),
         created_at_ms: 1_699_999_880_000,

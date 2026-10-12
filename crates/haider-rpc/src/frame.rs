@@ -1942,12 +1942,23 @@ pub enum ShellStatusWire {
     Closed,
 }
 
+/// Coded refusal during asynchronous shell setup, before a remote command
+/// starts. Kept separate from the remote command's numeric exit status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSetupErrorWire {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
 /// Public, secret-free projection of one entry in the unified shell registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellWire {
     pub id: String,
     pub kind: ShellKindWire,
     pub status: ShellStatusWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_error: Option<ShellSetupErrorWire>,
     pub title: String,
     pub cwd_or_host: String,
     pub created_at_ms: u64,

@@ -42,3 +42,7 @@ mod fixture_tests;
 #[cfg(test)]
 #[path = "ssh_cancel_tests.rs"]
 mod cancel_tests;
+
+#[cfg(test)]
+#[path = "ssh_setup_failure_tests.rs"]
+mod setup_failure_tests;

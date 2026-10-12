@@ -236,17 +236,7 @@ fn review_hunk_letters_remain_navigation_during_decision_dwell() {
 #[test]
 fn committing_keys_share_card_dwell_navigation_and_default() {
     for kind in ["permission", "question", "plan", "file", "child"] {
-        for code in [
-            KeyCode::Enter,
-            KeyCode::Char('1'),
-            KeyCode::Char('y'),
-            KeyCode::Char('n'),
-        ] {
-            let code = if kind == "file" && code == KeyCode::Char('n') {
-                KeyCode::Char('N') // Lowercase n is the review's existing next-hunk action.
-            } else {
-                code
-            };
+        for code in [KeyCode::Enter, KeyCode::Char('1')] {
             for gap in [0, 120, 250, 399, 400, 401] {
                 let t = Instant::now() + Duration::from_secs(5);
                 let mut m = AppModel::new();
@@ -439,8 +429,7 @@ fn outside_retirement_preserves_fresh_decision_commit_feedback_and_refuses_every
                         Event::Key(key)
                             if gap < 400
                                 && (key.code == KeyCode::Enter
-                                    || (!text
-                                        && matches!(key.code, KeyCode::Char('1' | 'y' | 'N')))) =>
+                                    || (!text && matches!(key.code, KeyCode::Char('1')))) =>
                         {
                             Some("New request")
                         }
@@ -455,6 +444,9 @@ fn outside_retirement_preserves_fresh_decision_commit_feedback_and_refuses_every
                         t + Duration::from_millis(gap)
                     ));
                     assert!(m.outbox.is_empty());
+                    if expected == Some("New request") {
+                        assert_eq!(m.flash.as_deref(), Some("· New request — press again"));
+                    }
                     assert_eq!(m.composer.text(), before);
                     assert_eq!(m.menu_selection, 0);
                     match expected {
@@ -955,7 +947,7 @@ fn queued_keyboard_dwell_uses_ingress_time_and_ordinary_edits_still_work() {
 }
 
 #[test]
-fn uppercase_repeat_keys_are_guarded_and_unmapped_keys_are_not_commits() {
+fn letter_option_keys_and_unmapped_digits_never_commit() {
     for c in ['y', 'Y', 'n', 'N'] {
         let mut m = AppModel::new();
         m.screen = Screen::Session;
@@ -989,11 +981,8 @@ fn uppercase_repeat_keys_are_guarded_and_unmapped_keys_are_not_commits() {
             Event::Key(repeat),
             t + Duration::from_millis(400),
         );
-        assert_eq!(m.outbox.len(), 1);
-        assert_eq!(
-            m.outbox[0].answer.option_index,
-            if c.eq_ignore_ascii_case(&'y') { 0 } else { 1 }
-        );
+        assert!(m.outbox.is_empty());
+        assert!(m.flash.is_none());
     }
 }
 
@@ -1025,7 +1014,11 @@ fn modified_keys_that_reach_menu_commits_share_dwell() {
             dispatch_input_at(&mut m, &[], event.clone(), t + Duration::from_millis(120));
             assert!(m.outbox.is_empty(), "{code:?} {modifiers:?}");
             dispatch_input_at(&mut m, &[], event, t + AppModel::DECISION_DWELL);
-            assert_eq!(m.outbox.len(), 1, "{code:?} {modifiers:?}");
+            assert_eq!(
+                m.outbox.len(),
+                usize::from(matches!(code, KeyCode::Enter | KeyCode::Char('1'))),
+                "{code:?} {modifiers:?}"
+            );
         }
     }
 }
@@ -2072,8 +2065,8 @@ fn modified_control_and_clipboard_chords_match_their_real_dispatch() {
             }
         }
     }
-    // Only the exact clipboard chords are intercepted. Modified Super+V
-    // which reaches a menu's explicit v option is still a committing key.
+    // A model option named v never turns modified V into a shortcut.
+    // The advertised clipboard chords still take their ordinary edit path.
     for modifiers in (0..64)
         .map(KeyModifiers::from_bits_retain)
         .filter(|flags| !flags.contains(KeyModifiers::CONTROL))
@@ -2087,19 +2080,10 @@ fn modified_control_and_clipboard_chords_match_their_real_dispatch() {
         let t = Instant::now();
         set_shown_at(&m, t);
         let key = KeyEvent::new(KeyCode::Char('V'), modifiers);
-        let clipboard = modifiers == KeyModifiers::SUPER
-            || modifiers == (KeyModifiers::SUPER | KeyModifiers::SHIFT);
-        assert_eq!(m.decision_key_commits(&key), !clipboard);
-        if !clipboard {
-            dispatch_input_at(&mut m, &[], Event::Key(key), t + Duration::from_millis(120));
-            assert!(m.outbox.is_empty());
-            assert!(
-                m.flash
-                    .as_deref()
-                    .is_some_and(|flash| flash.contains("New request"))
-            );
-            dispatch_input_at(&mut m, &[], Event::Key(key), t + AppModel::DECISION_DWELL);
-            assert_eq!(m.outbox.len(), 1, "{modifiers:?}");
+        assert!(!m.decision_key_commits(&key));
+        for gap in [120, 400] {
+            dispatch_input_at(&mut m, &[], Event::Key(key), t + Duration::from_millis(gap));
+            assert!(m.outbox.is_empty(), "{modifiers:?}");
         }
     }
     // Bare Ctrl+Enter remains swallowed by the earlier non-composer gate.
@@ -2115,5 +2099,222 @@ fn modified_control_and_clipboard_chords_match_their_real_dispatch() {
         dispatch_input_at(&mut m, &[], Event::Key(key), t + Duration::from_millis(gap));
         assert!(m.accounts.pending_replace.is_some());
         assert!(m.flash.is_none());
+    }
+}
+
+#[test]
+fn typed_prose_never_commits_model_option_letters_at_any_dwell() {
+    for kind in ["permission", "question", "plan", "file", "child"] {
+        for keys in [["a", "b"], ["y", "n"], ["A", "B"], ["β", "é"], ["o", "r"]] {
+            for gap in [0, 120, 399, 400, 401, 1_500, 60_000] {
+                for repeat in [false, true] {
+                    let mut m = AppModel::new();
+                    m.screen = Screen::Session;
+                    let mut menu = if kind == "file" {
+                        file_review_decision("prose")
+                    } else {
+                        decision("prose")
+                    };
+                    menu.options[0].key = keys[0].into();
+                    menu.options[1].key = keys[1].into();
+                    if kind == "question" {
+                        menu.kind = haider_protocol::menu::MenuKind::Question;
+                    }
+                    if kind == "plan" {
+                        menu.origin = "plan".into();
+                    }
+                    if kind == "child" {
+                        let mut chip =
+                            super::runtime_pointer_tests::question_chip("child", "prose");
+                        crate::session::chip_apply(&mut chip, &EventPayload::MenuOpened(menu), 0);
+                        m.chips.push(chip);
+                        m.screen = Screen::Subagent;
+                        m.view_path = vec!["child".into()];
+                    } else {
+                        m.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(menu))));
+                    }
+                    paint(&mut m);
+                    let t = Instant::now();
+                    set_shown_at(&m, t);
+                    for c in "I have a question. YES, No. βé or AB?".chars() {
+                        let mut key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+                        if repeat {
+                            key.kind = KeyEventKind::Repeat;
+                        }
+                        assert!(!m.decision_key_commits(&key), "{kind} {keys:?} {c}");
+                        let stamp = m.painted_stamp();
+                        dispatch(
+                            &mut m,
+                            Event::Key(key),
+                            stamp,
+                            t + Duration::from_millis(gap),
+                        );
+                        assert!(m.outbox.is_empty(), "{kind} {keys:?} gap={gap} {c}");
+                    }
+                    // Quick picks use display position, never a model's key.
+                    dispatch_input_at(
+                        &mut m,
+                        &[],
+                        k(KeyCode::Char('2')),
+                        t + Duration::from_secs(61),
+                    );
+                    assert_eq!(m.outbox.len(), 1);
+                    assert_eq!(m.outbox[0].answer.option_index, 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stale_cohort_commit_keeps_discarded_edit_feedback() {
+    for child in [false, true] {
+        for edit in [Event::Paste("answer".into()), k(KeyCode::Char('a'))] {
+            for gap in [0, 120, 399, 400, 401, 1_500] {
+                let mut m = text_question(child, "discarded");
+                paint(&mut m);
+                let stale = m.painted_stamp();
+                m.invalidate_queued_input();
+                paint(&mut m);
+                let t = Instant::now();
+                set_shown_at(&m, t);
+                dispatch(&mut m, edit.clone(), stale.clone(), t);
+                dispatch(
+                    &mut m,
+                    k(KeyCode::Enter),
+                    stale.clone(),
+                    t + Duration::from_millis(gap),
+                );
+                assert_eq!(
+                    m.flash.as_deref(),
+                    Some("· New request — input discarded, type again")
+                );
+                assert!(m.outbox.is_empty());
+                assert!(m.composer.text().is_empty());
+                // A new paint alone cannot turn this burst into an informed retry.
+                let fresh = m.painted_stamp();
+                dispatch(
+                    &mut m,
+                    k(KeyCode::Enter),
+                    fresh,
+                    t + Duration::from_millis(gap),
+                );
+                if gap < 400 {
+                    assert_eq!(
+                        m.flash.as_deref(),
+                        Some("· New request — input discarded, type again")
+                    );
+                } else {
+                    assert!(m.outbox.is_empty());
+                }
+                // A valid edit starts the user's replacement burst.
+                let fresh = m.painted_stamp();
+                dispatch(
+                    &mut m,
+                    Event::Paste("retry".into()),
+                    fresh,
+                    t + Duration::from_millis(gap),
+                );
+                assert_eq!(m.composer.text(), "retry");
+                // An old stamp no longer claims that replacement was discarded.
+                dispatch(
+                    &mut m,
+                    k(KeyCode::Enter),
+                    stale,
+                    t + Duration::from_millis(gap),
+                );
+                assert_eq!(
+                    m.flash.as_deref(),
+                    Some(if gap < 400 {
+                        "· New request — press again"
+                    } else {
+                        "· Input changed: please try again"
+                    })
+                );
+            }
+        }
+        let mut m = text_question(child, "no-discard");
+        paint(&mut m);
+        let stale = m.painted_stamp();
+        m.invalidate_queued_input();
+        paint(&mut m);
+        let t = Instant::now();
+        set_shown_at(&m, t);
+        dispatch(&mut m, k(KeyCode::Down), stale.clone(), t);
+        dispatch(&mut m, k(KeyCode::Enter), stale, t);
+        assert_eq!(m.flash.as_deref(), Some("· New request — press again"));
+    }
+}
+
+#[test]
+fn discarded_text_feedback_survives_new_paints_and_passive_reports_before_commit() {
+    for child in [false, true] {
+        for edit in [Event::Paste("answer".into()), k(KeyCode::Char('a'))] {
+            let mut release = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+            release.kind = KeyEventKind::Release;
+            for report in [
+                None,
+                Some(Event::Key(release)),
+                Some(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                })),
+                Some(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                })),
+            ] {
+                let mut m = text_question(child, "cross-paint");
+                paint(&mut m);
+                let old = m.painted_stamp();
+                m.invalidate_queued_input();
+                paint(&mut m);
+                let t = Instant::now();
+                set_shown_at(&m, t);
+                assert!(!dispatch(&mut m, edit.clone(), old, t));
+                if let Some(report) = report {
+                    let fresh = m.painted_stamp();
+                    assert!(dispatch(
+                        &mut m,
+                        report,
+                        fresh,
+                        t + Duration::from_millis(20)
+                    ));
+                }
+                let fresh = m.painted_stamp();
+                assert!(dispatch(
+                    &mut m,
+                    k(KeyCode::Enter),
+                    fresh,
+                    t + Duration::from_millis(120)
+                ));
+                assert_eq!(
+                    m.flash.as_deref(),
+                    Some("· New request — input discarded, type again")
+                );
+                assert!(m.outbox.is_empty());
+                assert!(m.composer.text().is_empty());
+                let fresh = m.painted_stamp();
+                assert!(dispatch(
+                    &mut m,
+                    Event::Paste("restored".into()),
+                    fresh,
+                    t + Duration::from_millis(130)
+                ));
+                let fresh = m.painted_stamp();
+                assert!(dispatch(
+                    &mut m,
+                    k(KeyCode::Enter),
+                    fresh,
+                    t + Duration::from_millis(140)
+                ));
+                assert_eq!(m.flash.as_deref(), Some("· New request — press again"));
+                assert_eq!(m.composer.text(), "restored");
+            }
+        }
     }
 }

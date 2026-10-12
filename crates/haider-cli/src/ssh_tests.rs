@@ -102,6 +102,14 @@ fn typed_refusals_map_to_scriptable_exit_codes() {
     assert_eq!(exit_code_for_refusal("ssh_timeout"), EX_TIMEOUT);
     assert_eq!(exit_code_for_refusal("ssh_host_key_changed"), EX_BLOCKED);
     assert_eq!(
+        exit_code_for_refusal("ssh_authentication_failed"),
+        EX_BLOCKED
+    );
+    assert_eq!(
+        exit_code_for_refusal("ssh_connection_failed"),
+        EX_UNAVAILABLE
+    );
+    assert_eq!(
         exit_code_for_refusal("ssh_agent_unavailable"),
         EX_UNAVAILABLE
     );

@@ -240,6 +240,13 @@ impl fmt::Display for SshError {
 impl std::error::Error for SshError {}
 
 impl SshError {
+    pub(crate) const fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::SshConnection { .. } | Self::SshChannelQuota { .. } | Self::Vault { .. }
+        )
+    }
+
     pub(crate) const fn code(&self) -> &'static str {
         match self {
             Self::SshProfileNotFound { .. } => "ssh_profile_not_found",

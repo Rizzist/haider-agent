@@ -111,6 +111,18 @@ fn dispatch_queued_input(
         dispatch_input(model, hits, input.event);
         return true;
     }
+    let preserve_discarded_edit = match &input.event {
+        Event::Key(key) if key.kind == KeyEventKind::Release => true,
+        Event::Key(key) => {
+            model.decision_key_commits(key) && !model.decision_key_commit_ready(input.received_at)
+        }
+        Event::Mouse(mouse) => passive_mouse(mouse.kind),
+        Event::Paste(text) => text.is_empty(),
+        _ => false,
+    };
+    if !preserve_discarded_edit {
+        model.discarded_edit = false;
+    }
     let pointer_before = model.pointer_input_owner();
     let (mut sources, mut pointer_sources) = if rebased {
         model
@@ -154,6 +166,26 @@ fn dispatch_queued_input(
     true
 }
 
+fn passive_mouse(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Moved
+            | MouseEventKind::Drag(_)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    )
+}
+
+fn new_request_feedback(discarded_edit: bool) -> &'static str {
+    if discarded_edit {
+        "· New request — input discarded, type again"
+    } else {
+        "· New request — press again"
+    }
+}
+
 /// Motion and wheel reports have no action for the user to retry.
 fn refuse_stale_input(model: &mut AppModel, input: &QueuedInput) {
     let event = &input.event;
@@ -161,10 +193,7 @@ fn refuse_stale_input(model: &mut AppModel, input: &QueuedInput) {
     if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
         return;
     }
-    if matches!(event, Event::Mouse(mouse) if matches!(mouse.kind,
-        MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::ScrollUp |
-        MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight))
-    {
+    if matches!(event, Event::Mouse(mouse) if passive_mouse(mouse.kind)) {
         return;
     }
     // Outside events can retire the reader's stamp before or after the
@@ -173,13 +202,22 @@ fn refuse_stale_input(model: &mut AppModel, input: &QueuedInput) {
     // This changes only the explanation, never the stale-input refusal.
     // Unstamped startup input predates presentation, even if the card is
     // painted by dispatch time. It cannot carry a fresh-card confirmation.
+    if matches!(event, Event::Paste(text) if !text.is_empty())
+        || matches!(event, Event::Key(key) if matches!(key.code, KeyCode::Char(_))
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            && !model.decision_key_commits(key))
+    {
+        model.discarded_edit = true;
+    }
+    let discarded_edit = model.discarded_edit;
     let stamped = input.presented.is_some();
     let message = if stamped {
         match event {
             Event::Key(key)
-                if model.decision_key_commits(key) && !model.decision_key_commit_ready(now) =>
+                if model.decision_key_commits(key)
+                    && (discarded_edit || !model.decision_key_commit_ready(now)) =>
             {
-                "· New request — press again"
+                new_request_feedback(discarded_edit)
             }
             Event::Mouse(mouse)
                 if matches!(
@@ -1501,7 +1539,7 @@ pub fn dispatch_input_at(
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             if model.decision_key_commits(&key) && !model.decision_key_commit_ready(now) {
-                model.flash = Some("· New request — press again".to_owned());
+                model.flash = Some(new_request_feedback(model.discarded_edit).to_owned());
                 model.input_refused = true;
                 model.dirty = true;
                 return;

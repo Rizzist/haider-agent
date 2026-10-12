@@ -99,6 +99,21 @@ async fn cancelling_a_pty_open_interrupts_stalled_negotiation_and_clears_invento
             ShellStatusWire::Closed
         );
         assert_eq!(registry.inventory().count, 0);
+        assert!(
+            registry
+                .get(&id)
+                .expect("cancelled row")
+                .setup_error
+                .is_none()
+        );
+        let closed = registry
+            .control(
+                &id,
+                Some("owned-connection"),
+                crate::shell_registry::ShellControl::Eof,
+            )
+            .expect_err("cancelled controls");
+        assert!(registry.setup_error_for_control(&closed).is_none());
         drop(peer);
     }
 }

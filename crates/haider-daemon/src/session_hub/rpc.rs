@@ -19180,17 +19180,11 @@ impl HubConnection {
         request_id: RequestId,
         error: crate::ssh::SshError,
     ) -> Result<(), SessionHubError> {
-        let retryable = matches!(
-            &error,
-            crate::ssh::SshError::SshConnection { .. }
-                | crate::ssh::SshError::SshChannelQuota { .. }
-                | crate::ssh::SshError::Vault { .. }
-        );
         self.respond_error(
             request_id,
             error.code(),
             &error.to_string(),
-            retryable,
+            error.retryable(),
             None,
         )
     }
@@ -19200,6 +19194,15 @@ impl HubConnection {
         request_id: RequestId,
         error: crate::shell_registry::ShellRegistryError,
     ) -> Result<(), SessionHubError> {
+        if let Some(setup_error) = self.hub.shell_registry().setup_error_for_control(&error) {
+            return self.respond_error(
+                request_id,
+                &setup_error.code,
+                &setup_error.message,
+                setup_error.retryable,
+                None,
+            );
+        }
         let retryable = matches!(
             &error,
             crate::shell_registry::ShellRegistryError::ControlBusy(_)

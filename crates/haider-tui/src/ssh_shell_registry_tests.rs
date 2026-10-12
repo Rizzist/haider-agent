@@ -25,6 +25,7 @@ fn shell(id: &str, kind: haider_rpc::ShellKindWire) -> haider_rpc::ShellWire {
         id: id.into(),
         kind,
         status: haider_rpc::ShellStatusWire::Running,
+        setup_error: None,
         title: "tests".into(),
         cwd_or_host: "/workspace".into(),
         created_at_ms: 1,
@@ -444,4 +445,46 @@ fn failed_pending_setup_keeps_the_owned_error_visible() {
         model.flash.as_deref(),
         Some("· remote terminal failed: SSH fixture setup failed")
     );
+}
+
+#[test]
+fn typed_setup_failure_is_visible_only_on_its_owned_terminal() {
+    for code in [
+        "ssh_connection_failed",
+        "ssh_authentication_failed",
+        "ssh_host_key_changed",
+    ] {
+        let mut model = live_session();
+        model.ssh_terminal = Some(SshTerminalPane::opening(
+            "prod".into(),
+            model.ssh_terminal_size,
+        ));
+        let mut pending = shell(
+            "owned-pending",
+            haider_rpc::ShellKindWire::Ssh {
+                profile: "prod".into(),
+            },
+        );
+        pending.status = haider_rpc::ShellStatusWire::Starting;
+        model.apply_ssh_shell_opened(pending.clone());
+        pending.status = haider_rpc::ShellStatusWire::Exited { code: None };
+        pending.setup_error = Some(haider_rpc::ShellSetupErrorWire {
+            code: code.into(),
+            message: "synthetic refusal\r\n".into(),
+            retryable: false,
+        });
+        let mut other = pending.clone();
+        other.id = "other-pending".into();
+        model.apply_shell_event(other);
+        assert!(model.ssh_terminal.is_some());
+        assert_eq!(model.flash.as_deref(), Some("· opening remote terminal…"));
+        model.apply_shell_event(pending);
+        assert!(model.ssh_terminal.is_none());
+        assert_eq!(
+            model.flash,
+            Some(format!(
+                "· remote terminal failed: {code}: synthetic refusal"
+            ))
+        );
+    }
 }
