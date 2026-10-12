@@ -686,6 +686,7 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         LiveCommand::ProviderSetTrust { .. } | LiveCommand::LockdownStatus { .. } => {
             &[haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1]
         }
+        LiveCommand::AccountListWatch => &[haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1],
         _ => &[],
     }
 }
@@ -1623,6 +1624,7 @@ pub fn request_body_for_features(
             replace_existing: false,
         },
         LiveCommand::AccountList => RequestBody::AccountList { provider: None },
+        LiveCommand::AccountListWatch => RequestBody::AccountListWatch {},
         // D2: the read carries nothing; the import carries ONLY the opaque
         // candidate id — the daemon re-reads the local store itself, so no
         // credential bytes exist to send.
@@ -2344,6 +2346,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }]
             })
         }
+        ResponseBody::AccountListWatch { accepted } => {
+            vec![LiveReply::ManagementWatch { accepted }]
+        }
         ResponseBody::AccountList {
             descriptors,
             revision,
@@ -2888,6 +2893,11 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         // binding signals. Name the known frame explicitly so it can never be
         // confused with the forward-compat fallback below.
         WireFrame::ResidentSessionBinding { .. } => Vec::new(),
+        // `account.list_watch` signal: re-read the management snapshot so an
+        // idle terminal follows another client's account or catalog change.
+        WireFrame::AccountsChanged { revision } => {
+            vec![LiveReply::ManagementChanged { revision }]
+        }
         WireFrame::ProtocolError(error)
             if matches!(
                 error.code.as_str(),
@@ -2919,7 +2929,6 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         | WireFrame::Request { .. }
         | WireFrame::Response { .. }
         | WireFrame::SessionRosterDelta { .. }
-        | WireFrame::AccountsChanged { .. }
         | WireFrame::HaiderCodePlanStatus { .. }
         | WireFrame::SessionSurfaceDelta { input: None, .. }
         | WireFrame::MenuAnswer { .. }

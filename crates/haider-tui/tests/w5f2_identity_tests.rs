@@ -2535,3 +2535,100 @@ fn retired_private_session_identity_clears_account_and_window_in_either_reply_or
         }
     }
 }
+
+/// MUTATION CHECK (catalog-fixes N1, idle efficiency): an idle launcher
+/// follows another client's account or catalog change through the daemon's
+/// `account.list_watch` signal, not a per-second poll. Expected failures:
+/// drop `AccountListWatch` from `boot`/`resume` (no subscription), map
+/// `AccountsChanged` to nothing (signal ignored), or keep the throttle on a
+/// signal (re-read suppressed); or leave the watch active across a socket
+/// loss (the runtime would neither poll nor be signalled).
+#[test]
+fn management_changes_arrive_by_watch_signal_without_polling() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+
+    let boot = driver.boot();
+    assert!(
+        boot.iter()
+            .any(|command| matches!(command, LiveCommand::AccountListWatch)),
+        "boot must subscribe to management signals: {boot:?}"
+    );
+    assert_eq!(
+        command_required_features(&LiveCommand::AccountListWatch),
+        &[haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1],
+        "an older daemon without the watch must see no request"
+    );
+    assert!(
+        !driver.management_watch_active(),
+        "until the daemon accepts, the runtime keeps its fallback poll"
+    );
+
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::ManagementWatch { accepted: true },
+    );
+    assert!(driver.management_watch_active());
+
+    // A refresh is already in flight (throttled); a pushed signal still
+    // re-reads both halves at once.
+    assert_eq!(
+        driver.refresh_management(),
+        vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+    );
+    assert!(driver.refresh_management().is_empty());
+    let signalled = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ManagementChanged { revision: 7 }),
+        std::time::Instant::now(),
+    );
+    assert!(
+        signalled
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::AccountList))
+            && signalled
+                .commands
+                .iter()
+                .any(|command| matches!(command, LiveCommand::ProviderList)),
+        "a management signal must re-read accounts and providers: {:?}",
+        signalled.commands
+    );
+
+    let mapped =
+        haider_tui::link::map_frame(haider_rpc::WireFrame::AccountsChanged { revision: 9 });
+    assert!(
+        matches!(
+            mapped.as_slice(),
+            [LiveReply::ManagementChanged { revision: 9 }]
+        ),
+        "the pushed frame must reach the driver: {mapped:?}"
+    );
+
+    // The watch is connection-scoped: a socket loss returns the runtime
+    // to polling, and the reconnect resume subscribes again.
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Disconnected {
+            reason: "test".into(),
+        },
+    );
+    assert!(!driver.management_watch_active());
+    let resumed = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Reconnected),
+        std::time::Instant::now(),
+    );
+    assert!(
+        resumed
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::AccountListWatch)),
+        "a reconnect must re-open the watch: {:?}",
+        resumed.commands
+    );
+}

@@ -721,6 +721,10 @@ pub enum LiveCommand {
     },
     /// `account.list` for the `/accounts` screen (W5d). A read.
     AccountList,
+    /// `account.list_watch`: subscribe this connection to management
+    /// revision signals. A read; a socket loss ends it and the reconnect
+    /// resume re-opens it.
+    AccountListWatch,
     /// `account.device_candidates` (D2) — the daemon's metadata-only
     /// discovery of first-party CLI credential stores. A read, issued on
     /// screen entry only; secrets never ride its response by D1's wire
@@ -1179,6 +1183,7 @@ impl LiveCommand {
             | Self::AttachWithOrigin { .. }
             | Self::Detach { .. }
             | Self::AccountList
+            | Self::AccountListWatch
             | Self::DeviceCandidates
             | Self::ProviderList
             | Self::RefreshProviderModels { .. }
@@ -1798,6 +1803,16 @@ pub enum LiveReply {
         retryable: bool,
         presentation: Option<haider_protocol::error::ErrorPresentation>,
     },
+    /// `account.list_watch` answered: whether this connection now receives
+    /// management revision signals.
+    ManagementWatch {
+        accepted: bool,
+    },
+    /// The daemon published a new management revision (account or provider
+    /// catalog state). A signal only: the snapshot is re-read.
+    ManagementChanged {
+        revision: u64,
+    },
     /// `account.list` answered (W5d `/accounts`).
     Accounts {
         descriptors: Vec<haider_protocol::credential::CredentialDescriptor>,
@@ -2149,6 +2164,9 @@ pub struct LiveDriver {
     management_refresh_started: Option<std::time::Instant>,
     management_refresh_accounts: bool,
     management_refresh_providers: bool,
+    /// The daemon pushes management revision signals on this connection,
+    /// so an idle terminal needs no polling.
+    management_watch: bool,
     /// Bidirectional volatile composer state. Session fences reset on a new
     /// socket; the process-local publish counter stays monotonic.
     input_mirror: InputMirrorState,
@@ -2455,6 +2473,7 @@ impl LiveDriver {
             management_refresh_started: None,
             management_refresh_accounts: false,
             management_refresh_providers: false,
+            management_watch: false,
             input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
             routes: HashMap::new(),
@@ -2638,7 +2657,17 @@ impl LiveDriver {
             LiveCommand::List { cursor: None },
             LiveCommand::AccountList,
             LiveCommand::ProviderList,
+            // Dropped by the link when the daemon lacks the feature; the
+            // runtime then falls back to a slow management poll.
+            LiveCommand::AccountListWatch,
         ]
+    }
+
+    /// Whether management changes arrive as pushed signals on this
+    /// connection. When false the runtime polls `refresh_management`.
+    #[must_use]
+    pub fn management_watch_active(&self) -> bool {
+        self.connected && self.management_watch
     }
 
     /// Poll external management changes with at most one outstanding pair.
@@ -4527,6 +4556,19 @@ impl LiveDriver {
                     Vec::new()
                 }
             }
+            LiveReply::ManagementWatch { accepted } => {
+                self.management_watch = accepted;
+                Vec::new()
+            }
+            LiveReply::ManagementChanged { revision: _ } => {
+                // Another client (or a background catalog refresh) published
+                // a management revision. Re-read both halves now: account
+                // and catalog replacements must retire identity chrome
+                // without user input (N1). The daemon collapses bursts into
+                // one signal carrying the newest revision.
+                self.management_refresh_started = None;
+                self.refresh_management()
+            }
             LiveReply::Accounts {
                 descriptors,
                 revision,
@@ -5775,6 +5817,9 @@ impl LiveDriver {
                     authoring.validated = false;
                 }
                 self.connection_epoch = self.connection_epoch.wrapping_add(1);
+                // The management watch is connection-scoped; the reconnect
+                // resume re-opens it, and the runtime polls until then.
+                self.management_watch = false;
                 // Round 3: capability facts die with the socket as well; the
                 // reconnect handshake re-grounds them before work resumes.
                 model.daemon_features.clear();
@@ -6711,6 +6756,7 @@ impl LiveDriver {
             LiveCommand::List { cursor: None },
             LiveCommand::AccountList,
             LiveCommand::ProviderList,
+            LiveCommand::AccountListWatch,
         ];
         if model.daemon_serves(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1) {
             commands.push(LiveCommand::DeviceCandidates);
