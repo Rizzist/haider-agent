@@ -17476,6 +17476,10 @@ impl HubConnection {
                     .try_send(WireFrame::AccountsChanged { revision })
                     .is_err()
                 {
+                    // A subscribed client no longer polls. A refused signal
+                    // must close the transport so reconnect restores its
+                    // current snapshot and connection-scoped watch.
+                    sink.close_after_required_delivery_failure();
                     break;
                 }
             }
