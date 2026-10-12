@@ -61,12 +61,16 @@ struct PolicyClock {
 }
 
 impl PolicyClock {
-    fn hold() -> (Self, tokio::sync::oneshot::Receiver<()>) {
-        let runnable = tokio::spawn(async {
+    fn runnable() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {
             loop {
                 tokio::task::yield_now().await;
             }
-        });
+        })
+    }
+
+    fn hold() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let runnable = Self::runnable();
         let (stop_alarm, stopped) = std::sync::mpsc::channel();
         let (expired, alarm_expired) = tokio::sync::oneshot::channel();
         let alarm = std::thread::spawn(move || {
@@ -85,6 +89,19 @@ impl PolicyClock {
             },
             alarm_expired,
         )
+    }
+
+    async fn elapse_backoff(&mut self, delay: Duration) {
+        // Anchor our ceiling while policy time is still frozen. Releasing the
+        // runnable holder lets the runtime drain runnable work before it jumps
+        // to a timer. This includes an actor which cooperatively yielded after
+        // publishing Retrying but has not yet polled its relative sleeper.
+        let ceiling = tokio::time::sleep(delay);
+        self.runnable.abort();
+        ceiling.await;
+        // The controller wakes at the declared backoff ceiling, so real HTTP
+        // and store work cannot auto-advance time toward the caller deadline.
+        self.runnable = Self::runnable();
     }
 }
 
@@ -535,7 +552,11 @@ struct TerminalObservation {
     terminal: Option<RunState>,
 }
 
-async fn observe_terminal(client: &mut UdsClient, run_id: &RunId) -> TerminalObservation {
+async fn observe_terminal(
+    client: &mut UdsClient,
+    run_id: &RunId,
+    clock: &mut PolicyClock,
+) -> TerminalObservation {
     let mut observation = TerminalObservation::default();
     loop {
         let Some(frame) = client.try_next().await else {
@@ -571,11 +592,7 @@ async fn observe_terminal(client: &mut UdsClient, run_id: &RunId) -> TerminalObs
         };
         observation.events.push(payload);
         if let Some(delay_ms) = retry_delay {
-            // The actor publishes this committed fact and polls its sleeper
-            // without another await. On this current-thread runtime, receiving
-            // it therefore fences registration of the actual backoff timer.
-            // HTTP and store work use no policy time between these receipts.
-            tokio::time::advance(Duration::from_millis(delay_ms)).await;
+            clock.elapse_backoff(Duration::from_millis(delay_ms)).await;
         }
         if observation.terminal.is_some() {
             return observation;
@@ -662,16 +679,16 @@ async fn bounded_429_ladder_terminalizes_before_caller_deadline() {
     assert_eq!(
         tokio::runtime::Handle::current().runtime_flavor(),
         tokio::runtime::RuntimeFlavor::CurrentThread,
-        "retry receipts fence the sleeper on one runtime thread"
+        "the controller freezes policy time on one runtime thread"
     );
-    let (_clock, alarm) = PolicyClock::hold();
+    let (mut clock, alarm) = PolicyClock::hold();
     tokio::select! {
-        () = bounded_429_retry_policy() => {}
+        () = bounded_429_retry_policy(&mut clock) => {}
         _ = alarm => panic!("bounded retry fixture failed to complete its real events"),
     }
 }
 
-async fn bounded_429_retry_policy() {
+async fn bounded_429_retry_policy(clock: &mut PolicyClock) {
     let server = Scripted429Server::spawn().await;
     let vault = MemoryVault::default();
     let alias = CredentialAlias::new("upstretry-construction-token");
@@ -745,7 +762,7 @@ async fn bounded_429_retry_policy() {
         "a deterministic run id with <=21.5s through five backoffs is found within 32 candidates",
     );
 
-    let observation = observe_terminal(&mut client, &run_id).await;
+    let observation = observe_terminal(&mut client, &run_id, clock).await;
     let policy_elapsed = started.elapsed();
     eprintln!(
         "upstretry run={run_id} policy_ms={} requests={} delays={:?}",
@@ -864,9 +881,12 @@ async fn bounded_429_retry_policy() {
         1,
         "sealed replay also has exactly one typed terminal"
     );
-    assert_eq!(
-        policy_elapsed,
-        Duration::from_millis(expected_delays.iter().copied().sum()),
-        "only the observed retry timers advance policy time"
+    let declared_backoffs = Duration::from_millis(expected_delays.iter().copied().sum());
+    // Tokio rounds timer deadlines up to its one-millisecond resolution.
+    let timer_rounding =
+        Duration::from_millis(u64::try_from(expected_delays.len()).expect("retry count fits u64"));
+    assert!(
+        policy_elapsed >= declared_backoffs && policy_elapsed <= declared_backoffs + timer_rounding,
+        "only retry backoffs and timer rounding advance policy time: policy={policy_elapsed:?} backoffs={declared_backoffs:?} rounding={timer_rounding:?}"
     );
 }
