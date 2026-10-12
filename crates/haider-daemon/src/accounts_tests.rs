@@ -14585,6 +14585,115 @@ async fn management_publications_notify_watchers_with_the_new_revision() {
     assert_eq!(snapshot.read().expect("view").revision, 11);
 }
 
+struct ManagementWatchFrameSink {
+    refuse_signal: bool,
+    frames: StdMutex<Vec<haider_rpc::WireFrame>>,
+    closed: std::sync::atomic::AtomicBool,
+    signal_attempted: tokio::sync::Notify,
+}
+
+impl crate::session_hub::FrameSink for ManagementWatchFrameSink {
+    fn try_send(
+        &self,
+        frame: haider_rpc::WireFrame,
+    ) -> Result<(), crate::session_hub::FrameSendError> {
+        if matches!(frame, haider_rpc::WireFrame::AccountsChanged { .. }) {
+            self.signal_attempted.notify_one();
+            if self.refuse_signal {
+                return Err(crate::session_hub::FrameSendError);
+            }
+        }
+        self.frames.lock().expect("frames").push(frame);
+        Ok(())
+    }
+
+    fn close_after_required_delivery_failure(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// MUTATION: omit the transport close after refusing a management signal.
+/// The client then keeps an accepted watch that can no longer notify it.
+/// A delivered signal is a negative control: its connection stays open.
+#[tokio::test]
+async fn management_watch_closes_after_required_signal_refusal() {
+    for refuse_signal in [false, true] {
+        let root = tempfile::tempdir().expect("temp store");
+        let store = SqliteStoreHandle::open(root.path())
+            .await
+            .expect("store opens");
+        let hub = crate::session_hub::SessionHub::new(
+            store.clone(),
+            crate::session_hub::SessionHubConfig::default(),
+        )
+        .expect("hub opens");
+        let management = crate::accounts::ManagementSnapshot::new(0, Vec::new(), Vec::new());
+        hub.install_accounts(crate::accounts::AccountsFacade {
+            login: None,
+            oauth: None,
+            snapshot: Arc::new(StdMutex::new(Vec::new())),
+            management: management.clone(),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            sources: Arc::new(StdMutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts install");
+        let sink = Arc::new(ManagementWatchFrameSink {
+            refuse_signal,
+            frames: StdMutex::new(Vec::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            signal_attempted: tokio::sync::Notify::new(),
+        });
+        let connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+                sink.clone(),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("watch connection opens");
+        connection
+            .request(
+                haider_rpc::RequestId::new("management-watch"),
+                haider_rpc::RequestBody::AccountListWatch {},
+            )
+            .await
+            .expect("watch registers");
+        assert!(sink.frames.lock().expect("frames").iter().any(|frame| {
+            matches!(
+                frame,
+                haider_rpc::WireFrame::Response {
+                    body: haider_rpc::ResponseBody::AccountListWatch { accepted: true },
+                    ..
+                }
+            )
+        }));
+        assert!(!sink.closed.load(std::sync::atomic::Ordering::Acquire));
+        management.publish_accounts(1, Vec::new());
+        tokio::time::timeout(Duration::from_secs(5), sink.signal_attempted.notified())
+            .await
+            .expect("publication attempts delivery");
+        assert_eq!(
+            sink.closed.load(std::sync::atomic::Ordering::Acquire),
+            refuse_signal
+        );
+        assert_eq!(
+            sink.frames.lock().expect("frames").iter().any(|frame| {
+                matches!(
+                    frame,
+                    haider_rpc::WireFrame::AccountsChanged { revision: 1 }
+                )
+            }),
+            !refuse_signal
+        );
+        connection.close().await.expect("watch connection closes");
+        hub.shutdown().await.expect("hub stops");
+        store.close().await.expect("store closes");
+    }
+}
+
 /// PER-TURN CREDENTIAL RESOLUTION (R6/R8, pinned v0.0.938): every logical
 /// turn resolves its provider's CURRENTLY-ACTIVE credential from live account
 /// state. Making a different account active takes effect on the very next
