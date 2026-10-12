@@ -94,7 +94,13 @@ active boundary for each session. A new run is written to a temporary file,
 synced with `Full`, and renamed into place. A `Full` directory sync follows on
 Unix; the Windows directory-sync seam is a no-op. The turn waits for this
 sequence before it may execute. Re-activating the same already-active run with
-the same frozen binding does not replace or sync the ledger. Ledger lookups,
+the same frozen binding avoids replacement and sync only when this manager
+has confirmed a completed Full save and the ledger file still has the same
+identity. An equal record loaded after a restart or a failed save requires a
+new Full save before success. Each background save carries its owning run and
+generation. Cancellation, terminal run state, worker replacement, and shutdown
+fence stale saves before replacement or publication, so they cannot replace a
+successor's active setting. Ledger lookups,
 publications, quota operations, and tool sandbox reads and writes run on the
 blocking pool. Callers await durable publication before exposing the in-memory
 binding or executing a turn; a failed blocking task fails closed. At startup
