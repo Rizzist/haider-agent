@@ -161,7 +161,10 @@ producer cannot inherit it, and a fresh successful list clears it.
 A stale list preserves fetched metadata and may show missing explicit configured
 rows without borrowing metadata from another inventory.
 
-The running TUI refreshes management state during idle. Retiring a catalog
+The running TUI follows management changes through a connection-scoped watch,
+with polling only when the daemon does not accept the watch. Acceptance at boot
+and reconnect triggers a snapshot read to cover changes before subscription.
+Retiring a catalog
 producer clears every current identity projection, including the launcher and
 session headers, composer, account label and context meter. A restored private
 model preference stays hidden until live snapshots prove its owner. Startup may

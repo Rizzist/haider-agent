@@ -2564,19 +2564,28 @@ fn management_changes_arrive_by_watch_signal_without_polling() {
         "until the daemon accepts, the runtime keeps its fallback poll"
     );
 
-    pass(
-        &mut driver,
-        &mut model,
-        LiveReply::ManagementWatch { accepted: true },
-    );
-    assert!(driver.management_watch_active());
-
-    // A refresh is already in flight (throttled); a pushed signal still
-    // re-reads both halves at once.
+    // Snapshot reads may finish before the watch is registered. Acceptance
+    // must re-read even when the fallback already has a throttled refresh,
+    // closing that unobserved publication gap at boot and reconnect.
     assert_eq!(
         driver.refresh_management(),
         vec![LiveCommand::AccountList, LiveCommand::ProviderList]
     );
+    let accepted = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ManagementWatch { accepted: true }),
+        std::time::Instant::now(),
+    );
+    assert!(driver.management_watch_active());
+    assert_eq!(
+        accepted.commands,
+        vec![LiveCommand::AccountList, LiveCommand::ProviderList],
+        "accepted subscription must read a baseline after registration"
+    );
+
+    // A refresh is already in flight (throttled); a pushed signal still
+    // re-reads both halves at once.
     assert!(driver.refresh_management().is_empty());
     let signalled = live_pass(
         &mut driver,
@@ -2631,6 +2640,25 @@ fn management_changes_arrive_by_watch_signal_without_polling() {
         "a reconnect must re-open the watch: {:?}",
         resumed.commands
     );
+    let accepted = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ManagementWatch { accepted: true }),
+        std::time::Instant::now(),
+    );
+    assert_eq!(
+        accepted.commands,
+        vec![LiveCommand::AccountList, LiveCommand::ProviderList],
+        "reconnect acceptance must also close the snapshot/subscription gap"
+    );
+    let declined = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ManagementWatch { accepted: false }),
+        std::time::Instant::now(),
+    );
+    assert!(!driver.management_watch_active());
+    assert!(declined.commands.is_empty());
 }
 
 /// MUTATION CHECK (catalog-fixes, restored pick): a persisted pick keyed to

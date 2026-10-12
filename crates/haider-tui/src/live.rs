@@ -4558,7 +4558,15 @@ impl LiveDriver {
             }
             LiveReply::ManagementWatch { accepted } => {
                 self.management_watch = accepted;
-                Vec::new()
+                if accepted {
+                    // The boot/reconnect snapshots can precede subscription.
+                    // Re-read after acceptance so a change in that gap cannot
+                    // leave an idle terminal on the previous account forever.
+                    self.management_refresh_started = None;
+                    self.refresh_management()
+                } else {
+                    Vec::new()
+                }
             }
             LiveReply::ManagementChanged { revision: _ } => {
                 // Another client (or a background catalog refresh) published
