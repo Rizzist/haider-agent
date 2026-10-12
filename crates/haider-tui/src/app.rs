@@ -12543,7 +12543,8 @@ impl AppModel {
         let key = summary
             .and_then(|row| row.catalog_scope.as_ref())
             .map(|scope| scope.key.clone());
-        let public_catalog = summary.is_some_and(ProviderSummaryWire::catalog_has_permanent_names);
+        let public_catalog =
+            summary.is_some_and(haider_rpc::ProviderSummaryWire::catalog_has_permanent_names);
         let account_changed = self.accounts.revision.is_some()
             && self.identity_catalog_scope.is_some()
             && self.identity_catalog_scope != current_scope;
