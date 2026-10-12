@@ -354,14 +354,6 @@ pub fn workspace_state_digest(root: &Path) -> String {
     workspace_state_receipt(root).mutation_digest()
 }
 
-#[cfg(test)]
-fn compute_workspace_state_receipt_with_git(
-    root: &Path,
-    git_program: &OsStr,
-) -> WorkspaceStateReceipt {
-    workspace_state_receipt_with_git(root.to_path_buf(), git_program.to_os_string())
-}
-
 async fn workspace_state_receipt_async(root: PathBuf) -> WorkspaceStateReceipt {
     workspace_state_receipt_async_with_git(root, OsString::from("git")).await
 }
@@ -397,6 +389,16 @@ async fn compute_workspace_state_receipt_async(
     git_program: OsString,
 ) -> WorkspaceStateReceipt {
     let deadline = Instant::now() + WORKSPACE_RECEIPT_WALL_TIME;
+    compute_workspace_state_receipt_async_with_deadline(root, git_program, deadline).await
+}
+
+// Separate the cooperative deadline from the public hard timeout so tests of
+// content, enumeration, redaction and mutation do not race the scheduler.
+async fn compute_workspace_state_receipt_async_with_deadline(
+    root: PathBuf,
+    git_program: OsString,
+    deadline: Instant,
+) -> WorkspaceStateReceipt {
     let preparation_root = root.clone();
     let preparation = match tokio::task::spawn_blocking(move || {
         prepare_workspace_receipt(&preparation_root, deadline)

@@ -2,11 +2,35 @@
 
 use super::{
     WorkspaceReceiptCoverage, WorkspaceReceiptStrategy, WorkspaceReceiptTracker,
-    WorkspaceReceiptUnknownReason, compute_workspace_state_receipt_with_git, porcelain_v1_paths,
-    workspace_state_receipt,
+    WorkspaceReceiptUnknownReason, porcelain_v1_paths,
 };
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+fn test_deadline() -> Instant {
+    // These fixtures have finite entry/content bounds. Wall-time behavior is
+    // tested separately with an already-expired deadline; it must not pre-empt
+    // an unrelated assertion when the machine is running other build lanes.
+    Instant::now() + Duration::from_secs(60 * 60)
+}
+
+fn receipt_with_git_for_test(root: &Path, git_program: &OsStr) -> super::WorkspaceStateReceipt {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("receipt runtime")
+        .block_on(super::compute_workspace_state_receipt_async_with_deadline(
+            root.to_path_buf(),
+            git_program.to_os_string(),
+            test_deadline(),
+        ))
+}
+
+fn receipt_for_test(root: &Path) -> super::WorkspaceStateReceipt {
+    receipt_with_git_for_test(root, OsStr::new("git"))
+}
 
 #[cfg(unix)]
 fn fake_git(fixture: &Path) -> PathBuf {
@@ -38,7 +62,7 @@ fn non_repository_receipt_is_explicitly_unknown_without_enumeration() {
         .expect("wide entry");
     }
 
-    let receipt = workspace_state_receipt(workspace.path());
+    let receipt = receipt_for_test(workspace.path());
 
     assert_eq!(
         receipt.coverage,
@@ -59,7 +83,7 @@ fn repository_receipt_does_not_export_unkeyed_secret_identity() {
     std::fs::create_dir_all(workspace.join(".git")).expect("repository marker");
     std::fs::write(workspace.join("oracle.txt"), "password=violet-sunrise\n")
         .expect("synthetic credential");
-    let receipt = workspace_state_receipt(&workspace);
+    let receipt = receipt_for_test(&workspace);
     assert_eq!(
         receipt.coverage,
         WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::RedactedMaterial)
@@ -72,7 +96,7 @@ fn repository_receipt_does_not_export_unkeyed_secret_identity() {
     assert!(published.contains("bytes=unreported"));
     std::fs::write(workspace.join("oracle.txt"), "password=violet-morning\n")
         .expect("equal-length replacement");
-    let next = workspace_state_receipt(&workspace);
+    let next = receipt_for_test(&workspace);
     assert_eq!(
         published,
         next.mutation_digest(),
@@ -98,7 +122,7 @@ fn git_status_with_sensitive_path_has_no_guessable_receipt() {
     assert!(added.success());
     std::fs::write(workspace.path().join(".env"), "ordinary after\n").expect("synthetic mutation");
 
-    let receipt = workspace_state_receipt(workspace.path());
+    let receipt = receipt_for_test(workspace.path());
     assert_eq!(
         receipt.coverage,
         WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::RedactedMaterial)
@@ -120,7 +144,7 @@ fn entry_limit_prevents_git_from_being_invoked() {
     }
     let fake_git = fake_git(fixture.path());
 
-    let receipt = compute_workspace_state_receipt_with_git(&workspace, fake_git.as_os_str());
+    let receipt = receipt_with_git_for_test(&workspace, fake_git.as_os_str());
 
     assert_eq!(
         receipt.coverage,
@@ -141,9 +165,9 @@ fn linked_worktree_metadata_outside_the_workspace_uses_the_anchored_fallback() {
     std::fs::write(workspace.join("source.rs"), "before").expect("source");
     let fake_git = fake_git(fixture.path());
 
-    let before = compute_workspace_state_receipt_with_git(&workspace, fake_git.as_os_str());
+    let before = receipt_with_git_for_test(&workspace, fake_git.as_os_str());
     std::fs::write(workspace.join("source.rs"), "after").expect("mutate source");
-    let after = compute_workspace_state_receipt_with_git(&workspace, fake_git.as_os_str());
+    let after = receipt_with_git_for_test(&workspace, fake_git.as_os_str());
 
     assert_eq!(before.strategy, WorkspaceReceiptStrategy::RepositoryWalk);
     assert_eq!(before.coverage, WorkspaceReceiptCoverage::Complete);
@@ -168,20 +192,24 @@ fn porcelain_parser_keeps_both_rename_paths_and_untracked_paths() {
 fn unavailable_git_falls_back_without_failing_the_receipt() {
     let workspace = tempfile::tempdir().expect("workspace");
     std::fs::create_dir(workspace.path().join(".git")).expect("repository marker");
+    // A readable index header makes preparation actually attempt Git. An
+    // empty .git directory would bypass Git before testing the fallback.
+    std::fs::write(
+        workspace.path().join(".git/index"),
+        b"DIRC\0\0\0\x02\0\0\0\0",
+    )
+    .expect("synthetic empty index header");
     std::fs::write(workspace.path().join("source.rs"), b"before").expect("source");
 
-    let before = compute_workspace_state_receipt_with_git(
-        workspace.path(),
-        OsStr::new("definitely-not-a-git-binary"),
-    );
+    let before =
+        receipt_with_git_for_test(workspace.path(), OsStr::new("definitely-not-a-git-binary"));
     std::fs::write(workspace.path().join("source.rs"), b"after").expect("mutate source");
-    let after = compute_workspace_state_receipt_with_git(
-        workspace.path(),
-        OsStr::new("definitely-not-a-git-binary"),
-    );
+    let after =
+        receipt_with_git_for_test(workspace.path(), OsStr::new("definitely-not-a-git-binary"));
 
     assert_eq!(before.strategy, WorkspaceReceiptStrategy::RepositoryWalk);
     assert_eq!(before.coverage, WorkspaceReceiptCoverage::Complete);
+    assert_eq!(after.coverage, WorkspaceReceiptCoverage::Complete);
     assert_ne!(before.mutation_digest(), after.mutation_digest());
 }
 
@@ -202,7 +230,7 @@ fn available_git_overlays_porcelain_on_the_bounded_anchored_walk() {
         .expect("git add");
     assert!(added.success());
 
-    let receipt = workspace_state_receipt(workspace.path());
+    let receipt = receipt_for_test(workspace.path());
 
     assert_eq!(receipt.strategy, WorkspaceReceiptStrategy::GitStatus);
     assert_eq!(receipt.coverage, WorkspaceReceiptCoverage::Complete);
@@ -210,26 +238,20 @@ fn available_git_overlays_porcelain_on_the_bounded_anchored_walk() {
 
 #[test]
 fn observed_length_content_budget_is_explicitly_elided() {
-    use std::io::{Seek as _, SeekFrom, Write as _};
-
+    const CONTENT_BUDGET: u64 = 64;
     let workspace = tempfile::tempdir().expect("workspace");
-    let oversized = workspace.path().join("oversized.bin");
-    let mut file = std::fs::File::create(&oversized).expect("oversized file");
-    file.set_len(super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES + 1)
-        .expect("sparse size");
-    // Keep each physical line below the process redactor's line ceiling.
-    // A single oversized line is itself masked and has an unknown receipt.
-    for offset in (64 * 1024 - 1..super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES).step_by(64 * 1024)
-    {
-        file.seek(SeekFrom::Start(offset)).expect("newline offset");
-        file.write_all(b"\n").expect("newline");
-    }
-    drop(file);
+    std::fs::write(workspace.path().join("oversized.bin"), [b'x'; 65]).expect("oversized file");
     let reader = super::AnchoredWorkspaceReader::new(workspace.path()).expect("anchored reader");
-    let mut builder = super::ReceiptBuilder::new(
-        WorkspaceReceiptStrategy::RepositoryWalk,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    let mut builder =
+        super::ReceiptBuilder::new(WorkspaceReceiptStrategy::RepositoryWalk, test_deadline());
+    assert_eq!(
+        builder.content_budget,
+        super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES
     );
+    // Model a nearly exhausted aggregate budget rather than redacting 16 MiB
+    // just to exercise the observed-length/content-elided branch.
+    builder.content_budget = CONTENT_BUDGET;
+    builder.content_bytes_read = super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES - CONTENT_BUDGET;
 
     let reason = builder
         .hash_path(&reader, Path::new("oversized.bin"))
@@ -245,7 +267,117 @@ fn observed_length_content_budget_is_explicitly_elided() {
         receipt.content_bytes_read,
         super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES
     );
+    assert_eq!(receipt.entries_visited, 1);
+    assert!(receipt.counts_known);
     assert!(receipt.mutation_digest().contains("reason=content_limit"));
+}
+
+#[test]
+fn exact_content_budget_remains_complete() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("exact.bin"), [b'x'; 64]).expect("exact file");
+    let reader = super::AnchoredWorkspaceReader::new(workspace.path()).expect("anchored reader");
+    let mut builder =
+        super::ReceiptBuilder::new(WorkspaceReceiptStrategy::RepositoryWalk, test_deadline());
+    builder.content_budget = 64;
+    builder
+        .hash_path(&reader, Path::new("exact.bin"))
+        .expect("exact budget");
+    assert_eq!(builder.content_budget, 0);
+    let receipt = builder.finish();
+    assert_eq!(receipt.coverage, WorkspaceReceiptCoverage::Complete);
+    assert_eq!(receipt.content_bytes_read, 64);
+}
+
+#[test]
+fn depleted_content_budget_elides_the_next_nonempty_file() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("first.bin"), b"x").expect("first file");
+    std::fs::write(workspace.path().join("next.bin"), b"x").expect("next file");
+    let reader = super::AnchoredWorkspaceReader::new(workspace.path()).expect("anchored reader");
+    let mut builder =
+        super::ReceiptBuilder::new(WorkspaceReceiptStrategy::RepositoryWalk, test_deadline());
+    builder.content_budget = 1;
+    builder
+        .hash_path(&reader, Path::new("first.bin"))
+        .expect("first byte");
+    let reason = builder
+        .hash_path(&reader, Path::new("next.bin"))
+        .expect_err("depleted budget");
+    assert_eq!(reason, WorkspaceReceiptUnknownReason::ContentLimit);
+    assert_eq!(builder.content_bytes_read, 1);
+    assert_eq!(builder.entries_visited, 2);
+}
+
+#[test]
+fn empty_file_remains_complete_with_zero_content_budget() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("empty.bin"), b"").expect("empty file");
+    let reader = super::AnchoredWorkspaceReader::new(workspace.path()).expect("anchored reader");
+    let mut builder =
+        super::ReceiptBuilder::new(WorkspaceReceiptStrategy::RepositoryWalk, test_deadline());
+    builder.content_budget = 0;
+    builder
+        .hash_path(&reader, Path::new("empty.bin"))
+        .expect("empty content");
+    let receipt = builder.finish();
+    assert_eq!(receipt.coverage, WorkspaceReceiptCoverage::Complete);
+    assert_eq!(receipt.content_bytes_read, 0);
+}
+
+#[test]
+fn content_budget_across_read_chunks_is_explicitly_elided() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut content = vec![b'x'; 64 * 1024 + 2];
+    content[32 * 1024 - 1] = b'\n';
+    content[64 * 1024 - 1] = b'\n';
+    std::fs::write(workspace.path().join("chunks.bin"), content).expect("chunked file");
+    let reader = super::AnchoredWorkspaceReader::new(workspace.path()).expect("anchored reader");
+    let mut builder =
+        super::ReceiptBuilder::new(WorkspaceReceiptStrategy::RepositoryWalk, test_deadline());
+    builder.content_budget = 64 * 1024 + 1;
+    let reason = builder
+        .hash_path(&reader, Path::new("chunks.bin"))
+        .expect_err("suffix elided");
+    assert_eq!(reason, WorkspaceReceiptUnknownReason::ContentLimit);
+    assert_eq!(builder.content_bytes_read, 64 * 1024 + 1);
+    assert_eq!(builder.content_budget, 0);
+}
+
+#[test]
+fn expired_receipt_deadline_still_preempts_content_work() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join(".git")).expect("repository marker");
+    std::fs::write(workspace.path().join("source.rs"), b"x").expect("source");
+    let reader = super::AnchoredWorkspaceReader::new(workspace.path()).expect("anchored reader");
+    let deadline = Instant::now();
+    let mut builder =
+        super::ReceiptBuilder::new(WorkspaceReceiptStrategy::RepositoryWalk, deadline);
+    builder.content_budget = 0;
+    assert_eq!(
+        builder.hash_path(&reader, Path::new("source.rs")),
+        Err(WorkspaceReceiptUnknownReason::WallTimeLimit)
+    );
+    assert_eq!(builder.content_bytes_read, 0);
+    assert_eq!(builder.entries_visited, 0);
+    let receipt = super::repository_walk_receipt(workspace.path(), deadline);
+    assert_eq!(
+        receipt.coverage,
+        WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::WallTimeLimit)
+    );
+}
+
+#[test]
+fn production_receipt_limits_remain_pinned() {
+    assert_eq!(
+        super::WORKSPACE_RECEIPT_WALL_TIME,
+        Duration::from_millis(500)
+    );
+    assert_eq!(
+        super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES,
+        16 * 1024 * 1024
+    );
+    assert_eq!(super::WORKSPACE_RECEIPT_MAX_ENTRIES, 4_096);
 }
 
 #[cfg(unix)]
@@ -259,10 +391,8 @@ fn repository_fallback_does_not_follow_a_symlink_cycle() {
     std::fs::write(workspace.path().join("nested/source.rs"), b"source").expect("source");
     symlink("..", workspace.path().join("nested/cycle")).expect("cycle");
 
-    let receipt = compute_workspace_state_receipt_with_git(
-        workspace.path(),
-        OsStr::new("definitely-not-a-git-binary"),
-    );
+    let receipt =
+        receipt_with_git_for_test(workspace.path(), OsStr::new("definitely-not-a-git-binary"));
 
     assert_eq!(receipt.strategy, WorkspaceReceiptStrategy::RepositoryWalk);
     assert_eq!(
@@ -276,10 +406,8 @@ fn an_interleaved_known_filesystem_mutation_invalidates_a_live_process_compariso
     let workspace = tempfile::tempdir().expect("workspace");
     std::fs::create_dir(workspace.path().join(".git")).expect("repository marker");
     std::fs::write(workspace.path().join("source.rs"), b"stable").expect("source");
-    let receipt = compute_workspace_state_receipt_with_git(
-        workspace.path(),
-        OsStr::new("definitely-not-a-git-binary"),
-    );
+    let receipt =
+        receipt_with_git_for_test(workspace.path(), OsStr::new("definitely-not-a-git-binary"));
     assert_eq!(receipt.coverage, WorkspaceReceiptCoverage::Complete);
     let tracker = WorkspaceReceiptTracker::default();
     tracker.install_initial_receipt(receipt.clone());
@@ -291,6 +419,20 @@ fn an_interleaved_known_filesystem_mutation_invalidates_a_live_process_compariso
         .expect("interleaving forces an assumed mutation");
 
     assert!(mutation.contains("reason=concurrent_or_interleaved_mutation"));
+}
+
+#[test]
+fn unchanged_complete_receipt_does_not_report_mutation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join(".git")).expect("repository marker");
+    std::fs::write(workspace.path().join("source.rs"), b"stable").expect("source");
+    let receipt =
+        receipt_with_git_for_test(workspace.path(), OsStr::new("definitely-not-a-git-binary"));
+    assert_eq!(receipt.coverage, WorkspaceReceiptCoverage::Complete);
+    let tracker = WorkspaceReceiptTracker::default();
+    tracker.install_initial_receipt(receipt.clone());
+    let lease = tracker.begin_foreground();
+    assert_eq!(lease.finish(receipt), None);
 }
 
 #[tokio::test]
