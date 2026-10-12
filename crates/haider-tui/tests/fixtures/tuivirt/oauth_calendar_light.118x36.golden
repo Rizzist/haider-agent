@@ -41,8 +41,8 @@
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×118
 20|      │ DETAIL anthropic — provider-reported extras                                                                   |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×6; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×37; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×67
-21|      │ previous resets  not reported by provider                                                                     |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×69
+21|      │ previous resets  no entries reported (empty or omitted)                                                       |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×55; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×55
 22|      │ banked resets    not reported by provider                                                                     |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×69
 23|      │ use banked reset no operation reported for this account                                                       |
@@ -66,7 +66,7 @@
 32|──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×118
 33|↑↓ ←→ account (list order) · b banked reset · PgUp/PgDn scroll · f refresh · s next scope · esc back                  |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×100; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×100; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18
 34|──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×118
 35| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                                                              |

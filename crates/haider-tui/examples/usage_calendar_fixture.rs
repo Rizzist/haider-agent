@@ -17,7 +17,9 @@
 use haider_protocol::credential::AuthMethod;
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::usage::{
-    AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1, UsageWindowV1,
+    AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1,
+    UsageResetCreditV1, UsageResetCreditsV1, UsageResetHistoryEntryV1, UsageResetHistorySourceV1,
+    UsageWindowV1,
 };
 use haider_tui::app::{AppEvent, AppModel};
 use haider_tui::theme::{ThemeChoice, ThemeKey};
@@ -38,6 +40,8 @@ fn account(
         plan: plan.map(str::to_owned),
         auth_method: AuthMethod::OAuth,
         meter,
+        reset_credits: None,
+        previous_resets: Vec::new(),
         local: LocalUsageStatsV1::default(),
     }
 }
@@ -56,8 +60,9 @@ fn window(name: &str, utilization: f64, resets_at_ms: u64) -> UsageWindowV1 {
 fn fixture_report() -> UsageReportV1 {
     let unavailable = |reason: &str| AccountMeterStateV1::Unavailable {
         reason: reason.to_owned(),
+        retry_at_ms: None,
     };
-    UsageReportV1 {
+    let mut report = UsageReportV1 {
         generated_at_ms: 1_790_182_800_000,
         accounts: vec![
             account(
@@ -116,7 +121,36 @@ fn fixture_report() -> UsageReportV1 {
             ),
         ],
         orchestration: Default::default(),
-    }
+    };
+    report.accounts[0].reset_credits = Some(UsageResetCreditsV1 {
+        available_count: 2,
+        applicable_available_count: Some(1),
+        total_earned_count: Some(3),
+        used_count: Some(1),
+        remaining_count: None,
+        apply_supported: true,
+        credits: vec![UsageResetCreditV1 {
+            reset_type: "banked_reset".into(),
+            status: "available".into(),
+            title: Some("Synthetic earned reset".into()),
+            description: Some("Synthetic provider detail for UI verification".into()),
+            granted_at_ms: Some(1_790_179_200_000),
+            expires_at_ms: Some(1_790_269_200_000),
+            redeemed_at_ms: None,
+        }],
+    });
+    report.accounts[0].previous_resets = vec![UsageResetHistoryEntryV1 {
+        reset_at_ms: 1_790_096_400_000,
+        source: UsageResetHistorySourceV1::Provider,
+        window: None,
+        kind: Some("banked_reset".into()),
+        observed_at_ms: Some(1_790_182_800_000),
+    }];
+    report.accounts[0].meter = AccountMeterStateV1::Unavailable {
+        reason: "http_status_429".into(),
+        retry_at_ms: Some(1_790_186_400_000),
+    };
+    report
 }
 
 fn key(model: &mut AppModel, code: KeyCode) {

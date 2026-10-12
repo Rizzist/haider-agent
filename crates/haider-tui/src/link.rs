@@ -518,6 +518,7 @@ async fn issue(
                 | LiveCommand::CheckpointRollbackTurn { .. }
                 | LiveCommand::ProviderSetTrust { .. }
                 | LiveCommand::WorkspaceSet { .. }
+                | LiveCommand::UsageResetApply { .. }
                 // escretract: a retract MUST be answered. Falling through to
                 // the bare `return false` would leave the durable command in
                 // the outbox with nothing to retire it — resent and re-dropped
@@ -633,6 +634,7 @@ async fn issue(
 #[must_use]
 pub fn command_required_features(command: &LiveCommand) -> &'static [&'static str] {
     match command {
+        LiveCommand::UsageResetApply { .. } => &[haider_rpc::FEATURE_USAGE_RESET_APPLY_V1],
         LiveCommand::Create { .. } => &[haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1],
         LiveCommand::LoomAuthorDraft { .. } | LiveCommand::LoomAuthorRevise { .. } => {
             &[haider_rpc::FEATURE_LOOM_AUTHORING_V1]
@@ -742,6 +744,7 @@ pub struct CommandContext {
     /// This request was a `usage.report` read (U2). Same identity pattern
     /// as `hooks_list`: the error reply lands on the usage screen.
     usage_report: bool,
+    usage_reset_session: Option<haider_protocol::ids::SessionId>,
     usage_history: bool,
     usage_today: bool,
     queue_list: bool,
@@ -868,6 +871,10 @@ impl CommandContext {
             },
             hooks_list: matches!(command, LiveCommand::HooksList { .. }),
             usage_report: matches!(command, LiveCommand::UsageReport),
+            usage_reset_session: match command {
+                LiveCommand::UsageResetApply { session, .. } => Some(session.clone()),
+                _ => None,
+            },
             usage_history: matches!(command, LiveCommand::UsageHistoryRange { .. }),
             usage_today: matches!(command, LiveCommand::UsageHistoryDay { .. }),
             queue_list: matches!(command, LiveCommand::QueueList { .. }),
@@ -1419,6 +1426,15 @@ pub fn request_body_for_features(
         LiveCommand::HooksList { cwd } => RequestBody::HooksList { cwd },
         // U2: parameterless read (U1's wire) — CONSUMED, never redefined.
         LiveCommand::UsageReport => RequestBody::UsageReport,
+        LiveCommand::UsageResetApply {
+            command_id,
+            session,
+            account,
+        } => RequestBody::UsageResetApply {
+            command_id,
+            session_id: session,
+            account,
+        },
         // 954: the bounded heatmap read — CONSUMED, never redefined.
         LiveCommand::UsageHistoryRange { through_date, days } => {
             RequestBody::UsageHistoryRange { through_date, days }
@@ -2147,6 +2163,19 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             revision,
             hooks,
         }],
+        ResponseBody::UsageResetApply { result, .. } => {
+            match (
+                context.command_id.clone(),
+                context.usage_reset_session.clone(),
+            ) {
+                (Some(command_id), Some(session)) => vec![LiveReply::UsageResetApplyResult {
+                    command_id,
+                    session,
+                    result,
+                }],
+                _ => Vec::new(),
+            }
+        }
         ResponseBody::UsageReport { report, .. } => vec![LiveReply::UsageReport {
             report: Box::new(report),
         }],

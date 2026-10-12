@@ -947,7 +947,9 @@ pub fn usage_plain(model: &crate::app::AppModel) -> String {
             out.push_str(&format!("    detail for {}:\n", account.alias));
             let extras = account_extras(account);
             let mut label = "";
-            for row in detail_rows(account, &extras, zone, snapshot, year) {
+            let mut rows = detail_rows(account, &extras, zone, snapshot, year);
+            rows.extend(usage.reset_apply.rows(&account.alias));
+            for row in rows {
                 if !row.label.is_empty() {
                     label = row.label;
                 }

@@ -39,14 +39,14 @@
    ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×96; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×64
 19|      │ DETAIL google-antigravity — provider-reported extras                                                                                                    |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×6; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×46; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×100
-20|      │ previous resets  not reported by provider                                                                                                               |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×111
+20|      │ previous resets  no entries reported (empty or omitted)                                                                                                 |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×55; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×97
 21|      │ banked resets    not reported by provider                                                                                                               |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×111
-22|      │ use banked reset no operation reported for this account                                                                                                 |
+22|      │ retry at         not reported by provider                                                                                                               |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×111
+23|      │ use banked reset no operation reported for this account                                                                                                 |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(110, 110, 110)/Rgb(253, 253, 253)/ITALIC×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×97
-23|                                                                                                                                                                |
-   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
 24|                                                                                                                                                                |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
 25|                                                                                                                                                                |
@@ -94,7 +94,7 @@
 46|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×160
 47|↑↓ ←→ account (list order) · b banked reset · PgUp/PgDn scroll · f refresh · s next scope · esc back                                                            |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×100; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×60
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×100; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×60
 48|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×160
 49| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                                                                                                        |

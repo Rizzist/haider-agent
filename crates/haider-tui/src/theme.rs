@@ -94,6 +94,28 @@ impl Rgb {
     }
 }
 
+/// Preserve the preferred ink when it meets AA on this actual background.
+/// Otherwise use the neutral extreme with the greater contrast.
+#[must_use]
+pub fn readable_fg(preferred: Rgb, background: Rgb) -> Rgb {
+    if preferred.contrast(background) >= 4.5 {
+        return preferred;
+    }
+    let light = Rgb::hex(0xffffff);
+    let dark = Rgb::hex(0x000000);
+    if light.contrast(background) >= dark.contrast(background) {
+        light
+    } else {
+        dark
+    }
+}
+
+/// Calendar badge ink without changing the shared badge palette.
+#[must_use]
+pub fn reset_badge_fg(theme: &Theme) -> Rgb {
+    readable_fg(theme.badge_fg, theme.ok)
+}
+
 /// Which rendering is active. `Dark` is the default — it is also the
 /// detection fallback (owner spec §3: undetectable terminal → dark).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

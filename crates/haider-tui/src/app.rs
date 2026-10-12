@@ -1521,8 +1521,11 @@ pub struct UsageState {
     pub revealed: bool,
     /// F2b scroll discipline: RENDER is the single scroll authority — the
     /// frame writes the true max and reconciles this offset against it.
-    pub scroll: std::cell::Cell<u16>,
-    pub scroll_max: std::cell::Cell<u16>,
+    /// Published detail records are not capped by terminal coordinates.
+    pub scroll: std::cell::Cell<usize>,
+    pub scroll_max: std::cell::Cell<usize>,
+    /// The frame's paging stride, with overlap for the pinned summary.
+    pub scroll_page: std::cell::Cell<usize>,
     /// Armed by a cursor move: the next frame scrolls the cursor's group
     /// header into view, then clears the latch.
     pub follow_cursor: std::cell::Cell<bool>,
@@ -1552,9 +1555,17 @@ pub struct UsageState {
     /// Defaults to UTC-only (deterministic); the live TUI binary sets the
     /// host zone at boot.
     pub time_zone: crate::usage_time::UsageTimeZone,
+    pub reset_apply: crate::usage_apply::UsageApplyState,
 }
 
 impl UsageState {
+    fn page_step(&self) -> usize {
+        match self.scroll_page.get() {
+            0 => 8, // Preserve the existing stride before the first frame.
+            rows => rows,
+        }
+    }
+
     /// Install a committed `usage.report` snapshot. The ONLY writer of
     /// `report`; clears the in-flight mark and any stale error.
     pub fn apply_report(&mut self, report: haider_protocol::usage::UsageReportV1) {
@@ -3929,6 +3940,11 @@ pub enum AppRequest {
     /// pushed on screen entry and by `r`, live-only vocabulary: the demo
     /// opens an honest empty state and never fabricates a meter.
     UsageRefresh,
+    /// Requests the daemon's existing deferred approval; never spends directly.
+    UsageResetApply {
+        session: SessionId,
+        account: haider_protocol::ids::CredentialAlias,
+    },
     /// 954: the bounded heatmap read (`usage.history_range`).
     UsageHistoryRefresh,
     /// 954 Models scope: today's full day read (`usage.history_day`).
@@ -7973,6 +7989,9 @@ impl AppModel {
                     // demo/mock twin, whose prompts have no durable
                     // sequence. Recording one would fabricate a fork cut.
                     self.record_prompt(crate::session::PromptEntry::local(text.clone()));
+                }
+                if let Some(session) = &self.active_session {
+                    self.usage.reset_apply.observe(session, &payload);
                 }
                 self.handle_envelope(&payload);
             }
@@ -12606,18 +12625,42 @@ impl AppModel {
                 }
             }
             KeyCode::Char('b') if self.usage.scope == UsageScope::Calendar => {
-                // The banked-reset affordance: offered only when the provider
-                // reports a usable operation; otherwise say why, do nothing.
-                let note = self.usage.selected_slot().and_then(|slot| {
-                    let account = self.usage.report.as_ref()?.accounts.get(slot)?;
-                    let extras = crate::usage_detail::account_extras(account);
-                    crate::usage_detail::banked_reset_unavailable_note(
-                        account.alias.as_str(),
-                        &extras.action,
-                    )
-                });
-                if let Some(note) = note {
-                    self.flash = Some(note);
+                if let Some(account) = self
+                    .usage
+                    .selected_slot()
+                    .and_then(|slot| self.usage.report.as_ref()?.accounts.get(slot))
+                {
+                    let alias = account.alias.clone();
+                    let action = crate::usage_detail::account_extras(account).action;
+                    if let Some(note) =
+                        crate::usage_detail::banked_reset_unavailable_note(alias.as_str(), &action)
+                    {
+                        self.flash = Some(note);
+                    } else if self.mode.fabricates_locally() {
+                        self.flash =
+                            Some("reset approval requires a connected daemon session".into());
+                    } else if let Some(session) = self.active_session.clone() {
+                        // The existing session card is the sole answer path.
+                        // Preserve the user's draft; a nonempty draft keeps
+                        // the card hidden until the user clears it.
+                        if let Some(owner) = self.usage.reset_apply.pending_session(&alias) {
+                            self.flash = Some(format!(
+                                "reset request unresolved for {alias} · open session {owner}"
+                            ));
+                            if owner == &session {
+                                self.switch_surface(Screen::Session);
+                            }
+                        } else {
+                            self.switch_surface(Screen::Session);
+                            self.requests.push(AppRequest::UsageResetApply {
+                                session,
+                                account: alias,
+                            });
+                        }
+                        self.retire_spend_card_navigation();
+                    } else {
+                        self.flash = Some("open a session before requesting reset approval".into());
+                    }
                     self.dirty = true;
                 }
             }
@@ -12710,16 +12753,23 @@ impl AppModel {
             // F2b: page keys move the viewport and clamp at the true
             // frame-written range.
             KeyCode::PageUp => {
-                self.usage
-                    .scroll
-                    .set(self.usage.scroll.get().saturating_sub(8));
+                self.usage.scroll.set(
+                    self.usage
+                        .scroll
+                        .get()
+                        .saturating_sub(self.usage.page_step()),
+                );
                 self.dirty = true;
             }
             KeyCode::PageDown => {
                 let max = self.usage.scroll_max.get();
-                self.usage
-                    .scroll
-                    .set(self.usage.scroll.get().saturating_add(8).min(max));
+                self.usage.scroll.set(
+                    self.usage
+                        .scroll
+                        .get()
+                        .saturating_add(self.usage.page_step())
+                        .min(max),
+                );
                 self.dirty = true;
             }
             KeyCode::Home => {
@@ -18387,6 +18437,11 @@ impl AppModel {
         };
         match outcome {
             RawOutcome::Applied => {
+                if let Ok(payload) = envelope.payload.decode_event() {
+                    self.usage
+                        .reset_apply
+                        .observe(&envelope.session_id, &payload);
+                }
                 self.dirty = true;
                 // A journal diagnostic describes a former connection. It
                 // cannot establish compatibility of this Hello/Welcome pair.

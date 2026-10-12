@@ -33,8 +33,8 @@
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
 16|      │ DETAIL anthropic-oauth-2 — provider-reported extras                     |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×6; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×45; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×21
-17|      │ previous resets  not reported by provider                               |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×31
+17|      │ previous resets  no entries reported (empty or omitted)                 |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×55; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×17
 18|      │ banked resets    not reported by provider                               |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×31
 19|⋮     │ use banked reset no operation reported for this account                 |
@@ -42,7 +42,7 @@
 20|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×80
 21|↑↓ account · ⇞⇟ scroll · b banked · f refresh · s scope · esc back              |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×66; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×14
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×66; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×14
 22|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×80
 23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |

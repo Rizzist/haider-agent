@@ -3,21 +3,19 @@
 //!
 //! The panel is shaped for data the provider may or may not report: the
 //! Haider Code weekly allowance, previous resets, banked / used / remaining
-//! resets, and a "use banked reset" action. Every field is optional and
-//! absence is SAID ("not reported by provider") — nothing is inferred, and
+//! resets, and a "use banked reset" action. Optional fields retain their
+//! absence ("not reported by provider") — nothing is inferred, and
 //! no production path fabricates a value.
 //!
-//! Wire status (973): the usage report carries none of the banked-reset or
-//! reset-history fields yet, so [`account_extras`] fills only what the
-//! current wire can prove (a Haider Code account's published `weekly`
-//! window). The typed [`AccountResetExtras`] is the landing surface for the
-//! backend follow-up: mapping new report fields into it covers the DISPLAY.
-//! Enabling the action additionally needs a request path: `b` today only
-//! explains unavailable states, and an `Available` action must send the
-//! daemon's banked-reset request (which owns the always-ask approval) and
-//! render its pending/approved/denied result.
+//! Counts and detail records are carried directly from the published wire.
+//! Empty and omitted history share the same wire representation, so the UI
+//! makes no claim that a provider explicitly reported an empty history.
+//! The daemon owns credit selection, account binding and human approval.
 
-use haider_protocol::usage::{AccountMeterStateV1, AccountUsageReportV1, UsageWindowV1};
+use haider_protocol::usage::{
+    AccountMeterStateV1, AccountUsageReportV1, UsageResetApplyResultV1, UsageResetApplyStatusV1,
+    UsageResetCreditsV1, UsageResetHistoryEntryV1, UsageResetHistorySourceV1, UsageWindowV1,
+};
 
 use crate::usage_time::{UsageTimeZone, fmt_relative, fmt_reset_instant};
 
@@ -34,41 +32,18 @@ pub struct AllowanceView {
     pub resets_at_ms: Option<u64>,
 }
 
-/// Where a previous-reset record came from. The device journal is labelled
-/// as such: it is this machine's observation, not provider truth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResetHistorySource {
-    Provider,
-    DeviceJournal,
-}
-
-/// One previous reset.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PastReset {
-    /// Window name (`five_hour`, `seven_day`, `5h`, `weekly`, ...).
-    pub window: String,
-    pub at_ms: u64,
-    pub source: ResetHistorySource,
-}
-
-/// Banked-reset counters, each only when the provider states it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BankedResets {
-    pub banked: Option<u32>,
-    pub used: Option<u32>,
-    pub remaining: Option<u32>,
-}
+pub type ResetHistorySource = UsageResetHistorySourceV1;
+pub type PastReset = UsageResetHistoryEntryV1;
+pub type BankedResets = UsageResetCreditsV1;
 
 /// Whether "use banked reset" can be offered for this account.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BankedResetAction {
-    /// Nothing on the wire says whether an operation exists (the 973 usage
-    /// report carries no such field). Unknown is never inferred: this is
+    /// No reset-credit inventory was published. Unknown is never inferred: this is
     /// "not reported", NOT "not offered". Disabled.
     #[default]
     NotReported,
-    /// The provider/daemon explicitly reported that no operation exists
-    /// (a future wire state). Disabled.
+    /// The daemon did not publish a supported operation. Disabled.
     NotOffered,
     /// The provider operation exists but cannot be used now (typed reason,
     /// e.g. `no banked resets remaining`): disabled with that reason.
@@ -77,22 +52,19 @@ pub enum BankedResetAction {
     Available,
 }
 
-/// Everything the detail panel can show beyond the meter windows.
-/// `None` means "the provider did not report this" — rendered as such.
+/// Published extras beyond meter windows. Optional inventory and allowance
+/// retain absence; history has only the distinctions carried by the wire.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccountResetExtras {
     /// Haider Code accounts only.
     pub allowance: Option<AllowanceView>,
-    /// `Some(vec![])` is a REPORTED empty history, distinct from `None`.
+    /// Empty and omitted history both mean no entries were published.
     pub history: Option<Vec<PastReset>>,
     pub banked: Option<BankedResets>,
     pub action: BankedResetAction,
 }
 
-/// The extras the CURRENT wire can prove for `account`. Only a Haider Code
-/// account's published, unlabeled `weekly`/`seven_day` window becomes an
-/// allowance; history, banked counters and the action stay "not reported"
-/// until the usage report carries them.
+/// Project published fields without narrowing counters or inferring counts.
 #[must_use]
 pub fn account_extras(account: &AccountUsageReportV1) -> AccountResetExtras {
     AccountResetExtras {
@@ -101,7 +73,21 @@ pub fn account_extras(account: &AccountUsageReportV1) -> AccountResetExtras {
             utilization: Some(window.utilization),
             resets_at_ms: window.resets_at_ms,
         }),
-        ..AccountResetExtras::default()
+        history: (!account.previous_resets.is_empty()).then(|| account.previous_resets.clone()),
+        banked: account.reset_credits.clone(),
+        action: match &account.reset_credits {
+            None => BankedResetAction::NotReported,
+            Some(credits) if !credits.apply_supported => BankedResetAction::NotOffered,
+            Some(credits) if credits.available_count == 0 => BankedResetAction::Unavailable {
+                reason: "no available reset credits".into(),
+            },
+            Some(credits) if credits.applicable_available_count == Some(0) => {
+                BankedResetAction::Unavailable {
+                    reason: "no applicable reset credits".into(),
+                }
+            }
+            Some(_) => BankedResetAction::Available,
+        },
     }
 }
 
@@ -203,7 +189,7 @@ pub fn reset_at(account: &AccountUsageReportV1, kind: ResetKind) -> Option<u64> 
 #[must_use]
 pub fn reset_unknown_reason(account: &AccountUsageReportV1, kind: ResetKind) -> Option<String> {
     match &account.meter {
-        AccountMeterStateV1::Unavailable { reason } => Some(format!(
+        AccountMeterStateV1::Unavailable { reason, .. } => Some(format!(
             "meter unavailable · {}",
             fmt_meter_reason_friendly(reason)
         )),
@@ -245,10 +231,10 @@ pub struct DetailRow {
 }
 
 impl DetailRow {
-    fn new(label: &'static str, text: impl Into<String>, tone: DetailTone) -> Self {
+    pub(crate) fn new(label: &'static str, text: impl Into<String>, tone: DetailTone) -> Self {
         Self {
             label,
-            text: text.into(),
+            text: crate::toolview::sanitize(&text.into()),
             tone,
         }
     }
@@ -257,8 +243,8 @@ impl DetailRow {
 /// The text shown for any field the provider did not report.
 pub const NOT_REPORTED: &str = "not reported by provider";
 
-/// Previous resets listed at most (newest first).
-pub const HISTORY_ROWS: usize = 3;
+/// No entries on the v1 wire does not distinguish omitted from empty.
+pub const NO_HISTORY: &str = "no entries reported (empty or omitted)";
 
 /// The panel rows for one account. Pure: the snapshot instant, zone and
 /// reference year come from the caller.
@@ -297,65 +283,117 @@ pub fn detail_rows(
             }
         });
     }
-    match &extras.history {
-        None => rows.push(DetailRow::new(
+    let mut history = extras.history.clone().unwrap_or_default();
+    history.sort_by_key(|reset| std::cmp::Reverse(reset.reset_at_ms));
+    if history.is_empty() {
+        rows.push(DetailRow::new(
             "previous resets",
+            NO_HISTORY,
+            DetailTone::Dim,
+        ));
+    }
+    for (index, reset) in history.iter().enumerate() {
+        rows.push(DetailRow::new(
+            if index == 0 { "previous resets" } else { "" },
+            format!(
+                "{} {} · {} · {}",
+                reset.window.as_deref().unwrap_or("window not reported"),
+                fmt_reset_instant(reset.reset_at_ms, zone, reference_year),
+                fmt_relative(snapshot_ms, reset.reset_at_ms),
+                match reset.source {
+                    ResetHistorySource::Provider => "provider",
+                    ResetHistorySource::DeviceJournal => "this device's meter journal",
+                    _ => "source unknown",
+                }
+            ),
+            DetailTone::Normal,
+        ));
+        rows.push(DetailRow::new(
+            "reset kind",
+            reset.kind.as_deref().unwrap_or(NOT_REPORTED),
+            DetailTone::Normal,
+        ));
+        rows.push(reset.observed_at_ms.map_or_else(
+            || DetailRow::new("observed", NOT_REPORTED, DetailTone::Dim),
+            |at| instant_row("observed", at, zone, snapshot_ms, reference_year),
+        ));
+    }
+    match &extras.banked {
+        None => rows.push(DetailRow::new(
+            "banked resets",
             NOT_REPORTED,
             DetailTone::Dim,
         )),
-        Some(history) if history.is_empty() => {
+        Some(credits) => {
             rows.push(DetailRow::new(
-                "previous resets",
-                "none reported",
-                DetailTone::Dim,
+                "banked resets",
+                format!("available {}", credits.available_count),
+                DetailTone::Normal,
             ));
-        }
-        Some(history) => {
-            let mut newest = history.clone();
-            newest.sort_by_key(|reset| std::cmp::Reverse(reset.at_ms));
-            for (index, reset) in newest.iter().take(HISTORY_ROWS).enumerate() {
+            for (label, value) in [
+                ("applicable", credits.applicable_available_count),
+                ("total earned", credits.total_earned_count),
+                ("used", credits.used_count),
+                ("remaining", credits.remaining_count),
+            ] {
                 rows.push(DetailRow::new(
-                    if index == 0 { "previous resets" } else { "" },
-                    format!(
-                        "{} {} · {} · {}",
-                        reset.window,
-                        fmt_reset_instant(reset.at_ms, zone, reference_year),
-                        fmt_relative(snapshot_ms, reset.at_ms),
-                        match reset.source {
-                            ResetHistorySource::Provider => "provider",
-                            ResetHistorySource::DeviceJournal => "this device's meter journal",
-                        }
-                    ),
+                    label,
+                    value.map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
                     DetailTone::Normal,
                 ));
             }
-            if newest.len() > HISTORY_ROWS {
+            rows.push(DetailRow::new(
+                "apply supported",
+                credits.apply_supported.to_string(),
+                DetailTone::Normal,
+            ));
+            if credits.credits.is_empty() {
                 rows.push(DetailRow::new(
-                    "",
-                    format!("+{} older", newest.len() - HISTORY_ROWS),
+                    "credit details",
+                    NO_HISTORY,
                     DetailTone::Dim,
                 ));
             }
+            for (index, credit) in credits.credits.iter().enumerate() {
+                rows.push(DetailRow::new(
+                    "credit details",
+                    format!(
+                        "{} · type {} · status {}",
+                        index + 1,
+                        credit.reset_type,
+                        credit.status
+                    ),
+                    DetailTone::Normal,
+                ));
+                for (label, value) in [
+                    ("title", &credit.title),
+                    ("description", &credit.description),
+                ] {
+                    rows.push(DetailRow::new(
+                        label,
+                        value.as_deref().unwrap_or(NOT_REPORTED),
+                        DetailTone::Normal,
+                    ));
+                }
+                for (label, at) in [
+                    ("granted", credit.granted_at_ms),
+                    ("expires", credit.expires_at_ms),
+                    ("redeemed", credit.redeemed_at_ms),
+                ] {
+                    rows.push(at.map_or_else(
+                        || DetailRow::new(label, NOT_REPORTED, DetailTone::Dim),
+                        |at| instant_row(label, at, zone, snapshot_ms, reference_year),
+                    ));
+                }
+            }
         }
     }
-    rows.push(match extras.banked {
-        None => DetailRow::new("banked resets", NOT_REPORTED, DetailTone::Dim),
-        Some(banked) => {
-            let count = |value: Option<u32>| {
-                value.map_or_else(|| "not reported".to_owned(), |value| value.to_string())
-            };
-            DetailRow::new(
-                "banked resets",
-                format!(
-                    "banked {} · used {} · remaining {}",
-                    count(banked.banked),
-                    count(banked.used),
-                    count(banked.remaining)
-                ),
-                DetailTone::Normal,
-            )
-        }
-    });
+    if let AccountMeterStateV1::Unavailable { retry_at_ms, .. } = account.meter {
+        rows.push(retry_at_ms.map_or_else(
+            || DetailRow::new("retry at", NOT_REPORTED, DetailTone::Dim),
+            |at| instant_row("retry at", at, zone, snapshot_ms, reference_year),
+        ));
+    }
     rows.push(match &extras.action {
         BankedResetAction::NotReported => DetailRow::new(
             "use banked reset",
@@ -364,7 +402,7 @@ pub fn detail_rows(
         ),
         BankedResetAction::NotOffered => DetailRow::new(
             "use banked reset",
-            "unavailable — provider offers no banked-reset operation",
+            "unavailable — no supported reset operation reported",
             DetailTone::Disabled,
         ),
         BankedResetAction::Unavailable { reason } => DetailRow::new(
@@ -381,6 +419,52 @@ pub fn detail_rows(
     rows
 }
 
+fn instant_row(
+    label: &'static str,
+    at: u64,
+    zone: UsageTimeZone,
+    snapshot_ms: u64,
+    year: i64,
+) -> DetailRow {
+    DetailRow::new(
+        label,
+        format!(
+            "{} · {}",
+            fmt_reset_instant(at, zone, year),
+            fmt_relative(snapshot_ms, at)
+        ),
+        DetailTone::Normal,
+    )
+}
+
+/// Preserve reported status and typed provider reasons without guessing.
+#[must_use]
+pub fn reset_result_rows(result: &UsageResetApplyResultV1) -> Vec<DetailRow> {
+    let status = match result.status {
+        UsageResetApplyStatusV1::ApprovalPending => "approval pending",
+        UsageResetApplyStatusV1::Applied => "applied",
+        UsageResetApplyStatusV1::Denied => "denied",
+        UsageResetApplyStatusV1::Failed => "failed",
+        _ => "unknown",
+    };
+    let mut rows = vec![DetailRow::new(
+        "reset request",
+        format!("{status} · {}", result.approval_id),
+        DetailTone::Normal,
+    )];
+    rows.push(DetailRow::new(
+        "windows reset",
+        result
+            .windows_reset
+            .map_or_else(|| NOT_REPORTED.to_owned(), |count| count.to_string()),
+        DetailTone::Normal,
+    ));
+    if let Some(reason) = &result.reason {
+        rows.push(DetailRow::new("reset reason", reason, DetailTone::Warn));
+    }
+    rows
+}
+
 /// The flash `b` shows when the action is not available for `alias`.
 #[must_use]
 pub fn banked_reset_unavailable_note(alias: &str, action: &BankedResetAction) -> Option<String> {
@@ -390,7 +474,7 @@ pub fn banked_reset_unavailable_note(alias: &str, action: &BankedResetAction) ->
             Some(format!("no banked-reset operation reported for {alias}"))
         }
         BankedResetAction::NotOffered => Some(format!(
-            "use banked reset: unavailable for {alias} — provider offers no banked-reset operation"
+            "use banked reset: unavailable for {alias} — no supported reset operation reported"
         )),
         BankedResetAction::Unavailable { reason } => Some(format!(
             "use banked reset: unavailable for {alias} — {reason}"

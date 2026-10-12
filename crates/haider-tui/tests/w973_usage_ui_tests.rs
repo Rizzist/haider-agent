@@ -63,6 +63,8 @@ fn account(
         plan: plan.map(str::to_owned),
         auth_method: AuthMethod::OAuth,
         meter,
+        reset_credits: None,
+        previous_resets: Vec::new(),
         local: LocalUsageStatsV1::default(),
     }
 }
@@ -79,6 +81,7 @@ fn window(name: &str, utilization: f64, resets_at_ms: Option<u64>) -> UsageWindo
 fn unavailable(reason: &str) -> AccountMeterStateV1 {
     AccountMeterStateV1::Unavailable {
         reason: reason.to_owned(),
+        retry_at_ms: None,
     }
 }
 
@@ -557,6 +560,63 @@ fn selected_account_reset_days_are_highlighted_distinct_from_today() {
     assert!(cell_bg(&frame, "24  e5").iter().all(|bg| *bg == ok));
 }
 
+#[test]
+fn painted_reset_badges_and_snapshot_markers_meet_aa_in_every_theme() {
+    fn rgb(color: Color) -> haider_tui::theme::Rgb {
+        let Color::Rgb(r, g, b) = color else {
+            panic!("expected RGB ink: {color:?}");
+        };
+        haider_tui::theme::Rgb { r, g, b }
+    }
+    for theme in ThemeKey::ALL {
+        for (width, height) in [(118, 36), (80, 24)] {
+            let mut model = calendar(UsageTimeZone::UtcOnly);
+            model.theme = theme;
+            for _ in 0..3 {
+                model.handle(key(KeyCode::Down));
+            }
+            model.usage.follow_cursor.set(false);
+            model.usage.scroll.set(0);
+            let frame = draw(&model, width, height);
+            for (row_needle, ink_needle) in
+                [("USAGE · calendar", "calendar"), ("b banked", "b banked")]
+            {
+                let row = frame
+                    .row_containing(row_needle)
+                    .expect("calendar control text");
+                let fg = rgb(cell_fg(&frame, row, ink_needle));
+                let bg = rgb(cell_bg(&frame, row_needle)[0]);
+                assert!(
+                    fg.contrast(bg) >= 4.5,
+                    "{theme:?} {width}x{height} {ink_needle} control text"
+                );
+            }
+            let row = frame
+                .row_containing("25  dW")
+                .expect("selected reset badge");
+            let fg = rgb(cell_fg(&frame, row, "dW"));
+            let bg = rgb(cell_bg(&frame, "25  dW")[0]);
+            assert!(
+                fg.contrast(bg) >= 4.5,
+                "{theme:?} {width}x{height} painted badge"
+            );
+            model.handle(key(KeyCode::Down));
+            model.usage.follow_cursor.set(false);
+            model.usage.scroll.set(0);
+            let frame = draw(&model, width, height);
+            let row = frame
+                .row_containing("[23] d5")
+                .expect("other reset on snapshot day");
+            let fg = rgb(cell_fg(&frame, row, "d5"));
+            let bg = rgb(cell_bg(&frame, "[23] d5")[0]);
+            assert!(
+                fg.contrast(bg) >= 4.5,
+                "{theme:?} {width}x{height} painted snapshot marker"
+            );
+        }
+    }
+}
+
 /// Local days: in the owner's UTC+03:30, d's 21:09 UTC five-hour reset is
 /// Thu 24 00:39 local — the marker moves to the 24th.
 #[test]
@@ -618,7 +678,7 @@ fn detail_panel_says_not_reported_and_disables_the_action() {
     }
     let text = draw(&model, 118, 60).rows.join("\n");
     assert!(text.contains("│ DETAIL anthropic-oauth-2 — provider-reported extras"));
-    assert!(text.contains("│ previous resets  not reported by provider"));
+    assert!(text.contains("│ previous resets  no entries reported (empty or omitted)"));
     assert!(text.contains("│ banked resets    not reported by provider"));
     assert!(text.contains("│ use banked reset no operation reported for this account"));
     assert_eq!(
@@ -689,30 +749,42 @@ fn detail_rows_render_reported_extras_without_filling_gaps() {
         allowance: None,
         history: Some(vec![
             PastReset {
-                window: "five_hour".into(),
-                at_ms: SNAPSHOT_MS - 3 * 3_600_000,
+                window: Some("five_hour".into()),
+                observed_at_ms: None,
+                kind: None,
+                reset_at_ms: SNAPSHOT_MS - 3 * 3_600_000,
                 source: ResetHistorySource::Provider,
             },
             PastReset {
-                window: "seven_day".into(),
-                at_ms: 1_789_750_740_000,
+                window: Some("seven_day".into()),
+                observed_at_ms: None,
+                kind: None,
+                reset_at_ms: 1_789_750_740_000,
                 source: ResetHistorySource::DeviceJournal,
             },
             PastReset {
-                window: "five_hour".into(),
-                at_ms: SNAPSHOT_MS - 8 * 3_600_000,
+                window: Some("five_hour".into()),
+                observed_at_ms: None,
+                kind: None,
+                reset_at_ms: SNAPSHOT_MS - 8 * 3_600_000,
                 source: ResetHistorySource::Provider,
             },
             PastReset {
-                window: "five_hour".into(),
-                at_ms: SNAPSHOT_MS - 13 * 3_600_000,
+                window: Some("five_hour".into()),
+                observed_at_ms: None,
+                kind: None,
+                reset_at_ms: SNAPSHOT_MS - 13 * 3_600_000,
                 source: ResetHistorySource::Provider,
             },
         ]),
         banked: Some(BankedResets {
-            banked: Some(2),
-            used: Some(1),
-            remaining: None,
+            available_count: 2,
+            applicable_available_count: None,
+            total_earned_count: None,
+            used_count: Some(1),
+            remaining_count: None,
+            credits: vec![],
+            apply_supported: true,
         }),
         action: BankedResetAction::Available,
     };
@@ -731,10 +803,24 @@ fn detail_rows_render_reported_extras_without_filling_gaps() {
         text,
         vec![
             "previous resets  five_hour Wed 23 Sep · 17:30 local (14:00 UTC) · 3h 0m ago · provider",
+            "reset kind       not reported by provider",
+            "observed         not reported by provider",
             "                 five_hour Wed 23 Sep · 12:30 local (09:00 UTC) · 8h 0m ago · provider",
+            "reset kind       not reported by provider",
+            "observed         not reported by provider",
             "                 five_hour Wed 23 Sep · 07:30 local (04:00 UTC) · 13h 0m ago · provider",
-            "                 +1 older",
-            "banked resets    banked 2 · used 1 · remaining not reported",
+            "reset kind       not reported by provider",
+            "observed         not reported by provider",
+            "                 seven_day Fri 18 Sep · 20:29 local (16:59 UTC) · 5d 0h ago · this device's meter journal",
+            "reset kind       not reported by provider",
+            "observed         not reported by provider",
+            "banked resets    available 2",
+            "applicable       not reported",
+            "total earned     not reported",
+            "used             1",
+            "remaining        not reported",
+            "apply supported  true",
+            "credit details   no entries reported (empty or omitted)",
             "use banked reset b · always asks for your approval before spending one",
         ]
     );
@@ -742,8 +828,10 @@ fn detail_rows_render_reported_extras_without_filling_gaps() {
 
     let journal_only = AccountResetExtras {
         history: Some(vec![PastReset {
-            window: "seven_day".into(),
-            at_ms: 1_789_750_740_000,
+            window: Some("seven_day".into()),
+            observed_at_ms: None,
+            kind: None,
+            reset_at_ms: 1_789_750_740_000,
             source: ResetHistorySource::DeviceJournal,
         }]),
         action: BankedResetAction::Unavailable {
@@ -760,14 +848,20 @@ fn detail_rows_render_reported_extras_without_filling_gaps() {
     );
     assert!(rows[0].text.ends_with("· this device's meter journal"));
     assert_eq!(rows[1].text, "not reported by provider");
-    assert_eq!(rows[2].text, "unavailable — no banked resets remaining");
-    assert_eq!(rows[2].tone, DetailTone::Disabled);
+    assert_eq!(rows[2].text, "not reported by provider");
+    assert_eq!(rows[3].text, "not reported by provider");
+    assert_eq!(rows[4].text, "unavailable — no banked resets remaining");
+    assert_eq!(rows[4].tone, DetailTone::Disabled);
     let empty = AccountResetExtras {
         history: Some(Vec::new()),
         ..AccountResetExtras::default()
     };
     let rows = detail_rows(account, &empty, UsageTimeZone::UtcOnly, SNAPSHOT_MS, 2026);
-    assert_eq!(rows[0].text, "none reported", "a reported empty history");
+    assert_eq!(
+        rows[0].text,
+        haider_tui::usage_detail::NO_HISTORY,
+        "v1 cannot distinguish empty from omitted"
+    );
 
     let allowance = AccountResetExtras {
         allowance: Some(AllowanceView {
@@ -790,7 +884,7 @@ fn detail_rows_render_reported_extras_without_filling_gaps() {
     );
 }
 
-/// `b` never spends anything today: no provider operation is reported, so
+/// With no published credit inventory, `b` spends nothing and
 /// it explains and queues no request.
 #[test]
 fn b_explains_the_unavailable_banked_reset_and_requests_nothing() {
@@ -817,7 +911,7 @@ fn b_explains_the_unavailable_banked_reset_and_requests_nothing() {
     // current wire's silence is "not reported".
     assert_eq!(
         banked_reset_unavailable_note("x", &BankedResetAction::NotOffered).as_deref(),
-        Some("use banked reset: unavailable for x — provider offers no banked-reset operation")
+        Some("use banked reset: unavailable for x — no supported reset operation reported")
     );
     let report = owner_report();
     for account in &report.accounts {
@@ -970,7 +1064,7 @@ fn plain_mode_carries_the_calendar_information_in_words() {
         "    5h reset: Thu 24 Sep · 00:39 local (Wed 23 Sep 21:09 UTC) · in 4h 9m · five_hour",
         "    weekly reset: Fri 25 Sep · 20:29 local (16:59 UTC) · in 1d 23h · seven_day",
         "    detail for anthropic-oauth-2:",
-        "      previous resets: not reported by provider",
+        "      previous resets: no entries reported (empty or omitted)",
         "      banked resets: not reported by provider",
         "      use banked reset: no operation reported for this account",
         "    5h reset: unknown — local only; no provider meter",

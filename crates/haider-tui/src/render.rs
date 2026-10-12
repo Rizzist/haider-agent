@@ -4647,7 +4647,6 @@ fn calendar_instant(timestamp_ms: u64) -> (i64, String) {
     )
 }
 
-
 /// U2 — the `/usage` screen: one block per provider group showing the
 /// SELECTED account (←/→ tabs), its meter state rendered per the wire's
 /// tag — `metered` limit bars with % + reset times, `unavailable` the
@@ -4677,6 +4676,16 @@ fn render_usage(
     let history = model.usage.scope == crate::app::UsageScope::History;
     let models = model.usage.scope == crate::app::UsageScope::Models;
     let calendar = model.usage.scope == crate::app::UsageScope::Calendar;
+    let accent = if calendar {
+        Style::default().fg(crate::theme::readable_fg(theme.gold, theme.bg).into())
+    } else {
+        theme.gold_style()
+    };
+    let failure = if calendar {
+        Style::default().fg(crate::theme::readable_fg(theme.err, theme.bg).into())
+    } else {
+        theme.err_style()
+    };
     lines.push(Line::from(vec![
         Span::styled(
             "USAGE",
@@ -4692,7 +4701,7 @@ fn render_usage(
                 crate::app::UsageScope::Models => " · models",
                 crate::app::UsageScope::Calendar => " · calendar",
             },
-            theme.gold_style(),
+            accent,
         ),
         Span::styled(
             " — meters are provider truth · stats are this device's journal · s switches scope",
@@ -4722,9 +4731,7 @@ fn render_usage(
         scope_spans.push(Span::styled(
             name,
             if model.usage.scope == scope {
-                theme
-                    .gold_style()
-                    .add_modifier(ratatui::style::Modifier::BOLD)
+                accent.add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 theme.dim_style()
             },
@@ -4732,9 +4739,9 @@ fn render_usage(
         scope_column = scope_column.saturating_add(width);
     }
     scope_spans.extend([
-        Span::styled("    s", theme.gold_style()),
+        Span::styled("    s", accent),
         Span::styled(" next scope · ", theme.dim_style()),
-        Span::styled("← →", theme.gold_style()),
+        Span::styled("← →", accent),
         Span::styled(" account", theme.dim_style()),
     ]);
     lines.push(Line::from(scope_spans));
@@ -4749,7 +4756,7 @@ fn render_usage(
             } else {
                 format!("  filter: {filter}* — bare /usage clears")
             },
-            theme.gold_style(),
+            accent,
         ));
     }
     if model.mode.fabricates_locally() {
@@ -4758,11 +4765,11 @@ fn render_usage(
             theme.dim_style(),
         ));
     } else if model.usage.fetching {
-        lines.push(Line::styled("  fetching…", theme.gold_style()));
+        lines.push(Line::styled("  fetching…", accent));
     } else if let Some(error) = &model.usage.error {
         lines.push(Line::from(vec![
-            Span::styled("  ✗ usage read failed — ", theme.err_style()),
-            Span::styled(error.clone(), theme.err_style()),
+            Span::styled("  ✗ usage read failed — ", failure),
+            Span::styled(error.clone(), failure),
         ]));
     }
     lines.push(Line::raw(""));
@@ -5567,37 +5574,40 @@ fn render_usage(
         theme,
         frame,
         area,
-        Line::styled(hint, theme.faint_style()),
+        Line::styled(
+            hint,
+            if calendar {
+                theme.dim_style()
+            } else {
+                theme.faint_style()
+            },
+        ),
         hits,
     );
 
     // RENDER is the single scroll authority (the transcript's law): the
     // frame writes the true max, reconciles the offset, and resolves a
     // cursor-follow latch against ITS OWN line layout.
-    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let max_scroll = total.saturating_sub(report_area.height);
+    let visible_height = usize::from(report_area.height);
+    model
+        .usage
+        .scroll_page
+        .set(visible_height.saturating_sub(1).clamp(1, 8));
+    let max_scroll = lines.len().saturating_sub(visible_height);
     model.usage.scroll_max.set(max_scroll);
     let mut scroll = model.usage.scroll.get().min(max_scroll);
     if model.usage.follow_cursor.take() {
-        let header = header_lines
-            .get(model.usage.cursor)
-            .and_then(|&line| u16::try_from(line).ok())
-            .unwrap_or(0);
+        let header = header_lines.get(model.usage.cursor).copied().unwrap_or(0);
         if header < scroll {
             scroll = header;
-        } else if header + 1 >= scroll + report_area.height {
-            scroll = (header + 2)
-                .saturating_sub(report_area.height)
-                .min(max_scroll);
+        } else if header + 1 >= scroll + visible_height {
+            scroll = (header + 2).saturating_sub(visible_height).min(max_scroll);
         }
-        if let Some(end) = calendar_layout
-            .follow_end
-            .and_then(|line| u16::try_from(line).ok())
-        {
+        if let Some(end) = calendar_layout.follow_end {
             // Bring the block's end into view, but never past its header.
-            if end >= scroll + report_area.height {
+            if end >= scroll + visible_height {
                 scroll = (end + 1)
-                    .saturating_sub(report_area.height)
+                    .saturating_sub(visible_height)
                     .min(max_scroll)
                     .min(header);
             }
@@ -5609,18 +5619,23 @@ fn render_usage(
     // under the pin is scrolled one row further up.
     let pinned = calendar_layout
         .pinned_summary
-        .filter(|(line, _)| usize::from(scroll) > *line && report_area.height > 2);
+        .filter(|(line, _)| scroll > *line && report_area.height > 2);
     if pinned.is_some() {
-        let header = header_lines
-            .get(model.usage.cursor)
-            .and_then(|&line| u16::try_from(line).ok());
+        let header = header_lines.get(model.usage.cursor).copied();
         if header == Some(scroll) {
             scroll = scroll.saturating_sub(1);
         }
     }
-    let pinned = pinned.filter(|(line, _)| usize::from(scroll) > *line);
+    let pinned = pinned.filter(|(line, _)| scroll > *line);
     model.usage.scroll.set(scroll);
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), report_area);
+    // Slice by the document offset before passing terminal-sized rows to
+    // ratatui, whose Paragraph scroll coordinates are limited to u16.
+    let visible = lines
+        .into_iter()
+        .skip(scroll)
+        .take(visible_height)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), report_area);
     if let Some((_, summary)) = pinned {
         frame.render_widget(
             Paragraph::new(summary),
@@ -5655,14 +5670,16 @@ fn render_usage(
         );
     }
     for (line_index, x, width, hit) in chip_hits {
-        let line = u16::try_from(line_index).unwrap_or(u16::MAX);
-        if line < scroll || line - scroll >= report_area.height || x >= report_area.width {
+        let Ok(row) = u16::try_from(line_index.saturating_sub(scroll)) else {
+            continue;
+        };
+        if line_index < scroll || row >= report_area.height || x >= report_area.width {
             continue;
         }
         hits.push((
             Rect {
                 x: report_area.x + x,
-                y: report_area.y + (line - scroll),
+                y: report_area.y + row,
                 width: width.min(report_area.width - x),
                 height: 1,
             },

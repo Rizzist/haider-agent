@@ -49,6 +49,7 @@ pub mod theme;
 pub mod throughput;
 pub mod toolfold;
 pub mod toolview;
+pub mod usage_apply;
 pub mod usage_detail;
 pub mod usage_time;
 pub mod wordmark;

@@ -479,6 +479,11 @@ pub enum LiveCommand {
     /// a socket loss simply leaves the screen on its honest fetching /
     /// stale state and `r` re-reads.
     UsageReport,
+    UsageResetApply {
+        command_id: CommandId,
+        session: SessionId,
+        account: haider_protocol::ids::CredentialAlias,
+    },
     /// `usage.history_range` — the bounded heatmap READ (954): daily
     /// totals through a UTC date. Receipt-free, never outboxed — a socket
     /// loss leaves the History scope on its honest fetching/stale state.
@@ -1149,7 +1154,8 @@ impl LiveCommand {
     #[must_use]
     pub const fn command_id(&self) -> Option<&CommandId> {
         match self {
-            Self::Create { command_id, .. }
+            Self::UsageResetApply { command_id, .. }
+            | Self::Create { command_id, .. }
             | Self::SessionDiagnostic { command_id, .. }
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
@@ -1660,6 +1666,12 @@ pub enum LiveReply {
     UsageReport {
         report: Box<haider_protocol::usage::UsageReportV1>,
     },
+    UsageResetApplyResult {
+        command_id: CommandId,
+        session: SessionId,
+        result: haider_protocol::usage::UsageResetApplyResultV1,
+    },
+
     /// `usage.report` FAILED. Identity-tagged from the link's request
     /// context (the read has no durable command id — the hooks.list
     /// precedent): the typed message lands on the usage screen, never a
@@ -3240,7 +3252,6 @@ impl LiveDriver {
 
     #[allow(clippy::too_many_lines)]
     fn apply_inner(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
-
         match reply {
             LiveReply::ListedAt { .. } | LiveReply::ListFailedAt { .. } => {
                 unreachable!("normalized above")
@@ -4147,6 +4158,24 @@ impl LiveDriver {
             }
             LiveReply::HooksListFailed { message } => {
                 model.hooks.list_failed(&message);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::UsageResetApplyResult {
+                command_id,
+                session,
+                result,
+            } => {
+                let issued = self.outbox.iter().any(|pending| {
+                    matches!(&pending.command, LiveCommand::UsageResetApply {
+                        command_id: issued_id, session: issued_session, account,
+                    } if issued_id == &command_id && issued_session == &session && account == &result.account)
+                });
+                if !issued {
+                    return Vec::new();
+                }
+                self.retire(&command_id);
+                model.usage.reset_apply.record(&session, result);
                 model.dirty = true;
                 Vec::new()
             }
@@ -5557,6 +5586,37 @@ impl LiveDriver {
                 retryable,
                 presentation,
             } => {
+                let busy_exhausted = command_id.as_ref().is_some_and(|id| {
+                    code == haider_rpc::ERROR_CODE_BUSY
+                        && self.outbox.iter().any(|pending| {
+                            &pending.command_id == id && pending.attempts >= BUSY_MAX_ATTEMPTS
+                        })
+                });
+                if !retryable || busy_exhausted || code == "feature_missing" {
+                    let reset_account = command_id.as_ref().and_then(|id| {
+                        self.outbox
+                            .iter()
+                            .find_map(|pending| match &pending.command {
+                                LiveCommand::UsageResetApply {
+                                    command_id,
+                                    account,
+                                    ..
+                                } if command_id == id => Some(account.clone()),
+                                _ => None,
+                            })
+                    });
+                    if let Some(account) = reset_account {
+                        let hint = if message == "reset account identity is incomplete" {
+                            " · refresh or re-establish this login in /accounts"
+                        } else {
+                            ""
+                        };
+                        model
+                            .usage
+                            .reset_apply
+                            .failed(account, format!("{code} · {message}{hint}"));
+                    }
+                }
                 // escretract: a retraction that did not commit becomes ONE
                 // ordinary cancel for the same run — which is exactly what
                 // plain Esc would have done — and the transcript keeps the
@@ -7997,6 +8057,31 @@ impl LiveDriver {
                 self.hooks_cwd = Some(cwd.clone());
                 vec![LiveCommand::HooksList { cwd }]
             }
+            AppRequest::UsageResetApply { session, account } => {
+                if !self.connected || !model.daemon_serves(haider_rpc::FEATURE_USAGE_RESET_APPLY_V1)
+                {
+                    model.usage.reset_apply.failed(
+                        account,
+                        "daemon reset-approval capability unavailable".into(),
+                    );
+                    model.flash = Some("daemon reset-approval capability unavailable".into());
+                    model.dirty = true;
+                    return Vec::new();
+                }
+                if model.usage.reset_apply.pending(&account) {
+                    return Vec::new();
+                }
+                model
+                    .usage
+                    .reset_apply
+                    .begin(session.clone(), account.clone());
+                let command_id = self.mint();
+                vec![self.enqueue(LiveCommand::UsageResetApply {
+                    command_id,
+                    session,
+                    account,
+                })]
+            }
             // U2: a read — never outboxed (the hooks.list discipline).
             AppRequest::UsageRefresh => vec![
                 // Refresh direct/root agent snapshots through the additive
@@ -8615,7 +8700,8 @@ fn with_connection_epoch(mut command: LiveCommand, epoch: u64) -> LiveCommand {
 
 const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
     match command {
-        LiveCommand::Submit { session, .. }
+        LiveCommand::UsageResetApply { session, .. }
+        | LiveCommand::Submit { session, .. }
         | LiveCommand::SessionDiagnostic { session, .. }
         | LiveCommand::Cancel { session, .. }
         | LiveCommand::Retract { session, .. }

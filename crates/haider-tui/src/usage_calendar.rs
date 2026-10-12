@@ -29,7 +29,7 @@ use ratatui::text::{Line, Span};
 
 use super::{ellipsize, hover_band};
 use crate::app::AppModel;
-use crate::theme::Theme;
+use crate::theme::{Rgb, Theme, readable_fg};
 use crate::usage_detail::{
     DetailTone, ResetKind, account_extras, account_marker, detail_rows, fmt_meter_reason_friendly,
     reset_at, reset_window,
@@ -76,9 +76,13 @@ fn bold(style: Style) -> Style {
     style.add_modifier(Modifier::BOLD)
 }
 
+fn accent_style(theme: &Theme, background: Rgb) -> Style {
+    Style::default().fg(readable_fg(theme.gold, background).into())
+}
+
 /// The snapshot day's cell: the gold soft ground (unchanged from 970).
 fn today_style(theme: &Theme) -> Style {
-    bold(theme.gold_style().bg(theme.gold_soft.into()))
+    bold(accent_style(theme, theme.gold_soft).bg(theme.gold_soft.into()))
 }
 
 /// A reset day of the SELECTED account: a filled badge, unmistakably not
@@ -86,7 +90,7 @@ fn today_style(theme: &Theme) -> Style {
 fn selected_day_style(theme: &Theme) -> Style {
     bold(
         Style::default()
-            .fg(theme.badge_fg.into())
+            .fg(crate::theme::reset_badge_fg(theme).into())
             .bg(theme.ok.into()),
     )
 }
@@ -95,8 +99,8 @@ fn detail_style(theme: &Theme, tone: DetailTone) -> Style {
     match tone {
         DetailTone::Normal => theme.text_style(),
         DetailTone::Dim => theme.dim_style(),
-        DetailTone::Warn => theme.warn_style(),
-        DetailTone::Action => theme.gold_style(),
+        DetailTone::Warn => bold(theme.text_style()),
+        DetailTone::Action => bold(theme.bright_style()),
         // A disabled affordance still has to be READABLE (≥4.5:1): the
         // secondary ink (dim, ≈6.2:1 dark / ≈5.0:1 light) in italics, never
         // the faint ink (≈1.7:1 / ≈1.4:1) that marks decoration.
@@ -116,6 +120,7 @@ struct CalendarCtx<'a> {
     year: i64,
     area_width: u16,
     wide: bool,
+    reset_apply: &'a crate::usage_apply::UsageApplyState,
 }
 
 /// The per-cell facts of the month grid.
@@ -223,6 +228,7 @@ pub(super) fn render_usage_calendar(
         year,
         area_width,
         wide: area_width >= 100,
+        reset_apply: &model.usage.reset_apply,
     };
     let month_start = crate::format::days_from_civil(year, month, 1);
     let grid_start = month_start - i64::from(crate::format::weekday_from_days(month_start));
@@ -315,10 +321,10 @@ pub(super) fn render_usage_calendar(
             lines.len(),
             Line::from(Span::styled(
                 format!("{pinned:<budget$}"),
-                bold(theme.gold_style()).bg(theme.bar_bg.into()),
+                bold(accent_style(theme, theme.bar_bg)).bg(theme.bar_bg.into()),
             )),
         ));
-        lines.push(Line::styled(summary, theme.gold_style()));
+        lines.push(Line::styled(summary, accent_style(theme, theme.bg)));
     }
     lines.push(Line::raw(""));
 
@@ -449,14 +455,16 @@ fn grid_cell(ctx: &CalendarCtx<'_>, grid: &GridCtx<'_>, day: i64) -> Vec<Span<'s
             if selected_day {
                 cell_style
             } else {
-                bold(theme.gold_style())
+                bold(accent_style(theme, theme.bg))
             }
         } else if selected_day {
             // Another account sharing the selected day: keep the badge
             // ground so the day reads as one block, drop the weight.
             cell_style.remove_modifier(Modifier::BOLD)
         } else if day == today {
-            theme.dim_style().bg(theme.gold_soft.into())
+            Style::default()
+                .fg(readable_fg(theme.dim, theme.gold_soft).into())
+                .bg(theme.gold_soft.into())
         } else {
             theme.dim_style()
         };
@@ -493,6 +501,7 @@ fn push_account_rows(
         year,
         area_width,
         wide,
+        reset_apply,
     } = *ctx;
     let head = if wide {
         let identity = account
@@ -519,7 +528,7 @@ fn push_account_rows(
     let head = Line::from(Span::styled(
         head,
         if selected {
-            bold(theme.gold_style())
+            bold(accent_style(theme, theme.sel_bg))
         } else {
             theme.bright_style()
         },
@@ -527,7 +536,7 @@ fn push_account_rows(
     lines.push(hover_band(head, selected, area_width, theme));
 
     match &account.meter {
-        AccountMeterStateV1::Unavailable { reason } => lines.push(Line::styled(
+        AccountMeterStateV1::Unavailable { reason, .. } => lines.push(Line::styled(
             if wide {
                 format!(
                     "      5h reset unknown · weekly reset unknown · meter unavailable · {}",
@@ -607,18 +616,27 @@ fn push_account_rows(
                 theme.dim_style(),
             ),
         ]));
-        for row in detail_rows(account, &extras, zone, snapshot_ms, year) {
-            lines.push(Line::from(vec![
-                Span::styled("      │ ", theme.faint_style()),
-                Span::styled(format!("{:<label_width$}", row.label), theme.dim_style()),
-                Span::styled(
-                    ellipsize(
-                        &row.text,
-                        usize::from(area_width).saturating_sub(8 + label_width + 1),
+        let mut rows = detail_rows(account, &extras, zone, snapshot_ms, year);
+        rows.extend(reset_apply.rows(&account.alias));
+        for row in rows {
+            // All provider fields stay reachable with normal page scrolling.
+            // Wrap instead of ellipsizing counts, instants and credit prose.
+            let budget = usize::from(area_width)
+                .saturating_sub(8 + label_width + 1)
+                .max(1);
+            for (index, text) in crate::toolview::wrap_cells(&row.text, budget)
+                .into_iter()
+                .enumerate()
+            {
+                lines.push(Line::from(vec![
+                    Span::styled("      │ ", theme.faint_style()),
+                    Span::styled(
+                        format!("{:<label_width$}", if index == 0 { row.label } else { "" }),
+                        theme.dim_style(),
                     ),
-                    detail_style(theme, row.tone),
-                ),
-            ]));
+                    Span::styled(text, detail_style(theme, row.tone)),
+                ]));
+            }
         }
     }
 }

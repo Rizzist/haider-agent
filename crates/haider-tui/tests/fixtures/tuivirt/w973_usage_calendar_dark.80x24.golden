@@ -33,8 +33,8 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 16|      │ DETAIL anthropic-oauth-2 — provider-reported extras                     |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×45; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×21
-17|      │ previous resets  not reported by provider                               |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×31
+17|      │ previous resets  no entries reported (empty or omitted)                 |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×55; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×17
 18|      │ banked resets    not reported by provider                               |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×31
 19|⋮     │ use banked reset no operation reported for this account                 |
@@ -42,7 +42,7 @@
 20|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
 21|↑↓ account · ⇞⇟ scroll · b banked · f refresh · s scope · esc back              |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×66; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×14
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×66; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×14
 22|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
 23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |
