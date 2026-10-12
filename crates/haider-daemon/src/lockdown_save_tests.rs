@@ -74,6 +74,15 @@ fn cancelled_and_superseded_saves_cannot_activate_either_path() {
                     Ok(())
                 })
                 .unwrap();
+            let mut latest_published = false;
+            latest
+                .permit()
+                .publish(|| {
+                    latest_published = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(latest_published);
             if variant == "delete" {
                 active_owners.fence(Some(&session), None);
                 manager.remove_session_bindings(profile, "session").unwrap();
@@ -97,12 +106,77 @@ fn cancelled_and_superseded_saves_cannot_activate_either_path() {
                 std::fs::read(temp.path().join("lockdown/turns.json")).unwrap(),
                 before
             );
+            let mut published = false;
+            let result = stale.publish(|| {
+                published = true;
+                Ok(())
+            });
+            assert!(matches!(
+                result,
+                Err(SessionHubError::SettingsSaveSuperseded { .. })
+            ));
+            assert!(
+                !published,
+                "{variant}/{standalone}: stale memory publication"
+            );
             // Old hub cleanup must not revoke the successor's save after restart.
             if variant == "restart" {
                 owners.fence(None, None);
                 latest.permit().ensure_current().unwrap();
             }
         }
+    }
+}
+
+#[test]
+fn cancellation_after_a_durable_save_refuses_memory_publication() {
+    for standalone in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().to_str().unwrap();
+        let manager = LockdownManager::initialize(temp.path().join("lockdown")).unwrap();
+        let owners = SaveOwners::default();
+        let session = SessionId::new("s");
+        let run = RunId::new("r");
+        let guard = owners.begin(profile, &session, &run).unwrap();
+        let save = guard.permit();
+        if standalone {
+            manager
+                .bind_turn(profile, "s", "r", "provider", true, false)
+                .unwrap();
+        }
+        let mut published = false;
+        let result = save.commit(|| {
+            if standalone {
+                manager
+                    .activate_turn_if_current(profile, "s", "r", &save)
+                    .unwrap();
+            } else {
+                manager
+                    .bind_and_activate_turn_if_current(
+                        profile, "s", "r", "provider", true, false, &save,
+                    )
+                    .unwrap();
+            }
+            // The file save completed, but the awaiting run ended before its
+            // live setting could be published. Completion does not confer
+            // continuing authority on this detached blocking task.
+            drop(guard);
+            save.publish(|| {
+                published = true;
+                Ok(())
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(SessionHubError::SettingsSaveSuperseded { .. })
+        ));
+        assert!(!published, "{standalone}: cancelled memory publication");
+        assert!(
+            manager
+                .active_session_binding(profile, "s")
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -181,8 +255,9 @@ fn ownership_is_rechecked_under_the_file_lock_and_before_replacement() {
 }
 
 #[test]
-fn storage_failure_retries_require_full_confirmation_in_both_apis() {
-    for standalone in [false, true] {
+fn storage_failure_retries_require_full_confirmation_in_all_save_apis() {
+    for api in ["combined", "activate", "bind-only"] {
+        let standalone = api == "activate";
         for case in [
             "full",
             "configured",
@@ -220,14 +295,21 @@ fn storage_failure_retries_require_full_confirmation_in_both_apis() {
                             .bind_turn("p", "s", "r", "provider", restricted, auto)
                             .unwrap();
                     }
-                    let apply = |manager: &LockdownManager| {
-                        if standalone {
-                            manager.activate_turn("p", "s", "r")
-                        } else {
-                            manager
-                                .bind_and_activate_turn("p", "s", "r", "provider", restricted, auto)
-                                .map(|_| ())
-                        }
+                    // Also exercise an unchanged bind-only record through a
+                    // fresh manager, which has no durability confirmation.
+                    let manager = if api == "bind-only" {
+                        LockdownManager::initialize(root.clone()).unwrap()
+                    } else {
+                        manager
+                    };
+                    let apply = |manager: &LockdownManager| match api {
+                        "activate" => manager.activate_turn("p", "s", "r"),
+                        "bind-only" => manager
+                            .bind_turn("p", "s", "r", "provider", restricted, auto)
+                            .map(|_| ()),
+                        _ => manager
+                            .bind_and_activate_turn("p", "s", "r", "provider", restricted, auto)
+                            .map(|_| ()),
                     };
                     assert!(with_publication_io_fault(stage, || apply(&manager)).is_err());
                     let manager = if reopen {
@@ -237,7 +319,7 @@ fn storage_failure_retries_require_full_confirmation_in_both_apis() {
                     };
                     assert!(
                         with_publication_io_fault(stage, || apply(&manager)).is_err(),
-                        "{standalone}/{case}/{reopen}/{stage}"
+                        "{api}/{case}/{reopen}/{stage}"
                     );
                     let counts = Arc::new(PublicationIoCounts::default());
                     with_publication_io_hook(counts.clone(), || apply(&manager)).unwrap();
@@ -254,6 +336,61 @@ fn storage_failure_retries_require_full_confirmation_in_both_apis() {
             }
         }
     }
+}
+
+#[test]
+fn removal_retries_confirm_durability_and_preserve_absent_records() {
+    for reopen in [false, true] {
+        for stage in [1, 2, 3, 4] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("lockdown");
+            let manager = LockdownManager::initialize(root.clone()).unwrap();
+            manager
+                .bind_and_activate_turn("p", "s", "r", "provider", true, false)
+                .unwrap();
+            assert!(
+                with_publication_io_fault(stage, || manager.remove_session_bindings("p", "s"))
+                    .is_err()
+            );
+            let manager = if reopen {
+                LockdownManager::initialize(root).unwrap()
+            } else {
+                manager
+            };
+            assert!(
+                with_publication_io_fault(stage, || manager.remove_session_bindings("p", "s"))
+                    .is_err()
+            );
+            let counts = Arc::new(PublicationIoCounts::default());
+            with_publication_io_hook(counts.clone(), || manager.remove_session_bindings("p", "s"))
+                .unwrap();
+            assert_eq!(counts.writes.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                counts.full_syncs.load(Ordering::Relaxed),
+                if cfg!(unix) { 2 } else { 1 }
+            );
+            assert!(manager.turn_binding("p", "s", "r").unwrap().is_none());
+            assert!(manager.active_session_binding("p", "s").unwrap().is_none());
+            let counts = Arc::new(PublicationIoCounts::default());
+            with_publication_io_hook(counts.clone(), || manager.remove_session_bindings("p", "s"))
+                .unwrap();
+            assert_eq!(counts.writes.load(Ordering::Relaxed), 0);
+            assert_eq!(counts.syncs.load(Ordering::Relaxed), 0);
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("lockdown");
+    let manager = LockdownManager::initialize(root.clone()).unwrap();
+    assert!(!root.join("turns.json").exists());
+    assert!(with_publication_io_fault(3, || manager.remove_session_bindings("p", "s")).is_err());
+    let counts = Arc::new(PublicationIoCounts::default());
+    with_publication_io_hook(counts.clone(), || manager.remove_session_bindings("p", "s")).unwrap();
+    assert_eq!(counts.writes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        counts.full_syncs.load(Ordering::Relaxed),
+        usize::from(cfg!(unix))
+    );
+    assert!(!root.join("turns.json").exists());
 }
 
 #[test]
@@ -344,6 +481,11 @@ fn save_identity_scope_and_hub_shutdown_do_not_fence_other_owners() {
     let successor = other.begin(profile, &s, &RunId::new("new")).unwrap();
     // A new hub takes over even before old-hub shutdown has finished.
     assert!(first.permit().ensure_current().is_err());
+    assert!(matches!(
+        owners.begin(profile, &s, &r),
+        Err(SessionHubError::SettingsSaveSuperseded { .. })
+    ));
+    successor.permit().ensure_current().unwrap();
     owners.close();
     assert!(first.permit().ensure_current().is_err());
     assert!(unrelated.permit().ensure_current().is_err());
@@ -353,4 +495,60 @@ fn save_identity_scope_and_hub_shutdown_do_not_fence_other_owners() {
         owners.begin(profile, &s, &r),
         Err(SessionHubError::Closed)
     ));
+}
+
+#[tokio::test]
+async fn replaced_and_retired_worker_leases_cannot_register_late_saves() {
+    use haider_protocol::ids::{DeviceId, EventId};
+    let temp = tempfile::tempdir().unwrap();
+    let (store, hub) = crate::session_hub::open_retention_test_hub(temp.path())
+        .await
+        .unwrap();
+    let session = SessionId::new("late-settings-save");
+    hub.create_internal_session(haider_core::SessionCreateCommand {
+        command_id: "create-late-save".into(),
+        request_digest: "create-late-save-digest".into(),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        cwd: "/tmp".into(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        max_tokens_source: None,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: "test-system".into(),
+        event_id: EventId::new("created-late-save"),
+        device_id: DeviceId::new("late-save-test-device"),
+    })
+    .await
+    .unwrap();
+    let old = hub.acquire_worker_lease(session.clone()).await.unwrap();
+    let old_clone = old.clone();
+    let old_run = RunId::new("old");
+    let old_save = old.begin_lockdown_save(&old_run).unwrap();
+    let next = hub.acquire_worker_lease(session).await.unwrap();
+    let next_run = RunId::new("next");
+    let next_save = next.begin_lockdown_save(&next_run).unwrap();
+    assert!(old_save.permit().ensure_current().is_err());
+    // A worker can finish an unsealed metadata read after replacement. Its
+    // subsequent save admission must refuse without fencing the successor.
+    assert!(old_clone.session_metadata().await.unwrap().is_some());
+    assert!(matches!(
+        old_clone.begin_lockdown_save(&old_run),
+        Err(SessionHubError::SettingsSaveSuperseded { .. })
+    ));
+    next_save.permit().ensure_current().unwrap();
+    old.unregister_worker().await.unwrap();
+    next_save.permit().ensure_current().unwrap();
+    next.unregister_worker().await.unwrap();
+    assert!(next_save.permit().ensure_current().is_err());
+    assert!(matches!(
+        next.begin_lockdown_save(&next_run),
+        Err(SessionHubError::SettingsSaveSuperseded { .. })
+    ));
+    hub.shutdown().await.unwrap();
+    store.close().await.unwrap();
 }

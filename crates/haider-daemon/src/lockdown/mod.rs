@@ -733,8 +733,18 @@ impl LockdownManager {
             ledger.active.retain(|binding| {
                 binding.profile_id != profile_id || binding.session_id != session_id
             });
-            if ledger.bindings.len() != bindings_before || ledger.active.len() != active_before {
+            let changed =
+                ledger.bindings.len() != bindings_before || ledger.active.len() != active_before;
+            let path = self.root.join(TURN_BINDINGS_FILE);
+            let present = path
+                .try_exists()
+                .map_err(|source| io_error("inspect", &path, source))?;
+            if changed || (present && !self.turn_bindings_confirmed(&ledger)?) {
                 self.persist_turn_bindings(&ledger)?;
+            } else if !present {
+                // Confirm absence without creating an empty settings record.
+                // A failed Windows replacement can leave the target missing.
+                sync_named_directory(&self.root, TURN_BINDINGS_FILE)?;
             }
             Ok(())
         })
@@ -1545,6 +1555,12 @@ fn atomic_write_named_if_current(
     check_path_budget(&temporary)?;
     check_path_budget(&target)?;
     write_and_replace(&temporary, &target, contents, is_current)?;
+    sync_named_directory(parent, target_name)
+}
+
+fn sync_named_directory(parent: &Path, target_name: &str) -> Result<(), LockdownError> {
+    #[cfg(not(test))]
+    let _ = target_name;
     let sync_policy = SyncPolicy::Full;
     #[cfg(all(test, unix))]
     count_publication_io(Some(sync_policy));

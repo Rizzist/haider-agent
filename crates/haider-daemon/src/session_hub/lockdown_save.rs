@@ -47,6 +47,26 @@ impl SaveOwners {
         session: &SessionId,
         run: &RunId,
     ) -> Result<SaveGuard, SessionHubError> {
+        self.begin_with_worker(profile, session, run, None)
+    }
+
+    pub(crate) fn begin_for_worker(
+        &self,
+        profile: &str,
+        session: &SessionId,
+        run: &RunId,
+        worker_live: Arc<AtomicBool>,
+    ) -> Result<SaveGuard, SessionHubError> {
+        self.begin_with_worker(profile, session, run, Some(worker_live))
+    }
+
+    fn begin_with_worker(
+        &self,
+        profile: &str,
+        session: &SessionId,
+        run: &RunId,
+        worker_live: Option<Arc<AtomicBool>>,
+    ) -> Result<SaveGuard, SessionHubError> {
         let mut local = super::lock(&self.slots)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
@@ -66,6 +86,17 @@ impl SaveOwners {
             slot
         };
         let mut current = super::lock(&slot.current)?;
+        if current.owner > self.owner
+            || worker_live
+                .as_ref()
+                .is_some_and(|live| !live.load(Ordering::Acquire))
+        {
+            return Err(SessionHubError::SettingsSaveSuperseded {
+                session_id: session.clone(),
+                run_id: run.clone(),
+                generation: current.generation,
+            });
+        }
         current.generation = current
             .generation
             .checked_add(1)
@@ -80,6 +111,7 @@ impl SaveOwners {
             run: run.clone(),
             generation,
             cancelled: Arc::default(),
+            worker_live,
         }))
     }
 
@@ -137,6 +169,7 @@ pub(crate) struct SavePermit {
     run: RunId,
     generation: u64,
     cancelled: Arc<AtomicBool>,
+    worker_live: Option<Arc<AtomicBool>>,
 }
 
 impl SavePermit {
@@ -161,6 +194,10 @@ impl SavePermit {
 
     fn owns(&self, current: &Current) -> bool {
         !self.cancelled.load(Ordering::Acquire)
+            && self
+                .worker_live
+                .as_ref()
+                .is_none_or(|live| live.load(Ordering::Acquire))
             && current.generation == self.generation
             && current.run.as_ref() == Some(&self.run)
     }

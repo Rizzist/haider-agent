@@ -1771,10 +1771,17 @@ struct RecoveredMenuCoordinate {
 
 struct RegisteredWorker {
     lease_id: WorkerLeaseId,
+    settings_save_live: Arc<AtomicBool>,
     harness: Option<HarnessHandle>,
     /// Nonblocking notification only; the durable journal is the cancellation
     /// lag buffer. Replacement swaps this sender in actor order.
     cancellation_wake: Option<watch::Sender<u64>>,
+}
+
+impl Drop for RegisteredWorker {
+    fn drop(&mut self) {
+        self.settings_save_live.store(false, Ordering::Release);
+    }
 }
 
 /// Lease-fenced, session-scoped store surface handed to a worker (R1).
@@ -1793,6 +1800,7 @@ pub struct HubStoreHandle {
     session_id: SessionId,
     worker_generation: u64,
     lease_id: WorkerLeaseId,
+    settings_save_live: Arc<AtomicBool>,
 }
 
 /// Hub-level attachment metadata (§5.6): who owns the attachment and with
@@ -2050,6 +2058,7 @@ enum ActorCommand {
     },
     AcquireWorkerLease {
         lease_id: WorkerLeaseId,
+        settings_save_live: Arc<AtomicBool>,
         cancellation_wake: Option<watch::Sender<u64>>,
         completed: oneshot::Sender<()>,
     },
@@ -6423,11 +6432,13 @@ impl SessionHub {
             return Ok(None);
         };
         let lease_id = WorkerLeaseId(random_id("drain-worker-lease")?);
+        let settings_save_live = Arc::new(AtomicBool::new(true));
         let (completed, response) = oneshot::channel();
         actor
             .commands
             .send(ActorCommand::AcquireWorkerLease {
                 lease_id: lease_id.clone(),
+                settings_save_live: Arc::clone(&settings_save_live),
                 cancellation_wake: None,
                 completed,
             })
@@ -6439,6 +6450,7 @@ impl SessionHub {
             session_id,
             worker_generation: self.inner.store.worker_generation(),
             lease_id,
+            settings_save_live,
         }))
     }
 
@@ -6926,11 +6938,13 @@ impl SessionHub {
     ) -> Result<HubStoreHandle, SessionHubError> {
         let actor = self.actor_for(session_id.clone()).await?;
         let lease_id = WorkerLeaseId(random_id("worker-lease")?);
+        let settings_save_live = Arc::new(AtomicBool::new(true));
         let (completed, response) = oneshot::channel();
         actor
             .commands
             .send(ActorCommand::AcquireWorkerLease {
                 lease_id: lease_id.clone(),
+                settings_save_live: Arc::clone(&settings_save_live),
                 cancellation_wake,
                 completed,
             })
@@ -6942,6 +6956,7 @@ impl SessionHub {
             session_id,
             worker_generation: self.inner.store.worker_generation(),
             lease_id,
+            settings_save_live,
         })
     }
 
@@ -8418,6 +8433,20 @@ fn inject_test_done_append_failure(envelopes: &[RawEnvelope]) -> bool {
 }
 
 impl HubStoreHandle {
+    /// Admission shares the actor's lease lifetime. A delayed metadata read
+    /// cannot let a replaced worker register a new save over its successor.
+    pub(crate) fn begin_lockdown_save(
+        &self,
+        run_id: &RunId,
+    ) -> Result<lockdown_save::SaveGuard, SessionHubError> {
+        self.hub.inner.lockdown_saves.begin_for_worker(
+            self.hub.inner.store.cached_profile_installation_id(),
+            &self.session_id,
+            run_id,
+            Arc::clone(&self.settings_save_live),
+        )
+    }
+
     async fn append_owned_inner(
         &self,
         expected_head: Option<u64>,

@@ -7310,8 +7310,7 @@ async fn perform_manual_compaction(
     );
 
     let save_guard = lease
-        .hub()
-        .begin_lockdown_save(lease.session_id(), &boundary_run_id)
+        .begin_lockdown_save(&boundary_run_id)
         .map_err(hub_error)?;
     let save = save_guard.permit();
     let delegation = dependencies.delegation.clone().ok_or_else(|| {
@@ -8651,8 +8650,7 @@ async fn start_turn(
         recovering: _,
     } = pending;
     let save_guard = lease
-        .hub()
-        .begin_lockdown_save(lease.session_id(), &accepted.run_id)
+        .begin_lockdown_save(&accepted.run_id)
         .map_err(hub_error)?;
     let save = save_guard.permit();
     let turn_trace = turn_trace_enabled().then(|| {
