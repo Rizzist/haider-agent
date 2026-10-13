@@ -611,7 +611,20 @@ pub(super) async fn read_catalog_response(
             reason: format!("server returned {} for /models", response_status.as_u16()),
         });
     }
-    let models = parse_catalog(source, &value)?;
+    let models = parse_discovered_models(source, &value, access_token)?;
+    Ok(DiscoveredCatalog {
+        models,
+        etag: response_etag,
+    })
+}
+
+fn parse_discovered_models(
+    source: CatalogSource,
+    value: &serde_json::Value,
+    access_token: Option<&str>,
+) -> Result<Vec<DiscoveredModel>, CatalogError> {
+    let declared_empty = catalog_entries(&source, value)?.is_empty();
+    let models = parse_catalog(source, value)?;
     // A credential-reflecting server must not smuggle the key into a
     // public picker, receipt, cache, or event as a model id.
     if access_token
@@ -626,13 +639,12 @@ pub(super) async fn read_catalog_response(
             reason: "model catalog response contains credential material".to_owned(),
         });
     }
-    if models.is_empty() {
+    // A real empty array is successful negative listing evidence, with a
+    // fetch time and validator. A nonempty array without usable IDs is not.
+    if models.is_empty() && !declared_empty {
         return Err(CatalogError::Empty);
     }
-    Ok(DiscoveredCatalog {
-        models,
-        etag: response_etag,
-    })
+    Ok(models)
 }
 
 /// Custom model ids must retain every character when a terminal draws
@@ -655,13 +667,11 @@ fn declared_token_count(entry: &serde_json::Value, keys: &[&str]) -> Option<u64>
         .filter(|tokens| *tokens > 0)
 }
 
-/// Parses either provider's shape. Public so the fake-server tests drive the
-/// same parser production uses.
-pub fn parse_catalog(
-    source: CatalogSource,
-    value: &serde_json::Value,
-) -> Result<Vec<DiscoveredModel>, CatalogError> {
-    let entries = match source {
+fn catalog_entries<'a>(
+    source: &CatalogSource,
+    value: &'a serde_json::Value,
+) -> Result<&'a [serde_json::Value], CatalogError> {
+    match source {
         // codex: `{ "models": [ … ] }`
         CatalogSource::OpenAiSubscription | CatalogSource::GeminiApiKey => value.get("models"),
         // Anthropic and OpenAI-compatible: `{ "data": [ … ] }`
@@ -675,9 +685,19 @@ pub fn parse_catalog(
         | CatalogSource::XaiApi => value.get("data"),
     }
     .and_then(serde_json::Value::as_array)
+    .map(Vec::as_slice)
     .ok_or_else(|| CatalogError::InvalidBody {
         reason: "model catalog response has no model array".to_owned(),
-    })?;
+    })
+}
+
+/// Parses either provider's shape. Public so the fake-server tests drive the
+/// same parser production uses.
+pub fn parse_catalog(
+    source: CatalogSource,
+    value: &serde_json::Value,
+) -> Result<Vec<DiscoveredModel>, CatalogError> {
+    let entries = catalog_entries(&source, value)?;
 
     let mut models = Vec::new();
     for entry in entries {
@@ -1012,4 +1032,81 @@ pub fn pickable(provider: &str, models: &[DiscoveredModel]) -> Vec<DiscoveredMod
             .then_with(|| left.display_name.cmp(&right.display_name))
     });
     visible
+}
+
+#[cfg(test)]
+mod catalog_response_tests {
+    use super::*;
+
+    /// MUTATION: reject every empty decoded list. Every supported wire shape
+    /// must retain a genuine empty success without accepting unusable entries.
+    #[test]
+    fn empty_success_is_distinct_from_unusable_catalog_entries() {
+        let sources = [
+            CatalogSource::OpenAiSubscription,
+            CatalogSource::AnthropicSubscription,
+            CatalogSource::KimiOAuth,
+            CatalogSource::GrokOAuth,
+            CatalogSource::GeminiApiKey,
+            CatalogSource::OpenAiCompatible {
+                origin: "http://127.0.0.1/v1".into(),
+            },
+            CatalogSource::AnthropicCompatible {
+                origin: "http://127.0.0.1/v1".into(),
+            },
+            CatalogSource::DeepSeekApi,
+            CatalogSource::HaiderCodeApi,
+            CatalogSource::XaiApi,
+        ];
+        for source in sources {
+            let key = if matches!(
+                source,
+                CatalogSource::OpenAiSubscription | CatalogSource::GeminiApiKey
+            ) {
+                "models"
+            } else {
+                "data"
+            };
+            let mut payload = serde_json::json!({});
+            payload[key] = serde_json::json!([]);
+            let empty = parse_discovered_models(source.clone(), &payload, None)
+                .unwrap_or_else(|error| panic!("{source:?}: {error}"));
+            assert!(empty.is_empty(), "{source:?}");
+            payload[key] = serde_json::json!([{}]);
+            assert!(
+                matches!(
+                    parse_discovered_models(source.clone(), &payload, None),
+                    Err(CatalogError::Empty)
+                ),
+                "{source:?}"
+            );
+            assert!(
+                matches!(
+                    parse_discovered_models(
+                        source.clone(),
+                        &serde_json::json!({"unexpected": []}),
+                        None
+                    ),
+                    Err(CatalogError::InvalidBody { .. })
+                ),
+                "{source:?}"
+            );
+            payload[key] = match source {
+                CatalogSource::OpenAiSubscription => serde_json::json!([{"slug": "model-one"}]),
+                CatalogSource::GeminiApiKey => serde_json::json!([{"name": "models/model-one"}]),
+                _ => serde_json::json!([{"id": "model-one"}]),
+            };
+            let named = parse_discovered_models(source.clone(), &payload, None)
+                .unwrap_or_else(|error| panic!("{source:?}: {error}"));
+            assert_eq!(named.len(), 1, "{source:?}");
+            assert_eq!(named[0].slug, "model-one", "{source:?}");
+            assert!(
+                matches!(
+                    parse_discovered_models(source.clone(), &payload, Some("model-one")),
+                    Err(CatalogError::InvalidBody { .. })
+                ),
+                "credential reflection {source:?}"
+            );
+        }
+    }
 }

@@ -264,17 +264,9 @@ fn refresh_targets(document: &ModelsDocument, requested: Option<&ModelsRefresh>)
             .filter(|provider| provider_supports_live_discovery(provider))
             .map(|provider| provider.provider.clone())
             .collect(),
-        None => document
-            .providers
-            .iter()
-            .filter(|provider| {
-                matches!(
-                    provider.inventory,
-                    haider_rpc::ModelInventoryWire::Stale { .. }
-                )
-            })
-            .map(|provider| provider.provider.clone())
-            .collect(),
+        // Ordinary reads expose cached uncertainty immediately. The daemon
+        // schedules bounded background refresh; only --refresh waits for it.
+        None => Vec::new(),
     }
 }
 

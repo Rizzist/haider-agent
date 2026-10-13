@@ -63,18 +63,25 @@ fn refresh_parser_distinguishes_global_and_provider_scopes() {
     assert!(parse_options(&["--refresh".to_owned(), "--refresh".to_owned()]).is_err());
 }
 
-/// MUTATION CHECK: changing the documented fifteen-minute TTL comparison
-/// from `>=` to `>` makes the exact-boundary provider disappear.
+/// MUTATION: implicitly refresh a stale row on an ordinary read. A held
+/// listing would then hide otherwise selectable cached inventory until timeout.
 #[test]
-fn automatic_refresh_starts_at_the_exact_ttl_boundary() {
+fn default_read_never_waits_for_stale_inventory_refresh() {
     let just_fresh = haider_rpc::MODEL_INVENTORY_TTL_MS - 1;
     let at_boundary = haider_rpc::MODEL_INVENTORY_TTL_MS;
     let document = document(vec![
         provider("fresh", Some(1), Some(just_fresh)),
         provider("stale", Some(2), Some(at_boundary)),
+        provider("older", Some(3), Some(at_boundary + 1)),
         provider("seeded", None, None),
     ]);
-    assert_eq!(refresh_targets(&document, None), vec!["stale"]);
+    assert!(refresh_targets(&document, None).is_empty());
+    assert_eq!(document.providers[1].availability, "available");
+    assert_eq!(document.providers[1].models[0].model, "local-model");
+    assert_eq!(
+        refresh_targets(&document, Some(&ModelsRefresh::Provider("stale".into()))),
+        vec!["stale"]
+    );
 }
 
 /// Explicit global refresh includes a configured compatible source even when

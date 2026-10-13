@@ -143,12 +143,12 @@ inventory is advisory for every provider kind. That unverified
 inventory remains excluded from automatic failover and promotion. Maintained
 offline and OAuth catalogs retain their permanent rows with healthy credentials.
 
-Successful empty listings retain their discovery timestamp when a later refresh fails.
+A valid HTTP success with an empty model array persists an empty listing and its discovery timestamp. Nonempty arrays with no usable IDs remain discovery errors. Successful empty listings retain their discovery timestamp when a later refresh fails.
 For advisory custom providers, that uncertainty also permits explicit input when
 no model IDs are declared; it does not invent picker rows, metadata or a default.
 Configured IDs use the published shared availability decision without awaiting
 admission-time discovery. Staleness schedules background refresh with bounded backoff; it never blocks
-new sessions or turns of existing sessions. The daemon's admission, CLI, TUI
+new sessions or turns of existing sessions. Plain `haider models` reads return the cached snapshot without awaiting discovery; only explicit `--refresh` waits for a listing. The daemon's admission, CLI, TUI
 picker and summaries use `ProviderSummaryWire::selection_availability` and its
 shared reason projection. A fresh empty list does not authorize configured rows.
 The TUI ages the complete projection through the same RPC policy, including
