@@ -22,6 +22,13 @@ const WORKSPACE_RECEIPT_MAX_ENTRIES: usize = 4_096;
 const WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 const WORKSPACE_RECEIPT_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const WORKSPACE_RECEIPT_WALL_TIME: Duration = Duration::from_millis(500);
+/// Bounded receipt budget for tests whose assertion concerns content, entries,
+/// Git classification or mutation detection rather than the wall limit. It is
+/// long enough that a loaded build machine cannot pre-empt those assertions,
+/// and short enough that a hung receipt fails the test instead of stalling it.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const TEST_RECEIPT_WALL_TIME: Duration = Duration::from_secs(90);
 const GIT_INDEX_HEADER_BYTES: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,10 +319,18 @@ fn finalize(hasher: blake3::Hasher) -> String {
 /// caps, so a timed-out worker cannot continue into an unbounded traversal.
 #[must_use]
 pub fn workspace_state_receipt(root: &Path) -> WorkspaceStateReceipt {
-    workspace_state_receipt_with_git(root.to_path_buf(), OsString::from("git"))
+    workspace_state_receipt_with_git(
+        root.to_path_buf(),
+        OsString::from("git"),
+        WORKSPACE_RECEIPT_WALL_TIME,
+    )
 }
 
-fn workspace_state_receipt_with_git(root: PathBuf, git_program: OsString) -> WorkspaceStateReceipt {
+fn workspace_state_receipt_with_git(
+    root: PathBuf,
+    git_program: OsString,
+    wall_time: Duration,
+) -> WorkspaceStateReceipt {
     let (sender, receiver) = mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
         .name("haider-workspace-receipt".into())
@@ -325,7 +340,11 @@ fn workspace_state_receipt_with_git(root: PathBuf, git_program: OsString) -> Wor
                 .enable_time()
                 .build()
                 .map(|runtime| {
-                    runtime.block_on(workspace_state_receipt_async_with_git(root, git_program))
+                    runtime.block_on(workspace_state_receipt_async_with_git(
+                        root,
+                        git_program,
+                        wall_time,
+                    ))
                 })
                 .unwrap_or_else(|_| WorkspaceStateReceipt::worker_failed());
             let _ = sender.send(receipt);
@@ -336,7 +355,7 @@ fn workspace_state_receipt_with_git(root: PathBuf, git_program: OsString) -> Wor
             WorkspaceReceiptUnknownReason::ReceiptWorkerFailed,
         );
     }
-    match receiver.recv_timeout(WORKSPACE_RECEIPT_WALL_TIME) {
+    match receiver.recv_timeout(wall_time) {
         Ok(receipt) => receipt,
         Err(mpsc::RecvTimeoutError::Timeout) => WorkspaceStateReceipt::unknown_unreported(
             WorkspaceReceiptStrategy::NotEnumerated,
@@ -354,8 +373,11 @@ pub fn workspace_state_digest(root: &Path) -> String {
     workspace_state_receipt(root).mutation_digest()
 }
 
-async fn workspace_state_receipt_async(root: PathBuf) -> WorkspaceStateReceipt {
-    workspace_state_receipt_async_with_git(root, OsString::from("git")).await
+async fn workspace_state_receipt_async(
+    root: PathBuf,
+    wall_time: Duration,
+) -> WorkspaceStateReceipt {
+    workspace_state_receipt_async_with_git(root, OsString::from("git"), wall_time).await
 }
 
 enum ReceiptPreparation {
@@ -369,10 +391,11 @@ enum ReceiptPreparation {
 async fn workspace_state_receipt_async_with_git(
     root: PathBuf,
     git_program: OsString,
+    wall_time: Duration,
 ) -> WorkspaceStateReceipt {
     match tokio::time::timeout(
-        WORKSPACE_RECEIPT_WALL_TIME,
-        compute_workspace_state_receipt_async(root, git_program),
+        wall_time,
+        compute_workspace_state_receipt_async(root, git_program, wall_time),
     )
     .await
     {
@@ -387,8 +410,9 @@ async fn workspace_state_receipt_async_with_git(
 async fn compute_workspace_state_receipt_async(
     root: PathBuf,
     git_program: OsString,
+    wall_time: Duration,
 ) -> WorkspaceStateReceipt {
-    let deadline = Instant::now() + WORKSPACE_RECEIPT_WALL_TIME;
+    let deadline = Instant::now() + wall_time;
     compute_workspace_state_receipt_async_with_deadline(root, git_program, deadline).await
 }
 
@@ -942,6 +966,12 @@ struct WorkspaceReceiptTrackerState {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceReceiptTracker {
     state: Arc<Mutex<WorkspaceReceiptTrackerState>>,
+    /// Budget for every before/after receipt this tracker computes. It is
+    /// always `WORKSPACE_RECEIPT_WALL_TIME` unless a test changes it: the only
+    /// writer is `set_wall_time_for_tests`, compiled solely under `cfg(test)`
+    /// or the dev-only `test-support` feature, so neither configuration nor
+    /// model input can reach it and a release build does not contain it.
+    wall_time: Duration,
 }
 
 impl Default for WorkspaceReceiptTracker {
@@ -953,11 +983,25 @@ impl Default for WorkspaceReceiptTracker {
                 active: 0,
                 ambiguity_epoch: 0,
             })),
+            wall_time: WORKSPACE_RECEIPT_WALL_TIME,
         }
     }
 }
 
 impl WorkspaceReceiptTracker {
+    /// Test seam: lets broker-level tests assert mutation detection without
+    /// racing the production 500 ms receipt budget on a loaded machine. Set it
+    /// before the first receipt; clones taken earlier keep their budget.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_wall_time_for_tests(&mut self, wall_time: Duration) {
+        self.wall_time = wall_time;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wall_time(&self) -> Duration {
+        self.wall_time
+    }
+
     pub(crate) fn needs_initial_receipt(&self) -> bool {
         !self.lock().initialized
     }
@@ -984,7 +1028,7 @@ impl WorkspaceReceiptTracker {
         if !self.needs_initial_receipt() {
             return;
         }
-        let receipt = workspace_state_receipt_async(root).await;
+        let receipt = workspace_state_receipt_async(root, self.wall_time).await;
         self.install_initial_receipt(receipt);
     }
 
@@ -1079,7 +1123,7 @@ impl WorkspaceReceiptLease {
         if !self.requires_after_receipt() {
             return self.finish_without_after_receipt();
         }
-        let after = workspace_state_receipt_async(root).await;
+        let after = workspace_state_receipt_async(root, self.tracker.wall_time).await;
         self.finish(after)
     }
 

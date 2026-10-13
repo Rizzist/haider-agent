@@ -12,7 +12,8 @@ fn test_deadline() -> Instant {
     // These fixtures have finite entry/content bounds. Wall-time behavior is
     // tested separately with an already-expired deadline; it must not pre-empt
     // an unrelated assertion when the machine is running other build lanes.
-    Instant::now() + Duration::from_secs(60 * 60)
+    // The budget stays bounded so a hung receipt fails rather than stalls.
+    Instant::now() + super::TEST_RECEIPT_WALL_TIME
 }
 
 fn receipt_with_git_for_test(root: &Path, git_program: &OsStr) -> super::WorkspaceStateReceipt {
@@ -73,6 +74,82 @@ fn non_repository_receipt_is_explicitly_unknown_without_enumeration() {
         receipt
             .mutation_digest()
             .contains("reason=not_enumerated_non_repository")
+    );
+}
+
+/// F2: the synchronous wrapper (worker thread, runtime and channel) must hand
+/// back the computed receipt, not substitute its own wall-time `Unknown`.
+/// Driven through the wrapper's internal entry point with the bounded test
+/// budget so the assertion cannot race the production 500 ms timeout.
+#[test]
+fn sync_wrapper_returns_the_computed_non_repository_receipt() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("source.rs"), b"source").expect("source");
+
+    let receipt = super::workspace_state_receipt_with_git(
+        workspace.path().to_path_buf(),
+        "git".into(),
+        super::TEST_RECEIPT_WALL_TIME,
+    );
+
+    assert_eq!(
+        receipt.coverage,
+        WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::NonRepository)
+    );
+    assert_eq!(receipt.strategy, WorkspaceReceiptStrategy::NotEnumerated);
+    assert!(
+        receipt.counts_known,
+        "a classified receipt keeps exact counts"
+    );
+    assert_eq!(receipt.entries_visited, 0);
+    assert_eq!(receipt.content_bytes_read, 0);
+    assert_eq!(receipt, receipt_for_test(workspace.path()));
+}
+
+/// F2: a complete repository receipt crosses the wrapper unchanged.
+#[test]
+fn sync_wrapper_returns_the_computed_complete_receipt() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join(".git")).expect("repository marker");
+    std::fs::write(workspace.path().join("source.rs"), b"stable").expect("source");
+
+    let receipt = super::workspace_state_receipt_with_git(
+        workspace.path().to_path_buf(),
+        "definitely-not-a-git-binary".into(),
+        super::TEST_RECEIPT_WALL_TIME,
+    );
+
+    assert_eq!(receipt.coverage, WorkspaceReceiptCoverage::Complete);
+    assert_eq!(receipt.strategy, WorkspaceReceiptStrategy::RepositoryWalk);
+    assert_eq!(
+        receipt,
+        receipt_with_git_for_test(workspace.path(), OsStr::new("definitely-not-a-git-binary"))
+    );
+}
+
+/// The public entry points keep the production budget, so on a loaded machine
+/// they may legitimately report the wall limit; any other outcome is a defect.
+#[test]
+fn public_receipt_entry_points_classify_a_non_repository_root() {
+    let workspace = tempfile::tempdir().expect("workspace");
+
+    let receipt = super::workspace_state_receipt(workspace.path());
+    let digest = super::workspace_state_digest(workspace.path());
+
+    match receipt.coverage {
+        WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::NonRepository) => {
+            assert!(receipt.counts_known);
+            assert_eq!(receipt.entries_visited, 0);
+        }
+        WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::WallTimeLimit) => {
+            assert!(!receipt.counts_known);
+        }
+        other => panic!("unexpected public receipt coverage: {other:?}"),
+    }
+    assert!(
+        digest.contains("reason=not_enumerated_non_repository")
+            || digest.contains("reason=wall_time_limit"),
+        "{digest}"
     );
 }
 
@@ -378,6 +455,16 @@ fn production_receipt_limits_remain_pinned() {
         16 * 1024 * 1024
     );
     assert_eq!(super::WORKSPACE_RECEIPT_MAX_ENTRIES, 4_096);
+    assert_eq!(
+        WorkspaceReceiptTracker::default().wall_time(),
+        Duration::from_millis(500),
+        "only the cfg(test) seam may change a tracker's receipt budget"
+    );
+    let test_budget = super::TEST_RECEIPT_WALL_TIME;
+    assert!(
+        (Duration::from_secs(60)..=Duration::from_secs(120)).contains(&test_budget),
+        "the test budget must stay bounded so a hung receipt fails: {test_budget:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -481,4 +568,56 @@ async fn invalidated_complete_receipt_skips_the_after_walk_and_assumes_mutation(
         .expect("interleaving assumes mutation");
 
     assert!(mutation.contains("reason=concurrent_or_interleaved_mutation"));
+}
+
+/// Seam guard: the tracker's receipt budget governs the initial (before)
+/// receipt. With a zero budget it cannot be complete; ignoring the seam would
+/// compute it under the production budget and make it complete.
+#[tokio::test]
+async fn tracker_budget_governs_the_initial_receipt() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join(".git")).expect("repository marker");
+    std::fs::write(workspace.path().join("source.rs"), b"stable").expect("source");
+    let mut tracker = WorkspaceReceiptTracker::default();
+    tracker.set_wall_time_for_tests(Duration::ZERO);
+
+    let lease = tracker
+        .begin_foreground_for_root(workspace.path().to_path_buf())
+        .await;
+
+    assert_eq!(
+        lease.before.coverage,
+        WorkspaceReceiptCoverage::Unknown(WorkspaceReceiptUnknownReason::WallTimeLimit)
+    );
+    let before = lease.before.clone();
+    assert!(lease.finish(before).is_some());
+}
+
+/// Seam guard: the tracker's receipt budget also governs the after receipt.
+/// The before receipt is complete, so the after receipt is really computed;
+/// with a zero budget it is a wall-time `Unknown` and assumes a mutation.
+#[tokio::test]
+async fn tracker_budget_governs_the_after_receipt() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join(".git")).expect("repository marker");
+    std::fs::write(workspace.path().join("source.rs"), b"stable").expect("source");
+    let complete = super::compute_workspace_state_receipt_async_with_deadline(
+        workspace.path().to_path_buf(),
+        "definitely-not-a-git-binary".into(),
+        test_deadline(),
+    )
+    .await;
+    assert_eq!(complete.coverage, WorkspaceReceiptCoverage::Complete);
+    let mut tracker = WorkspaceReceiptTracker::default();
+    tracker.set_wall_time_for_tests(Duration::ZERO);
+    tracker.install_initial_receipt(complete);
+    let lease = tracker.begin_foreground();
+
+    let mutation = lease
+        .finish_for_root(workspace.path().to_path_buf())
+        .await
+        .expect("an exhausted after-receipt budget assumes mutation");
+
+    assert!(mutation.contains("reason=wall_time_limit"), "{mutation}");
+    assert!(mutation.contains("assumed_mutation=true"));
 }
