@@ -643,6 +643,19 @@ exec /usr/bin/mktemp "$@"
             {'dev-entry': '/dev/disk973'}]}]
         self.assertEqual(set(self.attached_test_images(inventory)), {image.resolve()})
 
+    def test_attachment_records_follow_filesystem_case_and_unicode_equivalence(self):
+        image = self.base / 'owned-\u00e9.dmg'
+        image.touch()
+        alias = self.base / 'OWNED-e\u0301.DMG'
+        (self.base / 'attachments').write_text(json.dumps({
+            'image': str(alias), 'device': '/dev/disk973'}) + '\n')
+        inventory = [{'image-path': str(image), 'system-entities': [
+            {'dev-entry': '/dev/disk973'}]}]
+        # Match the host filesystem: on a case-sensitive volume this spelling
+        # cannot name the attached image and must not confer ownership.
+        expected = {image.resolve()} if alias.exists() and alias.samefile(image) else set()
+        self.assertEqual(set(self.attached_test_images(inventory)), expected)
+
     def test_recycled_device_on_foreign_image_does_not_confer_ownership(self):
         point = self.base / 'tmp.gone' / 'mount'
         mine = self.mock_attachment(point)
