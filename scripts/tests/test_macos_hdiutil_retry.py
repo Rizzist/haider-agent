@@ -488,12 +488,20 @@ exec /bin/rm "$@"
                 self.assertEqual(marker.read_text(), 'foreign fixture data\n')
                 self.assertTrue(self.payload.is_dir())
         finally:
-            # The independent caller cleans its own exact mount, even on failure.
-            if (self.unrecorded_mountpoint.exists()
-                    and self.unrecorded_mountpoint.stat().st_dev
-                    != self.unrecorded_mountpoint.parent.stat().st_dev):
-                subprocess.run(['/usr/bin/hdiutil', 'detach', str(self.unrecorded_mountpoint)],
-                               check=True, capture_output=True, timeout=60)
+            # The independent caller ejects its own exact device, even on failure.
+            for image in self.disk_image_inventory():
+                if Path(image.get('image-path', '')).resolve() != foreign_image.resolve():
+                    continue
+                device = next(entity['dev-entry'] for entity in image['system-entities']
+                              if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
+                for attempt in range(4):
+                    result = subprocess.run(['/usr/bin/hdiutil', 'detach', device],
+                                            capture_output=True, timeout=60)
+                    if result.returncode == 0:
+                        break
+                    if attempt == 3:
+                        result.check_returncode()
+                    time.sleep(0.1 * (attempt + 1))
 
     def test_external_builder_directory_with_spaces_tmpdir_set_and_unset(self):
         external = Path(tempfile.mkdtemp(prefix='hdiutil builder with spaces '))
