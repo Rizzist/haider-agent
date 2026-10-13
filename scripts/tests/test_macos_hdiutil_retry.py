@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import platform
 import plistlib
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -24,10 +26,44 @@ if [ "$1" = attach ]; then
   for argument in "$@"; do
     if [ "$previous" = -mountpoint ]; then
       printf '%s\\0' "$argument" >> "$HDIUTIL_TEST_DIR/mountpoints"
+      HDIUTIL_MOUNTPOINT=$argument
     fi
     previous=$argument
   done
 fi
+native_hdiutil() {
+  if [ "$1" != attach ]; then /usr/bin/hdiutil "$@"; return $?; fi
+  python3 - "$@" <<'TRACE_PY'
+import json, os, pathlib, plistlib, re, subprocess, sys
+arguments = sys.argv[1:]
+image = str(pathlib.Path(arguments[1]).resolve())
+record = pathlib.Path(os.environ['HDIUTIL_TEST_DIR']) / 'attachments'
+def append(device):
+    with record.open('a') as output:
+        output.write(json.dumps({'image': image, 'device': device}) + '\\n')
+# Record the actual native argument before attach, including a substituted image.
+append(None)
+if '-plist' not in arguments: arguments.append('-plist')
+result = subprocess.run(['/usr/bin/hdiutil', *arguments], capture_output=True)
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+try:
+    attached = plistlib.loads(result.stdout)
+except ValueError:
+    attached = {}
+for entity in attached.get('system-entities', []):
+    device = entity.get('dev-entry', '')
+    if re.fullmatch(r'/dev/disk[0-9]+', device): append(device)
+info = plistlib.loads(subprocess.check_output(['/usr/bin/hdiutil', 'info', '-plist']))
+for attached in info.get('images', []):
+    if str(pathlib.Path(attached.get('image-path', '')).resolve()) == image:
+        for entity in attached.get('system-entities', []):
+            device = entity.get('dev-entry', '')
+            if re.fullmatch(r'/dev/disk[0-9]+', device):
+                append(device)
+sys.exit(result.returncode)
+TRACE_PY
+}
 '''
 
 
@@ -60,12 +96,12 @@ if [ "$1" = "$HDIUTIL_TEST_OPERATION" ]; then
   printf '%s\\n' "$count" > "$count_file"
   if [ "$count" -le "$HDIUTIL_TEST_FAILURES" ]; then
     if [ "$1" = create ]; then touch "${@: -1}"; fi
-    if [ "$1" = attach ]; then /usr/bin/hdiutil "$@" >/dev/null || exit $?; fi
+    if [ "$1" = attach ]; then native_hdiutil "$@" || exit $?; fi
     printf 'simulated %s, attempt %s\\n' "$HDIUTIL_TEST_ERROR" "$count" >&2
     exit "$HDIUTIL_TEST_EXIT"
   fi
 fi
-exec /usr/bin/hdiutil "$@"
+native_hdiutil "$@"
 ''')
         script.chmod(0o755)
 
@@ -76,13 +112,47 @@ exec /usr/bin/hdiutil "$@"
         return {Path(os.fsdecode(point)).resolve()
                 for point in record.read_bytes().split(b'\0') if point}
 
+    def recorded_attachments(self):
+        record = self.base / 'attachments'
+        if not record.exists():
+            return []
+        return [json.loads(line) for line in record.read_text().splitlines()]
+
+    def disk_image_inventory(self):
+        for attempt in range(4):
+            result = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'],
+                                    capture_output=True, timeout=60, check=True)
+            if b'cannot get IO media array' not in result.stderr:
+                return plistlib.loads(result.stdout).get('images', [])
+            if attempt == 3:
+                raise RuntimeError('hdiutil attachment inventory remained incomplete')
+            time.sleep(0.1 * (attempt + 1))
+
     def disk_image_mountpoints(self):
-        info = plistlib.loads(subprocess.check_output(
-            ['/usr/bin/hdiutil', 'info', '-plist'], timeout=60))
         return {Path(entity['mount-point']).resolve()
-                for image in info.get('images', [])
+                for image in self.disk_image_inventory()
                 for entity in image.get('system-entities', [])
                 if 'mount-point' in entity}
+
+    def attached_test_images(self, inventory=None):
+        owned = {Path(record['image']).resolve() for record in self.recorded_attachments()}
+        if not owned:
+            return {}
+        if inventory is None:
+            inventory = self.disk_image_inventory()
+        def is_owned(path):
+            if path in owned:
+                return True
+            for record in owned:
+                try:
+                    if path.samefile(record):
+                        return True
+                except OSError:
+                    pass
+            return False
+        return {Path(image['image-path']).resolve(): image
+                for image in inventory if 'image-path' in image
+                and is_owned(Path(image['image-path']).resolve())}
 
     def mounted_test_mounts(self, inventory=None):
         owned = self.recorded_mountpoints()
@@ -102,19 +172,24 @@ exec /usr/bin/hdiutil "$@"
         return mounted
 
     def assert_no_test_mounts(self):
+        self.assertEqual(self.attached_test_images(), {}, 'owned test image attached')
         self.assertEqual(self.mounted_test_mounts(), set(), 'owned test mount retained')
 
     def detach_leftover_test_mounts(self):
         owned = self.recorded_mountpoints()
-        if not owned:
-            return
-        for point in self.mounted_test_mounts():
-            subprocess.run(['/usr/bin/hdiutil', 'detach', str(point)], check=True,
+        # Whole disks remain in hdiutil info even after their volumes unmount.
+        # Match the exact recorded image before using a recyclable device name.
+        for image in self.attached_test_images().values():
+            devices = [entity['dev-entry'] for entity in image.get('system-entities', [])
+                       if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', ''))]
+            self.assertTrue(devices, 'owned attached image has no whole-disk device')
+            subprocess.run(['/usr/bin/hdiutil', 'detach', devices[0]], check=True,
                            capture_output=True, text=True, timeout=60)
+        self.assertEqual(self.attached_test_images(), {}, 'owned test image attached')
         remaining = self.disk_image_mountpoints()
         self.assertEqual(self.mounted_test_mounts(remaining), set(), 'owned test mount retained')
         # A failed builder retains its work directory. Remove it only after the
-        # exact recorded mount is clear; never derive its location from TMPDIR.
+        # exact recorded attachment and mount are clear; never guess from TMPDIR.
         for point in owned:
             if (point.name == 'mount' and point.parent.name.startswith('tmp.')
                     and point.parent.exists()):
@@ -123,6 +198,10 @@ exec /usr/bin/hdiutil "$@"
     def remove_clear_directory(self, directory, inventory, label):
         if not directory.exists():
             return
+        # Protect even foreign backing files whose volumes are already unmounted.
+        self.assertFalse(any(Path(image['image-path']).resolve().is_relative_to(directory.resolve())
+                             for image in self.disk_image_inventory() if 'image-path' in image),
+                         f'attached image inside {label}')
         self.assertFalse(any(mount.is_relative_to(directory.resolve()) for mount in inventory),
                          f'unrecorded mount inside {label}')
         device = directory.stat().st_dev
@@ -189,15 +268,15 @@ if [ "$1" = attach ]; then
   printf '%s\\n' "$count" > "$HDIUTIL_TEST_DIR/attach-count"
   if [ "$count" = 1 ]; then
     if [ "$EMPTY_IMAGE" = 1 ]; then
-      /usr/bin/hdiutil attach "$BLANK_DMG" -readonly -nobrowse -mountpoint "${@: -1}" >/dev/null || exit $?
+      native_hdiutil attach "$BLANK_DMG" -readonly -nobrowse -mountpoint "$HDIUTIL_MOUNTPOINT" -plist || exit $?
     else
-      /usr/bin/hdiutil "$@" >/dev/null || exit $?
+      native_hdiutil "$@" || exit $?
     fi
     printf 'simulated Resource busy after mount\\n' >&2
     exit "$ATTACH_ERROR_CODE"
   fi
-  mount_device=$(stat -f %d "${@: -1}")
-  parent_device=$(stat -f %d "$(dirname "${@: -1}")")
+  mount_device=$(stat -f %d "$HDIUTIL_MOUNTPOINT")
+  parent_device=$(stat -f %d "$(dirname "$HDIUTIL_MOUNTPOINT")")
   if [ "$mount_device" != "$parent_device" ]; then
     printf 'attach retried before previous mount was detached\\n' >&2
     exit 99
@@ -217,7 +296,7 @@ if [ "$1" = detach ]; then
     exit 16
   fi
 fi
-exec /usr/bin/hdiutil "$@"
+native_hdiutil "$@"
 ''')
         output = self.base / 'output-attach-cleanup'
         env = {
@@ -359,13 +438,13 @@ exec /bin/rm "$@"
         result, _, calls = self.build_with_mounted_attach_failure(0, second_attach_error=True)
         self.assertEqual(result.returncode, 5, result.stderr)
         self.assertEqual([calls.count(action) for action in ('create', 'attach', 'detach')],
-                         [1, 2, 2])
+                         [1, 2, 1])
         self.assertIn('simulated Invalid argument on second attach', result.stderr)
 
     def test_retained_native_mktemp_mount_fails_helper_assertion(self):
         # This is Astra's original sustained-busy-detach reproducer. The helper
         # must reject it even when native mktemp ignores the fixture's TMPDIR.
-        with self.assertRaisesRegex(AssertionError, 'owned test mount retained'):
+        with self.assertRaisesRegex(AssertionError, 'owned test (mount retained|image attached)'):
             self.build_with_mounted_attach_failure(99)
         points = self.recorded_mountpoints()
         self.assertEqual(len(points), 1)
@@ -373,7 +452,7 @@ exec /bin/rm "$@"
         # A missing/alternate inventory spelling must not hide a real mount.
         with patch.object(self, 'disk_image_mountpoints', return_value=set()):
             self.assertEqual(self.mounted_test_mounts(), points)
-            with self.assertRaisesRegex(AssertionError, 'owned test mount retained'):
+            with self.assertRaisesRegex(AssertionError, 'owned test (mount retained|image attached)'):
                 self.assert_no_test_mounts()
             self.detach_leftover_test_mounts()
         self.assert_no_test_mounts()
@@ -395,7 +474,8 @@ exec /bin/rm "$@"
             marker.write_text('foreign fixture data\n')
             # The physical preflight must protect an unrecorded writable volume
             # even when an inventory spelling mismatch makes it absent here.
-            with patch.object(self, 'disk_image_mountpoints', return_value=set()):
+            with patch.object(self, 'disk_image_mountpoints', return_value=set()), \
+                    patch.object(self, 'disk_image_inventory', return_value=[]):
                 with self.assertRaisesRegex(AssertionError, 'mounted filesystem inside fixture'):
                     self.cleanup_fixtures()
                 self.assertEqual(marker.read_text(), 'foreign fixture data\n')
@@ -436,7 +516,7 @@ exec /usr/bin/mktemp "$@"
                 self.assertTrue(all(not point.is_relative_to(self.base.resolve())
                                     for point in points))
                 self.assertTrue(all(' ' in str(point) for point in points))
-                with self.assertRaisesRegex(AssertionError, 'owned test mount retained'):
+                with self.assertRaisesRegex(AssertionError, 'owned test (mount retained|image attached)'):
                     self.assert_no_test_mounts()
                 self.detach_leftover_test_mounts()
                 self.assert_no_test_mounts()
@@ -476,25 +556,78 @@ exec /usr/bin/mktemp "$@"
             b''.join(os.fsencode(str(record)) + b'\0' for record in records))
         info = plistlib.dumps({'images': [{'system-entities': [
             {'mount-point': str(point.resolve())}, {'dev-entry': '/dev/fixture'}]}]})
-        with patch.object(subprocess, 'check_output', return_value=info):
+        with patch.object(self, 'disk_image_inventory', return_value=plistlib.loads(info)['images']):
             self.assertEqual(self.recorded_mountpoints(), {point.resolve()})
             self.assertEqual(self.mounted_test_mounts(), {point.resolve()})
+
+    def mock_attachment(self, point, device='/dev/disk973'):
+        image = self.base / 'owned.dmg'
+        (self.base / 'attachments').write_text(json.dumps({
+            'image': str(image), 'device': device}) + '\n')
+        return {'image-path': str(image), 'system-entities': [
+            {'dev-entry': device}, {'mount-point': str(point)}]}
+
+    def test_incomplete_inventory_is_requeried(self):
+        info = plistlib.dumps({'images': []})
+        warning = b'hdiutil: info: cannot get IO media array for IOHDIXHDDriveOutKernel'
+        with patch.object(subprocess, 'run', side_effect=[
+                subprocess.CompletedProcess([], 0, info, warning),
+                subprocess.CompletedProcess([], 0, info, b'')]) as query:
+            self.assertEqual(self.disk_image_inventory(), [])
+            self.assertEqual(query.call_count, 2)
+
+    def test_incomplete_inventory_preserves_fixtures(self):
+        self.mock_attachment(self.base / 'mount')
+        info = plistlib.dumps({'images': []})
+        warning = b'hdiutil: info: cannot get IO media array for IOHDIXHDDriveOutKernel'
+        with patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess(
+                [], 0, info, warning)) as query:
+            with self.assertRaisesRegex(RuntimeError, 'inventory remained incomplete'):
+                self.cleanup_fixtures()
+            self.assertEqual(query.call_count, 4)
+        self.assertTrue(self.payload.is_dir())
+
+    def test_attachment_records_normalize_image_aliases_and_whitespace(self):
+        image = self.base / 'image space \t\n\u03a9.dmg'
+        image.touch()
+        alias = self.base / 'image alias'
+        alias.symlink_to(image)
+        (self.base / 'attachments').write_text(json.dumps({
+            'image': str(alias), 'device': '/dev/disk973'}) + '\n')
+        inventory = [{'image-path': str(image), 'system-entities': [
+            {'dev-entry': '/dev/disk973'}]}]
+        self.assertEqual(set(self.attached_test_images(inventory)), {image.resolve()})
+
+    def test_recycled_device_on_foreign_image_does_not_confer_ownership(self):
+        point = self.base / 'tmp.gone' / 'mount'
+        mine = self.mock_attachment(point)
+        foreign = {'image-path': str(self.base.parent / 'foreign.dmg'),
+                   'system-entities': [{'dev-entry': mine['system-entities'][0]['dev-entry']}]}
+        self.assertEqual(self.attached_test_images([foreign]), {})
+        with patch.object(self, 'disk_image_inventory', return_value=[foreign]), \
+                patch.object(subprocess, 'run') as detach:
+            self.detach_leftover_test_mounts()
+            detach.assert_not_called()
 
     def test_cleanup_ignores_unrecorded_mounts_and_prefix_siblings(self):
         point = self.base / 'tmp.owned' / 'mount'
         neighbor = self.base / 'tmp.owned-other' / 'mount'
         point.mkdir(parents=True)
         (self.base / 'mountpoints').write_bytes(os.fsencode(str(point)) + b'\0')
-        def info(points):
-            return plistlib.dumps({'images': [{'system-entities': [
-                {'mount-point': str(p)} for p in points]}]})
-        with patch.object(subprocess, 'check_output', side_effect=[
-                info([point, neighbor]), info([neighbor])]), \
-                patch.object(subprocess, 'run') as detach:
+        mine = self.mock_attachment(point)
+        foreign = {'image-path': str(self.base.parent / 'foreign.dmg'),
+                   'system-entities': [{'dev-entry': '/dev/disk974'},
+                                       {'mount-point': str(neighbor)}]}
+        inventory = [mine, foreign]
+        def detached(*args, **kwargs):
+            inventory.remove(mine)
+        with patch.object(self, 'disk_image_inventory', side_effect=lambda: inventory), \
+                patch.object(subprocess, 'run', side_effect=detached) as detach:
             self.detach_leftover_test_mounts()
             detach.assert_called_once_with(
-                ['/usr/bin/hdiutil', 'detach', str(point.resolve())], check=True,
+                ['/usr/bin/hdiutil', 'detach', '/dev/disk973'], check=True,
                 capture_output=True, text=True, timeout=60)
+            self.assertEqual(inventory, [foreign])
 
     def test_cleanup_already_gone_is_repeatable_noop(self):
         point = self.base / 'tmp.gone' / 'mount'
@@ -508,9 +641,10 @@ exec /usr/bin/mktemp "$@"
     def test_failed_detach_preserves_fixtures(self):
         point = self.base / 'tmp.retained' / 'mount'
         (self.base / 'mountpoints').write_bytes(os.fsencode(str(point)) + b'\0')
-        with patch.object(self, 'disk_image_mountpoints', return_value={point.resolve()}), \
+        mine = self.mock_attachment(point)
+        with patch.object(self, 'disk_image_inventory', return_value=[mine]), \
                 patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(
-                    16, ['/usr/bin/hdiutil', 'detach', str(point)])):
+                    16, ['/usr/bin/hdiutil', 'detach', '/dev/disk973'])):
             with self.assertRaises(subprocess.CalledProcessError):
                 self.cleanup_fixtures()
         self.assertTrue(self.payload.is_dir())
@@ -520,7 +654,7 @@ exec /usr/bin/mktemp "$@"
         (self.base / 'mountpoints').write_bytes(os.fsencode(str(point)) + b'\0')
         with patch.object(self, 'disk_image_mountpoints', return_value={point.resolve()}), \
                 patch.object(subprocess, 'run'):
-            with self.assertRaisesRegex(AssertionError, 'owned test mount retained'):
+            with self.assertRaisesRegex(AssertionError, 'owned test (mount retained|image attached)'):
                 self.cleanup_fixtures()
         self.assertTrue(self.payload.is_dir())
 
@@ -529,14 +663,200 @@ exec /usr/bin/mktemp "$@"
         point.mkdir(parents=True)
         neighbor = point.parent / 'mount-other'
         (self.base / 'mountpoints').write_bytes(os.fsencode(str(point)) + b'\0')
-        with patch.object(self, 'disk_image_mountpoints', side_effect=[
-                {point.resolve(), neighbor.resolve()}, {neighbor.resolve()}]), \
-                patch.object(subprocess, 'run') as detach:
+        mine = self.mock_attachment(point)
+        foreign = {'image-path': str(self.base.parent / 'foreign.dmg'),
+                   'system-entities': [{'dev-entry': '/dev/disk974'},
+                                       {'mount-point': str(neighbor)}]}
+        inventory = [mine, foreign]
+        def detached(*args, **kwargs):
+            inventory.remove(mine)
+        with patch.object(self, 'disk_image_inventory', side_effect=lambda: inventory), \
+                patch.object(subprocess, 'run', side_effect=detached) as detach:
             with self.assertRaisesRegex(AssertionError, 'unrecorded mount inside builder'):
                 self.detach_leftover_test_mounts()
             self.assertEqual(detach.call_args.args[0],
-                             ['/usr/bin/hdiutil', 'detach', str(point.resolve())])
+                             ['/usr/bin/hdiutil', 'detach', '/dev/disk973'])
         self.assertTrue(point.parent.is_dir())
+
+    def attach_fixture(self, *, mountpoint=True, recorded=True):
+        image = self.base / 'attached image.dmg'
+        subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                        '-volname', f'Owned973-{self.base.name}', str(image)], check=True,
+                       capture_output=True, timeout=60)
+        arguments = ['attach', str(image), '-nobrowse']
+        point = self.base / 'mount'
+        if mountpoint:
+            point.mkdir()
+            arguments += ['-mountpoint', str(point)]
+        if recorded:
+            (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + 'native_hdiutil "$@"\n')
+            command = [str(self.shim / 'hdiutil'), *arguments]
+        else:
+            command = ['/usr/bin/hdiutil', *arguments]
+        subprocess.run(command, check=True, capture_output=True, timeout=60, env={
+            'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+            'HDIUTIL_TEST_DIR': str(self.base)})
+        attached = next(entry for entry in self.disk_image_inventory()
+                        if Path(entry.get('image-path', '')).resolve() == image.resolve())
+        device = next(entity['dev-entry'] for entity in attached['system-entities']
+                      if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
+        return image, device, attached
+
+    def test_attached_unmounted_image_is_detected_and_detached_before_deletion(self):
+        image, device, _ = self.attach_fixture()
+        subprocess.run(['/usr/sbin/diskutil', 'unmountDisk', device], check=True,
+                       capture_output=True, timeout=60)
+        self.assertEqual(self.mounted_test_mounts(), set())
+        with self.assertRaisesRegex(AssertionError, 'owned test image attached'):
+            self.assert_no_test_mounts()
+        self.assertIn({'image': str(image.resolve()), 'device': device},
+                      self.recorded_attachments())
+        native_run = subprocess.run
+        detaches = []
+        def detach_with_backing_file(*args, **kwargs):
+            if args[0][:2] == ['/usr/bin/hdiutil', 'detach']:
+                self.assertTrue(image.is_file(), 'backing image deleted before detach')
+                self.assertEqual(args[0], ['/usr/bin/hdiutil', 'detach', device])
+                detaches.append(args[0])
+            return native_run(*args, **kwargs)
+        with patch.object(subprocess, 'run', side_effect=detach_with_backing_file):
+            self.cleanup_fixtures()
+        self.assertEqual(len(detaches), 1)
+        self.assertFalse(self.base.exists())
+        self.assertFalse(any(entity.get('dev-entry') == device
+                             for entry in self.disk_image_inventory()
+                             for entity in entry.get('system-entities', [])))
+        self.assert_no_test_mounts()
+
+    def test_attach_without_mountpoint_is_recorded_and_cleaned(self):
+        image, device, _ = self.attach_fixture(mountpoint=False)
+        self.assertEqual(self.recorded_mountpoints(), set())
+        self.assertIn({'image': str(image.resolve()), 'device': device},
+                      self.recorded_attachments())
+        with self.assertRaisesRegex(AssertionError, 'owned test image attached'):
+            self.assert_no_test_mounts()
+        self.cleanup_fixtures()
+        self.assert_no_test_mounts()
+        self.assertFalse(image.exists())
+
+    def test_busy_eject_of_unmounted_image_preserves_backing_file(self):
+        image, device, _ = self.attach_fixture()
+        subprocess.run(['/usr/sbin/diskutil', 'unmountDisk', device], check=True,
+                       capture_output=True, timeout=60)
+        native_run = subprocess.run
+        def busy_detach(*args, **kwargs):
+            if args[0][:2] == ['/usr/bin/hdiutil', 'detach']:
+                raise subprocess.CalledProcessError(16, args[0])
+            return native_run(*args, **kwargs)
+        with patch.object(subprocess, 'run', side_effect=busy_detach):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.cleanup_fixtures()
+        self.assertTrue(image.is_file())
+        with self.assertRaisesRegex(AssertionError, 'owned test image attached'):
+            self.assert_no_test_mounts()
+        self.detach_leftover_test_mounts()
+        self.assert_no_test_mounts()
+
+    def test_failed_attachment_reaudit_preserves_backing_file(self):
+        image, _, _ = self.attach_fixture()
+        native_run = subprocess.run
+        def retain_device(*args, **kwargs):
+            if args[0][:2] == ['/usr/bin/hdiutil', 'detach']:
+                return subprocess.CompletedProcess(args[0], 0)
+            return native_run(*args, **kwargs)
+        with patch.object(subprocess, 'run', side_effect=retain_device):
+            with self.assertRaisesRegex(AssertionError, 'owned test image attached'):
+                self.cleanup_fixtures()
+        self.assertTrue(image.is_file())
+        self.detach_leftover_test_mounts()
+
+    def test_foreign_unmounted_image_in_fixture_is_not_deleted_or_detached(self):
+        image, device, _ = self.attach_fixture(recorded=False)
+        try:
+            subprocess.run(['/usr/sbin/diskutil', 'unmountDisk', device], check=True,
+                           capture_output=True, timeout=60)
+            self.assert_no_test_mounts()
+            with self.assertRaisesRegex(AssertionError, 'attached image inside fixture'):
+                self.cleanup_fixtures()
+            self.assertTrue(image.is_file())
+            self.assertTrue(any(entity.get('dev-entry') == device
+                                for entry in self.disk_image_inventory()
+                                for entity in entry.get('system-entities', [])))
+        finally:
+            subprocess.run(['/usr/bin/hdiutil', 'detach', device], check=True,
+                           capture_output=True, timeout=60)
+
+    def build_with_busy_eject(self, *, already_ejected=False, attach_error=False, failures=1):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = attach ] && [ "$ATTACH_ERROR" = 1 ]; then
+  native_hdiutil "$@" || exit $?
+  printf 'simulated Resource busy after attach\\n' >&2
+  exit 16
+fi
+if [ "$1" = detach ]; then
+  count=0
+  [ ! -f "$HDIUTIL_TEST_DIR/eject-count" ] || count=$(cat "$HDIUTIL_TEST_DIR/eject-count")
+  count=$((count + 1))
+  printf '%s\\n' "$count" > "$HDIUTIL_TEST_DIR/eject-count"
+  if [ "$count" -le "$EJECT_FAILURES" ]; then
+  if [ "$ALREADY_EJECTED" = 1 ]; then
+    native_hdiutil "$@" || exit $?
+    printf 'simulated already-ejected error\\n' >&2
+    exit 1
+  fi
+  if [ "$count" = 1 ]; then /usr/sbin/diskutil unmountDisk "$2" >/dev/null || exit $?; fi
+  printf 'simulated could not eject %s - Resource busy\\n' "$2" >&2
+  exit 16
+  fi
+fi
+native_hdiutil "$@"
+''')
+        output = self.base / 'output-busy-eject'
+        result = subprocess.run(['bash', str(BUILD), str(self.payload), str(output),
+                                 VERSION, TARGET], capture_output=True, text=True, timeout=120,
+                                env={'PATH': f'{self.shim}:{os.environ.get("PATH", "/usr/bin:/bin")}',
+                                     'HDIUTIL_TEST_DIR': str(self.base),
+                                     'ALREADY_EJECTED': '1' if already_ejected else '0',
+                                     'ATTACH_ERROR': '1' if attach_error else '0',
+                                     'EJECT_FAILURES': str(failures)})
+        return result, output, (self.base / 'calls').read_text().splitlines()
+
+    def test_builder_retries_busy_eject_by_device_after_unmount(self):
+        result, output, calls = self.build_with_busy_eject()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Resource busy', result.stderr)
+        self.assertEqual(calls.count('detach'), 2)
+        self.assertTrue(list(output.glob('*.dmg.sha256')))
+        self.assert_no_test_mounts()
+
+    def test_builder_persistent_busy_eject_is_bounded_and_retains_attachment(self):
+        result, output, calls = self.build_with_busy_eject(failures=99)
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual(calls.count('detach'), 5)  # Four attempts plus the exit trap.
+        self.assertIn('failed after 4 attempts', result.stderr)
+        self.assertIn('retaining temporary mount for manual cleanup', result.stderr)
+        self.assertFalse(list(output.glob('*.sha256')))
+        images = self.attached_test_images()
+        self.assertEqual(len(images), 1)
+        self.assertTrue(all(image.is_file() for image in images))
+        self.assertEqual(self.mounted_test_mounts(), set())
+        self.detach_leftover_test_mounts()
+        self.assert_no_test_mounts()
+
+    def test_builder_already_ejected_device_is_success(self):
+        result, _, calls = self.build_with_busy_eject(already_ejected=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.count('detach'), 1)
+        self.assert_no_test_mounts()
+
+    def test_partial_attach_retries_busy_eject_after_unmount(self):
+        # Both attach attempts report busy after attachment. Each is fully
+        # detached before retry, including the first unmount-then-busy eject.
+        result, _, calls = self.build_with_busy_eject(attach_error=True)
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual(calls.count('attach'), 4)
+        self.assertEqual(calls.count('detach'), 5)
+        self.assert_no_test_mounts()
 
 
 if __name__ == '__main__':
