@@ -339,25 +339,26 @@ native_hdiutil "$@"
         return result, output, calls
 
     def assert_busy_attempts(self, operation, calls):
-    native = [json.loads(line) for line in
-              (self.base / 'native-results').read_text().splitlines()]
-    relevant = {operation, 'attach'} if operation == 'detach' else {operation}
-    failures = [record for record in native if record['action'] in relevant
-                and record['status'] != 0]
-    for record in failures:
-        self.assertTrue(record['status'] == 16 or re.search(
-            r'resource busy|device busy|resource temporarily unavailable|\bebusy\b',
-            record['stderr'], re.IGNORECASE), record)
-    # The injected busy response needs a retry. Real additional
-    # busy responses may also need retries, or partial-attach ejects.
-    # Every extra call must be explained by a recorded native busy
-    # failure; create/attach each still have a four-attempt ceiling.
-    attempts = calls.count(operation)
-    attach_failures = sum(record['action'] == 'attach' for record in failures)
-    ceiling = 4 + 5 * attach_failures if operation == 'detach' else 4
-    self.assertGreaterEqual(attempts, 2)
-    self.assertLessEqual(attempts, ceiling)
-    self.assertLessEqual(attempts - 2, len(failures))
+        native = [json.loads(line) for line in
+                  (self.base / 'native-results').read_text().splitlines()]
+        relevant = {operation, 'attach'} if operation == 'detach' else {operation}
+        failures = [record for record in native if record['action'] in relevant
+                    and record['status'] != 0]
+        for record in failures:
+            self.assertTrue(record['status'] == 16 or re.search(
+                r'resource busy|device busy|resource temporarily unavailable|\bebusy\b',
+                record['stderr'], re.IGNORECASE), record)
+        # The injected busy response needs a retry. Real additional
+        # busy responses may also need retries, or partial-attach ejects.
+        # Every extra call must be explained by a recorded native busy
+        # failure; create/attach each still have a four-attempt ceiling.
+        attempts = calls.count(operation)
+        attach_failures = sum(record['action'] == 'attach' for record in failures)
+        ceiling = 4 + 5 * attach_failures if operation == 'detach' else 4
+        self.assertGreaterEqual(attempts, 2)
+        self.assertLessEqual(attempts, ceiling)
+        self.assertLessEqual(attempts - 2, len(failures))
+
 
     def test_busy_create_attach_and_detach_recover(self):
         for operation in ('create', 'attach', 'detach'):
