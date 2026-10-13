@@ -12945,6 +12945,60 @@ async fn append_session_idle(
     store.settle_idle(envelope).await.map(|_| ())
 }
 
+/// Prepare a run bookkeeping envelope whose payload depends on an epoch that
+/// is chosen later (by the session actor). Identity, render and agent fields
+/// are the ones `append_payloads` gives every bookkeeping item.
+pub(crate) async fn deferred_bookkeeping_envelope(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_id: EventId,
+    payload: impl FnOnce(u64) -> Result<EventPayload, HaiderError> + Send + 'static,
+) -> Result<crate::session_hub::RunRouteEnvelopeBuilder, HaiderError> {
+    let mut template = supervisor_raw_envelope(
+        store,
+        device_id,
+        branch_id.cloned(),
+        Some(run_id.clone()),
+        event_id,
+        serde_json::Value::Null,
+    );
+    template.render.ui = false;
+    template.agent_id = store
+        .hub()
+        .delegation_for_child_session(store.session_id().clone())
+        .await?
+        .map(|record| record.agent_id);
+    Ok(Box::new(move |epoch| {
+        let payload = payload(epoch)?;
+        if !matches!(
+            &payload,
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { .. },
+                ..
+            })
+        ) {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "a deferred bookkeeping envelope must carry an extension item",
+                false,
+            ));
+        }
+        let mut envelope = template;
+        envelope.payload = serde_json::to_value(payload)
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot serialize supervisor event: {error}"),
+                    false,
+                )
+            })?
+            .into();
+        Ok(vec![envelope])
+    }))
+}
+
 pub(crate) async fn append_payloads(
     store: &HubStoreHandle,
     device_id: &DeviceId,

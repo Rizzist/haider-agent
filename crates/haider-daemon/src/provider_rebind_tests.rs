@@ -2262,3 +2262,148 @@ async fn resolved_route_refusal_after_matching_read_advances_run_epoch() {
         store.close().await.expect("close");
     }
 }
+
+/// A diverged route's next epoch is allocated by the session actor together
+/// with its run-route append. A selection, rebind or session resolution that
+/// commits while the append is pending can never be given the same epoch, and
+/// later resolutions in the run (including A->B->A) keep distinct provenance.
+#[tokio::test]
+async fn run_scoped_route_epoch_is_allocated_with_its_append() {
+    use haider_core::ProviderRouteCommitter as _;
+    let mut failures = Vec::new();
+    for variant in [
+        "budget_reselect",
+        "model_roundtrip",
+        "cross_provider",
+        "same_provider_model",
+        "account_pin",
+        "live_rebind",
+        "concurrent_resolution",
+    ] {
+        let root = tempfile::tempdir().expect("profile");
+        let session = SessionId::new(format!("route-alloc-{variant}"));
+        let run = RunId::new(format!("route-alloc-run-{variant}"));
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("hub");
+        let generation = store.worker_generation();
+        create_rebind_test_session(&hub, &session).await;
+        commit_test_rebind(&hub, &session, generation, 1).await;
+        let (lease, md, e0) = pin_rotation_test_run(&hub, &session, &run, generation).await;
+        let mut turn = lease.session_metadata().await.expect("md").expect("typed");
+        hub.run_output_pair(&session, &run)
+            .await
+            .expect("pair")
+            .expect("pin")
+            .restore_route(&mut turn);
+        // An epoch-only divergence sends the next served account to the
+        // run-scoped path.
+        select_rotation_test_model(
+            &hub,
+            &session,
+            generation,
+            "diverge",
+            "fake",
+            &md.model,
+            None,
+            Some(2500),
+        )
+        .await;
+        let probe = hub.install_run_route_append_probe(&session).await;
+        let racing_lease = lease.clone();
+        let racing_run = run.clone();
+        let racing_turn = turn.clone();
+        let commit = tokio::spawn(async move {
+            racing_lease
+                .commit_turn_resolved_route(&racing_run, &racing_turn, Some("acct-2"))
+                .await
+        });
+        // Reached after the run-scoped decision, before epoch allocation.
+        probe.run_route_reached.notified().await;
+        if variant == "concurrent_resolution" {
+            let current = lease.session_metadata().await.expect("md").expect("typed");
+            lease
+                .commit_resolved_route(&current, Some("session-acct"))
+                .await
+                .expect("concurrent route");
+        } else {
+            change_rotation_test_session(&hub, &session, generation, &md.model, variant).await;
+        }
+        let raced = lease.session_metadata().await.expect("md").expect("typed");
+        probe.run_route_release.notify_one();
+        let e2 = commit.await.expect("task").expect("run-scoped route");
+        let raced_epoch = raced.selection_epoch.unwrap_or(0);
+        if e2 <= raced_epoch {
+            failures.push(format!(
+                "{variant}: run epoch {e2} was not allocated after the racing session epoch {raced_epoch}"
+            ));
+        }
+        assert_eq!(
+            lease.session_metadata().await.expect("md").expect("typed"),
+            raced,
+            "{variant}: a run-scoped route never writes session metadata"
+        );
+        // Later resolutions in the same run, back to the first account and
+        // then a third one, through the real committer.
+        hub.install_resolved_route_probe(&session, false).await;
+        let mut selection = turn.clone();
+        selection.selection_epoch = Some(e2);
+        selection.resolved_route_alias = Some("acct-2".into());
+        selection.resolved_route_seen = true;
+        let committer = crate::worker::DaemonProviderRouteCommitter {
+            store: lease.clone(),
+            run_id: run.clone(),
+            selection: Arc::new(tokio::sync::Mutex::new(selection)),
+        };
+        let mut epochs = vec![e0, e2];
+        for account in ["acct-1", "acct-3"] {
+            epochs.push(
+                committer
+                    .commit(
+                        "fake",
+                        &md.model,
+                        &haider_protocol::ids::CredentialAlias::new(account),
+                    )
+                    .await
+                    .expect("later rotation"),
+            );
+        }
+        let facts =
+            rotation_route_facts(&store.read(&session, 0, 4096).await.expect("journal"), &run);
+        println!(
+            "ROUTE-ALLOC variant={variant} e0={e0} raced_session_epoch={raced_epoch} epochs={epochs:?} facts={facts:?}"
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .map(|(_, _, alias)| alias.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("acct-1"),
+                Some("acct-2"),
+                Some("acct-1"),
+                Some("acct-3")
+            ],
+            "{variant}: every served account change is journaled"
+        );
+        let mut fact_epochs = facts.iter().map(|fact| fact.1).collect::<Vec<_>>();
+        fact_epochs.sort_unstable();
+        fact_epochs.dedup();
+        let mut ids = facts.iter().map(|fact| fact.0.clone()).collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        if fact_epochs.len() != facts.len() || ids.len() != facts.len() {
+            failures.push(format!(
+                "{variant}: served accounts share a run epoch or item id: {facts:?}"
+            ));
+        }
+        drop(committer);
+        drop(lease);
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+    assert!(
+        failures.is_empty(),
+        "run-scoped epoch allocation failures: {failures:#?}"
+    );
+}

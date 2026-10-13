@@ -926,6 +926,12 @@ pub(crate) struct ResolvedRouteCommitProbe {
     pub pause: bool,
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+    /// Pauses a run-scoped route append after the route decision and before
+    /// the actor allocates its epoch: the window a read-outside allocation
+    /// would leave open to a concurrent selection.
+    pub pause_run_route: bool,
+    pub run_route_reached: tokio::sync::Notify,
+    pub run_route_release: tokio::sync::Notify,
 }
 
 pub(crate) struct ActiveRunOutputPairSnapshot {
@@ -1891,6 +1897,10 @@ enum ActorRegisterResult {
     CursorAhead { requested: u64, head: u64 },
 }
 
+/// Builds a run's route envelopes for an epoch chosen by the session actor.
+pub(crate) type RunRouteEnvelopeBuilder =
+    Box<dyn FnOnce(u64) -> Result<Vec<RawEnvelope>, HaiderError> + Send>;
+
 enum ActorCommand {
     Append {
         envelopes: Vec<RawEnvelope>,
@@ -2041,6 +2051,16 @@ enum ActorCommand {
         lease_id: WorkerLeaseId,
         expected_head: Option<u64>,
         envelopes: Vec<RawEnvelope>,
+        completed: oneshot::Sender<Result<Arc<[RawEnvelope]>, HaiderError>>,
+    },
+    /// Allocate a run-scoped route epoch from the actor's journal head and
+    /// append the envelopes built for it as a `WorkerAppend` in the same
+    /// actor turn.
+    WorkerAppendAllocatedEpoch {
+        lease_id: WorkerLeaseId,
+        floor: u64,
+        build: RunRouteEnvelopeBuilder,
+        allocated: oneshot::Sender<u64>,
         completed: oneshot::Sender<Result<Arc<[RawEnvelope]>, HaiderError>>,
     },
     WorkerProviderViewAppend {
@@ -7156,10 +7176,39 @@ impl SessionHub {
         session_id: &SessionId,
         pause: bool,
     ) -> Arc<ResolvedRouteCommitProbe> {
-        let probe = Arc::new(ResolvedRouteCommitProbe {
-            pause,
-            ..Default::default()
-        });
+        self.install_route_probe(
+            session_id,
+            ResolvedRouteCommitProbe {
+                pause,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Pause only the run-scoped route append, before its epoch allocation.
+    #[cfg(test)]
+    pub(crate) async fn install_run_route_append_probe(
+        &self,
+        session_id: &SessionId,
+    ) -> Arc<ResolvedRouteCommitProbe> {
+        self.install_route_probe(
+            session_id,
+            ResolvedRouteCommitProbe {
+                pause_run_route: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn install_route_probe(
+        &self,
+        session_id: &SessionId,
+        probe: ResolvedRouteCommitProbe,
+    ) -> Arc<ResolvedRouteCommitProbe> {
+        let probe = Arc::new(probe);
         self.inner
             .resolved_route_probes
             .lock()
@@ -8949,20 +8998,11 @@ impl HubStoreHandle {
         if route.resolved_seen && route.resolved_alias.as_deref() == alias {
             return Ok(session_epoch.unwrap_or(current));
         }
-        let epoch = if let Some(epoch) = session_epoch {
-            epoch
-        } else if route.resolved_seen {
-            self.latest_seq(&self.session_id)
-                .await?
-                .max(current)
-                .checked_add(1)
-                .ok_or_else(|| {
-                    HaiderError::new(ErrorCode::StoreCorrupt, "run route epoch exhausted", false)
-                })?
-        } else {
-            current
-        };
-        route.selection_epoch = Some(epoch);
+        // An accepted session commit owns its epoch, and a run's first
+        // resolution keeps its current epoch. Any other served-account change
+        // (a refused or diverged session commit) takes a fresh epoch that the
+        // session actor allocates atomically with the append below.
+        let fixed_epoch = session_epoch.or((!route.resolved_seen).then_some(current));
         route.resolved_alias = alias.map(str::to_owned);
         route.resolved_seen = true;
         let branch_id = self
@@ -8977,26 +9017,87 @@ impl HubStoreHandle {
                 )
             })?
             .branch_id;
-        let event_ids =
-            haider_core::EventIdGenerator::new(random_id("run-route").map_err(hub_error_as_store)?);
-        crate::worker::append_payloads(
+        let event_id =
+            haider_core::EventIdGenerator::new(random_id("run-route").map_err(hub_error_as_store)?)
+                .next();
+        let item_run = run_id.clone();
+        let build = crate::worker::deferred_bookkeeping_envelope(
             self,
             &self.hub.inner.device_id,
             run_id,
             branch_id.as_ref(),
-            &event_ids,
-            vec![EventPayload::Item(ItemEvent::Completed {
-                item_id: haider_protocol::ids::ItemId::new(format!("run-route-{run_id}-{epoch}")),
-                item: TurnItem::Extension {
-                    kind: haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND.into(),
-                    data: serde_json::to_value(route).map_err(|error| {
-                        HaiderError::new(ErrorCode::Internal, error.to_string(), false)
-                    })?,
-                },
-            })],
+            event_id,
+            move |epoch| {
+                route.selection_epoch = Some(epoch);
+                Ok(EventPayload::Item(ItemEvent::Completed {
+                    item_id: haider_protocol::ids::ItemId::new(format!(
+                        "run-route-{item_run}-{epoch}"
+                    )),
+                    item: TurnItem::Extension {
+                        kind: haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND
+                            .into(),
+                        data: serde_json::to_value(route).map_err(|error| {
+                            HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                        })?,
+                    },
+                }))
+            },
         )
         .await?;
-        Ok(epoch)
+        if let Some(epoch) = fixed_epoch {
+            let mut envelopes = build(epoch)?;
+            haider_core::StoreHandle::append(self, &mut envelopes).await?;
+            return Ok(epoch);
+        }
+        // A served-account change on a diverged route takes the next epoch,
+        // allocated by the session actor atomically with this append.
+        self.append_at_allocated_epoch(current, build).await
+    }
+
+    /// Append run-scoped envelopes at an epoch the session actor allocates
+    /// above both `floor` and its journal head, in the same actor turn as the
+    /// append, so no concurrent selection can be given the same epoch.
+    async fn append_at_allocated_epoch(
+        &self,
+        floor: u64,
+        build: RunRouteEnvelopeBuilder,
+    ) -> Result<u64, HaiderError> {
+        #[cfg(test)]
+        let probe = self
+            .hub
+            .inner
+            .resolved_route_probes
+            .lock()
+            .await
+            .get(&self.session_id)
+            .cloned();
+        #[cfg(test)]
+        if let Some(probe) = probe
+            && probe.pause_run_route
+        {
+            probe.run_route_reached.notify_one();
+            probe.run_route_release.notified().await;
+        }
+        let actor = self
+            .hub
+            .existing_actor(&self.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (allocated, allocation) = oneshot::channel();
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::WorkerAppendAllocatedEpoch {
+                lease_id: self.lease_id.clone(),
+                floor,
+                build,
+                allocated,
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        response.await.map_err(|_| hub_closed_store_error())??;
+        allocation.await.map_err(|_| hub_closed_store_error())
     }
 
     pub(crate) async fn commit_resolved_route(
