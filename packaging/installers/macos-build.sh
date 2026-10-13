@@ -29,16 +29,16 @@ refresh_attached_device() {
 import json, pathlib, plistlib, re, subprocess, sys, time
 image_path = pathlib.Path(sys.argv[1]).resolve()
 record = pathlib.Path(sys.argv[2])
-attach_device = None
+attach_devices = []
 if record.exists():
     saved = json.loads(record.read_text())
     image_path = pathlib.Path(saved["image"])
-    attach_device = saved["device"]
+    attach_devices = saved["devices"]
 else:
     try:
         attached = plistlib.loads(pathlib.Path(sys.argv[3]).read_bytes())
-        attach_device = next(entity["dev-entry"] for entity in attached["system-entities"]
-                             if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", "")))
+        attach_devices = [entity["dev-entry"] for entity in attached["system-entities"]
+                          if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
     except (OSError, ValueError, KeyError, StopIteration):
         pass  # A failed attach may emit no plist; recover by exact image path.
 for attempt in range(4):
@@ -57,15 +57,21 @@ for attempt in range(4):
                 same_image = current_path.samefile(image_path)
             except OSError:
                 pass
-        same_device = attach_device and any(entity.get("dev-entry") == attach_device
-                                            for entity in entities)
+        same_device = any(entity.get("dev-entry") in attach_devices for entity in entities)
         device_in_inventory |= bool(same_device)
         # Only initial attach output may establish the backing path by device.
         # Once recorded, a recycled device on another image conveys no ownership.
         if same_image or (not record.exists() and same_device):
             matched = (current_path, entities)
-    if not matched and attach_device and pathlib.Path(attach_device).exists() and not device_in_inventory:
-        incomplete = True
+    if not matched:
+        if any(pathlib.Path(device).exists() for device in attach_devices) and not device_in_inventory:
+            incomplete = True
+        point = pathlib.Path(sys.argv[4])
+        try:
+            if point.stat().st_dev != point.parent.stat().st_dev:
+                incomplete = True
+        except FileNotFoundError:
+            pass
     if incomplete:
         if attempt == 3:
             sys.stderr.buffer.write(result.stderr)
@@ -78,18 +84,20 @@ for attempt in range(4):
                        if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))), None)
         if not device:
             sys.exit("owned image is attached without a whole-disk device")
-        record.write_text(json.dumps({"image": str(current_path), "device": device}))
+        devices = [entity["dev-entry"] for entity in entities
+                   if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
+        record.write_text(json.dumps({"image": str(current_path), "devices": devices}))
         print(device)
     else:
         # Discard stale attach output after the first complete inventory.
-        record.write_text(json.dumps({"image": str(image_path), "device": None}))
+        record.write_text(json.dumps({"image": str(image_path), "devices": []}))
     sys.exit(0)
-' "$dmg" "$work/attached-image.json" "$work/attach.plist") || return 1
+' "$dmg" "$work/attached-image.json" "$work/attach.plist" "$work/mount") || return 1
   attached_device=$device
 }
 attachment_is_clear() {
   refresh_attached_device || return 1
-  [ -z "$attached_device" ]
+  [ -z "$attached_device" ] && mount_is_clear
 }
 detach_owned_image() {
   local status=0
@@ -190,7 +198,9 @@ run_hdiutil() {
     mounted=1
     rm -f "$work/attached-image.json"
     hdiutil attach "$@" -plist > "$work/attach.plist" || status=$?
-    refresh_attached_device || return 1
+    if ! refresh_attached_device; then
+      if [ "$status" -eq 0 ]; then status=1; fi
+    fi
     return "$status"
   fi
   if [ "$action" = detach ]; then

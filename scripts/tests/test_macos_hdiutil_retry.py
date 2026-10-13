@@ -122,8 +122,15 @@ native_hdiutil "$@"
         for attempt in range(4):
             result = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'],
                                     capture_output=True, timeout=60, check=True)
-            if b'cannot get IO media array' not in result.stderr:
-                return plistlib.loads(result.stdout).get('images', [])
+            images = plistlib.loads(result.stdout).get('images', [])
+            inventory_devices = {entity.get('dev-entry') for image in images
+                                 for entity in image.get('system-entities', [])}
+            devices = {record['device'] for record in self.recorded_attachments()
+                       if record['device']}
+            missing_device = any(Path(device).exists() and device not in inventory_devices
+                                 for device in devices)
+            if b'cannot get IO media array' not in result.stderr and not missing_device:
+                return images
             if attempt == 3:
                 raise RuntimeError('hdiutil attachment inventory remained incomplete')
             time.sleep(0.1 * (attempt + 1))
@@ -567,6 +574,30 @@ exec /usr/bin/mktemp "$@"
         return {'image-path': str(image), 'system-entities': [
             {'dev-entry': device}, {'mount-point': str(point)}]}
 
+    def test_failed_inventory_keeps_original_attach_status_and_fixtures(self):
+        shim = self.shim / 'hdiutil'
+        shim.write_text(shim.read_text().replace(
+            'if [ "$1" = "$HDIUTIL_TEST_OPERATION" ]; then',
+            'if [ "$1" = info ]; then exit 9; fi\n'
+            'if [ "$1" = "$HDIUTIL_TEST_OPERATION" ]; then'))
+        output = self.base / 'output-inventory-error'
+        result = subprocess.run(['bash', str(BUILD), str(self.payload), str(output),
+                                 VERSION, TARGET], capture_output=True, text=True, timeout=120,
+                                env={'PATH': f'{self.shim}:{os.environ.get("PATH", "/usr/bin:/bin")}',
+                                     'HDIUTIL_TEST_DIR': str(self.base),
+                                     'HDIUTIL_TEST_OPERATION': 'attach',
+                                     'HDIUTIL_TEST_FAILURES': '1',
+                                     'HDIUTIL_TEST_ERROR': 'Invalid argument',
+                                     'HDIUTIL_TEST_EXIT': '5'})
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertIn('retaining temporary mount for manual cleanup', result.stderr)
+        self.assertFalse(list(output.glob('*.sha256')))
+        images = self.attached_test_images()
+        self.assertEqual(len(images), 1)
+        self.assertTrue(all(image.is_file() for image in images))
+        self.detach_leftover_test_mounts()
+        self.assert_no_test_mounts()
+
     def test_incomplete_inventory_is_requeried(self):
         info = plistlib.dumps({'images': []})
         warning = b'hdiutil: info: cannot get IO media array for IOHDIXHDDriveOutKernel'
@@ -574,6 +605,20 @@ exec /usr/bin/mktemp "$@"
                 subprocess.CompletedProcess([], 0, info, warning),
                 subprocess.CompletedProcess([], 0, info, b'')]) as query:
             self.assertEqual(self.disk_image_inventory(), [])
+            self.assertEqual(query.call_count, 2)
+
+    def test_inventory_omitting_a_live_owned_device_is_requeried(self):
+        mine = self.mock_attachment(self.base / 'mount')
+        image = mine['image-path']
+        device = mine['system-entities'][0]['dev-entry']
+        missing = subprocess.CompletedProcess([], 0, plistlib.dumps({'images': []}), b'')
+        complete = subprocess.CompletedProcess([], 0, plistlib.dumps({'images': [mine]}), b'')
+        original_exists = Path.exists
+        def exists(path):
+            return str(path) == device or original_exists(path)
+        with patch.object(Path, 'exists', exists), \
+                patch.object(subprocess, 'run', side_effect=[missing, complete]) as query:
+            self.assertEqual(set(self.attached_test_images()), {Path(image).resolve()})
             self.assertEqual(query.call_count, 2)
 
     def test_incomplete_inventory_preserves_fixtures(self):
@@ -632,8 +677,8 @@ exec /usr/bin/mktemp "$@"
     def test_cleanup_already_gone_is_repeatable_noop(self):
         point = self.base / 'tmp.gone' / 'mount'
         (self.base / 'mountpoints').write_bytes(os.fsencode(str(point)) + b'\0')
-        with patch.object(subprocess, 'check_output', return_value=plistlib.dumps({
-                'images': []})), patch.object(subprocess, 'run') as detach:
+        with patch.object(self, 'disk_image_inventory', return_value=[]), \
+                patch.object(subprocess, 'run') as detach:
             self.detach_leftover_test_mounts()
             self.detach_leftover_test_mounts()
             detach.assert_not_called()
