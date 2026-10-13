@@ -13,6 +13,7 @@ case "$target" in aarch64-apple-darwin|x86_64-apple-darwin) ;; *) exit 2 ;; esac
 work=$(mktemp -d)
 mounted=0
 attached_device=
+create_started=0
 keychain_created=0
 original_keychains=()
 mount_is_clear() {
@@ -21,51 +22,62 @@ mount_is_clear() {
   mount_device=$(stat -f %d "$work/mount") || return 1
   [ "$work_device" = "$mount_device" ]
 }
-# hdiutil can unmount a volume before an eject fails. Keep the whole-disk
-# identity until the owned image disappears from the attachment inventory.
+# A device may outlive its mount or be recycled. Record identities from this
+# attach only, then require both the device and backing path on every audit.
 refresh_attached_device() {
   local device
   device=$(python3 -c '
 import json, pathlib, plistlib, re, subprocess, sys, time
 image_path = pathlib.Path(sys.argv[1]).resolve()
 record = pathlib.Path(sys.argv[2])
+before = pathlib.Path(sys.argv[5])
+snapshot = sys.argv[6] == "snapshot"
+saved = json.loads(record.read_text()) if record.exists() and not snapshot else None
 attach_devices = []
-if record.exists():
-    saved = json.loads(record.read_text())
-    image_path = pathlib.Path(saved["image"])
-    attach_devices = saved["devices"]
-else:
+if saved is None and not snapshot:
     try:
         attached = plistlib.loads(pathlib.Path(sys.argv[3]).read_bytes())
         attach_devices = [entity["dev-entry"] for entity in attached["system-entities"]
                           if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
-    except (OSError, ValueError, KeyError, StopIteration):
-        pass  # A failed attach may emit no plist; recover by exact image path.
+    except (OSError, ValueError, KeyError):
+        pass  # No plist: only new same-path devices can belong to this attach.
+previous = set(json.loads(before.read_text())) if before.exists() else set()
+def same_path(path, other):
+    if path == other:
+        return True
+    try:
+        return path.samefile(other)
+    except OSError:
+        return False
 for attempt in range(4):
     result = subprocess.run(["hdiutil", "info", "-plist"], capture_output=True)
-    result.check_returncode()
+    if result.returncode:
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit("hdiutil attachment inventory failed (exit %s)" % result.returncode)
     images = plistlib.loads(result.stdout).get("images", [])
     incomplete = b"cannot get IO media array" in result.stderr
-    matched = None
-    device_in_inventory = False
-    for image in images:
-        current_path = pathlib.Path(image.get("image-path", "")).resolve()
-        entities = image.get("system-entities", [])
-        same_image = current_path == image_path
-        if not same_image:
-            try:
-                same_image = current_path.samefile(image_path)
-            except OSError:
-                pass
-        same_device = any(entity.get("dev-entry") in attach_devices for entity in entities)
-        device_in_inventory |= bool(same_device)
-        # Only initial attach output may establish the backing path by device.
-        # Once recorded, a recycled device on another image conveys no ownership.
-        if same_image or (not record.exists() and same_device):
-            matched = (current_path, entities)
-    if not matched:
-        if any(pathlib.Path(device).exists() for device in attach_devices) and not device_in_inventory:
-            incomplete = True
+    identities = [(pathlib.Path(image["image-path"]).resolve(), entity["dev-entry"])
+                  for image in images if "image-path" in image
+                  for entity in image.get("system-entities", [])
+                  if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
+    inventory_devices = {device for path, device in identities}
+    if snapshot:
+        owned = []
+    elif saved is not None:
+        owned = [(path, device) for path, device in identities
+                 if any(device == item["device"] and same_path(path, pathlib.Path(item["image"]))
+                        for item in saved)]
+    elif attach_devices:
+        # This attach output establishes the actual backing path for each device.
+        owned = [(path, device) for path, device in identities
+                 if device in attach_devices and device not in previous]
+    else:
+        owned = [(path, device) for path, device in identities
+                 if same_path(path, image_path) and device not in previous]
+    known_devices = [item["device"] for item in saved] if saved is not None else attach_devices
+    if any(pathlib.Path(device).exists() and device not in inventory_devices for device in known_devices):
+        incomplete = True
+    if not owned and not snapshot:
         point = pathlib.Path(sys.argv[4])
         try:
             if point.stat().st_dev != point.parent.stat().st_dev:
@@ -75,24 +87,18 @@ for attempt in range(4):
     if incomplete:
         if attempt == 3:
             sys.stderr.buffer.write(result.stderr)
-            sys.exit("hdiutil attachment inventory remained incomplete")
+            sys.exit("hdiutil attachment inventory remained incomplete; recorded devices: %s" %
+                     ", ".join(known_devices))
         time.sleep(0.1 * (attempt + 1))
         continue
-    if matched:
-        current_path, entities = matched
-        device = next((entity["dev-entry"] for entity in entities
-                       if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))), None)
-        if not device:
-            sys.exit("owned image is attached without a whole-disk device")
-        devices = [entity["dev-entry"] for entity in entities
-                   if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
-        record.write_text(json.dumps({"image": str(current_path), "devices": devices}))
-        print(device)
+    if snapshot:
+        before.write_text(json.dumps([device for path, device in identities if same_path(path, image_path)]))
     else:
-        # Discard stale attach output after the first complete inventory.
-        record.write_text(json.dumps({"image": str(image_path), "devices": []}))
+        record.write_text(json.dumps([{"image": str(path), "device": device} for path, device in owned]))
+        for path, device in owned:
+            print(device)
     sys.exit(0)
-' "$dmg" "$work/attached-image.json" "$work/attach.plist" "$work/mount") || return 1
+' "$dmg" "$work/attached-image.json" "$work/attach.plist" "$work/mount" "$work/before-attach.json" "${1:-refresh}") || return 1
   attached_device=$device
 }
 attachment_is_clear() {
@@ -104,15 +110,26 @@ detach_owned_image() {
   # Recheck image ownership before using a device name that can be recycled.
   refresh_attached_device || return 1
   [ -n "$attached_device" ] || return 0
-  hdiutil detach "$attached_device" || status=$?
+  local device devices=$attached_device
+  while IFS= read -r device; do
+    # Ejecting the backing disk can also remove its synthesized APFS disk.
+    # Recheck each remaining identity instead of using a now-stale device list.
+    refresh_attached_device || return 1
+    case $'\n'"$attached_device"$'\n' in
+      *$'\n'"$device"$'\n'*) ;;
+      *) continue ;;
+    esac
+    hdiutil detach "$device" || { status=$?; break; }
+  done <<< "$devices"
   if attachment_is_clear; then return 0; fi
+  printf 'Owned image still attached as %s after detach\n' "$attached_device" >&2
   if [ "$status" -eq 0 ]; then status=1; fi
   return "$status"
 }
 cleanup() {
   local keep_work=0
   if [ "$mounted" = 1 ]; then
-    detach_owned_image >/dev/null 2>&1 || true
+    hdiutil_retry detach no_cleanup >/dev/null 2>&1 || true
     if ! attachment_is_clear || ! mount_is_clear; then
       printf 'Could not detach %s (%s); retaining temporary mount for manual cleanup\n' "$attached_device" "$work/mount" >&2
       keep_work=1
@@ -191,9 +208,26 @@ pkgutil --expand-full "$pkg" "$work/expanded"
 python3 "$here/macos-verify.py" "$work/expanded" "$payload" "$version" "$target"
 cp "$pkg" "$work/image/"
 run_hdiutil() {
-  local action=$1 status=0
-  shift
+  local action=$1 diagnostic=$2 status=0
+  shift 2
+  if [ "$action" = create ]; then
+    create_started=0
+    if [ -e "$dmg" ] || [ -L "$dmg" ]; then
+      printf 'Refusing to replace existing disk image %s\n' "$dmg" >&2
+      return 1
+    fi
+    create_started=1
+    hdiutil create "$@" || status=$?
+    # A destination created concurrently was never our partial output.
+    if [ "$status" -ne 0 ] && { [ "$status" -eq 17 ] || LC_ALL=C grep -Eiq 'file exists|eexist' "$diagnostic"; }; then
+      create_started=0
+    fi
+    return "$status"
+  fi
   if [ "$action" = attach ]; then
+    # Snapshot before attach: a partial failure may return no device plist.
+    # Refuse to attach if the pre-existing devices cannot be inventoried.
+    refresh_attached_device snapshot || return 1
     # Arm the exit trap even when attach creates a device and then returns error.
     mounted=1
     rm -f "$work/attached-image.json"
@@ -214,7 +248,9 @@ hdiutil_retry() {
   shift 2
   for ((attempt=1; attempt<=4; attempt++)); do
     diagnostic=$(mktemp "$work/hdiutil.XXXXXX")
-    if run_hdiutil "$action" "$@" 2>"$diagnostic"; then
+    # The callback reads diagnostics only after the native command has exited.
+    # shellcheck disable=SC2094
+    if run_hdiutil "$action" "$diagnostic" "$@" 2>"$diagnostic"; then
       cat "$diagnostic" >&2
       rm -f "$diagnostic"
       return 0
@@ -242,7 +278,11 @@ hdiutil_retry() {
     sleep "$((1 << (attempt - 1)))"
   done
 }
-remove_partial_dmg() { rm -f "$dmg"; }
+remove_partial_dmg() {
+  [ "$create_started" = 1 ] || return 0
+  rm -f "$dmg" || return $?
+  create_started=0
+}
 no_cleanup() { :; }
 detach_partial_mount() {
   detach_owned_image >/dev/null 2>&1 || true

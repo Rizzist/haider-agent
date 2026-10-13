@@ -48,13 +48,44 @@ NATIVE_PY
   python3 - "$@" <<'TRACE_PY'
 import json, os, pathlib, plistlib, re, subprocess, sys
 arguments = sys.argv[1:]
-image = str(pathlib.Path(arguments[1]).resolve())
+# hdiutil accepts flags before the image, including flags with values.
+value_flags = {'-mount', '-mountpoint', '-mountroot', '-mountrandom', '-shadow',
+               '-imagekey', '-drivekey', '-encryption', '-recover', '-cacert'}
+positional = []
+index = 1
+while index < len(arguments):
+    argument = arguments[index]
+    if argument in value_flags:
+        index += 2
+    elif argument.startswith('-'):
+        index += 1
+    else:
+        positional.append(argument)
+        index += 1
+if len(positional) != 1:
+    sys.exit('cannot identify hdiutil attach image argument')
+image = str(pathlib.Path(positional[0]).resolve())
 record = pathlib.Path(os.environ['HDIUTIL_TEST_DIR']) / 'attachments'
 def append(device):
     with record.open('a') as output:
         output.write(json.dumps({'image': image, 'device': device}) + '\\n')
-# Record the actual native argument before attach, including a substituted image.
+def same_image(path):
+    path = pathlib.Path(path).resolve()
+    if str(path) == image:
+        return True
+    try:
+        return path.samefile(image)
+    except OSError:
+        return False
+def inventory_devices():
+    info = plistlib.loads(subprocess.check_output(['/usr/bin/hdiutil', 'info', '-plist']))
+    return {entity['dev-entry'] for attached in info.get('images', [])
+            if same_image(attached.get('image-path', ''))
+            for entity in attached.get('system-entities', [])
+            if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', ''))}
+# Preserve the attempted path, but a path without a device grants no ownership.
 append(None)
+previous = inventory_devices()
 if '-plist' not in arguments: arguments.append('-plist')
 result = subprocess.run(['/usr/bin/hdiutil', *arguments], capture_output=True)
 with (record.parent / 'native-results').open('a') as output:
@@ -66,16 +97,12 @@ try:
     attached = plistlib.loads(result.stdout)
 except ValueError:
     attached = {}
-for entity in attached.get('system-entities', []):
-    device = entity.get('dev-entry', '')
-    if re.fullmatch(r'/dev/disk[0-9]+', device): append(device)
-info = plistlib.loads(subprocess.check_output(['/usr/bin/hdiutil', 'info', '-plist']))
-for attached in info.get('images', []):
-    if str(pathlib.Path(attached.get('image-path', '')).resolve()) == image:
-        for entity in attached.get('system-entities', []):
-            device = entity.get('dev-entry', '')
-            if re.fullmatch(r'/dev/disk[0-9]+', device):
-                append(device)
+devices = {entity['dev-entry'] for entity in attached.get('system-entities', [])
+           if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', ''))}
+# The plist belongs to this invocation. No plist: use only the new devices.
+for device in (devices if devices else inventory_devices() - previous):
+    if device not in previous:
+        append(device)
 sys.exit(result.returncode)
 TRACE_PY
 }
@@ -157,24 +184,35 @@ native_hdiutil "$@"
                 if 'mount-point' in entity}
 
     def attached_test_images(self, inventory=None):
-        owned = {Path(record['image']).resolve() for record in self.recorded_attachments()}
+        owned = [(Path(record['image']).resolve(), record['device'])
+                 for record in self.recorded_attachments() if record['device']]
         if not owned:
             return {}
         if inventory is None:
             inventory = self.disk_image_inventory()
-        def is_owned(path):
-            if path in owned:
-                return True
-            for record in owned:
+        def is_owned(path, device):
+            for recorded_path, recorded_device in owned:
+                if device != recorded_device:
+                    continue
+                if path == recorded_path:
+                    return True
                 try:
-                    if path.samefile(record):
+                    if path.samefile(recorded_path):
                         return True
                 except OSError:
                     pass
             return False
-        return {Path(image['image-path']).resolve(): image
-                for image in inventory if 'image-path' in image
-                and is_owned(Path(image['image-path']).resolve())}
+        attached = {}
+        for image in inventory:
+            if 'image-path' not in image:
+                continue
+            path = Path(image['image-path']).resolve()
+            entities = [entity for entity in image.get('system-entities', [])
+                        if is_owned(path, entity.get('dev-entry'))]
+            if entities:
+                attached.setdefault(path, {'image-path': str(path), 'system-entities': []})[
+                    'system-entities'].extend(entities)
+        return attached
 
     def mounted_test_mounts(self, inventory=None):
         owned = self.recorded_mountpoints()
@@ -205,8 +243,14 @@ native_hdiutil "$@"
             devices = [entity['dev-entry'] for entity in image.get('system-entities', [])
                        if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', ''))]
             self.assertTrue(devices, 'owned attached image has no whole-disk device')
-            subprocess.run(['/usr/bin/hdiutil', 'detach', devices[0]], check=True,
-                           capture_output=True, text=True, timeout=60)
+            for device in devices:
+                # Re-audit each identity before using a recyclable device name.
+                current = self.attached_test_images().get(Path(image['image-path']).resolve(), {})
+                if not any(entity.get('dev-entry') == device
+                           for entity in current.get('system-entities', [])):
+                    continue
+                subprocess.run(['/usr/bin/hdiutil', 'detach', device], check=True,
+                               capture_output=True, text=True, timeout=60)
         self.assertEqual(self.attached_test_images(), {}, 'owned test image attached')
         remaining = self.disk_image_mountpoints()
         self.assertEqual(self.mounted_test_mounts(remaining), set(), 'owned test mount retained')
@@ -220,9 +264,24 @@ native_hdiutil "$@"
     def remove_clear_directory(self, directory, inventory, label):
         if not directory.exists():
             return
+        root = directory.resolve()
+        def image_is_inside(image):
+            path = Path(image['image-path']).resolve()
+            if path.is_relative_to(root):
+                return True
+            # realpath does not normalize filesystem case/Unicode aliases.
+            # An aliased parent can still be this exact directory, even when
+            # an attached image's backing file has already been removed.
+            for parent in path.parents:
+                try:
+                    if parent.samefile(root):
+                        return True
+                except OSError:
+                    pass
+            return False
         # Protect even foreign backing files whose volumes are already unmounted.
-        self.assertFalse(any(Path(image['image-path']).resolve().is_relative_to(directory.resolve())
-                             for image in self.disk_image_inventory() if 'image-path' in image),
+        self.assertFalse(any(image_is_inside(image) for image in self.disk_image_inventory()
+                             if 'image-path' in image),
                          f'attached image inside {label}')
         self.assertFalse(any(mount.is_relative_to(directory.resolve()) for mount in inventory),
                          f'unrecorded mount inside {label}')
@@ -520,13 +579,16 @@ exec /bin/rm "$@"
         self.unrecorded_mountpoint.mkdir(parents=True)
         foreign_image = self.base / 'foreign.dmg'
         marker = self.unrecorded_mountpoint / 'foreign-data.txt'
+        foreign_device = None
         try:
             subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
                             '-volname', 'Foreign973', str(foreign_image)], check=True,
                            capture_output=True, timeout=60)
-            subprocess.run(['/usr/bin/hdiutil', 'attach', str(foreign_image), '-nobrowse',
-                            '-mountpoint', str(self.unrecorded_mountpoint)], check=True,
-                           capture_output=True, timeout=60)
+            attached = plistlib.loads(subprocess.check_output(
+                ['/usr/bin/hdiutil', 'attach', str(foreign_image), '-nobrowse',
+                 '-mountpoint', str(self.unrecorded_mountpoint), '-plist'], timeout=60))
+            foreign_device = next(entity['dev-entry'] for entity in attached['system-entities']
+                                  if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
             marker.write_text('foreign fixture data\n')
             # The physical preflight must protect an unrecorded writable volume
             # even when an inventory spelling mismatch makes it absent here.
@@ -538,19 +600,8 @@ exec /bin/rm "$@"
                 self.assertTrue(self.payload.is_dir())
         finally:
             # The independent caller ejects its own exact device, even on failure.
-            for image in self.disk_image_inventory():
-                if Path(image.get('image-path', '')).resolve() != foreign_image.resolve():
-                    continue
-                device = next(entity['dev-entry'] for entity in image['system-entities']
-                              if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
-                for attempt in range(4):
-                    result = subprocess.run(['/usr/bin/hdiutil', 'detach', device],
-                                            capture_output=True, timeout=60)
-                    if result.returncode == 0:
-                        break
-                    if attempt == 3:
-                        result.check_returncode()
-                    time.sleep(0.1 * (attempt + 1))
+            if foreign_device:
+                self.recover_foreign(foreign_image, foreign_device)
 
     def test_external_builder_directory_with_spaces_tmpdir_set_and_unset(self):
         external = Path(tempfile.mkdtemp(prefix='hdiutil builder with spaces '))
@@ -597,7 +648,7 @@ exec /usr/bin/mktemp "$@"
                 result, _, calls = run.result()
                 self.assertEqual(result.returncode, 16, result.stderr)
                 self.assertEqual([calls.count(op) for op in ('create', 'attach', 'detach')],
-                                 [1, 1, 6])
+                                 [1, 1, 9])
         mine, theirs = self.mounted_test_mounts(), other.mounted_test_mounts()
         self.assertEqual(len(mine), 1)
         self.assertEqual(len(theirs), 1)
@@ -635,7 +686,7 @@ exec /usr/bin/mktemp "$@"
         shim = self.shim / 'hdiutil'
         shim.write_text(shim.read_text().replace(
             'if [ "$1" = "$HDIUTIL_TEST_OPERATION" ]; then',
-            'if [ "$1" = info ]; then exit 9; fi\n'
+            'if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/attachments" ]; then exit 9; fi\n'
             'if [ "$1" = "$HDIUTIL_TEST_OPERATION" ]; then'))
         output = self.base / 'output-inventory-error'
         result = subprocess.run(['bash', str(BUILD), str(self.payload), str(output),
@@ -798,7 +849,7 @@ exec /usr/bin/mktemp "$@"
         subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
                         '-volname', f'Owned973-{self.base.name}', str(image)], check=True,
                        capture_output=True, timeout=60)
-        arguments = ['attach', str(image), '-nobrowse']
+        arguments = ['attach', str(image), '-nobrowse', '-plist']
         point = self.base / 'mount'
         if mountpoint:
             point.mkdir()
@@ -808,13 +859,16 @@ exec /usr/bin/mktemp "$@"
             command = [str(self.shim / 'hdiutil'), *arguments]
         else:
             command = ['/usr/bin/hdiutil', *arguments]
-        subprocess.run(command, check=True, capture_output=True, timeout=60, env={
+        result = subprocess.run(command, check=True, capture_output=True, timeout=60, env={
             'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
             'HDIUTIL_TEST_DIR': str(self.base)})
-        attached = next(entry for entry in self.disk_image_inventory()
-                        if Path(entry.get('image-path', '')).resolve() == image.resolve())
-        device = next(entity['dev-entry'] for entity in attached['system-entities']
+        own = plistlib.loads(result.stdout)
+        device = next(entity['dev-entry'] for entity in own['system-entities']
                       if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
+        attached = next(entry for entry in self.disk_image_inventory()
+                        if Path(entry.get('image-path', '')).resolve() == image.resolve()
+                        and any(entity.get('dev-entry') == device
+                                for entity in entry.get('system-entities', [])))
         return image, device, attached
 
     def test_attached_unmounted_image_is_detected_and_detached_before_deletion(self):
@@ -840,6 +894,7 @@ exec /usr/bin/mktemp "$@"
         self.assertFalse(self.base.exists())
         self.assertFalse(any(entity.get('dev-entry') == device
                              for entry in self.disk_image_inventory()
+                             if Path(entry.get('image-path', '')).resolve() == image.resolve()
                              for entity in entry.get('system-entities', [])))
         self.assert_no_test_mounts()
 
@@ -898,8 +953,7 @@ exec /usr/bin/mktemp "$@"
                                 for entry in self.disk_image_inventory()
                                 for entity in entry.get('system-entities', [])))
         finally:
-            subprocess.run(['/usr/bin/hdiutil', 'detach', device], check=True,
-                           capture_output=True, timeout=60)
+            self.recover_foreign(image, device)
 
     def build_with_busy_eject(self, *, already_ejected=False, attach_error=False, failures=1):
         (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
@@ -947,7 +1001,7 @@ native_hdiutil "$@"
     def test_builder_persistent_busy_eject_is_bounded_and_retains_attachment(self):
         result, output, calls = self.build_with_busy_eject(failures=99)
         self.assertEqual(result.returncode, 16, result.stderr)
-        self.assertEqual(calls.count('detach'), 5)  # Four attempts plus the exit trap.
+        self.assertEqual(calls.count('detach'), 8)  # Four attempts plus four in the exit trap.
         self.assertIn('failed after 4 attempts', result.stderr)
         self.assertIn('retaining temporary mount for manual cleanup', result.stderr)
         self.assertFalse(list(output.glob('*.sha256')))
@@ -972,6 +1026,300 @@ native_hdiutil "$@"
         self.assertEqual(calls.count('attach'), 4)
         self.assertEqual(calls.count('detach'), 5)
         self.assert_no_test_mounts()
+
+    def builder_environment(self, **extra):
+        return {'PATH': f'{self.shim}:{os.environ.get("PATH", "/usr/bin:/bin")}',
+                'HDIUTIL_TEST_DIR': str(self.base), **extra}
+
+    def run_builder(self, output, **extra):
+        return subprocess.run(['bash', str(BUILD), str(self.payload), str(output),
+                               VERSION, TARGET], capture_output=True, text=True,
+                              timeout=180, env=self.builder_environment(**extra))
+
+    def foreign_at_output_path(self, output, *, mounted):
+        output.mkdir()
+        image = output / f'haider-v{VERSION}-{TARGET}.dmg'
+        point = self.base / f'foreign-{output.name}'
+        point.mkdir()
+        subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                        '-volname', 'Foreign973', str(image)], check=True, capture_output=True)
+        attached = plistlib.loads(subprocess.check_output(
+            ['/usr/bin/hdiutil', 'attach', str(image), '-readonly', '-nobrowse',
+             '-mountpoint', str(point), '-plist']))
+        device = next(entity['dev-entry'] for entity in attached['system-entities']
+                      if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
+        if not mounted:
+            subprocess.run(['/usr/sbin/diskutil', 'unmountDisk', device],
+                           check=True, capture_output=True)
+        image.unlink()
+        return image, device, point
+
+    def image_for_device(self, device):
+        return next((image for image in self.disk_image_inventory()
+                     if any(entity.get('dev-entry') == device
+                            for entity in image.get('system-entities', []))), None)
+
+    def recover_foreign(self, image, device):
+        for attempt in range(4):
+            attached = self.image_for_device(device)
+            if attached is None:
+                return
+            path = Path(attached['image-path']).resolve()
+            same_image = path == image.resolve()
+            if not same_image:
+                try:
+                    same_image = path.samefile(image)
+                except OSError:
+                    pass
+            if not same_image:
+                return
+            result = subprocess.run(['/usr/bin/hdiutil', 'detach', device],
+                                    capture_output=True, timeout=60)
+            if result.returncode == 0:
+                return
+            if attempt == 3 or (result.returncode != 16 and not re.search(
+                    rb'resource busy|device busy|resource temporarily unavailable|\bebusy\b',
+                    result.stderr, re.IGNORECASE)):
+                result.check_returncode()
+            time.sleep(0.1 * (attempt + 1))
+
+    def test_builder_leaves_same_path_foreign_mounted_and_unmounted(self):
+        for mounted in (True, False):
+            for no_plist in (False, True):
+                with self.subTest(mounted=mounted, no_plist=no_plist):
+                    output = self.base / f'foreign-output-{mounted}-{no_plist}'
+                    image, device, point = self.foreign_at_output_path(output, mounted=mounted)
+                    try:
+                        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = attach ] && [ "$NO_PLIST" = 1 ] && [ ! -f "$HDIUTIL_TEST_DIR/no-plist-once" ]; then
+  touch "$HDIUTIL_TEST_DIR/no-plist-once"
+  native_hdiutil "$@" >/dev/null || exit $?
+  printf 'simulated Resource busy without plist\\n' >&2
+  exit 16
+fi
+native_hdiutil "$@"
+''')
+                        (self.base / 'no-plist-once').unlink(missing_ok=True)
+                        result = self.run_builder(output, NO_PLIST='1' if no_plist else '0')
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn('macOS installer gate PASS', result.stdout)
+                        self.assertTrue(self.image_for_device(device), 'foreign attachment ejected')
+                        self.assertEqual(point.stat().st_dev != point.parent.stat().st_dev, mounted)
+                        self.assertNotIn(device, {row['device'] for row in self.recorded_attachments()
+                                                 if Path(row['image']).resolve() == image.resolve()})
+                        self.assert_no_test_mounts()
+                    finally:
+                        self.recover_foreign(image, device)
+
+    def test_trace_flags_before_image_excludes_same_path_foreign(self):
+        output = self.base / 'trace-output'
+        image, foreign_device, _ = self.foreign_at_output_path(output, mounted=False)
+        try:
+            subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                            '-volname', 'Owned973', str(image)], check=True, capture_output=True)
+            point = self.base / 'trace-owned-mount'
+            point.mkdir()
+            # Exercise both plist and no-plist recording with flags before the image.
+            for no_plist in (False, True):
+                with self.subTest(no_plist=no_plist):
+                    trace = HDIUTIL_TRACE
+                    if no_plist:
+                        trace = trace.replace(
+                            "result = subprocess.run(['/usr/bin/hdiutil', *arguments], capture_output=True)",
+                            "result = subprocess.run(['/usr/bin/hdiutil', *arguments], capture_output=True)\n"
+                            "result.stdout = b''")
+                    (self.shim / 'hdiutil').write_text(trace + 'native_hdiutil "$@"\n')
+                    subprocess.run([str(self.shim / 'hdiutil'), 'attach', '-readonly',
+                                    '-mount', 'required',
+                                    '-mountpoint', str(point), '-nobrowse', str(image)],
+                                   check=True, capture_output=True, env=self.builder_environment())
+                    self.assertNotIn(foreign_device,
+                                     {row['device'] for row in self.recorded_attachments()})
+                    self.assertEqual(len(self.attached_test_images()), 1)
+                    self.detach_leftover_test_mounts()
+                    self.assertTrue(self.image_for_device(foreign_device))
+                    self.assert_no_test_mounts()
+        finally:
+            self.recover_foreign(image, foreign_device)
+
+    def test_same_path_foreign_device_is_not_owned_by_helper(self):
+        image = self.base / 'same.dmg'
+        (self.base / 'attachments').write_text(json.dumps({
+            'image': str(image), 'device': '/dev/disk973'}) + '\n')
+        foreign = {'image-path': str(image), 'system-entities': [{'dev-entry': '/dev/disk974'}]}
+        with patch.object(self, 'disk_image_inventory', return_value=[foreign]), \
+                patch.object(subprocess, 'run') as detach:
+            self.assertEqual(self.attached_test_images(), {})
+            self.detach_leftover_test_mounts()
+            detach.assert_not_called()
+
+    def test_foreign_unmounted_image_with_case_unicode_alias_preserves_fixture(self):
+        image = self.base / 'foreign-\u00e9.dmg'
+        alias = self.base.parent / self.base.name.upper() / 'FOREIGN-e\u0301.DMG'
+        subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                        '-volname', 'AliasForeign973', str(image)], check=True, capture_output=True)
+        if not alias.exists() or not alias.samefile(image):
+            self.skipTest('filesystem has no case/Unicode aliases')
+        attached = plistlib.loads(subprocess.check_output(
+            ['/usr/bin/hdiutil', 'attach', str(alias), '-readonly', '-nomount', '-plist']))
+        device = next(entity['dev-entry'] for entity in attached['system-entities']
+                      if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
+        # The independent creator records the actual native identity, including
+        # its spelling, so recovery stays safe even if a mutant removes backing.
+        identity = Path(self.image_for_device(device)['image-path']).resolve()
+        try:
+            self.assert_no_test_mounts()
+            with self.assertRaisesRegex(AssertionError, 'attached image inside fixture'):
+                self.cleanup_fixtures()
+            self.assertTrue(image.exists())
+            self.assertTrue(self.payload.exists())
+            self.assertTrue(self.image_for_device(device))
+        finally:
+            self.recover_foreign(identity, device)
+
+    def test_builder_exit_trap_retries_busy_eject_after_forced_failure(self):
+        (self.shim / 'cmp').write_text('#!/bin/bash\necho "forced cmp failure" >&2\nexit 7\n')
+        (self.shim / 'cmp').chmod(0o755)
+        result, output, calls = self.build_with_busy_eject()
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn('forced cmp failure', result.stderr)
+        self.assertEqual(calls.count('detach'), 2)
+        self.assertFalse(list(output.glob('*.sha256')))
+        self.assert_no_test_mounts()
+
+    def test_builder_post_detach_refusal_names_owned_device(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = detach ]; then exit 0; fi
+native_hdiutil "$@"
+''')
+        output = self.base / 'output-refusal'
+        result = self.run_builder(output)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        devices = {row['device'] for row in self.recorded_attachments() if row['device']}
+        self.assertTrue(devices)
+        self.assertIn('Owned image still attached as', result.stderr)
+        for device in devices:
+            self.assertIn(device, result.stderr)
+        self.assertIn('retaining temporary mount', result.stderr)
+        self.assertFalse(list(output.glob('*.sha256')))
+        self.detach_leftover_test_mounts()
+
+    def test_builder_recycled_device_does_not_confer_ownership(self):
+        # A deterministic inventory shim replaces the ejected disk by a different
+        # backing path under the same device ID. No foreign disk is really ejected.
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = detach ] && [ -f "$HDIUTIL_TEST_DIR/recycled-device" ]; then
+  printf 'attempted detach of recycled foreign device\\n' >&2
+  exit 99
+fi
+if [ "$1" = detach ]; then
+  native_hdiutil "$@" || exit $?
+  printf '%s' "$2" > "$HDIUTIL_TEST_DIR/recycled-device"
+  exit 0
+fi
+if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/recycled-device" ]; then
+  python3 - <<'RECYCLED'
+import os, pathlib, plistlib, subprocess
+base = pathlib.Path(os.environ['HDIUTIL_TEST_DIR'])
+info = plistlib.loads(subprocess.check_output(['/usr/bin/hdiutil', 'info', '-plist']))
+info['images'].append({'image-path': str(base / 'foreign-recycled.dmg'),
+    'system-entities': [{'dev-entry': (base / 'recycled-device').read_text()}]})
+plistlib.dump(info, __import__('sys').stdout.buffer)
+RECYCLED
+  exit 0
+fi
+native_hdiutil "$@"
+''')
+        result = self.run_builder(self.base / 'output-recycled')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('attempted detach of recycled foreign', result.stderr)
+        self.assertIn('macOS installer gate PASS', result.stdout)
+        self.assert_no_test_mounts()
+
+    def test_builder_missing_live_recorded_device_preserves_attachment(self):
+        # After a real unmount, omit the still-live device from info, with no
+        # warning. The builder must retry inventory and retain its work tree.
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = detach ]; then
+  /usr/sbin/diskutil unmountDisk "$2" >/dev/null || exit $?
+  touch "$HDIUTIL_TEST_DIR/omit-live-device"
+  exit 0
+fi
+if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/omit-live-device" ]; then
+  echo info-omitted >> "$HDIUTIL_TEST_DIR/omissions"
+  python3 -c 'import plistlib,sys; plistlib.dump({"images": []},sys.stdout.buffer)'
+  exit 0
+fi
+native_hdiutil "$@"
+''')
+        result = self.run_builder(self.base / 'output-missing-live')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('inventory remained incomplete', result.stderr)
+        self.assertIn('retaining temporary mount', result.stderr)
+        self.assertGreaterEqual(len((self.base / 'omissions').read_text().splitlines()), 4)
+        images = self.attached_test_images()
+        self.assertEqual(len(images), 1)
+        self.assertTrue(all(image.exists() for image in images))
+        self.assertEqual(self.mounted_test_mounts(), set())
+        self.detach_leftover_test_mounts()
+
+
+    def test_builder_preserves_existing_foreign_backing_file(self):
+        for mounted in (True, False):
+            with self.subTest(mounted=mounted):
+                output = self.base / f'existing-foreign-{mounted}'
+                output.mkdir()
+                image = output / f'haider-v{VERSION}-{TARGET}.dmg'
+                point = self.base / f'existing-mount-{mounted}'
+                point.mkdir()
+                subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                                '-volname', 'ExistingForeign973', str(image)],
+                               check=True, capture_output=True)
+                arguments = ['/usr/bin/hdiutil', 'attach', str(image), '-readonly', '-plist']
+                arguments += ['-mountpoint', str(point)] if mounted else ['-nomount']
+                attached = plistlib.loads(subprocess.check_output(arguments))
+                device = next(entity['dev-entry'] for entity in attached['system-entities']
+                              if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
+                try:
+                    original = hashlib.sha256(image.read_bytes()).hexdigest()
+                    result = self.run_builder(output)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Refusing to replace existing disk image', result.stderr)
+                    self.assertTrue(image.exists(), 'foreign backing file deleted')
+                    self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), original)
+                    self.assertTrue(self.image_for_device(device))
+                    self.assertEqual(point.stat().st_dev != point.parent.stat().st_dev, mounted)
+                    self.assertEqual(self.recorded_attachments(), [])
+                finally:
+                    self.recover_foreign(image, device)
+
+
+    def test_builder_preserves_foreign_file_created_during_create(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = create ]; then
+  image=${@: -1}
+  /usr/bin/hdiutil create -size 8m -fs HFS+ -volname LateForeign973 "$image" >/dev/null || exit $?
+  /usr/bin/hdiutil attach "$image" -readonly -nomount -plist > "$HDIUTIL_TEST_DIR/late-foreign.plist" || exit $?
+  shasum -a 256 "$image" > "$HDIUTIL_TEST_DIR/late-foreign.sha256"
+fi
+native_hdiutil "$@"
+''')
+        output = self.base / 'late-foreign-output'
+        image = output / f'haider-v{VERSION}-{TARGET}.dmg'
+        try:
+            result = self.run_builder(output)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('File exists', result.stderr)
+            self.assertTrue(image.exists(), 'concurrent foreign backing file deleted')
+            original = (self.base / 'late-foreign.sha256').read_text().split()[0]
+            self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), original)
+        finally:
+            record = self.base / 'late-foreign.plist'
+            if record.exists():
+                attached = plistlib.loads(record.read_bytes())
+                device = next(entity['dev-entry'] for entity in attached['system-entities']
+                              if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', '')))
+                self.recover_foreign(image, device)
 
 
 if __name__ == '__main__':
