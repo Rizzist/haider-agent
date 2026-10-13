@@ -32,7 +32,19 @@ if [ "$1" = attach ]; then
   done
 fi
 native_hdiutil() {
-  if [ "$1" != attach ]; then /usr/bin/hdiutil "$@"; return $?; fi
+  if [ "$1" != attach ]; then
+    python3 - "$@" <<'NATIVE_PY'
+import json, os, pathlib, subprocess, sys
+result = subprocess.run(['/usr/bin/hdiutil', *sys.argv[1:]], capture_output=True)
+with (pathlib.Path(os.environ['HDIUTIL_TEST_DIR']) / 'native-results').open('a') as output:
+    output.write(json.dumps({'action': sys.argv[1], 'status': result.returncode,
+                             'stderr': os.fsdecode(result.stderr)}) + '\\n')
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+sys.exit(result.returncode)
+NATIVE_PY
+    return $?
+  fi
   python3 - "$@" <<'TRACE_PY'
 import json, os, pathlib, plistlib, re, subprocess, sys
 arguments = sys.argv[1:]
@@ -45,6 +57,9 @@ def append(device):
 append(None)
 if '-plist' not in arguments: arguments.append('-plist')
 result = subprocess.run(['/usr/bin/hdiutil', *arguments], capture_output=True)
+with (record.parent / 'native-results').open('a') as output:
+    output.write(json.dumps({'action': arguments[0], 'status': result.returncode,
+                             'stderr': os.fsdecode(result.stderr)}) + '\\n')
 sys.stdout.buffer.write(result.stdout)
 sys.stderr.buffer.write(result.stderr)
 try:
@@ -323,16 +338,38 @@ native_hdiutil "$@"
         calls = (self.base / 'calls').read_text().splitlines()
         return result, output, calls
 
+    def assert_busy_attempts(self, operation, calls):
+    native = [json.loads(line) for line in
+              (self.base / 'native-results').read_text().splitlines()]
+    relevant = {operation, 'attach'} if operation == 'detach' else {operation}
+    failures = [record for record in native if record['action'] in relevant
+                and record['status'] != 0]
+    for record in failures:
+        self.assertTrue(record['status'] == 16 or re.search(
+            r'resource busy|device busy|resource temporarily unavailable|\bebusy\b',
+            record['stderr'], re.IGNORECASE), record)
+    # The injected busy response needs a retry. Real additional
+    # busy responses may also need retries, or partial-attach ejects.
+    # Every extra call must be explained by a recorded native busy
+    # failure; create/attach each still have a four-attempt ceiling.
+    attempts = calls.count(operation)
+    attach_failures = sum(record['action'] == 'attach' for record in failures)
+    ceiling = 4 + 5 * attach_failures if operation == 'detach' else 4
+    self.assertGreaterEqual(attempts, 2)
+    self.assertLessEqual(attempts, ceiling)
+    self.assertLessEqual(attempts - 2, len(failures))
+
     def test_busy_create_attach_and_detach_recover(self):
         for operation in ('create', 'attach', 'detach'):
             with self.subTest(operation=operation):
                 (self.base / 'calls').unlink(missing_ok=True)
                 (self.base / 'count').unlink(missing_ok=True)
+                (self.base / 'native-results').unlink(missing_ok=True)
                 result, output, calls = self.build(operation, 1)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('macOS post-pack gate:', result.stdout)
                 self.assertIn('macOS installer gate PASS', result.stdout)
-                self.assertEqual(calls.count(operation), 2)
+                self.assert_busy_attempts(operation, calls)
                 name = f'haider-v{VERSION}-{TARGET}'
                 for extension in ('.pkg', '.dmg'):
                     artifact = output / f'{name}{extension}'
@@ -340,6 +377,17 @@ native_hdiutil "$@"
                     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
                     self.assertEqual((output / f'{name}{extension}.sha256').read_text(),
                                      f'{digest}  {artifact.name}\n')
+
+    def test_busy_recovery_rejects_unexplained_or_excessive_attempts(self):
+        for attempts, native_busy in ((3, 0), (5, 3)):
+            with self.subTest(attempts=attempts, native_busy=native_busy):
+                records = [{'action': 'create', 'status': 16,
+                            'stderr': 'Resource busy'}] * native_busy
+                records.append({'action': 'create', 'status': 0, 'stderr': ''})
+                (self.base / 'native-results').write_text(
+                    ''.join(json.dumps(record) + '\n' for record in records))
+                with self.assertRaisesRegex(AssertionError, 'not less than or equal'):
+                    self.assert_busy_attempts('create', ['create'] * attempts)
 
     def test_persistent_create_failure_keeps_last_error(self):
         result, output, calls = self.build('create', 4)
