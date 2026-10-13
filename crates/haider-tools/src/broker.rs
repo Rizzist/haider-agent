@@ -1406,7 +1406,7 @@ impl EffectBroker {
         self.workspace_receipts.set_wall_time_for_tests(wall_time);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn workspace_receipt_wall_time(&self) -> std::time::Duration {
         self.workspace_receipts.wall_time()
     }
