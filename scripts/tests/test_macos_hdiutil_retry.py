@@ -47,7 +47,7 @@ NATIVE_PY
     return $?
   fi
   python3 - "__IDENTITY_HELPER__" "$@" <<'TRACE_PY'
-import importlib.util, json, os, pathlib, plistlib, re, subprocess, sys
+import importlib.util, json, os, pathlib, plistlib, re, subprocess, sys, time
 spec = importlib.util.spec_from_file_location("identity_helper", sys.argv[1])
 helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
 arguments = sys.argv[2:]
@@ -107,12 +107,25 @@ except ValueError:
 devices = {entity['dev-entry'] for entity in attached.get('system-entities', [])
            if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', ''))}
 # Neither a recyclable plist device nor a path delta proves backing ownership.
-info = plistlib.loads(subprocess.check_output(['/usr/bin/hdiutil', 'info', '-plist']))
-backing = {entity['dev-entry']: attached for attached in info.get('images', [])
-           for entity in attached.get('system-entities', []) if 'dev-entry' in entity}
+for post_attempt in range(4):
+    query = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'], capture_output=True, check=True)
+    # Post-attach inventory fault-injection seam.
+    info = plistlib.loads(query.stdout)
+    backing = {entity['dev-entry']: attached for attached in info.get('images', [])
+               for entity in attached.get('system-entities', []) if 'dev-entry' in entity}
+    incomplete = b'cannot get IO media array' in query.stderr or any(
+        pathlib.Path(device).exists() and device not in backing for device in devices)
+    if not incomplete:
+        break
+    if post_attempt == 3:
+        sys.exit('incomplete post-attach inventory; keeping everything')
+    time.sleep(0.1 * (post_attempt + 1))
 verified = {}
 def is_expected(device):
-    if device not in backing: return False
+    if device not in backing:
+        if pathlib.Path(device).exists():
+            sys.exit('live attach device missing from post-attach inventory; keeping everything')
+        return False
     attached = backing[device]; pid = attached.get('hdid-pid')
     if pid not in verified: verified[pid] = helper.backing_identity(attached, expected)
     if verified[pid] is None: sys.exit("backing inode unavailable; keeping everything")
@@ -473,6 +486,228 @@ native_hdiutil "$@"
                     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
                     self.assertEqual((output / f'{name}{extension}.sha256').read_text(),
                                      f'{digest}  {artifact.name}\n')
+
+    def test_nonempty_busy_create_partial_is_cleaned_and_retried(self):
+        shim = self.shim / 'hdiutil'
+        shim.write_text(shim.read_text().replace(
+            'if [ "$1" = create ]; then touch "${@: -1}"; fi',
+            'if [ "$1" = create ]; then /bin/dd if=/dev/zero of="${@: -1}" bs=1048576 count=1 2>/dev/null; fi'))
+        result, output, calls = self.build('create', 1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.count('create'), 2)
+        self.assertIn('macOS installer gate PASS', result.stdout)
+        paths = [Path(os.fsdecode(p)) for p in (self.base / 'createpaths').read_bytes().split(b'\0') if p]
+        self.assertEqual(len(paths), 2)
+        self.assertNotEqual(paths[0].parent, paths[1].parent)
+        self.assertTrue(all(not p.parent.parent.exists() for p in paths), 'PASS retained work directory')
+        self.assertTrue(list(output.glob('*.dmg.sha256')))
+
+    def test_nonempty_busy_create_is_still_bounded(self):
+        shim = self.shim / 'hdiutil'
+        shim.write_text(shim.read_text().replace(
+            'if [ "$1" = create ]; then touch "${@: -1}"; fi',
+            'if [ "$1" = create ]; then echo partial > "${@: -1}"; fi'))
+        result, output, calls = self.build('create', 4)
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual(calls.count('create'), 4)
+        self.assertFalse(list(output.glob('*.sha256')))
+        self.assertNotIn('Retaining unattributed create output in ', result.stderr)
+
+    def test_failed_builder_removes_verified_unattached_staging(self):
+        (self.shim / 'cmp').write_text('#!/bin/bash\necho "forced cmp failure" >&2\nexit 7\n')
+        (self.shim / 'cmp').chmod(0o755)
+        result, output, calls = self.build_with_busy_eject()
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(calls.count('detach'), 2)
+        self.assertFalse(list(output.glob('*.sha256')))
+        paths = [Path(os.fsdecode(p)) for p in (self.base / 'createpaths').read_bytes().split(b'\0') if p]
+        self.assertTrue(paths)
+        self.assertTrue(all(not p.parent.parent.exists() for p in paths))
+        self.assertNotIn('Retaining unattributed create output in ', result.stderr)
+        self.assert_no_test_mounts()
+
+    def test_successful_builder_removes_work_directory(self):
+        result, _, _ = self.build('create', 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paths = [Path(os.fsdecode(p)) for p in (self.base / 'createpaths').read_bytes().split(b'\0') if p]
+        self.assertTrue(paths)
+        self.assertTrue(all(not p.parent.parent.exists() for p in paths))
+        self.assertNotIn('Retaining unattributed create output in ', result.stderr)
+
+    def test_package_replaced_after_expansion_is_refused(self):
+        (self.shim / 'pkgutil').write_text('''#!/bin/bash
+/usr/sbin/pkgutil "$@" || exit $?
+if [ "$1" = --expand-full ]; then
+  /bin/rm -f "$PACKAGE_OUTPUT"; printf 'foreign pkg\n' > "$PACKAGE_OUTPUT"
+fi
+''')
+        (self.shim / 'pkgutil').chmod(0o755)
+        output = self.base / 'early-pkg-output'
+        pkg = output / f'haider-v{VERSION}-{TARGET}.pkg'
+        result = self.run_builder(output, PACKAGE_OUTPUT=str(pkg))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('identity changed', result.stderr)
+        self.assertEqual(pkg.read_text(), 'foreign pkg\n')
+        self.assertFalse(list(output.glob('*.sha256')))
+        self.assertFalse(list(output.glob('*.dmg')))
+
+    def test_package_replaced_after_detach_is_refused(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = detach ] && [ ! -f "$HDIUTIL_TEST_DIR/pkg-swapped" ]; then
+  touch "$HDIUTIL_TEST_DIR/pkg-swapped"
+  /bin/rm -f "$PACKAGE_OUTPUT"; printf 'foreign pkg\n' > "$PACKAGE_OUTPUT"
+fi
+native_hdiutil "$@"
+''')
+        output = self.base / 'late-pkg-output'
+        pkg = output / f'haider-v{VERSION}-{TARGET}.pkg'
+        result = self.run_builder(output, PACKAGE_OUTPUT=str(pkg))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('identity changed', result.stderr)
+        self.assertEqual(pkg.read_text(), 'foreign pkg\n')
+        self.assertFalse(list(output.glob('*.sha256')))
+        self.assert_no_test_mounts()
+
+    def test_package_inplace_change_after_validation_is_refused(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + """
+if [ "$1" = detach ]; then
+  printf 'foreign in-place package' > "$PACKAGE_OUTPUT"
+fi
+native_hdiutil "$@"
+""")
+        output = self.base / 'inplace-pkg-output'
+        pkg = output / f'haider-v{VERSION}-{TARGET}.pkg'
+        result = self.run_builder(output, PACKAGE_OUTPUT=str(pkg))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('package bytes changed since validation', result.stderr)
+        self.assertEqual(pkg.read_text(), 'foreign in-place package')
+        self.assertFalse(list(output.glob('*.sha256')))
+        self.assert_no_test_mounts()
+
+    def test_builder_refuses_each_preplanted_sidecar_symlink(self):
+        for extension in ('pkg', 'dmg'):
+            with self.subTest(extension=extension):
+                output = self.base / f'sidecar-output-{extension}'
+                output.mkdir()
+                victim = self.base / f'victim-{extension}'
+                victim.write_bytes(b'leave me alone')
+                sidecar = output / f'haider-v{VERSION}-{TARGET}.{extension}.sha256'
+                sidecar.symlink_to(victim)
+                result = self.run_builder(output)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('macOS installer gate PASS', result.stdout)
+                self.assertEqual(victim.read_bytes(), b'leave me alone')
+                self.assertTrue(sidecar.is_symlink())
+                self.assert_no_test_mounts()
+
+    def test_builder_dmg_replaced_between_detach_and_checksum_is_refused(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = detach ] && [ ! -f "$HDIUTIL_TEST_DIR/dmg-swapped" ]; then
+  touch "$HDIUTIL_TEST_DIR/dmg-swapped"
+  /bin/rm -f "$IMAGE_OUTPUT"; printf 'foreign dmg\n' > "$IMAGE_OUTPUT"
+fi
+native_hdiutil "$@"
+''')
+        output = self.base / 'late-dmg-output'
+        dmg = output / f'haider-v{VERSION}-{TARGET}.dmg'
+        result = self.run_builder(output, IMAGE_OUTPUT=str(dmg))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('identity changed', result.stderr)
+        self.assertNotIn('macOS installer gate PASS', result.stdout)
+        self.assertEqual(dmg.read_text(), 'foreign dmg\n')
+        self.assertFalse(Path(str(dmg) + '.sha256').exists())
+        self.assert_no_test_mounts()
+
+    def test_builder_changed_dmg_is_refused_before_comparison(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = attach ]; then
+  native_hdiutil "$@" || exit $?
+  /bin/rm -f "$2"; printf 'foreign dmg\n' > "$2"
+  exit 0
+fi
+native_hdiutil "$@"
+''')
+        (self.shim / 'cmp').write_text('''#!/bin/bash
+touch "$HDIUTIL_TEST_DIR/comparison-ran"
+exec /usr/bin/cmp "$@"
+''')
+        (self.shim / 'cmp').chmod(0o755)
+        result = self.run_builder(self.base / 'changed-before-comparison')
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.base / 'comparison-ran').exists())
+        self.assert_no_test_mounts()
+
+    def test_builder_pins_created_dmg_until_attachment_finishes(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = attach ]; then
+  /usr/sbin/lsof -a -p "$PPID" -d 9 -Fn > "$HDIUTIL_TEST_DIR/pinned-dmg"
+fi
+native_hdiutil "$@"
+''')
+        result = self.run_builder(self.base / 'pinned-dmg-output')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('haider-v' + VERSION + '-' + TARGET + '.dmg',
+                      (self.base / 'pinned-dmg').read_text())
+
+    def test_plist_capture_excludes_other_new_expected_inode_device(self):
+        # Inject an additional inventory entry sharing the real helper's inode.
+        # The nonexistent device is never passed to native detach. Plist-present
+        # attribution must record only devices returned by this attach.
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = attach ]; then
+  native_hdiutil "$@" > "$HDIUTIL_TEST_DIR/real-attach.plist" || exit $?
+  touch "$HDIUTIL_TEST_DIR/extra-inode-entry"
+  cat "$HDIUTIL_TEST_DIR/real-attach.plist"
+  exit 0
+fi
+if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/extra-inode-entry" ]; then
+  python3 - <<'EXTRA'
+import copy, os, pathlib, plistlib, subprocess, sys
+root = pathlib.Path(os.environ['HDIUTIL_TEST_DIR'])
+info = plistlib.loads(subprocess.check_output(['/usr/bin/hdiutil', 'info', '-plist']))
+original = plistlib.loads((root / 'real-attach.plist').read_bytes())
+devices = {e.get('dev-entry') for e in original['system-entities']}
+for image in list(info.get('images', [])):
+    if any(e.get('dev-entry') in devices for e in image.get('system-entities', [])):
+        extra = copy.deepcopy(image)
+        extra['system-entities'] = [{'dev-entry': '/dev/disk999973'}]
+        info['images'].append(extra)
+plistlib.dump(info, sys.stdout.buffer)
+EXTRA
+  exit 0
+fi
+if [ "$1" = detach ] && [ "$2" = /dev/disk999973 ]; then exit 99; fi
+native_hdiutil "$@"
+''')
+        (self.shim / 'cmp').write_text('''#!/bin/bash
+work=$(dirname "$(dirname "$2")")
+cp "$work/attached-image.json" "$HDIUTIL_TEST_DIR/captured-ownership.json"
+exec /usr/bin/cmp "$@"
+''')
+        (self.shim / 'cmp').chmod(0o755)
+        result = self.run_builder(self.base / 'plist-only-output')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads((self.base / 'captured-ownership.json').read_text())
+        self.assertTrue(saved)
+        self.assertNotIn('/dev/disk999973', [r['device'] for r in saved])
+        self.assert_no_test_mounts()
+
+    def test_changed_publication_is_refused_before_native_attach(self):
+        # Replace after the first post-create check. The next pre-attach check
+        # must refuse before any native attach observes the replacement.
+        (self.shim / 'python3').write_text('''#!/bin/bash
+"$REAL_PYTHON" "$@" || exit $?
+if [ "$2" = check ] && [ ! -f "$HDIUTIL_TEST_DIR/pre-attach-swapped" ]; then
+  touch "$HDIUTIL_TEST_DIR/pre-attach-swapped"
+  /bin/rm -f "$3"; printf 'foreign before attach\n' > "$3"
+fi
+''')
+        (self.shim / 'python3').chmod(0o755)
+        result = self.run_builder(self.base / 'pre-attach-output', REAL_PYTHON=__import__('sys').executable)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        calls = (self.base / 'calls').read_text().splitlines()
+        self.assertNotIn('attach', calls)
+        self.assertIn('identity changed', result.stderr)
 
     def test_busy_recovery_rejects_unexplained_or_excessive_attempts(self):
         for attempts, native_busy in ((3, 0), (5, 3)):
@@ -1422,6 +1657,7 @@ native_hdiutil "$@"
             device = next(e['dev-entry'] for e in attached['system-entities']
                           if re.fullmatch(r'/dev/disk[0-9]+', e.get('dev-entry', '')))
             self.assertTrue(self.image_for_device(device), 'foreign replacement ejected')
+            self.assertNotIn('Could not detach ' + device, result.stderr)
             self.assert_no_test_mounts()
         finally:
             ledger = self.base / 'capture-foreign.plist'
@@ -1549,6 +1785,65 @@ native_hdiutil "$@"
         self.assertFalse(any(r['device'] for r in self.recorded_attachments()))
         self.assertFalse((self.base / 'native-results').exists(), 'native attach was attempted')
         self.assert_no_test_mounts()
+
+    def test_tracer_incomplete_post_inventory_preserves_attachment(self):
+        image = self.base / 'post-inventory.dmg'
+        subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                        '-volname', 'PostInventory973', str(image)], check=True, capture_output=True)
+        anchor = "# Neither a recyclable plist device nor a path delta proves backing ownership."
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                hook = "\n(record.parent / 'post-real.plist').write_bytes(result.stdout)\n"
+                if missing:
+                    post = "    # Post-attach inventory fault-injection seam.\n"
+                    trace = HDIUTIL_TRACE.replace(post, post + "    query.stdout = plistlib.dumps({'images': []})\n")
+                else:
+                    post = "    # Post-attach inventory fault-injection seam.\n"
+                    trace = HDIUTIL_TRACE.replace(post, post + "    query.stderr = b'cannot get IO media array'\n")
+                (self.shim / 'hdiutil').write_text(trace.replace(anchor, hook + anchor)
+                                                 + 'native_hdiutil "$@"\n')
+                try:
+                    result = subprocess.run([str(self.shim / 'hdiutil'), 'attach', str(image),
+                                             '-readonly', '-nomount', '-plist'],
+                                            env=self.builder_environment(), capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(b'keeping everything', result.stderr)
+                    self.assertFalse([r for r in self.recorded_attachments() if r['device']])
+                    ledger = plistlib.loads((self.base / 'post-real.plist').read_bytes())
+                    devices = [e['dev-entry'] for e in ledger['system-entities']
+                               if re.fullmatch(r'/dev/disk[0-9]+', e.get('dev-entry', ''))]
+                    self.assertTrue(any(self.image_for_device(d) for d in devices))
+                    self.assertTrue(image.exists())
+                finally:
+                    for entity in plistlib.loads((self.base / 'post-real.plist').read_bytes())['system-entities']:
+                        device = entity.get('dev-entry', '')
+                        if re.fullmatch(r'/dev/disk[0-9]+', device):
+                            self.recover_foreign(image, device)
+
+    def test_tracer_transient_post_inventory_recovers_before_recording(self):
+        image = self.base / 'transient-post.dmg'
+        subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                        '-volname', 'TransientPost973', str(image)], check=True, capture_output=True)
+        seam = "    # Post-attach inventory fault-injection seam.\n"
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                fault = "query.stdout = plistlib.dumps({'images': []})" if missing else "query.stderr = b'cannot get IO media array'"
+                trace = HDIUTIL_TRACE.replace(seam, seam + "    if post_attempt == 0: " + fault + "\n")
+                (self.shim / 'hdiutil').write_text(trace + 'native_hdiutil "$@"\n')
+                result = subprocess.run([str(self.shim / 'hdiutil'), 'attach', str(image),
+                                         '-readonly', '-nomount', '-plist'],
+                                        env=self.builder_environment(), capture_output=True)
+                try:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(self.attached_test_images())
+                    self.detach_leftover_test_mounts()
+                    self.assert_no_test_mounts()
+                finally:
+                    if result.stdout:
+                        for entity in plistlib.loads(result.stdout)['system-entities']:
+                            device = entity.get('dev-entry', '')
+                            if re.fullmatch(r'/dev/disk[0-9]+', device):
+                                self.recover_foreign(image, device)
 
     def test_tracer_noplist_captures_only_the_original_backing_inode(self):
         image = self.base / 'tracer-race.dmg'

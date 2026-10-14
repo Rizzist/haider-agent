@@ -156,6 +156,88 @@ class ImageIdentityTests(unittest.TestCase):
                 IMAGE.create(self.path, self.record, self.root, [])
         self.assertEqual(self.path.read_bytes(), b'foreign publication')
 
+    def test_clean_staging_unlinks_only_the_saved_file_and_directory(self):
+        stage = self.root / 'create.owned'
+        stage.mkdir()
+        raw = stage / 'image.dmg'
+        raw.write_bytes(b'partial output')
+        (self.root / 'staged-image.json').write_text(json.dumps({
+            'path': str(raw), 'identity': IMAGE.identity(raw.stat()),
+            'directory': IMAGE.identity(stage.stat())}))
+        (self.root / 'retain-create').write_text(str(raw))
+        with patch.object(IMAGE, 'staging_inventory', return_value=[]):
+            IMAGE.clean_staging(self.root)
+        self.assertFalse(stage.exists())
+        self.assertFalse((self.root / 'retain-create').exists())
+
+    def test_clean_staging_refuses_replaced_file_or_directory(self):
+        for replace_directory in (False, True):
+            with self.subTest(replace_directory=replace_directory):
+                stage = self.root / f'create.{replace_directory}'
+                stage.mkdir()
+                raw = stage / 'image.dmg'
+                raw.write_bytes(b'partial output')
+                saved = {'path': str(raw), 'identity': IMAGE.identity(raw.stat()),
+                         'directory': IMAGE.identity(stage.stat())}
+                (self.root / 'staged-image.json').write_text(json.dumps(saved))
+                (self.root / 'retain-create').write_text(str(raw))
+                with raw.open('rb'):
+                    if replace_directory:
+                        stage.rename(stage.with_name(stage.name + '.original'))
+                        stage.mkdir()
+                    else:
+                        raw.unlink()
+                    raw.write_bytes(b'foreign output')
+                    with patch.object(IMAGE, 'staging_inventory', return_value=[]):
+                        with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                            IMAGE.clean_staging(self.root)
+                self.assertEqual(raw.read_bytes(), b'foreign output')
+                self.assertTrue((self.root / 'retain-create').exists())
+
+    def test_sidecar_exclusive_create_preserves_symlink_hardlink_and_regular_file(self):
+        self.path.write_bytes(b'validated image')
+        self.record.write_text(json.dumps(IMAGE.identity(self.path.stat())))
+        victim = self.root / 'victim'
+        victim.write_bytes(b'foreign sidecar')
+        for kind in ('symlink', 'hardlink', 'regular'):
+            with self.subTest(kind=kind):
+                sidecar = self.root / kind
+                if kind == 'symlink': sidecar.symlink_to(victim)
+                elif kind == 'hardlink': os.link(victim, sidecar)
+                else: sidecar.write_bytes(b'foreign sidecar')
+                with self.assertRaises(FileExistsError):
+                    IMAGE.checksum(self.path, self.record, sidecar)
+                self.assertEqual(victim.read_bytes(), b'foreign sidecar')
+                self.assertEqual(sidecar.read_bytes(), b'foreign sidecar')
+
+    def test_checksum_refuses_sidecar_or_artifact_replacement_during_write(self):
+        for replace_sidecar in (False, True):
+            with self.subTest(replace_sidecar=replace_sidecar):
+                self.path.write_bytes(b'validated image')
+                self.record.write_text(json.dumps(IMAGE.identity(self.path.stat())))
+                sidecar = self.root / f'digest-{replace_sidecar}'
+                fdopen = IMAGE.os.fdopen
+                def replace_after_write(fd, mode):
+                    output = fdopen(fd, mode)
+                    class Writer:
+                        def __enter__(self): return self
+                        def __exit__(self, *args): return output.__exit__(*args)
+                        def __getattr__(self, name): return getattr(output, name)
+                        def write(self, text):
+                            result = output.write(text)
+                            output.flush()
+                            target = sidecar if replace_sidecar else self_path
+                            target.unlink()
+                            target.write_bytes(b'foreign replacement')
+                            return result
+                    return Writer()
+                self_path = self.path
+                with patch.object(IMAGE.os, 'fdopen', side_effect=replace_after_write):
+                    with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                        IMAGE.checksum(self.path, self.record, sidecar)
+                target = sidecar if replace_sidecar else self.path
+                self.assertEqual(target.read_bytes(), b'foreign replacement')
+
     def test_checksum_rejects_replacement_since_validation(self):
         self.path.write_bytes(b'validated image')
         expected = IMAGE.identity(self.path.stat())

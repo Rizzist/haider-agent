@@ -26,6 +26,9 @@ mount_is_clear() {
 # attach only, then require both the device and backing path on every audit.
 refresh_attached_device() {
   local device
+  # An inventory refusal must not leave an earlier, possibly recycled device
+  # in the trap's operator instruction.
+  attached_device=
   device=$(python3 -c '
 import importlib.util, json, pathlib, plistlib, re, subprocess, sys, time
 spec = importlib.util.spec_from_file_location("image_identity", sys.argv[7])
@@ -147,15 +150,15 @@ detach_owned_image() {
   return "$status"
 }
 cleanup() {
-  local keep_work=0
+  local original_status=$? keep_work=0
   if [ "$mounted" = 1 ]; then
     hdiutil_retry detach no_cleanup >/dev/null 2>&1 || true
     if ! attachment_is_clear || ! mount_is_clear; then
       if [ -z "$attached_device" ]; then
-        attached_device=$(python3 -c 'import pathlib,plistlib,re,sys; p=pathlib.Path(sys.argv[1]); r=plistlib.loads(p.read_bytes()) if p.exists() else {}; print(", ".join(e["dev-entry"] for e in r.get("system-entities",[]) if re.fullmatch(r"/dev/disk[0-9]+",e.get("dev-entry",""))))' "$work/attach.plist") || attached_device=unknown
+        printf 'Attachment ownership unverified; no unverified device was detached; retaining temporary mount for manual cleanup (%s). Verify hdiutil info backing identity before detaching\n' "$work/mount" >&2
+      else
+        printf 'Could not detach %s (%s); retaining temporary mount for manual cleanup\n' "${attached_device//$'\n'/, }" "$work/mount" >&2
       fi
-      [ -n "$attached_device" ] || attached_device="unknown (attach plist unavailable)"
-      printf 'Could not detach %s (%s); retaining temporary mount for manual cleanup\n' "${attached_device//$'\n'/, }" "$work/mount" >&2
       keep_work=1
     fi
   fi
@@ -164,6 +167,11 @@ cleanup() {
     security delete-keychain "$work/signing.keychain-db" >/dev/null || true
   fi
   rm -f "$work/cert.p12" "$work/signing.keychain-db"
+  # A failed validation need not retain an intact, unattached staging file.
+  # Keep uncertain generations and unresolved mounts; preserve the exit status.
+  if [ "$original_status" -ne 0 ] && [ "$keep_work" = 0 ] && [ -f "$work/staged-image.json" ]; then
+    python3 "$here/macos-image-identity.py" clean "$dmg" "$work/image-identity.json" "$work" >/dev/null 2>&1 || true
+  fi
   if [ -f "$work/retain-create" ]; then
     printf 'Retaining unattributed create output in %s\n' "$work" >&2
     keep_work=1
@@ -188,7 +196,8 @@ PY
 name="haider-v$version-$target"
 pkg="$out/$name.pkg"
 dmg="$out/$name.dmg"
-pkgbuild --root "$work/root" --identifier ai.haidercode.haider --version "$version" --install-location / --ownership recommended "$pkg"
+private_pkg="$work/built.pkg"
+pkgbuild --root "$work/root" --identifier ai.haidercode.haider --version "$version" --install-location / --ownership recommended "$private_pkg"
 cert=${MACOS_INSTALLER_CERT_P12_BASE64:-${MACOS_SIGNING_CERT_P12_BASE64:-}}
 password=${MACOS_INSTALLER_CERT_PASSWORD:-${MACOS_SIGNING_CERT_PASSWORD:-}}
 signed=0
@@ -206,9 +215,9 @@ if [ -n "$cert" ] && [ -n "$password" ]; then
   security list-keychains -d user -s "$work/signing.keychain-db" "${original_keychains[@]}"
   identity=$(security find-identity -v -p basic "$work/signing.keychain-db" | sed -n 's/.*"\(Developer ID Installer: [^"]*\)".*/\1/p' | head -1)
   if [ -n "$identity" ]; then
-    productsign --sign "$identity" --keychain "$work/signing.keychain-db" --timestamp "$pkg" "$work/signed.pkg"
-    mv "$work/signed.pkg" "$pkg"
-    pkgutil --check-signature "$pkg"
+    productsign --sign "$identity" --keychain "$work/signing.keychain-db" --timestamp "$private_pkg" "$work/signed.pkg"
+    mv "$work/signed.pkg" "$private_pkg"
+    pkgutil --check-signature "$private_pkg"
     signed=1
   else
     echo 'SKIP macOS pkg signing: no Developer ID Installer identity in certificate bundle'
@@ -227,14 +236,13 @@ PY
 }
 notarized=0
 if [ "$signed" = 1 ] && [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
-  notarize "$pkg"
+  notarize "$private_pkg"
   notarized=1
 else
   echo 'SKIP macOS notarization: signed pkg or APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID absent'
 fi
-pkgutil --expand-full "$pkg" "$work/expanded"
-python3 "$here/macos-verify.py" "$work/expanded" "$payload" "$version" "$target"
-cp "$pkg" "$work/image/"
+python3 "$here/macos-image-identity.py" package "$pkg" "$work/pkg-identity.json" "$private_pkg" "$work" "$payload" "$version" "$target" "$here/macos-verify.py"
+exec 8< "$pkg"
 run_hdiutil() {
   local action=$1 diagnostic=$2 status=0
   shift 2
@@ -307,8 +315,11 @@ hdiutil_retry() {
 remove_partial_dmg() {
   [ "$create_started" = 1 ] || return 0
   python3 "$here/macos-image-identity.py" remove "$dmg" "$work/image-identity.json" || return $?
-  # A nonempty failed-create output could be another caller's replacement.
-  if [ -f "$work/create-unattributed-nonempty" ]; then return 1; fi
+  # Busy failures may leave real, nonempty partial bytes. Check the staging
+  # identity and inventory before unlinking; uncertainty stops the retry.
+  if [ -f "$work/retain-create" ]; then
+    python3 "$here/macos-image-identity.py" clean "$dmg" "$work/image-identity.json" "$work" || return $?
+  fi
   create_started=0
 }
 no_cleanup() { :; }
@@ -339,11 +350,12 @@ mkdir "$work/mount"
 hdiutil_retry attach detach_partial_mount "$dmg" -readonly -nobrowse -mountpoint "$work/mount"
 mounted=1
 python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
-cmp "$pkg" "$work/mount/$name.pkg"
+python3 "$here/macos-image-identity.py" compare "$pkg" "$work/pkg-identity.json" "$work/mount/$name.pkg"
 python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
 hdiutil_retry detach no_cleanup
 mounted=0
 python3 "$here/macos-image-identity.py" finish "$dmg" "$work/image-identity.json" "$work"
-(cd "$out" && shasum -a 256 "$name.pkg" > "$name.pkg.sha256")
+python3 "$here/macos-image-identity.py" clean "$dmg" "$work/image-identity.json" "$work"
+python3 "$here/macos-image-identity.py" checksum "$pkg" "$work/pkg-identity.json" "$pkg.sha256"
 python3 "$here/macos-image-identity.py" checksum "$dmg" "$work/image-identity.json" "$dmg.sha256"
 printf 'macOS installer gate PASS signed=%s notarized=%s\n' "$signed" "$notarized"

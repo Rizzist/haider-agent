@@ -67,6 +67,11 @@ def check(path, expected):
         raise RuntimeError('disk image identity changed; retaining ' + str(path))
 
 
+def expected_identity(record):
+    saved = json.loads(record.read_text())
+    return saved['identity'] if isinstance(saved, dict) else saved
+
+
 def create(path, record, staging, arguments):
     # Reserve the publication inode ourselves. Native hdiutil replaces even an
     # existing -ov destination, so it writes into a private staging directory.
@@ -85,11 +90,14 @@ def create(path, record, staging, arguments):
             retained.write(str(raw) + '\n')
         result = subprocess.run(['hdiutil', 'create', *arguments, str(raw)])
         if result.returncode:
-            # A failed tool provides no proof that an output is ours. In
-            # particular, do not unlink a replacement published by another run.
+            # A failed tool grants no attachment ownership. Record a regular
+            # partial for the guarded cleanup callback; attachments, symlinks
+            # and changed generations must be retained instead of retried.
             if raw.exists() or raw.is_symlink():
-                if raw.is_symlink() or raw.stat().st_size:
-                    (staging / 'create-unattributed-nonempty').touch()
+                if not raw.is_symlink() and stat.S_ISREG(raw.stat().st_mode):
+                    (staging / 'staged-image.json').write_text(json.dumps({
+                        'path': str(raw), 'identity': identity(raw.stat()),
+                        'directory': identity(os.fstat(stage_fd))}))
                 print('Unattributed create output; retaining ' + str(raw), file=sys.stderr)
             elif not retained_before:
                 (staging / 'retain-create').unlink()
@@ -105,11 +113,12 @@ def create(path, record, staging, arguments):
             shutil.copyfileobj(source, output)
         output.flush()
         check(path, expected)
-        # The returned pathname does not prove who created this generation,
-        # even when its bytes pass validation. Never claim its attachments or
-        # delete it. Only the publication inode reserved above is ours.
+        # Record the staging generation for identity-checked, unattached
+        # cleanup. This record grants no authority to eject any attachment;
+        # only the reserved publication inode is used for our attach.
         (staging / 'staged-image.json').write_text(json.dumps({
-            'path': str(raw), 'identity': raw_identity}))
+            'path': str(raw), 'identity': raw_identity,
+            'directory': identity(os.fstat(stage_fd))}))
     return 0
 
 
@@ -138,14 +147,98 @@ def finish(staging):
                            + '; retaining ' + str(raw))
 
 
+def clean_staging(staging):
+    """Remove only the inventoried, identity-checked native staging entry.
+
+    A returned staging file grants no attachment ownership. finish() refuses
+    any attachment before this unlink; a changed file or directory is retained.
+    """
+    saved = json.loads((staging / 'staged-image.json').read_text())
+    raw = Path(saved['path'])
+    with ExitStack() as descriptors:
+        directory_fd = os.open(raw.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.callback(os.close, directory_fd)
+        if identity(os.fstat(directory_fd)) != saved['directory']:
+            raise RuntimeError('staging directory identity changed; retaining ' + str(raw))
+        finish(staging)
+        if identity(os.stat(raw.name, dir_fd=directory_fd, follow_symlinks=False)) != saved['identity']:
+            raise RuntimeError('staging image identity changed; retaining ' + str(raw))
+        os.unlink(raw.name, dir_fd=directory_fd)
+    raw.parent.rmdir()
+    (staging / 'staged-image.json').unlink()
+    (staging / 'retain-create').unlink(missing_ok=True)
+
+
+def package(path, record, source_path, staging, payload, version, target, verifier):
+    """Validate, embed and publish one pinned package generation."""
+    with source_path.open('rb') as source, path.open('xb') as output:
+        expected = identity(os.fstat(output.fileno()))
+        record.write_text(json.dumps(expected))
+        shutil.copyfileobj(source, output)
+        output.flush()
+    # pkgutil does not expand /dev/fd inputs correctly on macOS. Give it a
+    # private snapshot copied from the checked descriptor, pin that snapshot,
+    # and check its identity and bytes across expansion. Embed from the same
+    # snapshot descriptor; never reopen the mutable publication for its bytes.
+    with path.open('rb') as source:
+        if identity(os.fstat(source.fileno())) != expected:
+            raise RuntimeError('package identity changed before validation')
+        snapshot = staging / 'validated.pkg'
+        with snapshot.open('xb') as output:
+            shutil.copyfileobj(source, output)
+        with snapshot.open('rb') as validated:
+            snapshot_identity = identity(os.fstat(validated.fileno()))
+            digest = hashlib.file_digest(validated, 'sha256').digest()
+            subprocess.run(['pkgutil', '--expand-full', str(snapshot),
+                            str(staging / 'expanded')], check=True)
+            check(snapshot, snapshot_identity)
+            validated.seek(0)
+            if hashlib.file_digest(validated, 'sha256').digest() != digest:
+                raise RuntimeError('validated package bytes changed')
+            subprocess.run([sys.executable, str(verifier), str(staging / 'expanded'),
+                            str(payload), version, target], check=True)
+            check(path, expected)
+            validated.seek(0)
+            with (staging / 'image' / path.name).open('xb') as embedded:
+                shutil.copyfileobj(validated, embedded)
+            check(snapshot, snapshot_identity)
+        check(path, expected)
+        source.seek(0)
+        if hashlib.file_digest(source, 'sha256').digest() != digest:
+            raise RuntimeError('published package bytes changed since validation')
+        record.write_text(json.dumps({'identity': expected, 'sha256': digest.hex()}))
+
+
+def compare(path, record, embedded):
+    expected = expected_identity(record)
+    with path.open('rb') as source:
+        if identity(os.fstat(source.fileno())) != expected:
+            raise RuntimeError('package identity changed before comparison')
+        # cmp receives the validated package descriptor, not a reopened path.
+        result = subprocess.run(['cmp', '/dev/fd/' + str(source.fileno()), str(embedded)],
+                                pass_fds=(source.fileno(),))
+        if result.returncode:
+            return result.returncode
+        check(path, expected)
+    return 0
+
+
 def checksum(path, record, sidecar):
-    expected = json.loads(record.read_text())
+    expected = expected_identity(record)
+    saved = json.loads(record.read_text())
     with path.open('rb') as source:
         if identity(os.fstat(source.fileno())) != expected:
             raise RuntimeError('disk image identity changed before checksum')
         digest = hashlib.file_digest(source, 'sha256').hexdigest()
+        if isinstance(saved, dict) and digest != saved['sha256']:
+            raise RuntimeError('published package bytes changed since validation')
         check(path, expected)
-        sidecar.write_text(digest + '  ' + path.name + '\n')
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        with os.fdopen(os.open(sidecar, flags, 0o644), 'w') as output:
+            output.write(digest + '  ' + path.name + '\n')
+            output.flush()
+            check(sidecar, identity(os.fstat(output.fileno())))
+        check(path, expected)
 
 
 if __name__ == '__main__':
@@ -156,7 +249,14 @@ if __name__ == '__main__':
     if action == 'finish':
         finish(Path(args[0]))
         sys.exit(0)
-    expected = json.loads(record.read_text())
+    if action == 'clean':
+        clean_staging(Path(args[0]))
+        sys.exit(0)
+    if action == 'package':
+        package(path, record, Path(args[0]), Path(args[1]), Path(args[2]),
+                args[3], args[4], Path(args[5]))
+        sys.exit(0)
+    expected = expected_identity(record)
     check(path, expected)
     if action == 'remove':
         # Check immediately before invoking unlink; no pathname-only permission.
@@ -164,3 +264,5 @@ if __name__ == '__main__':
         sys.exit(0)
     if action == 'checksum':
         checksum(path, record, Path(args[0]))
+    if action == 'compare':
+        sys.exit(compare(path, record, Path(args[0])))
