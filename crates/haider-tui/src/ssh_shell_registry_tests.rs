@@ -358,6 +358,26 @@ fn pane_cancel_chords_share_cli_encodings_but_connected_ctrl_c_is_remote_input()
 }
 
 #[test]
+fn owned_output_recovers_pane_connection_state_after_event_loss() {
+    let mut model = live_session();
+    let mut pane = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);
+    pane.shell_id = Some("owned-shell".into());
+    model.ssh_terminal = Some(pane);
+    model.apply_ssh_shell_output("other-shell", b"unrelated");
+    assert!(model.ssh_terminal.as_ref().expect("pane").connecting);
+    model.apply_ssh_shell_output("owned-shell", b"ready");
+    assert!(!model.ssh_terminal.as_ref().expect("pane").connecting);
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(model.ssh_terminal.is_some());
+    assert!(
+        matches!(model.requests.as_slice(), [AppRequest::SshShellInput { id, input }] if id == "owned-shell" && input.as_slice() == [3])
+    );
+}
+
+#[test]
 fn ssh_terminal_splits_large_paste_at_the_wire_input_bound() {
     let mut model = live_session();
     let mut terminal = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);

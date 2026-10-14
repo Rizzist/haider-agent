@@ -3262,6 +3262,9 @@ pub struct SshTerminalPane {
     pub profile: String,
     pub shell_id: Option<String>,
     pub connecting: bool,
+    // Older daemons emit setup failures as output before terminalizing.
+    // Keep that fallback distinct from output-based connection recovery.
+    reported_running: bool,
     output: zeroize::Zeroizing<Vec<u8>>,
     pub size: haider_rpc::SshPtySizeWire,
 }
@@ -3286,6 +3289,7 @@ impl SshTerminalPane {
             profile,
             shell_id: None,
             connecting: true,
+            reported_running: false,
             output: zeroize::Zeroizing::new(Vec::new()),
             size,
         }
@@ -18582,6 +18586,7 @@ impl AppModel {
             )
         {
             terminal.connecting = shell.status == haider_rpc::ShellStatusWire::Starting;
+            terminal.reported_running = shell.status == haider_rpc::ShellStatusWire::Running;
             terminal.shell_id = Some(shell.id);
             self.flash = Some(
                 if terminal.connecting {
@@ -18602,6 +18607,12 @@ impl AppModel {
         if let Some(terminal) = self.ssh_terminal.as_mut()
             && terminal.shell_id.as_deref() == Some(id)
         {
+            // Owned PTY output also proves setup finished if the event queue
+            // dropped Running. Ctrl+C must then remain remote input.
+            if terminal.connecting {
+                terminal.connecting = false;
+                self.flash = Some("· remote terminal connected · ⌃] close".into());
+            }
             terminal.push_output(bytes);
             self.dirty = true;
         }
@@ -18613,6 +18624,7 @@ impl AppModel {
             && terminal.shell_id.as_deref() == Some(shell.id.as_str())
         {
             terminal.connecting = false;
+            terminal.reported_running = true;
             self.flash = Some("· remote terminal connected · ⌃] close".into());
         }
         let closes = self
@@ -18633,7 +18645,7 @@ impl AppModel {
                 .or_else(|| {
                     // Older daemons report setup failure as terminal output.
                     terminal
-                        .filter(|pane| pane.connecting)
+                        .filter(|pane| !pane.reported_running)
                         .map(|pane| pane.display_text())
                 })
                 .map(|text| text.chars().filter(|c| !c.is_control()).collect::<String>())
