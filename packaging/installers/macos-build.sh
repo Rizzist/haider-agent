@@ -27,7 +27,10 @@ mount_is_clear() {
 refresh_attached_device() {
   local device
   device=$(python3 -c '
-import json, pathlib, plistlib, re, subprocess, sys, time
+import importlib.util, json, pathlib, plistlib, re, subprocess, sys, time
+spec = importlib.util.spec_from_file_location("image_identity", sys.argv[7])
+helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
+expected = json.loads(pathlib.Path(sys.argv[8]).read_text())
 image_path = pathlib.Path(sys.argv[1]).resolve()
 record = pathlib.Path(sys.argv[2])
 before = pathlib.Path(sys.argv[5])
@@ -56,6 +59,19 @@ for attempt in range(4):
         sys.exit("hdiutil attachment inventory failed (exit %s)" % result.returncode)
     images = plistlib.loads(result.stdout).get("images", [])
     incomplete = b"cannot get IO media array" in result.stderr
+    backing = {entity["dev-entry"]: image for image in images
+               for entity in image.get("system-entities", []) if "dev-entry" in entity}
+    verified = {}
+    def is_expected(device):
+        image = backing[device]
+        pid = image.get("hdid-pid")
+        if pid not in verified:
+            verified[pid] = helper.backing_identity(image, expected)
+        if verified[pid] is None:
+            if not pathlib.Path(device).exists():
+                return False
+            sys.exit("backing inode unavailable; retaining recorded device " + device)
+        return verified[pid]
     identities = [(pathlib.Path(image["image-path"]).resolve(), entity["dev-entry"])
                   for image in images if "image-path" in image
                   for entity in image.get("system-entities", [])
@@ -66,14 +82,15 @@ for attempt in range(4):
     elif saved is not None:
         owned = [(path, device) for path, device in identities
                  if any(device == item["device"] and same_path(path, pathlib.Path(item["image"]))
-                        for item in saved)]
+                        for item in saved) and is_expected(device)]
     elif attach_devices:
-        # This attach output establishes the actual backing path for each device.
+        # Native plists supply devices, not paths. Bind each to the expected
+        # open backing vnode; a recycled device cannot establish ownership.
         owned = [(path, device) for path, device in identities
-                 if device in attach_devices and device not in previous]
+                 if device in attach_devices and device not in previous and is_expected(device)]
     else:
         owned = [(path, device) for path, device in identities
-                 if same_path(path, image_path) and device not in previous]
+                 if same_path(path, image_path) and device not in previous and is_expected(device)]
     known_devices = [item["device"] for item in saved] if saved is not None else attach_devices
     if any(pathlib.Path(device).exists() and device not in inventory_devices for device in known_devices):
         incomplete = True
@@ -94,11 +111,14 @@ for attempt in range(4):
     if snapshot:
         before.write_text(json.dumps([device for path, device in identities if same_path(path, image_path)]))
     else:
-        record.write_text(json.dumps([{"image": str(path), "device": device} for path, device in owned]))
+        if saved is None and not owned and any(device not in previous for path, device in identities
+                if device in attach_devices or same_path(path, image_path)):
+            sys.exit("cannot attribute attachment to the created backing inode; keeping everything")
+        record.write_text(json.dumps([{ "image": str(image_path), "device": device, "identity": expected} for path, device in owned]))
         for path, device in owned:
             print(device)
     sys.exit(0)
-' "$dmg" "$work/attached-image.json" "$work/attach.plist" "$work/mount" "$work/before-attach.json" "${1:-refresh}") || return 1
+' "$dmg" "$work/attached-image.json" "$work/attach.plist" "$work/mount" "$work/before-attach.json" "${1:-refresh}" "$here/macos-image-identity.py" "$work/image-identity.json") || return 1
   attached_device=$device
 }
 attachment_is_clear() {
@@ -122,16 +142,26 @@ detach_owned_image() {
     hdiutil detach "$device" || { status=$?; break; }
   done <<< "$devices"
   if attachment_is_clear; then return 0; fi
-  printf 'Owned image still attached as %s after detach\n' "$attached_device" >&2
+  printf 'Owned image still attached as %s after detach\n' "${attached_device//$'\n'/, }" >&2
   if [ "$status" -eq 0 ]; then status=1; fi
   return "$status"
 }
+approve_staging_from_mount() {
+  if [ -e "$work/mount/$name.pkg" ] && /usr/bin/cmp -s "$pkg" "$work/mount/$name.pkg"; then
+    python3 "$here/macos-image-identity.py" approve "$dmg" "$work/image-identity.json" "$work" || return 1
+  fi
+}
 cleanup() {
   local keep_work=0
+  if [ "$mounted" = 1 ]; then approve_staging_from_mount >/dev/null 2>&1 || true; fi
   if [ "$mounted" = 1 ]; then
     hdiutil_retry detach no_cleanup >/dev/null 2>&1 || true
     if ! attachment_is_clear || ! mount_is_clear; then
-      printf 'Could not detach %s (%s); retaining temporary mount for manual cleanup\n' "$attached_device" "$work/mount" >&2
+      if [ -z "$attached_device" ]; then
+        attached_device=$(python3 -c 'import pathlib,plistlib,re,sys; p=pathlib.Path(sys.argv[1]); r=plistlib.loads(p.read_bytes()) if p.exists() else {}; print(", ".join(e["dev-entry"] for e in r.get("system-entities",[]) if re.fullmatch(r"/dev/disk[0-9]+",e.get("dev-entry",""))))' "$work/attach.plist") || attached_device=unknown
+      fi
+      [ -n "$attached_device" ] || attached_device="unknown (attach plist unavailable)"
+      printf 'Could not detach %s (%s); retaining temporary mount for manual cleanup\n' "${attached_device//$'\n'/, }" "$work/mount" >&2
       keep_work=1
     fi
   fi
@@ -140,6 +170,10 @@ cleanup() {
     security delete-keychain "$work/signing.keychain-db" >/dev/null || true
   fi
   rm -f "$work/cert.p12" "$work/signing.keychain-db"
+  if [ -f "$work/retain-create" ]; then
+    printf 'Retaining unattributed create output in %s\n' "$work" >&2
+    keep_work=1
+  fi
   if [ "$keep_work" = 0 ]; then rm -rf "$work"; fi
 }
 trap cleanup EXIT
@@ -216,17 +250,15 @@ run_hdiutil() {
       printf 'Refusing to replace existing disk image %s\n' "$dmg" >&2
       return 1
     fi
-    create_started=1
-    hdiutil create "$@" || status=$?
-    # A destination created concurrently was never our partial output.
-    if [ "$status" -ne 0 ] && { [ "$status" -eq 17 ] || LC_ALL=C grep -Eiq 'file exists|eexist' "$diagnostic"; }; then
-      create_started=0
-    fi
+    rm -f "$work/image-identity.json"
+    python3 "$here/macos-image-identity.py" create "$dmg" "$work/image-identity.json" "$work" "${@:1:$#-1}" || status=$?
+    if [ -f "$work/image-identity.json" ]; then create_started=1; fi
     return "$status"
   fi
   if [ "$action" = attach ]; then
     # Snapshot before attach: a partial failure may return no device plist.
     # Refuse to attach if the pre-existing devices cannot be inventoried.
+    python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json" || return 1
     refresh_attached_device snapshot || return 1
     # Arm the exit trap even when attach creates a device and then returns error.
     mounted=1
@@ -280,11 +312,14 @@ hdiutil_retry() {
 }
 remove_partial_dmg() {
   [ "$create_started" = 1 ] || return 0
-  rm -f "$dmg" || return $?
+  python3 "$here/macos-image-identity.py" remove "$dmg" "$work/image-identity.json" || return $?
+  # A nonempty failed-create output could be another caller's replacement.
+  if [ -f "$work/create-unattributed-nonempty" ]; then return 1; fi
   create_started=0
 }
 no_cleanup() { :; }
 detach_partial_mount() {
+  approve_staging_from_mount >/dev/null 2>&1 || true
   detach_owned_image >/dev/null 2>&1 || true
   if attachment_is_clear; then
     mounted=0
@@ -304,12 +339,19 @@ detach_partial_mount() {
   return 1
 }
 hdiutil_retry create remove_partial_dmg -volname "Haider $version" -srcfolder "$work/image" -format UDZO "$dmg"
+exec 9< "$dmg"
+python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
 if [ "$notarized" = 1 ]; then notarize "$dmg"; fi
 mkdir "$work/mount"
 hdiutil_retry attach detach_partial_mount "$dmg" -readonly -nobrowse -mountpoint "$work/mount"
 mounted=1
+python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
 cmp "$pkg" "$work/mount/$name.pkg"
+python3 "$here/macos-image-identity.py" approve "$dmg" "$work/image-identity.json" "$work"
+python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
 hdiutil_retry detach no_cleanup
 mounted=0
-(cd "$out" && shasum -a 256 "$name.pkg" > "$name.pkg.sha256" && shasum -a 256 "$name.dmg" > "$name.dmg.sha256")
+python3 "$here/macos-image-identity.py" finish "$dmg" "$work/image-identity.json" "$work"
+(cd "$out" && shasum -a 256 "$name.pkg" > "$name.pkg.sha256")
+python3 "$here/macos-image-identity.py" checksum "$dmg" "$work/image-identity.json" "$dmg.sha256"
 printf 'macOS installer gate PASS signed=%s notarized=%s\n' "$signed" "$notarized"
