@@ -6029,9 +6029,9 @@ pub struct AppModel {
     pub(crate) painted_epoch: std::cell::Cell<u64>,
     pub(crate) input_rebase: Option<crate::runtime::InputRebase>,
     pub(crate) input_refused: bool,
-    /// Text lost from the pending burst. A guarded commit or passive report
-    /// cannot erase it merely because the reader observed a newer paint.
-    pub(crate) discarded_edit: bool,
+    /// Last text lost from the pending burst. A guarded commit or passive
+    /// report preserves it; accepted replacement input or 10 s expires it.
+    pub(crate) discarded_edit_at: Option<std::time::Instant>,
     /// Foreign mirror and inject replacements own a fresh draft. Local
     /// typing keeps this revision stable so a burst can remain one cohort.
     composer_replacement_epoch: u64,
@@ -6379,7 +6379,7 @@ impl Default for AppModel {
             painted_epoch: std::cell::Cell::new(0),
             input_rebase: None,
             input_refused: false,
-            discarded_edit: false,
+            discarded_edit_at: None,
             composer_replacement_epoch: 0,
             pointer_presentation: std::cell::RefCell::new(None),
             text_question_presentation: std::cell::RefCell::new(None),
@@ -18653,11 +18653,11 @@ impl AppModel {
     }
 
     fn handle_ssh_terminal_key(&mut self, key: KeyEvent) {
-        let close = key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(
-                key.code,
-                KeyCode::Char(']' | '5') | KeyCode::Char('\u{001d}')
-            );
+        let connected = self
+            .ssh_terminal
+            .as_ref()
+            .is_some_and(|pane| !pane.connecting);
+        let close = crate::ssh_terminal::cancels_terminal(key, connected);
         if close
             && self
                 .ssh_terminal

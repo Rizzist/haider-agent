@@ -28,6 +28,12 @@ use crate::shell_registry::{ShellControl, ShellHandle};
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+// DNS/TCP gets 10 s; SSH negotiation and authentication share 30 s. The
+// entire PTY setup gets 50 s, including pool contention, reconnects and
+// channel admission. Leave room for the typed reply inside the RPC's 60 s.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const PTY_SETUP_TIMEOUT: Duration = Duration::from_secs(50);
 const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const EXIT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const OUTPUT_LIMIT: usize = haider_tools::PROCESS_MAX_OUTPUT_BYTES;
@@ -376,7 +382,11 @@ impl SshRuntime {
                     if close.changed().await.is_err() { break; }
                 }
             } => Err(registry_error("SSH terminal connection cancelled".into())),
-            result = setup => result,
+            result = tokio::time::timeout(PTY_SETUP_TIMEOUT, setup) => {
+                result.unwrap_or_else(|_| Err(SshError::SshTimeout {
+                    name: requested_profile.clone(),
+                }))
+            },
         };
         let (profile_name, channel, lease) = match setup {
             Ok(setup) => setup,
@@ -769,19 +779,31 @@ impl SshRuntime {
             ..client::Config::default()
         };
         let config = Arc::new(config);
-        let mut handle = client::connect(
-            config,
-            (profile.ssh.host.as_str(), profile.ssh.port),
-            handler,
+        let stream = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect((profile.ssh.host.as_str(), profile.ssh.port)),
         )
         .await
-        .map_err(handler_error)?;
-        let authenticated = self.authenticate(&mut handle, profile).await?;
-        if !authenticated {
-            return Err(SshError::SshAuthenticationFailed {
-                name: profile.name.clone(),
-            });
-        }
+        .map_err(|_| SshError::SshTimeout {
+            name: profile.name.clone(),
+        })?
+        .map_err(|error| connection_error(error.into()))?;
+        let _ = stream.set_nodelay(true);
+        let handle = tokio::time::timeout(HANDSHAKE_AUTH_TIMEOUT, async {
+            let mut handle = client::connect_stream(config, stream, handler)
+                .await
+                .map_err(handler_error)?;
+            if !self.authenticate(&mut handle, profile).await? {
+                return Err(SshError::SshAuthenticationFailed {
+                    name: profile.name.clone(),
+                });
+            }
+            Ok(handle)
+        })
+        .await
+        .map_err(|_| SshError::SshTimeout {
+            name: profile.name.clone(),
+        })??;
         let pinned = observed
             .lock()
             .map_err(|_| SshError::SshConnection {
@@ -1049,4 +1071,34 @@ fn unix_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod setup_deadline_tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use crate::ssh::setup_timeout_tests::{assert_timeout, fixture, opening};
+
+    #[tokio::test(start_paused = true)]
+    async fn profile_lock_wait_uses_the_total_setup_deadline_and_stays_cancellable() {
+        let (runtime, registry) = fixture(1);
+        let slot = runtime.session_slot("stall").await;
+        let guard = slot.lock().await;
+        for cancel in [false, true] {
+            let (id, task) = opening(&runtime, &registry);
+            tokio::task::yield_now().await;
+            if cancel {
+                registry
+                    .close_control(&id, Some("owner"))
+                    .expect("cancel while waiting for pool");
+                assert!(task.await.expect("cancel task").is_err());
+                assert!(registry.get(&id).expect("cancel row").setup_error.is_none());
+            } else {
+                tokio::time::advance(Duration::from_secs(50)).await;
+                assert_timeout(&registry, &id, task).await;
+            }
+            assert_eq!(registry.inventory().count, 0);
+        }
+        drop(guard);
+    }
 }

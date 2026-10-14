@@ -40,6 +40,7 @@ struct QueuedInput {
 
 type PresentedFrame = Mutex<std::collections::VecDeque<((PresentedInput, u64), Instant)>>;
 const INPUT_FRAME_HISTORY: usize = 128;
+const DISCARDED_EDIT_LIFETIME: Duration = Duration::from_secs(10);
 
 /// Retain every frame produced by accepted queued input. The expected stamp
 /// includes the paint epoch; outside changes retire the whole history, even
@@ -111,18 +112,6 @@ fn dispatch_queued_input(
         dispatch_input(model, hits, input.event);
         return true;
     }
-    let preserve_discarded_edit = match &input.event {
-        Event::Key(key) if key.kind == KeyEventKind::Release => true,
-        Event::Key(key) => {
-            model.decision_key_commits(key) && !model.decision_key_commit_ready(input.received_at)
-        }
-        Event::Mouse(mouse) => passive_mouse(mouse.kind),
-        Event::Paste(text) => text.is_empty(),
-        _ => false,
-    };
-    if !preserve_discarded_edit {
-        model.discarded_edit = false;
-    }
     let pointer_before = model.pointer_input_owner();
     let (mut sources, mut pointer_sources) = if rebased {
         model
@@ -186,6 +175,19 @@ fn new_request_feedback(discarded_edit: bool) -> &'static str {
     }
 }
 
+fn has_discarded_edit(model: &mut AppModel, now: Instant) -> bool {
+    // Ingress timestamps govern decision dwell, but a delayed queue cannot
+    // extend this presentation marker beyond ten seconds of real time.
+    let now = now.max(Instant::now());
+    if model
+        .discarded_edit_at
+        .is_some_and(|at| now.saturating_duration_since(at) >= DISCARDED_EDIT_LIFETIME)
+    {
+        model.discarded_edit_at = None;
+    }
+    model.discarded_edit_at.is_some()
+}
+
 /// Motion and wheel reports have no action for the user to retry.
 fn refuse_stale_input(model: &mut AppModel, input: &QueuedInput) {
     let event = &input.event;
@@ -207,9 +209,9 @@ fn refuse_stale_input(model: &mut AppModel, input: &QueuedInput) {
             && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
             && !model.decision_key_commits(key))
     {
-        model.discarded_edit = true;
+        model.discarded_edit_at = Some(now);
     }
-    let discarded_edit = model.discarded_edit;
+    let discarded_edit = has_discarded_edit(model, now);
     let stamped = input.presented.is_some();
     let message = if stamped {
         match event {
@@ -1536,10 +1538,21 @@ pub fn dispatch_input_at(
         );
         return;
     }
+    let preserve_discarded_edit = match &event {
+        Event::Key(key) if key.kind == KeyEventKind::Release => true,
+        Event::Key(key) => model.decision_key_commits(key) && !model.decision_key_commit_ready(now),
+        Event::Mouse(mouse) => passive_mouse(mouse.kind),
+        Event::Paste(text) => text.is_empty(),
+        _ => true,
+    };
+    if !preserve_discarded_edit {
+        model.discarded_edit_at = None;
+    }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             if model.decision_key_commits(&key) && !model.decision_key_commit_ready(now) {
-                model.flash = Some(new_request_feedback(model.discarded_edit).to_owned());
+                let discarded_edit = has_discarded_edit(model, now);
+                model.flash = Some(new_request_feedback(discarded_edit).to_owned());
                 model.input_refused = true;
                 model.dirty = true;
                 return;

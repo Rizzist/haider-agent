@@ -318,6 +318,46 @@ fn ctrl_bracket_closes_a_connecting_terminal_and_retires_its_late_shell() {
 }
 
 #[test]
+fn pane_cancel_chords_share_cli_encodings_but_connected_ctrl_c_is_remote_input() {
+    for c in [']', '5', '\u{1d}', 'c', 'C'] {
+        for has_id in [false, true] {
+            let mut model = live_session();
+            let mut pane = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);
+            if has_id {
+                pane.shell_id = Some("owned-shell".into());
+            }
+            model.ssh_terminal = Some(pane);
+            model.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(model.ssh_terminal.is_none(), "{c:?} has_id={has_id}");
+            assert_eq!(model.requests.len(), usize::from(has_id));
+            if has_id {
+                assert!(
+                    matches!(model.requests.last(), Some(AppRequest::ShellClose { id }) if id == "owned-shell")
+                );
+            }
+        }
+    }
+    for c in ['c', 'C'] {
+        let mut model = live_session();
+        let mut pane = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);
+        pane.shell_id = Some("owned-shell".into());
+        pane.connecting = false;
+        model.ssh_terminal = Some(pane);
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(model.ssh_terminal.is_some());
+        assert!(
+            matches!(model.requests.as_slice(), [AppRequest::SshShellInput { id, input }] if id == "owned-shell" && input.as_slice() == [3])
+        );
+    }
+}
+
+#[test]
 fn ssh_terminal_splits_large_paste_at_the_wire_input_bound() {
     let mut model = live_session();
     let mut terminal = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);

@@ -46,3 +46,7 @@ mod cancel_tests;
 #[cfg(test)]
 #[path = "ssh_setup_failure_tests.rs"]
 mod setup_failure_tests;
+
+#[cfg(test)]
+#[path = "ssh_setup_timeout_tests.rs"]
+mod setup_timeout_tests;

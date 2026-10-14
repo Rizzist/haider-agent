@@ -2318,3 +2318,81 @@ fn discarded_text_feedback_survives_new_paints_and_passive_reports_before_commit
         }
     }
 }
+
+#[test]
+fn discarded_text_marker_expires_after_ten_seconds_or_accepted_replacement() {
+    for child in [false, true] {
+        for fresh_stamp in [false, true] {
+            for gap in [9_999, 10_000, 10_001, 600_000] {
+                let mut m = text_question(child, "expiry");
+                paint(&mut m);
+                let old = m.painted_stamp();
+                m.invalidate_queued_input();
+                paint(&mut m);
+                let t = Instant::now();
+                set_shown_at(&m, t);
+                dispatch(&mut m, Event::Paste("lost".into()), old.clone(), t);
+                let retry_at = t + Duration::from_millis(gap);
+                set_shown_at(&m, retry_at);
+                let stamp = if fresh_stamp { m.painted_stamp() } else { old };
+                dispatch(&mut m, k(KeyCode::Enter), stamp, retry_at);
+                assert_eq!(
+                    m.flash.as_deref(),
+                    Some(if gap < 10_000 {
+                        "· New request — input discarded, type again"
+                    } else {
+                        "· New request — press again"
+                    }),
+                    "child={child} fresh={fresh_stamp} gap={gap}"
+                );
+                assert!(m.outbox.is_empty());
+                assert_eq!(m.discarded_edit_at.is_some(), gap < 10_000);
+            }
+        }
+        let mut m = text_question(child, "replacement");
+        paint(&mut m);
+        let old = m.painted_stamp();
+        m.invalidate_queued_input();
+        paint(&mut m);
+        let t = Instant::now();
+        set_shown_at(&m, t);
+        dispatch(&mut m, Event::Paste("lost".into()), old, t);
+        let fresh = m.painted_stamp();
+        dispatch(
+            &mut m,
+            Event::Paste("retry".into()),
+            fresh,
+            t + Duration::from_millis(100),
+        );
+        let fresh = m.painted_stamp();
+        dispatch(&mut m, k(KeyCode::Enter), fresh, t + Duration::from_secs(1));
+        assert_eq!(m.outbox.len(), 1);
+        assert!(m.discarded_edit_at.is_none());
+    }
+}
+
+#[test]
+fn delayed_ingress_cannot_revive_an_expired_discarded_text_marker() {
+    let mut m = text_question(false, "delayed");
+    paint(&mut m);
+    let stale = m.painted_stamp();
+    m.invalidate_queued_input();
+    paint(&mut m);
+    set_shown_at(&m, Instant::now());
+    let received = Instant::now() - Duration::from_secs(11);
+    dispatch(
+        &mut m,
+        Event::Paste("old lost text".into()),
+        stale.clone(),
+        received,
+    );
+    assert!(m.discarded_edit_at.is_none());
+    dispatch(
+        &mut m,
+        k(KeyCode::Enter),
+        stale,
+        received + Duration::from_millis(10),
+    );
+    assert_eq!(m.flash.as_deref(), Some("· New request — press again"));
+    assert!(m.outbox.is_empty());
+}

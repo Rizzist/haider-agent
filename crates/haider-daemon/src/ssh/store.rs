@@ -168,6 +168,9 @@ pub(crate) enum SshError {
     SshConnection {
         message: String,
     },
+    SshTimeout {
+        name: String,
+    },
     SshChannelClosed {
         name: String,
     },
@@ -222,6 +225,9 @@ impl fmt::Display for SshError {
             Self::SshConnection { message } => {
                 write!(formatter, "SSH connection failed: {message}")
             }
+            Self::SshTimeout { name } => {
+                write!(formatter, "SSH setup timed out for profile `{name}`")
+            }
             Self::SshChannelClosed { name } => {
                 write!(formatter, "SSH shell for profile `{name}` was closed")
             }
@@ -243,7 +249,10 @@ impl SshError {
     pub(crate) const fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::SshConnection { .. } | Self::SshChannelQuota { .. } | Self::Vault { .. }
+            Self::SshConnection { .. }
+                | Self::SshTimeout { .. }
+                | Self::SshChannelQuota { .. }
+                | Self::Vault { .. }
         )
     }
 
@@ -259,6 +268,7 @@ impl SshError {
             Self::SshAgentUnavailable => "ssh_agent_unavailable",
             Self::SshKeyInvalid { .. } => "ssh_key_invalid",
             Self::SshConnection { .. } => "ssh_connection_failed",
+            Self::SshTimeout { .. } => "ssh_timeout",
             Self::SshChannelClosed { .. } => "ssh_channel_closed",
             Self::SshChannelQuota { .. } => "ssh_channel_quota",
             Self::Vault { .. } => "ssh_vault_error",
