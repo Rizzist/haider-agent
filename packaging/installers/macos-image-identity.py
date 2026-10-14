@@ -233,6 +233,7 @@ def seal(path, record, descriptor):
     with descriptor.open('rb') as source:
         if identity(os.fstat(source.fileno())) != expected:
             raise RuntimeError('disk image identity changed before validation')
+        source.seek(0)
         digest = file_digest(source, 'sha256').hexdigest()
         check(path, expected)
         record.write_text(json.dumps({'identity': expected, 'sha256': digest}))

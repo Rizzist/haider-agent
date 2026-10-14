@@ -271,6 +271,9 @@ run_hdiutil() {
     # Refuse to attach if the pre-existing devices cannot be inventoried.
     python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json" || return 1
     refresh_attached_device snapshot || return 1
+    # Snapshot inventory can include legitimate in-place postprocessing. Pin
+    # the bytes only once that completes, immediately before native attach.
+    python3 "$here/macos-image-identity.py" seal "$dmg" "$work/image-identity.json" /dev/fd/9 || return 1
     # Arm the exit trap even when attach creates a device and then returns error.
     mounted=1
     rm -f "$work/attached-image.json"
@@ -355,7 +358,6 @@ hdiutil_retry create remove_partial_dmg -volname "Haider $version" -srcfolder "$
 exec 9< "$dmg"
 python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
 if [ "$notarized" = 1 ]; then notarize "$dmg"; fi
-python3 "$here/macos-image-identity.py" seal "$dmg" "$work/image-identity.json" /dev/fd/9
 mkdir "$work/mount"
 hdiutil_retry attach detach_partial_mount "$dmg" -readonly -nobrowse -mountpoint "$work/mount"
 mounted=1

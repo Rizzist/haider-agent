@@ -278,6 +278,7 @@ class ImageIdentityTests(unittest.TestCase):
         expected = IMAGE.identity(self.path.stat())
         self.record.write_text(json.dumps(expected))
         with self.path.open('rb') as pinned:
+            pinned.read()  # A retry may inherit the pin's previous read offset.
             IMAGE.seal(self.path, self.record, Path('/dev/fd/' + str(pinned.fileno())))
         IMAGE.checksum(self.path, self.record, self.root / 'good-digest')
         self.path.write_bytes(b'modified image')
