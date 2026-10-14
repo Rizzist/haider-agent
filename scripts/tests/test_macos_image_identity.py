@@ -40,7 +40,7 @@ class ImageIdentityTests(unittest.TestCase):
             self.assertEqual(IMAGE.create(self.path, self.record, self.root, []), 0)
             raw = Path(json.loads((self.root / 'staged-image.json').read_text())['path'])
             self.assertTrue(raw.exists(), 'unvalidated native output deleted')
-            IMAGE.approve(self.root, self.path)
+            IMAGE.check(self.path, json.loads(self.record.read_text()))
             IMAGE.finish(self.root)
             self.assertTrue(raw.exists(), 'post-create identity conferred deletion authority')
         self.assertEqual(self.path.read_bytes(), b'created image')
@@ -72,7 +72,7 @@ class ImageIdentityTests(unittest.TestCase):
             return subprocess.CompletedProcess(arguments, 0, plistlib.dumps({'images': []}), b'')
         with patch.object(IMAGE.subprocess, 'run', side_effect=native):
             self.assertEqual(IMAGE.create(self.path, self.record, self.root, []), 0)
-            IMAGE.approve(self.root, self.path)
+            IMAGE.check(self.path, json.loads(self.record.read_text()))
             IMAGE.finish(self.root)
         raw = Path((self.root / 'retain-create').read_text().strip())
         self.assertEqual(raw.read_bytes(), b'valid bytes')
@@ -91,6 +91,42 @@ class ImageIdentityTests(unittest.TestCase):
             self.assertEqual(native.call_count, 1)
             self.assertEqual(native.call_args.args[0], ['hdiutil', 'info', '-plist'])
         self.assertTrue(raw.exists())
+
+    def test_create_does_not_read_a_symlinked_native_output(self):
+        foreign = self.root / 'foreign.bin'
+        foreign.write_bytes(b'foreign bytes')
+        def native(arguments):
+            Path(arguments[-1]).symlink_to(foreign)
+            return subprocess.CompletedProcess(arguments, 0)
+        with patch.object(IMAGE.subprocess, 'run', side_effect=native):
+            with self.assertRaises(OSError):
+                IMAGE.create(self.path, self.record, self.root, [])
+        self.assertEqual(self.path.read_bytes(), b'')
+        self.assertEqual(foreign.read_bytes(), b'foreign bytes')
+
+    def test_create_rejects_a_fifo_without_waiting_for_a_writer(self):
+        def native(arguments):
+            os.mkfifo(arguments[-1])
+            return subprocess.CompletedProcess(arguments, 0)
+        with patch.object(IMAGE.subprocess, 'run', side_effect=native):
+            with self.assertRaisesRegex(RuntimeError, 'not a regular file'):
+                IMAGE.create(self.path, self.record, self.root, [])
+        self.assertEqual(self.path.read_bytes(), b'')
+
+    def test_create_directory_replacement_cannot_redirect_the_source_copy(self):
+        foreign = self.root / 'foreign-directory'
+        foreign.mkdir()
+        (foreign / 'image.dmg').write_bytes(b'foreign directory bytes')
+        def native(arguments):
+            raw = Path(arguments[-1])
+            raw.write_bytes(b'native bytes')
+            raw.parent.rename(raw.parent.with_name('original-directory'))
+            raw.parent.symlink_to(foreign, target_is_directory=True)
+            return subprocess.CompletedProcess(arguments, 0)
+        with patch.object(IMAGE.subprocess, 'run', side_effect=native):
+            self.assertEqual(IMAGE.create(self.path, self.record, self.root, []), 0)
+        self.assertEqual(self.path.read_bytes(), b'native bytes')
+        self.assertEqual((foreign / 'image.dmg').read_bytes(), b'foreign directory bytes')
 
     def test_finish_refuses_an_unattached_staging_replacement(self):
         raw = self.root / 'raw.dmg'

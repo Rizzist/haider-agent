@@ -1,11 +1,13 @@
 """Stable backing-file identities for the macOS installer and its test tracer."""
 import hashlib
+from contextlib import ExitStack
 import json
 import os
 import plistlib
 import re
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -68,10 +70,14 @@ def check(path, expected):
 def create(path, record, staging, arguments):
     # Reserve the publication inode ourselves. Native hdiutil replaces even an
     # existing -ov destination, so it writes into a private staging directory.
-    with path.open('xb') as output:
+    with path.open('xb') as output, ExitStack() as descriptors:
         expected = identity(os.fstat(output.fileno()))
         record.write_text(json.dumps(expected))
         raw = Path(tempfile.mkdtemp(prefix='create.', dir=staging)) / 'image.dmg'
+        # Bind the source directory before the tool runs. A later directory
+        # replacement must not redirect the copy to another caller's files.
+        stage_fd = os.open(raw.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.callback(os.close, stage_fd)
         # Arm retention before invoking the tool, including interruption before
         # it returns. No failed or interrupted create grants pathname ownership.
         retained_before = (staging / 'retain-create').exists()
@@ -88,7 +94,13 @@ def create(path, record, staging, arguments):
             elif not retained_before:
                 (staging / 'retain-create').unlink()
             return result.returncode
-        with raw.open('rb') as source:
+        # Native output is untrusted input, not deletion authority. Refuse
+        # symlinks and special files without reading through either of them.
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        source_fd = os.open(raw.name, flags, dir_fd=stage_fd)
+        with os.fdopen(source_fd, 'rb') as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise RuntimeError('native create output is not a regular file; retaining ' + str(raw))
             raw_identity = identity(os.fstat(source.fileno()))
             shutil.copyfileobj(source, output)
         output.flush()
@@ -97,7 +109,7 @@ def create(path, record, staging, arguments):
         # even when its bytes pass validation. Never claim its attachments or
         # delete it. Only the publication inode reserved above is ours.
         (staging / 'staged-image.json').write_text(json.dumps({
-            'path': str(raw), 'identity': raw_identity, 'retain_before': retained_before}))
+            'path': str(raw), 'identity': raw_identity}))
     return 0
 
 
@@ -109,17 +121,6 @@ def staging_inventory():
         if attempt == 3:
             raise RuntimeError('incomplete create-output inventory; retaining staging')
         time.sleep(.1 * (attempt + 1))
-
-
-def approve(staging, publication):
-    saved = json.loads((staging / 'staged-image.json').read_text())
-    raw = Path(saved['path'])
-    with raw.open('rb') as source, publication.open('rb') as copied:
-        if identity(os.fstat(source.fileno())) != saved['identity']:
-            raise RuntimeError('staging identity changed before validation')
-        if hashlib.file_digest(source, 'sha256').digest() != hashlib.file_digest(copied, 'sha256').digest():
-            raise RuntimeError('staging bytes differ from the validated publication')
-    check(raw, saved['identity'])
 
 
 def finish(staging):
@@ -161,7 +162,5 @@ if __name__ == '__main__':
         # Check immediately before invoking unlink; no pathname-only permission.
         path.unlink()
         sys.exit(0)
-    if action == 'approve':
-        approve(Path(args[0]), path)
     if action == 'checksum':
         checksum(path, record, Path(args[0]))

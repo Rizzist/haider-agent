@@ -1657,5 +1657,38 @@ native_hdiutil "$@"
                     self.recover_foreign(Path(current['image-path']), device)
 
 
+    def test_valid_inplace_publication_postprocessing_keeps_the_created_inode(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + """
+if [ "$1" = create ]; then
+  native_hdiutil "$@" || exit $?
+  touch "$HDIUTIL_TEST_DIR/created"
+  exit 0
+fi
+if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/created" ] && [ ! -f "$HDIUTIL_TEST_DIR/transformed" ]; then
+  touch "$HDIUTIL_TEST_DIR/transformed"
+  /usr/bin/hdiutil convert "$PUBLICATION_DMG" -format UDZO -imagekey zlib-level=1 -o "$HDIUTIL_TEST_DIR/converted.dmg" >/dev/null || exit $?
+  python3 - "$PUBLICATION_DMG" "$HDIUTIL_TEST_DIR" <<'TRANSFORM'
+import hashlib,json,pathlib,sys
+image,root=map(pathlib.Path,sys.argv[1:]);before=image.stat();original=hashlib.sha256(image.read_bytes()).hexdigest()
+image.write_bytes((root/'converted.dmg').read_bytes())
+after=image.stat();changed=hashlib.sha256(image.read_bytes()).hexdigest()
+(root/'transformed.json').write_text(json.dumps({'before_inode':before.st_ino,'after_inode':after.st_ino,'before_sha256':original,'after_sha256':changed}))
+TRANSFORM
+fi
+native_hdiutil "$@"
+""")
+        output = self.base / 'postprocess-output'
+        image = output / f'haider-v{VERSION}-{TARGET}.dmg'
+        result = self.run_builder(output, PUBLICATION_DMG=str(image))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('macOS installer gate PASS', result.stdout)
+        changed = json.loads((self.base / 'transformed.json').read_text())
+        self.assertEqual(changed['before_inode'], changed['after_inode'])
+        self.assertNotEqual(changed['before_sha256'], changed['after_sha256'])
+        self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), changed['after_sha256'])
+        self.assertEqual(image.with_suffix('.dmg.sha256').read_text().split()[0], changed['after_sha256'])
+        self.assert_no_test_mounts()
+
+
 if __name__ == '__main__':
     unittest.main()

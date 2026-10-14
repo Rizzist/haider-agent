@@ -146,14 +146,8 @@ detach_owned_image() {
   if [ "$status" -eq 0 ]; then status=1; fi
   return "$status"
 }
-approve_staging_from_mount() {
-  if [ -e "$work/mount/$name.pkg" ] && /usr/bin/cmp -s "$pkg" "$work/mount/$name.pkg"; then
-    python3 "$here/macos-image-identity.py" approve "$dmg" "$work/image-identity.json" "$work" || return 1
-  fi
-}
 cleanup() {
   local keep_work=0
-  if [ "$mounted" = 1 ]; then approve_staging_from_mount >/dev/null 2>&1 || true; fi
   if [ "$mounted" = 1 ]; then
     hdiutil_retry detach no_cleanup >/dev/null 2>&1 || true
     if ! attachment_is_clear || ! mount_is_clear; then
@@ -319,7 +313,6 @@ remove_partial_dmg() {
 }
 no_cleanup() { :; }
 detach_partial_mount() {
-  approve_staging_from_mount >/dev/null 2>&1 || true
   detach_owned_image >/dev/null 2>&1 || true
   if attachment_is_clear; then
     mounted=0
@@ -347,7 +340,6 @@ hdiutil_retry attach detach_partial_mount "$dmg" -readonly -nobrowse -mountpoint
 mounted=1
 python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
 cmp "$pkg" "$work/mount/$name.pkg"
-python3 "$here/macos-image-identity.py" approve "$dmg" "$work/image-identity.json" "$work"
 python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
 hdiutil_retry detach no_cleanup
 mounted=0
