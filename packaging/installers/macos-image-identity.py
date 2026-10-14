@@ -18,6 +18,17 @@ def identity(stat):
     return [stat.st_dev, stat.st_ino]
 
 
+def file_digest(source, algorithm):
+    """Hash an open descriptor on both stock macOS Python 3.9 and newer Python."""
+    native = getattr(hashlib, 'file_digest', None)
+    if native is not None:
+        return native(source, algorithm)
+    digest = hashlib.new(algorithm)
+    for chunk in iter(lambda: source.read(1024 * 1024), b''):
+        digest.update(chunk)
+    return digest
+
+
 def backing_identity(image, expected):
     """Inspect the helper's open vnode, never stat its mutable backing pathname.
 
@@ -98,7 +109,7 @@ def create(path, record, staging, arguments):
                     (staging / 'staged-image.json').write_text(json.dumps({
                         'path': str(raw), 'identity': identity(raw.stat()),
                         'directory': identity(os.fstat(stage_fd))}))
-                print('Unattributed create output; retaining ' + str(raw), file=sys.stderr)
+                print('Create output requires identity-checked cleanup: ' + str(raw), file=sys.stderr)
             elif not retained_before:
                 (staging / 'retain-create').unlink()
             return result.returncode
@@ -173,9 +184,18 @@ def package(path, record, source_path, staging, payload, version, target, verifi
     """Validate, embed and publish one pinned package generation."""
     with source_path.open('rb') as source, path.open('xb') as output:
         expected = identity(os.fstat(output.fileno()))
-        record.write_text(json.dumps(expected))
+        record.write_text(json.dumps({'identity': expected, 'copying': True}))
+        digest = file_digest(source, 'sha256').digest()
+        source.seek(0)
         shutil.copyfileobj(source, output)
         output.flush()
+        record.write_text(json.dumps({'identity': expected, 'sha256': digest.hex()}))
+        # Snapshot the private, signature-checked source, never the publication.
+        # Both copies must still match the bytes read from that descriptor.
+        source.seek(0)
+        snapshot = staging / 'validated.pkg'
+        with snapshot.open('xb') as validated:
+            shutil.copyfileobj(source, validated)
     # pkgutil does not expand /dev/fd inputs correctly on macOS. Give it a
     # private snapshot copied from the checked descriptor, pin that snapshot,
     # and check its identity and bytes across expansion. Embed from the same
@@ -183,17 +203,15 @@ def package(path, record, source_path, staging, payload, version, target, verifi
     with path.open('rb') as source:
         if identity(os.fstat(source.fileno())) != expected:
             raise RuntimeError('package identity changed before validation')
-        snapshot = staging / 'validated.pkg'
-        with snapshot.open('xb') as output:
-            shutil.copyfileobj(source, output)
         with snapshot.open('rb') as validated:
             snapshot_identity = identity(os.fstat(validated.fileno()))
-            digest = hashlib.file_digest(validated, 'sha256').digest()
+            if file_digest(validated, 'sha256').digest() != digest:
+                raise RuntimeError('private package bytes changed while copying')
             subprocess.run(['pkgutil', '--expand-full', str(snapshot),
                             str(staging / 'expanded')], check=True)
             check(snapshot, snapshot_identity)
             validated.seek(0)
-            if hashlib.file_digest(validated, 'sha256').digest() != digest:
+            if file_digest(validated, 'sha256').digest() != digest:
                 raise RuntimeError('validated package bytes changed')
             subprocess.run([sys.executable, str(verifier), str(staging / 'expanded'),
                             str(payload), version, target], check=True)
@@ -204,9 +222,38 @@ def package(path, record, source_path, staging, payload, version, target, verifi
             check(snapshot, snapshot_identity)
         check(path, expected)
         source.seek(0)
-        if hashlib.file_digest(source, 'sha256').digest() != digest:
+        if file_digest(source, 'sha256').digest() != digest:
             raise RuntimeError('published package bytes changed since validation')
         record.write_text(json.dumps({'identity': expected, 'sha256': digest.hex()}))
+
+
+def seal(path, record, descriptor):
+    """Remember the pinned DMG bytes after stapling and before validation."""
+    expected = expected_identity(record)
+    with descriptor.open('rb') as source:
+        if identity(os.fstat(source.fileno())) != expected:
+            raise RuntimeError('disk image identity changed before validation')
+        digest = file_digest(source, 'sha256').hexdigest()
+        check(path, expected)
+        record.write_text(json.dumps({'identity': expected, 'sha256': digest}))
+
+
+def withdraw(path, record):
+    """Withdraw only this failed run's unchanged package and its own sidecar."""
+    saved = json.loads(record.read_text())
+    sidecar = saved.get('sidecar')
+    if sidecar:
+        target = Path(sidecar['path'])
+        check(target, sidecar['identity'])
+        target.unlink()
+    check(path, saved['identity'])
+    with path.open('rb') as source:
+        if identity(os.fstat(source.fileno())) != saved['identity']:
+            raise RuntimeError('package identity changed before withdrawal')
+        if not saved.get('copying') and file_digest(source, 'sha256').hexdigest() != saved['sha256']:
+            raise RuntimeError('package bytes changed; retaining ' + str(path))
+        check(path, saved['identity'])
+        path.unlink()
 
 
 def compare(path, record, embedded):
@@ -229,12 +276,16 @@ def checksum(path, record, sidecar):
     with path.open('rb') as source:
         if identity(os.fstat(source.fileno())) != expected:
             raise RuntimeError('disk image identity changed before checksum')
-        digest = hashlib.file_digest(source, 'sha256').hexdigest()
+        digest = file_digest(source, 'sha256').hexdigest()
         if isinstance(saved, dict) and digest != saved['sha256']:
-            raise RuntimeError('published package bytes changed since validation')
+            kind = 'package' if path.suffix == '.pkg' else 'disk image'
+            raise RuntimeError('published ' + kind + ' bytes changed since validation')
         check(path, expected)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         with os.fdopen(os.open(sidecar, flags, 0o644), 'w') as output:
+            if isinstance(saved, dict):
+                saved['sidecar'] = {'path': str(sidecar), 'identity': identity(os.fstat(output.fileno()))}
+                record.write_text(json.dumps(saved))
             output.write(digest + '  ' + path.name + '\n')
             output.flush()
             check(sidecar, identity(os.fstat(output.fileno())))
@@ -255,6 +306,12 @@ if __name__ == '__main__':
     if action == 'package':
         package(path, record, Path(args[0]), Path(args[1]), Path(args[2]),
                 args[3], args[4], Path(args[5]))
+        sys.exit(0)
+    if action == 'seal':
+        seal(path, record, Path(args[0]))
+        sys.exit(0)
+    if action == 'withdraw':
+        withdraw(path, record)
         sys.exit(0)
     expected = expected_identity(record)
     check(path, expected)

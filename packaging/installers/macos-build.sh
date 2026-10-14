@@ -33,7 +33,7 @@ refresh_attached_device() {
 import importlib.util, json, pathlib, plistlib, re, subprocess, sys, time
 spec = importlib.util.spec_from_file_location("image_identity", sys.argv[7])
 helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
-expected = json.loads(pathlib.Path(sys.argv[8]).read_text())
+expected = helper.expected_identity(pathlib.Path(sys.argv[8]))
 image_path = pathlib.Path(sys.argv[1]).resolve()
 record = pathlib.Path(sys.argv[2])
 before = pathlib.Path(sys.argv[5])
@@ -145,7 +145,11 @@ detach_owned_image() {
     hdiutil detach "$device" || { status=$?; break; }
   done <<< "$devices"
   if attachment_is_clear; then return 0; fi
-  printf 'Owned image still attached as %s after detach\n' "${attached_device//$'\n'/, }" >&2
+  if [ -n "$attached_device" ]; then
+    printf 'Owned image still attached as %s after detach\n' "${attached_device//$'\n'/, }" >&2
+  else
+    printf 'Attachment ownership unverified after detach\n' >&2
+  fi
   if [ "$status" -eq 0 ]; then status=1; fi
   return "$status"
 }
@@ -167,6 +171,11 @@ cleanup() {
     security delete-keychain "$work/signing.keychain-db" >/dev/null || true
   fi
   rm -f "$work/cert.p12" "$work/signing.keychain-db"
+  # An exclusive publication belongs to this run only while its identity and
+  # bytes still match. A failed build must not block a later clean rerun.
+  if [ "$original_status" -ne 0 ] && [ -f "$work/pkg-identity.json" ]; then
+    python3 "$here/macos-image-identity.py" withdraw "$pkg" "$work/pkg-identity.json" || true
+  fi
   # A failed validation need not retain an intact, unattached staging file.
   # Keep uncertain generations and unresolved mounts; preserve the exit status.
   if [ "$original_status" -ne 0 ] && [ "$keep_work" = 0 ] && [ -f "$work/staged-image.json" ]; then
@@ -346,6 +355,7 @@ hdiutil_retry create remove_partial_dmg -volname "Haider $version" -srcfolder "$
 exec 9< "$dmg"
 python3 "$here/macos-image-identity.py" check "$dmg" "$work/image-identity.json"
 if [ "$notarized" = 1 ]; then notarize "$dmg"; fi
+python3 "$here/macos-image-identity.py" seal "$dmg" "$work/image-identity.json" /dev/fd/9
 mkdir "$work/mount"
 hdiutil_retry attach detach_partial_mount "$dmg" -readonly -nobrowse -mountpoint "$work/mount"
 mounted=1

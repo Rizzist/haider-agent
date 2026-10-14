@@ -501,6 +501,7 @@ native_hdiutil "$@"
         self.assertNotEqual(paths[0].parent, paths[1].parent)
         self.assertTrue(all(not p.parent.parent.exists() for p in paths), 'PASS retained work directory')
         self.assertTrue(list(output.glob('*.dmg.sha256')))
+        self.assertNotIn('retaining ', result.stderr.lower())
 
     def test_nonempty_busy_create_is_still_bounded(self):
         shim = self.shim / 'hdiutil'
@@ -512,6 +513,94 @@ native_hdiutil "$@"
         self.assertEqual(calls.count('create'), 4)
         self.assertFalse(list(output.glob('*.sha256')))
         self.assertNotIn('Retaining unattributed create output in ', result.stderr)
+
+    def test_failed_busy_create_can_be_rerun_into_the_same_output(self):
+        result, output, calls = self.build('create', 4)
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual(calls.count('create'), 4)
+        self.assertFalse(list(output.glob('*.pkg')))
+        self.assertFalse(list(output.glob('*.sha256')))
+        result, rerun_output, _ = self.build('create', 0)
+        self.assertEqual(output, rerun_output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('macOS installer gate PASS', result.stdout)
+        self.assertEqual(len(list(output.iterdir())), 4)
+
+    def test_failed_package_validation_can_be_rerun_into_the_same_output(self):
+        verifier = self.shim / 'pkgutil'
+        verifier.write_text('#!/bin/bash\nexit 7\n')
+        verifier.chmod(0o755)
+        output = self.base / 'failed-validation-output'
+        result = self.run_builder(output)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(list(output.iterdir()))
+        verifier.unlink()
+        result = self.run_builder(output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('macOS installer gate PASS', result.stdout)
+
+    def test_builder_preserves_a_preexisting_foreign_package(self):
+        output = self.base / 'foreign-pkg-output'
+        output.mkdir()
+        pkg = output / f'haider-v{VERSION}-{TARGET}.pkg'
+        pkg.write_bytes(b'foreign package')
+        expected = (pkg.stat().st_dev, pkg.stat().st_ino)
+        result = self.run_builder(output)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(pkg.read_bytes(), b'foreign package')
+        self.assertEqual((pkg.stat().st_dev, pkg.stat().st_ino), expected)
+        self.assertFalse(list(output.glob('*.sha256')))
+
+    def test_busy_partial_attached_before_retry_is_retained_with_original_status(self):
+        # The native tool finishes before the helper records staging identity.
+        # The first callback inventory then observes an independent attach.
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = create ] && [ ! -f "$HDIUTIL_TEST_DIR/partial-path" ]; then
+  native_hdiutil "$@" || exit $?
+  printf '%s' "${@: -1}" > "$HDIUTIL_TEST_DIR/partial-path"
+  echo 'simulated Resource busy with valid partial' >&2
+  exit 16
+fi
+if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/partial-path" ] && [ ! -f "$HDIUTIL_TEST_DIR/partial-device" ]; then
+  python3 - <<'FOREIGN_PARTIAL'
+import os, pathlib, plistlib, re, subprocess
+base = pathlib.Path(os.environ['HDIUTIL_TEST_DIR'])
+raw = pathlib.Path((base / 'partial-path').read_text())
+result = subprocess.run(['/usr/bin/hdiutil', 'attach', str(raw), '-readonly', '-nobrowse', '-nomount', '-plist'],
+                        capture_output=True, check=True)
+entities = plistlib.loads(result.stdout)['system-entities']
+device = next(e['dev-entry'] for e in entities if re.fullmatch(r'/dev/disk[0-9]+', e.get('dev-entry', '')))
+(base / 'partial-device').write_text(device)
+FOREIGN_PARTIAL
+  [ "$?" = 0 ] || exit $?
+fi
+native_hdiutil "$@"
+''')
+        device = None
+        try:
+            result = self.run_builder(self.base / 'attached-partial-output')
+            raw = Path((self.base / 'partial-path').read_text())
+            device = (self.base / 'partial-device').read_text()
+            self.assertEqual(result.returncode, 16, result.stderr)
+            self.assertEqual((self.base / 'calls').read_text().splitlines().count('create'), 1)
+            self.assertIn('Retaining unattributed create output', result.stderr)
+            self.assertTrue(raw.exists())
+            self.assertEqual(Path(self.image_for_device(device)['image-path']).resolve(), raw.resolve())
+        finally:
+            record = self.base / 'partial-device'
+            if record.exists():
+                device = record.read_text()
+                self.recover_foreign(Path((self.base / 'partial-path').read_text()), device)
+
+    def test_builder_runs_with_stock_python39(self):
+        stock = Path('/usr/bin/python3')
+        if not stock.exists(): self.skipTest('stock Python unavailable')
+        version = subprocess.check_output([str(stock), '-c', 'import sys; print("%s.%s" % sys.version_info[:2])'], text=True).strip()
+        if version != '3.9': self.skipTest('stock Python is ' + version)
+        (self.shim / 'python3').symlink_to(stock)
+        result = self.run_builder(self.base / 'python39-output')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('macOS installer gate PASS', result.stdout)
 
     def test_failed_builder_removes_verified_unattached_staging(self):
         (self.shim / 'cmp').write_text('#!/bin/bash\necho "forced cmp failure" >&2\nexit 7\n')
@@ -616,6 +705,33 @@ native_hdiutil "$@"
         self.assertNotIn('macOS installer gate PASS', result.stdout)
         self.assertEqual(dmg.read_text(), 'foreign dmg\n')
         self.assertFalse(Path(str(dmg) + '.sha256').exists())
+        self.assert_no_test_mounts()
+
+    def test_builder_dmg_inplace_change_after_detach_is_refused(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = detach ] && [ ! -f "$HDIUTIL_TEST_DIR/dmg-edited" ]; then
+  native_hdiutil "$@" || exit $?
+  touch "$HDIUTIL_TEST_DIR/dmg-edited"
+  python3 - "$IMAGE_OUTPUT" <<'EDIT_DMG'
+import os, pathlib, sys
+path = pathlib.Path(sys.argv[1]); before = path.stat()
+with path.open('r+b') as image:
+    image.seek(before.st_size // 2); image.write(b'foreign in-place bytes')
+assert (path.stat().st_dev, path.stat().st_ino) == (before.st_dev, before.st_ino)
+EDIT_DMG
+  exit $?
+fi
+native_hdiutil "$@"
+''')
+        output = self.base / 'inplace-dmg-output'
+        dmg = output / f'haider-v{VERSION}-{TARGET}.dmg'
+        result = self.run_builder(output, IMAGE_OUTPUT=str(dmg))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('disk image bytes changed since validation', result.stderr)
+        self.assertNotIn('macOS installer gate PASS', result.stdout)
+        self.assertFalse(Path(str(dmg) + '.sha256').exists())
+        self.assertFalse(list(output.glob('*.pkg')))
+        self.assertFalse(list(output.glob('*.pkg.sha256')))
         self.assert_no_test_mounts()
 
     def test_builder_changed_dmg_is_refused_before_comparison(self):
@@ -1496,6 +1612,31 @@ native_hdiutil "$@"
         self.assertIn('retaining temporary mount', result.stderr)
         self.assertFalse(list(output.glob('*.sha256')))
         self.detach_leftover_test_mounts()
+
+    def test_builder_post_detach_inventory_failure_clears_stale_device(self):
+        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = detach ]; then
+  native_hdiutil "$@" || exit $?
+  touch "$HDIUTIL_TEST_DIR/fail-post-detach-info"
+  exit 0
+fi
+if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/fail-post-detach-info" ]; then
+  echo 'simulated post-detach inventory failure' >&2
+  exit 5
+fi
+if [ "$1" = create ]; then
+  native_hdiutil "$@" -fs HFS+
+  exit $?
+fi
+native_hdiutil "$@"
+''')
+        result = self.run_builder(self.base / 'post-detach-inventory-failure')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Attachment ownership unverified after detach', result.stderr)
+        self.assertIn('Attachment ownership unverified; no unverified device was detached', result.stderr)
+        self.assertNotIn('Owned image still attached as', result.stderr)
+        self.assertNotIn('Could not detach /dev/', result.stderr)
+        self.assert_no_test_mounts()
 
     def test_builder_recycled_device_does_not_confer_ownership(self):
         # A deterministic inventory shim replaces the ejected disk by a different

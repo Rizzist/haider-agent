@@ -1,5 +1,6 @@
 """Backing identity and publication controls, including mutable output paths."""
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -253,16 +254,107 @@ class ImageIdentityTests(unittest.TestCase):
     def test_checksum_uses_the_open_file_and_rechecks_publication(self):
         self.path.write_bytes(b'validated image')
         self.record.write_text(json.dumps(IMAGE.identity(self.path.stat())))
-        digest = IMAGE.hashlib.file_digest
+        digest = IMAGE.file_digest
         def replace_after_hash(source, algorithm):
             result = digest(source, algorithm)
             self.path.unlink()
             self.path.write_bytes(b'foreign replacement')
             return result
-        with patch.object(IMAGE.hashlib, 'file_digest', side_effect=replace_after_hash):
+        with patch.object(IMAGE, 'file_digest', side_effect=replace_after_hash):
             with self.assertRaisesRegex(RuntimeError, 'identity changed'):
                 IMAGE.checksum(self.path, self.record, self.root / 'digest')
         self.assertFalse((self.root / 'digest').exists())
+
+    def test_chunked_digest_matches_native_for_empty_and_multichunk_files(self):
+        for data in (b'', b'abc', b'0123456789' * 250000):
+            with self.subTest(size=len(data)):
+                self.path.write_bytes(data)
+                with self.path.open('rb') as source, patch.object(IMAGE.hashlib, 'file_digest', None, create=True):
+                    self.assertEqual(IMAGE.file_digest(source, 'sha256').digest(),
+                                     hashlib.sha256(data).digest())
+
+    def test_sealed_image_refuses_inplace_change_and_accepts_unchanged_bytes(self):
+        self.path.write_bytes(b'validated image')
+        expected = IMAGE.identity(self.path.stat())
+        self.record.write_text(json.dumps(expected))
+        with self.path.open('rb') as pinned:
+            IMAGE.seal(self.path, self.record, Path('/dev/fd/' + str(pinned.fileno())))
+        IMAGE.checksum(self.path, self.record, self.root / 'good-digest')
+        self.path.write_bytes(b'modified image')
+        self.assertEqual(IMAGE.identity(self.path.stat()), expected)
+        with self.assertRaisesRegex(RuntimeError, 'disk image bytes changed since validation'):
+            IMAGE.checksum(self.path, self.record, self.root / 'bad-digest')
+        self.assertFalse((self.root / 'bad-digest').exists())
+
+    def test_seal_refuses_a_foreign_descriptor_even_with_original_path(self):
+        self.path.write_bytes(b'created image')
+        self.record.write_text(json.dumps(IMAGE.identity(self.path.stat())))
+        foreign = self.root / 'foreign.dmg'
+        foreign.write_bytes(b'foreign bytes')
+        with foreign.open('rb') as pinned:
+            with self.assertRaisesRegex(RuntimeError, 'identity changed before validation'):
+                IMAGE.seal(self.path, self.record, Path('/dev/fd/' + str(pinned.fileno())))
+
+    def test_package_snapshots_the_private_source_even_if_publication_is_edited(self):
+        source = self.root / 'built.pkg'
+        source.write_bytes(b'private signed bytes')
+        (self.root / 'image').mkdir()
+        copy = IMAGE.shutil.copyfileobj
+        def edit_publication(reader, writer):
+            copy(reader, writer)
+            writer.flush()
+            if writer.name == str(self.path):
+                self.path.write_bytes(b'foreign publication')
+        with patch.object(IMAGE.shutil, 'copyfileobj', side_effect=edit_publication), \
+                patch.object(IMAGE.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            with self.assertRaisesRegex(RuntimeError, 'published package bytes changed since validation'):
+                IMAGE.package(self.path, self.record, source, self.root, self.root, '1.2.3',
+                              'aarch64-apple-darwin', self.root / 'verify.py')
+        self.assertEqual((self.root / 'validated.pkg').read_bytes(), source.read_bytes())
+        self.assertEqual((self.root / 'image' / self.path.name).read_bytes(), source.read_bytes())
+
+    def test_failed_package_withdrawal_removes_only_our_unchanged_publication(self):
+        for kind in ('unchanged', 'partial', 'replaced', 'edited', 'symlink'):
+            with self.subTest(kind=kind):
+                path = self.root / (kind + '.pkg')
+                path.write_bytes(b'our bytes')
+                saved = {'identity': IMAGE.identity(path.stat()),
+                         'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                with path.open('rb'):
+                    if kind == 'partial': saved = {'identity': saved['identity'], 'copying': True}
+                    if kind in ('replaced', 'symlink'):
+                        path.unlink()
+                    if kind in ('replaced', 'edited'): path.write_bytes(b'foreign bytes')
+                    if kind == 'symlink': path.symlink_to(self.root / 'missing-foreign')
+                    self.record.write_text(json.dumps(saved))
+                    if kind in ('unchanged', 'partial'):
+                        IMAGE.withdraw(path, self.record)
+                        self.assertFalse(path.exists())
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'changed'):
+                            IMAGE.withdraw(path, self.record)
+                        self.assertTrue(path.exists() or path.is_symlink())
+
+    def test_withdrawal_removes_own_sidecar_and_preserves_a_replaced_sidecar(self):
+        for replaced in (False, True):
+            with self.subTest(replaced=replaced):
+                self.path.write_bytes(b'our bytes')
+                self.record.write_text(json.dumps({'identity': IMAGE.identity(self.path.stat()),
+                    'sha256': hashlib.sha256(self.path.read_bytes()).hexdigest()}))
+                sidecar = self.root / f'sidecar-{replaced}'
+                IMAGE.checksum(self.path, self.record, sidecar)
+                with sidecar.open('rb'):
+                    if replaced:
+                        sidecar.unlink()
+                        sidecar.write_bytes(b'foreign sidecar')
+                        with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                            IMAGE.withdraw(self.path, self.record)
+                        self.assertEqual(sidecar.read_bytes(), b'foreign sidecar')
+                        self.assertTrue(self.path.exists())
+                    else:
+                        IMAGE.withdraw(self.path, self.record)
+                        self.assertFalse(sidecar.exists())
+                        self.assertFalse(self.path.exists())
 
     def test_checksum_rejects_foreign_descriptor_after_publication_path_is_restored(self):
         self.path.write_bytes(b'validated image')
