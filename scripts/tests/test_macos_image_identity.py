@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ IMAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(IMAGE)
 
 
+@unittest.skipUnless(platform.system() == 'Darwin', 'requires macOS backing-inode lifecycle semantics')
 class ImageIdentityTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -141,6 +143,23 @@ class ImageIdentityTests(unittest.TestCase):
             return result
         with patch.object(IMAGE.hashlib, 'file_digest', side_effect=replace_after_hash):
             with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                IMAGE.checksum(self.path, self.record, self.root / 'digest')
+        self.assertFalse((self.root / 'digest').exists())
+
+    def test_checksum_rejects_foreign_descriptor_after_publication_path_is_restored(self):
+        self.path.write_bytes(b'validated image')
+        self.record.write_text(json.dumps(IMAGE.identity(self.path.stat())))
+        foreign = self.root / 'independent.dmg'
+        foreign.write_bytes(b'independent replacement')
+        native_open = Path.open
+        def open_replaced_generation(path, *args, **kwargs):
+            # The pathname was replaced while opening, then restored before
+            # the audit. Only the returned descriptor reveals the wrong file.
+            if path == self.path and args == ('rb',):
+                return native_open(foreign, *args, **kwargs)
+            return native_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', open_replaced_generation):
+            with self.assertRaisesRegex(RuntimeError, 'identity changed before checksum'):
                 IMAGE.checksum(self.path, self.record, self.root / 'digest')
         self.assertFalse((self.root / 'digest').exists())
 
