@@ -79,7 +79,7 @@ fn attaching_a_session_replays_its_seed_and_starts_no_turn() {
     )));
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "◇ checkpoint 7 committed"
+        TranscriptEntry::Note { text, .. } if text == "◇ checkpoint 7 committed"
     )));
     assert_eq!(
         model.session_dir, "~/dev/diffforge/cloud",

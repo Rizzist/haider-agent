@@ -948,9 +948,14 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
         None,
         7_000,
         ModelSelected {
+            selection_epoch: None,
             provider: "openai".into(),
             model_catalog_key: None,
             model: "gpt-5.2".into(),
+            route_only: false,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("model selected"),

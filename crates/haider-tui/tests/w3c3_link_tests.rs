@@ -1055,6 +1055,7 @@ fn tui_session_create_carries_automode_overrides() {
         command_id: haider_rpc::CommandId::new("automode-create"),
         cwd: allocation.leaf.clone(),
         workspace_allocation: Some(allocation.clone()),
+        account_alias: None,
         provider: "fake".into(),
         expected_catalog_key: None,
         model: "fake-model".into(),

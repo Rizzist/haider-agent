@@ -54,7 +54,24 @@ STORE_CALLERS = (
 CALLER_PHASES = ("store_query_replay", "store_query_reducer", "store_event_decode")
 
 
+class PhaseTraceError(ValueError):
+    """An incomplete diagnostic, separate from a product correctness failure."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
+    try:
+        return _read_records(directory)
+    except PhaseTraceError:
+        raise
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, RecursionError) as error:
+        raise PhaseTraceError("invalid_trace", str(error)) from error
+
+
+def _read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
     records: list[dict[str, Any]] = []
     pids: list[int] = []
     for path in sorted(directory.glob("phase-*.jsonl")):
@@ -63,12 +80,18 @@ def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
             raise ValueError(f"empty phase trace: {path.name}")
         header = json.loads(lines[0])
         schema = header.get("schema")
-        if (schema not in (1, 2, 3, 4) or header.get("dropped") != 0
-                or type(header.get("records")) is not int
-                or header["records"] != len(lines) - 1
-                or header.get("clock") != "CLOCK_MONOTONIC"
+        if type(schema) is not int or schema not in (1, 2, 3, 4):
+            raise PhaseTraceError("unsupported_schema", f"unsupported phase trace schema: {path.name}")
+        if type(header.get("dropped")) is not int or header["dropped"] < 0:
+            raise PhaseTraceError("invalid_trace", f"invalid phase drop count: {path.name}")
+        if header["dropped"]:
+            raise PhaseTraceError("record_capacity", f"truncated phase trace: {path.name}; dropped={header['dropped']}")
+        if (type(header.get("records")) is not int
+                or header["records"] != len(lines) - 1):
+            raise PhaseTraceError("incomplete_trace", f"unsupported or truncated phase trace: {path.name}")
+        if (header.get("clock") != "CLOCK_MONOTONIC"
                 or header.get("cpu_clock") != "CLOCK_THREAD_CPUTIME_ID"):
-            raise ValueError(f"unsupported or truncated phase trace: {path.name}")
+            raise PhaseTraceError("unsupported_clock", f"unsupported phase trace clock: {path.name}")
         pid = header["pid"]
         if type(pid) is not int or pid <= 0 or path.name != f"phase-{pid}.jsonl":
             raise ValueError("invalid phase process identity")

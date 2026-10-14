@@ -706,6 +706,12 @@ pub async fn run_demo(
     if let Some(store) = settings.as_mut() {
         store.set_tool_rows(tool_rows);
     }
+    if let Some(pick) = settings
+        .as_ref()
+        .and_then(crate::settings::SettingsStore::load_last_model)
+    {
+        model.restore_last_model_pick(&pick);
+    }
     // 970: the terms acknowledgements this profile already carries — read
     // ONCE at boot so the first-login disclosure never reappears for a user
     // who has already answered it.
@@ -716,6 +722,7 @@ pub async fn run_demo(
         .unwrap_or_default();
     let mut seen_terms_commits = model.terms_ack_commits;
     let mut seen_theme_commits = model.theme_commits;
+    let mut seen_model_commits = model.model_commits;
     let mut seen_verbosity_commits = model.verbosity_commits;
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
@@ -892,6 +899,7 @@ pub async fn run_demo(
         }
         // Theme cycled: re-sync the emulator background.
         sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
+        sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);

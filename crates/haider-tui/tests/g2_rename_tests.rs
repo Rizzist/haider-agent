@@ -37,6 +37,7 @@ fn summary(
     title: Option<&str>,
 ) -> haider_rpc::SessionSummary {
     haider_rpc::SessionSummary {
+        latest_context_footprint: None,
         session_id: session_id.clone(),
         head_seq,
         worker_generation: 7,

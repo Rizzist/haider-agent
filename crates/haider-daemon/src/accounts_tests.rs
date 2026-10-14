@@ -1551,6 +1551,11 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         Arc::new(ProductionAccountBuilder::default()),
     );
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -2088,6 +2093,11 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     );
     let resolved = factory
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+            selection_epoch: None,
+            route_reset_epoch: None,
+            budget_clamp_notice_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,
@@ -2302,6 +2312,11 @@ async fn check_compaction_promotion_policy(unverified: bool) {
             Some("configured (unverified): server returned 404 for /models".into());
     }
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -2470,6 +2485,11 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
     let origin = "http://127.0.0.1:11434/v1";
     let summary = keyless_summary(provider, origin);
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -2577,6 +2597,47 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
     );
     assert!(resolved.initial_rotation.is_none());
 
+    // The actual keyless route has a synthetic alias even though the
+    // session has no explicit account pin. It must still receive an epoch.
+    let route_profile = test_store_dir();
+    let route_store = haider_store::Store::open(route_profile.path()).expect("route store");
+    let route_session = haider_protocol::ids::SessionId::new("keyless-route-session");
+    route_store
+        .create_session(&haider_store::SessionCreateCommand {
+            command_id: "keyless-route-create".into(),
+            request_digest: "keyless-route-digest".into(),
+            request_json: "{}".into(),
+            session_id: route_session.clone(),
+            cwd: metadata.cwd.clone(),
+            provider: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            max_tokens: metadata.max_tokens,
+            max_tokens_source: None,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "test".into(),
+            event_id: haider_protocol::ids::EventId::new("keyless-route-created"),
+            device_id: haider_protocol::ids::DeviceId::new("keyless-test"),
+            model_catalog_key: None,
+        })
+        .expect("create unpinned keyless session");
+    let route_device = haider_protocol::ids::DeviceId::new("keyless-test");
+    assert_eq!(
+        route_store
+            .commit_resolved_route(
+                &route_session,
+                provider,
+                &metadata.model,
+                0,
+                resolved.account_alias.as_deref(),
+                &route_device,
+            )
+            .expect("keyless route epoch"),
+        0
+    );
+
     // A STORED KEY WINS: with an active vault-backed descriptor for the same
     // auth-None profile, resolution returns it and never synthesizes.
     let alias = CredentialAlias::new("ollama-key");
@@ -2623,6 +2684,26 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         .expect("stored-key dispatch");
     assert_eq!(resolved.account_alias.as_deref(), Some(alias.as_str()));
     assert!(!resolved.active_no_auth);
+    let switched = route_store
+        .commit_resolved_route(
+            &route_session,
+            provider,
+            &metadata.model,
+            0,
+            resolved.account_alias.as_deref(),
+            &route_device,
+        )
+        .expect("stored route epoch");
+    assert!(switched > 0);
+    let committed = route_store
+        .session_metadata(&route_session)
+        .expect("metadata")
+        .expect("session");
+    assert_eq!(committed.selection_epoch, Some(switched));
+    assert_eq!(
+        committed.account_alias, None,
+        "route changes must not pin the session"
+    );
 }
 
 /// LAW (LK1 refusal edge): the keyless fallback is SCOPED — a provider whose
@@ -2649,6 +2730,11 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
         );
         let Err(error) = factory
             .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+                selection_epoch: None,
+                route_reset_epoch: None,
+                budget_clamp_notice_epoch: None,
+                resolved_route_alias: None,
+                resolved_route_seen: false,
                 launch_origin: None,
                 workspace_allocation: None,
                 provider_base_url: None,
@@ -3177,6 +3263,11 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     let resolver = AccountsAttemptResolver::new(
         factory,
         haider_protocol::session::SessionMetadataV1 {
+            selection_epoch: None,
+            route_reset_epoch: None,
+            budget_clamp_notice_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,
@@ -3290,6 +3381,11 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         promotion_targets: HashMap::new(),
     });
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -3536,6 +3632,11 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
     );
     let resolved = factory
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+            selection_epoch: None,
+            route_reset_epoch: None,
+            budget_clamp_notice_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
             launch_origin: None,
             workspace_allocation: None,
             provider_base_url: None,
@@ -3756,6 +3857,11 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         broker,
     );
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -13387,6 +13493,11 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
     use crate::accounts::{ProviderTuning, anthropic_fast_for};
 
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -13618,6 +13729,11 @@ fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummary
 
 fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session::SessionMetadataV1 {
     haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -14460,6 +14576,11 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         Arc::clone(&builder) as Arc<dyn AccountProviderBuilder>,
     );
     let metadata = |provider: &str| haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -14779,6 +14900,11 @@ async fn each_turn_resolves_the_currently_active_account() {
         Arc::new(ProductionAccountBuilder::default()),
     );
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -15877,6 +16003,11 @@ fn antigravity_summary(models: &[&str], default_model: Option<&str>) -> Provider
 
 fn antigravity_metadata(model: &str) -> haider_protocol::session::SessionMetadataV1 {
     haider_protocol::session::SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -17727,7 +17858,19 @@ fn persisted_configured_deployment_turns_share_the_selection_availability_rule()
             assert_eq!(result.expect_err("refusal").message, reason);
         }
     }
-    summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+    // A FRESH successful empty list is definite negative evidence. (An aged
+    // one is uncertainty and stays selectable by the shared aging rule —
+    // `project_inventory_at_time`; the old fixture time of 1 ms was aged.)
+    let fresh_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis(),
+    )
+    .expect("millisecond clock fits u64");
+    summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: fresh_ms,
+    };
     summary.models.clear();
     summary.availability = ProviderAvailabilityWire::Unavailable;
     summary.availability_reason = Some("model list is empty".into());

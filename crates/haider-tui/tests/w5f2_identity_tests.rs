@@ -150,7 +150,7 @@ fn an_unpinned_identity_follows_the_imported_active_account() {
     assert_eq!(model.identity.account, "openai-oauth");
     assert_eq!(model.identity.model_short, "gpt-5.6-codex");
     assert!(
-        !model.identity_pinned,
+        !model.launcher_identity_pinned,
         "a bootstrap is not a user choice — later daemon truth may still move it"
     );
 }
@@ -195,7 +195,7 @@ fn fresh_oauth_login_adopts_static_model_after_catalog_403() {
     assert_eq!(model.identity.provider, "anthropic-oauth");
     assert_eq!(model.identity.account, "work");
     assert_eq!(model.identity.model_short, "claude-fable-5-1");
-    assert!(!model.identity_pinned);
+    assert!(!model.launcher_identity_pinned);
     model.open_model_picker(String::new());
     assert!(model.model_picker_rows().iter().any(|row| {
         row.provider == "anthropic-oauth" && row.model == "claude-fable-5-1" && row.selectable
@@ -203,7 +203,7 @@ fn fresh_oauth_login_adopts_static_model_after_catalog_403() {
 }
 
 /// MUTATION CHECK (W5f-2): make `bootstrap_identity_from_daemon` ignore
-/// `identity_pinned`. Expected runtime failure: the snapshot below
+/// `launcher_identity_pinned`. Expected runtime failure: the snapshot below
 /// overwrites the user's explicit `/model` pick.
 /// Verified by revert on 2026-07-30.
 #[test]
@@ -228,7 +228,10 @@ fn a_pinned_choice_survives_every_later_snapshot() {
     run_slash(&mut model, "/model o4-mini");
     model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
     assert_eq!(model.identity.model_short, "o4-mini");
-    assert!(model.identity_pinned, "/model is an explicit choice");
+    assert!(
+        model.launcher_identity_pinned,
+        "/model is an explicit choice"
+    );
 
     pass(
         &mut driver,
@@ -359,12 +362,12 @@ fn connecting_asks_for_account_and_provider_truth() {
     let boot = driver.boot();
     assert!(
         boot.iter()
-            .any(|command| matches!(command, LiveCommand::AccountList)),
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. })),
         "boot must ask for account truth: {boot:?}"
     );
     assert!(
         boot.iter()
-            .any(|command| matches!(command, LiveCommand::ProviderList)),
+            .any(|command| matches!(command, LiveCommand::ProviderListAt { .. })),
         "and provider truth: {boot:?}"
     );
 
@@ -378,14 +381,14 @@ fn connecting_asks_for_account_and_provider_truth() {
     assert!(
         pass.commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::AccountList)),
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. })),
         "a reconnect must ask for account truth: {:?}",
         pass.commands
     );
     assert!(
         pass.commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::ProviderList)),
+            .any(|command| matches!(command, LiveCommand::ProviderListAt { .. })),
         "and provider truth: {:?}",
         pass.commands
     );
@@ -414,7 +417,7 @@ fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
     assert!(
         pass.commands.iter().any(|command| matches!(
             command,
-            LiveCommand::RefreshProviderModels { provider } if provider == "openai-oauth"
+            LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai-oauth"
         )),
         "the active OAuth provider must have its catalog discovered: {:?}",
         pass.commands
@@ -436,7 +439,7 @@ fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
         !again
             .commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::RefreshProviderModels { .. })),
+            .any(|command| matches!(command, LiveCommand::RefreshProviderModelsAt { .. })),
         "discovery must not storm on every snapshot: {:?}",
         again.commands
     );
@@ -499,7 +502,7 @@ fn never_fetched_state_refreshes_even_when_legacy_rows_are_nonempty() {
         }),
         std::time::Instant::now(),
     );
-    assert!(pass.commands.iter().any(|command| matches!(command, LiveCommand::RefreshProviderModels { provider } if provider == "openai-oauth")));
+    assert!(pass.commands.iter().any(|command| matches!(command, LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai-oauth")));
     assert_eq!(
         model.identity.model_short, before,
         "never adopt a legacy seed before discovery"
@@ -549,7 +552,7 @@ fn same_alias_new_incarnation_retires_current_picker_and_launcher_default() {
             },
         );
         assert_eq!(model.identity.model_short, "a-private");
-        assert!(model.identity_pinned);
+        assert!(model.launcher_identity_pinned);
         let mut unrelated = oauth_descriptor("unrelated", "other", true);
         unrelated.incarnation = 3;
         let mut unrelated_summary =
@@ -677,7 +680,7 @@ fn static_or_configured_picker_choice_survives_an_account_incarnation_change() {
             },
         );
         assert_eq!(model.identity.model_short, "permanent-choice");
-        assert!(model.identity_pinned);
+        assert!(model.launcher_identity_pinned);
     }
 }
 
@@ -752,7 +755,7 @@ fn account_selection_reply_cannot_pin_the_old_provider_default() {
     a.incarnation = 2;
     model.apply_account_selected(&a, 2);
     assert!(model.identity.model_short.is_empty());
-    assert!(!model.identity_pinned);
+    assert!(!model.launcher_identity_pinned);
     pass(
         &mut driver,
         &mut model,
@@ -875,8 +878,14 @@ fn public_fetched_choice_and_same_producer_refresh_keep_the_user_pin() {
         account.incarnation = 1;
         let mut summary = private_summary(1, "stable-choice");
         if public {
+            // A GENUINE public listing: anonymous, unauthenticated and
+            // authoritative. (An authenticated or advisory catalog under a
+            // public provider name is account-owned since 67ab6384; see
+            // `picked_public_namespace_model_retains_its_private_producer`.)
             summary.catalog = haider_rpc::ProviderCatalogKindWire::Public;
             summary.catalog_scope = None;
+            summary.auth_methods.clear();
+            summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Authoritative;
         }
         pass(
             &mut driver,
@@ -917,7 +926,7 @@ fn public_fetched_choice_and_same_producer_refresh_keep_the_user_pin() {
             },
         );
         assert_eq!(model.identity.model_short, "stable-choice");
-        assert!(model.identity_pinned);
+        assert!(model.launcher_identity_pinned);
         assert_eq!(model.identity.context_window, 123_456);
     }
 }
@@ -969,7 +978,7 @@ fn remote_metadata_for_a_static_slug_is_retired_without_unpinning_the_static_cho
         },
     );
     assert_eq!(model.identity.model_short, slug);
-    assert!(model.identity_pinned);
+    assert!(model.launcher_identity_pinned);
     assert_eq!(model.identity.context_window, 0, "A's context is retired");
     let detail = model
         .providers
@@ -1118,7 +1127,7 @@ fn automatic_session_default_is_resolved_by_daemon_instead_of_echoed() {
     );
     model.identity.provider = "custom".into();
     model.identity.model_short = "a-private-alpha".into();
-    model.identity_pinned = false;
+    model.launcher_identity_pinned = false;
     model.requests.push(AppRequest::CreateSession {
         text: "hello".into(),
     });
@@ -1180,9 +1189,10 @@ fn delayed_session_selection_does_not_borrow_replacement_catalog_owner() {
         model.identity.model_short.is_empty(),
         "retired current marker removed"
     );
+    model.bootstrap_identity_from_daemon();
     assert!(
-        model.identity_pinned,
-        "attached session awaits an explicit choice"
+        model.identity.model_short.is_empty(),
+        "attached session awaits an explicit choice: no default is adopted into it"
     );
     assert_eq!(model.identity.context_window, 0);
     model.apply_scoped_model_selected(
@@ -1244,8 +1254,30 @@ fn picker_request_captures_owner_before_a_replacement_reply_is_applied() {
         }),
         std::time::Instant::now(),
     );
-    let select = pass
-        .commands
+    // The selection is held for the session's control attachment (wave
+    // 973 route epochs); the attach completes after the replacement reply.
+    let mut commands = pass.commands;
+    if !commands
+        .iter()
+        .any(|command| matches!(command, LiveCommand::SelectModel { .. }))
+    {
+        commands.extend(
+            live_pass(
+                &mut driver,
+                &mut model,
+                Some(LiveReply::Attached {
+                    attachment: haider_rpc::AttachmentId::new("picker-account-race-att"),
+                    session: session.clone(),
+                    worker_generation: 7,
+                    replay_through_seq: 0,
+                    launch_origin: None,
+                }),
+                std::time::Instant::now(),
+            )
+            .commands,
+        );
+    }
+    let select = commands
         .into_iter()
         .find(|command| matches!(command, LiveCommand::SelectModel { .. }))
         .expect("queued selection");
@@ -1349,7 +1381,7 @@ fn configured_id_survives_remote_metadata_retirement_but_owned_session_defaults_
                 model.identity.model_short.is_empty(),
                 "captured A defaults require a fresh selection"
             );
-            assert!(model.identity_pinned);
+            assert!(model.launcher_identity_pinned);
         } else {
             assert_eq!(
                 model.identity.model_short, "my-deployment",
@@ -1581,6 +1613,7 @@ fn provider_rebound_retires_owned_selection_without_erasing_explicit_configurati
                 .into(),
             ),
             account: Some(if route == "account" { "other" } else { "work" }.into()),
+            selection_epoch: None,
         });
         if route == "endpoint" || route == "account" {
             assert_eq!(
@@ -1649,7 +1682,14 @@ fn idle_management_refresh_is_bounded_and_retires_header_without_input() {
     assert_eq!(model.identity.model_short, "a-private");
     assert_eq!(
         driver.refresh_management(),
-        vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: driver.connection_epoch(),
+            },
+            LiveCommand::ProviderListAt {
+                epoch: driver.connection_epoch(),
+            },
+        ]
     );
     assert!(driver.refresh_management().is_empty());
     account.incarnation = 2;
@@ -2569,7 +2609,14 @@ fn management_changes_arrive_by_watch_signal_without_polling() {
     // closing that unobserved publication gap at boot and reconnect.
     assert_eq!(
         driver.refresh_management(),
-        vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: driver.connection_epoch(),
+            },
+            LiveCommand::ProviderListAt {
+                epoch: driver.connection_epoch(),
+            },
+        ]
     );
     let accepted = live_pass(
         &mut driver,
@@ -2580,7 +2627,14 @@ fn management_changes_arrive_by_watch_signal_without_polling() {
     assert!(driver.management_watch_active());
     assert_eq!(
         accepted.commands,
-        vec![LiveCommand::AccountList, LiveCommand::ProviderList],
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: driver.connection_epoch(),
+            },
+            LiveCommand::ProviderListAt {
+                epoch: driver.connection_epoch(),
+            },
+        ],
         "accepted subscription must read a baseline after registration"
     );
 
@@ -2597,11 +2651,11 @@ fn management_changes_arrive_by_watch_signal_without_polling() {
         signalled
             .commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::AccountList))
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. }))
             && signalled
                 .commands
                 .iter()
-                .any(|command| matches!(command, LiveCommand::ProviderList)),
+                .any(|command| matches!(command, LiveCommand::ProviderListAt { .. })),
         "a management signal must re-read accounts and providers: {:?}",
         signalled.commands
     );
@@ -2640,6 +2694,11 @@ fn management_changes_arrive_by_watch_signal_without_polling() {
         "a reconnect must re-open the watch: {:?}",
         resumed.commands
     );
+    assert!(
+        !driver.management_watch_active(),
+        "the old socket's acceptance cannot vouch for the new connection: \
+         the runtime polls until the re-opened watch is accepted"
+    );
     let accepted = live_pass(
         &mut driver,
         &mut model,
@@ -2648,7 +2707,14 @@ fn management_changes_arrive_by_watch_signal_without_polling() {
     );
     assert_eq!(
         accepted.commands,
-        vec![LiveCommand::AccountList, LiveCommand::ProviderList],
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: driver.connection_epoch(),
+            },
+            LiveCommand::ProviderListAt {
+                epoch: driver.connection_epoch(),
+            },
+        ],
         "reconnect acceptance must also close the snapshot/subscription gap"
     );
     let declined = live_pass(

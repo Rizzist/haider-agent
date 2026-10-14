@@ -186,7 +186,11 @@ fn opening_model_picker_refreshes_a_stale_selected_provider() {
 
     run_slash(&mut model, "/model");
     let initial = live_pass(&mut driver, &mut model, None, std::time::Instant::now()).commands;
-    assert!(initial.contains(&LiveCommand::ProviderList));
+    assert!(
+        initial
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ProviderListAt { .. }))
+    );
     let followups = driver.apply(
         &mut model,
         LiveReply::Providers {
@@ -194,9 +198,8 @@ fn opening_model_picker_refreshes_a_stale_selected_provider() {
             revision: 2,
         },
     );
-    assert!(followups.contains(&LiveCommand::RefreshProviderModels {
-        provider: "openai".to_owned(),
-    }));
+    assert!(followups.iter().any(|command| matches!(command,
+        LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai")));
 
     driver.apply(
         &mut model,
@@ -212,9 +215,8 @@ fn opening_model_picker_refreshes_a_stale_selected_provider() {
             revision: 3,
         },
     );
-    assert!(retry.contains(&LiveCommand::RefreshProviderModels {
-        provider: "openai".to_owned(),
-    }));
+    assert!(retry.iter().any(|command| matches!(command,
+        LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai")));
 }
 
 /// `/provider` lists the registry with honest health; `/account` lists live

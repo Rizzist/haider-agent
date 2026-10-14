@@ -351,7 +351,7 @@ fn agent_spawn_state_and_report_populate_nested_chips() {
     assert!(
         child.transcript.entries().iter().any(|entry| matches!(
             entry,
-            haider_tui::projection::TranscriptEntry::Note { text }
+            haider_tui::projection::TranscriptEntry::Note { text, .. }
                 if text.contains("tests green") && text.contains("verified")
         )),
         "AgentReport contributes summary + verification content"

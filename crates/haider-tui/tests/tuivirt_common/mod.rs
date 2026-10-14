@@ -166,8 +166,23 @@ pub fn session_id() -> SessionId {
 pub fn session_model() -> AppModel {
     let mut model = launcher_model();
     model.mode = RuntimeMode::Live;
+    // These frame pins deliberately use a known live model window. A live
+    // session cannot inherit the demo launcher's 200k seed; its own catalog
+    // must declare that window before the status line may render it.
+    let mut providers = haider_tui::mock::seed_provider_summaries();
+    let anthropic = providers
+        .iter_mut()
+        .find(|row| row.provider == "anthropic")
+        .expect("anthropic fixture provider");
+    let mut detail = anthropic.model_details[0].clone();
+    detail.name = "fable-5".to_owned();
+    detail.context_window = Some(200_000);
+    anthropic.models.push(detail.name.clone());
+    anthropic.model_details.push(detail);
+    model.providers.apply_snapshot(providers, 1);
     model.sessions.clear();
     model.upsert_live_session(&session_id());
+    model.note_session_metadata_at(&session_id(), "anthropic", "fable-5", 30_000, Some(0), None);
     model.open_session(&session_id());
     model.requests.clear();
     model.screen = Screen::Session;

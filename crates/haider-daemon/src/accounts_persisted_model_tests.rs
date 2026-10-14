@@ -544,6 +544,7 @@ async fn catalog_derived_session_selection_keeps_its_original_incarnation() {
         provider: profile.provider.clone(),
         base_url: None,
         account: Some(alias.as_str().into()),
+        selection_epoch: None,
     }
     .apply_to_metadata(&mut metadata);
     assert_eq!(

@@ -466,7 +466,7 @@ fn a_selected_api_key_account_triggers_model_discovery() {
         .filter(|command| {
             matches!(
                 command,
-                LiveCommand::RefreshProviderModels { provider } if provider == "custom-llama"
+                LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "custom-llama"
             )
         })
         .count();

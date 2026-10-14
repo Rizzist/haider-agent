@@ -8,6 +8,7 @@ use haider_rpc::{SeqRange, SessionReadResult};
 
 fn exact_footprint() -> ContextFootprint {
     ContextFootprint {
+        selection_epoch: None,
         input_tokens: 100,
         output_tokens: 20,
         cached_input_tokens: 30,

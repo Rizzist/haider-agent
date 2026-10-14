@@ -142,6 +142,7 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
             model_catalog_key: None,
             model: model.into(),
             expected_pair,
+            account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("selected-{ordinal}")),
             device_id: DeviceId::new("rebind-test-device"),
@@ -436,6 +437,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 model: "pending-next-turn-model".into(),
                 output_budget: None,
                 expected_pair: None,
+                account_alias: None,
                 event_id: EventId::new("pending-model-selected"),
                 device_id: device_id.clone(),
             })

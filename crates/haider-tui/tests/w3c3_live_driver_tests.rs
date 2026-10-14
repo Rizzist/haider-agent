@@ -37,6 +37,7 @@ fn attachment(n: usize) -> AttachmentId {
 
 fn summary(n: usize, head_seq: u64) -> SessionSummary {
     SessionSummary {
+        latest_context_footprint: None,
         session_id: sid(n),
         head_seq,
         worker_generation: 7,
@@ -420,7 +421,10 @@ fn reconnect_restores_the_working_set_after_each_sessions_last_applied_cursor() 
     let commands = driver.apply(&mut model, LiveReply::Reconnected);
     assert_eq!(
         commands.first(),
-        Some(&LiveCommand::List { cursor: None }),
+        Some(&LiveCommand::ListAt {
+            cursor: None,
+            epoch: driver.connection_epoch()
+        }),
         "a fresh connection re-lists first"
     );
     let attaches: Vec<(SessionId, u64)> = commands
@@ -722,6 +726,7 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
             provider: "anthropic".into(),
             model_catalog_key: None,
             model: "fable-5".to_owned(),
+            metadata: None,
         },
     );
     assert_eq!(model.sessions.len(), 1, "the daemon's session became a row");
@@ -733,11 +738,17 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
     );
     assert_eq!(
         after,
-        vec![LiveCommand::Attach {
-            session: sid(1),
-            after_seq: 0
-        }],
-        "the create response asks for the ATTACHMENT and nothing else"
+        vec![
+            LiveCommand::Attach {
+                session: sid(1),
+                after_seq: 0
+            },
+            LiveCommand::ListAt {
+                cursor: None,
+                epoch: 0
+            }
+        ],
+        "the create response attaches and reads current metadata; it cannot submit yet"
     );
     assert!(
         !after
@@ -1367,6 +1378,7 @@ fn an_attached_dated_session_speaks_uncreated_until_its_leaf_exists() {
             provider: "anthropic".into(),
             model_catalog_key: None,
             model: "fable-5".to_owned(),
+            metadata: None,
         },
     );
     assert_eq!(
@@ -1473,6 +1485,7 @@ fn rapid_session_switches_cannot_exceed_the_probe_bound() {
                 provider: "anthropic".into(),
                 model_catalog_key: None,
                 model: "fable-5".to_owned(),
+                metadata: None,
             },
         );
         leaves.push(std::path::PathBuf::from(leaf));
@@ -1561,6 +1574,7 @@ fn an_absent_non_dated_workspace_never_claims_the_uncreated_cue() {
             provider: "anthropic".into(),
             model_catalog_key: None,
             model: "fable-5".to_owned(),
+            metadata: None,
         },
     );
     driver.sync_workspace_presence(&mut model, true);

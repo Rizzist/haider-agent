@@ -94,6 +94,10 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
         ("turn_count", "not surfaced by the sessions view"),
         ("footprint_tokens", "flattened into `footprint`"),
         ("footprint_truth", "flattened into `footprint`"),
+        (
+            "latest_context_footprint",
+            "request-level meter provenance is consumed by the TUI; sessions JSON keeps its compact footprint summary",
+        ),
         ("workspace_cwd", "not surfaced by the sessions view"),
         (
             "agent_metrics",

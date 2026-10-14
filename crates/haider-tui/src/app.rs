@@ -20,6 +20,17 @@ use haider_protocol::{DeliveryMode, EventPayload};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+fn loom_selection_slash(draft: &str) -> bool {
+    let Some(name) = draft
+        .trim_start()
+        .strip_prefix('/')
+        .and_then(|tail| tail.split_whitespace().next())
+    else {
+        return false;
+    };
+    matches!(name.to_ascii_lowercase().as_str(), "model" | "provider")
+}
+
 /// Sim `autoBlurb` (tui.js:401-406): strip a leading slash-command token,
 /// keep the first seven words, cap at 46 chars, capitalize the first letter.
 #[must_use]
@@ -1727,6 +1738,12 @@ pub struct ChipModel {
     pub full: String,
     pub name: String,
     pub model: String,
+    /// The provider the child's model runs through — the manifest's
+    /// spawn-time provider coordinate. `None` when the manifest carries no
+    /// provenance (older daemon, demo seeds): the child's model is then
+    /// looked up under NO provider, never borrowed from the parent's
+    /// (973-context-meter-fixes B2).
+    pub provider: Option<String>,
     /// Daemon-stamped provider ceiling for this child.
     pub lockdown: bool,
     pub device: String,
@@ -1812,6 +1829,7 @@ impl ChipModel {
             full: seed.full,
             name: seed.name,
             model: seed.model,
+            provider: None,
             lockdown: false,
             device: seed.device,
             state: seed.state,
@@ -1866,6 +1884,7 @@ impl ChipModel {
             // display label (research W6b checklist item 4).
             name: manifest.task.clone(),
             model: manifest.model_profile.clone(),
+            provider: manifest.provider().map(str::to_owned),
             lockdown: manifest
                 .coordinates
                 .as_ref()
@@ -2064,7 +2083,7 @@ impl ChipModel {
             crate::projection::TranscriptEntry::Peer { sender, text, .. } => {
                 format!("peer {sender}: {text}")
             }
-            crate::projection::TranscriptEntry::Note { text } => text.clone(),
+            crate::projection::TranscriptEntry::Note { text, .. } => text.clone(),
             crate::projection::TranscriptEntry::Refusal {
                 provider,
                 tool,
@@ -5287,6 +5306,18 @@ impl Default for IdentityLine {
     }
 }
 
+/// catalog-fixes: the catalog owner of one identity pick — the account
+/// incarnation and catalog it came from — so an account or catalog change
+/// can retire it. The displayed pick's lives on [`AppModel`]'s identity
+/// fields; the launcher's is parked here while a session is displayed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PickScope {
+    catalog_scope: Option<(String, String, u64)>,
+    catalog_key: Option<String>,
+    restored_pending: bool,
+    unowned_configuration: bool,
+}
+
 /// The single mutable application state (research rec 3).
 #[derive(Debug)]
 pub struct AppModel {
@@ -5354,6 +5385,8 @@ pub struct AppModel {
     /// is the explicit confirmation that opens a new epoch.
     pub pending_cache_change: Option<PendingCacheChange>,
     pub identity: IdentityLine,
+    /// No-session defaults; attached session selections never overwrite it.
+    pub launcher_identity: IdentityLine,
     /// One replaceable launch-origin context slot (dated-workspace
     /// addendum O5/O7): `(revision, optional sanitised display)` of the
     /// LATEST committed registration for the active session. `None` display
@@ -5361,15 +5394,19 @@ pub struct AppModel {
     /// revision — the latest wins in place; origin facts never append
     /// per-event transcript rows and never touch unread/turn counters.
     pub launch_origin: Option<(u64, Option<String>)>,
-    /// The user EXPLICITLY chose a provider/model/account this run
-    /// (`/model`, `/provider`, or clicking an account). Once pinned, the
-    /// daemon-truth bootstrap below never overwrites their choice; until
-    /// then the identity line is only a seed and daemon reality wins.
-    pub identity_pinned: bool,
+    /// The no-session launcher's explicit default. Attached sessions are
+    /// pinned by their own committed [`crate::context_meter::MeterEpoch::selection_epoch`], never
+    /// by this launcher flag.
+    pub launcher_identity_pinned: bool,
+    /// catalog-fixes: the catalog owner of the DISPLAYED identity pick (the
+    /// launcher pick with no session, else the attached session's pair).
     identity_catalog_scope: Option<(String, String, u64)>,
     identity_catalog_key: Option<String>,
     restored_model_catalog_pending: bool,
     identity_unowned_configuration: bool,
+    /// The launcher pick's catalog owner while a session is displayed. It
+    /// is parked with [`Self::launcher_identity`] and restored on detach.
+    launcher_pick_scope: PickScope,
     session_catalog_keys: HashMap<SessionId, (String, String, Option<String>)>,
     session_catalog_routes: HashMap<SessionId, (Option<String>, Option<String>)>,
     /// The ACTIVE surface's composer (TUI5): text + first-class cursor +
@@ -5412,13 +5449,11 @@ pub struct AppModel {
     /// ⌃G / `/tokens` context panel (sim tui.js:2946-2977) — session
     /// surfaces only; esc closes.
     pub token_panel: bool,
-    /// The (provider, model) pair the context meter last resolved against
-    /// (973-context-meter), maintained by [`Self::refresh_context_window`].
-    meter_identity: Option<(String, String)>,
-    /// The latest snapshot at the moment the identity pair last CHANGED:
-    /// while it is still the latest, it describes the previous model, so
-    /// its window may not stand in for the current model's.
-    meter_snapshot_before_switch: Option<haider_protocol::context::ContextFootprint>,
+    /// The VIEWED session's context-meter epoch (973-context-meter-fixes):
+    /// its committed model pair, durable selection version, and output
+    /// budget. Travels with the session on checkout; changed only by that
+    /// session's versioned selection reply, fact, or metadata.
+    pub meter_epoch: crate::context_meter::MeterEpoch,
     /// `/tree` — selected row (sim treeSel).
     pub tree_sel: usize,
     /// `/tree` — the VIEWED branch (`None` = the root/main branch; sim
@@ -6082,8 +6117,7 @@ impl Default for AppModel {
         Self {
             screen: Screen::Boot,
             token_panel: false,
-            meter_identity: None,
-            meter_snapshot_before_switch: None,
+            meter_epoch: crate::context_meter::MeterEpoch::default(),
             tree_sel: 0,
             tree_view: None,
             pending_jump: std::cell::RefCell::new(None),
@@ -6114,11 +6148,13 @@ impl Default for AppModel {
             pending_cache_change: None,
             identity: IdentityLine::default(),
             launch_origin: None,
-            identity_pinned: false,
+            launcher_identity_pinned: false,
+            launcher_identity: IdentityLine::default(),
             identity_catalog_scope: None,
             identity_catalog_key: None,
             restored_model_catalog_pending: false,
             identity_unowned_configuration: false,
+            launcher_pick_scope: PickScope::default(),
             session_catalog_keys: HashMap::new(),
             session_catalog_routes: HashMap::new(),
             composer: crate::composer::Composer::new(),
@@ -6760,6 +6796,16 @@ impl AppModel {
         let from = self.screen;
         let from_key = self.surface_key();
         self.screen = to;
+        if to == Screen::Subagent {
+            if !self.mode.fabricates_locally()
+                && let Some(child) = self.selection_surface_session()
+            {
+                // Attach/replay needs the child's own cursor even before
+                // session.list has introduced its row.
+                self.upsert_live_session(&child);
+            }
+            self.restore_child_session_notes();
+        }
         if self.surface_key() == from_key {
             return;
         }
@@ -6817,6 +6863,18 @@ impl AppModel {
         self.view_path
             .last()
             .and_then(|agent| find_chip(&self.chips, agent))
+    }
+
+    /// A composer selection belongs to the session the surface is steering.
+    #[must_use]
+    pub fn selection_surface_session(&self) -> Option<SessionId> {
+        if self.screen == Screen::Subagent {
+            return self
+                .viewed_chip()
+                .and_then(|chip| chip.child_session.as_deref())
+                .map(SessionId::new);
+        }
+        self.active_session.clone()
     }
 
     /// The status-bar badge with the DERIVED `◔ WAITING · N subagent(s)`
@@ -7396,7 +7454,7 @@ impl AppModel {
         let mut text = String::new();
         match entry {
             crate::projection::TranscriptEntry::User { text: value, .. }
-            | crate::projection::TranscriptEntry::Note { text: value }
+            | crate::projection::TranscriptEntry::Note { text: value, .. }
             | crate::projection::TranscriptEntry::Error { text: value, .. } => text.push_str(value),
             crate::projection::TranscriptEntry::Peer {
                 sender,
@@ -9244,6 +9302,9 @@ impl AppModel {
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     self.composer.insert_str("\n");
                     self.note_loom_author_edit();
+                }
+                KeyCode::Enter if loom_selection_slash(self.composer.text()) => {
+                    self.submit_composer();
                 }
                 KeyCode::Enter if self.loom_authoring.is_some() => {
                     self.submit_loom_turn();
@@ -11869,25 +11930,32 @@ impl AppModel {
             descriptor.alias,
             auth_label(descriptor.auth_method)
         ));
-        // Choosing an account IS choosing the session identity (W5f-2):
-        // the committed pick rides into the composer line and pins, so the
-        // next `session.create` carries it and no later snapshot undoes it.
         self.accounts
             .catalog_incarnations
             .insert(descriptor.alias.as_str().to_owned(), descriptor.incarnation);
-        self.identity.provider = descriptor.provider.clone();
-        self.identity.account = descriptor.alias.as_str().to_owned();
-        self.bootstrap_identity_from_daemon();
-        // Do not pin a model from a provider reply owned by the old account.
-        // A fresh provider snapshot completes the account selection.
-        if !self.identity.model_short.is_empty() {
+        if self.active_session.is_some() {
+            // Account selection supplies the launcher default for future
+            // sessions. An attached session retains its own committed pair.
             self.adopt_identity(&descriptor.provider, descriptor.alias.as_str(), true);
-            self.pin_model_catalog_scope();
+        } else {
+            // Choosing an account IS choosing the launcher identity (W5f-2):
+            // the committed pick rides into the composer line and pins, so the
+            // next `session.create` carries it and no later snapshot undoes it.
+            self.identity.provider = descriptor.provider.clone();
+            self.identity.account = descriptor.alias.as_str().to_owned();
+            self.bootstrap_identity_from_daemon();
+            // Do not pin a model from a provider reply owned by the old account.
+            // A fresh provider snapshot completes the account selection.
+            if !self.identity.model_short.is_empty() {
+                self.adopt_identity(&descriptor.provider, descriptor.alias.as_str(), true);
+                self.pin_model_catalog_scope();
+            }
+            self.park_launcher_pick();
         }
         self.dirty = true;
     }
 
-    /// Point the composer identity at `provider`/`alias`, taking the model
+    /// Point the launcher identity at `provider`/`alias`, taking the model
     /// from the provider's own declaration (its default, else its first
     /// discovered slug — NEVER an invented one; with nothing discovered the
     /// current model stands until `/model` can offer real candidates).
@@ -11902,6 +11970,35 @@ impl AppModel {
                 scope.account_alias.is_none() && scope.account_incarnation.is_none()
             });
         let alias = if anonymous { "" } else { alias };
+        if self.active_session.is_some() {
+            let mut launcher = self.launcher_identity.clone();
+            launcher.provider = provider.to_owned();
+            launcher.account = alias.to_owned();
+            if let Some(model) = self
+                .providers
+                .providers
+                .iter()
+                .find(|summary| summary.provider == provider)
+                .and_then(|summary| {
+                    summary
+                        .default_model
+                        .clone()
+                        .or_else(|| summary.models.first().cloned())
+                })
+            {
+                launcher.model_short = model;
+            }
+            launcher.context_window = self
+                .providers
+                .declared_window(&launcher.provider, &launcher.model_short)
+                .unwrap_or(0);
+            self.launcher_pick_scope =
+                self.pick_scope_for(&launcher.provider, &launcher.model_short);
+            self.launcher_identity = launcher;
+            self.launcher_identity_pinned |= pin;
+            self.dirty = true;
+            return;
+        }
         if self.identity.provider != provider {
             self.identity.provider = provider.to_owned();
         }
@@ -11924,46 +12021,95 @@ impl AppModel {
             self.identity.model_short = model;
         }
         self.refresh_context_window();
-        self.identity_pinned |= pin;
+        self.park_launcher_pick();
+        self.launcher_identity_pinned |= pin;
         self.dirty = true;
     }
 
+    /// The boot restore of the persisted launcher pick (model retention).
     pub fn restore_last_model_pick(&mut self, pick: &crate::settings::LastModelPick) {
         self.identity.provider = pick.provider.clone();
         self.identity.model_short = pick.model.clone();
-        self.identity_pinned = true;
+        self.launcher_identity_pinned = true;
         self.identity_catalog_scope = None;
         self.identity_catalog_key = pick.catalog_key.clone();
         self.restored_model_catalog_pending = !pick.scope_known;
         self.identity_unowned_configuration = pick.scope_known && pick.catalog_key.is_none();
         self.refresh_context_window();
+        self.park_launcher_pick();
     }
 
+    /// The launcher pick to persist: the displayed pick with no session,
+    /// else the parked launcher pick (an attached session's pair is not the
+    /// launcher's unless a commit made it so).
     pub fn last_model_pick(&self) -> Option<crate::settings::LastModelPick> {
-        (self.identity_pinned && !self.identity.model_short.is_empty()).then(|| {
+        let (identity, scope) = if self.active_session.is_none() {
+            (&self.identity, self.displayed_pick_scope())
+        } else {
+            (&self.launcher_identity, self.launcher_pick_scope.clone())
+        };
+        (self.launcher_identity_pinned && !identity.model_short.is_empty()).then(|| {
             crate::settings::LastModelPick {
-                provider: self.identity.provider.clone(),
-                model: self.identity.model_short.clone(),
-                catalog_key: self.identity_choice_catalog_key(),
-                scope_known: !self.restored_model_catalog_pending
-                    && (self.identity_unowned_configuration || self.identity_catalog_key.is_some()),
+                provider: identity.provider.clone(),
+                model: identity.model_short.clone(),
+                catalog_key: self.choice_catalog_key_for(identity, &scope),
+                scope_known: !scope.restored_pending
+                    && (scope.unowned_configuration || scope.catalog_key.is_some()),
             }
         })
     }
 
     pub(crate) fn launcher_model_pick_is_ready(&self) -> bool {
-        self.identity_pinned && !self.restored_model_catalog_pending
+        self.launcher_identity_pinned && !self.restored_model_catalog_pending
     }
 
     pub(crate) fn identity_choice_catalog_key(&self) -> Option<String> {
-        if self.identity_unowned_configuration {
+        self.choice_catalog_key_for(&self.identity, &self.displayed_pick_scope())
+    }
+
+    fn choice_catalog_key_for(&self, identity: &IdentityLine, scope: &PickScope) -> Option<String> {
+        if scope.unowned_configuration {
             return None;
         }
         // A restored pick can issue before the first inventory reply. Keep
         // its original producer even when a newer view no longer lists it.
-        self.identity_catalog_key.clone().or_else(|| {
-            self.catalog_key_for_model(&self.identity.provider, &self.identity.model_short)
-        })
+        scope
+            .catalog_key
+            .clone()
+            .or_else(|| self.catalog_key_for_model(&identity.provider, &identity.model_short))
+    }
+
+    fn displayed_pick_scope(&self) -> PickScope {
+        PickScope {
+            catalog_scope: self.identity_catalog_scope.clone(),
+            catalog_key: self.identity_catalog_key.clone(),
+            restored_pending: self.restored_model_catalog_pending,
+            unowned_configuration: self.identity_unowned_configuration,
+        }
+    }
+
+    fn set_displayed_pick_scope(&mut self, scope: PickScope) {
+        self.identity_catalog_scope = scope.catalog_scope;
+        self.identity_catalog_key = scope.catalog_key;
+        self.restored_model_catalog_pending = scope.restored_pending;
+        self.identity_unowned_configuration = scope.unowned_configuration;
+    }
+
+    /// The launcher default now equals the displayed pick: park the pair
+    /// together with its catalog owner, so a detach restores both.
+    pub fn park_launcher_pick(&mut self) {
+        self.launcher_identity = self.identity.clone();
+        self.launcher_pick_scope = self.displayed_pick_scope();
+    }
+
+    /// Detach: the launcher pick becomes the displayed one again, with the
+    /// owner it was parked under, and is re-judged against current account
+    /// and catalog truth before anything can mint a session from it.
+    fn restore_launcher_pick(&mut self) {
+        self.identity = self.launcher_identity.clone();
+        let scope = self.launcher_pick_scope.clone();
+        self.set_displayed_pick_scope(scope);
+        self.bootstrap_identity_from_daemon();
     }
 
     fn model_is_configuration(&self, provider: &str, model: &str) -> bool {
@@ -12004,6 +12150,7 @@ impl AppModel {
             .map(|scope| scope.key.clone())
     }
 
+    /// The created session's committed pair (the `session.create` reply).
     pub fn apply_scoped_model_selected(
         &mut self,
         provider: &str,
@@ -12011,6 +12158,43 @@ impl AppModel {
         key: Option<String>,
     ) {
         self.apply_model_selected(provider, model);
+        self.bind_displayed_catalog_key(provider, model, key);
+    }
+
+    /// A committed selection (reply or journal fact) for `session` names the
+    /// catalog owner the daemon admitted it under. A selection the meter
+    /// epoch did not admit (stale, superseded) records nothing.
+    pub fn note_selected_catalog_key(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        key: Option<String>,
+    ) {
+        let pair = (provider.to_owned(), model.to_owned());
+        if self.active_session.as_ref() != Some(session) {
+            if self
+                .sessions
+                .iter()
+                .find(|row| &row.id == session)
+                .is_some_and(|row| row.meter_epoch.pair.as_ref() == Some(&pair))
+            {
+                self.session_catalog_keys
+                    .insert(session.clone(), (pair.0, pair.1, key));
+            }
+            return;
+        }
+        if self.meter_epoch.pair.as_ref() != Some(&pair)
+            || self.identity.provider != provider
+            || self.identity.model_short != model
+        {
+            return;
+        }
+        self.pin_model_catalog_scope();
+        self.bind_displayed_catalog_key(provider, model, key);
+    }
+
+    fn bind_displayed_catalog_key(&mut self, provider: &str, model: &str, key: Option<String>) {
         if let Some(session) = self.active_session.clone() {
             self.session_catalog_keys.insert(
                 session,
@@ -12022,6 +12206,12 @@ impl AppModel {
         self.identity_catalog_key = key;
         self.identity_unowned_configuration = self.identity_catalog_key.is_none();
         self.bootstrap_identity_from_daemon();
+        // A commit that became the launcher default carries the same owner.
+        if self.launcher_identity.provider == provider
+            && self.launcher_identity.model_short == model
+        {
+            self.launcher_pick_scope = self.displayed_pick_scope();
+        }
     }
 
     /// A routing fact preserves the model's producer. A route mismatch retires
@@ -12046,22 +12236,22 @@ impl AppModel {
     }
 
     fn pin_model_catalog_scope(&mut self) {
-        self.restored_model_catalog_pending = false;
-        self.identity_unowned_configuration =
-            self.model_is_configuration(&self.identity.provider, &self.identity.model_short);
+        let scope = self.pick_scope_for(&self.identity.provider, &self.identity.model_short);
+        self.set_displayed_pick_scope(scope);
+    }
+
+    /// The catalog owner a pick of `provider`/`model` made NOW would carry.
+    fn pick_scope_for(&self, provider: &str, model: &str) -> PickScope {
         let summary = self
             .providers
             .providers
             .iter()
-            .find(|row| row.provider == self.identity.provider);
-        self.identity_catalog_key = summary
-            .and_then(|row| row.catalog_scope.as_ref())
-            .map(|scope| scope.key.clone());
-        self.identity_catalog_scope = summary
+            .find(|row| row.provider == provider);
+        let catalog_scope = summary
             .and_then(|row| row.catalog_scope.as_ref())
             .and_then(|scope| {
                 Some((
-                    self.identity.provider.clone(),
+                    provider.to_owned(),
                     scope.account_alias.clone()?,
                     scope.account_incarnation?,
                 ))
@@ -12074,7 +12264,7 @@ impl AppModel {
                     self.accounts
                         .rows
                         .iter()
-                        .find(|row| row.selected && row.provider == self.identity.provider)
+                        .find(|row| row.selected && row.provider == provider)
                         .and_then(|row| {
                             self.accounts
                                 .catalog_incarnations
@@ -12087,6 +12277,14 @@ impl AppModel {
                 })
                 .flatten()
             });
+        PickScope {
+            catalog_scope,
+            catalog_key: summary
+                .and_then(|row| row.catalog_scope.as_ref())
+                .map(|scope| scope.key.clone()),
+            restored_pending: false,
+            unowned_configuration: self.model_is_configuration(provider, model),
+        }
     }
 
     fn project_provider_inventories(&mut self) {
@@ -12264,11 +12462,8 @@ impl AppModel {
             self.identity.provider.clone(),
             self.identity.model_short.clone(),
         );
-        if self.meter_identity.as_ref() != Some(&pair) {
-            if self.meter_identity.is_some() {
-                self.meter_snapshot_before_switch = self.projection.latest_footprint().cloned();
-            }
-            self.meter_identity = Some(pair);
+        if self.active_session.is_none() && self.mode.fabricates_locally() {
+            self.meter_epoch.pair = Some(pair);
         }
         let declared = self
             .current_catalog_matches_session_route()
@@ -12294,35 +12489,123 @@ impl AppModel {
     #[must_use]
     pub fn context_meter(&self) -> crate::context_meter::ContextMeter {
         let identity = self.display_identity();
-        // A snapshot's window may stand in for an undeclared one only while
-        // the catalog has no row for the current model (not yet loaded, or
-        // a model outside it). When the catalog lists the model without a
-        // window, "unknown" is the answer — a snapshot window then belongs
-        // to a previously selected model.
-        // Nor may a snapshot taken before the last model switch: until the
-        // new model's first request it describes the previous model.
-        let snapshot_predates_model = self.meter_snapshot_before_switch.is_some()
-            && self.projection.latest_footprint() == self.meter_snapshot_before_switch.as_ref();
-        let snapshot_window_allowed = self.mode.fabricates_locally()
-            || !(identity.model_short.is_empty()
-                || snapshot_predates_model
-                || !self.current_catalog_matches_session_route()
-                || self
-                    .providers
-                    .model_listed(&identity.provider, &identity.model_short));
-        crate::context_meter::ContextMeter::resolve(
-            self.projection.latest_footprint(),
+        // A request's epoch proves whether its window, trigger, and turns
+        // belong to the current selection. An older or epochless request
+        // keeps its used count for projection but supplies none of those
+        // current-selection values. A retired pick (no displayed model) or a
+        // catalog that no longer matches the session's route cannot vouch
+        // for a snapshot either: it describes the previous owner's selection.
+        let latest = self.projection.latest_footprint();
+        let epoch = if self.mode.fabricates_locally() {
+            crate::context_meter::SnapshotEpoch::Current
+        } else if identity.model_short.is_empty() || !self.current_catalog_matches_session_route() {
+            crate::context_meter::SnapshotEpoch::Previous
+        } else {
+            self.meter_epoch.snapshot_epoch(latest)
+        };
+        let mut meter = crate::context_meter::ContextMeter::resolve(
+            latest,
             self.projection.context_tokens(),
             identity.context_window,
-            snapshot_window_allowed,
+            epoch,
             |window| {
-                crate::context_meter::derived_reserved_output(
-                    self.current_pair_detail()
-                        .and_then(|detail| detail.max_output_tokens),
+                let output_limit = self
+                    .current_pair_detail()
+                    .and_then(|detail| detail.max_output_tokens);
+                crate::context_meter::epoch_reserved_output(
+                    self.meter_epoch.projected_output_budget(output_limit),
+                    output_limit,
                     window,
                 )
             },
-        )
+        );
+        meter.reserve_assumed = self.meter_epoch.reserve_assumed && meter.threshold_projected;
+        meter
+    }
+
+    /// The child row and viewed-child status share the same own-session
+    /// summary and committed selection. Spawn manifest data is only used
+    /// before that session has supplied a summary.
+    #[must_use]
+    pub fn child_context_meter(
+        &self,
+        chip: &ChipModel,
+    ) -> Option<crate::context_meter::ContextMeter> {
+        let session = chip.child_session.as_deref()?;
+        let row = self
+            .sessions
+            .iter()
+            .find(|row| row.id.as_str() == session)?;
+        let (provider, model) = row.meter_epoch.pair.as_ref()?;
+        // The viewed child may already have a streamed transcript while its
+        // list summary has no usage yet. Both sources belong to this child;
+        // never fall back to the parent's projection.
+        let footprint = row
+            .latest_context_footprint()
+            .or_else(|| chip.transcript.latest_footprint());
+        let fallback = row
+            .known_tokens()
+            .or_else(|| {
+                let tokens = chip.transcript.context_tokens();
+                (tokens > 0).then_some(tokens)
+            })
+            .or_else(|| footprint.map(|item| item.used_tokens))?;
+        let window = self.providers.declared_window(provider, model).unwrap_or(0);
+        let output_limit = self.providers.declared_output_limit(provider, model);
+        let mut meter = crate::context_meter::ContextMeter::resolve(
+            footprint,
+            fallback,
+            window,
+            row.meter_epoch.snapshot_epoch(footprint),
+            |window| {
+                crate::context_meter::epoch_reserved_output(
+                    row.meter_epoch.projected_output_budget(output_limit),
+                    output_limit,
+                    window,
+                )
+            },
+        );
+        if footprint.is_none() {
+            meter.estimated = row.summary_counts.as_ref().is_some_and(|counts| {
+                matches!(
+                    counts.footprint_truth,
+                    Some(haider_protocol::context::ContextFootprintTruth::Estimated)
+                )
+            });
+        }
+        meter.reserve_assumed = row.meter_epoch.reserve_assumed && meter.threshold_projected;
+        Some(meter)
+    }
+
+    /// The child's current committed model for visible labels. The spawn
+    /// manifest is provisional and must not outlive the child's own summary.
+    #[must_use]
+    pub fn child_display_model<'a>(&'a self, chip: &'a ChipModel) -> &'a str {
+        let Some(row) = chip
+            .child_session
+            .as_deref()
+            .and_then(|session| self.sessions.iter().find(|row| row.id.as_str() == session))
+        else {
+            return &chip.model;
+        };
+        if let Some((_, model)) = &row.meter_epoch.pair {
+            return model;
+        }
+        if row.summary_seen {
+            "unknown"
+        } else {
+            &chip.model
+        }
+    }
+
+    #[must_use]
+    pub fn viewed_context_meter(&self) -> Option<crate::context_meter::ContextMeter> {
+        if self.screen == Screen::Subagent {
+            self.viewed_chip()
+                .and_then(|chip| self.child_context_meter(chip))
+        } else {
+            Some(self.context_meter())
+        }
     }
 
     /// The auth flavor of the CURRENT identity pair — `oauth` or `api` —
@@ -12442,9 +12725,8 @@ impl AppModel {
     /// never only the model — the auth label, the reasoning level and the
     /// fast marker were all parent-scoped while a child was being steered.
     ///
-    /// The child's model is its MANIFEST fact (`ChipModel::model`, stamped
-    /// from `AgentManifest::model_profile`); its auth flavor comes from the
-    /// provider it actually billed, or the one the fleet snapshot records.
+    /// A child's own session selection is authoritative after its summary
+    /// arrives. Before that, its manifest and usage are provisional labels.
     /// The session's reasoning level and fast marker are not the child's
     /// and no manifest carries them, so they DROP rather than mislabel the
     /// child — [`crate::fleet::node_metric`]'s law. A child with no model
@@ -12457,12 +12739,25 @@ impl AppModel {
         let Some(chip) = self.viewed_chip() else {
             return self.composer_identity(budget);
         };
-        let model = chip.model.trim();
+        let child_row = chip
+            .child_session
+            .as_deref()
+            .and_then(|session| self.sessions.iter().find(|row| row.id.as_str() == session));
+        let current_pair = child_row.and_then(|row| row.meter_epoch.pair.as_ref());
+        let summary_known = child_row.is_some_and(|row| row.summary_seen);
+        let model = self.child_display_model(chip).trim();
         if model.is_empty() {
             return None;
         }
         let mut candidates: Vec<String> = Vec::new();
-        if let Some(auth) = self.child_auth_label(chip) {
+        let auth = if let Some((provider, _)) = current_pair {
+            self.auth_label_for(provider)
+        } else if summary_known {
+            None
+        } else {
+            self.child_auth_label(chip)
+        };
+        if let Some(auth) = auth {
             candidates.push(format!("{model} · {auth}"));
         }
         candidates.push(model.to_owned());
@@ -12515,12 +12810,20 @@ impl AppModel {
         self.auth_label_for(provider)
     }
 
-    /// Daemon-truth identity bootstrap (W5f-2): until the user pins a
-    /// choice, the composer identity follows the ACTIVE account — so the
-    /// first session lands on a provider that can actually serve a turn
-    /// instead of the demo seed pair. Called by the LIVE driver whenever an
-    /// account or provider snapshot applies; demo never calls it.
+    /// Daemon-truth launcher bootstrap (W5f-2): until the user pins a
+    /// launcher default, future sessions follow the active account. When a
+    /// session is attached this updates only the parked launcher identity;
+    /// the session keeps its own committed selection. Either way a displayed
+    /// pick whose catalog owner retired is withdrawn (catalog-fixes N1).
     pub fn bootstrap_identity_from_daemon(&mut self) {
+        self.bootstrap_displayed_identity();
+        if self.active_session.is_none() {
+            // With no session the displayed pick IS the launcher pick.
+            self.park_launcher_pick();
+        }
+    }
+
+    fn bootstrap_displayed_identity(&mut self) {
         self.fence_provider_catalogs();
         self.project_provider_inventories();
         let current_scope = self
@@ -12582,7 +12885,8 @@ impl AppModel {
             self.identity_catalog_key.is_some() && !self.current_catalog_matches_session_route();
         // A legacy daemon cannot prove which account offered a choice made
         // before its first account reply. Do not stamp it as the new owner.
-        let unknown_owner = self.identity_pinned
+        let unknown_owner = self.active_session.is_none()
+            && self.launcher_identity_pinned
             && !self.identity_unowned_configuration
             && ((self.identity_catalog_scope.is_none()
                 && current_scope.is_some()
@@ -12633,7 +12937,11 @@ impl AppModel {
                 self.identity.model_short.clear();
                 self.identity.context_window = 0;
                 self.identity.account.clear();
-                self.identity_pinned = self.active_session.is_some();
+                // A withdrawn launcher pick is no longer a choice; an
+                // attached session stays bound to its committed epoch.
+                if self.active_session.is_none() {
+                    self.launcher_identity_pinned = false;
+                }
             }
             if self.accounts.revision.is_some() {
                 self.identity_catalog_scope = current_scope.clone();
@@ -12650,7 +12958,7 @@ impl AppModel {
         if current_scope.is_some() && self.providers.revision < self.accounts.revision {
             return;
         }
-        if self.identity_pinned {
+        if self.launcher_identity_pinned {
             return;
         }
         let selected = self
@@ -12684,7 +12992,10 @@ impl AppModel {
             return;
         }
         self.adopt_identity(&provider, &alias, false);
-        self.pin_model_catalog_scope();
+        if self.active_session.is_none() {
+            // Attached: `adopt_identity` parked the launcher's owner itself.
+            self.pin_model_catalog_scope();
+        }
     }
 
     /// A failed `account.set_active`: clear the pending gate and surface the
@@ -18094,8 +18405,8 @@ impl AppModel {
         };
         // The G3 path applies to an ATTACHED live session, exactly like the
         // picker: the launcher/demo has no session to select on yet.
-        let live_session = (!self.mode.fabricates_locally() && self.screen == Screen::Session)
-            .then(|| self.active_session.clone())
+        let live_session = (!self.mode.fabricates_locally())
+            .then(|| self.selection_surface_session())
             .flatten();
         match live_session {
             Some(session) => {
@@ -18124,6 +18435,12 @@ impl AppModel {
                 )
             }
             None => {
+                if self.active_session.is_some() {
+                    return format!(
+                        "· /{} — child session identity unavailable; model unchanged",
+                        command.name
+                    );
+                }
                 // M9: the launcher has no attached session YET, but the very
                 // next `CreateSession` mints the session from the identity pair
                 // (live.rs reads `identity.provider`/`identity.model_short`).
@@ -18133,9 +18450,10 @@ impl AppModel {
                 // the first turn ran on the old pair.)
                 self.identity.provider = provider.clone();
                 self.identity.model_short = resolved_model.clone();
-                self.identity_pinned = true;
+                self.launcher_identity_pinned = true;
                 self.pin_model_catalog_scope();
                 self.refresh_context_window();
+                self.park_launcher_pick();
                 format!(
                     "· /{} — model → {resolved_model} · {provider} (applies to the new session)",
                     command.name
@@ -18363,6 +18681,32 @@ impl AppModel {
     /// rejected, not invented.
     pub fn route_raw(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
         use crate::projection::RawOutcome;
+        if self.active_session.as_ref() == Some(&envelope.session_id) {
+            let window = self.context_meter().window;
+            self.projection.set_compaction_note_window(window);
+        } else if let Some(entry) = self
+            .sessions
+            .iter_mut()
+            .find(|entry| entry.id == envelope.session_id)
+        {
+            let declared = entry
+                .meter_epoch
+                .pair
+                .as_ref()
+                .and_then(|(provider, model)| self.providers.declared_window(provider, model));
+            let footprint = entry.projection.latest_footprint();
+            let window = if entry.meter_epoch.snapshot_epoch(footprint)
+                != crate::context_meter::SnapshotEpoch::Previous
+            {
+                footprint
+                    .and_then(|item| item.context_window)
+                    .filter(|window| *window > 0)
+                    .or(declared)
+            } else {
+                declared
+            };
+            entry.projection.set_compaction_note_window(window);
+        }
         let outcome = if self.active_session.as_ref() == Some(&envelope.session_id) {
             self.absorb_raw_active(envelope)
         } else if let Some(entry) = self
@@ -19358,6 +19702,10 @@ impl AppModel {
         // one restore per transition).
         self.stash_draft();
         self.checkin();
+        if self.active_session.is_none() && !self.mode.fabricates_locally() {
+            // The launcher pick (with its catalog owner) waits for detach.
+            self.park_launcher_pick();
+        }
         let Some(index) = self.sessions.iter().position(|entry| &entry.id == id) else {
             // Unknown id: the checkin left us on the no-session surface —
             // bring ITS (the launcher's) draft live, stranding nothing.
@@ -19436,13 +19784,41 @@ impl AppModel {
         self.session_workspace_uncreated = false;
         self.tool_detail = None;
         self.launch_origin = slot.launch_origin.take();
+        // A first open waits for this session's own metadata or selection.
+        let epoch = std::mem::take(&mut slot.meter_epoch);
+        let (provider, model) = epoch
+            .pair
+            .clone()
+            .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
+        self.identity.provider = provider;
+        self.identity.model_short = model;
+        self.meter_epoch = epoch;
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
-        if let Some((provider, model, key)) = self.session_catalog_keys.get(id).cloned() {
-            self.identity.provider = provider;
-            self.identity.model_short = model;
-            self.identity_catalog_key = key;
-            self.identity_pinned = true;
+        // catalog-fixes: the displayed pair keeps the catalog owner it was
+        // committed under only when this session's recorded pick IS that
+        // pair; otherwise its owner is unknown here and the daemon (which
+        // admitted it) stays the authority, so it is never retired locally.
+        let recorded = self
+            .session_catalog_keys
+            .get(id)
+            .filter(|(provider, model, _)| {
+                self.meter_epoch.pair.is_none()
+                    || self.meter_epoch.pair.as_ref() == Some(&(provider.clone(), model.clone()))
+            })
+            .cloned();
+        if let Some((provider, model, _)) = &recorded {
+            self.identity.provider.clone_from(provider);
+            self.identity.model_short.clone_from(model);
+        }
+        self.pin_model_catalog_scope();
+        let known = recorded.is_some();
+        let key = recorded.and_then(|(_, _, key)| key);
+        self.identity_unowned_configuration = key.is_none();
+        self.identity_catalog_key = key;
+        self.refresh_context_window();
+        if known {
+            // Re-judge a recorded owner against current catalogs now.
             self.bootstrap_identity_from_daemon();
         }
         self.menu_selection = 0;
@@ -19576,8 +19952,13 @@ impl AppModel {
             slot.dir = std::mem::replace(&mut self.session_dir, self.launcher_dir.clone());
             slot.workspace_cwd = self.session_workspace_cwd.take();
             slot.launch_origin = self.launch_origin.take();
+            slot.meter_epoch = std::mem::take(&mut self.meter_epoch);
         }
         self.last_detached = Some(active);
+        if !self.mode.fabricates_locally() {
+            self.restore_launcher_pick();
+            self.refresh_context_window();
+        }
         self.toolfold.seed_verbosity(self.default_tool_verbosity);
         self.lockdown_status = None;
         self.lockdown_overlay = false;
@@ -19614,7 +19995,12 @@ impl AppModel {
         entry.head = (head.callsign, head.hon.to_owned());
         entry.head_ros = Some(ros);
         entry.dir = self.launcher_dir.clone();
+        // Demo sessions are minted from the current launcher selection.
         entry.model_short = self.identity.model_short.clone();
+        entry.meter_epoch.pair = Some((
+            self.identity.provider.clone(),
+            self.identity.model_short.clone(),
+        ));
         entry.device = self.identity.device.clone();
         entry.ago = "now".to_owned();
         self.sessions.insert(0, entry);
@@ -19875,7 +20261,10 @@ impl AppModel {
         self.next_ui_generation += 1;
         let mut entry = crate::session::SessionState::neutral(id.clone(), ui_gen);
         entry.dir = self.launcher_dir.clone();
-        entry.model_short = self.identity.model_short.clone();
+        // A newly discovered session has no trusted model until its own
+        // metadata or selection fact arrives. The launcher identity belongs
+        // only to future sessions.
+        entry.model_short = "unknown".to_owned();
         entry.device = self.identity.device.clone();
         entry.ago = "now".to_owned();
         // Newest first, exactly like `new_session` — the launcher's order
@@ -19896,6 +20285,28 @@ impl AppModel {
     ///   ([`crate::session::SessionState::turns`] / `row_tokens`), so a
     ///   checkin AFTER this call still beats a stale summary.
     pub fn note_summary_counts(&mut self, summary: &haider_rpc::SessionSummary) {
+        if let Some(entry) = self
+            .sessions
+            .iter_mut()
+            .find(|row| row.id == summary.session_id)
+        {
+            entry.summary_seen = true;
+        }
+        let current_selection = if self.active_session.as_ref() == Some(&summary.session_id) {
+            self.meter_epoch.selection_epoch
+        } else {
+            self.sessions
+                .iter()
+                .find(|row| row.id == summary.session_id)
+                .and_then(|row| row.meter_epoch.selection_epoch)
+        };
+        let summary_selection_fresh = current_selection.is_none_or(|current| {
+            summary
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.selection_epoch)
+                .is_some_and(|incoming| incoming >= current)
+        });
         if let Some(metadata) = &summary.metadata {
             let first_catalog_snapshot =
                 !self.session_catalog_keys.contains_key(&summary.session_id);
@@ -19918,10 +20329,12 @@ impl AppModel {
                 });
             // Once an event/reply supplies a selection, a delayed session-list
             // snapshot cannot overwrite it. Cold checkout still gets metadata.
-            if first_catalog_snapshot && self.active_session.as_ref() == Some(&summary.session_id) {
+            if first_catalog_snapshot
+                && summary_selection_fresh
+                && self.active_session.as_ref() == Some(&summary.session_id)
+            {
                 self.identity.provider = metadata.provider.clone();
                 self.identity.model_short = metadata.model.clone();
-                self.identity_pinned = true;
                 self.pin_model_catalog_scope();
                 self.identity_catalog_key = metadata.model_catalog_key.clone();
                 self.bootstrap_identity_from_daemon();
@@ -19950,7 +20363,7 @@ impl AppModel {
                 self.dirty = true;
             }
         }
-        if let Some(last_model) = &summary.last_model {
+        if summary_selection_fresh && let Some(last_model) = &summary.last_model {
             let prior = self
                 .session_last_models
                 .insert(summary.session_id.clone(), last_model.clone());
@@ -20057,12 +20470,18 @@ impl AppModel {
         // the CLIENT's current model). Absence hydrates nothing (older
         // daemon); the ACTIVE session's identity follows the live
         // ModelSelected lane instead.
-        if let Some(last_model) = &summary.last_model
+        if summary_selection_fresh
+            && let Some(last_model) = &summary.last_model
             && self.active_session.as_ref() != Some(&summary.session_id)
             && let Some(entry) = self
                 .sessions
                 .iter_mut()
                 .find(|row| row.id == summary.session_id)
+            && entry
+                .meter_epoch
+                .pair
+                .as_ref()
+                .is_none_or(|(_, current)| current == last_model)
             && entry.model_short != *last_model
         {
             entry.model_short = last_model.clone();
@@ -20105,6 +20524,7 @@ impl AppModel {
             turns: summary.turn_count,
             footprint_tokens: summary.footprint_tokens,
             footprint_truth: summary.footprint_truth,
+            latest_context_footprint: summary.latest_context_footprint.clone(),
         });
         self.dirty = true;
     }
@@ -21638,16 +22058,22 @@ impl AppModel {
         // sets the default pair used by the next CreateSession. W-flow: the
         // loom authoring input's ⌥m hop selects for the BOUND session too —
         // the receipted select is the authoring model choice.
-        let live_session = (!self.mode.fabricates_locally()
-            && (self.screen == Screen::Session || self.screen == Screen::Loom))
-            .then(|| self.active_session.clone())
+        let live_session = (!self.mode.fabricates_locally())
+            .then(|| self.selection_surface_session())
             .flatten();
+        if self.active_session.is_some() && live_session.is_none() {
+            self.flash = Some("· child session identity unavailable".to_owned());
+            return;
+        }
         let Some(session) = live_session else {
             self.identity.provider = row.provider.clone();
             self.identity.model_short = row.model.clone();
-            self.identity_pinned = true;
+            self.launcher_identity_pinned = true;
             self.pin_model_catalog_scope();
             self.refresh_context_window();
+            if self.active_session.is_none() {
+                self.park_launcher_pick();
+            }
             self.model_picker = None;
             self.flash = Some(format!("· model → {} · {}", row.model, row.provider));
             return;
@@ -21690,14 +22116,20 @@ impl AppModel {
     /// provider.
     fn select_provider(&mut self, name: String, health: String) {
         self.dirty = true;
-        let live_session = (!self.mode.fabricates_locally()
-            && (self.screen == Screen::Session || self.screen == Screen::Loom))
-            .then(|| self.active_session.clone())
+        let live_session = (!self.mode.fabricates_locally())
+            .then(|| self.selection_surface_session())
             .flatten();
+        if self.active_session.is_some() && live_session.is_none() {
+            self.flash = Some("· child session identity unavailable".to_owned());
+            return;
+        }
         let Some(session) = live_session else {
             self.identity.provider = name.clone();
             self.refresh_context_window();
-            self.identity_pinned = true;
+            self.launcher_identity_pinned = true;
+            if self.active_session.is_none() {
+                self.park_launcher_pick();
+            }
             self.flash = Some(format!("· provider → {name} · {health}"));
             return;
         };
@@ -21748,15 +22180,629 @@ impl AppModel {
     pub fn apply_model_selected(&mut self, provider: &str, model: &str) {
         self.identity.provider = provider.to_owned();
         self.identity.model_short = model.to_owned();
-        self.identity_pinned = true;
         self.pin_model_catalog_scope();
         self.refresh_context_window();
+        self.launcher_identity_pinned = true;
+        self.park_launcher_pick();
         self.model_picker = None;
         self.pending_cache_change = None;
-        // Model retention: a COMMITTED pick is what the next boot opens on.
+        // Count this committed pick for the current surface.
         self.model_commits += 1;
         self.flash = Some(format!("· model → {model} · {provider}"));
         self.dirty = true;
+    }
+
+    /// The `session.select_model` reply for `session` (973-context-meter-
+    /// fixes B1/B3). The VIEWED session renders the resolved pair and
+    /// starts its meter epoch with the daemon's committed effective output
+    /// budget; a reply for a session the user has since left binds that
+    /// session's parked epoch instead of the identity on screen.
+    pub fn apply_session_model_selected(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        output_budget: Option<&haider_protocol::output_budget::SessionOutputBudgetV1>,
+    ) {
+        self.apply_session_model_selected_at(session, provider, model, output_budget, None);
+    }
+
+    pub fn apply_session_model_selected_at(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        output_budget: Option<&haider_protocol::output_budget::SessionOutputBudgetV1>,
+        selection_epoch: Option<u64>,
+    ) {
+        let pair = (provider.to_owned(), model.to_owned());
+        let budget = output_budget.map(|budget| budget.max_tokens);
+        let source = output_budget.map(|budget| {
+            matches!(
+                budget.source,
+                haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { .. }
+            )
+        });
+        let previous_provider = if self.active_session.as_ref() == Some(session) {
+            self.meter_epoch.pair.as_ref().map(|pair| pair.0.as_str())
+        } else {
+            self.sessions
+                .iter()
+                .find(|row| &row.id == session)
+                .and_then(|row| row.meter_epoch.pair.as_ref())
+                .map(|pair| pair.0.as_str())
+        };
+        let new_route = previous_provider.is_some_and(|old| old != provider);
+        let viewed_child = self.screen == Screen::Subagent
+            && self.selection_surface_session().as_ref() == Some(session);
+        if viewed_child && !self.sessions.iter().any(|row| &row.id == session) {
+            self.upsert_live_session(session);
+        }
+        if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
+            self.record_budget_clamp_notice(session, selection_epoch, provider, model, &clamp);
+        }
+        let admitted = if self.active_session.as_ref() == Some(session) {
+            let admitted = self
+                .meter_epoch
+                .admit(pair, selection_epoch, budget, source);
+            if admitted {
+                self.apply_model_selected(provider, model);
+            }
+            admitted
+        } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
+            let admitted = entry
+                .meter_epoch
+                .admit(pair, selection_epoch, budget, source);
+            if admitted {
+                entry.model_short = model.to_owned();
+                self.dirty = true;
+            }
+            admitted
+        } else {
+            false
+        };
+        if !admitted {
+            return;
+        }
+        if new_route && let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) {
+            row.reset_account_route(provider, selection_epoch);
+        }
+        if viewed_child {
+            self.launcher_identity.provider = provider.to_owned();
+            self.launcher_identity.model_short = model.to_owned();
+            self.launcher_identity.context_window =
+                self.providers.declared_window(provider, model).unwrap_or(0);
+            self.launcher_pick_scope = self.pick_scope_for(provider, model);
+            self.launcher_identity_pinned = true;
+            self.model_commits += 1;
+            self.model_picker = None;
+            self.pending_cache_change = None;
+            self.flash = Some(format!("· model → {model} · {provider}"));
+        }
+        if let Some(clamp) = output_budget.and_then(|budget| budget.clamped)
+            && self.selection_surface_session().as_ref() == Some(session)
+        {
+            self.apply_output_budget_clamp(&clamp);
+        }
+    }
+
+    /// A committed `ModelSelected` journal fact for the VIEWED session
+    /// (live or replayed), after the identity followed it: snapshots before
+    /// the fact belong to the previous epoch.
+    pub fn note_model_selected_fact(&mut self, provider: &str, model: &str) {
+        self.note_model_selected_fact_at(provider, model, None);
+    }
+
+    pub fn note_model_selected_fact_at(&mut self, provider: &str, model: &str, epoch: Option<u64>) {
+        self.meter_epoch
+            .admit((provider.to_owned(), model.to_owned()), epoch, None, None);
+    }
+
+    /// A committed `ModelSelected` fact for a PARKED session (a background
+    /// change, e.g. from another client): it binds that session's own
+    /// epoch — the viewed identity is untouched — and lands the same
+    /// transcript note the viewed session gets, so reopening the attached
+    /// session (which replays nothing) shows the model it now runs.
+    pub fn note_parked_model_selected(&mut self, session: &SessionId, provider: &str, model: &str) {
+        self.note_parked_model_selected_at(session, provider, model, None);
+    }
+
+    pub fn note_parked_model_selected_at(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        epoch: Option<u64>,
+    ) {
+        let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
+            return;
+        };
+        let new_provider = entry
+            .meter_epoch
+            .pair
+            .as_ref()
+            .is_some_and(|pair| pair.0 != provider);
+        if !entry
+            .meter_epoch
+            .admit((provider.to_owned(), model.to_owned()), epoch, None, None)
+        {
+            return;
+        }
+        if new_provider {
+            entry.reset_account_route(provider, epoch);
+        }
+        entry.model_short = model.to_owned();
+        entry
+            .projection
+            .push_note(format!("⇄ model → {model} · {provider}"));
+        self.dirty = true;
+    }
+
+    pub fn note_parked_account_pin_cleared(
+        &mut self,
+        session: &SessionId,
+        alias: &str,
+        provider: &str,
+    ) {
+        if let Some(notice) =
+            haider_protocol::session::model_selection_clear_notice(Some(alias), None, provider)
+        {
+            self.record_selection_notice(session, format!("· {notice}"));
+        }
+    }
+
+    /// Local selection feedback follows the owning session in both the root
+    /// projection and the child transcript rendered by the recursive tree.
+    pub fn record_selection_notice(&mut self, session: &SessionId, text: String) {
+        self.record_selection_note(session, None, text);
+    }
+
+    pub(crate) fn record_budget_clamp_notice(
+        &mut self,
+        session: &SessionId,
+        epoch: Option<u64>,
+        provider: &str,
+        model: &str,
+        clamp: &haider_protocol::output_budget::OutputBudgetClampV1,
+    ) {
+        // An omitted epoch identifies no particular commit. Independent
+        // legacy notifications must not collide with one another or epoch zero.
+        self.record_selection_note(
+            session,
+            epoch,
+            format!("· {provider}/{model} · {}", clamp.notice()),
+        );
+    }
+
+    fn record_selection_note(&mut self, session: &SessionId, epoch: Option<u64>, text: String) {
+        fn children(chips: &mut [ChipModel], session: &SessionId, epoch: Option<u64>, text: &str) {
+            for chip in chips {
+                if chip.child_session.as_deref() == Some(session.as_str()) {
+                    chip.transcript
+                        .push_selection_notice(epoch, text.to_owned());
+                }
+                children(&mut chip.children, session, epoch, text);
+            }
+        }
+        if self.active_session.as_ref() == Some(session) {
+            self.projection.push_selection_notice(epoch, text.clone());
+        }
+        children(&mut self.chips, session, epoch, &text);
+        for row in &mut self.sessions {
+            if &row.id == session && self.active_session.as_ref() != Some(session) {
+                row.projection.push_selection_notice(epoch, text.clone());
+            }
+            children(&mut row.chips, session, epoch, &text);
+        }
+        self.dirty = true;
+    }
+
+    /// A rebuilt tree entry still owns notices received while it was absent.
+    /// Count occurrences so repeated identical selections remain distinct.
+    fn restore_child_session_notes(&mut self) {
+        let Some(chip) = self.viewed_chip() else {
+            return;
+        };
+        let agent = chip.agent.clone();
+        let Some(session) = chip.child_session.as_deref() else {
+            return;
+        };
+        let notices = self
+            .sessions
+            .iter()
+            .find(|row| row.id.as_str() == session)
+            .map(|row| {
+                row.projection
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| {
+                        if let crate::projection::TranscriptEntry::Note {
+                            text,
+                            selection_notice_epoch,
+                        } = entry
+                        {
+                            Some((text.clone(), *selection_notice_epoch))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(chip) = find_chip_mut(&mut self.chips, &agent) else {
+            return;
+        };
+        let mut existing = std::collections::HashMap::<(String, Option<u64>), usize>::new();
+        for entry in chip.transcript.entries() {
+            if let crate::projection::TranscriptEntry::Note {
+                text,
+                selection_notice_epoch,
+            } = entry
+            {
+                *existing
+                    .entry((text.clone(), *selection_notice_epoch))
+                    .or_default() += 1;
+            }
+        }
+        let mut occurrences = std::collections::HashMap::<(String, Option<u64>), usize>::new();
+        for (text, epoch) in notices {
+            let count = occurrences.entry((text.clone(), epoch)).or_default();
+            *count += 1;
+            if existing.get(&(text.clone(), epoch)).copied().unwrap_or(0) < *count {
+                chip.transcript.push_selection_notice(epoch, text);
+            }
+        }
+    }
+
+    /// A resolved-account change advances provenance for a parked session
+    /// without changing its model or forgetting its committed output budget.
+    pub fn note_parked_route_selected_at(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        epoch: Option<u64>,
+    ) {
+        let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) else {
+            return;
+        };
+        let pair = (provider.to_owned(), model.to_owned());
+        let same_pair = row.meter_epoch.pair.as_ref() == Some(&pair);
+        let budget = same_pair.then_some(row.meter_epoch.output_budget).flatten();
+        let user_budget = same_pair.then_some(row.meter_epoch.user_budget);
+        let previous_epoch = row.meter_epoch.selection_epoch;
+        if row.meter_epoch.admit(pair, epoch, budget, user_budget) {
+            row.observe_route_commit(epoch, previous_epoch);
+            self.dirty = true;
+        }
+    }
+
+    /// A committed provider rebind for a PARKED session: its epoch's pair
+    /// moves to the new provider (the model is unchanged).
+    pub fn note_parked_provider_rebound(&mut self, session: &SessionId, provider: &str) {
+        self.note_parked_provider_rebound_at(session, provider, None);
+    }
+
+    pub fn note_parked_provider_rebound_at(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        epoch: Option<u64>,
+    ) {
+        let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
+            return;
+        };
+        if let Some((previous, model)) = entry.meter_epoch.pair.clone()
+            && entry
+                .meter_epoch
+                .admit((provider.to_owned(), model), epoch, None, None)
+        {
+            if previous != provider {
+                entry.reset_account_route(provider, epoch);
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Apply route coordinates only after this rebind's epoch was admitted.
+    /// A no-op preserves known served provenance and cannot make legacy
+    /// missing provenance eligible for today's global default.
+    pub(crate) fn note_session_rebound_account_at(
+        &mut self,
+        session: &SessionId,
+        rebound: &haider_protocol::session::SessionProviderRebound,
+        epoch: Option<u64>,
+    ) {
+        let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) else {
+            return;
+        };
+        let meter = if self.active_session.as_ref() == Some(session) {
+            &self.meter_epoch
+        } else {
+            &row.meter_epoch
+        };
+        if meter.selection_epoch != epoch
+            || meter
+                .pair
+                .as_ref()
+                .is_none_or(|pair| pair.0 != rebound.provider)
+        {
+            return;
+        }
+        // Budget/model epochs can advance without changing route choices.
+        // Provider resets and unresolved route commits invalidate an older
+        // snapshot's coordinates, so it cannot prove a later rebind is fresh.
+        let required_epoch = row.route_reset_epoch.max(
+            (!row.resolved_route_seen)
+                .then_some(row.account_request_epoch)
+                .flatten(),
+        );
+        let coordinates_known = row.account_provider.is_some()
+            && match (row.account_metadata_epoch, required_epoch) {
+                (Some(snapshot), Some(required)) => snapshot >= required,
+                (None, Some(0)) => true,
+                (None, Some(_)) => false,
+                (_, None) => true,
+            };
+        let changed = coordinates_known.then(|| {
+            row.account_provider.as_deref() != Some(rebound.provider.as_str())
+                || row.account_base_url != rebound.base_url
+                || row.account_alias != rebound.account
+        });
+        let cached_change = row
+            .account_provider
+            .as_deref()
+            .is_some_and(|provider| provider != rebound.provider)
+            || row.account_alias != rebound.account
+            || (row.route_reset_epoch == epoch && row.account_default_epoch == epoch);
+        if changed == Some(true) || (changed.is_none() && cached_change) {
+            row.reset_account_route(&rebound.provider, epoch);
+        } else if changed.is_none() {
+            // An absent snapshot cannot prove that the route stayed the same.
+            row.resolved_route_alias = None;
+            row.resolved_route_seen = false;
+            row.account_default_epoch = None;
+        } else if row.account_default_epoch.is_some() {
+            row.account_default_epoch = epoch;
+        }
+        row.account_alias.clone_from(&rebound.account);
+        row.account_provider = Some(rebound.provider.clone());
+        row.account_base_url.clone_from(&rebound.base_url);
+        row.account_metadata_epoch = epoch;
+        self.dirty = true;
+    }
+
+    /// The daemon's typed session metadata (`session.list`) for `session`:
+    /// its committed pair and effective output budget. A parked session this
+    /// process has not bound yet is seeded from it, so the FIRST open meters
+    /// the session against its own model, not the one on screen; an epoch
+    /// already on that same pair learns the committed budget (the only
+    /// source of it after a selection made on another surface).
+    pub fn note_session_metadata(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        output_budget: u64,
+    ) {
+        self.note_session_metadata_at(session, provider, model, output_budget, None, None);
+    }
+
+    pub fn note_session_metadata_at(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        model: &str,
+        output_budget: u64,
+        selection_epoch: Option<u64>,
+        budget_source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
+    ) {
+        let pair = (provider.to_owned(), model.to_owned());
+        let budget = (output_budget > 0).then_some(output_budget);
+        let user_budget = budget.map(|value| {
+            matches!(
+                haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                    budget_source,
+                    value,
+                ),
+                haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { .. }
+            )
+        });
+        let epoch = if self.active_session.as_ref() == Some(session) {
+            &mut self.meter_epoch
+        } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
+            &mut entry.meter_epoch
+        } else {
+            return;
+        };
+        if epoch.admit(pair, selection_epoch, budget, user_budget) {
+            if self.active_session.as_ref() == Some(session) {
+                self.identity.provider = provider.to_owned();
+                self.identity.model_short = model.to_owned();
+                self.refresh_context_window();
+            } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session)
+            {
+                entry.model_short = model.to_owned();
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// The account label for the attached session comes from that session's
+    /// pin or last resolved route. An unserved session follows the provider's
+    /// active account, which is labelled as a default rather than a pin.
+    pub fn attached_account_label(&self) -> String {
+        let Some(session) = self.active_session.as_ref() else {
+            return self.identity.account.clone();
+        };
+        let Some(row) = self.sessions.iter().find(|row| &row.id == session) else {
+            return "unknown".to_owned();
+        };
+        if row.account_provider.as_deref() == Some(self.identity.provider.as_str()) {
+            if let Some(alias) = row.account_alias.as_deref() {
+                return format!("{alias} (pinned)");
+            }
+            if row.resolved_route_seen {
+                return row
+                    .resolved_route_alias
+                    .clone()
+                    .unwrap_or_else(|| "unbound".to_owned());
+            }
+        }
+        // A default describes only a future first request. Running requests
+        // and recorded history need route provenance, including older daemons
+        // that supplied usage but never recorded their resolved account.
+        let projection = &self.projection;
+        let footprint = projection
+            .latest_footprint()
+            .or_else(|| row.latest_context_footprint());
+        let prior_epoch = footprint.is_some_and(|fp| {
+            matches!(
+                (fp.selection_epoch, row.route_reset_epoch),
+                (Some(served), Some(current)) if served < current
+            )
+        });
+        if self.meter_epoch.selection_epoch.is_none()
+            || row.account_default_epoch != self.meter_epoch.selection_epoch
+            || projection.is_turn_active()
+            || (!prior_epoch
+                && (projection.context_tokens() > 0
+                    || projection.user_row_count() > 0
+                    || row.turns() > 0))
+        {
+            return "unknown".to_owned();
+        }
+        self.accounts
+            .rows
+            .iter()
+            .find(|account| account.provider == self.identity.provider && account.selected)
+            .map_or_else(
+                || "none (default)".to_owned(),
+                |account| format!("{} (default)", account.alias),
+            )
+    }
+
+    pub fn note_session_account(
+        &mut self,
+        session: &SessionId,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) {
+        if let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) {
+            let epoch = if self.active_session.as_ref() == Some(session) {
+                &self.meter_epoch
+            } else {
+                &row.meter_epoch
+            };
+            let same_pair =
+                epoch.pair.as_ref() == Some(&(metadata.provider.clone(), metadata.model.clone()));
+            let older_epoch = matches!((epoch.selection_epoch, metadata.selection_epoch),
+                (Some(current), Some(incoming)) if incoming < current);
+            if same_pair
+                && !older_epoch
+                && metadata.route_reset_epoch.is_none()
+                && !metadata.resolved_route_seen
+            {
+                // Unknown current provenance cannot inherit an earlier
+                // forecast; an explicitly stale reply cannot revoke one.
+                row.account_default_epoch = None;
+                self.dirty = true;
+            }
+            // An epochless snapshot cannot overwrite a known later route
+            // reset/commit. It may have been read before the explicit change.
+            let unversioned_route_is_stale = metadata.selection_epoch.is_none()
+                && row
+                    .route_reset_epoch
+                    .max(row.account_request_epoch)
+                    .max(row.account_metadata_epoch)
+                    .is_some_and(|route| route > 0);
+            if unversioned_route_is_stale || !same_pair || older_epoch {
+                return;
+            }
+            let same_route_reset = match metadata.route_reset_epoch {
+                Some(reset) => row
+                    .route_reset_epoch
+                    .or(row.account_metadata_epoch)
+                    .is_some_and(|recorded| reset <= recorded),
+                None => {
+                    metadata.selection_epoch.is_none()
+                        || metadata.selection_epoch == row.account_metadata_epoch
+                }
+            };
+            // First-route truth is monotonic within an unchanged route. A
+            // read from before that first commit has the same selection epoch
+            // and cannot erase a later recorded named or null serving route.
+            let retain_recorded_route = row.resolved_route_seen
+                && !metadata.resolved_route_seen
+                && same_route_reset
+                && row.account_provider.as_deref() == Some(metadata.provider.as_str())
+                && row.account_alias == metadata.account_alias
+                && row.account_base_url == metadata.provider_base_url;
+            row.account_alias.clone_from(&metadata.account_alias);
+            row.account_provider = Some(metadata.provider.clone());
+            row.account_base_url.clone_from(&metadata.provider_base_url);
+            row.account_metadata_epoch = metadata.selection_epoch;
+            if !retain_recorded_route {
+                row.resolved_route_alias
+                    .clone_from(&metadata.resolved_route_alias);
+                row.resolved_route_seen = metadata.resolved_route_seen;
+            }
+            if let Some(reset) = metadata.route_reset_epoch {
+                row.route_reset_epoch = Some(reset);
+                row.account_default_epoch = (!row.resolved_route_seen
+                    && row
+                        .account_request_epoch
+                        .is_none_or(|request| request < reset))
+                .then_some(epoch.selection_epoch)
+                .flatten();
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Disclose a current legacy/inherited clamp only when this metadata's
+    /// pair and effective budget were admitted. Account snapshot provenance
+    /// has an independent fence and cannot suppress a valid budget warning.
+    pub(crate) fn note_session_budget_clamp(
+        &mut self,
+        session: &SessionId,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) {
+        let epoch = if self.active_session.as_ref() == Some(session) {
+            &self.meter_epoch
+        } else if let Some(row) = self.sessions.iter().find(|row| &row.id == session) {
+            &row.meter_epoch
+        } else {
+            return;
+        };
+        if epoch.pair.as_ref() != Some(&(metadata.provider.clone(), metadata.model.clone()))
+            || epoch.output_budget != Some(metadata.max_tokens)
+            || matches!((epoch.selection_epoch, metadata.selection_epoch),
+                (Some(current), Some(incoming)) if incoming < current)
+        {
+            return;
+        }
+        if metadata.budget_clamp_notice_epoch.is_none()
+            && let Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                requested,
+            }) = metadata.max_tokens_source
+            && requested > metadata.max_tokens
+        {
+            self.record_budget_clamp_notice(
+                session,
+                // Re-reading the same legacy metadata is a state read,
+                // distinct from an epochless selection notification.
+                metadata
+                    .selection_epoch
+                    .or(epoch.selection_epoch)
+                    .or(Some(0)),
+                &metadata.provider,
+                &metadata.model,
+                &haider_protocol::output_budget::OutputBudgetClampV1 {
+                    requested,
+                    max_output_tokens: metadata.max_tokens,
+                },
+            );
+        }
     }
 
     /// A user-set output budget did not fit the newly selected model: the

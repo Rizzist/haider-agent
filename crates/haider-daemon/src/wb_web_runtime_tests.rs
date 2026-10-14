@@ -306,6 +306,7 @@ impl WebWorld {
                 model_catalog_key: None,
                 model: model.to_owned(),
                 expected_pair: None,
+                account_alias: None,
                 output_budget: None,
                 event_id: EventId::new(format!("{command_id}-event")),
                 device_id: self.device_id.clone(),
