@@ -369,8 +369,11 @@ async fn configure_with_auth(client: &mut Client, origin: &str, auth: ProviderAu
                 origin: Some(origin.into()),
                 auth_requirement: Some(auth),
                 enabled: true,
-                models: vec![MODEL.into()],
-                default_model: Some(MODEL.into()),
+                // Routing uses an explicitly typed advisory wire ID. A
+                // configured deployment would require catalog eligibility
+                // belonging to each new endpoint/account, a separate contract.
+                models: Vec::new(),
+                default_model: None,
                 response_open_timeout_ms: Some(OPEN_TIMEOUT_MS),
                 chunk_idle_timeout_ms: None,
                 semantic_progress_timeout_ms: None,

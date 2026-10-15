@@ -1379,15 +1379,15 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         },
     )
     .await;
-    let (successor_session, successor_generation) = match successor_created {
-        ResponseBody::SessionCreate {
-            session_id,
-            worker_generation,
-            ..
-        } => (session_id, worker_generation),
-        other => panic!("unexpected successor session.create: {other:?}"),
-    };
-    let _ = request(
+    assert!(
+        matches!(successor_created, ResponseBody::Error { ref code, retryable: false, .. }
+            if code == haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE),
+        "the tombstoned credential cannot admit a new session: {successor_created:?}"
+    );
+    // A persisted session must still fail its next physical turn without
+    // reviving the predecessor's credential. Exercise that boundary too.
+    let successor_session = session_id;
+    let attached = request(
         &mut after_restart,
         "barrier-successor-attach",
         RequestBody::SessionAttach {
@@ -1398,6 +1398,10 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         },
     )
     .await;
+    let successor_generation = match attached {
+        ResponseBody::SessionAttach { attach_state, .. } => attach_state.worker_generation,
+        other => panic!("successor persisted session attach: {other:?}"),
+    };
     after_restart
         .send(
             &WireFrame::Request {

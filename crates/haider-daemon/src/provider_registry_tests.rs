@@ -2259,6 +2259,8 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
             .expect("summary")
     };
     assert_eq!(current().inventory, haider_rpc::ModelInventoryWire::Static);
+    let permanent_models = current().models;
+    assert!(!permanent_models.is_empty(), "permanent seed control");
     source.unavailable(HAIDER_CODE_PROVIDER_NAME, "catalog transport failed".into());
     let unavailable = current();
     assert!(matches!(
@@ -2299,7 +2301,7 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
             ..
         }
     ));
-    assert!(empty_stale.models.is_empty());
+    assert_eq!(empty_stale.models, permanent_models);
     assert_eq!(
         empty_stale.availability,
         haider_rpc::ProviderAvailabilityWire::Available
