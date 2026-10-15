@@ -9,7 +9,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::provider::FinishReason;
 use haider_protocol::session::SessionMetadataV1;
 use haider_provider::{FakeProvider, FakeStep, Provider};
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 struct FixedProviderFactory {
     provider: Arc<FakeProvider>,
@@ -150,22 +150,38 @@ impl World {
     }
 
     async fn await_done(&self, session_id: &SessionId, run_id: &RunId) {
-        timeout(Duration::from_secs(10), async {
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
             loop {
                 let events = self
                     .store
                     .read(session_id, 0, 2048)
                     .await
                     .expect("read journal");
-                if events.iter().any(|event| {
-                    event.run_id.as_ref() == Some(run_id)
+                let done_seq = events.iter().find_map(|event| {
+                    (event.run_id.as_ref() == Some(run_id)
                         && event.payload.decode_event().is_ok_and(|payload| {
                             matches!(payload, EventPayload::RunState(RunState::Done))
-                        })
+                        }))
+                    .then_some(event.seq)
+                });
+                // Done precedes the worker's final aggregate-idle commit.
+                // Fence that tail before taking the head and paging receipts.
+                if done_seq.is_some_and(|done_seq| {
+                    events.iter().any(|event| {
+                        event.seq > done_seq
+                            && event.payload.decode_event().is_ok_and(|payload| {
+                                matches!(
+                                    payload,
+                                    EventPayload::SessionState(
+                                        haider_protocol::state::SessionState::Idle { .. }
+                                    )
+                                )
+                            })
+                    })
                 }) {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await

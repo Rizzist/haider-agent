@@ -1397,9 +1397,7 @@ async fn client_that_never_reads_a_byte_cannot_hold_the_barrier_open() {
     // Nothing is feeding this socket any more: the reply is a truncated prefix
     // followed by EOF, reached promptly because the writer was joined, not left
     // to finish its half-megabyte frame.
-    let delivered = tokio::time::timeout(Duration::from_secs(2), client.frames_until_eof())
-        .await
-        .expect("EOF must follow the barrier promptly");
+    let delivered = client.frames_at_joined_barrier();
     assert_eq!(
         delivered, 0,
         "a writer that outlived teardown completed its frame"
@@ -1450,9 +1448,7 @@ async fn one_byte_reader_cannot_hold_the_barrier_open() {
     );
     assert!(!config.endpoint_path().exists());
     poll_store_release(&config).await;
-    let delivered = tokio::time::timeout(Duration::from_secs(2), client.frames_until_eof())
-        .await
-        .expect("EOF must follow the barrier promptly");
+    let delivered = client.frames_at_joined_barrier();
     assert_eq!(delivered, 0);
 }
 
@@ -2266,7 +2262,8 @@ async fn reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_eff
     // retry; the law under test (exactly-once Unknown reconciliation) is
     // unchanged.
     let mut store = Store::open(&config.store_dir);
-    for _ in 0..200u32 {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
         match &store {
             Err(error) if error.retryable => {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;

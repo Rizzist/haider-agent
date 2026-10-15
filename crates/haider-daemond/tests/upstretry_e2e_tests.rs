@@ -34,31 +34,86 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use support::{UdsClient, ready_with_dependencies, test_root};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 
 const UPSTREAM_429_COUNT: usize = 6;
 const CALLER_DEADLINE: Duration = Duration::from_millis(32_400);
-const TERMINAL_PUBLICATION_GRACE: Duration = Duration::from_secs(2);
-const TERMINAL_OBSERVER_DEADLINE: Duration = Duration::from_millis(34_400);
-// Registry #94: once the terminal append is durable, replay has no provider
-// wait; reuse the two-second local publication/store grace rather than adding
-// an unrelated wall-clock constant.
-const REPLAY_OBSERVER_DEADLINE: Duration = TERMINAL_PUBLICATION_GRACE;
 // The first five lower-half jittered delays can total 15.5--31 seconds. Pick
-// a real run coordinate whose deterministic ladder leaves 10.9 seconds for
-// worker startup plus six loopback/store cycles under the explicit 32.4-second
-// deadline. Attempt six has a minimum 15-second jitter plus both 1s margins,
+// a real run coordinate whose first five backoffs leave 10.9 seconds of the
+// explicit 32.4-second policy budget. HTTP/store scheduling does not advance
+// the paused clock. Attempt six has a minimum 15-second jitter plus both 1s margins,
 // so the global 15.5-second minimum through attempt five needs at least 32.5
 // seconds to admit a seventh request. The 100ms strict gap forbids it.
 const SIXTH_OPEN_LADDER_CEILING: u64 = 21_500;
 const RUN_SELECTION_ATTEMPTS: usize = 32;
-// Registry #94: one-second cancellation settlement + two copies of the
-// two-second local store/publication grace (request and reply) = five seconds.
-const SELECTION_CANCEL_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Freeze policy time during real HTTP and SQLite work. A separate, joined
+/// wall-clock alarm caps missing events without consuming the caller budget.
+struct PolicyClock {
+    runnable: tokio::task::JoinHandle<()>,
+    stop_alarm: std::sync::mpsc::Sender<()>,
+    alarm: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PolicyClock {
+    fn runnable() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    fn hold() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let runnable = Self::runnable();
+        let (stop_alarm, stopped) = std::sync::mpsc::channel();
+        let (expired, alarm_expired) = tokio::sync::oneshot::channel();
+        let alarm = std::thread::spawn(move || {
+            if stopped
+                .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
+                .is_err()
+            {
+                let _ = expired.send(());
+            }
+        });
+        (
+            Self {
+                runnable,
+                stop_alarm,
+                alarm: Some(alarm),
+            },
+            alarm_expired,
+        )
+    }
+
+    async fn elapse_backoff(&mut self, delay: Duration) {
+        // Anchor our ceiling while policy time is still frozen. Releasing the
+        // runnable holder lets the runtime drain runnable work before it jumps
+        // to a timer. This includes an actor which cooperatively yielded after
+        // publishing Retrying but has not yet polled its relative sleeper.
+        let ceiling = tokio::time::sleep(delay);
+        self.runnable.abort();
+        ceiling.await;
+        // The controller wakes at the declared backoff ceiling, so real HTTP
+        // and store work cannot auto-advance time toward the caller deadline.
+        self.runnable = Self::runnable();
+    }
+}
+
+impl Drop for PolicyClock {
+    fn drop(&mut self) {
+        self.runnable.abort();
+        let _ = self.stop_alarm.send(());
+        if let Some(alarm) = self.alarm.take() {
+            alarm.join().expect("join fixture watchdog");
+        }
+    }
+}
 
 #[derive(Clone)]
 struct RoutingFactory {
@@ -475,23 +530,19 @@ async fn cancel_selection_run(
         },
     )
     .await;
-    tokio::time::timeout(SELECTION_CANCEL_DEADLINE, async {
-        loop {
-            if let WireFrame::Response {
-                body:
-                    ResponseBody::TurnCancel {
-                        status: CancelStatus::Accepted | CancelStatus::AlreadyTerminal,
-                        ..
-                    },
-                ..
-            } = client.next().await
-            {
-                return;
-            }
+    loop {
+        if let WireFrame::Response {
+            body:
+                ResponseBody::TurnCancel {
+                    status: CancelStatus::Accepted | CancelStatus::AlreadyTerminal,
+                    ..
+                },
+            ..
+        } = client.next().await
+        {
+            return;
         }
-    })
-    .await
-    .expect("selection cancellation settles within its derived deadline");
+    }
 }
 
 #[derive(Default)]
@@ -501,46 +552,52 @@ struct TerminalObservation {
     terminal: Option<RunState>,
 }
 
-async fn observe_terminal(client: &mut UdsClient, run_id: &RunId) -> TerminalObservation {
+async fn observe_terminal(
+    client: &mut UdsClient,
+    run_id: &RunId,
+    clock: &mut PolicyClock,
+) -> TerminalObservation {
     let mut observation = TerminalObservation::default();
-    tokio::time::timeout(TERMINAL_OBSERVER_DEADLINE, async {
-        loop {
-            let Some(frame) = client.try_next().await else {
-                panic!("daemon connection closed before run {run_id} terminalized")
-            };
-            let WireFrame::Event { envelope, .. } = frame else {
-                continue;
-            };
-            if envelope.run_id.as_ref() != Some(run_id) {
-                continue;
-            }
-            let Ok(payload) = envelope.payload.decode_event() else {
-                continue;
-            };
-            match &payload {
-                EventPayload::RunFailed {
-                    code,
-                    message,
-                    retryable,
-                    presentation,
-                } => {
-                    observation.failure =
-                        Some((*code, message.clone(), *retryable, presentation.clone()));
-                }
-                EventPayload::RunState(state) if state.is_terminal() => {
-                    observation.terminal = Some(state.clone());
-                }
-                _ => {}
-            }
-            observation.events.push(payload);
-            if observation.terminal.is_some() {
-                return;
-            }
+    loop {
+        let Some(frame) = client.try_next().await else {
+            panic!("daemon connection closed before run {run_id} terminalized")
+        };
+        let WireFrame::Event { envelope, .. } = frame else {
+            continue;
+        };
+        if envelope.run_id.as_ref() != Some(run_id) {
+            continue;
         }
-    })
-    .await
-    .expect("32.4s caller deadline plus 2s terminal-publication grace");
-    observation
+        let Ok(payload) = envelope.payload.decode_event() else {
+            continue;
+        };
+        match &payload {
+            EventPayload::RunFailed {
+                code,
+                message,
+                retryable,
+                presentation,
+            } => {
+                observation.failure =
+                    Some((*code, message.clone(), *retryable, presentation.clone()));
+            }
+            EventPayload::RunState(state) if state.is_terminal() => {
+                observation.terminal = Some(state.clone());
+            }
+            _ => {}
+        }
+        let retry_delay = match &payload {
+            EventPayload::RunState(RunState::Retrying { delay_ms, .. }) => Some(*delay_ms),
+            _ => None,
+        };
+        observation.events.push(payload);
+        if let Some(delay_ms) = retry_delay {
+            clock.elapse_backoff(Duration::from_millis(delay_ms)).await;
+        }
+        if observation.terminal.is_some() {
+            return observation;
+        }
+    }
 }
 
 async fn replay_run_events(
@@ -568,29 +625,25 @@ async fn replay_run_events(
         },
     )
     .await;
-    tokio::time::timeout(REPLAY_OBSERVER_DEADLINE, async {
-        let mut response = false;
-        let mut caught_up = false;
-        let mut events = Vec::new();
-        while !(response && caught_up) {
-            match replay.next().await {
-                WireFrame::Response {
-                    body: ResponseBody::SessionAttach { .. },
-                    ..
-                } => response = true,
-                WireFrame::AttachCaughtUp { .. } => caught_up = true,
-                WireFrame::Event { envelope, .. } if envelope.run_id.as_ref() == Some(run_id) => {
-                    if let Ok(payload) = envelope.payload.decode_event() {
-                        events.push(payload);
-                    }
+    let mut response = false;
+    let mut caught_up = false;
+    let mut events = Vec::new();
+    while !(response && caught_up) {
+        match replay.next().await {
+            WireFrame::Response {
+                body: ResponseBody::SessionAttach { .. },
+                ..
+            } => response = true,
+            WireFrame::AttachCaughtUp { .. } => caught_up = true,
+            WireFrame::Event { envelope, .. } if envelope.run_id.as_ref() == Some(run_id) => {
+                if let Ok(payload) = envelope.payload.decode_event() {
+                    events.push(payload);
                 }
-                _ => {}
             }
+            _ => {}
         }
-        events
-    })
-    .await
-    .expect("durable terminal replays within the local publication grace")
+    }
+    events
 }
 
 fn retry_delays(events: &[EventPayload]) -> Vec<u64> {
@@ -621,13 +674,21 @@ fn retry_sequence(events: &[EventPayload]) -> Vec<(u32, u32, u64, WaitReason)> {
 /// Six complete HTTP 429 bodies must not enter a backoff which the absolute
 /// caller budget cannot contain. The run fails as the bounded provider error
 /// after six real HTTP opens; it never relies on the caller's timeout.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bounded_429_ladder_terminalizes_before_caller_deadline() {
     assert_eq!(
-        TERMINAL_OBSERVER_DEADLINE,
-        CALLER_DEADLINE + TERMINAL_PUBLICATION_GRACE,
-        "registry #94 observer arithmetic stays explicit"
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread,
+        "the controller freezes policy time on one runtime thread"
     );
+    let (mut clock, alarm) = PolicyClock::hold();
+    tokio::select! {
+        () = bounded_429_retry_policy(&mut clock) => {}
+        _ = alarm => panic!("bounded retry fixture failed to complete its real events"),
+    }
+}
+
+async fn bounded_429_retry_policy(clock: &mut PolicyClock) {
     let server = Scripted429Server::spawn().await;
     let vault = MemoryVault::default();
     let alias = CredentialAlias::new("upstretry-construction-token");
@@ -701,18 +762,18 @@ async fn bounded_429_ladder_terminalizes_before_caller_deadline() {
         "a deterministic run id with <=21.5s through five backoffs is found within 32 candidates",
     );
 
-    let observation = observe_terminal(&mut client, &run_id).await;
-    let wall = started.elapsed();
+    let observation = observe_terminal(&mut client, &run_id, clock).await;
+    let policy_elapsed = started.elapsed();
     eprintln!(
-        "upstretry run={run_id} wall_ms={} requests={} delays={:?}",
-        wall.as_millis(),
+        "upstretry run={run_id} policy_ms={} requests={} delays={:?}",
+        policy_elapsed.as_millis(),
         server.request_count(),
         retry_delays(&observation.events),
     );
 
     assert!(
-        wall < CALLER_DEADLINE,
-        "the provider failure must self-terminalize before the 32.4s caller deadline; wall={wall:?}"
+        policy_elapsed < CALLER_DEADLINE,
+        "the provider failure must precede the 32.4s policy deadline; policy={policy_elapsed:?}"
     );
     assert_eq!(server.request_count(), UPSTREAM_429_COUNT);
     assert_eq!(observation.terminal, Some(RunState::Errored));
@@ -820,9 +881,12 @@ async fn bounded_429_ladder_terminalizes_before_caller_deadline() {
         1,
         "sealed replay also has exactly one typed terminal"
     );
-    let ladder_wall = Duration::from_millis(expected_delays.iter().copied().sum());
+    let declared_backoffs = Duration::from_millis(expected_delays.iter().copied().sum());
+    // Tokio rounds timer deadlines up to its one-millisecond resolution.
+    let timer_rounding =
+        Duration::from_millis(u64::try_from(expected_delays.len()).expect("retry count fits u64"));
     assert!(
-        wall <= ladder_wall + TERMINAL_PUBLICATION_GRACE,
-        "loopback/store overhead exceeded the deadline-derived publication grace: wall={wall:?}, ladder={ladder_wall:?}"
+        policy_elapsed >= declared_backoffs && policy_elapsed <= declared_backoffs + timer_rounding,
+        "only retry backoffs and timer rounding advance policy time: policy={policy_elapsed:?} backoffs={declared_backoffs:?} rounding={timer_rounding:?}"
     );
 }

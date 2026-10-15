@@ -239,7 +239,7 @@ pub fn open_workspace_directory(
 pub fn duplicate_workspace_directory(
     directory: &WorkspaceDirectory,
 ) -> Result<WorkspaceDirectory, WorkspaceDirectoryError> {
-    rustix::io::dup(directory)
+    rustix::io::fcntl_dupfd_cloexec(directory, 0)
 }
 
 #[cfg(windows)]
@@ -484,6 +484,46 @@ mod windows_process_directory_tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn workspace_directory_duplicate_handles_are_not_inheritable() {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        };
+        let root = tempfile::tempdir().expect("workspace root");
+        let canonical = std::fs::canonicalize(root.path()).expect("canonical root");
+        let directory = open_workspace_directory(&canonical).expect("directory owner");
+        for anchor in &directory.anchors {
+            // SAFETY: each anchor owns a live directory handle. Plant the
+            // inherit flag to prove DuplicateHandle clears it on the new copy.
+            assert_ne!(
+                unsafe {
+                    SetHandleInformation(
+                        anchor.as_raw_handle(),
+                        HANDLE_FLAG_INHERIT,
+                        HANDLE_FLAG_INHERIT,
+                    )
+                },
+                0
+            );
+        }
+        let duplicate = duplicate_workspace_directory(&directory).expect("directory duplicate");
+        assert_eq!(
+            workspace_directory_identity(&directory).expect("owner identity"),
+            workspace_directory_identity(&duplicate).expect("duplicate identity")
+        );
+        for anchor in &duplicate.anchors {
+            let mut flags = 0;
+            // SAFETY: the duplicate owns this live handle and flags is writable.
+            assert_ne!(
+                unsafe { GetHandleInformation(anchor.as_raw_handle(), &raw mut flags) },
+                0
+            );
+            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+        }
+    }
 
     #[test]
     fn process_directory_spelling_preserves_drive_and_unc_components() {

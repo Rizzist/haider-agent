@@ -1062,6 +1062,23 @@ impl UdsClient {
         assert_eq!(read, 0);
     }
 
+    /// After a joined teardown, the kernel must already contain EOF after
+    /// the buffered prefix. Reading directly avoids Tokio readiness delivery
+    /// becoming another scheduling prerequisite for this lifetime assertion.
+    #[cfg(unix)]
+    pub fn frames_at_joined_barrier(&mut self) -> usize {
+        let mut frames = self.pending.len();
+        loop {
+            let mut bytes = [0_u8; 16 * 1024];
+            let read = rustix::io::read(&self.stream, &mut bytes)
+                .expect("writer/socket outlived the joined teardown barrier");
+            if read == 0 {
+                return frames;
+            }
+            frames += self.decoder.push(&bytes[..read]).frames.len();
+        }
+    }
+
     /// Reads until EOF and reports how many complete frames arrived.
     pub async fn frames_until_eof(&mut self) -> usize {
         let mut frames = self.pending.len();

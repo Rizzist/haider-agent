@@ -96,7 +96,8 @@ fn command(child: &mut Child, value: &PresenceCommand) {
 }
 
 async fn until<F: Fn() -> bool>(condition: F) {
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
         if condition() {
             return;
         }

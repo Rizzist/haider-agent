@@ -45,12 +45,19 @@ pub use directory::{
     WorkspaceDirectory, WorkspaceDirectoryError, duplicate_workspace_directory,
     open_workspace_directory, open_workspace_file,
 };
+pub use file_lock::{FileLock, lock_file_exclusive, try_lock_file_exclusive, unlock_file};
 #[cfg(unix)]
 pub use file_lock::{
     file_owner_record_pid, lock_file_owner_record, try_lock_file_owner_record,
     unlock_file_owner_record,
 };
-pub use file_lock::{lock_file_exclusive, try_lock_file_exclusive, unlock_file};
+
+/// Hang watchdog for test fixture readiness and completion. The shared build
+/// gate runs two jobs on a 16 GiB host; image validation, blocking-pool work,
+/// and scheduling can exceed short local deadlines. Semantic timing tests
+/// must retain their own virtual clocks or explicit elapsed-time assertions.
+#[doc(hidden)]
+pub const TEST_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(windows)]
 pub use fs::replace_file_with_backup;
 pub use fs::{
@@ -75,9 +82,9 @@ pub use local_date::{
     CivilDateError, CivilDateSample, civil_from_unix_days, sample_local_civil_date,
     sample_utc_civil_date, sample_with_offset,
 };
-#[cfg(target_os = "macos")]
-pub use process::process_group_contains_only_leader;
 pub use process::program_on_path;
+#[cfg(target_os = "macos")]
+pub use process::{MacosProcessState, macos_process_states, process_group_contains_only_leader};
 pub use process::{
     ProcessExitMonitor, ProcessGroup, ProcessId, ProcessSignal, abandon_process_group,
     allocator_pressure_relief, configure_background_process, configure_process_environment,

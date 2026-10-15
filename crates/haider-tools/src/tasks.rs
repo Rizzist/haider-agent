@@ -1036,7 +1036,7 @@ mod supervisor_tests {
                     "/usr/bin/perl -e '$SIG{TERM}=q(IGNORE); ",
                     "open $started, q(>), q(background-observer-started.log); ",
                     "print $started q(started); close $started; ",
-                    "select undef, undef, undef, 0.3; ",
+                    "alarm 600; while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
                     "open $survived, q(>), q(background-observer-survived.log); ",
                     "print $survived q(survived); close $survived; sleep 30' & ",
                     "while :; do :; done",
@@ -1050,10 +1050,12 @@ mod supervisor_tests {
             .await
             .expect("spawn background process");
         let pid = spawn.pid;
+        let mut fixture_group = crate::process::FixtureProcessGroup::new(spawn.process_group);
         let (_kill, kill_signal) = task_kill_channel();
         let observer_started = descendant_started.clone();
         let exit_observation: BackgroundLeaderExitObservation = Box::pin(async move {
-            for _ in 0..200 {
+            let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+            while std::time::Instant::now() < deadline {
                 if observer_started.exists() {
                     return Err(ToolError::Runtime {
                         message: "injected background exit-observer failure".into(),
@@ -1067,7 +1069,7 @@ mod supervisor_tests {
         });
 
         let status = tokio::time::timeout(
-            Duration::from_secs(3),
+            haider_platform::TEST_WAIT_TIMEOUT,
             supervise_background_with_exit_observation(
                 spawn,
                 kill_signal,
@@ -1091,15 +1093,12 @@ mod supervisor_tests {
             "observer failure was not preserved: {status:?}"
         );
         assert!(descendant_started.exists(), "owned descendant starts");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        fixture_group.assert_swept(pid).await;
+        std::fs::write(workspace.path().join("release-descendant"), b"released")
+            .expect("release descendant after teardown");
         assert!(
             !descendant_survived.exists(),
             "background observer failure detached instead of sweeping the group"
-        );
-        assert_eq!(
-            probe_group_liveness(pid),
-            PidLiveness::Dead,
-            "background process group remains live after observer-failure teardown"
         );
         broker.close().await.expect("broker closes");
     }

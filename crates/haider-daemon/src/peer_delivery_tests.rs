@@ -1,7 +1,9 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
-use crate::peer_tests::{live_peer_fixture, start_held_peer_turn};
+use crate::peer_tests::{
+    live_peer_fixture, start_held_peer_turn, wait_for_peer_delivery_quiescence,
+};
 use haider_core::StoreHandle;
 use haider_protocol::EventPayload;
 use haider_protocol::ids::RunId;
@@ -77,11 +79,7 @@ async fn peer_offline_queue_survives_sender_and_receiver_restart_and_replays_onc
     let manager = start_held_peer_turn(&th, &ts, &target_id, &RunId::new("busy-target")).await;
     sender.drain_outbox().await.expect("reconnect drain");
     assert!(sender.outbox.lock().await.is_empty());
-    assert!(
-        sh.daemon_is_durably_quiescent()
-            .await
-            .expect("delivered quiescence")
-    );
+    wait_for_peer_delivery_quiescence(&sh).await;
     let receipt = sender
         .send_with_options(
             &from,
@@ -374,12 +372,7 @@ async fn peer_terminal_states_wake_and_release_durable_quiescence() {
                 .state,
             PeerDeliveryState::Failed
         );
-        assert!(
-            sh.daemon_is_durably_quiescent()
-                .await
-                .expect("terminal check"),
-            "{terminal}"
-        );
+        wait_for_peer_delivery_quiescence(&sh).await;
     }
     sender.shutdown().await;
     sh.shutdown().await.expect("sender stop");

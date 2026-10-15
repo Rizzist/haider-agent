@@ -468,6 +468,12 @@ pub async fn ensure_daemon(
                     // launch even though that daemon is meant to outlive us.
                     match qualify_ready_candidate(peer_credentials.pid, active).await {
                         ReadyCandidate::OwnChild(active) => {
+                            if trace_enabled {
+                                eprintln!(
+                                    "haider: lifecycle event=spawn_ready_candidate path=own_child candidate_pid={}",
+                                    active.id()
+                                );
+                            }
                             ownership = Some(DaemonOwnershipToken {
                                 authenticated_pid: active.id(),
                                 child: active,
