@@ -1087,6 +1087,25 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     config.inject_worker_manager_shutdown_error = inject_worker_shutdown_error;
     let server = FakeServer::start().await;
     let vault = Arc::new(BlockingRotationVault::new());
+    // The injected OAuth registration supplies transport, not a configured
+    // provider. Seed its synthetic adapter before exercising shutdown; OAuth
+    // adapters without a listing API retain configured, unverified models.
+    std::fs::create_dir_all(&config.store_dir).expect("provider fixture directory");
+    std::fs::write(
+        config.store_dir.join("providers.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "providers": [{
+                "provider_id": "fake-oauth", "display_name": "Fake OAuth",
+                "api_family": "anthropic_messages",
+                "base_url": format!("http://{}", server.address),
+                "enabled": true, "auth_requirement": "oauth",
+                "configured_models": ["fake-model"], "default_model": "fake-model",
+                "provenance": "custom"
+            }]
+        }))
+        .expect("encode synthetic provider"),
+    )
+    .expect("seed synthetic provider");
     let builder = Arc::new(OAuthTurnBuilder {
         fake: Arc::new(FakeProvider::new(vec![FakeStep::Finish {
             reason: haider_protocol::provider::FinishReason::EndTurn,

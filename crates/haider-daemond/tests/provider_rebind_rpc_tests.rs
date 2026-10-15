@@ -384,6 +384,24 @@ async fn configure_with_auth(client: &mut Client, origin: &str, auth: ProviderAu
         matches!(response, ResponseBody::ProviderConfigure { .. }),
         "configure: {response:?}"
     );
+    // Configuration names deployments; the real loopback catalog establishes
+    // their availability before this routing fixture creates a session.
+    let refreshed = client
+        .request(
+            "refresh",
+            RequestBody::ProviderModelsRefresh {
+                provider: PROVIDER.into(),
+            },
+        )
+        .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed else {
+        panic!("refresh: {refreshed:?}");
+    };
+    assert!(provider.models.iter().any(|model| model == MODEL));
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
 }
 
 /// The override tuple is unchanged (`provider`, `None`, `None`), but a new

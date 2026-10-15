@@ -309,11 +309,11 @@ async fn recording_models_server_returns_403_for_the_models_get() {
     assert!(matches!(result, Err(CatalogError::Unavailable { reason }) if reason.contains("403")));
 }
 
-/// The daemon maps these three discovery errors to the public Q probe
+/// The daemon maps discovery errors to the public Q probe
 /// taxonomy; pin the transport/parser source classifications at the mocked
 /// `/v1/models` boundary.
 #[tokio::test]
-async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
+async fn custom_catalog_distinguishes_errors_from_successful_empty_lists() {
     for (status, body, expected) in [
         (
             "401 Unauthorized",
@@ -331,7 +331,7 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
             br#"{"models":[{"id":"wrong-shape"}]}"#.as_slice(),
             "invalid_body",
         ),
-        ("200 OK", br#"{"data":[]}"#.as_slice(), "empty"),
+        ("200 OK", br#"{"data":[]}"#.as_slice(), "empty_success"),
         (
             "200 OK",
             br#"{"data":[{"id":""},{"id":"  "},{"name":"missing-id"}]}"#.as_slice(),
@@ -339,10 +339,18 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
         ),
     ] {
         let (origin, fixture) = one_shot_catalog(status, body).await;
-        let error = discover_models(CatalogSource::OpenAiCompatible { origin }, None, None)
-            .await
-            .expect_err("scripted catalog failure");
+        let result = discover_models(CatalogSource::OpenAiCompatible { origin }, None, None).await;
         fixture.await.expect("catalog fixture");
+        if expected == "empty_success" {
+            assert!(
+                result
+                    .expect("empty list is successful fetch evidence")
+                    .models
+                    .is_empty()
+            );
+            continue;
+        }
+        let error = result.expect_err("scripted catalog failure");
         assert!(matches!(
             (expected, error),
             ("unauthorized", CatalogError::Unauthorized)

@@ -224,6 +224,8 @@ fn spawn_helper(
         .env("HAIDER_PROFILE_DIR", &profile.store_dir)
         .env("HAIDER_RUNTIME_DIR", runtime_root)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
+        // Liveness fixtures need no host credential or live provider.
+        .env("HAIDER_TEST_FAKE_PROVIDER", "[]")
         // Lockdown is intentionally machine-user global. Keep that global
         // root inside this black-box fixture rather than touching the
         // developer/runner account's real home.
@@ -867,8 +869,8 @@ fn active_monitor_holds_ephemeral_daemon_until_expiry() {
         .block_on(connected.client.request(RequestBody::SessionCreate {
             command_id: CommandId::new("ephemeral-monitor-session"),
             cwd: root.path().to_string_lossy().into_owned(),
-            provider: "anthropic".into(),
-            model: "claude-opus-5".into(),
+            provider: "fake".into(),
+            model: "monitor-fixture".into(),
             max_tokens: 64,
         }))
         .expect("create ephemeral monitor session");

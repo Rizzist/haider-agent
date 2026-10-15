@@ -2289,12 +2289,28 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     );
     source.unavailable(
         HAIDER_CODE_PROVIDER_NAME,
-        "empty cache is not prior inventory".into(),
+        "temporary outage after successful empty inventory".into(),
     );
+    let empty_stale = current();
     assert!(matches!(
-        current().inventory,
-        haider_rpc::ModelInventoryWire::Unavailable { .. }
+        empty_stale.inventory,
+        haider_rpc::ModelInventoryWire::Stale {
+            fetched_at_ms: 1,
+            ..
+        }
     ));
+    assert!(empty_stale.models.is_empty());
+    assert_eq!(
+        empty_stale.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(
+        empty_stale
+            .availability_reason
+            .as_deref()
+            .expect("visible uncertainty")
+            .contains("temporary outage after successful empty inventory")
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
