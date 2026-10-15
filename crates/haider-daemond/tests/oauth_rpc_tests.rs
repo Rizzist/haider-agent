@@ -1419,18 +1419,37 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         )
         .await;
     tokio::time::timeout(DEADLINE, async {
+        let mut successor_run = None;
+        let mut terminal_runs = Vec::new();
         loop {
-            if let WireFrame::Event { envelope, .. } = after_restart.receive().await
-                && let Ok(EventPayload::RunState(state)) =
-                    serde_json::from_value::<EventPayload>(envelope.payload.into())
-                && state.is_terminal()
+            match after_restart.receive().await {
+                WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::TurnSubmit { run_id, .. },
+                } if request_id.as_str() == "barrier-successor-submit" => {
+                    successor_run = Some(run_id);
+                }
+                WireFrame::Event { envelope, .. } => {
+                    if let Ok(EventPayload::RunState(state)) =
+                        serde_json::from_value::<EventPayload>(envelope.payload.into())
+                        && state.is_terminal()
+                        && let Some(run_id) = envelope.run_id
+                    {
+                        terminal_runs.push(run_id);
+                    }
+                }
+                _ => {}
+            }
+            if successor_run
+                .as_ref()
+                .is_some_and(|run| terminal_runs.contains(run))
             {
                 break;
             }
         }
     })
     .await
-    .expect("successor turn terminal");
+    .expect("the newly submitted successor turn, not replayed history, becomes terminal");
     assert_eq!(
         server.refresh_calls.load(Ordering::SeqCst),
         1,
