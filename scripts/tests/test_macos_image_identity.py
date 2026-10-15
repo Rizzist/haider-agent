@@ -72,6 +72,21 @@ class ImageIdentityTests(unittest.TestCase):
                 IMAGE.require_unattached(self.path, IMAGE.identity(self.path.stat()), self.root / 'seen')
         self.assertTrue(self.path.exists())
 
+    def test_reader_inventory_retries_incomplete_snapshots_but_not_unknown_readers(self):
+        self.users_patch.stop()
+        with patch.object(IMAGE, 'image_users_snapshot', side_effect=[RuntimeError('incomplete'), set()]) as query, \
+                patch.object(IMAGE.time, 'sleep'):
+            self.assertEqual(IMAGE.open_image_users(self.path, 0), set())
+            self.assertEqual(query.call_count, 2)
+        with patch.object(IMAGE, 'image_users_snapshot', side_effect=RuntimeError('incomplete')) as query, \
+                patch.object(IMAGE.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+                IMAGE.open_image_users(self.path, 0)
+            self.assertEqual(query.call_count, 4)
+        with patch.object(IMAGE, 'image_users_snapshot', return_value={973}) as query:
+            self.assertEqual(IMAGE.open_image_users(self.path, 0), {973})
+            self.assertEqual(query.call_count, 1)
+
     def test_reader_inventory_requires_the_pinned_vnode_and_preserves_unknown_readers(self):
         self.users_patch.stop()
         self.path.write_bytes(b'image')

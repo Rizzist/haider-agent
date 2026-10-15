@@ -149,7 +149,7 @@ def staging_inventory():
         time.sleep(.1 * (attempt + 1))
 
 
-def open_image_users(path, descriptor):
+def image_users_snapshot(path, descriptor):
     """Cross-check inventory against readers of the pinned vnode.
 
     A warning-free hdiutil plist can silently omit an attachment. lsof selects
@@ -183,6 +183,17 @@ def open_image_users(path, descriptor):
     if os.getpid() not in users:
         raise RuntimeError('pinned image absent from backing-file inventory; retaining ' + str(path))
     return users - {os.getpid(), os.getppid()}
+
+
+def open_image_users(path, descriptor):
+    for attempt in range(4):
+        try:
+            return image_users_snapshot(path, descriptor)
+        except RuntimeError:
+            if attempt == 3:
+                raise
+            time.sleep(.1 * (attempt + 1))
+
 
 
 def require_unattached(path, expected, history):
