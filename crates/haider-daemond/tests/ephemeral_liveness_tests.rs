@@ -337,14 +337,17 @@ fn wait_for_cleanup_preserving_peer_registration(
         || {
             !pid_path(profile).exists()
                 && !profile.endpoint_path.exists()
-                && std::fs::read_dir(&profile.runtime_dir).is_ok_and(|entries| {
-                    entries.flatten().all(|entry| {
-                        entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|name| name.starts_with("ph-") && name.ends_with(".j"))
-                    })
-                })
+                && match std::fs::read_dir(&profile.runtime_dir) {
+                    Ok(entries) => entries.into_iter().all(|entry| {
+                        entry.is_ok_and(|entry| {
+                            entry.file_type().is_ok_and(|kind| kind.is_file())
+                                && entry.file_name().to_str().is_some_and(|name| {
+                                    name.starts_with("ph-") && name.ends_with(".j")
+                                })
+                        })
+                    }),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                }
         },
         || {
             process_snapshot(profile, child.as_deref_mut(), daemon_pid)
