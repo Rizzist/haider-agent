@@ -81,3 +81,4 @@ daemon-native-close-publication	linux	haider-daemon	lib	native_close_refuses_mon
 daemon-native-close-process-owner	linux	haider-daemon	lib	native_close_waits_for_cancelled_process_owner_cleanup	crates/haider-daemon/src/session_close_tests.rs
 warm-projection-seed-share	macos	haider-daemon	lib	concurrent_warm_readers_share_one_reducer_seed	crates/haider-daemon/src/worker_warm_journal_projection_tests.rs
 catalog-linked-rotation	linux	haider-daemon	lib	same_account_linked_rotation_race_completes_then_reconciles_and_retries	crates/haider-daemon/src/accounts_tests.rs
+daemon-sidecar-committed-coverage	all	haider-daemon	test:session_hub_tests	sidecar_wait_requires_committed_coverage_before_returning	crates/haider-daemon/tests/session_hub_tests.rs

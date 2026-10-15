@@ -834,23 +834,72 @@ fn sidecar_path(root: &tempfile::TempDir, session_id: &SessionId) -> std::path::
     root.path().join("pipe").join(format!("{session_id}.pipe"))
 }
 
-/// #6 (935): sidecar maintenance runs off the publish path on a per-session
-/// writer task, so a read right after `append` can race the write. Poll the
-/// file until it is non-empty and STABLE across a tick — the atomic
-/// temp+rename rebuild converges to exactly the steady state
-/// `hub.shutdown()` guarantees, with no intermediate stable point.
-async fn stable_sidecar(path: &std::path::Path) -> String {
+/// Sidecar maintenance runs off the publish path. An unchanged predecessor
+/// is not a completion barrier: wait for the committed batch's coverage marker
+/// before requiring two matching snapshots. A row cursor alone can still be
+/// waiting for its batch's trailing coverage marker.
+async fn sidecar_through(path: &std::path::Path, through_seq: u64) -> String {
     let mut prev: Option<String> = None;
     for _ in 0..300 {
         if let Ok(cur) = std::fs::read_to_string(path) {
-            if !cur.is_empty() && prev.as_deref() == Some(cur.as_str()) {
+            let coverage = cur
+                .lines()
+                .last()
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .and_then(|tail| tail.get("coverage").and_then(serde_json::Value::as_u64));
+            if coverage.is_some_and(|coverage| coverage >= through_seq)
+                && prev.as_deref() == Some(cur.as_str())
+            {
                 return cur;
             }
             prev = Some(cur);
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    prev.unwrap_or_default()
+    panic!(
+        "sidecar {} did not settle through sequence {through_seq}: {prev:?}",
+        path.display()
+    );
+}
+
+#[tokio::test]
+async fn sidecar_wait_requires_committed_coverage_before_returning() {
+    let root = tempfile::tempdir().expect("sidecar fixture directory");
+    let settled = "{\"role\":\"user\",\"seq\":1}\n{\"coverage\":3,\"generation\":1}\n";
+    for (name, predecessor) in [
+        ("old-row", Some("{\"role\":\"user\",\"seq\":1}\n")),
+        (
+            "unsettled-current-row",
+            Some("{\"role\":\"user\",\"seq\":3}\n"),
+        ),
+        ("old-coverage", Some("{\"coverage\":1,\"generation\":1}\n")),
+        ("partial", Some("{\"coverage\":")),
+        ("empty", Some("")),
+        ("missing", None),
+    ] {
+        let path = root.path().join(format!("{name}.pipe"));
+        if let Some(predecessor) = predecessor {
+            std::fs::write(&path, predecessor).expect("predecessor writes");
+        }
+        let wait = sidecar_through(&path, 3);
+        tokio::pin!(wait);
+        // The producer is deliberately held. Biased polling observes an early
+        // return before the control timer even when both wake under load.
+        tokio::select! {
+            biased;
+            body = &mut wait => panic!("{name} returned before coverage committed: {body}"),
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        std::fs::write(&path, settled).expect("committed coverage writes");
+        assert_eq!(wait.await, settled, "{name} observes the committed body");
+    }
+    let path = root.path().join("already-current.pipe");
+    std::fs::write(&path, settled).expect("current sidecar writes");
+    assert_eq!(
+        sidecar_through(&path, 3).await,
+        settled,
+        "an unchanged current file is a valid positive control"
+    );
 }
 
 async fn append_delta(
@@ -9707,7 +9756,8 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
     events[3].branch_id = Some(BranchId::new("branch-sidecar"));
 
     hub.append(&mut events).await.expect("pipe batch commits");
-    let bytes = stable_sidecar(&sidecar_path(&root, &session_id))
+    let head = events.last().expect("pipe batch has events").seq;
+    let bytes = sidecar_through(&sidecar_path(&root, &session_id), head)
         .await
         .into_bytes();
     assert_eq!(
@@ -9718,7 +9768,7 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         String::from_utf8(bytes).expect("sidecar utf8"),
         stored_sidecar(&store, &session_id, 1).await
     );
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let sidecar = sidecar_through(&sidecar_path(&root, &session_id), head).await;
     let values: Vec<serde_json::Value> = sidecar
         .lines()
         .skip(1)
@@ -9931,7 +9981,7 @@ async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() 
         "before",
     )];
     hub.append(&mut seed).await.expect("seed commits");
-    let _ = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let _ = sidecar_through(&sidecar_path(&root, &session_id), seed[0].seq).await;
 
     let mut tool_call = pipe_event(
         &session_id,
@@ -10290,9 +10340,9 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         .await
         .expect("offline delta commits");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
-    append_delta(&hub, &session_id, generation, "resume-trigger").await;
+    let head = append_delta(&hub, &session_id, generation, "resume-trigger").await;
 
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let sidecar = sidecar_through(&sidecar_path(&root, &session_id), head).await;
     let rows: Vec<&str> = sidecar
         .lines()
         .filter(|line| line.contains("\"role\""))
@@ -10327,12 +10377,12 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
         .expect("out-of-daemon commit");
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
-    append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
+    let head = append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
     assert_eq!(
-        stable_sidecar(&sidecar_path(&root, &session_id)).await,
+        sidecar_through(&sidecar_path(&root, &session_id), head).await,
         stored_sidecar(&store, &session_id, 1).await
     );
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let sidecar = sidecar_through(&sidecar_path(&root, &session_id), head).await;
     let tail: serde_json::Value =
         serde_json::from_str(sidecar.lines().last().expect("coverage tail"))
             .expect("coverage tail JSON");
