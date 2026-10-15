@@ -19,7 +19,13 @@ core-backoff-wake-race	linux	haider-core	test:m4_retry_tests	m4_natural_backoff_
 core-prompt-history-interleaving	linux	haider-core	test:prompt_history_tests	prompt_cache_extends_interleaved_agents_from_exact_heads	crates/haider-core/tests/prompt_history_tests.rs
 core-delta-interleaving	linux	haider-core	test:delta_coalescing_tests	interleaved_delta_kinds_flush_as_ordered_separate_envelopes	crates/haider-core/tests/delta_coalescing_tests.rs
 platform-temp-initialization	macos	haider-platform	lib	concurrent_first_temp_initialization_is_idempotent_but_path_is_immutable	crates/haider-platform/src/native_temp_tests.rs
-platform-phase-accounting	linux	haider-platform	lib	suspended_future_does_not_charge_interleaved_work	crates/haider-platform/src/phase_trace.rs
+platform-phase-accounting	linux	haider-platform	lib	suspended_future_does_not_charge_interleaved_work	crates/haider-platform/src/phase_trace/native_tests.rs
+platform-phase-concurrent-recorders	linux	haider-platform	lib	concurrent_recorders_share_process_cap	crates/haider-platform/src/phase_trace/native_tests.rs
+platform-phase-records-at-cap	linux	haider-platform	lib	records_at_cap_are_complete	crates/haider-platform/src/phase_trace/native_tests.rs
+platform-phase-records-past-cap	linux	haider-platform	lib	records_past_cap_are_explicitly_truncated	crates/haider-platform/src/phase_trace/native_tests.rs
+platform-phase-long-stream	linux	haider-platform	lib	long_record_streams_remain_bounded	crates/haider-platform/src/phase_trace/native_tests.rs
+platform-phase-disabled-tracing	linux	haider-platform	lib	disabled_scopes_do_not_allocate_or_record	crates/haider-platform/src/phase_trace/native_tests.rs
+platform-phase-empty-directory	linux	haider-platform	lib	empty_directory_disables_scopes	crates/haider-platform/src/phase_trace/native_tests.rs
 platform-process-writers	macos	haider-platform	lib	concurrent_process_writers_have_isolated_uncorrupted_lines	crates/haider-platform/src/spawn.rs
 protocol-reasoning-interleaving	linux	haider-protocol	lib	sealed_reasoning_attaches_to_the_correct_interleaved_turn	crates/haider-protocol/src/pipe.rs
 daemond-replay-lanes	linux	haider-daemond	test:session_rpc_tests	five_concurrent_replay_lanes_on_one_connection_never_lag_a_reading_client	crates/haider-daemond/tests/session_rpc_tests.rs
@@ -63,6 +69,7 @@ tui-branch-interleaving	linux	haider-tui	test:b2b_branch_state_tests	interleaved
 tui-rapid-submit	linux	haider-tui	test:tui31_lifecycle_tests	two_rapid_aura_submits_cannot_interleave	crates/haider-tui/tests/tui31_lifecycle_tests.rs
 tui-effect-interleaving	linux	haider-tui	test:f2_error_visibility_tests	interleaved_results_attribute_each_effect_to_its_own_row	crates/haider-tui/tests/f2_error_visibility_tests.rs
 # Timing-window tests whose names do not contain an explicit race token.
+platform-phase-cpu-accounting	linux	haider-platform	lib	nested_cpu_is_exclusive_and_thread_time_does_not_charge_sleep	crates/haider-platform/src/phase_trace/native_tests.rs
 cli-one-shot-daemon-reap	macos	haider-cli	test:cli_tests	one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure	crates/haider-cli/tests/cli_tests.rs
 daemon-coordinator-restart-wait	macos	haider-daemon	lib	coordinator_restart_mid_wait_rearms_supervision_from_durable_progress	crates/haider-daemon/src/subagent_core_tests.rs
 daemon-hook-decision-window	linux	haider-daemon	lib	decision_deny_is_reject_once_and_malformed_output_falls_through	crates/haider-daemon/src/hooks_tests.rs
