@@ -1392,6 +1392,25 @@ impl EffectBroker {
         self.workspace_receipts.invalidate();
     }
 
+    /// Test seam, compiled only into unit tests and `test-support` builds
+    /// (dev-dependencies): receipt-sensitive tests assert mutation detection,
+    /// not the production 500 ms receipt budget, so they run with the long but
+    /// bounded `TEST_RECEIPT_WALL_TIME` instead.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_workspace_receipt_wall_time_for_tests(&mut self, wall_time: std::time::Duration) {
+        assert!(
+            self.workspace_receipts.needs_initial_receipt(),
+            "set the receipt budget before the first workspace receipt"
+        );
+        self.workspace_receipts.set_wall_time_for_tests(wall_time);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn workspace_receipt_wall_time(&self) -> std::time::Duration {
+        self.workspace_receipts.wall_time()
+    }
+
     /// Read-only copy of every effect phase whose durable append succeeded.
     ///
     /// The sink itself is intentionally neither borrowed nor recoverable.
