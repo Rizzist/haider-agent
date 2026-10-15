@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use haider_protocol::{
     EventPayload,
     ids::{AgentId, EffectId, MenuId, SessionId},
@@ -876,6 +878,7 @@ fn ctl_ssh_terminal_and_form_and_login_chords() {
         let mut m = model();
         arm(&mut m, "ssh-terminal");
         m.ssh_terminal.as_mut().unwrap().shell_id = Some("fake-local".into());
+        common::mark_ssh_terminal_running(&mut m, "fake-local");
         m.requests.clear();
         dispatch_input(
             &mut m,

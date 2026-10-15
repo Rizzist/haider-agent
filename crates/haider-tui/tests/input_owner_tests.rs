@@ -1,6 +1,8 @@
 //! Production-dispatch regressions for the single visible input owner.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod common;
+
 use haider_protocol::{
     EventPayload,
     ids::{AgentId, EffectId, MenuId, SessionId},
@@ -1988,6 +1990,7 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
         let mut model = model();
         arm(&mut model, "ssh-terminal");
         model.ssh_terminal.as_mut().unwrap().shell_id = Some("remote".into());
+        common::mark_ssh_terminal_running(&mut model, "remote");
         model.requests.clear();
         key(&mut model, KeyCode::Char(code), KeyModifiers::CONTROL);
         assert_eq!(model.screen, Screen::Session, "Ctrl+{code}");
@@ -2076,6 +2079,30 @@ fn owner_control_chords_reach_ssh_terminal_form_and_login_through_dispatch() {
             }
             assert_eq!(card_model.screen, screen, "{mode} Ctrl+{code}");
             assert_eq!(card_model.theme_choice, theme, "{mode} Ctrl+{code}");
+        }
+    }
+}
+
+#[test]
+fn setup_control_c_closes_without_remote_input_through_dispatch() {
+    for id in [None, Some("remote")] {
+        let mut model = model();
+        arm(&mut model, "ssh-terminal");
+        model.ssh_terminal.as_mut().unwrap().shell_id = id.map(str::to_owned);
+        assert!(model.ssh_terminal.as_ref().unwrap().connecting);
+        model.requests.clear();
+        key(&mut model, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(model.ssh_terminal.is_none());
+        assert_eq!(model.screen, Screen::Session);
+        assert!(
+            !model.requests.iter().any(|request| matches!(
+                request,
+                haider_tui::app::AppRequest::SshShellInput { .. }
+            ))
+        );
+        if let Some(id) = id {
+            assert!(model.requests.iter().any(|request|
+                matches!(request, haider_tui::app::AppRequest::ShellClose { id: actual } if actual == id)));
         }
     }
 }

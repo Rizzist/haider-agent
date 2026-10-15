@@ -405,7 +405,7 @@ mod tests {
             let frame = WireFrame::ShellOutput {
                 id: id.into(),
                 stream: haider_rpc::ShellOutputStreamWire::Stdout,
-                chunk_b64: haider_rpc::SecretWire::new(BASE64.encode(b"ready")),
+                chunk_b64: haider_rpc::TerminalOutputWire::new(BASE64.encode(b"ready")),
             };
             assert!(
                 terminal_frame(frame, "owned-shell", &mut connected, &mut output)

@@ -125,6 +125,7 @@ fn terminal_setup_timeout_keeps_base_exit_and_command_timeout_stays_124() {
         code: code.into(),
         message: "synthetic refusal".into(),
         retryable: true,
+        data: None,
     };
     for (code, expected) in [
         ("ssh_timeout", EX_PROTOCOL),
