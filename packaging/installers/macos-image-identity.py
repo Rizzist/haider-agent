@@ -89,6 +89,8 @@ def create(path, record, staging, arguments):
     with path.open('xb') as output, ExitStack() as descriptors:
         expected = identity(os.fstat(output.fileno()))
         record.write_text(json.dumps(expected))
+        withdrawal = record.with_suffix('.withdraw.json')
+        withdrawal.write_text(json.dumps({'identity': expected, 'sha256': hashlib.sha256(b'').hexdigest()}))
         raw = Path(tempfile.mkdtemp(prefix='create.', dir=staging)) / 'image.dmg'
         # Bind the source directory before the tool runs. A later directory
         # replacement must not redirect the copy to another caller's files.
@@ -121,9 +123,13 @@ def create(path, record, staging, arguments):
             if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
                 raise RuntimeError('native create output is not a regular file; retaining ' + str(raw))
             raw_identity = identity(os.fstat(source.fileno()))
+            withdrawal.write_text(json.dumps({'identity': expected, 'copying': True}))
             shutil.copyfileobj(source, output)
+            source.seek(0)
+            digest = file_digest(source, 'sha256').hexdigest()
         output.flush()
         check(path, expected)
+        withdrawal.write_text(json.dumps({'identity': expected, 'sha256': digest}))
         # Record the staging generation for identity-checked, unattached
         # cleanup. This record grants no authority to eject any attachment;
         # only the reserved publication inode is used for our attach.
@@ -143,19 +149,87 @@ def staging_inventory():
         time.sleep(.1 * (attempt + 1))
 
 
+def open_image_users(path, descriptor):
+    """Cross-check inventory against readers of the pinned vnode.
+
+    A warning-free hdiutil plist can silently omit an attachment. lsof selects
+    by file identity (including case/Unicode aliases); our held descriptor is
+    the positive control that the query actually accounted for this file.
+    Unknown readers are uncertainty, never permission to delete a backing file.
+    """
+    result = subprocess.run(['/usr/sbin/lsof', '-nP', '-F0pfDti', '--', str(path)],
+                            capture_output=True, timeout=60)
+    if result.returncode or result.stderr:
+        raise RuntimeError('incomplete backing-file inventory; retaining ' + str(path))
+    expected = identity(os.fstat(descriptor))
+    pid = None
+    current = {}
+    records = []
+    for field in result.stdout.split(b'\0'):
+        field = field.lstrip(b'\n')
+        if not field:
+            continue
+        key, value = chr(field[0]), os.fsdecode(field[1:])
+        if key in ('p', 'f'):
+            records.append((pid, current))
+            current = {}
+        if key == 'p':
+            pid = int(value)
+        current[key] = value
+    records.append((pid, current))
+    users = {pid for pid, item in records if item.get('f', '')[:1].isdigit()
+             and item.get('t') == 'REG' and 'D' in item and 'i' in item
+             and [int(item['D'], 16), int(item['i'])] == expected}
+    if os.getpid() not in users:
+        raise RuntimeError('pinned image absent from backing-file inventory; retaining ' + str(path))
+    return users - {os.getpid(), os.getppid()}
+
+
+def require_unattached(path, expected, history):
+    """Refuse deletion of any attached or incompletely inventoried generation.
+
+    Native staging attachments are never ours to eject. Observations survive
+    later cleanup calls; an omitted live device cannot erase a prior refusal.
+    """
+    check(path, expected)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), 'rb') as source:
+        if identity(os.fstat(source.fileno())) != expected:
+            raise RuntimeError('image identity changed before attachment audit')
+        images = staging_inventory()
+        devices = set()
+        inventoried = set()
+        for image in images:
+            current = {e['dev-entry'] for e in image.get('system-entities', [])
+                       if re.fullmatch(r'/dev/disk[0-9]+', e.get('dev-entry', ''))}
+            inventoried.update(current)
+            try:
+                same_file = identity(Path(image['image-path']).stat()) == expected
+            except (OSError, KeyError):
+                same_file = False
+            if same_file:
+                devices.update(current)
+        seen = set(json.loads(history.read_text())) if history.exists() else set()
+        seen.update(devices)
+        history.write_text(json.dumps(sorted(seen)))
+        if devices:
+            raise RuntimeError('unattributed create output attached as ' + ', '.join(sorted(devices))
+                               + '; retaining ' + str(path))
+        if any(Path(device).exists() and device not in inventoried for device in seen):
+            raise RuntimeError('incomplete previously observed image inventory; retaining ' + str(path))
+        # Even an always-omitted attachment still has its backing vnode open.
+        if open_image_users(path, source.fileno()):
+            raise RuntimeError('incomplete image inventory: backing file still open; retaining ' + str(path))
+        check(path, expected)
+
+
 def finish(staging):
     saved = json.loads((staging / 'staged-image.json').read_text())
     raw = Path(saved['path'])
     check(raw, saved['identity'])
     # A successful create can also return an independently replaced image.
     # Matching bytes or a post-create inode is no authority to eject it.
-    devices = {e['dev-entry'] for image in staging_inventory()
-               if Path(image.get('image-path', '')).resolve() == raw.resolve()
-               for e in image.get('system-entities', [])
-               if re.fullmatch(r'/dev/disk[0-9]+', e.get('dev-entry', ''))}
-    if devices:
-        raise RuntimeError('unattributed create output attached as ' + ', '.join(sorted(devices))
-                           + '; retaining ' + str(raw))
+    require_unattached(raw, saved['identity'], staging / 'seen-create-devices.json')
 
 
 def clean_staging(staging):
@@ -314,10 +388,17 @@ if __name__ == '__main__':
     if action == 'withdraw':
         withdraw(path, record)
         sys.exit(0)
+    if action == 'withdraw-image':
+        if path.exists() or path.is_symlink():
+            require_unattached(path, expected_identity(record), record.with_suffix('.devices.json'))
+            saved = json.loads(record.read_text())
+            withdraw(path, record if isinstance(saved, dict) else record.with_suffix('.withdraw.json'))
+        sys.exit(0)
     expected = expected_identity(record)
     check(path, expected)
     if action == 'remove':
         # Check immediately before invoking unlink; no pathname-only permission.
+        require_unattached(path, expected, record.with_suffix('.devices.json'))
         path.unlink()
         sys.exit(0)
     if action == 'checksum':

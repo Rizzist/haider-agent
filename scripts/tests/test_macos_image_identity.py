@@ -26,6 +26,68 @@ class ImageIdentityTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.path = self.root / 'publication.dmg'
         self.record = self.root / 'identity.json'
+        # Most unit fixtures synthesize hdiutil output. Supply the independent
+        # reader inventory too; native builder tests exercise the real lsof.
+        self.users_patch = patch.object(IMAGE, 'open_image_users', return_value=set())
+        self.users = self.users_patch.start()
+        self.addCleanup(self.users_patch.stop)
+
+    def test_attachment_aliases_are_matched_by_file_identity(self):
+        raw = self.root / 'É-image.dmg'
+        raw.write_bytes(b'image')
+        hardlink = self.root / 'hardlink.dmg'
+        os.link(raw, hardlink)
+        symlink = self.root / 'symlink.dmg'
+        symlink.symlink_to(raw)
+        for alias in (raw, self.root / 'é-IMAGE.DMG', self.root / 'E\u0301-image.dmg', hardlink, symlink):
+            with self.subTest(alias=alias):
+                self.assertTrue(alias.samefile(raw))
+                image = {'image-path': str(alias), 'system-entities': [{'dev-entry': '/dev/disk973'}]}
+                history = self.root / 'seen.json'
+                with patch.object(IMAGE, 'staging_inventory', return_value=[image]):
+                    with self.assertRaisesRegex(RuntimeError, 'attached as /dev/disk973'):
+                        IMAGE.require_unattached(raw, IMAGE.identity(raw.stat()), history)
+                self.assertEqual(json.loads(history.read_text()), ['/dev/disk973'])
+                self.assertTrue(raw.exists())
+
+    def test_later_inventory_cannot_forget_a_live_observed_device(self):
+        self.path.write_bytes(b'image')
+        history = self.root / 'seen.json'
+        history.write_text(json.dumps(['/dev/disk973']))
+        exists = Path.exists
+        def live_device(path):
+            return str(path) == '/dev/disk973' or exists(path)
+        with patch.object(IMAGE, 'staging_inventory', return_value=[]), \
+                patch.object(Path, 'exists', live_device):
+            with self.assertRaisesRegex(RuntimeError, 'previously observed'):
+                IMAGE.require_unattached(self.path, IMAGE.identity(self.path.stat()), history)
+        self.assertEqual(json.loads(history.read_text()), ['/dev/disk973'])
+        self.assertTrue(self.path.exists())
+
+    def test_always_omitted_attachment_reader_prevents_cleanup(self):
+        self.path.write_bytes(b'image')
+        self.users.return_value = {973}
+        with patch.object(IMAGE, 'staging_inventory', return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, 'backing file still open'):
+                IMAGE.require_unattached(self.path, IMAGE.identity(self.path.stat()), self.root / 'seen')
+        self.assertTrue(self.path.exists())
+
+    def test_reader_inventory_requires_the_pinned_vnode_and_preserves_unknown_readers(self):
+        self.users_patch.stop()
+        self.path.write_bytes(b'image')
+        with self.path.open('rb') as source:
+            dev, ino = IMAGE.identity(os.fstat(source.fileno()))
+            own = f'p{os.getpid()}\0f{source.fileno()}\0tREG\0D0x{dev:x}\0i{ino}\0'.encode()
+            other = f'p973\0f3\0tREG\0D0x{dev:x}\0i{ino}\0'.encode()
+            for rc, output, error, expected in ((0, own, b'', set()), (0, own + other, b'', {973}),
+                    (0, other, b'', None), (1, b'', b'', None), (0, own, b'warning', None)):
+                with self.subTest(rc=rc, output=output, error=error), patch.object(IMAGE.subprocess, 'run',
+                        return_value=subprocess.CompletedProcess([], rc, output, error)):
+                    if expected is None:
+                        with self.assertRaisesRegex(RuntimeError, 'inventory'):
+                            IMAGE.open_image_users(self.path, source.fileno())
+                    else:
+                        self.assertEqual(IMAGE.open_image_users(self.path, source.fileno()), expected)
 
     def test_create_owns_the_publication_inode_before_native_create(self):
         def native(arguments, **kwargs):

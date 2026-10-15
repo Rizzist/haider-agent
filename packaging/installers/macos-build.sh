@@ -14,6 +14,7 @@ work=$(mktemp -d)
 mounted=0
 attached_device=
 create_started=0
+publication_complete=0
 keychain_created=0
 original_keychains=()
 mount_is_clear() {
@@ -154,7 +155,7 @@ detach_owned_image() {
   return "$status"
 }
 cleanup() {
-  local original_status=$? keep_work=0
+  local keep_work=0
   if [ "$mounted" = 1 ]; then
     hdiutil_retry detach no_cleanup >/dev/null 2>&1 || true
     if ! attachment_is_clear || ! mount_is_clear; then
@@ -173,12 +174,17 @@ cleanup() {
   rm -f "$work/cert.p12" "$work/signing.keychain-db"
   # An exclusive publication belongs to this run only while its identity and
   # bytes still match. A failed build must not block a later clean rerun.
-  if [ "$original_status" -ne 0 ] && [ -f "$work/pkg-identity.json" ]; then
+  if [ "$publication_complete" = 0 ] && [ -f "$work/pkg-identity.json" ]; then
     python3 "$here/macos-image-identity.py" withdraw "$pkg" "$work/pkg-identity.json" || true
+  fi
+  if [ "$publication_complete" = 0 ] && [ -f "$work/image-identity.json" ]; then
+    if ! python3 "$here/macos-image-identity.py" withdraw-image "$dmg" "$work/image-identity.json"; then
+      keep_work=1
+    fi
   fi
   # A failed validation need not retain an intact, unattached staging file.
   # Keep uncertain generations and unresolved mounts; preserve the exit status.
-  if [ "$original_status" -ne 0 ] && [ "$keep_work" = 0 ] && [ -f "$work/staged-image.json" ]; then
+  if [ "$publication_complete" = 0 ] && [ "$keep_work" = 0 ] && [ -f "$work/staged-image.json" ]; then
     python3 "$here/macos-image-identity.py" clean "$dmg" "$work/image-identity.json" "$work" >/dev/null 2>&1 || true
   fi
   if [ -f "$work/retain-create" ]; then
@@ -188,6 +194,9 @@ cleanup() {
   if [ "$keep_work" = 0 ]; then rm -rf "$work"; fi
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 130' INT
 mkdir -p "$work/root/usr/local/bin" "$work/root/usr/local/share/haider" "$work/image"
 python3 - "$payload" "$work/root" "$version" "$target" <<'PY'
 import hashlib,json,pathlib,re,shutil,sys
@@ -370,4 +379,5 @@ python3 "$here/macos-image-identity.py" finish "$dmg" "$work/image-identity.json
 python3 "$here/macos-image-identity.py" clean "$dmg" "$work/image-identity.json" "$work"
 python3 "$here/macos-image-identity.py" checksum "$pkg" "$work/pkg-identity.json" "$pkg.sha256"
 python3 "$here/macos-image-identity.py" checksum "$dmg" "$work/image-identity.json" "$dmg.sha256"
+publication_complete=1
 printf 'macOS installer gate PASS signed=%s notarized=%s\n' "$signed" "$notarized"

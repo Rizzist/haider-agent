@@ -8,6 +8,7 @@ import platform
 import plistlib
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -1431,6 +1432,95 @@ native_hdiutil "$@"
                                VERSION, TARGET], capture_output=True, text=True,
                               timeout=180, env=self.builder_environment(**extra))
 
+    def test_interrupted_publications_are_withdrawn_and_rerun_succeeds(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            for phase in ('package', 'create', 'backoff'):
+                for group in (False, True):
+                    with self.subTest(signal=signum, phase=phase, group=group):
+                        ready, release = self.base / 'ready', self.base / 'release'
+                        ready.unlink(missing_ok=True)
+                        release.unlink(missing_ok=True)
+                        pause = '''
+if [ ! -e "$HDIUTIL_TEST_DIR/release" ]; then
+  touch "$HDIUTIL_TEST_DIR/ready"
+  while [ ! -e "$HDIUTIL_TEST_DIR/release" ]; do /bin/sleep 0.05; done
+fi
+'''
+                        (self.shim / 'pkgutil').write_text('#!/bin/bash\n' +
+                            (pause if phase == 'package' else '') + 'exec /usr/sbin/pkgutil "$@"\n')
+                        (self.shim / 'pkgutil').chmod(0o755)
+                        (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE +
+                            ('if [ "$1" = create ]; then\n' + pause + 'fi\n' if phase == 'create' else '') +
+                            ('if [ "$1" = create ] && [ ! -e "$HDIUTIL_TEST_DIR/release" ]; then echo "Resource busy" >&2; exit 16; fi\n'
+                             if phase == 'backoff' else '') + 'native_hdiutil "$@"\n')
+                        (self.shim / 'sleep').write_text('#!/bin/bash\n' +
+                            (pause if phase == 'backoff' else '') + 'exec /bin/sleep "$@"\n')
+                        (self.shim / 'sleep').chmod(0o755)
+                        output = self.base / f'interrupt-{signum}-{phase}-{group}'
+                        with (self.base / 'interrupt.log').open('w+') as log:
+                            process = subprocess.Popen(['bash', str(BUILD), str(self.payload), str(output), VERSION, TARGET],
+                                env=self.builder_environment(), stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True,
+                                preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_DFL))
+                            try:
+                                deadline = time.monotonic() + 120
+                                while not ready.exists():
+                                    self.assertIsNone(process.poll(), 'builder exited before signal boundary')
+                                    self.assertLess(time.monotonic(), deadline, 'signal boundary timeout')
+                                    time.sleep(.05)
+                                (os.killpg if group else os.kill)(process.pid, signum)
+                                release.touch()
+                                self.assertNotEqual(process.wait(timeout=90), 0)
+                            finally:
+                                release.touch()
+                                if process.poll() is None:
+                                    os.killpg(process.pid, signal.SIGTERM)
+                                    process.wait(timeout=90)
+                            log.seek(0)
+                            self.assertFalse(list(output.glob('*.pkg')), log.read())
+                            self.assertFalse(list(output.glob('*.dmg')))
+                        rerun = self.run_builder(output)
+                        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+                        self.assertIn('macOS installer gate PASS', rerun.stdout)
+                        self.assert_no_test_mounts()
+
+    def test_image_unlink_actions_preserve_attached_backing_and_allow_ejected_file(self):
+        helper = ROOT / 'packaging/installers/macos-image-identity.py'
+        for mounted in (False, True):
+            image = self.base / f'unlink-{mounted}.dmg'
+            subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                            '-volname', 'Unlink973', str(image)], check=True, capture_output=True)
+            args = ['/usr/bin/hdiutil', 'attach', str(image), '-readonly', '-plist']
+            if mounted:
+                point = self.base / 'unlink-mount'
+                point.mkdir()
+                args += ['-nobrowse', '-mountpoint', str(point)]
+            else:
+                args += ['-nomount']
+            attached = plistlib.loads(subprocess.check_output(args))
+            device = next(e['dev-entry'] for e in attached['system-entities']
+                          if re.fullmatch(r'/dev/disk[0-9]+', e.get('dev-entry', '')))
+            record = self.base / 'unlink-identity.json'
+            expected = [image.stat().st_dev, image.stat().st_ino]
+            record.write_text(json.dumps(expected))
+            record.with_suffix('.withdraw.json').write_text(json.dumps({
+                'identity': expected, 'sha256': hashlib.sha256(image.read_bytes()).hexdigest()}))
+            try:
+                for action in ('remove', 'withdraw-image'):
+                    result = subprocess.run(['python3', str(helper), action, str(image), str(record)],
+                                            capture_output=True, text=True, timeout=60)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(image.exists())
+                    self.assertTrue(self.image_for_device(device))
+            finally:
+                self.recover_foreign(image, device)
+            # Ejection clears the backing reader. A historical, now absent
+            # device is not a permanent prohibition on withdrawing our file.
+            result = subprocess.run(['python3', str(helper), 'withdraw-image', str(image), str(record)],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(image.exists())
+
     def foreign_at_output_path(self, output, *, mounted):
         output.mkdir()
         image = output / f'haider-v{VERSION}-{TARGET}.dmg'
@@ -1861,6 +1951,87 @@ native_hdiutil "$@"
                             if re.fullmatch(r'/dev/disk[0-9]+', device):
                                 self.recover_foreign(image, device)
                         ledger.unlink()
+
+    def test_create_alias_and_incomplete_inventory_preserve_attached_backing(self):
+        for alias, mode in (('case', 'none'), ('unicode', 'none'), ('same', 'late'), ('case', 'always'), ('unicode', 'busy')):
+            for mounted in (False, True):
+                with self.subTest(alias=alias, mode=mode, mounted=mounted):
+                    (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + """
+if [ "$1" = create ]; then
+  native_hdiutil "$@" || exit $?
+  python3 - "${@: -1}" "$HDIUTIL_TEST_DIR" "$FOREIGN_MOUNTED" <<'CLONE'
+import hashlib, json, os, pathlib, shutil, subprocess, sys
+image, root = map(pathlib.Path, sys.argv[1:3])
+original = image.stat().st_ino
+clone = image.with_name('independent-copy.dmg')
+shutil.copyfile(image, clone)
+image.unlink(); clone.rename(image)
+assert image.stat().st_ino != original
+alias = image.with_name('IMAGE.DMG') if os.environ['ALIAS'] == 'case' else pathlib.Path(str(image).replace('É', 'E\u0301')) if os.environ['ALIAS'] == 'unicode' else image
+assert alias.samefile(image)
+args = ['/usr/bin/hdiutil', 'attach', str(alias), '-readonly', '-plist']
+if sys.argv[3] == '1':
+    point = root / 'clone-mount'; point.mkdir(exist_ok=True)
+    args += ['-nobrowse', '-mountpoint', str(point)]
+else:
+    args += ['-nomount']
+attached = subprocess.run(args, capture_output=True, check=True)
+(root / 'clone.plist').write_bytes(attached.stdout)
+(root / 'clone.json').write_text(json.dumps({
+    'path': str(image), 'sha256': hashlib.sha256(image.read_bytes()).hexdigest()}))
+CLONE
+  if [ "$INVENTORY_MODE" = busy ]; then echo 'Resource busy' >&2; exit 16; fi
+  exit 0
+fi
+if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/clone.json" ]; then
+  python3 - "$HDIUTIL_TEST_DIR" "$INVENTORY_MODE" <<'OMIT'
+import json, os, pathlib, plistlib, subprocess, sys
+root = pathlib.Path(sys.argv[1]); mode = sys.argv[2]
+p = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'], capture_output=True)
+# The shell shim is the parent; its parent is the finish/clean helper.
+ppid = subprocess.check_output(['/bin/ps', '-o', 'ppid=', '-p', str(os.getppid())], text=True).strip()
+parent = subprocess.check_output(['/bin/ps', '-o', 'command=', '-p', ppid], text=True)
+if mode in ('always', 'busy') or (mode == 'late' and 'macos-image-identity.py clean ' in parent):
+    raw = pathlib.Path(json.loads((root / 'clone.json').read_text())['path'])
+    info = plistlib.loads(p.stdout)
+    def same_file(image):
+        try: return pathlib.Path(image.get('image-path', '')).samefile(raw)
+        except OSError: return False
+    info['images'] = [i for i in info.get('images', []) if not same_file(i)]
+    p.stdout = plistlib.dumps(info)
+sys.stdout.buffer.write(p.stdout); sys.stderr.buffer.write(p.stderr); sys.exit(p.returncode)
+OMIT
+  exit $?
+fi
+native_hdiutil "$@"
+""")
+                    mktemp = self.shim / 'mktemp'
+                    mktemp.write_text('#!/bin/bash\nif [ "$#" = 1 ] && [ "$1" = -d ]; then exec /usr/bin/mktemp -d "$HDIUTIL_TEST_DIR/É-work.XXXXXXXX"; fi\nexec /usr/bin/mktemp "$@"\n')
+                    mktemp.chmod(0o755)
+                    try:
+                        result = self.run_builder(self.base / f'clone-output-{alias}-{mode}-{mounted}',
+                                                  FOREIGN_MOUNTED=str(int(mounted)), ALIAS=alias, INVENTORY_MODE=mode)
+                        self.assertNotEqual(result.returncode, 0, result.stderr)
+                        self.assertIn('retaining', result.stderr)
+                        self.assertNotIn('macOS installer gate PASS', result.stdout)
+                        record = json.loads((self.base / 'clone.json').read_text())
+                        image = Path(record['path'])
+                        self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), record['sha256'])
+                        attached = plistlib.loads((self.base / 'clone.plist').read_bytes())
+                        for entity in attached['system-entities']:
+                            device = entity.get('dev-entry', '')
+                            if re.fullmatch(r'/dev/disk[0-9]+', device):
+                                self.assertTrue(self.image_for_device(device), 'foreign clone ejected')
+                        self.assert_no_test_mounts()
+                    finally:
+                        ledger = self.base / 'clone.plist'
+                        if ledger.exists():
+                            image = Path(json.loads((self.base / 'clone.json').read_text())['path'])
+                            for entity in plistlib.loads(ledger.read_bytes())['system-entities']:
+                                device = entity.get('dev-entry', '')
+                                if re.fullmatch(r'/dev/disk[0-9]+', device):
+                                    self.recover_foreign(image, device)
+                            ledger.unlink()
 
     def test_builder_noplist_same_path_capture_preserves_foreign_inode(self):
         for mounted in (False, True):
