@@ -556,19 +556,31 @@ fn an_open_add_form_is_always_on_screen() {
         "a pinned form costs the roster no scrolling"
     );
 
-    // Short frame: the ladder unpins the form into the scrolling body, and
-    // the frame scrolls to it rather than leaving an invisible modal card
-    // eating keystrokes (the W5g-5 trap).
-    model.accounts.scroll.set(0);
-    let (rows, _) = draw(&model, 120, 16);
-    assert!(
-        rows.iter().any(|row| row.contains("deepseek · API key")),
-        "the unpinned form is scrolled into view: {rows:?}"
-    );
-    assert!(
-        model.accounts.scroll.get() > 0,
-        "the frame scrolled the body to reach it"
-    );
+    // The pinned header and wrapped feedback must leave enough body rows
+    // for every inked form line; the provider grid yields first.
+    for width in [80, 118, 120] {
+        for height in [16, 18, 24, 36] {
+            for notice in [
+                None,
+                Some("Could not save the account; correct the key and retry the open form"),
+            ] {
+                model.accounts.set_message(notice.map(str::to_owned));
+                model.accounts.scroll.set(0);
+                let (rows, _) = draw(&model, width, height);
+                for text in [
+                    "deepseek · API key",
+                    "alias ❯",
+                    "key   ❯",
+                    "the key is masked",
+                ] {
+                    assert!(
+                        rows.iter().any(|row| row.contains(text)),
+                        "form line {text:?} hidden at {width}x{height}: {rows:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

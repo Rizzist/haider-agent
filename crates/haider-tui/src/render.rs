@@ -3703,11 +3703,16 @@ fn render_accounts(
         u16::try_from(pinned).is_ok_and(|height| inner.height.saturating_sub(height) >= BODY_MIN)
     };
     let pin_card = room(card_lines.len() + grid_lines.len());
-    let pin_grid = if pin_card {
-        true
-    } else {
-        room(grid_lines.len())
-    };
+    // Once the form joins the scrolling body, reserve its inked rows before
+    // pinning the provider grid. Pinned feedback already consumed part of
+    // `inner`; BODY_MIN alone can leave the form title above the viewport.
+    let card_height = card_lines
+        .iter()
+        .rposition(|line| line.width() > 0)
+        .map_or(0, |last| last + 1);
+    let body_min = usize::from(BODY_MIN).max(card_height);
+    let pin_grid =
+        pin_card || usize::from(inner.height).saturating_sub(grid_lines.len()) >= body_min;
 
     // Column rects that live in BODY coordinates and therefore scroll.
     let mut body_column_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
