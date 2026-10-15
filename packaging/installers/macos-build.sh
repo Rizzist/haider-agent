@@ -178,7 +178,7 @@ cleanup() {
     python3 "$here/macos-image-identity.py" withdraw "$pkg" "$work/pkg-identity.json" || true
   fi
   if [ "$publication_complete" = 0 ] && [ -f "$work/image-identity.json" ]; then
-    if ! python3 "$here/macos-image-identity.py" withdraw-image "$dmg" "$work/image-identity.json"; then
+    if ! python3 "$here/macos-image-identity.py" withdraw-image "$dmg" "$work/image-identity.json" >"$work/image-withdrawal.log" 2>&1; then
       keep_work=1
     fi
   fi

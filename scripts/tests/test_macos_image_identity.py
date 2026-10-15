@@ -42,12 +42,15 @@ class ImageIdentityTests(unittest.TestCase):
         for alias in (raw, self.root / 'é-IMAGE.DMG', self.root / 'E\u0301-image.dmg', hardlink, symlink):
             with self.subTest(alias=alias):
                 self.assertTrue(alias.samefile(raw))
-                image = {'image-path': str(alias), 'system-entities': [{'dev-entry': '/dev/disk973'}]}
+                image = {'image-path': str(alias), 'hdid-pid': 973,
+                         'system-entities': [{'dev-entry': '/dev/disk973'}]}
                 history = self.root / 'seen.json'
                 with patch.object(IMAGE, 'staging_inventory', return_value=[image]):
                     with self.assertRaisesRegex(RuntimeError, 'attached as /dev/disk973'):
                         IMAGE.require_unattached(raw, IMAGE.identity(raw.stat()), history)
                 self.assertEqual(json.loads(history.read_text()), ['/dev/disk973'])
+                self.assertEqual(json.loads(history.with_suffix('.helpers.json').read_text()),
+                                 {'/dev/disk973': [973]})
                 self.assertTrue(raw.exists())
 
     def test_later_inventory_cannot_forget_a_live_observed_device(self):
@@ -71,6 +74,39 @@ class ImageIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'backing file still open'):
                 IMAGE.require_unattached(self.path, IMAGE.identity(self.path.stat()), self.root / 'seen')
         self.assertTrue(self.path.exists())
+
+    def test_recycled_name_requires_departed_helper_and_clear_pinned_reader_audit(self):
+        self.path.write_bytes(b'image')
+        history = self.root / 'seen.json'
+        history.write_text(json.dumps(['/dev/disk973']))
+        history.with_suffix('.helpers.json').write_text(json.dumps({'/dev/disk973': [973]}))
+        exists = Path.exists
+        for exited, readers in ((False, set()), (True, {974}), (True, set())):
+            with self.subTest(exited=exited, readers=readers), \
+                    patch.object(IMAGE, 'staging_inventory', return_value=[]), \
+                    patch.object(IMAGE, 'helper_has_exited', return_value=exited), \
+                    patch.object(Path, 'exists', lambda p: str(p) == '/dev/disk973' or exists(p)):
+                self.users.return_value = readers
+                if exited and not readers:
+                    IMAGE.require_unattached(self.path, IMAGE.identity(self.path.stat()), history)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'inventory'):
+                        IMAGE.require_unattached(self.path, IMAGE.identity(self.path.stat()), history)
+                self.assertEqual(json.loads(history.read_text()), ['/dev/disk973'])
+
+        self.users.return_value = set()
+        with patch.object(IMAGE, 'staging_inventory', return_value=[]), \
+                patch.object(IMAGE, 'helper_has_exited', side_effect=[False, True]) as query, \
+                patch.object(IMAGE.time, 'sleep'), \
+                patch.object(Path, 'exists', lambda p: str(p) == '/dev/disk973' or exists(p)):
+            IMAGE.require_unattached(self.path, IMAGE.identity(self.path.stat()), history)
+            self.assertEqual(query.call_count, 2)
+
+    def test_helper_exit_requires_positive_process_absence(self):
+        for error, exited in ((None, False), (PermissionError(), False), (ProcessLookupError(), True)):
+            with self.subTest(error=error), patch.object(IMAGE.os, 'kill', side_effect=error) as query:
+                self.assertEqual(IMAGE.helper_has_exited(973), exited)
+                query.assert_called_once_with(973, 0)
 
     def test_reader_inventory_retries_incomplete_snapshots_but_not_unknown_readers(self):
         self.users_patch.stop()

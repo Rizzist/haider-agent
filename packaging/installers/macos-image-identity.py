@@ -196,6 +196,16 @@ def open_image_users(path, descriptor):
 
 
 
+def helper_has_exited(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    return False
+
+
 def require_unattached(path, expected, history):
     """Refuse deletion of any attached or incompletely inventoried generation.
 
@@ -210,6 +220,8 @@ def require_unattached(path, expected, history):
         images = staging_inventory()
         devices = set()
         inventoried = set()
+        helpers_record = history.with_suffix('.helpers.json')
+        helpers = json.loads(helpers_record.read_text()) if helpers_record.exists() else {}
         for image in images:
             current = {e['dev-entry'] for e in image.get('system-entities', [])
                        if re.fullmatch(r'/dev/disk[0-9]+', e.get('dev-entry', ''))}
@@ -220,14 +232,29 @@ def require_unattached(path, expected, history):
                 same_file = False
             if same_file:
                 devices.update(current)
+                pid = image.get('hdid-pid')
+                if isinstance(pid, int) and pid > 0:
+                    for device in current:
+                        helpers[device] = sorted(set(helpers.get(device, [])) | {pid})
         seen = set(json.loads(history.read_text())) if history.exists() else set()
         seen.update(devices)
         history.write_text(json.dumps(sorted(seen)))
+        helpers_record.write_text(json.dumps(helpers))
         if devices:
             raise RuntimeError('unattributed create output attached as ' + ', '.join(sorted(devices))
                                + '; retaining ' + str(path))
-        if any(Path(device).exists() and device not in inventoried for device in seen):
+        # A remembered name can be recycled into a non-image device. Only a
+        # departed recorded helper AND a clear pinned-vnode audit below can
+        # establish that the old attachment ended; absence from info cannot.
+        missing = {device for device in seen if Path(device).exists() and device not in inventoried}
+        if any(not helpers.get(device) for device in missing):
             raise RuntimeError('incomplete previously observed image inventory; retaining ' + str(path))
+        for attempt in range(4):
+            if all(helper_has_exited(pid) for device in missing for pid in helpers[device]):
+                break
+            if attempt == 3:
+                raise RuntimeError('incomplete previously observed image inventory; retaining ' + str(path))
+            time.sleep(.1 * (attempt + 1))
         # Even an always-omitted attachment still has its backing vnode open.
         if open_image_users(path, source.fileno()):
             raise RuntimeError('incomplete image inventory: backing file still open; retaining ' + str(path))
