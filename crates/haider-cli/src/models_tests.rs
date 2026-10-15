@@ -204,3 +204,42 @@ fn cli_projects_configured_rows_when_a_fresh_empty_list_ages_before_render() {
             .contains("refresh")
     );
 }
+
+#[test]
+fn provider_availability_refusals_keep_provider_exit_status() {
+    for code in [
+        "provider_error",
+        "provider_timeout",
+        "credential_missing",
+        "credential_limited",
+        "unauthorized",
+        "provider_unavailable",
+    ] {
+        for retryable in [false, true] {
+            let error = ModelsError::Rpc {
+                code: code.into(),
+                message: "fixture refusal".into(),
+                retryable,
+            };
+            assert_eq!(failure(&error), ExitCode::from(EX_PROVIDER), "{code}");
+        }
+    }
+    for code in [
+        "internal",
+        "busy",
+        "PROVIDER_UNAVAILABLE",
+        " provider_unavailable",
+        "provider_unavailable_extra",
+        "provider_unavailable ",
+        "",
+    ] {
+        for retryable in [false, true] {
+            let error = ModelsError::Rpc {
+                code: code.into(),
+                message: "unknown refusal".into(),
+                retryable,
+            };
+            assert_eq!(failure(&error), ExitCode::from(EX_SOFTWARE), "{code}");
+        }
+    }
+}

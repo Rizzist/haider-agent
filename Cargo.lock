@@ -1760,6 +1760,7 @@ version = "0.0.972"
 dependencies = [
  "async-trait",
  "base64",
+ "haider-accounts",
  "haider-client",
  "haider-platform",
  "haider-protocol",

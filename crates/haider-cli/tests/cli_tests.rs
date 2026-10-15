@@ -795,16 +795,19 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         String::from_utf8_lossy(&slow_output.stdout),
         String::from_utf8_lossy(&slow_output.stderr)
     );
-    let unavailable = wait_for_provider_snapshot(&owner.profile, "catalog-failure", |row| {
-        row["inventory"]["state"] == "unavailable"
+    let uncertain = wait_for_provider_snapshot(&owner.profile, "catalog-failure", |row| {
+        row["inventory"]["state"] == "configured"
+            && row["availability_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("404"))
     });
-    assert_eq!(unavailable["availability"], "unavailable");
-    assert!(unavailable["models"].as_array().is_some_and(Vec::is_empty));
+    assert_eq!(uncertain["availability"], "available");
+    assert!(uncertain["models"].as_array().is_some_and(Vec::is_empty));
     assert!(
-        unavailable["inventory"]["reason"]
+        uncertain["availability_reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("404")),
-        "failure reason is not published: {unavailable}"
+        "failure reason is not published: {uncertain}"
     );
     let accounts = attached_json(&owner.profile, &["account", "list", "--json"]);
     assert!(
@@ -866,11 +869,14 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         String::from_utf8_lossy(&stale.stderr)
     );
     let failed_row = wait_for_provider_snapshot(&owner.profile, "catalog-main", |row| {
-        row["inventory"]["state"] == "unavailable"
+        row["inventory"]["state"] == "configured"
+            && row["availability_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("404"))
     });
-    assert_eq!(failed_row["availability"], "unavailable");
+    assert_eq!(failed_row["availability"], "available");
     assert!(
-        failed_row["inventory"]["reason"]
+        failed_row["availability_reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("404"))
     );
@@ -1056,6 +1062,49 @@ fn run_custom_model_wire_case(
                 1,
             )
             .expect("put provider cache");
+    }
+    if catalog.is_none() {
+        // An explicit refresh is the only listing request in this control.
+        // Its real 404 must not turn cached/configured uncertainty into refusal.
+        let mut refresh = Command::new(command.get_program());
+        if let Some(cwd) = command.get_current_dir() {
+            refresh.current_dir(cwd);
+        }
+        for (name, value) in command.get_envs() {
+            if let Some(value) = value {
+                refresh.env(name, value);
+            } else {
+                refresh.env_remove(name);
+            }
+        }
+        let output = refresh
+            .args(["models", "--refresh", "bench-proxy", "--json"])
+            .output()
+            .expect("explicit catalog refresh");
+        assert!(
+            output.status.success(),
+            "refresh: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("refresh JSON");
+        let provider = document["providers"]
+            .as_array()
+            .expect("provider rows")
+            .iter()
+            .find(|row| row["provider"] == "bench-proxy")
+            .expect("proxy row");
+        assert_eq!(provider["availability"], "available");
+        assert!(
+            provider["availability_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("404")),
+            "{provider}"
+        );
+        assert!(matches!(
+            captured.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
     let mut args = vec!["run", "--provider", "bench-proxy", "--jsonl", "wire model"];
     if let Some(model) = explicit_model {
@@ -3015,11 +3064,10 @@ fn one_shot_never_shuts_down_a_prestarted_incumbent() {
 
 /// MUTATION CHECK: drop the profile-default fallback, restore catalog-first
 /// substitution, restore the custom summary membership filter, bypass the
-/// selector path, treat the custom catalog as authoritative, skip its one
-/// refresh-on-miss probe, or restore the per-turn model-list membership probe.
-/// Expected runtime failure: the captured OpenAI-compatible chat body contains
-/// `canonical-other`, a provider prefix, no request, or a discovery count is
-/// not exactly one. The 404 case pins that even refresh failure stays advisory.
+/// selector path, treat stale advisory metadata as authoritative, or restore
+/// implicit discovery during selection. The wire model must remain verbatim,
+/// ordinary selections make no discovery request, and an explicitly refreshed
+/// 404 remains selectable uncertainty without a second implicit fetch.
 #[test]
 fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
     const CATALOG: &[u8] =
@@ -3040,7 +3088,7 @@ fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
         Some(CATALOG),
     );
     assert_eq!(unqualified["model"], "deepseek-v4-flash");
-    assert_eq!(unqualified_discoveries, 1);
+    assert_eq!(unqualified_discoveries, 0);
 
     let (qualified, qualified_discoveries) = run_custom_model_wire_case(
         "bench-proxy/deepseek-v4-flash",
@@ -3049,7 +3097,7 @@ fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
         Some(CATALOG),
     );
     assert_eq!(qualified["model"], "deepseek-v4-flash");
-    assert_eq!(qualified_discoveries, 1);
+    assert_eq!(qualified_discoveries, 0);
 
     let (explicit, explicit_discoveries) = run_custom_model_wire_case(
         "bench-proxy/deepseek-v4-flash",
@@ -3058,7 +3106,7 @@ fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
         Some(CATALOG),
     );
     assert_eq!(explicit["model"], "explicit-wire-model");
-    assert_eq!(explicit_discoveries, 1);
+    assert_eq!(explicit_discoveries, 0);
 
     let (no_catalog, no_catalog_discoveries) = run_custom_model_wire_case(
         "bench-proxy/deepseek-v4-flash",
@@ -3246,27 +3294,33 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
     }
     let out = out.expect("at least one attempt ran");
 
-    assert_eq!(out.status.code(), Some(65));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("HAIDER_ANTHROPIC_API_KEY"));
-    // Provider resolution belongs to the daemon after durable acceptance, so
-    // JSONL exposes the credential-specific Errored audit trail instead of
-    // collapsing a missing credential into a provider transport failure.
-    let envelopes = parse_jsonl(&out.stdout);
     assert_eq!(
-        envelopes.last().map(typed),
-        Some(Some(EventPayload::RunState(RunState::Errored)))
+        out.status.code(),
+        Some(65),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let terminals = envelopes
-        .iter()
-        .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("provider_unavailable"));
+    assert!(stderr.contains("no credential"));
+    // Known missing credentials now refuse before durable session admission.
+    // Keep the provider exit category and verify that no journal was invented.
+    let rows = String::from_utf8(out.stdout.clone())
+        .expect("JSONL UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("error JSONL"))
         .collect::<Vec<_>>();
-    assert_eq!(terminals.len(), 1);
-    assert_eq!(terminals[0].payload["terminal_kind"], "failure");
-    assert_eq!(terminals[0].payload["error_code"], "credential_missing");
-    assert!(envelopes.iter().any(|envelope| {
-        envelope.payload["type"] == "run_failed" && envelope.payload["code"] == "credential_missing"
-    }));
-    assert_jsonl_replay_raw_parity(&command, &out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["event"], "error");
+    assert_eq!(rows[0]["stage"], "bootstrap");
+    assert_eq!(rows[0]["error"]["code"], "provider_unavailable");
+    assert_eq!(rows[0]["error"]["retryable"], false);
+    let database =
+        rusqlite::Connection::open(profile.join("store.sqlite")).expect("profile database");
+    let sessions: i64 = database
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .expect("session count");
+    assert_eq!(sessions, 0, "refusal must precede durable session creation");
 }
 
 #[test]
@@ -5729,9 +5783,38 @@ fn default_request_budget_allows_more_than_sixty_four_provider_requests() {
 /// must then fail at runtime with usage exit 2, before any reselection.
 #[test]
 fn preupgrade_go_session_cli_recovery_reselects_before_any_provider_round() {
+    use haider_accounts::{
+        AccountStore, AuthMethod, CredentialAlias, CredentialDescriptor, CredentialStatus,
+        FileVault, JsonFileStore, Vault,
+    };
     const SESSION: &str = "session-6d3a6a6c6fd8bfdfdae2ee6a71694a4a";
     const MODEL: &str = "deepseek-v4-flash";
     let mut command = haider();
+    let alias = CredentialAlias::new("preupgrade-recovery-code");
+    let vault = FileVault::new(command.profile.join("vault"));
+    // A legacy raw physical alias is read through ProfileVault's supported
+    // fallback. This ephemeral profile contains only this synthetic sentinel.
+    vault
+        .put(&alias, b"SYNTHETIC_PREUPGRADE_RECOVERY_KEY")
+        .expect("synthetic legacy key");
+    let mut accounts =
+        AccountStore::new(JsonFileStore::new(&command.profile)).expect("fixture accounts");
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: "haider-code".into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "synthetic recovery account".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+            incarnation: 0,
+            credential_digest: None,
+        })
+        .expect("fixture account");
     let workspace = command
         .get_current_dir()
         .expect("isolated workspace")
@@ -5743,7 +5826,7 @@ fn preupgrade_go_session_cli_recovery_reselects_before_any_provider_round() {
             "haider-code",
             r#"[{"slug":"deepseek-v4-flash","display_name":"DeepSeek V4 Flash","supported_efforts":[],"visible":true}]"#,
             None,
-            1,
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_millis().try_into().expect("epoch milliseconds"),
         ).expect("published post-upgrade catalog");
         let connection = rusqlite::Connection::open(command.profile.join("store.sqlite"))
             .expect("fixture database");
@@ -5799,6 +5882,17 @@ fn preupgrade_go_session_cli_recovery_reselects_before_any_provider_round() {
         "Reply with OK.",
         "--json",
     ];
+    let inventory = invoke(&["provider", "list", "--json"], 0);
+    let inventory: serde_json::Value =
+        serde_json::from_slice(&inventory.stdout).expect("fixture inventory JSON");
+    let code = inventory["providers"]
+        .as_array()
+        .expect("provider rows")
+        .iter()
+        .find(|row| row["provider"] == "haider-code")
+        .expect("Haider Code row");
+    assert_eq!(code["inventory"]["state"], "fetched", "{code}");
+    assert_eq!(code["availability"], "available", "{code}");
     let output = invoke(&turn_args, 70);
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("refusal JSON");
     assert_eq!(
@@ -5847,14 +5941,27 @@ fn preupgrade_go_session_cli_recovery_reselects_before_any_provider_round() {
         assert_eq!(metadata["model"], MODEL);
     };
 
-    // Same-provider recovery uses the real discovered ID. With no account,
-    // its next turn now reaches credential resolution instead of admission.
+    // The fresh inventory can now admit the real discovered ID. Remove only
+    // our synthetic secret before its next turn: no real provider may open.
     reselect("haider-code");
+    vault.delete(&alias).expect("remove synthetic fixture key");
     let output = invoke(&turn_args, 65);
     let admitted: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("admitted JSON");
     assert_eq!(admitted["model"], MODEL);
-    assert_eq!(admitted["error"]["code"], "credential_missing");
+    assert!(
+        matches!(
+            admitted["error"]["code"].as_str(),
+            Some("credential_missing" | "provider_error")
+        ),
+        "{admitted}"
+    );
+    assert!(
+        admitted["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("credential")),
+        "{admitted}"
+    );
     assert_eq!(
         admitted["provider_rounds"]
             .as_array()

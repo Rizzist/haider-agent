@@ -570,18 +570,7 @@ fn failure(error: &ModelsError) -> ExitCode {
         ModelsError::Client(ClientError::Disconnected(_)) => EX_IOERR,
         ModelsError::Client(ClientError::Encode(_) | ClientError::MissingFeature(_))
         | ModelsError::SnapshotChanged => EX_SOFTWARE,
-        ModelsError::Rpc { code, .. }
-            if matches!(
-                code.as_str(),
-                "provider_error"
-                    | "provider_timeout"
-                    | "credential_missing"
-                    | "credential_limited"
-                    | "unauthorized"
-            ) =>
-        {
-            EX_PROVIDER
-        }
+        ModelsError::Rpc { code, .. } if super::run::is_provider_error_code(code) => EX_PROVIDER,
         ModelsError::Rpc { .. } => EX_SOFTWARE,
     };
     ExitCode::from(code)

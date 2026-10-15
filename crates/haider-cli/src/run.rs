@@ -41,6 +41,20 @@ pub(crate) const EX_BLOCKED: u8 = 77;
 pub(crate) const EX_TIMEOUT: u8 = 124;
 pub(crate) const EX_CANCELLED: u8 = 130;
 
+/// Provider failures keep one scriptable category whether they refuse
+/// admission or arrive after a turn starts. Unknown RPC codes stay software errors.
+pub(crate) fn is_provider_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "provider_error"
+            | "provider_timeout"
+            | "credential_missing"
+            | "credential_limited"
+            | "unauthorized"
+            | haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE
+    )
+}
+
 const OUTPUT_BUFFER: usize = 64;
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const JSONL_FLUSH_INTERVAL: Duration = Duration::from_millis(3);
@@ -2349,10 +2363,14 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
         ) => EX_UNAVAILABLE,
         HeadlessRunError::Transport { .. } => EX_IOERR,
         HeadlessRunError::Encode { .. } => EX_SOFTWARE,
-        HeadlessRunError::Bootstrap {
-            code: ERROR_CODE_NO_ACTIVE_ACCOUNT | ERROR_CODE_NO_DEFAULT_MODEL,
-            ..
-        } => EX_PROVIDER,
+        HeadlessRunError::Bootstrap { code, .. }
+            if matches!(
+                *code,
+                ERROR_CODE_NO_ACTIVE_ACCOUNT | ERROR_CODE_NO_DEFAULT_MODEL
+            ) || is_provider_error_code(code) =>
+        {
+            EX_PROVIDER
+        }
         HeadlessRunError::Bootstrap {
             code: "missing_feature",
             ..
@@ -2366,18 +2384,7 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
         {
             EX_TIMEOUT
         }
-        HeadlessRunError::Rpc { code, .. }
-            if matches!(
-                code.as_str(),
-                "provider_error"
-                    | "provider_timeout"
-                    | "credential_missing"
-                    | "credential_limited"
-                    | "unauthorized"
-            ) =>
-        {
-            EX_PROVIDER
-        }
+        HeadlessRunError::Rpc { code, .. } if is_provider_error_code(code) => EX_PROVIDER,
         HeadlessRunError::Rpc { code, .. }
             if matches!(
                 code.as_str(),
@@ -3281,5 +3288,65 @@ mod tests {
             })
         );
         assert!(stderr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod rpc_availability_exit_tests {
+    use super::*;
+
+    #[test]
+    fn provider_availability_refusals_keep_provider_exit_status() {
+        for code in [
+            "provider_error",
+            "provider_timeout",
+            "credential_missing",
+            "credential_limited",
+            "unauthorized",
+            "provider_unavailable",
+        ] {
+            for retryable in [false, true] {
+                let error = HeadlessRunError::Rpc {
+                    stage: "session.create",
+                    code: code.into(),
+                    message: "fixture refusal".into(),
+                    retryable,
+                };
+                assert_eq!(exit_code_for_error(&error), EX_PROVIDER, "{code}");
+                let bootstrap = HeadlessRunError::Bootstrap {
+                    stage: "model selection",
+                    code,
+                    message: "fixture refusal".into(),
+                    retryable,
+                };
+                assert_eq!(exit_code_for_error(&bootstrap), EX_PROVIDER, "{code}");
+            }
+        }
+        for code in [
+            "internal",
+            "busy",
+            "PROVIDER_UNAVAILABLE",
+            " provider_unavailable",
+            "provider_unavailable_extra",
+            "provider_unavailable ",
+            "",
+        ] {
+            for retryable in [false, true] {
+                let error = HeadlessRunError::Rpc {
+                    stage: "session.create",
+                    code: code.into(),
+                    message: "unknown refusal".into(),
+                    retryable,
+                };
+                assert_eq!(exit_code_for_error(&error), EX_SOFTWARE, "{code}");
+                let bootstrap = HeadlessRunError::Bootstrap {
+                    stage: "model selection",
+                    code,
+                    message: "unknown refusal".into(),
+                    retryable,
+                };
+                assert_eq!(exit_code_for_error(&bootstrap), EX_SOFTWARE, "{code}");
+            }
+        }
     }
 }

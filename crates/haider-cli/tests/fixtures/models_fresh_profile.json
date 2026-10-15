@@ -7,7 +7,7 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "adapter",
       "default_model": null,
       "enabled": true,
@@ -15,7 +15,7 @@
       "fetched_at": "<volatile>",
       "has_credential": false,
       "inventory": {
-        "state": "never_fetched"
+        "state": "configured"
       },
       "inventory_age": "<volatile>",
       "models": [],
@@ -306,7 +306,7 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "authenticated",
       "default_model": null,
       "enabled": true,
@@ -327,7 +327,7 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "authenticated",
       "default_model": null,
       "enabled": true,
@@ -348,7 +348,7 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "adapter",
       "default_model": null,
       "enabled": true,
@@ -515,7 +515,7 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "adapter",
       "default_model": null,
       "enabled": true,
@@ -523,7 +523,7 @@
       "fetched_at": "<volatile>",
       "has_credential": false,
       "inventory": {
-        "state": "never_fetched"
+        "state": "configured"
       },
       "inventory_age": "<volatile>",
       "models": [],
@@ -544,7 +544,7 @@
       "fetched_at": "<volatile>",
       "has_credential": false,
       "inventory": {
-        "state": "never_fetched"
+        "state": "configured"
       },
       "inventory_age": "<volatile>",
       "models": [],
@@ -729,7 +729,7 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "authenticated",
       "default_model": null,
       "enabled": true,

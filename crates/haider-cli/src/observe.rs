@@ -1513,18 +1513,7 @@ pub(crate) fn exit_code_for_observe_error(error: &ObserveError) -> u8 {
         | ObserveError::StreamTask(_)
         | ObserveError::UnknownSession(_) => EX_SOFTWARE,
         ObserveError::Rpc { code, .. } if code == "timeout_before_acceptance" => EX_TIMEOUT,
-        ObserveError::Rpc { code, .. }
-            if matches!(
-                code.as_str(),
-                "provider_error"
-                    | "provider_timeout"
-                    | "credential_missing"
-                    | "credential_limited"
-                    | "unauthorized"
-            ) =>
-        {
-            EX_PROVIDER
-        }
+        ObserveError::Rpc { code, .. } if super::run::is_provider_error_code(code) => EX_PROVIDER,
         ObserveError::Rpc { code, .. }
             if matches!(code.as_str(), "permission_denied" | "input_required") =>
         {
@@ -1658,5 +1647,49 @@ mod roster_scalar_tests {
             json["waiting_why"],
             serde_json::json!({"kind": "permission"})
         );
+    }
+}
+
+#[cfg(test)]
+mod rpc_availability_exit_tests {
+    use super::*;
+
+    #[test]
+    fn provider_availability_refusals_keep_provider_exit_status() {
+        for code in [
+            "provider_error",
+            "provider_timeout",
+            "credential_missing",
+            "credential_limited",
+            "unauthorized",
+            "provider_unavailable",
+        ] {
+            for retryable in [false, true] {
+                let error = ObserveError::Rpc {
+                    code: code.into(),
+                    message: "fixture refusal".into(),
+                    retryable,
+                };
+                assert_eq!(exit_code_for_observe_error(&error), EX_PROVIDER, "{code}");
+            }
+        }
+        for code in [
+            "internal",
+            "busy",
+            "PROVIDER_UNAVAILABLE",
+            " provider_unavailable",
+            "provider_unavailable_extra",
+            "provider_unavailable ",
+            "",
+        ] {
+            for retryable in [false, true] {
+                let error = ObserveError::Rpc {
+                    code: code.into(),
+                    message: "unknown refusal".into(),
+                    retryable,
+                };
+                assert_eq!(exit_code_for_observe_error(&error), EX_SOFTWARE, "{code}");
+            }
+        }
     }
 }

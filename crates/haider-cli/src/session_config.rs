@@ -848,18 +848,7 @@ fn failure_code(error: &ConfigError) -> ExitCode {
         ConfigError::Client(ClientError::Disconnected(_)) => EX_IOERR,
         ConfigError::Client(ClientError::Encode(_) | ClientError::MissingFeature(_))
         | ConfigError::MissingMetadata => EX_SOFTWARE,
-        ConfigError::Rpc { code, .. }
-            if matches!(
-                code.as_str(),
-                "provider_error"
-                    | "provider_timeout"
-                    | "credential_missing"
-                    | "credential_limited"
-                    | "unauthorized"
-            ) =>
-        {
-            EX_PROVIDER
-        }
+        ConfigError::Rpc { code, .. } if super::run::is_provider_error_code(code) => EX_PROVIDER,
         ConfigError::Rpc { code, .. }
             if matches!(code.as_str(), "permission_denied" | "input_required") =>
         {
@@ -887,4 +876,57 @@ fn command_id(prefix: &str) -> String {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos())
     )
+}
+
+#[cfg(test)]
+mod rpc_availability_exit_tests {
+    use super::*;
+
+    #[test]
+    fn provider_availability_refusals_keep_provider_exit_status() {
+        for code in [
+            "provider_error",
+            "provider_timeout",
+            "credential_missing",
+            "credential_limited",
+            "unauthorized",
+            "provider_unavailable",
+        ] {
+            for retryable in [false, true] {
+                let error = ConfigError::Rpc {
+                    code: code.into(),
+                    message: "fixture refusal".into(),
+                    retryable,
+                };
+                assert_eq!(failure_code(&error), ExitCode::from(EX_PROVIDER), "{code}");
+                let partial = ConfigError::Partial {
+                    applied: vec!["model"],
+                    error: Box::new(error),
+                };
+                assert_eq!(
+                    failure_code(&partial),
+                    ExitCode::from(EX_PROVIDER),
+                    "{code}"
+                );
+            }
+        }
+        for code in [
+            "internal",
+            "busy",
+            "PROVIDER_UNAVAILABLE",
+            " provider_unavailable",
+            "provider_unavailable_extra",
+            "provider_unavailable ",
+            "",
+        ] {
+            for retryable in [false, true] {
+                let error = ConfigError::Rpc {
+                    code: code.into(),
+                    message: "unknown refusal".into(),
+                    retryable,
+                };
+                assert_eq!(failure_code(&error), ExitCode::from(EX_SOFTWARE), "{code}");
+            }
+        }
+    }
 }
