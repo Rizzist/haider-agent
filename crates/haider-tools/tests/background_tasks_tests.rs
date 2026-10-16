@@ -79,6 +79,16 @@ fn background(call_id: &str, command: &str) -> BackgroundExec {
     .expect("valid background exec")
 }
 
+async fn wait_for_group_exit(pid: i32) {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while probe_group_liveness(pid) != PidLiveness::Dead {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("killed group members finish exiting and reaping");
+}
+
 /// MUTATION CHECK (LT1 seam): make the background spawn wait for the child,
 /// or route it through the foreground registry so broker close cancels it.
 /// Expected RUNTIME failure: the spawn call no longer returns while a
@@ -143,6 +153,7 @@ async fn background_spawn_returns_immediately_and_survives_broker_close() {
                 .contains("reason=concurrent_or_interleaved_mutation")),
         "turn close makes the detached lifetime conservatively unknown"
     );
+    wait_for_group_exit(pid).await;
     assert_eq!(probe_group_liveness(pid), PidLiveness::Dead);
 }
 
@@ -243,7 +254,10 @@ async fn task_kill_ladder_kills_the_whole_process_group() {
     // The leader waits on a TERM-trapping member: only a group KILL ends both.
     let spawn = broker
         .process_exec_background(
-            &background("bg-group", "trap '' TERM; sleep 30 & wait"),
+            &background(
+                "bg-group",
+                "trap '' TERM; (: > group-member-ready; exec sleep 30) & wait",
+            ),
             &exec_policy(),
         )
         .await
@@ -257,13 +271,20 @@ async fn task_kill_ladder_kills_the_whole_process_group() {
         output,
         Duration::from_millis(200),
     ));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while !workspace.path().join("group-member-ready").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("TERM-immune group member starts before kill");
     kill.kill();
     let status = supervision.await.expect("supervision joins");
     assert!(
         status.killed,
         "ladder reports the deliberate kill: {status:?}"
     );
+    wait_for_group_exit(pid).await;
     assert_eq!(
         probe_group_liveness(pid),
         PidLiveness::Dead,
@@ -289,8 +310,10 @@ async fn natural_exit_leaves_lingering_group_members_alone() {
                     "open $started, q(>), q(started); print $started q(started); close $started; ",
                     "close STDIN; close STDOUT; close STDERR; alarm 60; ",
                     "while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
-                    "open $survived, q(>), q(survived); print $survived q(survived); ",
-                    "close $survived; while (!-e q(cleanup)) { ",
+                    "open $survived, q(>), q(survived.tmp) or die $!; ",
+                    "print $survived q(survived) or die $!; close $survived or die $!; ",
+                    "rename q(survived.tmp), q(survived) or die $!; ",
+                    "while (!-e q(cleanup)) { ",
                     "select undef, undef, undef, 0.01 }'",
                 ),
             ),
@@ -384,6 +407,7 @@ async fn orphan_reap_honors_the_liveness_seam_and_kills_stale_groups() {
     assert_eq!(reap, OrphanReap::Killed, "a live stale group is reaped");
     let status = untouched.wait().expect("reap fixture zombie");
     assert!(!status.success());
+    wait_for_group_exit(untouched_pid).await;
     assert_eq!(probe_group_liveness(untouched_pid), PidLiveness::Dead);
 }
 

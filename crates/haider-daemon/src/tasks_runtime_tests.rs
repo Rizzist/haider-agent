@@ -278,13 +278,14 @@ fn monitor_marker_command(marker: &std::path::Path) -> String {
         .to_string_lossy();
     #[cfg(unix)]
     {
-        format!("printf authorized > '{marker}'")
+        format!("printf authorized > '{marker}.tmp' && mv '{marker}.tmp' '{marker}'")
     }
     #[cfg(windows)]
     {
         let marker = marker.replace('\'', "''");
         format!(
-            "[IO.File]::WriteAllBytes('{marker}',[byte[]](97,117,116,104,111,114,105,122,101,100))"
+            "[IO.File]::WriteAllBytes('{marker}.tmp',[byte[]](97,117,116,104,111,114,105,122,101,100)); \
+             [IO.File]::Move('{marker}.tmp','{marker}')"
         )
     }
 }

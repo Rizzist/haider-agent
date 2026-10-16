@@ -997,9 +997,11 @@ async fn shell_exit_leaves_background_members_of_its_process_group_alone() {
                     "if ($pid) { while (!-e q(descendant-started.log)) { ",
                     "select undef, undef, undef, 0.01 } print q(leader); exit 0 } ",
                     "open $started, q(>), q(descendant-started.log); print $started q(started); ",
-                    "close $started; select undef, undef, undef, 0.5; ",
-                    "open $survived, q(>), q(descendant-survived.log); ",
-                    "print $survived q(survived); close $survived'",
+                    "close $started; close STDIN; close STDOUT; close STDERR; alarm 60; ",
+                    "while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
+                    "open $survived, q(>), q(descendant-survived.tmp) or die $!; ",
+                    "print $survived q(survived) or die $!; close $survived or die $!; ",
+                    "rename q(descendant-survived.tmp), q(descendant-survived.log) or die $!'",
                 ),
             ),
             &process_policy(),
@@ -1049,7 +1051,15 @@ async fn shell_exit_leaves_background_members_of_its_process_group_alone() {
         event_index(ProcessLifecycleEvent::NormalCompletionDetached)
             < event_index(ProcessLifecycleEvent::RegistryRemoved)
     );
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    fs::write(workspace.path().join("release-descendant"), b"released")
+        .expect("release descendant after normal completion");
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while !workspace.path().join("descendant-survived.log").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("unmanaged descendant completes its write");
     assert_eq!(
         fs::read_to_string(workspace.path().join("descendant-survived.log"))
             .expect("unmanaged descendant survives normal leader completion"),
