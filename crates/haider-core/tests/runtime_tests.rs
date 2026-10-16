@@ -1152,6 +1152,7 @@ async fn repeated_identical_provider_tool_results_do_not_reset_the_streak() {
             call_id: "first".into(),
             name: "web_search".into(),
             args: serde_json::json!({"query": "same topic"}),
+            activity: None,
         },
         FakeStep::EmitServerToolResult {
             call_id: "first".into(),
@@ -1170,6 +1171,7 @@ async fn repeated_identical_provider_tool_results_do_not_reset_the_streak() {
             call_id: "second".into(),
             name: "web_search".into(),
             args: serde_json::json!({"query": "same topic"}),
+            activity: None,
         },
         FakeStep::EmitServerToolResult {
             call_id: "second".into(),
@@ -7270,6 +7272,7 @@ fn completed_tool_call_is_pending_execution() {
         name: "tool".into(),
         args: serde_json::json!({}),
         status: ToolStatus::Pending,
+        activity: None,
     };
     assert!(matches!(
         item,
@@ -8423,6 +8426,7 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
             call_id: "srvtoolu_1".into(),
             name: "web_search".into(),
             args: serde_json::json!({"query": "rust sse"}),
+            activity: Some(haider_protocol::activity::ActivityKind::Web),
         },
         FakeStep::Finish {
             reason: FinishReason::PauseTurn,
@@ -8550,9 +8554,10 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
                         name,
                         args,
                         status,
+                        activity,
                     },
                 ..
-            }) => Some((call_id, name, args, status)),
+            }) => Some((call_id, name, args, status, activity)),
             _ => None,
         })
         .expect("completed server row");
@@ -8563,6 +8568,7 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
             "web_search".into(),
             serde_json::json!({"query": "rust sse"}),
             ToolStatus::Completed,
+            Some(haider_protocol::activity::ActivityKind::Web),
         )
     );
 
@@ -8776,4 +8782,42 @@ async fn toolshape_fatal_applied_effects_are_journaled_once_before_errored_and_r
     );
     handle.stop().await.expect("stop actor");
     actor_task.await.expect("join actor");
+}
+#[tokio::test]
+async fn orphan_server_result_has_no_web_activity() {
+    let (handle, store, _) = runtime(vec![
+        FakeStep::EmitServerToolResult {
+            call_id: "orphan".into(),
+            preview: "result without use".into(),
+            is_error: false,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("inspect"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let row = events
+        .iter()
+        .find_map(|envelope| match typed(envelope) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::ToolCall { name, activity, .. },
+                ..
+            }) => Some((name, activity)),
+            _ => None,
+        })
+        .expect("orphan has a display row");
+    assert_eq!(row, ("web_tool".into(), None));
+    let mut tracker = haider_protocol::activity::ActivityTracker::new();
+    for envelope in &events {
+        tracker.observe(&typed(envelope), envelope.committed_at_ms);
+    }
+    assert!(tracker.used().is_empty());
 }

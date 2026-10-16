@@ -223,6 +223,11 @@ pub struct AgentMetricsSnapshot {
     /// Absent means no durable usage truth, not zero usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AgentUsageMetrics>,
+    /// 973-activity-icons: the agent's typed activity state at `head_seq`;
+    /// clients evaluate it against their own clock. Absent when nothing was
+    /// observed or the daemon predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<crate::activity::ActivityStateV1>,
 }
 
 /// Normalized direct usage and separately-accounted real/API-equivalent

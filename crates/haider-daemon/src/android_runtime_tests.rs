@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 //! The standalone feature uses the real runtime, UDS decoder, hub and actors.
+use crate::checkpoint_test_support::seed_recovered_checkpoint;
 use crate::*;
 use haider_protocol::{
     EventPayload, envelope::RawEnvelope, provider::FinishReason, session::SessionMetadataV1,
@@ -411,156 +412,6 @@ async fn android_runtime_full_rpc_recovery_metadata_inventory_and_force() {
     );
 }
 
-async fn seed_recovered_checkpoint(
-    store_root: &Path,
-    cwd: &Path,
-    label: &str,
-    target: &str,
-) -> haider_protocol::ids::SessionId {
-    use haider_core::{SqliteStoreHandle, StoreHandle};
-    use haider_protocol::{
-        checkpoint::{CheckpointKind, CheckpointOrigin},
-        effect::{
-            AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
-            WorkspaceMutation,
-        },
-        envelope::{EventEnvelope, RawPayload, RenderTargets, SCHEMA_VERSION},
-        ids::*,
-    };
-    let store = SqliteStoreHandle::open(store_root)
-        .await
-        .expect("seed recovered store");
-    let session = SessionId::new(format!("recovered-{label}"));
-    store
-        .create_session(haider_store::SessionCreateCommand {
-            command_id: format!("seed-{label}"),
-            request_digest: format!("seed-{label}"),
-            request_json: "{}".into(),
-            session_id: session.clone(),
-            cwd: cwd.display().to_string(),
-            provider: "fake".into(),
-            model: "fake-model".into(),
-            max_tokens: 4096,
-            max_tokens_source: None,
-            permission_overrides: Some(haider_protocol::session::SessionPermissionOverridesV1 {
-                auto_allow: true,
-                ..Default::default()
-            }),
-            effort: None,
-            fast: false,
-            cache_policy: Default::default(),
-            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
-            event_id: EventId::new(format!("seed-created-{label}")),
-            device_id: DeviceId::new("synthetic-device"),
-        })
-        .await
-        .expect("recovered full-trust session");
-    let run = RunId::new(format!("seed-run-{label}"));
-    let mut cas = store.clone();
-    let checkpoint = haider_tools::freeze_checkpoint(
-        &mut cas,
-        haider_tools::FreezeCheckpointInput {
-            session_id: session.clone(),
-            branch_id: None,
-            run_id: run.clone(),
-            effect_id: EffectId::new(format!("seed-effect-{label}")),
-            call_id: label.into(),
-            origin: CheckpointOrigin::Tool,
-            source_checkpoint_id: None,
-        },
-        haider_tools::CheckpointCapture {
-            kind: CheckpointKind::Delete,
-            paths: vec![haider_tools::CheckpointCapturePath {
-                path: target.into(),
-                pre_bytes: Some(b"synthetic recovered deletion".to_vec()),
-                pre_digest: Some(format!(
-                    "blake3:{}",
-                    blake3::hash(b"synthetic recovered deletion").to_hex()
-                )),
-                post_digest: None,
-                truncated_reason: None,
-            }],
-            post_digest: format!("blake3:{}", blake3::hash(label.as_bytes()).to_hex()),
-            redacted_content: false,
-        },
-    )
-    .await
-    .expect("checkpoint with durable preimage");
-    // Recovery starts from a valid durable effect history. The store stamps
-    // the checkpoint's revision from its preceding mutation outcome.
-    let effect = checkpoint.effect_id.clone();
-    let payloads = [
-        EventPayload::Effect(EffectPhase::Intent(EffectIntent {
-            effect: effect.clone(),
-            class: EffectClass::FsWrite,
-            summary: "synthetic recovered deletion".into(),
-            args_digest: checkpoint.post_digest.clone(),
-            workspace_revision: None,
-        })),
-        EventPayload::Effect(EffectPhase::Authorized {
-            effect: effect.clone(),
-            verdict: AuthorizationVerdict::Allow,
-        }),
-        EventPayload::Effect(EffectPhase::Dispatched {
-            effect: effect.clone(),
-        }),
-        EventPayload::Effect(EffectPhase::Outcome {
-            effect: effect.clone(),
-            outcome: EffectOutcome::Ok,
-            freshness: None,
-            workspace_mutation: Some(WorkspaceMutation {
-                effect_id: effect,
-                mutation_digest: checkpoint.post_digest.clone(),
-                workspace_revision: None,
-                subject_digest: None,
-                redacted_content: false,
-            }),
-        }),
-        EventPayload::CheckpointRecorded(checkpoint),
-    ];
-    let mut events: Vec<_> = payloads
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, payload)| EventEnvelope {
-            schema_version: SCHEMA_VERSION,
-            event_id: EventId::new(format!("seed-checkpoint-{label}-{ordinal}")),
-            seq: 0,
-            session_id: session.clone(),
-            branch_id: None,
-            run_id: Some(run.clone()),
-            agent_id: None,
-            device_id: DeviceId::new("synthetic-device"),
-            authority_epoch: 0,
-            worker_generation: store.worker_generation(),
-            causation_id: None,
-            correlation_id: None,
-            committed_at_ms: 0,
-            render: RenderTargets {
-                ui: false,
-                durable: true,
-                prompt: haider_protocol::envelope::PromptRender::Omit,
-            },
-            payload: RawPayload::from_event(payload).expect("checkpoint payload"),
-        })
-        .collect();
-    store
-        .append(&mut events)
-        .await
-        .expect("recovered checkpoint journal");
-    assert_eq!(
-        store
-            .list_checkpoints(session.clone(), None, None, 10)
-            .await
-            .expect("indexed checkpoint")
-            .checkpoints
-            .len(),
-        1
-    );
-    drop(cas);
-    store.close().await.expect("close seed");
-    session
-}
-
 async fn exercise_recovered_checkpoint_rpc(
     task: &DaemonTask,
     cases: &[(haider_protocol::ids::SessionId, std::path::PathBuf, bool)],
@@ -596,6 +447,17 @@ async fn exercise_recovered_checkpoint_rpc(
                 "{redo:?}"
             );
             assert!(!target.exists());
+            let rollback = client.request(json!({"method":"checkpoint.rollback_turn",
+                "command_id":format!("rollback-{}", session.as_str()), "session_id":session,
+                "worker_generation":worker_generation, "run_id":format!("seed-run-{}", session.as_str().trim_start_matches("recovered-"))})).await;
+            assert!(
+                matches!(rollback, ResponseBody::CheckpointRollbackTurn { .. }),
+                "{rollback:?}"
+            );
+            assert_eq!(
+                std::fs::read(target).expect("rollback restores deletion"),
+                b"synthetic recovered deletion"
+            );
         } else {
             // Distinguish ceiling/operand refusal from an earlier permission or
             // missing-checkpoint rejection, which would not exercise this fix.

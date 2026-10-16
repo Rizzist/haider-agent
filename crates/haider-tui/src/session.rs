@@ -506,12 +506,7 @@ impl SessionState {
                                     .push_front(PromptEntry::committed(text.clone(), envelope.seq));
                             }
                             if admission == Admission::Apply {
-                                self.route_admitted(
-                                    &payload,
-                                    envelope.branch_id.as_ref(),
-                                    envelope.agent_id.as_ref(),
-                                    envelope.committed_at_ms,
-                                );
+                                self.route_admitted(&payload, envelope);
                             }
                         }
                         // S3/W-A/L3: additive agent, task, and workflow graph
@@ -546,15 +541,10 @@ impl SessionState {
 
     /// Route one admitted content payload: aggregate session-scope types
     /// FIRST (risk 6), then branch (outer), then agent — the background
-    /// half; `AppModel::route_admitted` is the attached twin. `at_ms` is
-    /// the envelope's `committed_at_ms` — the chip clocks' time base (S4).
-    fn route_admitted(
-        &mut self,
-        payload: &EventPayload,
-        branch: Option<&haider_protocol::ids::BranchId>,
-        agent: Option<&AgentId>,
-        at_ms: u64,
-    ) {
+    /// half; `AppModel::route_admitted` is the attached twin. The raw
+    /// envelope preserves provenance and the chip clocks' time base (S4).
+    fn route_admitted(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let branch = envelope.branch_id.as_ref();
         use crate::branch::BranchScope;
         if let EventPayload::Usage(usage) = payload {
             self.cache_usage.note(usage);
@@ -564,17 +554,17 @@ impl SessionState {
                 self.branch_state.apply_aggregate_to_parked(payload);
                 self.absorb_envelope(payload);
             }
-            BranchScope::Active => self.absorb_scoped(payload, agent, at_ms),
+            BranchScope::Active => self.absorb_scoped(payload, envelope),
             BranchScope::ParkedMain => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.parked_main_mut() {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::ParkedNamed(id) => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.view_mut(&id) {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::Orphan => self.branch_state.count_orphan(),
@@ -608,12 +598,14 @@ impl SessionState {
     /// One admitted payload, routed by SCOPE (report R11 cut 2) — the
     /// BACKGROUND half. [`classify`] makes the decision so this path and
     /// the attached path in `AppModel` can never diverge.
-    pub fn absorb_scoped(&mut self, payload: &EventPayload, agent: Option<&AgentId>, at_ms: u64) {
+    pub fn absorb_scoped(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let agent = envelope.agent_id.as_ref();
+        let at_ms = envelope.committed_at_ms;
         match classify(&mut self.projection, &self.chips, payload, agent) {
             Destination::Agent => apply_agent_payload(&mut self.chips, payload, at_ms),
             Destination::Chip(target) => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &target) {
-                    chip_apply(chip, payload, at_ms);
+                    chip_apply(chip, payload, envelope);
                 }
             }
             Destination::Session => self.absorb_envelope(payload),
@@ -783,10 +775,13 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload, a
 /// user row. The demo driver's `ChipEmit` beats apply straight to the
 /// chip projection and stay plain: the sim fabricates locally and must
 /// not dress its rows as parent-stream truth.
-pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, at_ms: u64) {
+pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, envelope: &RawEnvelope) {
     // S4: every child-attributed envelope advances this chip's event
     // clock (the frozen-final measure's far end) before the payload lands.
-    chip.note_event_at(at_ms);
+    chip.note_event_at(envelope.committed_at_ms);
+    // Preserve typed operator provenance and accepted effectless metadata on
+    // attached, background and parked-branch paths, including journal replay.
+    chip.activity.observe_raw(envelope);
     if let EventPayload::UserMessage {
         text, attachments, ..
     } = payload

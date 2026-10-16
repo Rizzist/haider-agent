@@ -489,6 +489,7 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         name: "web_fetch".to_owned(),
         args: serde_json::json!({"url": "https://example.invalid/"}),
         status,
+        activity: None,
     };
     apply(
         &mut model,

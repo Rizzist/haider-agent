@@ -37,8 +37,8 @@
 //! a terminal session.
 
 pub use haider_client::fleet::{
-    FlatRow, ViewRollup, callsign, child_marker, flatten, header_line, node_metric, rollup,
-    state_glyph, truncation_footer,
+    FlatRow, ViewRollup, activities_summary, activity_glyph, callsign, child_marker, flatten,
+    header_line, node_metric, rollup, state_glyph, truncation_footer,
 };
 
 use haider_protocol::ids::{AgentId, SessionId};
@@ -352,6 +352,7 @@ pub fn snapshot_from_chips(
         parent_session: &SessionId,
         parent_agent: Option<&AgentId>,
         depth: u32,
+        now_ms: u64,
     ) -> FleetNodeWire {
         let session_id = chip.child_session.clone().map_or_else(
             || SessionId::new(format!("demo-{}", chip.agent)),
@@ -361,8 +362,28 @@ pub fn snapshot_from_chips(
         let children = chip
             .children
             .iter()
-            .map(|child| node_of(child, &session_id, Some(&agent_id), depth + 1))
+            .map(|child| node_of(child, &session_id, Some(&agent_id), depth + 1, now_ms))
             .collect();
+        // 973-activity-icons: the chip's own live tracker, at the open
+        // instant (the render path re-reads the chip for live updates).
+        let state = chip_fleet_state(chip);
+        let terminal = matches!(
+            state,
+            FleetAgentStateWire::Done
+                | FleetAgentStateWire::Failed
+                | FleetAgentStateWire::Cancelled
+        );
+        let live_children = chip.children.iter().any(|child| {
+            !matches!(
+                chip_fleet_state(child),
+                FleetAgentStateWire::Done
+                    | FleetAgentStateWire::Failed
+                    | FleetAgentStateWire::Cancelled
+            )
+        });
+        let activity = (!terminal)
+            .then(|| chip.activity.current(now_ms, live_children))
+            .flatten();
         FleetNodeWire {
             agent_id,
             session_id,
@@ -373,15 +394,17 @@ pub fn snapshot_from_chips(
             depth,
             parent_session_id: parent_session.clone(),
             parent_agent_id: parent_agent.cloned(),
-            state: chip_fleet_state(chip),
+            state,
             metrics: chip.metrics.clone(),
+            activity,
+            activities: chip.activity.used(),
             folded_children: 0,
             children,
         }
     }
     let roots: Vec<FleetNodeWire> = chips
         .iter()
-        .map(|chip| node_of(chip, session, None, 1))
+        .map(|chip| node_of(chip, session, None, 1, now_ms))
         .collect();
     let roll = rollup(&roots);
     let flat = flatten(&roots);
@@ -460,6 +483,17 @@ pub fn fleet_plain(model: &crate::app::AppModel) -> String {
             out.push_str(&" │ ".repeat(row.rel_depth));
             out.push_str(state_glyph(row.node.state));
             out.push(' ');
+            // 973-activity-icons: plain is the screen-reader/NO_COLOR
+            // surface — activity always renders as its TEXT label here
+            // (unless icons are off).
+            if model.activity_display != haider_protocol::activity::ActivityDisplay::Off
+                && let Some(label) = model
+                    .node_activity(row.node)
+                    .and_then(|kind| haider_protocol::activity::ActivityDisplay::Text.glyph(kind))
+            {
+                out.push_str(label);
+                out.push(' ');
+            }
             out.push_str(callsign(row.node));
             if let Some(marker) = child_marker(row.node) {
                 out.push(' ');

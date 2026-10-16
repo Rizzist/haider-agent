@@ -46,6 +46,8 @@ import androidx.compose.material.icons.rounded.BatteryFull
 import ai.diffforge.haider.ui.state.PermissionStanding
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Switch
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material3.Text
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
@@ -275,6 +277,9 @@ fun SettingsScreen(
                 onClick = { detail = PermissionDetail.Battery },
             )
 
+            // Display preferences follow permission standing so all existing
+            // permission rows retain their original position in the viewport.
+            ActivityIconsCard()
         }
 
         detail?.let { open ->
@@ -345,6 +350,42 @@ private fun standing(value: PermissionStanding): String = stringResource(
         PermissionStanding.Unknown -> R.string.permission_unknown
     },
 )
+
+/** The settings row tag for the activity-icons switch. */
+const val SETTINGS_ACTIVITY_ICONS_TAG = "settings_activity_icons"
+
+@Composable
+private fun ActivityIconsCard() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val enabled = ai.diffforge.haider.ui.fleet.ActivityIconPreference.current()
+    val title = stringResource(R.string.settings_activity_icons)
+    Card {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = ForgeSize.touch)
+                .testTag(SETTINGS_ACTIVITY_ICONS_TAG)
+                .toggleable(
+                    value = enabled,
+                    role = androidx.compose.ui.semantics.Role.Switch,
+                    onValueChange = {
+                        ai.diffforge.haider.ui.fleet.ActivityIconPreference.set(context, it)
+                    },
+                ),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(title, style = Forge.type.sessionTitle, color = Forge.colors.text)
+                Text(
+                    stringResource(R.string.settings_activity_icons_detail),
+                    style = Forge.type.sessionMeta,
+                    color = Forge.colors.textMuted,
+                )
+            }
+            Switch(checked = enabled, onCheckedChange = null)
+        }
+    }
+}
 
 /** One of the three logo colourway choices, in the app's chip idiom. */
 @Composable

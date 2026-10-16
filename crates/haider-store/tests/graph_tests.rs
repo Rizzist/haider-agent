@@ -1544,50 +1544,69 @@ fn process_signal_binds_to_its_outcome_revision_across_interleaved_mutation() {
 fn read_class_effect_cannot_forge_a_workspace_mutation() {
     // LAW 1 — MUTATION CHECK: a caller-supplied mutation on a pure read must
     // not advance the durable revision counter.
-    let root = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(root.path()).expect("open store");
-    let session_id = create_session(&store, "read-cannot-bump-revision");
-    let run_id = RunId::new("read-cannot-bump-run");
-    let head = store.latest_seq(&session_id).expect("head");
-    let effect = EffectId::new("forged-read-mutation");
-    let mut facts = vec![
-        raw_envelope(
-            &store,
-            &session_id,
-            &run_id,
-            "forged-read-intent",
-            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
-                effect: effect.clone(),
-                class: EffectClass::FsRead,
-                summary: "pure read".into(),
-                args_digest: "blake3:pure-read".into(),
-                workspace_revision: None,
-            })),
-        ),
-        raw_envelope(
-            &store,
-            &session_id,
-            &run_id,
-            "forged-read-outcome",
-            EventPayload::Effect(EffectPhase::Outcome {
-                effect: effect.clone(),
-                outcome: EffectOutcome::Ok,
-                freshness: None,
-                workspace_mutation: Some(WorkspaceMutation {
-                    effect_id: effect,
-                    mutation_digest: "blake3:forged-read".into(),
+    for class in [
+        EffectClass::FsRead,
+        EffectClass::ProviderTransport,
+        EffectClass::RemoteExecution,
+        EffectClass::Network {
+            host: "example.invalid".into(),
+        },
+        EffectClass::GitOp,
+        EffectClass::AgentSpawn,
+        EffectClass::PeerMessage,
+        EffectClass::CredentialAccess,
+        EffectClass::GuiAct,
+        EffectClass::ScreenObserve,
+        EffectClass::ScreenControl,
+        EffectClass::MobileObserve,
+        EffectClass::MobileControl,
+        EffectClass::ReadSms,
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = create_session(&store, "read-cannot-bump-revision");
+        let run_id = RunId::new("read-cannot-bump-run");
+        let head = store.latest_seq(&session_id).expect("head");
+        let effect = EffectId::new("forged-read-mutation");
+        let mut facts = vec![
+            raw_envelope(
+                &store,
+                &session_id,
+                &run_id,
+                "forged-read-intent",
+                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                    effect: effect.clone(),
+                    class,
+                    summary: "pure read".into(),
+                    args_digest: "blake3:pure-read".into(),
                     workspace_revision: None,
-                    subject_digest: None,
-                    redacted_content: false,
+                })),
+            ),
+            raw_envelope(
+                &store,
+                &session_id,
+                &run_id,
+                "forged-read-outcome",
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect: effect.clone(),
+                    outcome: EffectOutcome::Ok,
+                    freshness: None,
+                    workspace_mutation: Some(WorkspaceMutation {
+                        effect_id: effect,
+                        mutation_digest: "blake3:forged-read".into(),
+                        workspace_revision: None,
+                        subject_digest: None,
+                        redacted_content: false,
+                    }),
                 }),
-            }),
-        ),
-    ];
-    let error = store
-        .append(&mut facts)
-        .expect_err("read-class mutation must reject");
-    assert_eq!(error.code, ErrorCode::InvalidArgument);
-    assert_eq!(store.latest_seq(&session_id).expect("head"), head);
+            ),
+        ];
+        let error = store
+            .append(&mut facts)
+            .expect_err("read-class mutation must reject");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(store.latest_seq(&session_id).expect("head"), head);
+    }
 }
 
 #[test]
@@ -1641,57 +1660,74 @@ fn later_filesystem_mutation_stales_revision_bound_process_evidence() {
 fn filesystem_mutation_subject_is_daemon_verified_and_stale_checkable() {
     // LAWS 2/4 — MUTATION CHECK: dropping the fs provenance branch either
     // rejects a fresh subject or accepts it after the common revision moves.
-    let root = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(root.path()).expect("open store");
-    let session_id = create_session(&store, "fs-mutation-evidence-law");
-    pin(&store, &session_id, "fs-mutation-evidence-law");
-    advance_to_verify(&store, &session_id, 52_000);
-    let run_id = RunId::new("fs-mutation-evidence-run");
-    let (mutation, _) =
-        append_workspace_mutation(&store, &session_id, &run_id, 52_001, EffectClass::FsWrite);
-    let mutation_ref = WorkspaceMutationRef {
-        run_id: run_id.clone(),
-        effect_id: mutation.effect_id.clone(),
-    };
-    let mut fresh = evidence_command(
-        &store,
-        &session_id,
-        52_002,
-        haider_protocol::graph::verify_node(),
-        EvidenceVerdict::Green,
-        "filesystem mutation committed",
-    );
-    fresh.run_id = run_id;
-    fresh.slot = Some("tests".into());
-    fresh.subject_digest = mutation.subject_digest.clone();
-    fresh.workspace_mutation = Some(mutation_ref.clone());
-    store
-        .record_graph_evidence(&fresh)
-        .expect("fresh fs mutation is daemon-verifiable");
-
-    append_workspace_mutation(
-        &store,
-        &session_id,
-        &RunId::new("fs-mutation-evidence-later"),
-        52_003,
+    for class in [
         EffectClass::FsWrite,
-    );
-    let mut stale = fresh;
-    stale.command_id = "fs-mutation-stale-command".into();
-    stale.request_digest = "fs-mutation-stale-digest".into();
-    stale.request_json = r#"{"stale":true}"#.into();
-    stale.workspace_mutation = Some(mutation_ref);
-    let error = store
-        .record_graph_evidence(&stale)
-        .expect_err("later mutation stales fs subject");
-    assert_eq!(error.code, ErrorCode::RevisionConflict);
-    assert_eq!(
-        error
-            .details
-            .as_ref()
-            .and_then(|details| details["kind"].as_str()),
-        Some("stale_evidence_subject")
-    );
+        EffectClass::CheckpointRestore,
+        EffectClass::ProcessExec,
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = create_session(&store, "fs-mutation-evidence-law");
+        pin(&store, &session_id, "fs-mutation-evidence-law");
+        advance_to_verify(&store, &session_id, 52_000);
+        let run_id = RunId::new("fs-mutation-evidence-run");
+        let (mutation, _) =
+            append_workspace_mutation(&store, &session_id, &run_id, 52_001, class.clone());
+        let mutation_ref = WorkspaceMutationRef {
+            run_id: run_id.clone(),
+            effect_id: mutation.effect_id.clone(),
+        };
+        let mut fresh = evidence_command(
+            &store,
+            &session_id,
+            52_002,
+            haider_protocol::graph::verify_node(),
+            EvidenceVerdict::Green,
+            "filesystem mutation committed",
+        );
+        fresh.run_id = run_id;
+        fresh.slot = Some("tests".into());
+        fresh.subject_digest = mutation.subject_digest.clone();
+        fresh.workspace_mutation = Some(mutation_ref.clone());
+        if class == EffectClass::ProcessExec {
+            let error = store
+                .record_graph_evidence(&fresh)
+                .expect_err("process intent is not filesystem restore authority");
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert_eq!(
+                error.details.as_ref().and_then(|d| d["kind"].as_str()),
+                Some("mismatched_signal_provenance")
+            );
+            continue;
+        }
+        store
+            .record_graph_evidence(&fresh)
+            .expect("fresh fs mutation is daemon-verifiable");
+
+        append_workspace_mutation(
+            &store,
+            &session_id,
+            &RunId::new("fs-mutation-evidence-later"),
+            52_003,
+            EffectClass::FsWrite,
+        );
+        let mut stale = fresh;
+        stale.command_id = "fs-mutation-stale-command".into();
+        stale.request_digest = "fs-mutation-stale-digest".into();
+        stale.request_json = r#"{"stale":true}"#.into();
+        stale.workspace_mutation = Some(mutation_ref);
+        let error = store
+            .record_graph_evidence(&stale)
+            .expect_err("later mutation stales fs subject");
+        assert_eq!(error.code, ErrorCode::RevisionConflict);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details["kind"].as_str()),
+            Some("stale_evidence_subject")
+        );
+    }
 }
 
 /// MUTATION CHECK: drop either the payload-kind branch or the legacy
@@ -5000,6 +5036,7 @@ fn append_tool_attempt(
                     name: tool_name.into(),
                     args: args.clone(),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ),
@@ -5038,6 +5075,7 @@ fn append_tool_attempt(
                     name: tool_name.into(),
                     args,
                     status: item_status,
+                    activity: None,
                 },
             }),
         ),

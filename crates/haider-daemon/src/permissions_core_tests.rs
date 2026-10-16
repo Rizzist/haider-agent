@@ -1156,6 +1156,7 @@ fn append_permission_checkpoint(
                     name: "exec".into(),
                     args: serde_json::json!({"command":"printf old"}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }))
             .expect("item payload")
@@ -2114,4 +2115,34 @@ fn agent_type_identity_line_is_bounded_and_names_the_signature() {
         "the tail line stays bounded: {}",
         line.len()
     );
+}
+#[test]
+fn activity_is_derived_from_registered_routes_only() {
+    use haider_protocol::activity::ActivityKind as A;
+    for (name, expected) in [
+        ("computer", Some(A::Computer)),
+        ("mobile", Some(A::Mobile)),
+        ("web_fetch", Some(A::Web)),
+        ("web_search", Some(A::Web)),
+        ("ssh_shell", Some(A::Remote)),
+        ("fs_read", Some(A::Read)),
+        ("fs_write", Some(A::Edit)),
+        ("process_exec", Some(A::Run)),
+        ("spawn_subagent", Some(A::Orchestrate)),
+        ("list_models", Some(A::Read)),
+        ("session_transcript", Some(A::Read)),
+        ("peer_list", Some(A::Read)),
+        ("computer ", None),
+        ("COMPUTER", None),
+        ("mcp__server__computer", None),
+        ("browser_open", None),
+        ("web_tool", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            registered_tool_route(name).and_then(super::worker::RegisteredToolRoute::activity),
+            expected,
+            "{name}"
+        );
+    }
 }

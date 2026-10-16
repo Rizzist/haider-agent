@@ -2296,6 +2296,7 @@ impl SessionProjection {
                         name: (*name).to_owned(),
                         args: serde_json::json!({ "desc": desc, "meta": meta }),
                         status: haider_protocol::item::ToolStatus::Completed,
+                        activity: None,
                     },
                 }));
             }

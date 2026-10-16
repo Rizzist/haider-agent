@@ -14341,6 +14341,43 @@ pub(crate) enum RegisteredToolRoute {
     SshShell,
 }
 
+impl RegisteredToolRoute {
+    pub(crate) fn activity(self) -> Option<haider_protocol::activity::ActivityKind> {
+        use haider_protocol::activity::ActivityKind;
+        Some(match self {
+            Self::Computer => ActivityKind::Computer,
+            Self::Mobile => ActivityKind::Mobile,
+            Self::WebFetch | Self::WebSearch => ActivityKind::Web,
+            Self::SshShell => ActivityKind::Remote,
+            Self::FsWrite | Self::FsEdit | Self::FsPath => ActivityKind::Edit,
+            Self::ProcessExec
+            | Self::TestRun
+            | Self::ToolScript
+            | Self::TaskOutput
+            | Self::TaskKill => ActivityKind::Run,
+            Self::FsRead
+            | Self::FsGlob
+            | Self::FsSearch
+            | Self::SshList
+            | Self::ListModels
+            | Self::SessionTranscript
+            | Self::PeerList
+            | Self::ListTools => ActivityKind::Read,
+            Self::SpawnSubagent
+            | Self::MessageSubagent
+            | Self::WorkflowAuthor
+            | Self::LoomRegister
+            | Self::PeerSend => ActivityKind::Orchestrate,
+            Self::RequestInput
+            | Self::Plan
+            | Self::TodoWrite
+            | Self::TaskOutcome
+            | Self::GraphEvidence
+            | Self::Monitor => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RegisteredTool {
     pub(crate) manifest: ToolManifest,
@@ -17102,12 +17139,28 @@ async fn create_broker_tool_dispatcher(
         device_id: context.device_id.clone(),
         event_ids: Arc::clone(&context.event_ids),
     };
+    // 973-activity-icons: a SUBAGENT names itself on any presence badge it
+    // raises. Best-effort and read-only: a missing record or callsign keeps
+    // the generic badge rather than failing the run.
+    let presence_actor = if context.agent_id.is_some() {
+        context
+            .store
+            .hub()
+            .delegation_for_child_session(session_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.manifest.callsign)
+    } else {
+        None
+    };
     let cu_presence = crate::cu_presence::PresenceLease::for_run(
         presence,
         context.store.hub().clone(),
         session_id.clone(),
         context.run_id.clone(),
-    );
+    )
+    .with_actor(presence_actor);
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
         pending_workspace: Mutex::new(pending_workspace),
@@ -19582,6 +19635,7 @@ impl BrokerToolDispatcher {
                 name: tool.to_owned(),
                 args: args.clone(),
                 status: haider_protocol::item::ToolStatus::InProgress,
+                activity: None,
             },
         });
         let mut events = vec![start];
@@ -20829,6 +20883,7 @@ impl BrokerToolDispatcher {
             name: pending.tool.clone(),
             args: pending.args.0.clone(),
             status: result.status.item_status(),
+            activity: None,
         };
         let mut prefix = vec![
             EventPayload::ToolResult {
@@ -21161,8 +21216,107 @@ async fn recover_orchestration_child(
     }
 }
 
+fn live_activity_for_route(
+    name: &str,
+    lockdown_allowed: Option<&[String]>,
+    has_web_search: bool,
+) -> Option<haider_protocol::activity::ActivityKind> {
+    if lockdown_allowed.is_some_and(|allowed| !allowed.iter().any(|tool| tool == name)) {
+        return None;
+    }
+    if name == "web_search" && !has_web_search {
+        return None;
+    }
+    match registered_tool_route(name)? {
+        RegisteredToolRoute::WebSearch => Some(haider_protocol::activity::ActivityKind::Web),
+        RegisteredToolRoute::SessionTranscript
+        | RegisteredToolRoute::ListModels
+        | RegisteredToolRoute::PeerList => Some(haider_protocol::activity::ActivityKind::Read),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn live_activity_respects_lockdown_and_backend_availability() {
+    use haider_protocol::activity::ActivityKind;
+    let allowed = vec!["web_search".to_owned(), "peer_list".to_owned()];
+    let denied = vec!["peer_list".to_owned()];
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&denied), true),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), false),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), true),
+        Some(ActivityKind::Web)
+    );
+    assert_eq!(
+        live_activity_for_route("peer_list", Some(&allowed), false),
+        Some(ActivityKind::Read)
+    );
+    assert_eq!(
+        live_activity_for_route("unknown", Some(&allowed), true),
+        None
+    );
+    for name in [
+        "web_search",
+        "session_transcript",
+        "list_models",
+        "peer_list",
+    ] {
+        let only_this = vec![name.to_owned()];
+        assert!(
+            live_activity_for_route(name, Some(&only_this), true).is_some(),
+            "{name} positive control"
+        );
+        assert_eq!(
+            live_activity_for_route(name, Some(&[]), true),
+            None,
+            "empty lockdown {name}"
+        );
+        assert_eq!(
+            live_activity_for_route(name, None, false).is_none(),
+            name == "web_search",
+            "only search requires that backend"
+        );
+    }
+    for name in [
+        "Web_Search",
+        " web_search",
+        "web_search ",
+        "",
+        "computer",
+        "fs_write",
+    ] {
+        assert_eq!(
+            live_activity_for_route(name, None, true),
+            None,
+            "not an effectless live route: {name:?}"
+        );
+    }
+}
+
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
+    fn activity_for_route(&self, name: &str) -> Option<haider_protocol::activity::ActivityKind> {
+        registered_tool_route(name).and_then(RegisteredToolRoute::activity)
+    }
+    fn live_activity_for_route(
+        &self,
+        name: &str,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        live_activity_for_route(
+            name,
+            self.lockdown
+                .as_ref()
+                .map(|lockdown| lockdown.tools_allowed.as_slice()),
+            self.web_search.is_some(),
+        )
+    }
     fn platform_tool_supported(&self, name: &str) -> bool {
         !crate::android_policy::enabled() || registered_tool_route(name).is_some()
     }

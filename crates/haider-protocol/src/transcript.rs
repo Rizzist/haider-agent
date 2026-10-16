@@ -173,6 +173,7 @@ fn project_text(envelope: &RawEnvelope) -> Option<String> {
                 name,
                 args,
                 status,
+                ..
             } => Some(format!(
                 "tool call {call_id} {name} ({status:?}): {}",
                 args_preview(&args).unwrap_or_default()

@@ -977,7 +977,7 @@ must tolerate additive fields. Human output is not a parsing contract.
 | Verb | Successful `result` |
 | --- | --- |
 | agent spawn / workflow run | Parent `session_id`/`run_id`, actual `agent_id`, `child_session_id`/`child_run_id`, and durable `manifest`. |
-| agent list | Native `SessionFleetSnapshot`, including `roots`, bounds, truncation and rollup. |
+| agent list | Native `SessionFleetSnapshot`, including `roots`, bounds, truncation and rollup; each node may carry `activity` and `activities` (973-activity-icons). Without `--json` the verb prints the human fleet tree: state glyph, current activity glyph (emoji, `[text]` label under `NO_COLOR`/limited `TERM`/`HAIDER_ACTIVITY_ICONS=text`, nothing when `off`), name, task and metrics. |
 | agent message | Native `receipt`, including delivery kind and child run coordinates. Running children receive steer; idle children receive a queued fresh turn. |
 | agent cancel | Native `agent.cancel` fields: `agent`, child session/run, status and optional terminal sequence. When the original run already finished, the fields name the later run that was stopped. Acceptance is not terminal completion. With `--all`: `session_id` and `stopped` (`cancelled_runs`, `sessions`, `monitors_removed`, `still_running`). |
 | agent wait | Parent/agent/child coordinates, terminal `state`, child `terminal_seq`, `report`, `report_source`, and nullable parent `child_result_seq`. |

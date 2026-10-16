@@ -1272,6 +1272,7 @@ fn golden_item_lifecycle() {
                 name: "fs_edit".into(),
                 args: serde_json::json!({"path": "src/lib.rs"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         },
     );
@@ -1284,6 +1285,7 @@ fn golden_item_lifecycle() {
                 name: "fs_read".into(),
                 args: serde_json::json!({}),
                 status: ToolStatus::Cancelled,
+                activity: None,
             },
         },
     );
@@ -1380,6 +1382,7 @@ fn golden_item_lifecycle() {
                     ]
                 }),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         },
     );
@@ -2104,6 +2107,7 @@ fn golden_agent_metrics_snapshot_fact() {
         started_at_ms: 1_000,
         terminal_at_ms: None,
         live: true,
+        activity: None,
         tool_attempts: 2,
         usage: Some(AgentUsageMetrics {
             logical_input_tokens: 10_000,
