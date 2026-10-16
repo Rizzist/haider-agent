@@ -748,7 +748,8 @@ async fn supervise_background_with_exit_observation(
             &mut fatal,
             &mut escalation_notes,
             &mut lifecycle_events,
-        );
+        )
+        .await;
     }
 
     while !leader_reaped || output_open || kill_deadline.is_some() || pipe_drain_deadline.is_some()
@@ -768,7 +769,7 @@ async fn supervise_background_with_exit_observation(
                             &mut fatal,
                             &mut escalation_notes,
                             &mut lifecycle_events,
-                        );
+                        ).await;
                     }
                     Ok(()) => {}
                     Err(_) => kill_open = false,
@@ -821,7 +822,7 @@ async fn supervise_background_with_exit_observation(
                             &mut fatal,
                             &mut escalation_notes,
                             &mut lifecycle_events,
-                        );
+                        ).await;
                         false
                     }
                 };
@@ -889,7 +890,7 @@ async fn supervise_background_with_exit_observation(
                                 pid,
                                 Signal::KILL,
                                 leader_is_zombie,
-                            )
+                            ).await
                         {
                             escalation_notes.push(format!(
                                 "SIGKILL escalation failed for background task group {}: {error}",
@@ -1159,10 +1160,9 @@ pub fn probe_group_liveness_evidence(pid_raw: i32) -> EvidencePidLiveness {
 /// Reaps one stale background process group after a daemon restart: probe
 /// liveness through the injected seam, then TERM → grace → KILL the pgid.
 /// The orphan was reparented when the previous daemon died, so `ESRCH` at
-/// any rung means the group is gone. Both rungs pass the zombie-tolerant
-/// sweep flag: an `EPERM` here can only mean an unreaped same-pgid zombie
-/// (a caller-owned child in tests) — a live foreign-uid group was already
-/// impossible for a group the previous daemon spawned.
+/// any rung means the group is gone. A permission denial is not proof of
+/// cleanup: only a caller-owned unreaped zombie with no remaining group members
+/// can be confirmed as swept. Non-child orphan groups retain signal failures.
 pub async fn reap_orphan_group<P>(pid_raw: i32, grace: Duration, probe: P) -> OrphanReap
 where
     P: Fn(i32) -> PidLiveness,
@@ -1175,7 +1175,7 @@ where
             message: format!("orphan pid {pid_raw} is not representable"),
         };
     };
-    match signal_group_for_sweep(pid, Signal::TERM, true) {
+    match signal_group_for_sweep(pid, Signal::TERM, false).await {
         Ok(true) => {}
         Ok(false) => return OrphanReap::AlreadyDead,
         Err(error) => {
@@ -1187,7 +1187,7 @@ where
     sleep(grace).await;
     match process_group_exists(pid) {
         Ok(false) => OrphanReap::Killed,
-        Ok(true) => match signal_group_for_sweep(pid, Signal::KILL, true) {
+        Ok(true) => match signal_group_for_sweep(pid, Signal::KILL, false).await {
             Ok(_) => OrphanReap::Killed,
             Err(error) => OrphanReap::Failed {
                 message: format!("orphan KILL failed: {error}"),

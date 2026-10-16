@@ -46,6 +46,10 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::{Sleep, sleep};
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "process_sweep_tests.rs"]
+mod sweep_tests;
+
 #[cfg(unix)]
 type DirectoryIdentity = rustix::fs::Stat;
 #[cfg(windows)]
@@ -1358,7 +1362,8 @@ async fn supervise_process_with_exit_observation(
             &mut fatal,
             &mut escalation_notes,
             &mut lifecycle_events,
-        );
+        )
+        .await;
     }
 
     while !leader_reaped || output_open || kill_deadline.is_some() || pipe_drain_deadline.is_some()
@@ -1379,7 +1384,7 @@ async fn supervise_process_with_exit_observation(
                             &mut fatal,
                             &mut escalation_notes,
                             &mut lifecycle_events,
-                        );
+                        ).await;
                     }
                     Ok(()) => {}
                     Err(_) => cancel_open = false,
@@ -1398,7 +1403,7 @@ async fn supervise_process_with_exit_observation(
                     &mut fatal,
                     &mut escalation_notes,
                     &mut lifecycle_events,
-                );
+                ).await;
             }
             () = async {
                 if let Some(deadline) = pipe_drain_deadline.as_mut() {
@@ -1470,7 +1475,7 @@ async fn supervise_process_with_exit_observation(
                                     &mut fatal,
                                     &mut escalation_notes,
                                     &mut lifecycle_events,
-                                );
+                                ).await;
                             }
                         }
                         if !transcript_failed
@@ -1512,7 +1517,7 @@ async fn supervise_process_with_exit_observation(
                                 &mut fatal,
                                 &mut escalation_notes,
                                 &mut lifecycle_events,
-                            );
+                            ).await;
                             continue;
                         }
                         if let Some(active_spill) = spill.as_mut() {
@@ -1530,7 +1535,7 @@ async fn supervise_process_with_exit_observation(
                                     &mut fatal,
                                     &mut escalation_notes,
                                     &mut lifecycle_events,
-                                );
+                                ).await;
                             }
                         } else {
                             transcript_payload_bytes =
@@ -1549,7 +1554,7 @@ async fn supervise_process_with_exit_observation(
                                 &mut fatal,
                                 &mut escalation_notes,
                                 &mut lifecycle_events,
-                            );
+                            ).await;
                         }
                     }
                     Some(Captured::ReadError(stream, error)) => {
@@ -1566,7 +1571,7 @@ async fn supervise_process_with_exit_observation(
                             &mut fatal,
                             &mut escalation_notes,
                             &mut lifecycle_events,
-                        );
+                        ).await;
                     }
                     None => {
                         output_open = false;
@@ -1594,7 +1599,7 @@ async fn supervise_process_with_exit_observation(
                             &mut fatal,
                             &mut escalation_notes,
                             &mut lifecycle_events,
-                        );
+                        ).await;
                         false
                     }
                 };
@@ -1603,7 +1608,7 @@ async fn supervise_process_with_exit_observation(
                     group_termination_started = true;
                     lifecycle_events.push(ProcessLifecycleEvent::NormalCompletionSweeping);
                     begin_group_termination(group, pid, leader_is_zombie, bounds.kill_grace,
-                        &mut kill_deadline, &mut fatal, &mut escalation_notes, &mut lifecycle_events);
+                        &mut kill_deadline, &mut fatal, &mut escalation_notes, &mut lifecycle_events).await;
                 }
                 if kill_deadline.is_none() {
                     if !group_termination_started {
@@ -1681,7 +1686,7 @@ async fn supervise_process_with_exit_observation(
                     deadline.await;
                 }
             }, if kill_deadline.is_some() => {
-                match platform_group_exists_for_sweep(group, pid, leader_is_zombie) {
+                match platform_group_exists(group, pid) {
                     Ok(false) => {
                         kill_deadline = None;
                         lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
@@ -1693,7 +1698,7 @@ async fn supervise_process_with_exit_observation(
                                 pid,
                                 Signal::KILL,
                                 leader_is_zombie,
-                            )
+                            ).await
                         {
                             let note = format!(
                                 "SIGKILL escalation failed for process group {}: {error}",
@@ -2039,7 +2044,7 @@ fn signal_platform_group(group: ProcessGroup, pid: Pid, signal: Signal) -> ToolR
 /// Signals the original group during a supervisor sweep. `ESRCH` after the
 /// zombie leader has pinned the PGID means no live member remains to signal,
 /// so the sweep is complete rather than failed.
-pub(crate) fn signal_group_for_sweep(
+pub(crate) async fn signal_group_for_sweep(
     pid: Pid,
     signal: Signal,
     leader_is_zombie: bool,
@@ -2052,16 +2057,33 @@ pub(crate) fn signal_group_for_sweep(
             message: "signal process group: invalid process id".into(),
         });
     };
-    signal_platform_group_for_sweep(group, pid, signal, leader_is_zombie)
+    signal_platform_group_for_sweep(group, pid, signal, leader_is_zombie).await
 }
 
-pub(crate) fn signal_platform_group_for_sweep(
+pub(crate) async fn signal_platform_group_for_sweep(
     group: ProcessGroup,
     pid: Pid,
     signal: Signal,
     leader_is_zombie: bool,
 ) -> ToolResult<bool> {
-    match haider_platform::signal_process_group(group, signal) {
+    finish_sweep_signal(
+        haider_platform::signal_process_group(group, signal),
+        group,
+        pid,
+        signal,
+        leader_is_zombie,
+    )
+    .await
+}
+
+async fn finish_sweep_signal(
+    result: std::io::Result<()>,
+    group: ProcessGroup,
+    pid: Pid,
+    signal: Signal,
+    leader_is_zombie: bool,
+) -> ToolResult<bool> {
+    match result {
         Ok(()) => {
             // A Windows KILL terminates the entire Job Object. Drop the exact
             // token immediately so a terminal escalation cannot retain a
@@ -2073,10 +2095,9 @@ pub(crate) fn signal_platform_group_for_sweep(
             Ok(true)
         }
         Err(error) if haider_platform::process_error_is_missing(&error) => Ok(false),
-        // Darwin reports EPERM when a group contains only the caller's zombie
-        // child. Since that zombie pins this exact PGID, no live member of the
-        // original group remains signalable in this case.
-        Err(error) if sweep_permission_means_only_zombie(pid, leader_is_zombie, &error) => {
+        Err(error)
+            if sweep_permission_means_only_zombie(group, pid, leader_is_zombie, &error).await =>
+        {
             Ok(false)
         }
         Err(error) => Err(ToolError::Runtime {
@@ -2088,7 +2109,8 @@ pub(crate) fn signal_platform_group_for_sweep(
     }
 }
 
-fn sweep_permission_means_only_zombie(
+async fn sweep_permission_means_only_zombie(
+    group: ProcessGroup,
     pid: Pid,
     leader_is_zombie: bool,
     error: &std::io::Error,
@@ -2097,14 +2119,45 @@ fn sweep_permission_means_only_zombie(
     // containment witness. Never turn an Android/Linux signal denial into success.
     #[cfg(target_os = "macos")]
     {
-        haider_platform::process_error_is_permission(error)
-            && (leader_is_zombie || haider_platform::process_leader_exited(pid).unwrap_or(false))
+        if !haider_platform::process_error_is_permission(error) {
+            return false;
+        }
+        // Darwin's group iterator can stop finding an exiting process before
+        // waitid can report its zombie. EPERM alone is not an exit witness:
+        // retain the Child/PGID and allow that transition to finish. Requiring
+        // the pinned zombie to be the ONLY member also preserves a real denial
+        // for live (including foreign-uid) descendants of an exited leader.
+        confirm_swept_group(|| {
+            if !leader_is_zombie && !haider_platform::process_leader_exited(pid)? {
+                return Ok(false);
+            }
+            haider_platform::process_group_contains_only_leader(group, pid)
+        })
+        .await
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (pid, leader_is_zombie, error);
+        let _ = (group, pid, leader_is_zombie, error);
         false
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn confirm_swept_group(mut probe: impl FnMut() -> std::io::Result<bool>) -> bool {
+    // A bounded confirmation after a failed signal, independent of a caller's
+    // possibly tiny TERM grace. Expiry/inspection failure retains the original
+    // signal error; this never turns an uncertain group into successful cleanup.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match probe() {
+                Ok(true) => return true,
+                Ok(false) => sleep(Duration::from_millis(1)).await,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 pub(crate) fn process_group_exists(pid: Pid) -> ToolResult<bool> {
@@ -2127,25 +2180,6 @@ pub(crate) fn platform_group_exists(group: ProcessGroup, pid: Pid) -> ToolResult
     haider_platform::process_group_exists(group).map_err(|error| ToolError::Runtime {
         message: format!("probe process group {}: {error}", pid.as_raw_nonzero()),
     })
-}
-
-fn platform_group_exists_for_sweep(
-    group: ProcessGroup,
-    pid: Pid,
-    leader_is_zombie: bool,
-) -> ToolResult<bool> {
-    match haider_platform::process_group_exists(group) {
-        Ok(exists) => Ok(exists),
-        // Darwin reports EPERM for a group containing only our zombie child.
-        // The unreaped leader pins this exact PGID, so no live member of the
-        // original group remains in that case.
-        Err(error) if sweep_permission_means_only_zombie(pid, leader_is_zombie, &error) => {
-            Ok(false)
-        }
-        Err(error) => Err(ToolError::Runtime {
-            message: format!("probe process group {}: {error}", pid.as_raw_nonzero()),
-        }),
-    }
 }
 
 pub(crate) async fn observe_process_leader_exit(pid: Pid) -> ToolResult<()> {
@@ -2187,7 +2221,7 @@ pub(crate) async fn reap_process_leader(
 /// zombie keeps the PGID allocated, so every probe/signal below is guaranteed
 /// to target the original group rather than a recycled one.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn begin_group_termination(
+pub(crate) async fn begin_group_termination(
     group: ProcessGroup,
     pid: Pid,
     leader_is_zombie: bool,
@@ -2201,10 +2235,11 @@ pub(crate) fn begin_group_termination(
         return;
     }
     lifecycle_events.push(ProcessLifecycleEvent::GroupSweepStarted);
-    match platform_group_exists_for_sweep(group, pid, leader_is_zombie) {
+    match platform_group_exists(group, pid) {
         Ok(false) => lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted),
         Ok(true) => {
-            match signal_platform_group_for_sweep(group, pid, Signal::TERM, leader_is_zombie) {
+            match signal_platform_group_for_sweep(group, pid, Signal::TERM, leader_is_zombie).await
+            {
                 Ok(true) => *deadline = Some(Box::pin(sleep(grace))),
                 Ok(false) => {
                     lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
