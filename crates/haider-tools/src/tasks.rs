@@ -756,10 +756,12 @@ async fn supervise_background_with_exit_observation(
     {
         tokio::select! {
             biased;
-            changed = kill.changed(), if kill_open && !killed => {
+            // Exit observation ends natural-completion ownership. In
+            // particular, never signal the numeric group after reaping it.
+            changed = kill.changed(), if kill_open && !killed && !leader_exit_observed => {
                 match changed {
                     Ok(()) if *kill.borrow() => {
-                        killed = !leader_exit_observed;
+                        killed = true;
                         begin_group_termination(
                             group,
                             pid,
@@ -1010,6 +1012,118 @@ mod supervisor_tests {
         async fn append(&mut self, _payload: EventPayload) -> ToolResult<()> {
             Ok(())
         }
+    }
+
+    /// Queue a kill inside the exit-observation poll: the select's kill arm
+    /// has already returned Pending, so the next poll is after natural reap.
+    /// The descendant retains stdout to keep that next drain poll necessary.
+    #[tokio::test]
+    async fn late_kill_during_natural_output_drain_leaves_descendant_alive() {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let workspace = tempfile::tempdir().expect("late background kill workspace");
+        let lifetime = workspace.path().join("lifetime.fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&lifetime)
+                .status()
+                .expect("create descendant lifetime FIFO")
+                .success()
+        );
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).expect("nonblocking flag"),
+            )
+            .open(&lifetime)
+            .expect("open descendant lifetime reader");
+        let mut broker = EffectBroker::new_at(
+            Box::new(NoopJournal),
+            workspace.path(),
+            SessionId::new("background-late-kill-session"),
+            1,
+            1_700_000_000_000,
+        )
+        .expect("create broker");
+        let mut policy = PermissionPolicy::default();
+        policy.allow(EffectClass::ProcessExec);
+        let operation = BackgroundExec::new(
+            ProcessExec::new(
+                "background-late-kill",
+                concat!(
+                    "/usr/bin/perl -e '$pid=fork; die $! unless defined $pid; ",
+                    "if ($pid) { while (!-e q(started)) { select undef, undef, undef, 0.01 }; ",
+                    "print q(leader); exit 0 } ",
+                    "open $life, q(>), q(lifetime.fifo) or die $!; ",
+                    "syswrite($life, q(r)) == 1 or die $!; ",
+                    "open $started, q(>), q(started) or die $!; close $started; alarm 60; ",
+                    "while (!-e q(cleanup)) { select undef, undef, undef, 0.01 }'",
+                ),
+            ),
+            "background-late-kill",
+        )
+        .expect("valid background operation");
+        let spawn = broker
+            .process_exec_background(&operation, &policy)
+            .await
+            .expect("spawn background fixture");
+        let pid = spawn.pid_handle;
+        let (kill, kill_signal) = task_kill_channel();
+        let exit_observation: BackgroundLeaderExitObservation = Box::pin(async move {
+            observe_process_leader_exit(pid).await?;
+            kill.kill();
+            Ok(())
+        });
+        let output = shared_task_output(1024, 64);
+        let status = tokio::time::timeout(
+            haider_platform::TEST_WAIT_TIMEOUT,
+            supervise_background_with_exit_observation(
+                spawn,
+                kill_signal,
+                Arc::clone(&output),
+                Duration::from_millis(10),
+                exit_observation,
+            ),
+        )
+        .await
+        .expect("natural background completion stays bounded");
+        assert_eq!(status.exit_code, Some(0));
+        assert!(
+            !status.killed,
+            "late kill must not relabel natural completion: {status:?}"
+        );
+        assert!(
+            status.fault.is_none(),
+            "late kill must not start a sweep: {status:?}"
+        );
+        assert_eq!(lock_task_output(&output).retained(), b"leader");
+        let mut byte = [0];
+        reader
+            .read_exact(&mut byte)
+            .expect("descendant readiness byte");
+        assert_eq!(byte, *b"r");
+        let alive = reader.read(&mut byte);
+        assert!(
+            matches!(alive, Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "late kill signalled the naturally detached descendant: {alive:?}"
+        );
+        std::fs::write(workspace.path().join("cleanup"), b"released")
+            .expect("release descendant cleanup");
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+            loop {
+                match reader.read(&mut byte) {
+                    Ok(0) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    other => panic!("unexpected descendant lifetime read: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("descendant closes its lifetime descriptor after cleanup");
+        broker.close().await.expect("broker closes");
     }
 
     /// A background exit-observer error while the leader is live is a
