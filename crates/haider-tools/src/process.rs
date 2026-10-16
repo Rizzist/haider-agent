@@ -50,6 +50,12 @@ use tokio::time::{Sleep, sleep};
 #[path = "process_sweep_tests.rs"]
 mod sweep_tests;
 
+#[cfg(all(test, unix))]
+#[path = "process_completion_fixture.rs"]
+mod completion_fixture;
+#[cfg(all(test, unix))]
+pub(crate) use completion_fixture::NaturalExitFixture;
+
 #[cfg(unix)]
 type DirectoryIdentity = rustix::fs::Stat;
 #[cfg(windows)]
@@ -1099,26 +1105,34 @@ struct Supervisor {
     process_trace: bool,
 }
 
-struct AbortProcessGroup {
+struct ProcessGroupAuthority {
+    // Cleared before reap releases the leader's PID/PGID identity. Desktop
+    // ownership is relinquished on abort; standalone additionally sweeps it.
     group: Option<ProcessGroup>,
+    kill_on_abort: bool,
 }
 
-impl Drop for AbortProcessGroup {
+impl Drop for ProcessGroupAuthority {
     fn drop(&mut self) {
-        if let Some(group) = self.group.take() {
+        if self.kill_on_abort
+            && let Some(group) = self.group.take()
+        {
             let _ = haider_platform::signal_process_group(group, Signal::KILL);
         }
     }
 }
 
 #[cfg(all(test, unix))]
-pub(crate) struct FixtureProcessGroup(AbortProcessGroup);
+pub(crate) struct FixtureProcessGroup(ProcessGroupAuthority);
 
 #[cfg(all(test, unix))]
 #[allow(clippy::expect_used)]
 impl FixtureProcessGroup {
     pub(crate) fn new(group: ProcessGroup) -> Self {
-        Self(AbortProcessGroup { group: Some(group) })
+        Self(ProcessGroupAuthority {
+            group: Some(group),
+            kill_on_abort: true,
+        })
     }
 
     pub(crate) async fn assert_swept(&mut self, pid: i32) {
@@ -1296,8 +1310,9 @@ async fn supervise_process_with_exit_observation(
     } = supervisor;
     // Declared after Child: abort drops this guard before the unreaped child,
     // while its PGID is still pinned. Never retain numeric authority after reap.
-    let mut abort_group = AbortProcessGroup {
-        group: cfg!(feature = "android-standalone").then_some(group),
+    let mut group_authority = ProcessGroupAuthority {
+        group: Some(group),
+        kill_on_abort: cfg!(feature = "android-standalone"),
     };
     let (captured_sender, mut captured) = mpsc::channel(1);
     let (output_stop, stdout_stop) = watch::channel(false);
@@ -1354,7 +1369,7 @@ async fn supervise_process_with_exit_observation(
     if cancelled {
         group_termination_started = true;
         begin_group_termination(
-            group,
+            group_authority.group,
             pid,
             false,
             bounds.kill_grace,
@@ -1370,13 +1385,13 @@ async fn supervise_process_with_exit_observation(
     {
         tokio::select! {
             biased;
-            changed = cancel.changed(), if !cancelled && cancel_open => {
+            changed = cancel.changed(), if !cancelled && cancel_open && !natural_completion_won => {
                 match changed {
                     Ok(()) if *cancel.borrow() => {
                         cancelled = true;
                         group_termination_started = true;
                         begin_group_termination(
-                            group,
+                            group_authority.group,
                             pid,
                             false,
                             bounds.kill_grace,
@@ -1395,7 +1410,7 @@ async fn supervise_process_with_exit_observation(
                 limit_reached = Some(ProcessLimit::WallTimeout);
                 group_termination_started = true;
                 begin_group_termination(
-                    group,
+                    group_authority.group,
                     pid,
                     false,
                     bounds.kill_grace,
@@ -1467,7 +1482,7 @@ async fn supervise_process_with_exit_observation(
                                 fatal.get_or_insert(error);
                                 group_termination_started = true;
                                 begin_group_termination(
-                                    group,
+                                    group_authority.group,
                                     pid,
                                     false,
                                     bounds.kill_grace,
@@ -1509,7 +1524,7 @@ async fn supervise_process_with_exit_observation(
                         if transcript_failed {
                             group_termination_started = true;
                             begin_group_termination(
-                                group,
+                                group_authority.group,
                                 pid,
                                 false,
                                 bounds.kill_grace,
@@ -1527,7 +1542,7 @@ async fn supervise_process_with_exit_observation(
                                 transcript_failed = true;
                                 group_termination_started = true;
                                 begin_group_termination(
-                                    group,
+                                    group_authority.group,
                                     pid,
                                     false,
                                     bounds.kill_grace,
@@ -1546,7 +1561,7 @@ async fn supervise_process_with_exit_observation(
                             limit_reached = Some(ProcessLimit::OutputCap);
                             group_termination_started = true;
                             begin_group_termination(
-                                group,
+                                group_authority.group,
                                 pid,
                                 false,
                                 bounds.kill_grace,
@@ -1563,7 +1578,7 @@ async fn supervise_process_with_exit_observation(
                         });
                         group_termination_started = true;
                         begin_group_termination(
-                            group,
+                            group_authority.group,
                             pid,
                             false,
                             bounds.kill_grace,
@@ -1591,7 +1606,7 @@ async fn supervise_process_with_exit_observation(
                         fatal.get_or_insert(error);
                         group_termination_started = true;
                         begin_group_termination(
-                            group,
+                            group_authority.group,
                             pid,
                             false,
                             bounds.kill_grace,
@@ -1607,7 +1622,7 @@ async fn supervise_process_with_exit_observation(
                     natural_completion_won = true;
                     group_termination_started = true;
                     lifecycle_events.push(ProcessLifecycleEvent::NormalCompletionSweeping);
-                    begin_group_termination(group, pid, leader_is_zombie, bounds.kill_grace,
+                    begin_group_termination(group_authority.group, pid, leader_is_zombie, bounds.kill_grace,
                         &mut kill_deadline, &mut fatal, &mut escalation_notes, &mut lifecycle_events).await;
                 }
                 if kill_deadline.is_none() {
@@ -1631,7 +1646,7 @@ async fn supervise_process_with_exit_observation(
                     let control = control_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     live.store(false, Ordering::Release);
                     drop(control);
-                    abort_group.group = None;
+                    group_authority.group = None;
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -1729,7 +1744,7 @@ async fn supervise_process_with_exit_observation(
                     let control = control_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     live.store(false, Ordering::Release);
                     drop(control);
-                    abort_group.group = None;
+                    group_authority.group = None;
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -2222,7 +2237,7 @@ pub(crate) async fn reap_process_leader(
 /// to target the original group rather than a recycled one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn begin_group_termination(
-    group: ProcessGroup,
+    group: Option<ProcessGroup>,
     pid: Pid,
     leader_is_zombie: bool,
     grace: Duration,
@@ -2231,6 +2246,11 @@ pub(crate) async fn begin_group_termination(
     notes: &mut Vec<String>,
     lifecycle_events: &mut Vec<ProcessLifecycleEvent>,
 ) {
+    let Some(group) = group else {
+        // Reaping ends numeric group authority. Late output/error/cancel
+        // work may finish its ledger, but cannot start another sweep.
+        return;
+    };
     if deadline.is_some() {
         return;
     }
@@ -2597,6 +2617,147 @@ mod supervisor_tests {
         async fn emit(&self, _call_id: &str, _delta: ItemDelta) -> ToolResult<()> {
             Ok(())
         }
+    }
+
+    #[allow(clippy::expect_used)]
+    #[tokio::test]
+    async fn late_cancellation_during_natural_output_drain_leaves_descendant_alive() {
+        let mut fixture = NaturalExitFixture::new();
+        let mut command = shell_command(fixture.command());
+        command
+            .env_clear()
+            .current_dir(fixture.workspace())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        haider_platform::configure_process_environment(&mut command);
+        haider_platform::configure_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn foreground lifetime fixture");
+        let raw_pid = child.id().expect("fixture pid");
+        let pid = haider_platform::process_id(Some(raw_pid)).expect("valid fixture pid");
+        let group = haider_platform::register_process_group(raw_pid).expect("fixture group");
+        let stdout = child.stdout.take().expect("fixture stdout");
+        let stderr = child.stderr.take().expect("fixture stderr");
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let (cancel, cancel_signal) = watch::channel(false);
+        let live = Arc::new(AtomicBool::new(true));
+        let leaked = Arc::new(AtomicBool::new(false));
+        // The cancel arm was already polled Pending when this future queues
+        // the request. Its next select poll follows natural leader reaping.
+        let exit_observation: LeaderExitObservation = Box::pin(async move {
+            observe_process_leader_exit(pid).await?;
+            cancel.send_replace(true);
+            Ok(())
+        });
+        let completion = tokio::time::timeout(
+            haider_platform::TEST_WAIT_TIMEOUT,
+            supervise_process_with_exit_observation(
+                Supervisor {
+                    child,
+                    stdout,
+                    stderr,
+                    stdin,
+                    pid,
+                    group,
+                    call_id: "foreground-late-cancel".into(),
+                    effect: EffectId::new("effect-foreground-late-cancel"),
+                    command_arg_digest: "blake3:test".into(),
+                    workspace_revision: None,
+                    cancel: cancel_signal,
+                    live: Arc::clone(&live),
+                    leaked: Arc::clone(&leaked),
+                    control_gate: Arc::new(StdMutex::new(())),
+                    cas: Box::new(NoopCas),
+                    output: Arc::new(NoopOutput),
+                    bounds: ProcessBounds {
+                        kill_grace: Duration::from_millis(10),
+                        ..ProcessBounds::default()
+                    },
+                },
+                exit_observation,
+            ),
+        )
+        .await
+        .expect("natural foreground completion stays bounded");
+        let result = completion
+            .result
+            .expect("late cancellation must not start a sweep");
+        assert_eq!(
+            result.status,
+            ToolStatus::Completed,
+            "late cancellation cannot relabel natural completion"
+        );
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output_bytes, 6, "natural output is still drained");
+        assert!(!completion.cancelled && !completion.leaked);
+        assert!(!live.load(Ordering::Acquire) && !leaked.load(Ordering::Acquire));
+        assert!(
+            !result
+                .lifecycle_events
+                .contains(&ProcessLifecycleEvent::GroupSweepStarted)
+        );
+        fixture.assert_alive().await;
+        fixture.finish().await;
+    }
+
+    #[allow(clippy::expect_used)]
+    #[tokio::test]
+    async fn relinquished_group_cannot_start_a_new_sweep() {
+        let pid = Pid::from_raw(999_999_990).expect("nonexistent fixture pid");
+        let mut deadline = None;
+        let mut fatal = Some(ToolError::Runtime {
+            message: "existing output fault".into(),
+        });
+        let mut notes = vec!["existing output fault".to_owned()];
+        let mut events = Vec::new();
+        begin_group_termination(
+            None,
+            pid,
+            true,
+            Duration::from_millis(10),
+            &mut deadline,
+            &mut fatal,
+            &mut notes,
+            &mut events,
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "relinquished authority must not probe or signal a group"
+        );
+        assert!(deadline.is_none());
+        assert!(
+            fatal
+                .expect("existing fault retained")
+                .to_string()
+                .contains("existing output fault")
+        );
+        assert_eq!(notes, ["existing output fault"]);
+
+        // An owned authority still enters the sweep, including the ordinary
+        // missing-group completion path. Rejecting every request is not a fix.
+        let group = haider_platform::process_group(Some(pid.id())).expect("fixture group id");
+        let mut fatal = None;
+        notes.clear();
+        begin_group_termination(
+            Some(group),
+            pid,
+            false,
+            Duration::from_millis(10),
+            &mut deadline,
+            &mut fatal,
+            &mut notes,
+            &mut events,
+        )
+        .await;
+        assert_eq!(
+            events,
+            [
+                ProcessLifecycleEvent::GroupSweepStarted,
+                ProcessLifecycleEvent::GroupSweepCompleted
+            ]
+        );
+        assert!(fatal.is_none() && notes.is_empty() && deadline.is_none());
     }
 
     /// A kernel exit-observer error while the leader is live is a supervision

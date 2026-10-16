@@ -653,7 +653,7 @@ pub struct BackgroundExitStatus {
     pub exit_code: Option<i32>,
     /// Terminating signal when no conventional exit code exists.
     pub signal: Option<i32>,
-    /// True when the kill ladder was requested before the leader exited.
+    /// True when the kill ladder was requested before natural exit was observed.
     pub killed: bool,
     /// Supervision fault detail (probe/signal/reap errors), if any.
     pub fault: Option<String>,
@@ -733,6 +733,7 @@ async fn supervise_background_with_exit_observation(
     let mut leader_exit_observed = false;
     let mut leader_is_zombie = false;
     let mut leader_reaped = false;
+    let mut sweep_group = Some(group);
     #[cfg(windows)]
     let mut normal_completion_relinquished = false;
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
@@ -740,7 +741,7 @@ async fn supervise_background_with_exit_observation(
     if *kill.borrow() {
         killed = true;
         begin_group_termination(
-            group,
+            sweep_group,
             pid,
             false,
             grace,
@@ -763,7 +764,7 @@ async fn supervise_background_with_exit_observation(
                     Ok(()) if *kill.borrow() => {
                         killed = true;
                         begin_group_termination(
-                            group,
+                            sweep_group,
                             pid,
                             leader_is_zombie,
                             grace,
@@ -816,7 +817,7 @@ async fn supervise_background_with_exit_observation(
                         fatal.get_or_insert(error);
                         killed = true;
                         begin_group_termination(
-                            group,
+                            sweep_group,
                             pid,
                             false,
                             grace,
@@ -829,6 +830,7 @@ async fn supervise_background_with_exit_observation(
                     }
                 };
                 if kill_deadline.is_none() {
+                    sweep_group = None;
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -913,6 +915,7 @@ async fn supervise_background_with_exit_observation(
                     }
                 }
                 if kill_deadline.is_none() && leader_exit_observed && !leader_reaped {
+                    sweep_group = None;
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -1014,33 +1017,15 @@ mod supervisor_tests {
         }
     }
 
-    /// Queue a kill inside the exit-observation poll: the select's kill arm
-    /// has already returned Pending, so the next poll is after natural reap.
-    /// The descendant retains stdout to keep that next drain poll necessary.
+    /// Queue the kill after its arm was polled Pending and real exit was
+    /// observed. The next drain poll is after reap; the descendant must still
+    /// answer a fresh FIFO request after supervision returns.
     #[tokio::test]
     async fn late_kill_during_natural_output_drain_leaves_descendant_alive() {
-        use std::io::Read as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        let workspace = tempfile::tempdir().expect("late background kill workspace");
-        let lifetime = workspace.path().join("lifetime.fifo");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&lifetime)
-                .status()
-                .expect("create descendant lifetime FIFO")
-                .success()
-        );
-        let mut reader = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(
-                i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).expect("nonblocking flag"),
-            )
-            .open(&lifetime)
-            .expect("open descendant lifetime reader");
+        let mut fixture = crate::process::NaturalExitFixture::new();
         let mut broker = EffectBroker::new_at(
             Box::new(NoopJournal),
-            workspace.path(),
+            fixture.workspace(),
             SessionId::new("background-late-kill-session"),
             1,
             1_700_000_000_000,
@@ -1049,18 +1034,7 @@ mod supervisor_tests {
         let mut policy = PermissionPolicy::default();
         policy.allow(EffectClass::ProcessExec);
         let operation = BackgroundExec::new(
-            ProcessExec::new(
-                "background-late-kill",
-                concat!(
-                    "/usr/bin/perl -e '$pid=fork; die $! unless defined $pid; ",
-                    "if ($pid) { while (!-e q(started)) { select undef, undef, undef, 0.01 }; ",
-                    "print q(leader); exit 0 } ",
-                    "open $life, q(>), q(lifetime.fifo) or die $!; ",
-                    "syswrite($life, q(r)) == 1 or die $!; ",
-                    "open $started, q(>), q(started) or die $!; close $started; alarm 60; ",
-                    "while (!-e q(cleanup)) { select undef, undef, undef, 0.01 }'",
-                ),
-            ),
+            ProcessExec::new("background-late-kill", fixture.command()),
             "background-late-kill",
         )
         .expect("valid background operation");
@@ -1098,31 +1072,8 @@ mod supervisor_tests {
             "late kill must not start a sweep: {status:?}"
         );
         assert_eq!(lock_task_output(&output).retained(), b"leader");
-        let mut byte = [0];
-        reader
-            .read_exact(&mut byte)
-            .expect("descendant readiness byte");
-        assert_eq!(byte, *b"r");
-        let alive = reader.read(&mut byte);
-        assert!(
-            matches!(alive, Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock),
-            "late kill signalled the naturally detached descendant: {alive:?}"
-        );
-        std::fs::write(workspace.path().join("cleanup"), b"released")
-            .expect("release descendant cleanup");
-        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
-            loop {
-                match reader.read(&mut byte) {
-                    Ok(0) => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                    other => panic!("unexpected descendant lifetime read: {other:?}"),
-                }
-            }
-        })
-        .await
-        .expect("descendant closes its lifetime descriptor after cleanup");
+        fixture.assert_alive().await;
+        fixture.finish().await;
         broker.close().await.expect("broker closes");
     }
 
