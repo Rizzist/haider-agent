@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 
 use haider_client::{ProfileEnv, ResolvedProfile, resolve_profile};
 
+#[path = "support/daemon_identity.rs"]
+mod daemon_identity;
+
 fn haider_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_haider"))
 }
@@ -102,6 +105,9 @@ fn haider_command(store: &Path) -> Command {
     command
         .env("HAIDER_PROFILE_DIR", store)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env_remove("HAIDER_CLIENT_LIFECYCLE_TRACE")
+        .env_remove("HAIDER_DAEMON_TRACE")
+        .env_remove("HAIDER_PHASE_TRACE_DIR")
         // The harness resolves its expected endpoint with
         // `xdg_runtime_dir: None`; the CHILD must agree. On CI Linux the
         // runner exports XDG_RUNTIME_DIR=/run/user/NNN, so an inheriting
@@ -519,6 +525,8 @@ struct DaemonGuard {
 }
 
 impl DaemonGuard {
+    // Only startup observation and best-effort teardown use this transient
+    // diagnostic. A launcher may outlive its daemon's normal idle retirement.
     fn pid(&self) -> Option<u32> {
         let contents = std::fs::read_to_string(self.store.join("lock.owner")).ok()?;
         contents
@@ -527,8 +535,7 @@ impl DaemonGuard {
             .and_then(|pid| pid.trim().parse().ok())
     }
 
-    fn terminate_and_wait(&self, endpoint: &Path) {
-        let pid = self.pid().expect("running daemon PID before cleanup");
+    fn terminate_and_wait(&self, endpoint: &Path, pid: u32) {
         let _ = Command::new("kill").arg(pid.to_string()).status();
         let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
         while (process_exists(pid) || endpoint.exists()) && Instant::now() < deadline {
@@ -540,6 +547,68 @@ impl DaemonGuard {
     }
 }
 
+/// The launcher emits this authenticated child identity before releasing its
+/// connection/liveness guard. Captured output survives normal idle cleanup.
+fn spawned_daemon_pid(output: &Output) -> u32 {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let pids = stderr
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix(
+                "haider: lifecycle event=spawn_ready_candidate path=own_child candidate_pid=",
+            )
+        })
+        .map(|pid| pid.parse::<u32>().expect("numeric authenticated child PID"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pids.len(),
+        1,
+        "one authenticated spawn receipt required: status={} stdout={} stderr={stderr}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert_ne!(pids[0], 0, "spawn receipt must identify a process");
+    pids[0]
+}
+
+/// Exit traces live in a fixture-owned directory outside the runtime cleanup
+/// tree. Only the daemon opens the event store for this RPC-only invocation.
+/// Read complete JSON records: the exit guard may still be flushing the file.
+fn traced_daemon_pid(directory: &Path) -> u32 {
+    let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+    loop {
+        if let Some(pid) = daemon_identity::published_exit_pid(directory) {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not publish its durable exit identity"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn live_daemon_pid(store: &Path) -> u32 {
+    let output = output_with_timeout(
+        haider_command(store).args(["status", "--json", "--no-spawn"]),
+        "live daemon identity status",
+    );
+    assert!(
+        output.status.success(),
+        "live status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("live daemon status JSON");
+    let pid = status["daemon"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("status reply carries daemon PID");
+    assert_ne!(pid, 0, "status reply must identify a process");
+    pid
+}
+
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.pid() {
@@ -548,7 +617,7 @@ impl Drop for DaemonGuard {
     }
 }
 
-fn assert_daemon_serves(profile: &ResolvedProfile) {
+fn assert_daemon_serves(profile: &ResolvedProfile) -> u32 {
     let endpoint = profile.endpoint_path.clone();
     let expected_profile = profile.profile_id.clone();
     let daemon_log = profile
@@ -582,8 +651,13 @@ fn assert_daemon_serves(profile: &ResolvedProfile) {
                 .is_superset(&haider_client::required_live_features()),
             "daemon must advertise the live feature families"
         );
+        let pid = connected
+            .peer_credentials
+            .pid
+            .expect("live authenticated daemon PID");
         let _ = connected.client.close();
-    });
+        pid
+    })
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -1096,12 +1170,13 @@ fn real_status_tui_and_probe_autospawns_share_short_idle_ttl() {
     ] {
         let store = tempfile::tempdir().expect("store dir");
         let profile = resolved_for(store.path());
-        let guard = DaemonGuard {
+        let _guard = DaemonGuard {
             store: store.path().to_path_buf(),
         };
         let output = output_with_timeout(
             haider_command(store.path())
                 .args(arguments)
+                .env("HAIDER_CLIENT_LIFECYCLE_TRACE", "1")
                 .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS),
             &format!("{spawn_path} short-idle-TTL invocation"),
         );
@@ -1115,16 +1190,13 @@ fn real_status_tui_and_probe_autospawns_share_short_idle_ttl() {
             );
         }
 
-        let daemon_pid = guard.pid().unwrap_or_else(|| {
-            panic!(
-                "{spawn_path} did not spawn a daemon: status={} stdout={} stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            )
-        });
+        let daemon_pid = spawned_daemon_pid(&output);
         wait_for_idle_daemon_exit(&profile, daemon_pid, spawn_path);
         assert_idle_linger_receipt(store.path(), 250);
+        assert!(!store.path().join("lock.owner").exists());
+        // Deliberately observe identity again after the transient diagnostics
+        // are gone. Collection may be delayed by arbitrarily busy runners.
+        assert_eq!(spawned_daemon_pid(&output), daemon_pid);
     }
 }
 
@@ -1144,9 +1216,11 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
     let profile = resolved_for(store.path());
-    let guard = DaemonGuard {
+    let _guard = DaemonGuard {
         store: store.path().to_path_buf(),
     };
+    let traces = store.path().join("exit-traces");
+    std::fs::create_dir(&traces).expect("fixture-owned exit trace directory");
     let output = output_with_timeout(
         haider_command(store.path())
             .args(["run", "--provider", "fake", "--json", "-p", "hello"])
@@ -1154,6 +1228,7 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
                 "HAIDER_TEST_FAKE_PROVIDER",
                 r#"[{"step":"emit_text","text":"ok"},{"step":"finish","reason":"end_turn"}]"#,
             )
+            .env("HAIDER_PHASE_TRACE_DIR", &traces)
             .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string()),
         "short-idle-TTL run invocation",
     );
@@ -1165,7 +1240,7 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let daemon_pid = guard.pid().expect("spawned daemon PID");
+    let daemon_pid = traced_daemon_pid(&traces);
     let process_id = haider_platform::process_id(Some(daemon_pid)).expect("valid daemon PID");
     match haider_platform::ProcessExitMonitor::capture(process_id) {
         Ok(exit) => {
@@ -1183,8 +1258,8 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
             });
         }
         Err(error) if !process_exists(daemon_pid) => {
-            // A sufficiently fast daemon may exit between reading lock.owner
-            // and retaining its process identity; that is the required state.
+            // The captured receipt remains valid if normal idle retirement
+            // precedes retaining a kernel process identity.
             let _ = error;
         }
         Err(error) => panic!("retain spawned daemon process identity: {error}"),
@@ -1194,6 +1269,8 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
         "idle exit must remove the profile endpoint"
     );
     assert_idle_linger_receipt(store.path(), IDLE_TTL_MS);
+    assert!(!store.path().join("lock.owner").exists());
+    assert_eq!(traced_daemon_pid(&traces), daemon_pid);
 }
 
 /// Abrupt launcher death leaves no cancellation receipt, so a hanging fake
@@ -1286,7 +1363,7 @@ fn repeated_run_invocations_default_to_one_warm_daemon_until_operator_stop() {
     ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
     let profile = resolved_for(store.path());
-    let guard = DaemonGuard {
+    let _guard = DaemonGuard {
         store: store.path().to_path_buf(),
     };
     let fake_script = concat!(
@@ -1309,7 +1386,7 @@ fn repeated_run_invocations_default_to_one_warm_daemon_until_operator_stop() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        daemon_pids.push(guard.pid().expect("lingering daemon PID"));
+        daemon_pids.push(live_daemon_pid(store.path()));
     }
     assert!(
         daemon_pids.windows(2).all(|pair| pair[0] == pair[1]),
@@ -1397,6 +1474,7 @@ fn clients_immediately_after_daemon_pid_publication_all_wait_and_succeed() {
 
     let mut starter = haider_command(store.path())
         .arg("--ready")
+        .env("HAIDER_CLIENT_LIFECYCLE_TRACE", "1")
         .env("HAIDER_TEST_FAKE_PROVIDER", &fake_script)
         .env("HAIDER_TEST_READY_DELAY_MS", READY_DELAY_MS.to_string())
         .spawn()
@@ -1457,8 +1535,8 @@ fn clients_immediately_after_daemon_pid_publication_all_wait_and_succeed() {
     );
     assert!(String::from_utf8_lossy(&starter.stdout).contains("daemon ready"));
     assert_eq!(
-        guard.pid(),
-        Some(daemon_pid),
+        spawned_daemon_pid(&starter),
+        daemon_pid,
         "one daemon must serve every client"
     );
 
@@ -1474,7 +1552,7 @@ fn clients_immediately_after_daemon_pid_publication_all_wait_and_succeed() {
     assert!(status["daemon"]["ready_since"].as_u64().is_some());
     assert_eq!(status["daemon"]["providers_loaded"], true);
 
-    guard.terminate_and_wait(&profile.endpoint_path);
+    guard.terminate_and_wait(&profile.endpoint_path, daemon_pid);
 }
 
 // MUTATION CHECK: notify the inherited startup pipe from Recovering instead
@@ -1488,7 +1566,7 @@ fn launcher_readiness_pipe_stays_silent_until_positive_predicate() {
     let haiderd = ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
     let profile = resolved_for(store.path());
-    let guard = DaemonGuard {
+    let _guard = DaemonGuard {
         store: store.path().to_path_buf(),
     };
     let log_path =
@@ -1555,7 +1633,7 @@ fn launcher_readiness_pipe_stays_silent_until_positive_predicate() {
             .expect("positive readiness pipe result");
     });
 
-    let pid = guard.pid().expect("running daemon PID before cleanup");
+    let pid = child.id();
     let signal = Command::new("kill")
         .arg(pid.to_string())
         .status()
@@ -1608,7 +1686,7 @@ fn two_simultaneous_launchers_elect_one_daemon_and_both_reach_ready() {
 
     // Exactly one daemon serves the shared endpoint afterward, and a third
     // launcher attaches without spawning.
-    assert_daemon_serves(&profile);
+    let daemon_pid = assert_daemon_serves(&profile);
     let third = output_with_timeout(
         &mut haider_command(store.path()),
         "third haider launcher to attach and exit",
@@ -1620,7 +1698,7 @@ fn two_simultaneous_launchers_elect_one_daemon_and_both_reach_ready() {
         String::from_utf8_lossy(&third.stdout)
     );
 
-    guard.terminate_and_wait(&profile.endpoint_path);
+    guard.terminate_and_wait(&profile.endpoint_path, daemon_pid);
 }
 
 // MUTATION CHECK: stale-endpoint recovery is exclusively the lock-winning
@@ -1657,7 +1735,7 @@ fn stale_owner_socket_is_recovered_by_the_winning_daemon() {
     );
 
     let output = output_with_timeout(
-        &mut haider_command(store.path()),
+        haider_command(store.path()).env("HAIDER_CLIENT_LIFECYCLE_TRACE", "1"),
         "haider launcher to recover the stale socket and exit",
     );
     assert!(
@@ -1669,7 +1747,7 @@ fn stale_owner_socket_is_recovered_by_the_winning_daemon() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("daemon ready"));
     assert_daemon_serves(&profile);
 
-    guard.terminate_and_wait(&profile.endpoint_path);
+    guard.terminate_and_wait(&profile.endpoint_path, spawned_daemon_pid(&output));
 }
 
 // MUTATION CHECK: R8 shutdown policy — parent exit leaves the daemon
@@ -1719,7 +1797,7 @@ fn parent_exit_leaves_the_daemon_running() {
         assert_eq!(mode, 0o600, "daemon log must be owner-only");
     }
 
-    guard.terminate_and_wait(&profile.endpoint_path);
+    guard.terminate_and_wait(&profile.endpoint_path, spawned_daemon_pid(&output));
 }
 
 #[test]
@@ -1731,12 +1809,12 @@ fn parent_exit_liveness_assertion_rejects_a_stopped_daemon() {
         store: store.path().to_path_buf(),
     };
     let output = output_with_timeout(
-        &mut haider_command(store.path()),
+        haider_command(store.path()).env("HAIDER_CLIENT_LIFECYCLE_TRACE", "1"),
         "negative-control launcher",
     );
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("daemon ready"));
-    guard.terminate_and_wait(&profile.endpoint_path);
+    guard.terminate_and_wait(&profile.endpoint_path, spawned_daemon_pid(&output));
     assert!(
         std::panic::catch_unwind(|| assert_daemon_serves(&profile)).is_err(),
         "post-exit liveness must reject a daemon that genuinely stopped"

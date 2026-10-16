@@ -1,6 +1,10 @@
 #![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
 //! Black-box tests for the `haider` binary surface.
 
+#[cfg(unix)]
+#[path = "support/daemon_identity.rs"]
+mod daemon_identity;
+
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
 use haider_protocol::envelope::RawEnvelope;
@@ -167,6 +171,36 @@ fn daemon_pid(profile: &Path) -> Option<u32> {
         .ok()
 }
 
+// Required post-launcher identity comes from a live reply. The diagnostic
+// file above is only a best-effort cleanup/startup or absence observation.
+fn live_daemon_pid(profile: &Path) -> u32 {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut command, profile);
+    let output = command
+        .args(["status", "--json", "--no-spawn"])
+        .env("HAIDER_PROFILE_DIR", profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .output()
+        .expect("query live daemon identity");
+    status_daemon_pid(&output)
+}
+
+fn status_daemon_pid(output: &std::process::Output) -> u32 {
+    assert!(
+        output.status.success(),
+        "live status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("live status JSON");
+    status["daemon"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+        .expect("status reply carries daemon PID")
+}
+
 fn terminate_daemon_checked(profile: &Path) -> std::io::Result<()> {
     let pid = daemon_pid(profile).ok_or_else(|| {
         std::io::Error::new(
@@ -177,6 +211,10 @@ fn terminate_daemon_checked(profile: &Path) -> std::io::Result<()> {
             ),
         )
     })?;
+    terminate_daemon_pid_checked(pid)
+}
+
+fn terminate_daemon_pid_checked(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let status = Command::new("kill")
@@ -221,18 +259,6 @@ fn assert_terminal_jsonl_error(output: &std::process::Output) -> Vec<serde_json:
     assert!(terminal["error"]["message"].as_str().is_some());
     assert!(terminal["error"]["retryable"].as_bool().is_some());
     values
-}
-
-#[cfg(unix)]
-fn wait_for_daemon_pid(profile: &Path) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(pid) = daemon_pid(profile) {
-            return pid;
-        }
-        assert!(Instant::now() < deadline, "daemon PID publication deadline");
-        thread::sleep(Duration::from_millis(5));
-    }
 }
 
 #[cfg(unix)]
@@ -752,7 +778,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
             .is_some_and(|rows| rows.iter().any(|row| row["source"] == "static")),
         "the initial subscription catalog is published: {haider_code}"
     );
-    let daemon = wait_for_daemon_pid(&owner.profile);
+    let daemon = live_daemon_pid(&owner.profile);
     let proxy = CredentialCatalogProxy::start();
 
     // A held request that eventually 404s cannot sit on the mutation path.
@@ -816,7 +842,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
             .iter()
             .any(|account| account["alias"] == "catalog-failure")
     );
-    assert_eq!(daemon_pid(&owner.profile), Some(daemon));
+    assert_eq!(live_daemon_pid(&owner.profile), daemon);
 
     // Start the second case with a deliberately fabricated catalog, then
     // replace the credential while the endpoint 404s. A different key is a
@@ -946,7 +972,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         concurrent_before + 1,
         "a duplicate discovery started after the shared flight completed"
     );
-    assert_eq!(daemon_pid(&owner.profile), Some(daemon));
+    assert_eq!(live_daemon_pid(&owner.profile), daemon);
 
     // The discovered id is selectable immediately and the next turn uses the
     // production OpenAI-compatible adapter, not HAIDER_TEST_FAKE_PROVIDER.
@@ -986,7 +1012,7 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .expect("production adapter HTTP request");
     assert_eq!(request["model"], "real-current");
-    assert_eq!(daemon_pid(&owner.profile), Some(daemon));
+    assert_eq!(live_daemon_pid(&owner.profile), daemon);
 }
 
 fn run_custom_model_wire_case(
@@ -1784,7 +1810,7 @@ fn kill9_after_provider_admission_exposes_typed_probe_recovery() {
         thread::sleep(Duration::from_millis(20));
     }
 
-    let killed_pid = wait_for_daemon_pid(&starter.profile);
+    let killed_pid = live_daemon_pid(&starter.profile);
     let killed = Command::new("kill")
         .args(["-9", &killed_pid.to_string()])
         .status()
@@ -2674,20 +2700,22 @@ fn run_jsonl_bootstrap_failures_always_end_in_a_typed_error_record() {
 #[cfg(unix)]
 #[test]
 fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() {
-    let delayed_fake = concat!(
-        r#"[{"step":"delay","ms":300},{"step":"emit_text","text":"done"},{"step":"finish","reason":"end_turn"},"#,
+    let fake_script = concat!(
+        r#"[{"step":"emit_text","text":"done"},{"step":"finish","reason":"end_turn"},"#,
         r#"{"step":"emit_text","text":"done"},{"step":"finish","reason":"end_turn"}]"#,
     );
     let mut success = haider();
     let success_endpoint = configure_isolated_runtime(&mut success);
+    let success_traces = success._profile_root.path().join("exit-traces");
+    std::fs::create_dir(&success_traces).expect("successful one-shot exit trace directory");
     success
-        .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
+        .env("HAIDER_PHASE_TRACE_DIR", &success_traces)
+        .env("HAIDER_TEST_FAKE_PROVIDER", fake_script)
         .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .args(["run", "--provider", "fake", "--jsonl", "hello"]);
     let success_child = success.spawn().expect("spawn successful one-shot");
-    let success_pid = wait_for_daemon_pid(&success.profile);
     let success_output = success_child
         .wait_with_output()
         .expect("successful one-shot exits");
@@ -2706,6 +2734,10 @@ fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() 
         String::from_utf8_lossy(&success_output.stderr),
         success_logs
     );
+    // Checked one-shot shutdown must have finished before CLI return. Do not
+    // wait for trace publication here: a missing receipt is itself a failure.
+    let success_pid = daemon_identity::published_exit_pid(&success_traces)
+        .expect("owned daemon exit trace must be published before CLI return");
     assert!(
         !process_is_alive(success_pid),
         "owned daemon must be reaped"
@@ -2716,7 +2748,10 @@ fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() 
 
     let mut bootstrap_failure = haider();
     let failure_endpoint = configure_isolated_runtime(&mut bootstrap_failure);
+    let failure_traces = bootstrap_failure._profile_root.path().join("exit-traces");
+    std::fs::create_dir(&failure_traces).expect("bootstrap-failing one-shot exit trace directory");
     bootstrap_failure
+        .env("HAIDER_PHASE_TRACE_DIR", &failure_traces)
         .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2724,12 +2759,13 @@ fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() 
     let failure_child = bootstrap_failure
         .spawn()
         .expect("spawn bootstrap-failing one-shot");
-    let failure_pid = wait_for_daemon_pid(&bootstrap_failure.profile);
     let failure_output = failure_child
         .wait_with_output()
         .expect("bootstrap-failing one-shot exits");
     assert_eq!(failure_output.status.code(), Some(65));
     assert_terminal_jsonl_error(&failure_output);
+    let failure_pid = daemon_identity::published_exit_pid(&failure_traces)
+        .expect("failed owned daemon exit trace must be published before CLI return");
     assert!(
         !process_is_alive(failure_pid),
         "owned daemon must be reaped"
@@ -2890,8 +2926,13 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
         "steady-state fence must be the durable queued-run envelope"
     );
     assert_eq!(
-        daemon_pid(&resident.profile),
-        Some(resident_pid),
+        status_daemon_pid(
+            &resident
+                .arg("--no-spawn")
+                .output()
+                .expect("resident status")
+        ),
+        resident_pid,
         "staged run must retain the exact resident daemon generation"
     );
     assert_eq!(
@@ -2989,7 +3030,7 @@ fn one_shot_never_shuts_down_a_prestarted_incumbent() {
         String::from_utf8_lossy(&ready.stderr),
         incumbent_logs
     );
-    let pid = daemon_pid(&incumbent.profile).expect("incumbent PID");
+    let pid = live_daemon_pid(&incumbent.profile);
 
     let mut attached = Command::new(env!("CARGO_BIN_EXE_haider"));
     configure_test_home(&mut attached, &incumbent.profile);
@@ -3005,11 +3046,11 @@ fn one_shot_never_shuts_down_a_prestarted_incumbent() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(daemon_pid(&incumbent.profile), Some(pid));
+    assert_eq!(live_daemon_pid(&incumbent.profile), pid);
     assert!(process_is_alive(pid));
     assert!(endpoint.exists());
     wait_for_profile_lock(&incumbent.profile, false);
-    terminate_daemon_checked(&incumbent.profile).expect("stop incumbent fixture");
+    terminate_daemon_pid_checked(pid).expect("stop incumbent fixture");
 }
 
 /// MUTATION CHECK: drop the profile-default fallback, restore catalog-first
@@ -5907,5 +5948,6 @@ fn preupgrade_go_session_cli_recovery_reselects_before_any_provider_round() {
         .expect("actual HTTP request");
     assert_eq!(request["model"], MODEL);
     proxy.join().expect("recording proxy exits");
-    terminate_daemon_checked(&command.profile).expect("stop owned upgrade daemon");
+    terminate_daemon_pid_checked(live_daemon_pid(&command.profile))
+        .expect("stop owned upgrade daemon");
 }
