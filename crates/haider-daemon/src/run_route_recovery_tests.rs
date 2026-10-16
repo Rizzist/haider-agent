@@ -1,4 +1,11 @@
+#![allow(clippy::expect_used)]
+
 use super::*;
+use crate::worker::provider_rebind::tests::{
+    RecordingRebindFactory, change_rotation_test_session, commit_test_rebind,
+    create_rebind_test_session, rebound_recovery_headless_spec, select_rotation_test_model,
+    start_legacy_rebind_test_run,
+};
 
 #[path = "run_route_legacy_fixtures.rs"]
 mod legacy_fixtures;

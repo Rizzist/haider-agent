@@ -3,6 +3,10 @@
 #[path = "provider_rebind_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "run_route_recovery_tests.rs"]
+mod run_route_recovery_tests;
+
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 

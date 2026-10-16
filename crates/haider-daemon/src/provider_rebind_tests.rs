@@ -4,10 +4,10 @@ use super::*;
 use haider_core::ProviderRebindResolver as _;
 
 #[derive(Default)]
-struct RecordingRebindFactory {
-    calls: std::sync::Mutex<Vec<SessionMetadataV1>>,
-    active_no_auth: std::sync::atomic::AtomicBool,
-    provider: Option<Arc<haider_provider::FakeProvider>>,
+pub(super) struct RecordingRebindFactory {
+    pub(super) calls: std::sync::Mutex<Vec<SessionMetadataV1>>,
+    pub(super) active_no_auth: std::sync::atomic::AtomicBool,
+    pub(super) provider: Option<Arc<haider_provider::FakeProvider>>,
 }
 
 #[async_trait]
@@ -39,7 +39,7 @@ impl ProviderFactory for RecordingRebindFactory {
     }
 }
 
-async fn create_rebind_test_session(hub: &SessionHub, session_id: &SessionId) {
+pub(super) async fn create_rebind_test_session(hub: &SessionHub, session_id: &SessionId) {
     hub.create_internal_session(haider_core::SessionCreateCommand {
         command_id: format!("create-{session_id}"),
         request_digest: format!("create-digest-{session_id}"),
@@ -74,7 +74,11 @@ async fn create_rebind_test_session(hub: &SessionHub, session_id: &SessionId) {
 
 // These resolver fixtures model legacy running turns without a durable pin.
 // Their route resolution still belongs to an accepted run and its branch.
-async fn start_legacy_rebind_test_run(hub: &SessionHub, session_id: &SessionId, generation: u64) {
+pub(super) async fn start_legacy_rebind_test_run(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    generation: u64,
+) {
     let run = RunId::new("rebind-test-run");
     let device = DeviceId::new("rebind-test-device");
     hub.accept_internal_turn(haider_core::TurnAcceptCommand {
@@ -112,7 +116,7 @@ async fn start_legacy_rebind_test_run(hub: &SessionHub, session_id: &SessionId, 
     .expect("start legacy run");
 }
 
-async fn commit_test_rebind(
+pub(super) async fn commit_test_rebind(
     hub: &SessionHub,
     session_id: &SessionId,
     generation: u64,
@@ -376,7 +380,7 @@ async fn provider_rebind_rejects_keyless_adapter_resolved_after_full_policy_rece
     store.close().await.expect("close");
 }
 
-fn rebound_recovery_headless_spec() -> HeadlessRunSpecV1 {
+pub(super) fn rebound_recovery_headless_spec() -> HeadlessRunSpecV1 {
     serde_json::from_value(serde_json::json!({
         "provider": "fake",
         "model": "initial-model",
@@ -1852,7 +1856,7 @@ fn rotation_route_facts(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn select_rotation_test_model(
+pub(super) async fn select_rotation_test_model(
     hub: &SessionHub,
     session: &SessionId,
     generation: u64,
@@ -1888,7 +1892,7 @@ async fn select_rotation_test_model(
     .expect("select");
 }
 
-async fn change_rotation_test_session(
+pub(super) async fn change_rotation_test_session(
     hub: &SessionHub,
     session: &SessionId,
     generation: u64,
@@ -2471,6 +2475,3 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
         "run-scoped epoch allocation failures: {failures:#?}"
     );
 }
-
-#[path = "run_route_recovery_tests.rs"]
-mod run_route_recovery_tests;
