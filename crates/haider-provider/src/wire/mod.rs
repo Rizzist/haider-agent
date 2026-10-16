@@ -1536,6 +1536,12 @@ impl StreamState {
                     },
                     StreamEvent::ServerToolUse {
                         call_id: id,
+                        activity: match name.as_str() {
+                            "web_search" | "web_fetch" => {
+                                Some(haider_protocol::activity::ActivityKind::Web)
+                            }
+                            _ => None,
+                        },
                         name,
                         args: input,
                     },

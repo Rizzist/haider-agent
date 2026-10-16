@@ -1,6 +1,8 @@
 package ai.diffforge.haider.ui.daemon
 
 import org.json.JSONArray
+import ai.diffforge.haider.R
+import androidx.annotation.StringRes
 import org.json.JSONObject
 
 /**
@@ -100,10 +102,75 @@ data class FleetNodeMetrics(
     val live: Boolean = false,
     val toolAttempts: Long = 0,
     val usage: FleetUsage? = null,
+    /** 973-activity-icons: the tracker state, when the daemon publishes it. */
+    val activity: FleetActivityState? = null,
 ) {
     fun elapsedMs(generatedAtMs: Long?): Long? {
         val end = terminalAtMs ?: generatedAtMs ?: return null
         return (end - startedAtMs).coerceAtLeast(0)
+    }
+}
+
+/**
+ * 973-activity-icons: `haider_protocol::activity::ActivityKind` — what an agent
+ * is DOING (not its state), highest priority first. The daemon derives it from
+ * typed tool identity; the phone only renders it. An unknown future kind is
+ * dropped (no glyph), never coerced onto a known one.
+ */
+enum class FleetActivity(
+    val wire: String,
+    val emoji: String,
+    val label: String,
+    /** Localizable screen-reader phrase. */
+    @StringRes val description: Int,
+) {
+    Computer("computer", "\uD83D\uDDA5\uFE0F", "[screen]", R.string.activity_computer),
+    Mobile("mobile", "\uD83D\uDCF1", "[phone]", R.string.activity_mobile),
+    Web("web", "\uD83C\uDF10", "[web]", R.string.activity_web),
+    Remote("remote", "\uD83D\uDD0C", "[remote]", R.string.activity_remote),
+    Edit("edit", "\u270F\uFE0F", "[edit]", R.string.activity_edit),
+    Run("run", "\u2699\uFE0F", "[run]", R.string.activity_run),
+    Read("read", "\uD83D\uDD0D", "[read]", R.string.activity_read),
+    Orchestrate("orchestrate", "\uD83E\uDDED", "[orch]", R.string.activity_orchestrate);
+
+    companion object {
+        fun of(raw: String?): FleetActivity? = values().firstOrNull { it.wire == raw }
+    }
+}
+
+/**
+ * 973-activity-icons: `ActivityStateV1` from the node's metrics — the
+ * daemon's time-independent tracker state. The phone evaluates it on its own
+ * clock (mapped onto the daemon's via the snapshot instant), so an icon
+ * decays between fetches exactly like the TUI's (8 s hot, 60 s linger).
+ */
+data class FleetActivityState(
+    val open: List<FleetActivity> = emptyList(),
+    val touched: Map<FleetActivity, Long> = emptyMap(),
+    val latest: Pair<FleetActivity, Long>? = null,
+    val terminal: Boolean = false,
+) {
+    /** Mirrors `ActivityTracker::current` (haider-protocol activity.rs). */
+    fun current(nowMs: Long, liveChildren: Boolean): FleetActivity? {
+        if (terminal) return null
+        val candidates = buildList {
+            addAll(open)
+            touched.forEach { (kind, at) -> if (nowMs - at <= HOT_WINDOW_MS) add(kind) }
+            if (liveChildren) add(FleetActivity.Orchestrate)
+        }
+        candidates.minByOrNull { it.ordinal }?.let { return it }
+        return latest?.takeIf { (_, at) -> nowMs - at <= LINGER_MS }?.first
+    }
+
+    /** The next daemon-clock instant at which [current] can change, if any. */
+    fun nextChangeAt(nowMs: Long): Long? = buildList {
+        touched.values.forEach { at -> if (at + HOT_WINDOW_MS >= nowMs) add(at + HOT_WINDOW_MS + 1) }
+        latest?.let { (_, at) -> if (at + LINGER_MS >= nowMs) add(at + LINGER_MS + 1) }
+    }.minOrNull()
+
+    companion object {
+        const val HOT_WINDOW_MS = 8_000L
+        const val LINGER_MS = 60_000L
     }
 }
 
@@ -120,9 +187,28 @@ data class FleetNode(
     val parentAgentId: String? = null,
     val state: FleetStateView = FleetStateView.of(null),
     val metrics: FleetNodeMetrics? = null,
+    /** 973-activity-icons: current activity; absent = quiet/terminal/older daemon. */
+    val activity: FleetActivity? = null,
+    /** Every activity used so far, highest priority first. */
+    val activities: List<FleetActivity> = emptyList(),
     val foldedChildren: Int = 0,
     val children: List<FleetNode> = emptyList(),
 ) {
+    /** The activity at the snapshot instant: never on a terminal node. */
+    val currentActivity: FleetActivity? get() = activity?.takeUnless { state.terminal }
+
+    /**
+     * The activity at daemon-clock [nowMs]: the published tracker state
+     * evaluated locally (decays between fetches), else the snapshot figure.
+     */
+    fun activityAt(nowMs: Long?): FleetActivity? {
+        if (state.terminal) return null
+        val tracker = metrics?.activity ?: return currentActivity
+        if (nowMs == null) return currentActivity
+        val liveChildren = children.any { !it.state.terminal }
+        return tracker.current(nowMs, liveChildren)
+    }
+
     /** The daemon said there are more children than it returned. */
     val bounded: Boolean get() = foldedChildren > 0
 
@@ -182,7 +268,11 @@ enum class FleetCompleteness { Bounded, Complete, Unknown }
 sealed interface FleetLoad {
     data object Unread : FleetLoad
     data object Loading : FleetLoad
-    data class Snapshot(val snapshot: FleetSnapshot) : FleetLoad
+    data class Snapshot(
+        val snapshot: FleetSnapshot,
+        /** Local monotonic receipt anchor; retained with this read, even while the panel is closed. */
+        val receivedAtElapsedMs: Long = android.os.SystemClock.elapsedRealtime(),
+    ) : FleetLoad
 
     /** The daemon does not offer `session_fleet_v1` (frame.rs:395). */
     data class Unavailable(val reason: String) : FleetLoad
@@ -351,6 +441,12 @@ object FleetRpcAdapter {
         // not a daemon claim — it stays unknown with no raw word.
         state = FleetStateView.of(node.stringOrNull("state")),
         metrics = node.optJSONObject("metrics")?.let(::parseMetrics),
+        // Without a granted session_activity_v1 token the daemon omits these
+        // fields. Absence stays null/empty, so older daemons render no icon.
+        activity = FleetActivity.of(node.stringOrNull("activity")),
+        activities = node.optJSONArray("activities")?.let { array ->
+            (0 until array.length()).mapNotNull { FleetActivity.of(array.optString(it, "")) }
+        }.orEmpty(),
         // `folded_children` is skipped when zero (`is_zero_u32`), so absence
         // really is zero here — the one place a default is the wire's own.
         foldedChildren = node.intOrNull("folded_children") ?: 0,
@@ -379,12 +475,35 @@ object FleetRpcAdapter {
         )
     }
 
+    /** `ActivityStateV1`; unknown kinds are dropped, never coerced. */
+    fun parseActivityState(state: JSONObject): FleetActivityState {
+        fun touch(obj: JSONObject?): Pair<FleetActivity, Long>? {
+            obj ?: return null
+            val kind = FleetActivity.of(obj.stringOrNull("kind")) ?: return null
+            val at = obj.longOrNull("at_ms") ?: return null
+            return kind to at
+        }
+        val open = state.optJSONArray("open")?.let { array ->
+            (0 until array.length()).mapNotNull { FleetActivity.of(array.optString(it, "")) }
+        }.orEmpty()
+        val touched = state.optJSONArray("touched").mapObjects { touch(it) }
+            .filterNotNull()
+            .toMap()
+        return FleetActivityState(
+            open = open,
+            touched = touched,
+            latest = touch(state.optJSONObject("latest")),
+            terminal = state.optBoolean("terminal", false),
+        )
+    }
+
     fun parseMetrics(metrics: JSONObject): FleetNodeMetrics = FleetNodeMetrics(
         startedAtMs = metrics.longOrNull("started_at_ms") ?: 0L,
         terminalAtMs = metrics.longOrNull("terminal_at_ms"),
         live = metrics.optBoolean("live", false),
         toolAttempts = metrics.longOrNull("tool_attempts") ?: 0L,
         usage = metrics.optJSONObject("usage")?.let(::parseUsage),
+        activity = metrics.optJSONObject("activity")?.let(::parseActivityState),
     )
 
     fun parseUsage(usage: JSONObject): FleetUsage = FleetUsage(

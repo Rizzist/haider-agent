@@ -481,6 +481,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
                     name: "spawn_subagent".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ),

@@ -220,6 +220,7 @@ fn fleet_node(
             started_at_ms: 1_800_000_000_000,
             terminal_at_ms: Some(1_800_000_042_000),
             live: state == FleetAgentStateWire::Live,
+            activity: None,
             tool_attempts: 3,
             usage: Some(AgentUsageMetrics {
                 logical_input_tokens: 1_200,
@@ -230,6 +231,8 @@ fn fleet_node(
                 ..AgentUsageMetrics::default()
             }),
         }),
+        activity: None,
+        activities: Vec::new(),
         folded_children,
         children,
     }
@@ -846,6 +849,38 @@ fn fleet_snapshot_rendering_and_raw_json_are_append_only_goldens() {
     assert!(!raw.contains("haider.observe.v1"));
     assert!(raw.contains(r#""folded_children":2"#));
     assert_eq!(raw.matches("folded_children").count(), 1);
+}
+
+#[test]
+fn fleet_text_wears_the_activity_glyph_left_of_the_name() {
+    use cli_main::observe::fleet_human_text_with;
+    use haider_protocol::activity::{ActivityDisplay, ActivityKind};
+    let mut snapshot = fleet_snapshot();
+    snapshot.roots[0].activity = Some(ActivityKind::Orchestrate);
+    snapshot.roots[0].children[0].activity = Some(ActivityKind::Edit);
+    let emoji = fleet_human_text_with(&snapshot, ActivityDisplay::Emoji);
+    assert!(
+        emoji.contains("◉ \u{1F9ED} alpha ▸2 — coordinate the sweep"),
+        "{emoji}"
+    );
+    // The done child's stale activity never renders: terminal nodes are quiet.
+    assert!(emoji.contains("│ ✓ done — verify output"), "{emoji}");
+    let text = fleet_human_text_with(&snapshot, ActivityDisplay::Text);
+    assert!(text.contains("◉ [orch] alpha ▸2"), "{text}");
+    let off = fleet_human_text_with(&snapshot, ActivityDisplay::Off);
+    assert_eq!(
+        off,
+        fleet_human_text_with(&fleet_snapshot(), ActivityDisplay::Emoji)
+    );
+    // JSON carries the additive wire fields; a snapshot without them is the
+    // pre-lane shape byte for byte.
+    let raw = serde_json::to_value(&snapshot).expect("json");
+    assert_eq!(raw["roots"][0]["activity"], "orchestrate");
+    assert!(
+        !serde_json::to_string(&fleet_snapshot())
+            .expect("json")
+            .contains("activit")
+    );
 }
 
 #[test]
