@@ -147,6 +147,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
             name: "fs_read".to_owned(),
             args: serde_json::json!({"path": "crates/haider-store/src/event_store.rs"}),
             status: ToolStatus::InProgress,
+            activity: None,
         },
     }));
     script.push(EventPayload::Item(ItemEvent::Completed {
@@ -156,6 +157,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
             name: "fs_read".to_owned(),
             args: serde_json::json!({"path": "crates/haider-store/src/event_store.rs"}),
             status: ToolStatus::Completed,
+            activity: None,
         },
     }));
 

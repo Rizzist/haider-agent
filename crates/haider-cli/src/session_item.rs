@@ -571,6 +571,7 @@ mod tests {
                     args: json!({"cmd": "true"}),
                     status: haider_protocol::item::ToolStatus::Completed,
                     call_id: "call-join".into(),
+                    activity: None,
                 },
             },
         ))

@@ -261,6 +261,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Show or set session tool-output detail",
         "[quiet|default|verbose]",
     ),
+    client_cmd(
+        "icons",
+        "Subagent activity icons — emoji, text labels, or off",
+        "[emoji|text|off]",
+    ),
     session_client_cmd("tasks", "Show background tasks", ""),
 ];
 

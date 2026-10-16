@@ -3856,6 +3856,19 @@ pub struct ContextCompactionOutcome {
 
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
+    /// Returns activity only for a route owned and registered by this
+    /// dispatcher. The actor never classifies the model's requested name.
+    fn activity_for_route(&self, _name: &str) -> Option<haider_protocol::activity::ActivityKind> {
+        None
+    }
+    /// Effectless routes may publish a live fact at the accepted dispatch
+    /// boundary. Effectful routes already have broker dispatch facts.
+    fn live_activity_for_route(
+        &self,
+        _name: &str,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        None
+    }
     /// Hard platform availability precedes actor grant/exposure handling. A false
     /// result routes to the dispatcher's normal unsupported-tool outcome.
     fn platform_tool_supported(&self, _name: &str) -> bool {
@@ -5681,7 +5694,7 @@ impl HarnessActor {
         // TURN-scoped — a pause_turn boundary can split a server call from
         // its result across requests, and the bounded sources list journals
         // exactly once, under the finished message.
-        let mut server_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut server_calls: HashMap<String, ServerCall> = HashMap::new();
         let mut web_sources: Vec<WebSource> = Vec::new();
         // These are one logical provider response, not one physical transport
         // attempt. A reconnect keeps them alive while replay filtering skips
@@ -5753,8 +5766,16 @@ impl HarnessActor {
                         call_id,
                         name,
                         args,
+                        activity,
                     } => {
-                        server_calls.insert(call_id.clone(), (name.clone(), args.clone()));
+                        server_calls.insert(
+                            call_id.clone(),
+                            ServerCall {
+                                name: name.clone(),
+                                args: args.clone(),
+                                activity: *activity,
+                            },
+                        );
                     }
                     StreamEvent::ServerToolResult { call_id, .. } => {
                         server_calls.remove(call_id);
@@ -8274,6 +8295,7 @@ impl HarnessActor {
                         call_id,
                         name,
                         args,
+                        activity,
                     } => {
                         if let Err(error) = self.flush_pending_item_delta().await {
                             return self
@@ -8286,7 +8308,14 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
-                        server_calls.insert(call_id, (name, args));
+                        server_calls.insert(
+                            call_id,
+                            ServerCall {
+                                name,
+                                args,
+                                activity,
+                            },
+                        );
                         Ok(None)
                     }
                     StreamEvent::ServerToolResult {
@@ -8294,12 +8323,14 @@ impl HarnessActor {
                         preview,
                         is_error,
                     } => {
-                        let (name, args) = server_calls
-                            .remove(&call_id)
-                            .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null));
+                        let call = server_calls.remove(&call_id).unwrap_or_else(|| ServerCall {
+                            name: "web_tool".into(),
+                            args: serde_json::Value::Null,
+                            activity: None,
+                        });
                         let result_preview = preview.clone();
-                        let result_name = name.clone();
-                        let result_args = args.clone();
+                        let result_name = call.name.clone();
+                        let result_args = call.args.clone();
                         async {
                             self.complete_text(&run_id, &mut message, false).await?;
                             self.complete_text(&run_id, &mut reasoning, true).await?;
@@ -8332,10 +8363,8 @@ impl HarnessActor {
                                 }),
                                 orchestration: None,
                             };
-                            self.commit_server_tool_row(
-                                &run_id, &call_id, name, args, status, &result,
-                            )
-                            .await?;
+                            self.commit_server_tool_row(&run_id, &call_id, call, status, &result)
+                                .await?;
                             continuation_progress.observe_server_tool(
                                 &result_name,
                                 &result_args,
@@ -10855,6 +10884,7 @@ impl HarnessActor {
                     name: name.clone(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             },
         )
@@ -11132,9 +11162,13 @@ impl HarnessActor {
                 .map(|message| CompletedTool::Continue(Some(message)));
         }
         if let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) {
-            self.commit_state(run_id, RunState::RunningTool)
-                .await
-                .map_err(DriveError::Store)?;
+            self.commit_running_tool_activity(
+                run_id,
+                &tools[index],
+                dispatcher.live_activity_for_route(&tools[index].name),
+            )
+            .await
+            .map_err(DriveError::Store)?;
             let outcome = self
                 .execute_general_tool(
                     run_id,
@@ -12857,6 +12891,7 @@ impl HarnessActor {
                         name: tool.name.clone(),
                         args: tool_args_or_raw(tool),
                         status: ToolStatus::Pending,
+                        activity: None,
                     },
                 },
             )
@@ -12898,6 +12933,10 @@ impl HarnessActor {
         } else {
             parse_tool_args(tool)?.as_ref().clone()
         };
+        let activity = (status == ToolStatus::Completed
+            && tool_call_within_advertised_ceiling(&self.config, &tool.name))
+        .then(|| self.dispatcher.as_ref()?.activity_for_route(&tool.name))
+        .flatten();
         self.commit_item(
             run_id,
             ItemEvent::Completed {
@@ -12907,6 +12946,7 @@ impl HarnessActor {
                     name: tool.name.clone(),
                     args,
                     status,
+                    activity,
                 },
             },
         )
@@ -12997,6 +13037,10 @@ impl HarnessActor {
         } else {
             parse_tool_args(tool)?.as_ref().clone()
         };
+        let activity = (status == ToolStatus::Completed
+            && tool_call_within_advertised_ceiling(&self.config, &tool.name))
+        .then(|| self.dispatcher.as_ref()?.activity_for_route(&tool.name))
+        .flatten();
 
         self.flush_pending_item_delta()
             .await
@@ -13068,6 +13112,7 @@ impl HarnessActor {
                         name: tool.name.clone(),
                         args,
                         status,
+                        activity,
                     },
                 }),
                 prompt_verbatim_render(),
@@ -13466,6 +13511,36 @@ impl HarnessActor {
         Ok(())
     }
 
+    async fn commit_running_tool_activity(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        activity: Option<haider_protocol::activity::ActivityKind>,
+    ) -> Result<(), HaiderError> {
+        if let Some(activity) = activity {
+            let mut envelope = self.uncommitted_envelope(
+                run_id,
+                EventPayload::RunState(RunState::RunningTool),
+                prompt_omit_render(),
+            )?;
+            envelope.payload.insert_metadata(
+                "activity_kind",
+                serde_json::to_value(activity).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?,
+            );
+            envelope.payload.insert_metadata(
+                "activity_call_id",
+                serde_json::Value::String(tool.call_id.clone()),
+            );
+            self.append_and_publish_owned(vec![envelope]).await?;
+            self.state.send_replace(Some(RunState::RunningTool));
+            Ok(())
+        } else {
+            self.commit_state(run_id, RunState::RunningTool).await
+        }
+    }
+
     async fn commit_pending_thinking(
         &mut self,
         run_id: &RunId,
@@ -13621,23 +13696,29 @@ impl HarnessActor {
         &mut self,
         run_id: &RunId,
         call_id: &str,
-        name: String,
-        args: serde_json::Value,
+        call: ServerCall,
         status: ToolStatus,
         result: &BoundedResult,
     ) -> Result<(), DriveError> {
+        let ServerCall {
+            name,
+            args,
+            activity,
+        } = call;
         let item_id = self.next_item_id();
         let started = TurnItem::ToolCall {
             call_id: call_id.to_owned(),
             name: name.clone(),
             args: args.clone(),
             status: ToolStatus::InProgress,
+            activity: None,
         };
         let completed = TurnItem::ToolCall {
             call_id: call_id.to_owned(),
             name,
             args,
             status,
+            activity,
         };
         let render = prompt_omit_render();
         let started = self
@@ -15100,6 +15181,13 @@ struct PendingItemDelta {
     run_id: RunId,
     item_id: ItemId,
     delta: ItemDelta,
+}
+
+/// One provider-executed, display-only tool row awaiting its result.
+struct ServerCall {
+    name: String,
+    args: serde_json::Value,
+    activity: Option<haider_protocol::activity::ActivityKind>,
 }
 
 /// One in-flight tool call; `args` collects the streamed JSON fragments.

@@ -197,6 +197,7 @@ async fn journalview_rebind_failure_closes_recovered_items_under_the_source_requ
                 name: "todo_write".into(),
                 args: serde_json::json!({}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
             ItemDelta::ToolArgs {
                 fragment: "{\"items\":".into(),
@@ -625,6 +626,7 @@ async fn recovered_child_settlement_keeps_its_source_request_before_next_provide
                     name: "spawn_subagent".into(),
                     args: serde_json::json!({"task": "resume child"}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             },
         )

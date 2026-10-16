@@ -4090,6 +4090,8 @@ pub enum FakeStep {
         call_id: String,
         name: String,
         args: serde_json::Value,
+        #[serde(default)]
+        activity: Option<haider_protocol::activity::ActivityKind>,
     },
     /// Emits the display outcome of one provider-executed tool call.
     EmitServerToolResult {
@@ -4407,6 +4409,7 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 call_id,
                 name,
                 args,
+                activity,
             } => {
                 if !send_event(
                     &sender,
@@ -4414,6 +4417,7 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                         call_id,
                         name,
                         args,
+                        activity,
                     },
                 )
                 .await

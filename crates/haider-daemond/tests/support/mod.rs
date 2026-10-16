@@ -794,6 +794,7 @@ impl UdsClient {
             client_instance_id: client_instance_id.into(),
             client_kind,
             capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+            features_requested: Default::default(),
             max_receive_frame: u32::try_from(frame_limit).expect("frame limit"),
             encodings: Vec::new(),
         });
@@ -827,6 +828,7 @@ impl UdsClient {
                     client_instance_id: client_instance_id.into(),
                     client_kind,
                     capabilities_requested,
+                    features_requested: Default::default(),
                     max_receive_frame: u32::try_from(frame_limit).expect("frame limit"),
                     encodings: Vec::new(),
                 }),
