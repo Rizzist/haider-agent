@@ -7879,16 +7879,12 @@ async fn monitor_source_owned(
     match source {
         MonitorSource::Task { task_id } => {
             // Client controls can arrive before a worker has adopted tasks.
-            // Rebuild from this owner's journal so completed handles remain
-            // valid after restart, without admitting another session's ids.
+            // Consult this owner's journal even while recovery is filling
+            // the registry, without admitting another session's ids.
             crate::tasks::TaskFacade::new(hub.clone())
-                .adopt_session(session)
+                .owns_task(session, &TaskId::new(task_id))
                 .await
-                .map_err(|error| MonitorError::Store(error.to_string()))?;
-            Ok(hub
-                .task_registry()
-                .get(session, &TaskId::new(task_id))
-                .is_some())
+                .map_err(|error| MonitorError::Store(error.to_string()))
         }
         MonitorSource::Agent { agent_id } => hub
             .delegation(AgentId::new(agent_id))

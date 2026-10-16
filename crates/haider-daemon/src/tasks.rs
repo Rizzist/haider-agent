@@ -435,6 +435,24 @@ impl TaskFacade {
             .await
     }
 
+    /// Ownership survives an adoption already in progress: its registry
+    /// marker is set before the scan has restored every completed task.
+    pub(crate) async fn owns_task(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<bool, HaiderError> {
+        self.adopt_session(session_id).await?;
+        if self.hub.task_registry().get(session_id, task_id).is_some() {
+            return Ok(true);
+        }
+        Ok(self
+            .scan_session_tasks(session_id)
+            .await?
+            .started
+            .contains_key(task_id))
+    }
+
     /// Supervisor startup must admit recovery before spawning it. Otherwise
     /// a task first polled after close could reopen the evicted actor. The
     /// supervisor is retired before close drains this shared join registry.
