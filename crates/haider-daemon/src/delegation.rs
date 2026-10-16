@@ -454,6 +454,12 @@ impl DelegationHandle {
                         );
                     child.max_tokens = budget.max_tokens;
                     child.max_tokens_source = Some(budget.source);
+                    // This is the child's own explicit selection, rather than
+                    // inheritance of an already-started parent's provenance.
+                    child.selection_epoch = Some(0);
+                    child.route_reset_epoch = Some(0);
+                    child.resolved_route_alias = None;
+                    child.resolved_route_seen = false;
                 }
                 if explicit_provider || child.provider != provider {
                     // An explicit provider pick starts under that provider's

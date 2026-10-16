@@ -478,6 +478,11 @@ fn provider_rebind_omitted_coordinates_clear_only_the_session_override() {
         serde_json::json!({
             "type":"session_provider_rebound", "rebind_id":"rebind-2", "provider":"proxy",
             "selection_epoch":envelope.seq,
+            "route_snapshot": {
+                "account":null,"base_url":null,"rebind_id":"rebind-2",
+                "resolved_alias":null,"resolved_seen":false,
+                "selection_epoch":envelope.seq,"reset_epoch":envelope.seq
+            },
             "output_budget":{"max_tokens":4096,"source":{"kind":"derived"}}
         })
     );

@@ -13,11 +13,13 @@ use haider_protocol::{
 use std::collections::BTreeMap;
 
 type Route = [Value; 3];
+use crate::RunOutputRouteHistory;
 
 struct RunRoute {
     provider: String,
-    route: Option<Route>,
+    route: Option<RunOutputRouteHistory>,
     pinned: bool,
+    complete_pin: bool,
     started: bool,
     ended: bool,
     configured_provider: Option<String>,
@@ -29,6 +31,7 @@ impl RunRoute {
             provider: provider.into(),
             route: None,
             pinned: false,
+            complete_pin: false,
             started: false,
             ended: false,
             configured_provider: None,
@@ -40,32 +43,41 @@ fn route(account: Option<String>, base_url: Option<String>, rebind_id: Option<St
     [account, base_url, rebind_id].map(|value| value.map_or(Value::Null, Value::String))
 }
 
+fn boundary_route(
+    selected_provider: &str,
+    session_route: &RunOutputRouteHistory,
+    run_provider: &str,
+) -> RunOutputRouteHistory {
+    if selected_provider == run_provider {
+        session_route.clone()
+    } else {
+        RunOutputRouteHistory::missing()
+    }
+}
+
 fn expected(
-    metadata: SessionMetadataV1,
+    provider: &str,
+    session: &RunOutputRouteHistory,
     running: Option<&RunRoute>,
     child_provider: &str,
-) -> Route {
+) -> StoreResult<Route> {
     if let Some(running) = running {
         if child_provider != running.provider {
-            return [Value::Null, Value::Null, Value::Null];
+            return Ok([Value::Null, Value::Null, Value::Null]);
         }
-        if let Some(route) = &running.route {
-            return route.clone();
-        }
-        // A legacy run without an explicit binding has the same clear rule as
-        // restore_route: a different current provider cannot supply its route.
-        if metadata.provider != running.provider {
-            return [Value::Null, Value::Null, Value::Null];
-        }
+        let running = running.route.as_ref().ok_or_else(|| {
+            haider_protocol::session::run_route_history_unavailable(
+                "inherited run has no boundary witness",
+            )
+        })?;
+        let [account, endpoint, rebind] = running.selectors()?;
+        return Ok(route(account, endpoint, rebind));
     }
-    if child_provider == metadata.provider {
-        route(
-            metadata.account_alias,
-            metadata.provider_base_url,
-            metadata.provider_rebind_id,
-        )
+    if child_provider == provider {
+        let [account, endpoint, rebind] = session.selectors()?;
+        Ok(route(account, endpoint, rebind))
     } else {
-        [Value::Null, Value::Null, Value::Null]
+        Ok([Value::Null, Value::Null, Value::Null])
     }
 }
 
@@ -90,6 +102,7 @@ pub(super) fn at_child_creation(
         cutoff,
     } = witness;
     let mut runs = BTreeMap::<String, RunRoute>::new();
+    let mut session_route = RunOutputRouteHistory::from_creation(&metadata);
     let mut statement = connection.prepare(
         "SELECT envelope_json FROM events WHERE session_id = ?1 AND rowid < ?2 AND seq > ?3 ORDER BY seq",
     ).map_err(map_sqlite_error)?;
@@ -100,31 +113,48 @@ pub(super) fn at_child_creation(
         let event = decode_envelope_column(connection, row, 0)
             .map_err(|error| corrupt(format!("invalid inheritance event: {error}")))?;
         if let Some(rebound) = SessionProviderRebound::from_payload_value(&event.payload) {
+            session_route.rebind_legacy(metadata.provider != rebound.provider, &rebound);
+            if let Some(snapshot) = event.payload.get("route_snapshot") {
+                session_route.record(serde_json::from_value(snapshot.clone()).map_err(
+                    |error| corrupt(format!("invalid inherited route snapshot: {error}")),
+                )?);
+            }
             for running in runs
                 .values_mut()
                 .filter(|run| (run.pinned || run.started) && !run.ended)
             {
                 running.provider.clone_from(&rebound.provider);
-                running.route = Some(route(
-                    rebound.account.clone(),
-                    rebound.base_url.clone(),
-                    Some(rebound.rebind_id.clone()),
-                ));
+                running.route = Some(session_route.clone());
             }
             rebound.apply_to_metadata(&mut metadata);
         } else if let Some(selected) = ModelSelected::from_payload_value(&event.payload) {
-            if selected.cleared_account_pin.is_some() {
-                metadata.account_alias = None;
-            }
-            if metadata.provider != selected.provider {
-                if metadata.provider_rebind_id.is_some() {
-                    metadata.account_alias = None;
+            if selected.route_only {
+                session_route.resolve_legacy(&selected);
+            } else {
+                let coordinate_only = selected.selection_epoch.is_none()
+                    && event.payload.as_object().is_some_and(|fields| {
+                        fields.len() == 3
+                            && ["type", "provider", "model"]
+                                .iter()
+                                .all(|key| fields.contains_key(*key))
+                    });
+                if coordinate_only {
+                    // These exact older child digests used the pre-epoch
+                    // coordinate rule. Epoch/observation knowledge stays
+                    // missing; this is never a full recovery witness.
+                    session_route
+                        .select_pre_epoch_coordinates(metadata.provider != selected.provider);
+                } else {
+                    session_route.select_legacy(metadata.provider != selected.provider, &selected);
                 }
-                metadata.provider_base_url = None;
-                metadata.provider_rebind_id = None;
+                metadata.provider = selected.provider;
+                metadata.model = selected.model;
             }
-            metadata.provider = selected.provider;
-            metadata.model = selected.model;
+            if let Some(snapshot) = event.payload.get("route_snapshot") {
+                session_route.record(serde_json::from_value(snapshot.clone()).map_err(
+                    |error| corrupt(format!("invalid inherited route snapshot: {error}")),
+                )?);
+            }
         }
         let Some(run_id) = event.run_id.as_ref() else {
             continue;
@@ -137,7 +167,16 @@ pub(super) fn at_child_creation(
         )) =
             haider_protocol::headless::HeadlessRunEventPayload::from_payload_value(&event.payload)
         {
-            running.configured_provider = Some(spec.provider);
+            running.configured_provider = Some(spec.provider.clone());
+            if !running.pinned {
+                running.provider = spec.provider;
+                running.route = Some(boundary_route(
+                    &metadata.provider,
+                    &session_route,
+                    &running.provider,
+                ));
+                running.pinned = true;
+            }
         }
         match event.payload.decode_event() {
             Ok(EventPayload::RunState(state)) => {
@@ -151,6 +190,13 @@ pub(super) fn at_child_creation(
                             .clone()
                             .unwrap_or_else(|| metadata.provider.clone());
                     }
+                    if !running.pinned {
+                        running.route = Some(boundary_route(
+                            &metadata.provider,
+                            &session_route,
+                            &running.provider,
+                        ));
+                    }
                     running.started = true;
                 }
             }
@@ -158,15 +204,37 @@ pub(super) fn at_child_creation(
                 item: TurnItem::Extension { kind, data },
                 ..
             })) => {
-                if kind == RunOutputPairPinnedV1::KIND && !running.pinned && !running.ended {
+                if kind == RunOutputPairPinnedV1::KIND && !running.complete_pin && !running.ended {
                     let pin: RunOutputPairPinnedV1 =
                         serde_json::from_value(data).map_err(|error| {
                             corrupt(format!("invalid inheritance run pin: {error}"))
                         })?;
+                    // A legacy recovery checkpoint cannot move an existing
+                    // admission/start boundary past ordinary selections.
+                    if pin.route_snapshot.is_none() && (running.pinned || running.started) {
+                        continue;
+                    }
+                    running.complete_pin = pin.route_snapshot.is_some();
                     running.provider = pin.provider;
-                    running.route = pin
-                        .provider_route
-                        .map(|pin| route(pin.account, pin.base_url, Some(pin.rebind_id)));
+                    let pin = pin
+                        .route_snapshot
+                        .map(RunOutputRouteHistory::known)
+                        .or_else(|| pin.provider_route.map(RunOutputRouteHistory::legacy_pin));
+                    let history = match pin {
+                        Some(pin) if pin.is_complete() => pin,
+                        pin => {
+                            let mut history = boundary_route(
+                                &metadata.provider,
+                                &session_route,
+                                &running.provider,
+                            );
+                            if let Some(pin) = pin {
+                                history.overlay(pin);
+                            }
+                            history
+                        }
+                    };
+                    running.route = Some(history);
                     running.pinned = true;
                 } else if kind == "run_worker_pickup_v1" && !running.started {
                     if !running.pinned {
@@ -175,14 +243,23 @@ pub(super) fn at_child_creation(
                             .clone()
                             .unwrap_or_else(|| metadata.provider.clone());
                     }
+                    if !running.pinned {
+                        running.route = Some(boundary_route(
+                            &metadata.provider,
+                            &session_route,
+                            &running.provider,
+                        ));
+                    }
                     running.started = true;
                 } else if kind == "provider_pair_switch_v1"
                     && (running.pinned || running.started)
                     && !running.ended
                     && let Some(provider) = data.get("to_provider").and_then(Value::as_str)
                 {
-                    if running.provider != provider {
-                        running.route = None;
+                    if running.provider != provider
+                        && let Some(history) = running.route.as_mut()
+                    {
+                        history.clear_selectors();
                     }
                     running.provider = provider.into();
                 }
@@ -212,5 +289,10 @@ pub(super) fn at_child_creation(
         }
         running
     };
-    Ok(Some(expected(metadata, running, child_provider)))
+    Ok(Some(expected(
+        &metadata.provider,
+        &session_route,
+        running,
+        child_provider,
+    )?))
 }

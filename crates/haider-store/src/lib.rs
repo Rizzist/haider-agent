@@ -21,6 +21,7 @@ mod migrations;
 mod profile_lock;
 mod provider_model_cache_key;
 mod provider_view_store;
+mod run_output_route_history;
 mod usage_ledger;
 
 pub use cas::{CasUpload, FileCas, validate_image_block};
@@ -70,6 +71,7 @@ pub use event_store::{
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 pub use provider_model_cache_key::ProviderModelCacheKey;
+pub use run_output_route_history::RunOutputRouteHistory;
 pub use usage_ledger::{
     UsageLedgerCounters, UsageLedgerLane, UsageLedgerSlot, UsageLedgerWriter, UsageSlotAddress,
     read_usage_day, read_usage_range, reduce_journal_usage, slot_address,

@@ -15,146 +15,22 @@ pub(crate) async fn pin_headless_turn_metadata(
     store: &HubStoreHandle,
     run_id: &RunId,
 ) -> Result<(), HaiderError> {
-    if let Some(pair) = store
+    let pair = store
         .hub()
         .run_output_pair(store.session_id(), run_id)
         .await?
-        .filter(|pair| pair.durably_pinned)
-    {
-        pair.restore_route(metadata);
-        metadata.provider = pair.provider;
-        metadata.model = pair.model;
-        metadata.max_tokens = pair.max_tokens;
-        metadata.max_tokens_source = pair.source;
-        metadata.effort.clone_from(&spec.effort);
-        metadata.fast = spec.fast;
-        return Ok(());
-    }
-    let stored_budget = (metadata.max_tokens, metadata.max_tokens_source);
-    metadata.model.clone_from(&spec.model);
-    metadata.max_tokens = spec.max_output_tokens;
-    metadata.effort.clone_from(&spec.effort);
-    metadata.fast = spec.fast;
-    if metadata.provider_rebind_id.is_none() {
-        if metadata.provider != spec.provider {
-            metadata.provider_base_url = None;
-        }
-        metadata.provider.clone_from(&spec.provider);
-        return Ok(());
-    }
-    // An automatic promotion belongs to this run; a mutable session model
-    // selection may instead be queued for the next turn. Scan only explicitly
-    // rebound runs, leaving ordinary turn startup's reads unchanged.
-    let mut cursor = 0;
-    let mut first_run_seq = None;
-    let mut rebound_budget = None;
-    loop {
-        let page = store
-            .read_for(
-                haider_platform::phase_trace::StoreReadCaller::ProviderRebind,
-                store.session_id(),
-                cursor,
-                256,
-            )
-            .await?;
-        let page_len = page.len();
-        for envelope in page {
-            cursor = envelope.seq;
-            if let Some(rebound) =
-                haider_protocol::session::SessionProviderRebound::from_payload_value(
-                    &envelope.payload,
-                )
-                && metadata.provider_rebind_id.as_deref() == Some(rebound.rebind_id.as_str())
-            {
-                rebound_budget = Some((
-                    envelope.seq,
-                    rebound.output_budget,
-                    rebound.active_output_budget,
-                ));
-            }
-            if envelope.run_id.as_ref() != Some(run_id) {
-                continue;
-            }
-            first_run_seq.get_or_insert(envelope.seq);
-            let Ok(EventPayload::Item(ItemEvent::Completed {
-                item: TurnItem::Extension { kind, data },
-                ..
-            })) = envelope.payload.decode_event()
-            else {
-                continue;
-            };
-            if kind == "provider_pair_switch_v1"
-                && data
-                    .get("to_provider")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|provider| !provider.is_empty())
-                && let Some(model) = data
-                    .get("to_model")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|model| !model.is_empty())
-            {
-                metadata.model = model.to_owned();
-            }
-        }
-        if page_len < 256 {
-            break;
-        }
-    }
-    let run_rebound = rebound_budget
-        .as_ref()
-        .is_some_and(|(seq, _, _)| first_run_seq.is_some_and(|first| *seq > first));
-    if !run_rebound {
-        return Ok(());
-    }
-    if let Some((_, Some(budget), _)) = rebound_budget.as_ref() {
-        metadata.max_tokens = budget.max_tokens;
-        metadata.max_tokens_source = Some(budget.source);
-    } else {
-        // Older rebind facts had no budget field. Keep the durable metadata
-        // as the best available pair-specific value for that legacy run.
-        metadata.max_tokens = stored_budget.0;
-        metadata.max_tokens_source = stored_budget.1;
-    }
-    if let Some((_, _, Some(active))) = rebound_budget.as_ref()
-        && active.run_id == *run_id
-        && active.model == metadata.model
-    {
-        metadata.max_tokens = active.budget.max_tokens;
-        metadata.max_tokens_source = Some(active.budget.source);
-        return Ok(());
-    }
-    if let Some(view) = store
-        .hub()
-        .accounts()
-        .map_err(hub_error)?
-        .and_then(|accounts| accounts.management.read())
-    {
-        let selection = crate::model_select::ModelSelectionAuthority::new(
-            store.hub().creatable_providers().map_err(hub_error)?,
-            view.providers,
-        )
-        .validate_selection_with_status(&spec.provider, Some(&metadata.provider), &metadata.model)
-        .map_err(|refusal| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "recovered provider rebind rejected the active model: {}",
-                    refusal.message()
-                ),
-                false,
+        .ok_or_else(|| {
+            haider_protocol::session::run_route_history_unavailable(
+                "headless run has no admission boundary",
             )
         })?;
-        let budget = haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
-            metadata.max_tokens_source,
-            metadata.max_tokens,
-        )
-        .apply(
-            selection.max_output_tokens,
-            selection.explicit_max_output_tokens,
-        );
-        metadata.max_tokens = budget.max_tokens;
-        metadata.max_tokens_source = Some(budget.source);
-    }
+    pair.restore_route(metadata)?;
+    metadata.provider = pair.provider;
+    metadata.model = pair.model;
+    metadata.max_tokens = pair.max_tokens;
+    metadata.max_tokens_source = pair.source;
+    metadata.effort.clone_from(&spec.effort);
+    metadata.fast = spec.fast;
     Ok(())
 }
 
@@ -308,7 +184,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         // The durable run route survives ordinary selections for the next
         // turn, including selections that clear the session's rebind id.
         if let Some(pair) = active_pair.as_ref() {
-            pair.restore_route(&mut metadata);
+            pair.restore_route(&mut metadata)?;
             metadata.provider.clone_from(&pair.provider);
         }
         if metadata.provider_rebind_id.is_none()

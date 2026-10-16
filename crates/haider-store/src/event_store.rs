@@ -17,6 +17,7 @@
 //!   across process restarts even when the wall clock repeats.
 
 mod create_receipt_compat;
+mod run_output_history;
 
 use crate::cas::FileCas;
 use crate::migrations;
@@ -1128,6 +1129,8 @@ pub struct SelectedModel {
     pub cleared_account_pin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleared_provider_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_snapshot: Option<haider_protocol::session::RunOutputRouteSnapshotV1>,
 }
 
 /// Result of the atomic metadata-update/event/receipt transaction.
@@ -1446,6 +1449,7 @@ pub struct SessionOutputPairSnapshot {
     pub model: String,
     pub max_tokens: u64,
     pub source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
+    pub route: crate::RunOutputRouteHistory,
 }
 
 /// Stable response stored in the `session.provider.rebind` receipt.
@@ -5211,7 +5215,7 @@ impl Store {
                     cleared_provider_endpoint: None,
                     output_budget_clamp: unreported_clamp,
                 }
-                .to_payload_value()
+                .to_payload_value_with_route(&metadata)
                 .map_err(|error| store_error(ErrorCode::StoreCorrupt, error.to_string(), false))?,
                 PromptRender::Omit,
             )?];
@@ -8818,75 +8822,7 @@ impl Store {
         through_seq: u64,
     ) -> StoreResult<Option<SessionOutputPairSnapshot>> {
         let connection = self.connection()?;
-        let mut query = connection
-            .prepare(
-                "SELECT method, response_json FROM command_receipts
-             WHERE session_id = ?1 AND state = 'committed' AND accepted_seq <= ?2
-               AND method IN ('session.create', 'session.fork', 'session.metafork',
-                              'session.select_model', 'session.provider.rebind')
-             ORDER BY accepted_seq",
-            )
-            .map_err(map_sqlite_error)?;
-        let mut rows = query
-            .query(params![
-                session_id.as_str(),
-                to_sqlite_integer(through_seq)?
-            ])
-            .map_err(map_sqlite_error)?;
-        let mut pair: Option<SessionOutputPairSnapshot> = None;
-        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-            let method: String = row.get(0).map_err(map_sqlite_error)?;
-            let json: String = row.get(1).map_err(map_sqlite_error)?;
-            match method.as_str() {
-                "session.create" => {
-                    let created: CreatedSession = serde_json::from_str(&json)
-                        .map_err(|error| corrupt(format!("invalid create receipt: {error}")))?;
-                    let meta = created.metadata;
-                    pair = Some(SessionOutputPairSnapshot {
-                        provider: meta.provider,
-                        model: meta.model,
-                        max_tokens: meta.max_tokens,
-                        source: meta.max_tokens_source,
-                    });
-                }
-                "session.fork" | "session.metafork" => {
-                    let created: CreatedSessionFork = serde_json::from_str(&json)
-                        .map_err(|error| corrupt(format!("invalid fork receipt: {error}")))?;
-                    let meta = created.metadata;
-                    pair = Some(SessionOutputPairSnapshot {
-                        provider: meta.provider,
-                        model: meta.model,
-                        max_tokens: meta.max_tokens,
-                        source: meta.max_tokens_source,
-                    });
-                }
-                "session.select_model" => {
-                    let selected: SelectedModel = serde_json::from_str(&json)
-                        .map_err(|error| corrupt(format!("invalid selection receipt: {error}")))?;
-                    if let Some(current) = pair.as_mut() {
-                        current.provider = selected.provider;
-                        current.model = selected.model;
-                        if let Some(budget) = selected.output_budget {
-                            current.max_tokens = budget.max_tokens;
-                            current.source = Some(budget.source);
-                        }
-                    }
-                }
-                "session.provider.rebind" => {
-                    let rebound: ReboundSessionProvider = serde_json::from_str(&json)
-                        .map_err(|error| corrupt(format!("invalid rebind receipt: {error}")))?;
-                    if let Some(current) = pair.as_mut() {
-                        current.provider = rebound.provider;
-                        if rebound.max_tokens != 0 {
-                            current.max_tokens = rebound.max_tokens;
-                            current.source = Some(rebound.max_tokens_source);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(pair)
+        run_output_history::at(&connection, session_id, through_seq)
     }
 
     /// Atomically claims/finalizes a command receipt, inserts typed metadata,
@@ -9009,7 +8945,7 @@ impl Store {
                 false,
             ));
         }
-        let metadata = SessionMetadataV1 {
+        let mut metadata = SessionMetadataV1 {
             selection_epoch: Some(0),
             route_reset_epoch: Some(0),
             budget_clamp_notice_epoch: None,
@@ -9052,6 +8988,11 @@ impl Store {
             workspace_allocation,
             created_at_ms,
         };
+        if let Some(parent) = inherited_route.as_ref() {
+            haider_protocol::session::RunOutputRouteSnapshotV1::capture(parent)
+                .restore(&mut metadata);
+        }
+
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -10329,7 +10270,7 @@ impl Store {
                 cleared_provider_endpoint: cleared_provider_endpoint.clone(),
                 output_budget_clamp: command.output_budget.and_then(|budget| budget.clamped),
             }
-            .to_payload_value()
+            .to_payload_value_with_route(&metadata)
             .map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -10341,6 +10282,9 @@ impl Store {
         )?];
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let selected = SelectedModel {
+            route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+                &metadata,
+            )),
             session_id: command.session_id.clone(),
             provider: command.provider.clone(),
             model: command.model.clone(),
@@ -11497,6 +11441,10 @@ impl Store {
                 metadata.route_reset_epoch = Some(epoch);
             }
             fact_payload["selection_epoch"] = serde_json::Value::from(epoch);
+            fact_payload["route_snapshot"] = serde_json::to_value(
+                haider_protocol::session::RunOutputRouteSnapshotV1::capture(&metadata),
+            )
+            .map_err(|error| corrupt(format!("invalid rebind route snapshot: {error}")))?;
         }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
@@ -12529,16 +12477,24 @@ impl Store {
             )?);
         }
         if let Some(spec) = headless_spec {
+            if !same_run_delivery && spec.provider != metadata.provider {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "headless provider has no matching admission route",
+                    false,
+                ));
+            }
             if !same_run_delivery {
                 let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                    route_snapshot: Some(
+                        haider_protocol::session::RunOutputRouteSnapshotV1::capture(&metadata),
+                    ),
                     provider: spec.provider.clone(),
                     model: spec.model.clone(),
                     max_tokens: spec.max_output_tokens,
-                    provider_route: if metadata.provider == spec.provider {
-                        haider_protocol::session::RunOutputProviderRouteV1::capture(&metadata)
-                    } else {
-                        None
-                    },
+                    provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(
+                        &metadata,
+                    ),
                     source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
                         metadata.max_tokens_source,
                         spec.max_output_tokens,

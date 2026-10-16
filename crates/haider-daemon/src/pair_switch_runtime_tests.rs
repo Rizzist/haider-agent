@@ -55,6 +55,28 @@ async fn rotation_after_compaction_promotion_records_the_promoted_route() {
         Arc::new(FakeProvider::new(text_turn("b"))),
     )
     .await;
+    let run = RunId::new("promotion-rotation-run");
+    world
+        .hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "promotion-rotation-accept".into(),
+            request_digest: "promotion-rotation-accept".into(),
+            request_json: "{}".into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            run_id: run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "promote then rotate".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("promotion-queued"),
+            user_event_id: EventId::new("promotion-user"),
+            active_event_id: EventId::new("promotion-active"),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("admit promoted run");
     let lease = world
         .hub
         .acquire_worker_lease(world.session_id.clone())
@@ -66,6 +88,30 @@ async fn rotation_after_compaction_promotion_records_the_promoted_route() {
         .await
         .expect("metadata")
         .expect("typed");
+    let run_epoch = selection.selection_epoch;
+    let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        provider: selection.provider.clone(),
+        model: selection.model.clone(),
+        max_tokens: selection.max_tokens,
+        source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(&selection),
+        route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+            &selection,
+        )),
+    };
+    super::append_payloads(
+        &lease,
+        &world.device_id,
+        &run,
+        None,
+        &EventIdGenerator::new("promotion-start"),
+        vec![
+            pin.to_event(&run).expect("pin"),
+            EventPayload::RunState(RunState::Thinking),
+        ],
+    )
+    .await
+    .expect("pin admitted run");
     let shared = Arc::new(tokio::sync::Mutex::new(selection));
     let route = super::DaemonProviderRouteCommitter {
         store: lease.clone(),
@@ -73,7 +119,7 @@ async fn rotation_after_compaction_promotion_records_the_promoted_route() {
         selection: Arc::clone(&shared),
     };
     let pair = super::DaemonProviderPairSwitchCommitter {
-        store: lease,
+        store: lease.clone(),
         branch_id: None,
         device_id: world.device_id.clone(),
         event_ids: Arc::new(EventIdGenerator::new("promotion-route-test")),
@@ -91,6 +137,38 @@ async fn rotation_after_compaction_promotion_records_the_promoted_route() {
         })
         .await
         .expect("promotion commit");
+    // Core journals this fact after the automatic selection commit. Its own
+    // request epoch remains the one captured before the first provider call.
+    super::append_payloads(&lease, &world.device_id, &run, None, &EventIdGenerator::new("promotion-switch"),
+        vec![EventPayload::Item(ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new("promotion-switch"),
+            item: TurnItem::Extension { kind: "provider_pair_switch_v1".into(), data: serde_json::json!({
+                "from_provider": "fake-a", "from_model": "model-a", "to_provider": "fake-b", "to_model": "model-b", "resolved_alias": "promoted-account"
+            }) },
+        })]).await.expect("record active pair switch");
+    let mut before_rotation = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed");
+    world
+        .hub
+        .run_output_pair(&world.session_id, &run)
+        .await
+        .expect("pair")
+        .expect("run")
+        .restore_route(&mut before_rotation)
+        .expect("complete switch snapshot");
+    assert_eq!(
+        before_rotation.selection_epoch, run_epoch,
+        "the automatic switch preserves request provenance"
+    );
+    assert_eq!(
+        before_rotation.resolved_route_alias.as_deref(),
+        Some("promoted-account")
+    );
+    assert!(before_rotation.resolved_route_seen);
     let rotated_epoch = route
         .commit(
             "fake-b",
@@ -110,10 +188,31 @@ async fn rotation_after_compaction_promotion_records_the_promoted_route() {
         ("fake-b", "model-b")
     );
     assert_eq!(
-        metadata.resolved_route_alias.as_deref(),
+        metadata.resolved_route_alias, None,
+        "the next-turn epoch cannot receive the older run's resolution"
+    );
+    assert!(
+        rotated_epoch > promoted_epoch,
+        "the actual account rotation owns a fresh epoch"
+    );
+    let pair = world
+        .hub
+        .run_output_pair(&world.session_id, &run)
+        .await
+        .expect("run pair")
+        .expect("pinned");
+    let mut recovered = metadata.clone();
+    pair.restore_route(&mut recovered)
+        .expect("complete run route");
+    assert_eq!(
+        (pair.provider.as_str(), pair.model.as_str()),
+        ("fake-b", "model-b")
+    );
+    assert_eq!(recovered.selection_epoch, Some(rotated_epoch));
+    assert_eq!(
+        recovered.resolved_route_alias.as_deref(),
         Some("promoted-rotated-account")
     );
-    assert!(rotated_epoch >= promoted_epoch);
     world.shutdown().await;
 }
 
@@ -953,7 +1052,9 @@ async fn assert_prebound_route_survives_next_turn_selection(headless: bool) {
         ),
         ("fake-a", "model-a", 20000)
     );
-    pinned.restore_route(&mut next_turn);
+    pinned
+        .restore_route(&mut next_turn)
+        .expect("complete run route");
     assert_eq!(
         next_turn.provider_rebind_id.as_deref(),
         Some("prebound-route")
@@ -2214,9 +2315,34 @@ async fn fallback_chain_switch_is_durable_visible_and_finishes_the_same_turn() {
                         == Some("fake-b")
                     && data.get("why").and_then(serde_json::Value::as_str)
                         == Some("fallback_chain")
+                    && data.get("resolved_alias").and_then(serde_json::Value::as_str)
+                        == Some("fake-b-account")
         )
     }));
 
+    let mut restored = metadata.clone();
+    world
+        .hub
+        .run_output_pair(&world.session_id, &run_id)
+        .await
+        .expect("run pair")
+        .expect("run")
+        .restore_route(&mut restored)
+        .expect("complete automatic switch snapshot");
+    assert_eq!(
+        restored.selection_epoch,
+        Some(0),
+        "automatic switch cannot borrow the next-turn epoch"
+    );
+    assert_eq!(
+        restored.account_alias, None,
+        "a served account does not become an explicit selector"
+    );
+    assert_eq!(
+        restored.resolved_route_alias.as_deref(),
+        Some("fake-b-account")
+    );
+    assert!(restored.resolved_route_seen);
     world.shutdown().await;
 }
 

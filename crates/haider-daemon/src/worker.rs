@@ -410,7 +410,7 @@ impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
             && pair.provider == provider
             && pair.model == model
         {
-            pair.restore_route(&mut selection);
+            pair.restore_route(&mut selection)?;
             selection.provider = pair.provider;
             selection.model = pair.model;
         }
@@ -554,9 +554,17 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
                 | SessionSelectModelOutcome::IdempotentReplay { selected },
             ) => {
                 let mut current = self.turn_selection.lock().await;
+                // This selection also configures the next turn. The active
+                // run keeps the provenance captured before its first request,
+                // just as core's request/footprint epoch does.
+                if current.provider != selected.provider {
+                    let mut route =
+                        haider_protocol::session::RunOutputRouteSnapshotV1::capture(&current);
+                    route.clear_selectors();
+                    route.restore(&mut current);
+                }
                 current.provider = selected.provider;
                 current.model = selected.model;
-                current.selection_epoch = Some(selected.selected_seq);
                 Ok(selected.selected_seq)
             }
             Err(error) => Err(hub_error(error)),
@@ -8762,16 +8770,14 @@ async fn start_turn(
             .hub()
             .run_output_pair(lease.session_id(), &accepted.run_id)
             .await?;
-        let needs_pin = recorded_pair
-            .as_ref()
-            .is_none_or(|pair| !pair.durably_pinned);
+        let needs_pin = recorded_pair.as_ref().is_none_or(|pair| !pair.complete_pin);
         // An already-started legacy native run also owns its reconstructed
         // pair. A native turn that is still queued has no legacy start boundary.
         if let Some(pair) = recorded_pair
             .as_ref()
             .filter(|pair| pair.durably_pinned || headless.is_none())
         {
-            pair.restore_route(&mut fresh);
+            pair.restore_route(&mut fresh)?;
             fresh.provider.clone_from(&pair.provider);
             fresh.model.clone_from(&pair.model);
             fresh.max_tokens = pair.max_tokens;
@@ -8790,6 +8796,9 @@ async fn start_turn(
         }
         if needs_pin {
             let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+                    &fresh,
+                )),
                 provider: fresh.provider.clone(),
                 model: fresh.model.clone(),
                 max_tokens: fresh.max_tokens,
@@ -22256,14 +22265,19 @@ impl ToolDispatcher for BrokerToolDispatcher {
             // typed selection refusal is a completed tool result — the model
             // retries with an explicit pair — never a turn failure.
             let mut active_parent = self.metadata.clone();
-            if let Some(active) = self
-                .output
-                .store
-                .hub()
-                .run_output_pair(&self.session_id, run_id)
-                .await?
             {
-                active.restore_route(&mut active_parent);
+                let active = self
+                    .output
+                    .store
+                    .hub()
+                    .run_output_pair(&self.session_id, run_id)
+                    .await?
+                    .ok_or_else(|| {
+                        haider_protocol::session::run_route_history_unavailable(
+                            "child parent has no run boundary",
+                        )
+                    })?;
+                active.restore_route(&mut active_parent)?;
                 active_parent.provider = active.provider;
                 active_parent.model = active.model;
                 active_parent.max_tokens = active.max_tokens;

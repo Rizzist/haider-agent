@@ -390,52 +390,65 @@ fn rebound_recovery_headless_spec() -> HeadlessRunSpecV1 {
 }
 
 #[tokio::test]
-async fn headless_recovery_keeps_accepted_budget_when_rebind_predates_run() {
-    let root = tempfile::tempdir().expect("store root");
-    let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+async fn headless_recovery_keeps_accepted_budget_across_prebound_and_queued_rebinds() {
+    for rebind_before_admission in [true, false] {
+        let root = tempfile::tempdir().expect("store root");
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("hub");
+        let session_id = SessionId::new("prebound-headless-budget");
+        create_rebind_test_session(&hub, &session_id).await;
+        if rebind_before_admission {
+            commit_test_rebind(&hub, &session_id, store.worker_generation(), 1).await;
+        }
+        let run_id = RunId::new("prebound-headless-run");
+        hub.accept_internal_turn(haider_core::TurnAcceptCommand {
+            command_id: "prebound-accept".into(),
+            request_digest: "prebound-accept-digest".into(),
+            request_json: serde_json::json!({"headless": rebound_recovery_headless_spec()})
+                .to_string(),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: run_id.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "headless pinned request".into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Queue,
+            queued_event_id: EventId::new("prebound-queued"),
+            user_event_id: EventId::new("prebound-user"),
+            active_event_id: EventId::new("prebound-active"),
+            device_id: DeviceId::new("prebound-device"),
+        })
         .await
-        .expect("hub");
-    let session_id = SessionId::new("prebound-headless-budget");
-    create_rebind_test_session(&hub, &session_id).await;
-    commit_test_rebind(&hub, &session_id, store.worker_generation(), 1).await;
-    let run_id = RunId::new("prebound-headless-run");
-    hub.accept_internal_turn(haider_core::TurnAcceptCommand {
-        command_id: "prebound-accept".into(),
-        request_digest: "prebound-accept-digest".into(),
-        request_json: "{}".into(),
-        session_id: session_id.clone(),
-        worker_generation: store.worker_generation(),
-        run_id: run_id.clone(),
-        agent_id: None,
-        branch_id: None,
-        text: "headless pinned request".into(),
-        attachments: Vec::new(),
-        mode: haider_protocol::DeliveryMode::Queue,
-        queued_event_id: EventId::new("prebound-queued"),
-        user_event_id: EventId::new("prebound-user"),
-        active_event_id: EventId::new("prebound-active"),
-        device_id: DeviceId::new("prebound-device"),
-    })
-    .await
-    .expect("accepted run");
-    let lease = hub
-        .acquire_worker_lease(session_id.clone())
-        .await
-        .expect("lease");
-    let mut metadata = lease
-        .session_metadata()
-        .await
-        .expect("read")
-        .expect("typed");
-    assert_eq!(metadata.max_tokens, 4096);
-    let spec = rebound_recovery_headless_spec();
-    super::pin_headless_turn_metadata(&mut metadata, &spec, &lease, &run_id)
-        .await
-        .expect("pin earlier rebind");
-    assert_eq!(metadata.max_tokens, 513);
-    drop(lease);
-    hub.shutdown().await.expect("hub shutdown");
-    store.close().await.expect("store close");
+        .expect("accepted run");
+        if !rebind_before_admission {
+            commit_test_rebind(&hub, &session_id, store.worker_generation(), 1).await;
+        }
+        hub.shutdown().await.expect("shutdown before restore");
+        store.close().await.expect("close before restore");
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("reopen");
+        let lease = hub
+            .acquire_worker_lease(session_id.clone())
+            .await
+            .expect("lease");
+        let mut metadata = lease
+            .session_metadata()
+            .await
+            .expect("read")
+            .expect("typed");
+        assert_eq!(metadata.max_tokens, 4096);
+        let spec = rebound_recovery_headless_spec();
+        super::pin_headless_turn_metadata(&mut metadata, &spec, &lease, &run_id)
+            .await
+            .expect("pin earlier rebind");
+        assert_eq!(metadata.max_tokens, 513);
+        drop(lease);
+        hub.shutdown().await.expect("hub shutdown");
+        store.close().await.expect("store close");
+    }
 }
 
 /// MUTATION CHECK: restore the old headless provider, use mutable metadata's
@@ -550,6 +563,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 &event_ids,
                 vec![
                     haider_protocol::session::RunOutputPairPinnedV1 {
+                        route_snapshot: None,
                         provider: "fake".into(),
                         model: model.into(),
                         max_tokens: 6000,
@@ -798,7 +812,9 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
             .await
             .expect("next-turn metadata")
             .expect("typed session");
-        recovered_pair.restore_route(&mut next_turn);
+        recovered_pair
+            .restore_route(&mut next_turn)
+            .expect("complete run route");
         assert_eq!(
             next_turn.provider_rebind_id.as_deref(),
             Some("rebind-recovery")
@@ -1240,6 +1256,9 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
         .expect("metadata")
         .expect("typed");
     let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+            &metadata,
+        )),
         provider: metadata.provider.clone(),
         model: metadata.model.clone(),
         max_tokens: metadata.max_tokens,
@@ -1277,7 +1296,8 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
         .await
         .expect("initial pair")
         .expect("initial pair")
-        .restore_route(&mut initial);
+        .restore_route(&mut initial)
+        .expect("complete run route");
     assert_eq!(
         initial.resolved_route_alias, None,
         "pre-pin facts are excluded"
@@ -1358,7 +1378,7 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
         .expect("pin")
         .expect("durable");
     let mut active = next.clone();
-    pair.restore_route(&mut active);
+    pair.restore_route(&mut active).expect("complete run route");
     active.provider = pair.provider;
     assert_eq!(active.provider, "fake");
     assert_eq!(active.resolved_route_alias.as_deref(), Some("active-alias"));
@@ -1382,7 +1402,8 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
         .await
         .expect("pair")
         .expect("pair")
-        .restore_route(&mut again);
+        .restore_route(&mut again)
+        .expect("complete run route");
     assert_eq!(
         again.resolved_route_alias.as_deref(),
         Some("rotated-active-alias")
@@ -1418,7 +1439,8 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
         .await
         .expect("completed pair")
         .expect("completed pair")
-        .restore_route(&mut completed);
+        .restore_route(&mut completed)
+        .expect("complete run route");
     assert_eq!(
         completed.resolved_route_alias, again.resolved_route_alias,
         "post-terminal facts are excluded"
@@ -1479,6 +1501,9 @@ async fn matching_rebind_route_publishes_account_and_rotation_epoch() {
             .expect("lease");
         let md = lease.session_metadata().await.expect("md").expect("typed");
         let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+            route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+                &md,
+            )),
             provider: md.provider.clone(),
             model: md.model.clone(),
             max_tokens: md.max_tokens,
@@ -1507,7 +1532,8 @@ async fn matching_rebind_route_publishes_account_and_rotation_epoch() {
             .await
             .expect("p")
             .expect("p")
-            .restore_route(&mut turn_md);
+            .restore_route(&mut turn_md)
+            .expect("complete run route");
         let unchanged = lease
             .commit_turn_resolved_route(&run, &turn_md, Some("acct-1"))
             .await
@@ -1538,7 +1564,8 @@ async fn matching_rebind_route_publishes_account_and_rotation_epoch() {
                 .await
                 .expect("pair")
                 .expect("admitted")
-                .restore_route(&mut turn);
+                .restore_route(&mut turn)
+                .expect("complete run route");
             let epoch = lease
                 .commit_turn_resolved_route(&run, &turn, alias)
                 .await
@@ -1668,6 +1695,9 @@ async fn pinned_route_resolution_keeps_the_active_run_branch() {
         .expect("metadata")
         .expect("typed");
     let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+            &metadata,
+        )),
         provider: metadata.provider.clone(),
         model: metadata.model.clone(),
         max_tokens: metadata.max_tokens,
@@ -1738,7 +1768,7 @@ async fn pinned_route_resolution_keeps_the_active_run_branch() {
         .expect("pair")
         .expect("pin");
     let mut active = next.clone();
-    pair.restore_route(&mut active);
+    pair.restore_route(&mut active).expect("complete run route");
     active.provider = pair.provider;
     active.model = pair.model;
     lease
@@ -1785,7 +1815,8 @@ async fn pinned_route_resolution_keeps_the_active_run_branch() {
         .expect("pair")
         .expect("pin");
     let mut restored = next.clone();
-    pair.restore_route(&mut restored);
+    pair.restore_route(&mut restored)
+        .expect("complete run route");
     assert_eq!(
         restored.resolved_route_alias.as_deref(),
         Some("branch-rotated-alias")
@@ -1971,6 +2002,9 @@ async fn pin_rotation_test_run(
         .expect("lease");
     let md = lease.session_metadata().await.expect("md").expect("typed");
     let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+            &md,
+        )),
         provider: md.provider.clone(),
         model: md.model.clone(),
         max_tokens: md.max_tokens,
@@ -2090,7 +2124,8 @@ async fn matching_rebind_route_rotations_keep_distinct_provenance() {
                 .expect("pair")
                 .expect("durable pin");
             assert!(pair.durably_pinned);
-            pair.restore_route(&mut recovered);
+            pair.restore_route(&mut recovered)
+                .expect("complete run route");
             recovered.provider = pair.provider;
             recovered.model = pair.model;
             let attempts_before = probe.attempts.load(Ordering::SeqCst);
@@ -2210,7 +2245,8 @@ async fn resolved_route_refusal_after_matching_read_advances_run_epoch() {
             .await
             .expect("pair")
             .expect("pin")
-            .restore_route(&mut turn);
+            .restore_route(&mut turn)
+            .expect("complete run route");
         let probe = hub.install_resolved_route_probe(&session, true).await;
         let racing_lease = lease.clone();
         let racing_run = run.clone();
@@ -2295,7 +2331,8 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
             .await
             .expect("pair")
             .expect("pin")
-            .restore_route(&mut turn);
+            .restore_route(&mut turn)
+            .expect("complete run route");
         // An epoch-only divergence sends the next served account to the
         // run-scoped path.
         select_rotation_test_model(
@@ -2355,6 +2392,26 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
             run_id: run.clone(),
             selection: Arc::new(tokio::sync::Mutex::new(selection)),
         };
+        if variant == "live_rebind" {
+            let pair = hub
+                .run_output_pair(&session, &run)
+                .await
+                .expect("rebound pair")
+                .expect("run");
+            let mut own = raced.clone();
+            pair.restore_route(&mut own)
+                .expect("complete rebound snapshot");
+            assert_eq!(
+                own.provider_rebind_id, raced.provider_rebind_id,
+                "a stale completion cannot replace the explicit rebind"
+            );
+            assert_eq!(own.selection_epoch, Some(raced_epoch));
+            assert_eq!(
+                own.resolved_route_alias.as_deref(),
+                Some("acct-1"),
+                "the rebind carries its complete seen state"
+            );
+        }
         let mut epochs = vec![e0, e2];
         for account in ["acct-1", "acct-3"] {
             epochs.push(
@@ -2378,12 +2435,19 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
                 .iter()
                 .map(|(_, _, alias)| alias.as_deref())
                 .collect::<Vec<_>>(),
-            vec![
-                Some("acct-1"),
-                Some("acct-2"),
-                Some("acct-1"),
-                Some("acct-3")
-            ],
+            if variant == "live_rebind" {
+                // Acct-1 is already owned by the full rebind fact; resolving
+                // it again is a no-op, not another account change.
+                assert_eq!(epochs[2], raced_epoch);
+                vec![Some("acct-1"), Some("acct-2"), Some("acct-3")]
+            } else {
+                vec![
+                    Some("acct-1"),
+                    Some("acct-2"),
+                    Some("acct-1"),
+                    Some("acct-3"),
+                ]
+            },
             "{variant}: every served account change is journaled"
         );
         let mut fact_epochs = facts.iter().map(|fact| fact.1).collect::<Vec<_>>();
@@ -2407,3 +2471,6 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
         "run-scoped epoch allocation failures: {failures:#?}"
     );
 }
+
+#[path = "run_route_recovery_tests.rs"]
+mod run_route_recovery_tests;

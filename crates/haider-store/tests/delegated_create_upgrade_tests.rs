@@ -1675,6 +1675,9 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                 accept(&store, &parent.session_id, &run);
                 if !matches!(case, "legacy-rebound" | "linked-queued") {
                     let pair = haider_protocol::session::RunOutputPairPinnedV1 {
+                        route_snapshot: Some(
+                            haider_protocol::session::RunOutputRouteSnapshotV1::capture(&admitted),
+                        ),
                         provider: admitted.provider.clone(),
                         model: admitted.model.clone(),
                         max_tokens: admitted.max_tokens,

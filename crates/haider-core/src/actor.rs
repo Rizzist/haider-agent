@@ -10070,6 +10070,9 @@ impl HarnessActor {
                 "from_model": switch.from_model,
                 "to_provider": switch.to_provider,
                 "to_model": switch.to_model,
+                // The target was already resolved for this run. Preserve
+                // its observation without changing the request-start epoch.
+                "resolved_alias": target.account.as_str(),
                 "why": switch.cause.as_str(),
             }),
         )
