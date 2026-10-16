@@ -31,16 +31,24 @@ changes are additive; `schema_version` remains 1.
   ids and `collect`/`list`/`cancel`/`cancel_all` CLI commands) and `wait_ms`
   (bounds only the parent's observation, at most 86 400 000; never the child's
   life). Both are omitted from recorded arguments when absent.
-- `tool_result.result.data` gains kind `child_still_running` (fields `agent`,
-  `parent_session_id`, `child_session_id`, `child_run_id`, `progress`,
-  `latest_progress_at_ms`, `wait_limit_ms`, `collect`), returned when a
-  `wait_ms` observation ends before the child; the child keeps running and is
-  collected with `haider agent wait`. Like `tools_discovered`, `data` is an
-  optional field produced only by this or a newer daemon.
+- `tool_result.result.child_observation` is optional metadata with kind
+  `child_still_running` (fields `agent`, `parent_session_id`, `child_session_id`,
+  `child_run_id`, `progress`, `latest_progress_at_ms`, `wait_limit_ms`,
+  `collect`), returned when a `wait_ms` observation ends before the child; the
+  child keeps running and is collected with `haider agent wait`. It is outside
+  the strict legacy `data` enum so old readers retain the result preview and
+  history. Current readers also accept the earlier lane's `data` encoding;
+  existing `data` variants such as `tools_discovered` keep their wire shape.
 - Monitor sources gain `task` (`task_id`) and `agent` (`agent_id`), and
   monitor events gain `task`/`agent` (`payload`, a completion digest), in the
   tool vocabulary and on the wire (`MonitorSourceWire`,
-  `MonitorEventPayloadWire`; old clients decode them as `unknown`).
+  `MonitorEventPayloadWire`; old clients decode them as `unknown`). Durable
+  Task/Agent registrations and pending reports with unsupported source/payload
+  variants use an old-readable `monitor_removed` fence (`reason: "removed"`)
+  with the complete replacement event in additive `monitor_v2` metadata in the
+  same envelope. Current readers restore that event; old readers safely omit
+  the unsupported watch and dismiss its obsolete completion actions, including
+  prior pending/coalesced revisions.
 - Stopping the main thread stops ONLY the main thread (TUI Esc,
   `turn.cancel`, `haider run --stop-main`). Its subagents keep running; a
   foreground subagent the stopped turn was waiting on continues in the

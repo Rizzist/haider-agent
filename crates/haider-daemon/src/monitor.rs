@@ -905,12 +905,44 @@ enum MonitorJournalEvent {
 
 impl MonitorJournalEvent {
     fn from_value(value: &serde_json::Value) -> Option<Self> {
-        serde_json::from_value(value.clone()).ok()
+        serde_json::from_value(value.get("monitor_v2").unwrap_or(value).clone()).ok()
     }
 
     fn to_value(&self) -> Result<serde_json::Value, MonitorError> {
-        serde_json::to_value(self)
-            .map_err(|error| MonitorError::Store(format!("cannot encode monitor fact: {error}")))
+        let fact = serde_json::to_value(self)
+            .map_err(|error| MonitorError::Store(format!("cannot encode monitor fact: {error}")))?;
+        // An old fold must erase the previous registration/pending revision
+        // even when it cannot interpret its replacement. Put the new fact in
+        // an additive field on an old-readable tombstone in the SAME envelope.
+        // New readers restore the replacement; old readers safely omit it.
+        Ok(match self {
+            Self::MonitorRegistered { registration }
+                if matches!(
+                    registration.source,
+                    MonitorSource::Task { .. } | MonitorSource::Agent { .. }
+                ) =>
+            {
+                json!({"type":"monitor_removed", "monitor_id":registration.monitor_id,
+                    "reason":"removed", "removed_at_ms":registration.activated_at_ms,
+                    "monitor_v2":fact})
+            }
+            Self::MonitorReportPending { pending }
+                if matches!(
+                    pending.report.source,
+                    MonitorSourceKind::Task | MonitorSourceKind::Agent
+                ) || pending.report.events.iter().any(|event| {
+                    matches!(
+                        event.payload,
+                        MonitorEventPayload::Task { .. } | MonitorEventPayload::Agent { .. }
+                    )
+                }) =>
+            {
+                json!({"type":"monitor_removed", "monitor_id":pending.report.monitor_id,
+                    "reason":"removed", "removed_at_ms":pending.queued_at_ms,
+                    "monitor_v2":fact})
+            }
+            _ => fact,
+        })
     }
 }
 
@@ -2785,6 +2817,33 @@ impl MonitorService {
             );
         };
 
+        if let Some(rejection) = monitor_source_rejection(hub, &session_id, &source).await {
+            let receipt =
+                monitor_register_rejected(command_id, session_id, current_generation, rejection);
+            let body = StoredMonitorClientReceiptBody::Register {
+                receipt: receipt.clone(),
+            };
+            return match self
+                .persist_and_finalize_client_receipt_locked(
+                    hub,
+                    &receipt.command_id,
+                    &receipt.session_id,
+                    &operation_id,
+                    request_digest,
+                    body,
+                )
+                .await
+            {
+                Ok(()) => receipt,
+                Err(error) => monitor_register_rejected(
+                    receipt.command_id,
+                    receipt.session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                ),
+            };
+        }
+
         if source.resolved_argv().is_some() {
             let receipt = monitor_register_rejected(
                 command_id,
@@ -3771,6 +3830,35 @@ impl MonitorService {
             };
         };
 
+        if let Some(source) = parsed.source()
+            && let Some(rejection) = monitor_source_rejection(hub, &session_id, source).await
+        {
+            let receipt =
+                monitor_mutate_rejected(command_id, session_id, current_generation, rejection);
+            let body = StoredMonitorClientReceiptBody::Mutate {
+                receipt: receipt.clone(),
+            };
+            return match self
+                .persist_and_finalize_client_receipt_locked(
+                    hub,
+                    &receipt.command_id,
+                    &receipt.session_id,
+                    &operation_id,
+                    request_digest,
+                    body,
+                )
+                .await
+            {
+                Ok(()) => receipt,
+                Err(error) => monitor_mutate_rejected(
+                    receipt.command_id,
+                    receipt.session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                ),
+            };
+        }
+
         let (outcome, fact, projection, pending) = match parsed {
             MonitorRequest::Update {
                 source,
@@ -4325,20 +4413,11 @@ impl MonitorService {
                     .await?;
                     return Ok(result);
                 }
-                let owned = match &source {
-                    MonitorSource::Task { task_id } => hub
-                        .task_registry()
-                        .get(store.session_id(), &TaskId::new(task_id))
-                        .is_some(),
-                    MonitorSource::Agent { agent_id } => hub
-                        .delegation(AgentId::new(agent_id))
-                        .await
-                        .map_err(|error| ToolError::Runtime {
-                            message: error.to_string(),
-                        })?
-                        .is_some_and(|record| record.parent_session_id == *store.session_id()),
-                    _ => true,
-                };
+                let owned = monitor_source_owned(hub, store.session_id(), &source)
+                    .await
+                    .map_err(|error| ToolError::Runtime {
+                        message: error.to_string(),
+                    })?;
                 if !owned {
                     let result = tool_result(
                         json!({"status":"rejected", "kind":"source_not_owned", "source":source.kind()}),
@@ -4544,6 +4623,27 @@ impl MonitorService {
                     .await?;
                     return Ok(result);
                 };
+                let owned = monitor_source_owned(hub, store.session_id(), &source)
+                    .await
+                    .map_err(|error| ToolError::Runtime {
+                        message: error.to_string(),
+                    })?;
+                if !owned {
+                    let result = tool_result(
+                        json!({"status":"rejected", "kind":"source_not_owned", "source":source.kind()}),
+                        ToolResultStatus::Rejected,
+                        Some("monitor source id is not owned by this session".into()),
+                    );
+                    self.persist_tool_receipt_locked(
+                        store,
+                        &coordinates,
+                        &operation_id,
+                        &request_digest,
+                        &result,
+                    )
+                    .await?;
+                    return Ok(result);
+                }
                 let command_unapproved =
                     source.resolved_argv().is_some() && coordinates.approved_command.is_none();
                 let file_unapproved = !external_file_approval_matches(
@@ -7771,6 +7871,49 @@ fn monitor_filter_wire(filter: &MonitorFilter) -> haider_rpc::MonitorFilterWire 
     }
 }
 
+async fn monitor_source_owned(
+    hub: &SessionHub,
+    session: &SessionId,
+    source: &MonitorSource,
+) -> Result<bool, MonitorError> {
+    match source {
+        MonitorSource::Task { task_id } => {
+            // Client controls can arrive before a worker has adopted tasks.
+            // Rebuild from this owner's journal so completed handles remain
+            // valid after restart, without admitting another session's ids.
+            crate::tasks::TaskFacade::new(hub.clone())
+                .adopt_session(session)
+                .await
+                .map_err(|error| MonitorError::Store(error.to_string()))?;
+            Ok(hub
+                .task_registry()
+                .get(session, &TaskId::new(task_id))
+                .is_some())
+        }
+        MonitorSource::Agent { agent_id } => hub
+            .delegation(AgentId::new(agent_id))
+            .await
+            .map(|record| record.is_some_and(|record| record.parent_session_id == *session))
+            .map_err(|error| MonitorError::Store(error.to_string())),
+        _ => Ok(true),
+    }
+}
+
+async fn monitor_source_rejection(
+    hub: &SessionHub,
+    session: &SessionId,
+    source: &MonitorSource,
+) -> Option<haider_rpc::MonitorControlRejectionWire> {
+    match monitor_source_owned(hub, session, source).await {
+        Ok(true) => None,
+        Ok(false) => Some(haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+            field: Some("source".into()),
+            detail: "source_not_owned: monitor source id is not owned by this session".into(),
+        }),
+        Err(error) => Some(monitor_store_rejection(error)),
+    }
+}
+
 fn monitor_action_wire(action: &MonitorAction) -> haider_rpc::MonitorActionWire {
     haider_rpc::MonitorActionWire {
         report: action.report,
@@ -7782,6 +7925,13 @@ fn monitor_occurrence_wire(occurrence: MonitorOccurrence) -> haider_rpc::Monitor
     match occurrence {
         MonitorOccurrence::Once => haider_rpc::MonitorOccurrenceWire::Once,
         MonitorOccurrence::Every => haider_rpc::MonitorOccurrenceWire::Every,
+    }
+}
+
+pub(crate) fn pending_monitor_report(value: &serde_json::Value) -> Option<MonitorReport> {
+    match MonitorJournalEvent::from_value(value)? {
+        MonitorJournalEvent::MonitorReportPending { pending } => Some(pending.report),
+        _ => None,
     }
 }
 

@@ -16455,19 +16455,17 @@ impl HubConnection {
         let _fences = targets
             .iter()
             .filter(|target| {
-                matches!(scope, Scope::All | Scope::Subagents)
-                    && target.session_id != found.session_id
+                if target.session_id == found.session_id {
+                    // A terminal anchor can share its session with a later
+                    // main incarnation; that later run is outside this claim.
+                    matches!(scope, Scope::All) && !found.state.is_terminal()
+                } else {
+                    matches!(scope, Scope::All | Scope::Subagents)
+                }
             })
             .map(|target| monitor.stop_fences().fence(&target.session_id))
             .collect::<Vec<_>>();
         drop(admission);
-        let mut subagents = crate::delegation::SubagentStopSummary::default();
-        if matches!(scope, Scope::All | Scope::Subagents) {
-            subagents = delegation
-                .stop_subagent_tree_incarnations(tree.clone(), &prefix, Some(&targets))
-                .await
-                .map_err(SessionHubError::Store)?;
-        }
         let (status, terminal_seq) =
             if matches!(scope, Scope::Subagents) || found.state.is_terminal() {
                 (
@@ -16509,6 +16507,16 @@ impl HubConnection {
                     cancelled.terminal_seq,
                 )
             };
+        // Cancel the claimed main run before child cancellation can unblock a
+        // foreground wait and admit another provider request. Keep all fences
+        // through descendant settlement and the durable outer receipt commit.
+        let mut subagents = crate::delegation::SubagentStopSummary::default();
+        if matches!(scope, Scope::All | Scope::Subagents) {
+            subagents = delegation
+                .stop_subagent_tree_incarnations(tree.clone(), &prefix, Some(&targets))
+                .await
+                .map_err(SessionHubError::Store)?;
+        }
         if matches!(scope, Scope::Main) {
             subagents.still_running = delegation
                 .live_subagent_count(&tree)

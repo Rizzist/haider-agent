@@ -73,10 +73,7 @@ pub(crate) async fn load(
         }
         for envelope in page {
             journal.cursor = envelope.seq;
-            if envelope.payload.get("type").and_then(|v| v.as_str())
-                == Some("monitor_report_pending")
-                && let Some(value) = envelope.payload.pointer("/pending/report")
-                && let Ok(report) = serde_json::from_value::<MonitorReport>(value.clone())
+            if let Some(report) = crate::monitor::pending_monitor_report(&envelope.payload)
                 && report.session_id == *session
             {
                 journal

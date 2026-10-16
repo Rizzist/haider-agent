@@ -924,6 +924,62 @@ fn child_still_running_data_is_additive_and_keeps_legacy_results() {
         serde_json::from_value::<ToolResultData>(wire).expect("decode child handle"),
         data
     );
+    // The previous schema-33 reader has a strict data enum. Test the
+    // enclosing result, not just round-tripping the new enum with itself.
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyData {
+        ToolsDiscovered { promoted: Vec<String> },
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyResult {
+        preview: String,
+        data: Option<LegacyData>,
+    }
+    let result = BoundedResult {
+        data: Some(data.clone()),
+        ..serde_json::from_value::<BoundedResult>(
+            serde_json::json!({"preview":"original wait preview","truncated":false}),
+        )
+        .expect("result compatibility fixture")
+    };
+    let envelope = serde_json::to_value(&result).expect("encode observation");
+    assert!(
+        envelope.get("data").is_none(),
+        "new variants must not enter the strict legacy field"
+    );
+    assert!(envelope.get("child_observation").is_some());
+    let old: LegacyResult =
+        serde_json::from_value(envelope.clone()).expect("old reader keeps result");
+    assert_eq!(old.preview, result.preview);
+    assert!(old.data.is_none());
+    assert_eq!(
+        serde_json::from_value::<BoundedResult>(envelope).expect("result compatibility fixture"),
+        result
+    );
+    let earlier =
+        serde_json::json!({"preview":"original wait preview", "truncated":false, "data": data});
+    assert_eq!(
+        serde_json::from_value::<BoundedResult>(earlier).expect("result compatibility fixture"),
+        result
+    );
+    let ordinary = BoundedResult {
+        data: Some(ToolResultData::ToolsDiscovered {
+            promoted: vec!["fs_read".into()],
+        }),
+        ..serde_json::from_value::<BoundedResult>(
+            serde_json::json!({"preview":"discovered","truncated":false}),
+        )
+        .expect("result compatibility fixture")
+    };
+    let old: LegacyResult = serde_json::from_value(
+        serde_json::to_value(ordinary).expect("result compatibility fixture"),
+    )
+    .expect("result compatibility fixture");
+    let Some(LegacyData::ToolsDiscovered { promoted }) = old.data else {
+        panic!("existing data must remain readable")
+    };
+    assert_eq!(promoted, ["fs_read"]);
     let legacy = serde_json::json!({"preview":"old", "truncated":false});
     let decoded: BoundedResult = serde_json::from_value(legacy.clone()).expect("legacy result");
     assert_eq!(serde_json::to_value(decoded).expect("legacy bytes"), legacy);

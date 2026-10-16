@@ -126,7 +126,7 @@ pub struct BoundedResult {
     pub effects: Vec<ToolFileEffect>,
     /// Additive, tool-specific structured facts. Text previews remain stable
     /// for legacy consumers; typed clients can consume these facts directly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "compatible_result_data")]
     pub data: Option<ToolResultData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
@@ -321,6 +321,48 @@ pub(crate) mod tool_result_payload {
             payload.result.effects = payload.effects;
         }
         Ok(payload.result)
+    }
+}
+
+// Keep new observation metadata outside the strict legacy `data` enum. Old
+// readers ignore the additive field and still decode the preview and history.
+// Accept the earlier lane encoding on read so existing journals remain usable.
+mod compatible_result_data {
+    use super::ToolResultData;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize)]
+    struct Fields {
+        #[serde(default)]
+        data: Option<ToolResultData>,
+        #[serde(default)]
+        child_observation: Option<ToolResultData>,
+    }
+
+    pub fn serialize<S: Serializer>(
+        data: &Option<ToolResultData>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Output<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            data: Option<&'a ToolResultData>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            child_observation: Option<&'a ToolResultData>,
+        }
+        let observation = matches!(data, Some(ToolResultData::ChildStillRunning { .. }));
+        let fields = Output {
+            data: (!observation).then_some(data.as_ref()).flatten(),
+            child_observation: observation.then_some(data.as_ref()).flatten(),
+        };
+        fields.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ToolResultData>, D::Error> {
+        let fields = Fields::deserialize(deserializer)?;
+        Ok(fields.child_observation.or(fields.data))
     }
 }
 

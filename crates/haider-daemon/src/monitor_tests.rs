@@ -3039,3 +3039,338 @@ async fn assert_already_cancelling_stop_retention(scope: &str) {
         "{scope}: {result:?}"
     );
 }
+
+// MUTATION: write unsupported registrations/pending revisions directly, or
+// forget to unwrap their fences in CompletionProjection. Either old replay
+// resurrects a source/action, or the new reader loses the current obligation.
+#[test]
+fn unsupported_monitor_replacements_fence_every_legacy_source_and_pending_action() {
+    use haider_protocol::completion::CompletionProjection;
+    let sources = [
+        json!({"kind":"sms"}),
+        json!({"kind":"timer","interval_ms":3600000}),
+        json!({"kind":"process","command":"printf old"}),
+        json!({"kind":"file","path":"old.txt"}),
+        json!({"kind":"poll","command":"printf old","interval_ms":3600000}),
+        json!({"kind":"cli","preset":"gh-ci","argv":["run","view"]}),
+    ];
+    for old in sources {
+        let mut prior = registration(None);
+        prior.source = serde_json::from_value(old.clone()).expect("legacy source");
+        let original = MonitorJournalEvent::MonitorRegistered {
+            registration: prior.clone(),
+        };
+        assert_eq!(
+            MonitorJournalEvent::from_value(&original.to_value().unwrap()),
+            Some(original)
+        );
+        for source in [
+            MonitorSource::Task {
+                task_id: "owned-task".into(),
+            },
+            MonitorSource::Agent {
+                agent_id: "owned-agent".into(),
+            },
+        ] {
+            for (paused, exited) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut replacement = prior.clone();
+                replacement.source = source.clone();
+                replacement.paused = paused;
+                replacement.exited = exited;
+                replacement.action.follow_up = Some("new action".into());
+                let fact = MonitorJournalEvent::MonitorRegistered {
+                    registration: replacement,
+                };
+                let encoded = fact.to_value().unwrap();
+                assert_eq!(MonitorJournalEvent::from_value(&encoded), Some(fact));
+                // Ignore additive fields exactly as the previous daemon does.
+                assert!(
+                    matches!(serde_json::from_value::<MonitorJournalEvent>(encoded).unwrap(),
+                    MonitorJournalEvent::MonitorRemoved { monitor_id, reason:MonitorRemovalReason::Removed, .. }
+                    if monitor_id == prior.monitor_id)
+                );
+            }
+        }
+    }
+    for kind in [MonitorSourceKind::Task, MonitorSourceKind::Agent] {
+        for payload_only in [false, true] {
+            let mut report = test_report("coalesced-slot", "old", MonitorReportStatus::Matched);
+            report.action.follow_up = Some("obsolete action".into());
+            let pending = PendingMonitorReport {
+                report: report.clone(),
+                terminal_reason: None,
+                queue_order: 1,
+                queued_at_ms: 2,
+            };
+            let mut envelope = monitor_envelope(
+                &report.session_id,
+                None,
+                None,
+                None,
+                "old-pending",
+                DeviceId::new("test"),
+                1,
+                MonitorJournalEvent::MonitorReportPending {
+                    pending: pending.clone(),
+                }
+                .to_value()
+                .unwrap(),
+            );
+            envelope.seq = 1;
+            let mut current = CompletionProjection::default();
+            current.apply(&envelope);
+            let mut legacy = current.clone();
+            let mut replacement = pending;
+            replacement.report.action.follow_up = Some("new action".into());
+            if !payload_only {
+                replacement.report.source = kind;
+            }
+            replacement.report.events[0].payload = match kind {
+                MonitorSourceKind::Task => MonitorEventPayload::Task {
+                    payload: "done".into(),
+                },
+                _ => MonitorEventPayload::Agent {
+                    payload: "done".into(),
+                },
+            };
+            let fact = MonitorJournalEvent::MonitorReportPending {
+                pending: replacement.clone(),
+            };
+            envelope.payload = fact.to_value().unwrap().into();
+            envelope.seq = 2;
+            assert_eq!(
+                MonitorJournalEvent::from_value(&envelope.payload),
+                Some(fact)
+            );
+            assert_eq!(
+                pending_monitor_report(&envelope.payload),
+                Some(replacement.report.clone())
+            );
+            assert!(monitor_delivery_report(&envelope).is_some());
+            current.apply(&envelope);
+            envelope
+                .payload
+                .as_object_mut()
+                .unwrap()
+                .remove("monitor_v2");
+            legacy.apply(&envelope);
+            assert!(
+                legacy.pending.is_empty(),
+                "old completion must not fire obsolete action"
+            );
+            assert!(legacy.is_settled("monitor:coalesced-slot"));
+            assert!(current.pending.contains_key("monitor:coalesced-slot"));
+            assert!(!current.is_settled("monitor:coalesced-slot"));
+            assert!(matches!(
+                serde_json::from_value::<MonitorJournalEvent>(envelope.payload.to_json_value())
+                    .unwrap(),
+                MonitorJournalEvent::MonitorRemoved { .. }
+            ));
+        }
+    }
+}
+
+// MUTATION: bypass any one of the tool/client Register/Update ownership guards.
+#[tokio::test]
+async fn monitor_source_ownership_is_enforced_on_every_mutation_door() {
+    let world = MonitorWorld::new("source-owner").await;
+    let monitor_id = world
+        .register("initial", None, MonitorOccurrence::Every)
+        .await;
+    let completed = haider_protocol::task::TaskCompleted {
+        completion_consumer: None,
+        task: TaskId::new("owned-completed-task"),
+        name: "done".into(),
+        state: haider_protocol::task::TaskTerminalState::Completed { exit_code: Some(0) },
+        elapsed_ms: 1,
+        output_bytes: 0,
+        output_sha256: None,
+        tail: String::new(),
+        output_digest: None,
+        output_digest_complete: false,
+        artifact: None,
+        full_output_unavailable: false,
+        truncated: false,
+        delivery: haider_protocol::task::TaskCompletionDelivery::DeliveredQueued,
+        workspace_mutation: None,
+    };
+    let started = haider_protocol::task::TaskStarted {
+        task: completed.task.clone(),
+        name: "done".into(),
+        command: "fixture completed task".into(),
+        pid: i32::MAX,
+        started_at_ms: 1,
+    };
+    world
+        .hub
+        .append(&mut [
+            monitor_envelope(
+                &world.session,
+                Some(&world.run),
+                None,
+                None,
+                "owned-task-start",
+                world.hub.device_id(),
+                world.hub.worker_generation(),
+                started.to_payload_value().unwrap(),
+            ),
+            monitor_envelope(
+                &world.session,
+                Some(&world.run),
+                None,
+                None,
+                "owned-task-fact",
+                world.hub.device_id(),
+                world.hub.worker_generation(),
+                completed.to_payload_value().unwrap(),
+            ),
+        ])
+        .await
+        .unwrap();
+    let sources = [
+        MonitorSource::Task {
+            task_id: "missing-task".into(),
+        },
+        MonitorSource::Agent {
+            agent_id: "missing-agent".into(),
+        },
+    ];
+    let sources = sources
+        .into_iter()
+        .map(|source| (source, false))
+        .chain(std::iter::once((
+            MonitorSource::Task {
+                task_id: completed.task.to_string(),
+            },
+            true,
+        )));
+    for (n, (source, owned)) in sources.enumerate() {
+        for update in [false, true] {
+            let request = if update {
+                MonitorRequest::Update {
+                    monitor_id: monitor_id.clone(),
+                    source: source.clone(),
+                    filter: Some(MonitorFilter {
+                        field: MonitorFilterField::Payload,
+                        operator: MonitorFilterOperator::Contains,
+                        value: "NEVER_MATCH_OWNER_TEST".into(),
+                        case_sensitive: true,
+                    }),
+                    action: MonitorAction {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: MonitorOccurrence::Every,
+                    lifetime: MonitorLifetime::Session,
+                }
+            } else {
+                MonitorRequest::Register {
+                    source: source.clone(),
+                    filter: Some(MonitorFilter {
+                        field: MonitorFilterField::Payload,
+                        operator: MonitorFilterOperator::Contains,
+                        value: "NEVER_MATCH_OWNER_TEST".into(),
+                        case_sensitive: true,
+                    }),
+                    action: MonitorAction {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: MonitorOccurrence::Every,
+                    lifetime: MonitorLifetime::Session,
+                }
+            };
+            let result = world.execute(&format!("tool-{n}-{update}"), request).await;
+            assert_eq!(result.status.is_completed(), owned, "{result:?}");
+            if !owned {
+                assert!(result.preview.contains("source_not_owned"));
+            }
+            let wire = monitor_source_wire(&source);
+            if update {
+                let receipt = world
+                    .hub
+                    .inner_monitor()
+                    .client_mutate(
+                        &world.hub,
+                        haider_rpc::CommandId::new(format!("client-{n}-{update}")),
+                        world.session.clone(),
+                        world.hub.worker_generation(),
+                        haider_rpc::MonitorMutationWire::Update {
+                            monitor_id: monitor_id.clone(),
+                            source: wire,
+                            filter: Some(haider_rpc::MonitorFilterWire {
+                                field: haider_rpc::MonitorFilterFieldWire::Payload,
+                                operator: haider_rpc::MonitorFilterOperatorWire::Contains,
+                                value: "NEVER_MATCH_OWNER_TEST".into(),
+                                case_sensitive: true,
+                            }),
+                            action: haider_rpc::MonitorActionWire {
+                                report: true,
+                                follow_up: None,
+                            },
+                            occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                            lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                        },
+                    )
+                    .await;
+                assert_eq!(
+                    matches!(
+                        receipt.outcome,
+                        haider_rpc::MonitorMutateOutcomeWire::Updated { .. }
+                    ),
+                    owned,
+                    "{receipt:?}"
+                );
+            } else {
+                let receipt = world
+                    .hub
+                    .inner_monitor()
+                    .client_register(
+                        &world.hub,
+                        MonitorClientRegistrationRequest {
+                            command_id: haider_rpc::CommandId::new(format!("client-{n}-{update}")),
+                            session_id: world.session.clone(),
+                            worker_generation: world.hub.worker_generation(),
+                            source: wire,
+                            filter: Some(haider_rpc::MonitorFilterWire {
+                                field: haider_rpc::MonitorFilterFieldWire::Payload,
+                                operator: haider_rpc::MonitorFilterOperatorWire::Contains,
+                                value: "NEVER_MATCH_OWNER_TEST".into(),
+                                case_sensitive: true,
+                            }),
+                            action: haider_rpc::MonitorActionWire {
+                                report: true,
+                                follow_up: None,
+                            },
+                            occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                            lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                        },
+                    )
+                    .await;
+                assert_eq!(
+                    matches!(
+                        receipt.outcome,
+                        haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+                    ),
+                    owned,
+                    "{receipt:?}"
+                );
+            }
+            assert_eq!(
+                world
+                    .hub
+                    .inner_monitor()
+                    .inner
+                    .registry
+                    .get(&world.session, &monitor_id)
+                    .unwrap()
+                    .source,
+                if owned && update {
+                    source.clone()
+                } else {
+                    MonitorSource::Sms
+                }
+            );
+        }
+    }
+}
