@@ -253,6 +253,7 @@ fn hello(protocol_min: u32, protocol_max: u32, max_receive_frame: u32) -> WireFr
         client_instance_id: "test-client".into(),
         client_kind: ClientKind::Headless,
         capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+        features_requested: Default::default(),
         max_receive_frame,
         encodings: Vec::new(),
     })

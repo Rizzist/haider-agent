@@ -1418,6 +1418,8 @@ fn fleet_node(task: &str) -> FleetNodeWire {
         parent_agent_id: None,
         state: FleetAgentStateWire::Live,
         metrics: None,
+        activity: None,
+        activities: Vec::new(),
         folded_children: 0,
         children: Vec::new(),
     }

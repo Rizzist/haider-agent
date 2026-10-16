@@ -196,6 +196,7 @@ impl CuPresence {
 
     /// Starts one CU action. On success returns an optional acknowledgement
     /// the caller should await (bounded) before posting pointer input.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         &self,
         key: &str,
@@ -204,12 +205,17 @@ impl CuPresence {
         point: Option<PresencePoint>,
         stop: StopHook,
         in_flight: StopHook,
+        actor: Option<haider_tools::presence::PresenceActor>,
     ) -> Result<Option<oneshot::Receiver<()>>, PresenceRefusal> {
         let mut state = lock(&self.state);
-        let (seq, commands) =
-            state
-                .machine
-                .begin_action(key.to_owned(), surface, mark, point, self.now())?;
+        let (seq, commands) = state.machine.begin_action_as(
+            key.to_owned(),
+            surface,
+            mark,
+            point,
+            self.now(),
+            actor,
+        )?;
         state.hooks.insert(
             key.to_owned(),
             LeaseHooks {
@@ -609,6 +615,10 @@ pub(crate) struct PresenceLease {
     presence: Arc<CuPresence>,
     stop: StopHook,
     ended: AtomicBool,
+    /// 973-activity-icons: the subagent driving this run, named on the
+    /// overlay badge (`🖥️ Ammar is using your screen`). `None` for the main
+    /// thread, which keeps the generic badge.
+    actor: Option<haider_tools::presence::PresenceActor>,
 }
 
 /// Finishes the action when dropped, including on cancellation.
@@ -622,6 +632,13 @@ impl Drop for ActionGuard<'_> {
     }
 }
 
+/// Whether an overlay badge leads with the activity emoji (see
+/// [`PresenceLease::with_actor`]).
+pub(crate) fn overlay_emoji(override_value: Option<&str>, no_color: bool) -> bool {
+    haider_protocol::activity::ActivityDisplay::resolve(override_value, None, no_color, None)
+        == haider_protocol::activity::ActivityDisplay::Emoji
+}
+
 impl PresenceLease {
     pub(crate) fn new(presence: Arc<CuPresence>, key: String, stop: StopHook) -> Self {
         Self {
@@ -629,7 +646,28 @@ impl PresenceLease {
             presence,
             stop,
             ended: AtomicBool::new(false),
+            actor: None,
         }
+    }
+
+    /// Name the subagent driving this run on any badge it raises.
+    ///
+    /// Emoji rule (973-activity-icons, F4 — documented choice): the overlay
+    /// is a DAEMON surface shared by every client, so it cannot follow one
+    /// TUI's `/icons` preference. It uses the daemon's own environment with
+    /// the client resolution order minus the terminal heuristics:
+    /// `HAIDER_ACTIVITY_ICONS` (`emoji`/`text`/`off`) wins, else `NO_COLOR`
+    /// selects the plain label, else emoji. An auto-spawned daemon inherits
+    /// both from the client that launched it.
+    #[must_use]
+    pub(crate) fn with_actor(mut self, name: Option<String>) -> Self {
+        let override_value = std::env::var(haider_client::fleet::ACTIVITY_ICONS_ENV).ok();
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let emoji = overlay_emoji(override_value.as_deref(), no_color);
+        self.actor = name
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| haider_tools::presence::PresenceActor { name, emoji });
+        self
     }
 
     /// Lease on `presence` (the daemon-wide [`global`] in production) whose Stop cancels `run_id`
@@ -660,6 +698,7 @@ impl PresenceLease {
             point,
             Arc::clone(&self.stop),
             in_flight,
+            self.actor.clone(),
         )?;
         let guard = ActionGuard { lease: self };
         if let Some(ack) = ack {

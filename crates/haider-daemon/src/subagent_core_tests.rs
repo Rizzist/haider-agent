@@ -1068,6 +1068,7 @@ fn delegation_parent_projection_is_pinned_to_the_spawn_branch() {
         started_at_ms: 100,
         terminal_at_ms: None,
         live: true,
+        activity: None,
         tool_attempts: 2,
         usage: None,
     };
@@ -3516,6 +3517,7 @@ impl UdsControlClient {
                     Capability::View,
                     Capability::Control,
                 ]),
+                features_requested: Default::default(),
                 max_receive_frame: u32::try_from(haider_rpc::DEFAULT_FRAME_LIMIT)
                     .expect("test frame limit fits u32"),
                 encodings: Vec::new(),

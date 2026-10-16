@@ -260,6 +260,7 @@ fn describe(item: &crate::ProviderStreamItem) -> String {
             call_id,
             name,
             args,
+            ..
         }) => {
             format!("server_tool_use:{call_id}:{name}:{args}")
         }
@@ -2096,4 +2097,110 @@ async fn selecting_a_model_without_a_selector_is_refused_rather_than_faked() {
         "the refusal names what is missing: {}",
         error.message
     );
+}
+#[tokio::test]
+async fn gate_v1_acp_title_never_overrides_typed_kind() {
+    use haider_protocol::activity::ActivityKind as A;
+    let (connection, mut agent) = connect_pair(refusing());
+    let script = tokio::spawn(async move {
+        serve_handshake(&mut agent, live_auth_methods(), 1).await;
+        let prompt = agent.next_request().await;
+        for (id, title, kind) in [
+            ("call-1", "computer", "execute"),
+            ("call-2", "browser_open the docs", "fetch"),
+            ("call-3", "ssh_shell", "execute"),
+            ("call-4", "mobile", "read"),
+            ("call-5", "", "edit"),
+            ("call-6", "mcp__server__computer", "search"),
+            ("call-7", "computer", "delete"),
+            ("call-8", "mobile", "move"),
+            ("call-9", "browser_open", "think"),
+            ("call-10", "ssh_shell", "switch_mode"),
+            ("call-11", "computer", "future_kind"),
+            ("call-12", " RUN ", "other"),
+        ] {
+            agent
+                .send_update(json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": id,
+                    "title": title,
+                    "kind": kind,
+                    "status": "completed",
+                    "rawOutput": { "ok": true },
+                }))
+                .await;
+        }
+        agent
+            .send_update(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-13",
+                "title": "computer",
+                "kind": "other",
+                "status": "in_progress",
+            }))
+            .await;
+        agent
+            .send_update(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-13",
+                "kind": "read",
+                "status": "completed",
+            }))
+            .await;
+        agent
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": prompt["id"],
+                "result": { "stopReason": "end_turn" },
+            }))
+            .await;
+    });
+    let provider = AntigravityAcpProvider::handshake(connection, &session_config())
+        .await
+        .expect("handshakes");
+    let mut stream = provider
+        .stream_turn(turn_request("spoof"))
+        .await
+        .expect("opens turn");
+    let items = drain(&mut stream).await;
+    let activities: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            Ok(StreamEvent::ServerToolUse { activity, .. }) => Some(*activity),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        activities,
+        vec![
+            Some(A::Run),
+            Some(A::Web),
+            Some(A::Run),
+            Some(A::Read),
+            Some(A::Edit),
+            Some(A::Read),
+            Some(A::Edit),
+            Some(A::Edit),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(A::Read),
+        ]
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Ok(StreamEvent::ServerToolUse { name, activity, .. }) => {
+                    Some((name.as_str(), *activity))
+                }
+                _ => None,
+            })
+            .next_back(),
+        Some(("computer", Some(A::Read))),
+        "a kind update changes the typed activity without replacing its display title",
+    );
+    let _ = script.await;
 }

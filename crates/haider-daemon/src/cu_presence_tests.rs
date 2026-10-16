@@ -624,6 +624,68 @@ async fn first_capture_is_concealed_before_the_helper_reports_ready() {
     lease.end(false);
 }
 
+#[tokio::test]
+async fn a_subagent_lease_names_itself_on_the_overlay_badge() {
+    // 973-activity-icons, dry-run backend: the recording renderer stands in
+    // for the real overlay, so no real screen is driven.
+    let (presence, recorded) = presence_with(PresenceSurface::Screen, false);
+    let (stop, _stops) = counting_hook();
+    let lease = PresenceLease::new(Arc::clone(&presence), "s/sub".into(), stop)
+        .with_actor(Some("Ammar".into()));
+    let cancel = haider_tools::ComputerCancelToken::new();
+    {
+        let _guard = lease
+            .begin_computer(&ComputerAction::Screenshot, None, &cancel)
+            .await
+            .expect("begin");
+    }
+    lease.end(false);
+    let commands = recorded.commands.lock().unwrap().clone();
+    let expected_label = if !crate::cu_presence::overlay_emoji(
+        std::env::var("HAIDER_ACTIVITY_ICONS").ok().as_deref(),
+        std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+    ) {
+        "Ammar is using your screen".to_owned()
+    } else {
+        "\u{1F5A5}\u{FE0F} Ammar is using your screen".to_owned()
+    };
+    assert!(
+        matches!(commands.first(), Some(PresenceCommand::Show { label, .. }) if *label == expected_label),
+        "{commands:?}"
+    );
+    // An empty name keeps the generic badge.
+    let (stop, _stops) = counting_hook();
+    let generic = PresenceLease::new(Arc::clone(&presence), "s/main".into(), stop)
+        .with_actor(Some("  ".into()));
+    {
+        let _guard = generic
+            .begin_computer(&ComputerAction::Screenshot, None, &cancel)
+            .await
+            .expect("begin");
+    }
+    generic.end(false);
+    let commands = recorded.commands.lock().unwrap().clone();
+    assert!(commands.iter().any(|command| matches!(command,
+        PresenceCommand::Show { label, .. } if label == "Haider is controlling this screen")));
+}
+
+#[test]
+fn overlay_emoji_rule_follows_override_then_no_color() {
+    use crate::cu_presence::overlay_emoji;
+    assert!(overlay_emoji(None, false));
+    assert!(
+        !overlay_emoji(None, true),
+        "NO_COLOR selects the plain badge"
+    );
+    assert!(overlay_emoji(Some("emoji"), true), "explicit override wins");
+    assert!(!overlay_emoji(Some("text"), false));
+    assert!(!overlay_emoji(Some("off"), false));
+    assert!(
+        overlay_emoji(Some("sparkles"), false),
+        "unparseable override ignored"
+    );
+}
+
 /// Polls a future once without a runtime wake-up; true while it is pending.
 fn poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> bool {
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());

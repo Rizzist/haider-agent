@@ -17492,8 +17492,10 @@ fn load_workspace_mutation(
                 continue;
             };
             if intent.effect == effect {
-                if intent.class != EffectClass::FsWrite
-                    || intent_envelope.run_id.as_ref() != Some(&mutation_ref.run_id)
+                if !matches!(
+                    intent.class,
+                    EffectClass::FsWrite | EffectClass::CheckpointRestore
+                ) || intent_envelope.run_id.as_ref() != Some(&mutation_ref.run_id)
                 {
                     return Err(graph_evidence_error(
                         ErrorCode::InvalidArgument,
@@ -23053,7 +23055,7 @@ fn validate_workspace_mutation_intent(
         if candidate.run_id != envelope.run_id
             || !matches!(
                 intent.class,
-                EffectClass::FsWrite | EffectClass::ProcessExec
+                EffectClass::FsWrite | EffectClass::ProcessExec | EffectClass::CheckpointRestore
             )
         {
             return Err(store_error(
