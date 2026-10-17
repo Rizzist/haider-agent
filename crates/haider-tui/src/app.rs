@@ -12824,8 +12824,9 @@ impl AppModel {
     }
 
     /// Every current composer judges the selected model against the same
-    /// catalog owner and the session's explicit route. Ownerless selections
-    /// are permanent configuration or legacy daemon truth.
+    /// catalog owner and the session's explicit route. Account replies can
+    /// prove the former owner retired before a new provider reply arrives.
+    /// Ownerless selections are permanent configuration or legacy daemon truth.
     fn catalog_owner_is_current(
         &self,
         provider: &str,
@@ -12837,10 +12838,28 @@ impl AppModel {
         }
         self.providers.providers.iter().any(|summary| {
             summary.provider == provider
-                && summary
-                    .catalog_scope
-                    .as_ref()
-                    .is_some_and(|scope| Some(scope.key.as_str()) == key)
+                && summary.catalog_scope.as_ref().is_some_and(|scope| {
+                    Some(scope.key.as_str()) == key
+                        && (self.accounts.revision.is_none()
+                            || scope
+                                .account_alias
+                                .as_deref()
+                                .zip(scope.account_incarnation)
+                                .is_none_or(|(alias, incarnation)| {
+                                    incarnation != 0
+                                        && self.accounts.rows.iter().any(|account| {
+                                            account.selected
+                                                && account.provider == provider
+                                                && account.alias == alias
+                                                && self
+                                                    .accounts
+                                                    .catalog_incarnations
+                                                    .get(alias)
+                                                    .copied()
+                                                    == Some(incarnation)
+                                        })
+                                }))
+                })
                 && session
                     .and_then(|id| self.session_catalog_routes.get(id))
                     .is_none_or(|(base_url, account)| {

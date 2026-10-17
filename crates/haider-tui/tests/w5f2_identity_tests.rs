@@ -3266,6 +3266,10 @@ fn catalog_order_newer_active_list_keeps_owner_after_reopen() {
     catalog_order_newer_list_case(false, true);
 }
 fn catalog_order_child_case(changed: bool) {
+    catalog_order_child_snapshot_case(changed, true);
+}
+
+fn catalog_order_child_snapshot_case(changed: bool, provider_reply: bool) {
     use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
     use haider_protocol::ids::{AgentId, LeaseId, SessionId};
     use haider_tui::app::{ChipModel, Screen};
@@ -3317,21 +3321,23 @@ fn catalog_order_child_case(changed: bool) {
             sources: vec![],
         },
     );
-    pass(
-        &mut driver,
-        &mut model,
-        LiveReply::Providers {
-            providers: vec![private_summary(
-                incarnation,
-                if changed {
-                    "different-model"
-                } else {
-                    "shared-model"
-                },
-            )],
-            revision: 3,
-        },
-    );
+    if provider_reply {
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![private_summary(
+                    incarnation,
+                    if changed {
+                        "different-model"
+                    } else {
+                        "shared-model"
+                    },
+                )],
+                revision: 3,
+            },
+        );
+    }
     catalog_order_render(&model);
     let identity = model.surface_composer_identity(100);
     if changed {
@@ -3717,4 +3723,14 @@ fn catalog_order_parked_journal_selection_installs_owner() {
         "shared-model",
         "a parked journal selection must keep its admitted owner on reopen"
     );
+}
+
+#[test]
+fn catalog_order_child_account_reply_retires_before_provider_reply() {
+    catalog_order_child_snapshot_case(true, false);
+}
+
+#[test]
+fn catalog_order_child_same_account_reply_keeps_model_while_provider_is_delayed() {
+    catalog_order_child_snapshot_case(false, false);
 }
