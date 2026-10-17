@@ -12939,7 +12939,9 @@ impl AppModel {
         let current_pair = child_row.and_then(|row| row.meter_epoch.pair.as_ref());
         if let Some(row) = child_row
             && let Some((provider, model, key)) = self.session_catalog_keys.get(&row.id)
-            && current_pair == Some(&(provider.clone(), model.clone()))
+            && current_pair.is_some_and(|(selected_provider, selected_model)| {
+                selected_provider == provider && selected_model == model
+            })
             && !self.catalog_owner_is_current(provider, key.as_deref(), Some(&row.id))
         {
             return None;
