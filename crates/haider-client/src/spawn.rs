@@ -39,8 +39,8 @@ use crate::profile::ResolvedProfile;
 static SPAWN_READY_TRACE: Mutex<Option<(u128, u128)>> = Mutex::new(None);
 
 /// Takes the launcher-owned spawn-to-Ready timestamp, if client lifecycle
-/// tracing recorded one for this process. The CLI output adapter owns stderr,
-/// so it emits the marker without cross-thread lock inversion.
+/// tracing recorded one for this process. The CLI output adapter emits this
+/// marker in event order, without holding a stream lock across event waits.
 #[doc(hidden)]
 pub fn take_spawn_ready_trace() -> Option<(u128, u128)> {
     SPAWN_READY_TRACE.lock().ok()?.take()

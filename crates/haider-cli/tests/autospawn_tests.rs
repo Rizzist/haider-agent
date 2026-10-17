@@ -670,6 +670,74 @@ fn process_exists(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// This is an exit-time observation of a fixture-proven PID, not a new live
+/// peer identity capture. kill(0) still succeeds for zombies, whereas Darwin
+/// can already reject EVFILT_PROC registration with ESRCH in that state.
+#[cfg(target_os = "macos")]
+fn process_retired(pid: u32) -> bool {
+    let id = haider_platform::process_id(Some(pid)).expect("valid fixture process PID");
+    match haider_platform::ProcessExitMonitor::capture(id) {
+        // Registration is only a retirement probe: do not retain a new live
+        // identity after the peer/owned-child observation window has closed.
+        Ok(_) => false,
+        Err(error)
+            if error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<nix::errno::Errno>())
+                == Some(&nix::errno::Errno::ESRCH) =>
+        {
+            true
+        }
+        Err(error) => panic!("observe fixture process retirement: {error}"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_retired(pid: u32) -> bool {
+    let rows = capture_process_rows().expect("observe daemon retirement state");
+    let state = rows.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()?.parse::<u32>().ok()? == pid {
+            fields.nth(2)
+        } else {
+            None
+        }
+    });
+    state.is_some_and(|state| state.starts_with('Z')) || !process_exists(pid)
+}
+
+#[test]
+fn retirement_observation_distinguishes_live_zombie_and_reaped_children() {
+    use std::io::Write as _;
+
+    // The pipe keeps this owned child alive until explicitly released. Leave
+    // it unreaped to deterministically cover the state that broke late capture.
+    let mut child = Command::new("sh")
+        .args(["-c", "read release"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn retirement control");
+    let pid = child.id();
+    assert!(!process_retired(pid), "a live process is not retired");
+    child
+        .stdin
+        .take()
+        .expect("release pipe")
+        .write_all(b"exit\n")
+        .expect("release child");
+    let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+    while !process_retired(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let zombie_retired = process_retired(pid);
+    let zombie_exists = process_exists(pid);
+    let reaped = child.wait().expect("reap retirement control");
+    assert!(reaped.success());
+    assert!(zombie_exists, "unreaped child still has a PID");
+    assert!(zombie_retired, "an unreaped zombie is retired");
+    assert!(process_retired(pid), "a reaped child is retired");
+}
+
 fn wait_for_daemon_ready(profile: &ResolvedProfile, guard: &DaemonGuard) -> u32 {
     let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
     loop {
@@ -1209,7 +1277,7 @@ fn real_status_tui_and_probe_autospawns_share_short_idle_ttl() {
 #[test]
 fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     const IDLE_TTL_MS: u64 = 250;
-    // The retained process identity reports exit; the daemon log separately
+    // The published process identity reports exit; the daemon log separately
     // pins the actual configured policy rather than a host elapsed bound.
     const EXIT_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
@@ -1241,29 +1309,14 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     );
 
     let daemon_pid = traced_daemon_pid(&traces);
-    let process_id = haider_platform::process_id(Some(daemon_pid)).expect("valid daemon PID");
-    match haider_platform::ProcessExitMonitor::capture(process_id) {
-        Ok(exit) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime");
-            runtime.block_on(async {
-                tokio::time::timeout(EXIT_DEADLINE, exit.wait())
-                    .await
-                    .expect(
-                        "spawned daemon did not publish process exit before the fixture watchdog",
-                    )
-                    .expect("wait for spawned daemon exit");
-            });
-        }
-        Err(error) if !process_exists(daemon_pid) => {
-            // The captured receipt remains valid if normal idle retirement
-            // precedes retaining a kernel process identity.
-            let _ = error;
-        }
-        Err(error) => panic!("retain spawned daemon process identity: {error}"),
+    let deadline = Instant::now() + EXIT_DEADLINE;
+    while !process_retired(daemon_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
     }
+    assert!(
+        process_retired(daemon_pid),
+        "spawned daemon did not retire before the fixture watchdog"
+    );
     assert!(
         !profile.endpoint_path.exists(),
         "idle exit must remove the profile endpoint"
@@ -1271,6 +1324,65 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     assert_idle_linger_receipt(store.path(), IDLE_TTL_MS);
     assert!(!store.path().join("lock.owner").exists());
     assert_eq!(traced_daemon_pid(&traces), daemon_pid);
+}
+
+/// Both trace switches must preserve the own-child identity diagnostic without
+/// preventing Accepted. Warm runs are the attaching negative control, and each
+/// output adapter is exercised with actual sibling executables and a watchdog.
+#[test]
+fn traced_cold_and_warm_runs_complete_in_every_output_mode() {
+    ensure_haiderd_built();
+    for trace in ["HAIDER_CLIENT_LIFECYCLE_TRACE", "HAIDER_DAEMON_TRACE"] {
+        for mode in ["json", "jsonl", "print"] {
+            let store = tempfile::tempdir().expect("store dir");
+            let _guard = DaemonGuard {
+                store: store.path().to_path_buf(),
+            };
+            for cold in [true, false] {
+                let output = output_with_timeout(
+                    haider_command(store.path())
+                        .args(["run", "--provider", "fake", "--output", mode, "-p", "hello"])
+                        .env(trace, "1")
+                        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "60000")
+                        // Fake scripts are consumed across provider requests;
+                        // each of the two runs needs its own finish boundary.
+                        .env("HAIDER_TEST_FAKE_PROVIDER", concat!(
+                            r#"[{"step":"emit_text","text":"trace-probe-ok"},{"step":"finish","reason":"end_turn"},"#,
+                            r#"{"step":"emit_text","text":"trace-probe-ok"},{"step":"finish","reason":"end_turn"}]"#,
+                        )),
+                    &format!("{trace} {mode} cold={cold} run"),
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "{trace} {mode} cold={cold}: status={} stdout={stdout} stderr={stderr}",
+                    output.status
+                );
+                assert!(
+                    stdout.contains("trace-probe-ok"),
+                    "missing fake-provider response: {stdout}"
+                );
+                assert_eq!(
+                    stderr.contains("event=spawn_ready_candidate path=own_child candidate_pid="),
+                    cold,
+                    "identity diagnostic for {trace} {mode}: {stderr}"
+                );
+                match mode {
+                    "json" => {
+                        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            .expect("single JSON document");
+                    }
+                    "jsonl" => {
+                        for line in stdout.lines() {
+                            serde_json::from_str::<serde_json::Value>(line).expect("JSONL record");
+                        }
+                    }
+                    _ => assert_eq!(stdout.trim(), "trace-probe-ok"),
+                }
+            }
+        }
+    }
 }
 
 /// Abrupt launcher death leaves no cancellation receipt, so a hanging fake

@@ -36,5 +36,8 @@ tempfile.workspace = true
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true, features = ["event"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+nix = "0.31.3"
+
 [lints]
 workspace = true
