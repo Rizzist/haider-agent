@@ -3423,7 +3423,7 @@ mod tests {
             assert_eq!(document["error"]["code"], "protocol_mismatch");
             assert_eq!(
                 document["error"]["message"],
-                "This daemon is older than this CLI and cannot end helper tasks reliably. Stop it with `haider daemon stop`, then run your command again; the current daemon starts automatically."
+                haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE
             );
         }
         let missing = HeadlessRunError::Ensure(EnsureError::MissingFeatures {

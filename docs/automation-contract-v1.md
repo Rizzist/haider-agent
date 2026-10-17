@@ -846,11 +846,15 @@ This capability promises incarnation-bound stops, durable completed-stop
 replay, and removal of the stopped helper tasks' monitors. If it is absent,
 the CLI JSON and TUI refuse with `protocol_mismatch` (CLI exit 76), without
 sending the stop. The remedy is: "This daemon is older than this CLI and
-cannot end helper tasks reliably. Stop it with `haider daemon stop`, then
-run your command again; the current daemon starts automatically."
+cannot end helper tasks reliably. First close older clients attached to this
+profile (including session --watch and TUI clients) so they cannot restart the
+old daemon. Stop it with `haider daemon stop`, then run your command again;
+the current daemon starts automatically."
 With `--no-spawn`, the remedy instead says: "This daemon is older than this
-CLI and cannot end helper tasks reliably. Stop it with `haider daemon stop`,
-then run your command again without --no-spawn so the current daemon can start."
+CLI and cannot end helper tasks reliably. First close older clients attached
+to this profile (including session --watch and TUI clients) so they cannot
+restart the old daemon. Stop it with `haider daemon stop`, then run your
+command again without --no-spawn so the current daemon can start."
 The flag continues to disable automatic startup; recovery requires omitting it.
 An auto-spawned daemon stays up while any run or owed result
 delivery is live and retires only after all work is terminal plus its idle
