@@ -3,6 +3,25 @@ use super::*;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
+fn assert_failed_account_write(output: &std::process::Output, message: &str, json_output: bool) {
+    assert!(!output.status.success(), "{output:?}");
+    if json_output {
+        let error: Value = serde_json::from_slice(&output.stdout).expect("account error JSON");
+        assert_eq!(error["schema"], "haider.account.error.v1", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|text| text.contains(message)),
+            "{error}"
+        );
+    } else {
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{output:?}"
+        );
+    }
+}
+
 fn rpc(endpoint: &Path, body: Value) -> Value {
     use std::os::unix::net::UnixStream;
     fn send(stream: &mut UnixStream, value: Value) {
@@ -133,8 +152,7 @@ fn source_write_case(readd: bool) {
         .args(args)
         .output()
         .expect("source mutation");
-    assert!(!failed.status.success());
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("temporary credential source"));
+    assert_failed_account_write(&failed, "temporary credential source", !readd);
     let changed: Vec<haider_protocol::credential::CredentialDescriptor> = serde_json::from_slice(
         &std::fs::read(owner.profile.join("accounts.json")).expect("saved accounts"),
     )
@@ -233,8 +251,7 @@ fn partial_write_cli_auth_journal_error_retires_rows_default_and_automatic_selec
         .args(["account", "update", "work", "--no-auth", "--json"])
         .output()
         .expect("auth change");
-    assert!(!failed.status.success());
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("synthetic journal unavailable"));
+    assert_failed_account_write(&failed, "synthetic journal unavailable", true);
     let current = provider_snapshot_json(&owner.profile, "work");
     assert_eq!(
         current["auth_methods"],
