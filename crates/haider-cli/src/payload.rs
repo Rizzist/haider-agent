@@ -1,5 +1,5 @@
 //! Sibling process handoff. Headless dispatch never enters the TUI path.
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -12,7 +12,7 @@ fn sibling(name: &str) -> io::Result<PathBuf> {
 /// There is no negotiated RPC connection at this point. On Unix exec opens
 /// the chosen image before closing this CLOEXEC descriptor, so replacement
 /// cannot race version validation. Read-only managed installs need no new lock.
-fn install_read_lock(executable: &Path) -> io::Result<Option<File>> {
+fn install_read_lock(executable: &Path) -> io::Result<Option<haider_platform::FileLock>> {
     let path = executable.with_file_name(".haider-update.lock");
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(io::Error::other("update lock is a symlink"));
@@ -34,8 +34,7 @@ fn install_read_lock(executable: &Path) -> io::Result<Option<File>> {
             "update lock is not an owner-only regular file",
         ));
     }
-    file.lock_shared()?;
-    Ok(Some(file))
+    haider_platform::FileLock::shared(file).map(Some)
 }
 
 pub(super) fn launch() -> ExitCode {
@@ -127,7 +126,7 @@ mod tests {
         let lock = install_read_lock(&dir.path().join("haider-tui"))
             .expect("launch lock")
             .expect("writable install");
-        let metadata = lock.metadata().expect("lock metadata");
+        let metadata = lock.file().metadata().expect("lock metadata");
         assert!(metadata.is_file());
         assert!(haider_platform::metadata_is_current_user(&metadata));
         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
@@ -143,10 +142,8 @@ mod tests {
         // Parallel daemon tests fork before their pre_exec descriptor sweep.
         // CLOEXEC does not close a fork's inherited descriptor until exec;
         // dropping our File alone need not release that shared flock yet.
-        // Keep a duplicate alive to exercise this lifetime deterministically,
-        // and explicitly unlock through the descriptor that took the lock.
-        let inherited = lock.try_clone().expect("inherited lock descriptor");
-        lock.unlock().expect("release launch lock synchronously");
+        // Keep a duplicate alive to exercise the production guard's release.
+        let inherited = lock.file().try_clone().expect("inherited lock descriptor");
         drop(lock);
         exclusive.try_lock().expect("launch lock released");
         exclusive.unlock().expect("release updater lock");
