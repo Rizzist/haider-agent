@@ -12150,6 +12150,10 @@ impl AppModel {
             .map(|scope| scope.key.clone())
     }
 
+    pub(crate) fn clear_session_catalog_route(&mut self, session: &SessionId) {
+        self.session_catalog_routes.remove(session);
+    }
+
     /// The created session's committed pair (the `session.create` reply).
     pub fn apply_scoped_model_selected(
         &mut self,
@@ -12653,6 +12657,33 @@ impl AppModel {
         }
     }
 
+    /// Every current composer judges the selected model against the same
+    /// catalog owner and the session's explicit route. Ownerless selections
+    /// are permanent configuration or legacy daemon truth.
+    fn catalog_owner_is_current(
+        &self,
+        provider: &str,
+        key: Option<&str>,
+        session: Option<&SessionId>,
+    ) -> bool {
+        if self.mode != RuntimeMode::Live || key.is_none() {
+            return true;
+        }
+        self.providers.providers.iter().any(|summary| {
+            summary.provider == provider
+                && summary
+                    .catalog_scope
+                    .as_ref()
+                    .is_some_and(|scope| Some(scope.key.as_str()) == key)
+                && session
+                    .and_then(|id| self.session_catalog_routes.get(id))
+                    .is_none_or(|(base_url, account)| {
+                        summary
+                            .catalog_matches_session_route(base_url.as_deref(), account.as_deref())
+                    })
+        })
+    }
+
     /// The composer-top-rule identity (F2c): `model · oauth|api ·
     /// reasoning [· fast]` — NO alias, right-aligned on the band's top
     /// border by the renderer.
@@ -12663,15 +12694,11 @@ impl AppModel {
     pub fn display_identity(&self) -> std::borrow::Cow<'_, IdentityLine> {
         let awaiting_owner = self.mode == RuntimeMode::Live
             && (self.restored_model_catalog_pending
-                || self.identity_catalog_key.as_ref().is_some_and(|key| {
-                    !self.providers.providers.iter().any(|summary| {
-                        summary.provider == self.identity.provider
-                            && summary
-                                .catalog_scope
-                                .as_ref()
-                                .is_some_and(|scope| &scope.key == key)
-                    })
-                }));
+                || !self.catalog_owner_is_current(
+                    &self.identity.provider,
+                    self.identity_catalog_key.as_deref(),
+                    self.active_session.as_ref(),
+                ));
         if awaiting_owner {
             let mut identity = self.identity.clone();
             identity.model_short.clear();
@@ -12744,6 +12771,13 @@ impl AppModel {
             .as_deref()
             .and_then(|session| self.sessions.iter().find(|row| row.id.as_str() == session));
         let current_pair = child_row.and_then(|row| row.meter_epoch.pair.as_ref());
+        if let Some(row) = child_row
+            && let Some((provider, model, key)) = self.session_catalog_keys.get(&row.id)
+            && current_pair == Some(&(provider.clone(), model.clone()))
+            && !self.catalog_owner_is_current(provider, key.as_deref(), Some(&row.id))
+        {
+            return None;
+        }
         let summary_known = child_row.is_some_and(|row| row.summary_seen);
         let model = self.child_display_model(chip).trim();
         if model.is_empty() {
@@ -20308,37 +20342,7 @@ impl AppModel {
                 .is_some_and(|incoming| incoming >= current)
         });
         if let Some(metadata) = &summary.metadata {
-            let first_catalog_snapshot =
-                !self.session_catalog_keys.contains_key(&summary.session_id);
-            self.session_catalog_keys
-                .entry(summary.session_id.clone())
-                .or_insert_with(|| {
-                    (
-                        metadata.provider.clone(),
-                        metadata.model.clone(),
-                        metadata.model_catalog_key.clone(),
-                    )
-                });
-            self.session_catalog_routes
-                .entry(summary.session_id.clone())
-                .or_insert_with(|| {
-                    (
-                        metadata.provider_base_url.clone(),
-                        metadata.account_alias.clone(),
-                    )
-                });
-            // Once an event/reply supplies a selection, a delayed session-list
-            // snapshot cannot overwrite it. Cold checkout still gets metadata.
-            if first_catalog_snapshot
-                && summary_selection_fresh
-                && self.active_session.as_ref() == Some(&summary.session_id)
-            {
-                self.identity.provider = metadata.provider.clone();
-                self.identity.model_short = metadata.model.clone();
-                self.pin_model_catalog_scope();
-                self.identity_catalog_key = metadata.model_catalog_key.clone();
-                self.bootstrap_identity_from_daemon();
-            }
+            self.note_session_catalog_metadata(&summary.session_id, metadata);
             let prior = self
                 .session_created_at_ms
                 .insert(summary.session_id.clone(), metadata.created_at_ms);
@@ -22214,7 +22218,7 @@ impl AppModel {
         model: &str,
         output_budget: Option<&haider_protocol::output_budget::SessionOutputBudgetV1>,
         selection_epoch: Option<u64>,
-    ) {
+    ) -> bool {
         let pair = (provider.to_owned(), model.to_owned());
         let budget = output_budget.map(|budget| budget.max_tokens);
         let source = output_budget.map(|budget| {
@@ -22262,10 +22266,13 @@ impl AppModel {
             false
         };
         if !admitted {
-            return;
+            return false;
         }
-        if new_route && let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) {
-            row.reset_account_route(provider, selection_epoch);
+        if new_route {
+            self.session_catalog_routes.remove(session);
+            if let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) {
+                row.reset_account_route(provider, selection_epoch);
+            }
         }
         if viewed_child {
             self.launcher_identity.provider = provider.to_owned();
@@ -22284,6 +22291,7 @@ impl AppModel {
         {
             self.apply_output_budget_clamp(&clamp);
         }
+        true
     }
 
     /// A committed `ModelSelected` journal fact for the VIEWED session
@@ -22313,9 +22321,9 @@ impl AppModel {
         provider: &str,
         model: &str,
         epoch: Option<u64>,
-    ) {
+    ) -> bool {
         let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
-            return;
+            return false;
         };
         let new_provider = entry
             .meter_epoch
@@ -22326,9 +22334,10 @@ impl AppModel {
             .meter_epoch
             .admit((provider.to_owned(), model.to_owned()), epoch, None, None)
         {
-            return;
+            return false;
         }
         if new_provider {
+            self.session_catalog_routes.remove(session);
             entry.reset_account_route(provider, epoch);
         }
         entry.model_short = model.to_owned();
@@ -22336,6 +22345,7 @@ impl AppModel {
             .projection
             .push_note(format!("⇄ model → {model} · {provider}"));
         self.dirty = true;
+        true
     }
 
     pub fn note_parked_account_pin_cleared(
@@ -22462,19 +22472,21 @@ impl AppModel {
         provider: &str,
         model: &str,
         epoch: Option<u64>,
-    ) {
+    ) -> bool {
         let Some(row) = self.sessions.iter_mut().find(|row| &row.id == session) else {
-            return;
+            return false;
         };
         let pair = (provider.to_owned(), model.to_owned());
         let same_pair = row.meter_epoch.pair.as_ref() == Some(&pair);
         let budget = same_pair.then_some(row.meter_epoch.output_budget).flatten();
         let user_budget = same_pair.then_some(row.meter_epoch.user_budget);
         let previous_epoch = row.meter_epoch.selection_epoch;
-        if row.meter_epoch.admit(pair, epoch, budget, user_budget) {
+        let admitted = row.meter_epoch.admit(pair, epoch, budget, user_budget);
+        if admitted {
             row.observe_route_commit(epoch, previous_epoch);
             self.dirty = true;
         }
+        admitted
     }
 
     /// A committed provider rebind for a PARKED session: its epoch's pair
@@ -22569,6 +22581,13 @@ impl AppModel {
         row.account_provider = Some(rebound.provider.clone());
         row.account_base_url.clone_from(&rebound.base_url);
         row.account_metadata_epoch = epoch;
+        self.session_catalog_routes.insert(
+            session.clone(),
+            (rebound.base_url.clone(), rebound.account.clone()),
+        );
+        if let Some((provider, _, _)) = self.session_catalog_keys.get_mut(session) {
+            provider.clone_from(&rebound.provider);
+        }
         self.dirty = true;
     }
 
@@ -22596,7 +22615,7 @@ impl AppModel {
         output_budget: u64,
         selection_epoch: Option<u64>,
         budget_source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
-    ) {
+    ) -> bool {
         let pair = (provider.to_owned(), model.to_owned());
         let budget = (output_budget > 0).then_some(output_budget);
         let user_budget = budget.map(|value| {
@@ -22613,9 +22632,10 @@ impl AppModel {
         } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
             &mut entry.meter_epoch
         } else {
-            return;
+            return false;
         };
-        if epoch.admit(pair, selection_epoch, budget, user_budget) {
+        let admitted = epoch.admit(pair, selection_epoch, budget, user_budget);
+        if admitted {
             if self.active_session.as_ref() == Some(session) {
                 self.identity.provider = provider.to_owned();
                 self.identity.model_short = model.to_owned();
@@ -22626,6 +22646,50 @@ impl AppModel {
             }
             self.dirty = true;
         }
+        admitted
+    }
+
+    /// Installs a session's pair, epoch, catalog owner and route under the
+    /// same admission decision. Epochless legacy metadata can fill a budget,
+    /// but cannot replace the provenance of an already versioned selection.
+    pub fn note_session_catalog_metadata(
+        &mut self,
+        session: &SessionId,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) -> bool {
+        let current_epoch = if self.active_session.as_ref() == Some(session) {
+            self.meter_epoch.selection_epoch
+        } else {
+            self.sessions
+                .iter()
+                .find(|row| &row.id == session)
+                .and_then(|row| row.meter_epoch.selection_epoch)
+        };
+        let admitted = self.note_session_metadata_at(
+            session,
+            &metadata.provider,
+            &metadata.model,
+            metadata.max_tokens,
+            metadata.selection_epoch,
+            metadata.max_tokens_source,
+        );
+        if !admitted || (current_epoch.is_some() && metadata.selection_epoch.is_none()) {
+            return false;
+        }
+        self.session_catalog_routes.insert(
+            session.clone(),
+            (
+                metadata.provider_base_url.clone(),
+                metadata.account_alias.clone(),
+            ),
+        );
+        self.note_selected_catalog_key(
+            session,
+            &metadata.provider,
+            &metadata.model,
+            metadata.model_catalog_key.clone(),
+        );
+        true
     }
 
     /// The account label for the attached session comes from that session's

@@ -3693,14 +3693,7 @@ impl LiveDriver {
                         // epoch can exceed the child's local journal head.
                         // Epoch and pair admission order the configuration;
                         // the summary watermark orders the history counts.
-                        model.note_session_metadata_at(
-                            &summary.session_id,
-                            &metadata.provider,
-                            &metadata.model,
-                            metadata.max_tokens,
-                            metadata.selection_epoch,
-                            metadata.max_tokens_source,
-                        );
+                        model.note_session_catalog_metadata(&summary.session_id, metadata);
                         model.note_session_account(&summary.session_id, metadata);
                         model.note_session_budget_clamp(&summary.session_id, metadata);
                         self.workspace_paths
@@ -3958,40 +3951,50 @@ impl LiveDriver {
                 // daemon's own id in hand — does a row exist. Nothing was
                 // fabricated locally, so nothing has to be reconciled.
                 model.upsert_live_session(&session);
-                if let Some(metadata) = metadata.as_ref() {
-                    model.note_session_metadata_at(
-                        &session,
-                        &metadata.provider,
-                        &metadata.model,
-                        metadata.max_tokens,
-                        metadata.selection_epoch,
-                        metadata.max_tokens_source,
-                    );
+                let selection_admitted = if let Some(metadata) = metadata.as_ref() {
+                    let admitted = model.note_session_catalog_metadata(&session, metadata);
                     model.note_session_budget_clamp(&session, metadata);
-                }
+                    admitted
+                } else {
+                    let current_epoch = if model.active_session.as_ref() == Some(&session) {
+                        model.meter_epoch.selection_epoch
+                    } else {
+                        model
+                            .sessions
+                            .iter()
+                            .find(|row| row.id == session)
+                            .and_then(|row| row.meter_epoch.selection_epoch)
+                    };
+                    current_epoch.is_none()
+                        && model.note_session_metadata_at(
+                            &session,
+                            &provider,
+                            &model_name,
+                            0,
+                            None,
+                            None,
+                        )
+                };
                 if let Some(row) = model.sessions.iter_mut().find(|row| row.id == session) {
                     // The ROW shows the display form; `cwd` is the absolute
                     // path the daemon was given.
                     row.dir = cwd_display.clone();
                     row.workspace_cwd = Some(cwd.clone());
-                    row.model_short = model_name.clone();
+                    if selection_admitted {
+                        row.model_short = model_name.clone();
+                    }
                 }
                 let mut commands = self.ensure_attached(model, &session);
                 model.open_session(&session);
-                if metadata.is_some() {
-                    // The receipt's pair was admitted through the session's
-                    // meter epoch above; a replayed older receipt is not, and
-                    // cannot rebind the catalog owner of a newer selection.
+                if metadata.is_none() && selection_admitted {
+                    // Initial legacy receipts remain usable; a receipt without
+                    // an epoch cannot replace a newer versioned selection.
                     model.note_selected_catalog_key(
                         &session,
                         &provider,
                         &model_name,
                         model_catalog_key,
                     );
-                } else {
-                    // Legacy receipts without metadata: the created pair IS the
-                    // session's first selection.
-                    model.apply_scoped_model_selected(&provider, &model_name, model_catalog_key);
                 }
                 model.session_dir = cwd_display;
                 model.session_workspace_cwd = Some(cwd);
@@ -5172,19 +5175,20 @@ impl LiveDriver {
                 {
                     self.pending_model_select = None;
                 }
-                model.apply_session_model_selected_at(
+                if model.apply_session_model_selected_at(
                     &session,
                     &provider,
                     &model_name,
                     output_budget.as_ref(),
                     Some(selected_seq),
-                );
-                model.note_selected_catalog_key(
-                    &session,
-                    &provider,
-                    &model_name,
-                    model_catalog_key,
-                );
+                ) {
+                    model.note_selected_catalog_key(
+                        &session,
+                        &provider,
+                        &model_name,
+                        model_catalog_key,
+                    );
+                }
                 self.generations.insert(session, worker_generation);
                 Vec::new()
             }
@@ -7128,19 +7132,32 @@ impl LiveDriver {
             // bind its own meter epoch (never the identity on screen).
             match payload {
                 haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) => {
-                    if selected.route_only {
+                    let admitted = if selected.route_only {
                         model.note_parked_route_selected_at(
                             session,
                             &selected.provider,
                             &selected.model,
                             selected.selection_epoch.or(Some(envelope.seq)),
-                        );
+                        )
                     } else {
                         model.note_parked_model_selected_at(
                             session,
                             &selected.provider,
                             &selected.model,
                             selected.selection_epoch.or(Some(envelope.seq)),
+                        )
+                    };
+                    if admitted {
+                        if selected.cleared_account_pin.is_some()
+                            || selected.cleared_provider_endpoint.is_some()
+                        {
+                            model.clear_session_catalog_route(session);
+                        }
+                        model.note_selected_catalog_key(
+                            session,
+                            &selected.provider,
+                            &selected.model,
+                            selected.model_catalog_key.clone(),
                         );
                     }
                 }
@@ -7214,6 +7231,9 @@ impl LiveDriver {
                 // The selected pair keeps the catalog owner the daemon
                 // admitted it under (catalog-fixes); a route-only fact keeps
                 // the current key.
+                if selected.cleared_account_pin.is_some() || selected.cleared_provider_endpoint.is_some() {
+                    model.clear_session_catalog_route(session);
+                }
                 model.note_selected_catalog_key(
                     session,
                     &selected.provider,

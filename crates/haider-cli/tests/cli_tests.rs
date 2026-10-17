@@ -6017,3 +6017,7 @@ fn preupgrade_go_session_cli_recovery_reselects_before_any_provider_round() {
     proxy.join().expect("recording proxy exits");
     terminate_daemon_checked(&command.profile).expect("stop owned upgrade daemon");
 }
+
+#[cfg(unix)]
+#[path = "catalog/partial_writes.rs"]
+mod catalog_partial_write;

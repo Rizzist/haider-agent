@@ -18894,3 +18894,6 @@ async fn refresh_completion_restores_reactivated_owner_rejection_before_uncertai
     }
     store.close().await.expect("close");
 }
+
+#[path = "accounts_partial_write_tests.rs"]
+mod partial_write_tests;

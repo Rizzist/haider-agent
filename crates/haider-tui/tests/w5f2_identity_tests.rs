@@ -3005,3 +3005,715 @@ fn picked_public_namespace_model_retains_its_private_producer() {
         assert_eq!(model.context_meter().window, None);
     }
 }
+
+fn catalog_order_setup() -> (AppModel, LiveDriver, haider_protocol::ids::SessionId) {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("catalog-order");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 42;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(42, "shared-model")],
+            revision: 2,
+        },
+    );
+    let session = haider_protocol::ids::SessionId::new("catalog-order-session");
+    model.upsert_live_session(&session);
+    model.open_session(&session);
+    let reply = catalog_order_reply(&session, 20, Some("synthetic-producer-42"));
+    pass(&mut driver, &mut model, reply);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(model.display_identity().model_short, "shared-model");
+    (model, driver, session)
+}
+fn catalog_order_reply(
+    session: &haider_protocol::ids::SessionId,
+    seq: u64,
+    key: Option<&str>,
+) -> LiveReply {
+    LiveReply::ModelSelected {
+        connection_epoch: None,
+        selected_seq: seq,
+        command_id: haider_rpc::CommandId::new(format!("catalog-order-{seq}")),
+        session: session.clone(),
+        provider: "custom".into(),
+        model: "shared-model".into(),
+        worker_generation: 1,
+        output_budget: None,
+        model_catalog_key: key.map(str::to_owned),
+    }
+}
+#[test]
+fn catalog_order_older_same_pair_reply_keeps_current_header() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(&session, 10, Some("synthetic-producer-41")),
+    );
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "older reply cannot retire the current account's selected model"
+    );
+}
+#[test]
+fn catalog_order_same_owner_reply_control() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(&session, 10, Some("synthetic-producer-42")),
+    );
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(model.display_identity().model_short, "shared-model");
+}
+#[test]
+fn catalog_order_older_unowned_reply_cannot_remove_current_owner() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(&session, 10, None),
+    );
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    let mut next = oauth_descriptor("custom", "work", true);
+    next.incarnation = 43;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![next],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(43, "different-model")],
+            revision: 3,
+        },
+    );
+    assert!(
+        model.display_identity().model_short.is_empty(),
+        "account B's fetched choice must retire under C even after an older ownerless reply"
+    );
+}
+#[test]
+fn catalog_order_parked_reply_keeps_current_header_on_reopen() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let other = haider_protocol::ids::SessionId::new("catalog-order-other-session");
+    model.upsert_live_session(&other);
+    model.open_session(&other);
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(&session, 10, Some("synthetic-producer-41")),
+    );
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "parked current owner must survive an older reply"
+    );
+}
+
+#[test]
+fn catalog_order_older_same_pair_create_receipt_keeps_current_header() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let metadata: haider_protocol::session::SessionMetadataV1 =
+        serde_json::from_value(serde_json::json!({
+            "cwd":"/tmp", "provider":"custom", "model":"shared-model", "max_tokens":4096,
+            "created_at_ms":1, "selection_epoch":10, "model_catalog_key":"synthetic-producer-41"
+        }))
+        .expect("synthetic metadata");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Created {
+            command_id: haider_rpc::CommandId::new("catalog-order-old-create"),
+            session,
+            worker_generation: 1,
+            cwd: "/tmp".into(),
+            provider: "custom".into(),
+            model: "shared-model".into(),
+            model_catalog_key: Some("synthetic-producer-41".into()),
+            metadata: Some(metadata),
+        },
+    );
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "an older same-pair create receipt must not replace the current owner"
+    );
+}
+fn catalog_order_newer_list_case(parked: bool, reopen: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    if parked {
+        let other = haider_protocol::ids::SessionId::new("catalog-list-other-session");
+        model.upsert_live_session(&other);
+        model.open_session(&other);
+    }
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 43;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(43, "shared-model")],
+            revision: 3,
+        },
+    );
+    let summary: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id":session, "head_seq":30, "worker_generation":1,
+        "metadata":{"cwd":"/tmp", "provider":"custom", "model":"shared-model", "max_tokens":4096,
+        "created_at_ms":1, "selection_epoch":30, "model_catalog_key":"synthetic-producer-43"}
+    }))
+    .expect("synthetic list");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary],
+            next_cursor: None,
+        },
+    );
+    if reopen {
+        let other = haider_protocol::ids::SessionId::new("catalog-list-reopen-other");
+        model.upsert_live_session(&other);
+        model.open_session(&other);
+    }
+    if parked || reopen {
+        model.open_session(&session);
+    }
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "newer list metadata must install its current catalog owner"
+    );
+}
+#[test]
+fn catalog_order_newer_active_list_installs_current_owner() {
+    catalog_order_newer_list_case(false, false);
+}
+#[test]
+fn catalog_order_newer_parked_list_installs_current_owner() {
+    catalog_order_newer_list_case(true, false);
+}
+
+fn catalog_order_render(model: &AppModel) {
+    for (width, height) in [(118_u16, 36_u16), (80, 24)] {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                haider_tui::render::render(model, frame);
+            })
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line);
+        }
+        eprintln!(
+            "CATALOG_HEADER {width}x{height} epoch={:?}\n{}",
+            model.meter_epoch.selection_epoch,
+            lines.join("\n")
+        );
+    }
+}
+
+#[test]
+fn catalog_order_newer_active_list_keeps_owner_after_reopen() {
+    catalog_order_newer_list_case(false, true);
+}
+fn catalog_order_child_case(changed: bool) {
+    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+    use haider_protocol::ids::{AgentId, LeaseId, SessionId};
+    use haider_tui::app::{ChipModel, Screen};
+    let (mut model, mut driver, child_session) = catalog_order_setup();
+    let parent = SessionId::new("catalog-child-parent");
+    model.upsert_live_session(&parent);
+    model.open_session(&parent);
+    let manifest = AgentManifest {
+        agent: AgentId::new("catalog-child"),
+        role: AgentRole::Subagent,
+        task: "catalog display check".into(),
+        callsign: Some("catalog child".into()),
+        model_profile: "shared-model".into(),
+        grant: Grant {
+            tools: vec![],
+            effect_ceiling: vec![],
+        },
+        budget_tokens: None,
+        placement: Placement::Local,
+        lease: LeaseId::new("catalog-child-lease"),
+        fencing_epoch: 1,
+        attempt: 0,
+        parent: None,
+        coordinates: None,
+        cli_scope: None,
+    };
+    let mut chip = ChipModel::from_manifest(&manifest);
+    chip.child_session = Some(child_session.as_str().into());
+    chip.provider = Some("custom".into());
+    model.chips = vec![chip];
+    model.view_path = vec!["catalog-child".into()];
+    model.screen = Screen::Subagent;
+    assert!(
+        model
+            .surface_composer_identity(100)
+            .is_some_and(|s| s.contains("shared-model")),
+        "child positive control"
+    );
+    catalog_order_render(&model);
+    let incarnation = if changed { 43 } else { 42 };
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = incarnation;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(
+                incarnation,
+                if changed {
+                    "different-model"
+                } else {
+                    "shared-model"
+                },
+            )],
+            revision: 3,
+        },
+    );
+    catalog_order_render(&model);
+    let identity = model.surface_composer_identity(100);
+    if changed {
+        assert!(
+            !identity.is_some_and(|s| s.contains("shared-model")),
+            "steered child composer must retire account A's fetched model under B"
+        );
+    } else {
+        assert!(
+            identity.is_some_and(|s| s.contains("shared-model")),
+            "same-owner child control must retain its model"
+        );
+    }
+}
+#[test]
+fn catalog_order_child_composer_retires_previous_account_model() {
+    catalog_order_child_case(true);
+}
+#[test]
+fn catalog_order_child_composer_same_owner_control() {
+    catalog_order_child_case(false);
+}
+
+#[test]
+fn catalog_order_legacy_create_receipt_cannot_replace_newer_selection() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Created {
+            command_id: haider_rpc::CommandId::new("catalog-legacy-create"),
+            session,
+            worker_generation: 1,
+            cwd: "/tmp".into(),
+            provider: "custom".into(),
+            model: "old-legacy-model".into(),
+            model_catalog_key: None,
+            metadata: None,
+        },
+    );
+    catalog_order_render(&model);
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "a legacy create receipt cannot replace a newer known selection"
+    );
+}
+#[test]
+fn catalog_order_initial_legacy_create_control() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("catalog-legacy-first");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 42;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(42, "shared-model")],
+            revision: 2,
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Created {
+            command_id: haider_rpc::CommandId::new("catalog-legacy-first-create"),
+            session: haider_protocol::ids::SessionId::new("catalog-legacy-first-session"),
+            worker_generation: 1,
+            cwd: "/tmp".into(),
+            provider: "custom".into(),
+            model: "shared-model".into(),
+            model_catalog_key: None,
+            metadata: None,
+        },
+    );
+    catalog_order_render(&model);
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "initial legacy create remains usable"
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // One complete daemon metadata fixture.
+fn catalog_order_list_metadata(
+    model: &mut AppModel,
+    driver: &mut LiveDriver,
+    session: &haider_protocol::ids::SessionId,
+    provider: &str,
+    slug: &str,
+    epoch: u64,
+    key: &str,
+    route: (Option<&str>, Option<&str>),
+) {
+    let summary = serde_json::from_value(serde_json::json!({
+        "session_id":session, "head_seq":epoch, "worker_generation":1,
+        "metadata":{"cwd":"/tmp", "provider":provider, "model":slug, "max_tokens":4096,
+        "created_at_ms":1, "selection_epoch":epoch, "model_catalog_key":key,
+        "provider_base_url":route.0, "account_alias":route.1}
+    }))
+    .expect("synthetic list metadata");
+    pass(
+        driver,
+        model,
+        LiveReply::Listed {
+            sessions: vec![summary],
+            next_cursor: None,
+        },
+    );
+}
+
+fn catalog_order_list_pair_case(change_provider: bool, parked: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let other = haider_protocol::ids::SessionId::new("catalog-pair-other");
+    if parked {
+        model.upsert_live_session(&other);
+        model.open_session(&other);
+    }
+    let provider = if change_provider { "another" } else { "custom" };
+    let mut account = oauth_descriptor(provider, "work", true);
+    account.incarnation = 43;
+    let mut summary = private_summary(43, "new-model");
+    summary.provider = provider.into();
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account.clone()],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 3,
+        },
+    );
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        provider,
+        "new-model",
+        30,
+        "synthetic-producer-43",
+        (None, None),
+    );
+    model.upsert_live_session(&other);
+    model.open_session(&other);
+    model.open_session(&session);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(model.display_identity().model_short, "new-model");
+    account.incarnation = 44;
+    let mut summary = private_summary(44, "replacement-model");
+    summary.provider = provider.into();
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(4),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 4,
+        },
+    );
+    catalog_order_render(&model);
+    assert!(
+        model.display_identity().model_short.is_empty(),
+        "the newer list's owner must survive its changed pair and reopening"
+    );
+}
+#[test]
+fn catalog_order_newer_list_model_change_active() {
+    catalog_order_list_pair_case(false, false);
+}
+#[test]
+fn catalog_order_newer_list_model_change_parked() {
+    catalog_order_list_pair_case(false, true);
+}
+#[test]
+fn catalog_order_newer_list_provider_change_active() {
+    catalog_order_list_pair_case(true, false);
+}
+#[test]
+fn catalog_order_newer_list_provider_change_parked() {
+    catalog_order_list_pair_case(true, true);
+}
+
+fn catalog_order_list_route_case(change_alias: bool, parked: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let old = "https://old.synthetic.invalid/v1";
+    let new = "https://new.synthetic.invalid/v1";
+    let mut initial = private_summary(42, "shared-model");
+    initial.endpoint = Some(old.into());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![initial],
+            revision: 2,
+        },
+    );
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        "custom",
+        "shared-model",
+        20,
+        "synthetic-producer-42",
+        (Some(old), Some("work")),
+    );
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "initial route control"
+    );
+    let other = haider_protocol::ids::SessionId::new("catalog-route-other");
+    if parked {
+        model.upsert_live_session(&other);
+        model.open_session(&other);
+    }
+    let alias = if change_alias { "next-work" } else { "work" };
+    let origin = if change_alias { old } else { new };
+    let mut account = oauth_descriptor("custom", alias, true);
+    account.incarnation = 43;
+    let mut summary = private_summary(43, "shared-model");
+    summary.endpoint = Some(origin.into());
+    summary.catalog_scope.as_mut().expect("scope").account_alias = Some(alias.into());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 3,
+        },
+    );
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        "custom",
+        "shared-model",
+        30,
+        "synthetic-producer-43",
+        (Some(origin), Some(alias)),
+    );
+    model.upsert_live_session(&other);
+    model.open_session(&other);
+    model.open_session(&session);
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "newer route must replace the old route together with the owner"
+    );
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        "custom",
+        "shared-model",
+        10,
+        "synthetic-producer-41",
+        (Some(old), Some("work")),
+    );
+    model.open_session(&other);
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "older metadata cannot change the admitted route or owner"
+    );
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+}
+#[test]
+fn catalog_order_newer_list_endpoint_active() {
+    catalog_order_list_route_case(false, false);
+}
+#[test]
+fn catalog_order_newer_list_endpoint_parked() {
+    catalog_order_list_route_case(false, true);
+}
+#[test]
+fn catalog_order_newer_list_pinned_alias_active() {
+    catalog_order_list_route_case(true, false);
+}
+#[test]
+fn catalog_order_newer_list_pinned_alias_parked() {
+    catalog_order_list_route_case(true, true);
+}
+
+#[test]
+fn catalog_order_parked_journal_selection_installs_owner() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let attachment = haider_rpc::AttachmentId::new("catalog-journal");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Attached {
+            session: session.clone(),
+            attachment: attachment.clone(),
+            worker_generation: 1,
+            replay_through_seq: 0,
+            launch_origin: None,
+        },
+    );
+    let other = haider_protocol::ids::SessionId::new("catalog-journal-other");
+    model.upsert_live_session(&other);
+    model.open_session(&other);
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 43;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(43, "shared-model")],
+            revision: 3,
+        },
+    );
+    let selected = haider_protocol::session::ModelSelected {
+        provider: "custom".into(),
+        model: "shared-model".into(),
+        selection_epoch: Some(30),
+        model_catalog_key: Some("synthetic-producer-43".into()),
+        route_only: false,
+        cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
+    };
+    let envelope=serde_json::from_value(serde_json::json!({"schema_version":1,"event_id":"catalog-journal-1","seq":1,"session_id":session,"device_id":"synthetic","authority_epoch":1,"worker_generation":1,"committed_at_ms":1,"render":{"ui":true,"durable":true,"prompt":"omit"},"payload":selected.to_payload_value().expect("selection")})).expect("envelope");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Event {
+            attachment,
+            session: session.clone(),
+            envelope: Box::new(envelope),
+        },
+    );
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "a parked journal selection must keep its admitted owner on reopen"
+    );
+}

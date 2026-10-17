@@ -2093,21 +2093,34 @@ async fn run_account_actor(
                     })
                     .and_then(|mut registry| {
                         let enrolled = registry.enroll(kind, &job.root, job.label.as_deref())?;
-                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        let reconciled = reconcile_credential_sources(&mut registry, &mut accounts);
                         publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        reconciled?;
                         Ok(enrolled.id)
                     });
+                // Descriptor writes can commit before a later source-metadata
+                // write fails. Retire their former catalogs on either outcome.
+                finish_catalog_account_mutation(
+                    &store,
+                    &before,
+                    &accounts,
+                    &mut providers,
+                    &mut pending_catalog_discoveries,
+                )
+                .await;
+                refresh_resolver_snapshot(&snapshot, &accounts);
+                if result.is_err() && before != accounts.list() {
+                    let _ = publish_next_management_revision_with_inventory(
+                        &store,
+                        &snapshot,
+                        management.as_ref(),
+                        &accounts,
+                        &providers,
+                    )
+                    .await;
+                }
                 match result {
                     Ok(source_id) => {
-                        finish_catalog_account_mutation(
-                            &store,
-                            &before,
-                            &accounts,
-                            &mut providers,
-                            &mut pending_catalog_discoveries,
-                        )
-                        .await;
-                        refresh_resolver_snapshot(&snapshot, &accounts);
                         if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
@@ -2188,17 +2201,29 @@ async fn run_account_actor(
                         publish_source_snapshot(&source_snapshot, &registry, &accounts);
                         Ok(())
                     });
+                // Descriptor writes can commit before a later source-metadata
+                // write fails. Retire their former catalogs on either outcome.
+                finish_catalog_account_mutation(
+                    &store,
+                    &before,
+                    &accounts,
+                    &mut providers,
+                    &mut pending_catalog_discoveries,
+                )
+                .await;
+                refresh_resolver_snapshot(&snapshot, &accounts);
+                if result.is_err() && before != accounts.list() {
+                    let _ = publish_next_management_revision_with_inventory(
+                        &store,
+                        &snapshot,
+                        management.as_ref(),
+                        &accounts,
+                        &providers,
+                    )
+                    .await;
+                }
                 match result {
                     Ok(()) => {
-                        finish_catalog_account_mutation(
-                            &store,
-                            &before,
-                            &accounts,
-                            &mut providers,
-                            &mut pending_catalog_discoveries,
-                        )
-                        .await;
-                        refresh_resolver_snapshot(&snapshot, &accounts);
                         if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
@@ -2238,21 +2263,34 @@ async fn run_account_actor(
                         )
                     })
                     .and_then(|mut registry| {
-                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        let reconciled = reconcile_credential_sources(&mut registry, &mut accounts);
                         publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        reconciled?;
                         Ok(())
                     });
+                // Descriptor writes can commit before a later source-metadata
+                // write fails. Retire their former catalogs on either outcome.
+                finish_catalog_account_mutation(
+                    &store,
+                    &before,
+                    &accounts,
+                    &mut providers,
+                    &mut pending_catalog_discoveries,
+                )
+                .await;
+                refresh_resolver_snapshot(&snapshot, &accounts);
+                if result.is_err() && before != accounts.list() {
+                    let _ = publish_next_management_revision_with_inventory(
+                        &store,
+                        &snapshot,
+                        management.as_ref(),
+                        &accounts,
+                        &providers,
+                    )
+                    .await;
+                }
                 match result {
                     Ok(()) => {
-                        finish_catalog_account_mutation(
-                            &store,
-                            &before,
-                            &accounts,
-                            &mut providers,
-                            &mut pending_catalog_discoveries,
-                        )
-                        .await;
-                        refresh_resolver_snapshot(&snapshot, &accounts);
                         if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
@@ -2280,7 +2318,7 @@ async fn run_account_actor(
                     .lock()
                     .map(|sources| sources.clone())
                     .unwrap_or_default();
-                let reconciled = source_registry
+                let _reconciled = source_registry
                     .lock()
                     .map_err(|_| {
                         HaiderError::new(
@@ -2290,15 +2328,16 @@ async fn run_account_actor(
                         )
                     })
                     .and_then(|mut registry| {
-                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        let reconciled = reconcile_credential_sources(&mut registry, &mut accounts);
                         publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        reconciled?;
                         Ok(())
                     });
                 let sources_changed = source_snapshot
                     .lock()
                     .map(|sources| source_metadata_changed(&before_sources, &sources))
                     .unwrap_or(false);
-                if reconciled.is_ok() && (before != accounts.list() || sources_changed) {
+                if before != accounts.list() || sources_changed {
                     finish_catalog_account_mutation(
                         &store,
                         &before,
@@ -2591,12 +2630,15 @@ async fn run_account_actor(
                             )
                         })
                         .and_then(|mut registry| {
-                            reconcile_credential_sources(&mut registry, &mut accounts)?;
+                            let reconciled =
+                                reconcile_credential_sources(&mut registry, &mut accounts);
                             publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                            reconciled?;
                             refresh_resolver_snapshot(&snapshot, &accounts);
                             Ok(OAuthImportHealResult::LiveOwnerStore { source: source_id })
                         });
-                    if reconciled.is_ok() && before != accounts.list() {
+                    if before != accounts.list() {
+                        refresh_resolver_snapshot(&snapshot, &accounts);
                         finish_catalog_account_mutation(
                             &store,
                             &before,
@@ -5083,9 +5125,20 @@ async fn publish_next_management_revision_with_inventory(
     accounts: &AccountStore<Box<dyn StoreLike>>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Result<u64, HaiderError> {
-    let revision = store.advance_management_revision().await?;
-    publish_management_snapshot_with_inventory(snapshot, management, accounts, providers, revision);
-    Ok(revision)
+    let revision = store.advance_management_revision().await;
+    // Descriptor/configuration commits cannot be rolled back by a failed
+    // publication write. Keep admission coherent even without a new revision.
+    if let Some(current) = revision
+        .as_ref()
+        .ok()
+        .copied()
+        .or_else(|| management.and_then(|view| view.inspect(|view| view.revision)))
+    {
+        publish_management_snapshot_with_inventory(
+            snapshot, management, accounts, providers, current,
+        );
+    }
+    revision
 }
 
 async fn publish_marked_management_revision(
@@ -6519,6 +6572,42 @@ async fn handle_provider_configure(
             }
         }
     };
+    let configuration_boundary = !revision_unchanged
+        && (previous_origin != profile.base_url
+            || previous_auth_requirement.is_some_and(|auth| auth != profile.auth_requirement));
+    if configuration_boundary {
+        // The profile JSON may already be durable. Hide its prior fetched
+        // rows even if reserving a new incarnation or pruning then fails;
+        // receipt recovery completes the boundary before restart hydration.
+        providers.clear_discovered_models(&profile.provider_id);
+        reconcile_catalog_selection_scope(&profile.provider_id, accounts, providers);
+        // The JSON save has committed. Admission readers must lose the old
+        // inventory before any remaining fallible write, including journaling.
+        // Receipt finalization still owns the durable revision advance.
+        publish_management_snapshot_with_inventory(
+            snapshot,
+            management,
+            accounts,
+            providers,
+            management
+                .and_then(|view| view.inspect(|view| view.revision))
+                .unwrap_or(job.expected_revision),
+        );
+        if let Err(error) = mint_provider_incarnations(accounts, &profile.provider_id) {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        reconcile_catalog_selection_scope(&profile.provider_id, accounts, providers);
+        refresh_resolver_snapshot(snapshot, accounts);
+        if let Err(error) = store
+            .delete_provider_models(profile.provider_id.clone())
+            .await
+        {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        prune_catalog_cache(store, accounts, providers).await;
+    }
     let auth_event_revision = if let Some((previous, auth_requirement)) = auth_change {
         let Some(anticipated_revision) = job.expected_revision.checked_add(1) else {
             respond_management_error(
@@ -6548,30 +6637,6 @@ async fn handle_provider_configure(
     } else {
         None
     };
-    let configuration_boundary = !revision_unchanged
-        && (previous_origin != profile.base_url
-            || previous_auth_requirement.is_some_and(|auth| auth != profile.auth_requirement));
-    if configuration_boundary {
-        // The profile JSON may already be durable. Hide its prior fetched
-        // rows even if reserving a new incarnation or pruning then fails;
-        // receipt recovery completes the boundary before restart hydration.
-        providers.clear_discovered_models(&profile.provider_id);
-        reconcile_catalog_selection_scope(&profile.provider_id, accounts, providers);
-        if let Err(error) = mint_provider_incarnations(accounts, &profile.provider_id) {
-            respond_management_error(&job.route, &error);
-            return;
-        }
-        reconcile_catalog_selection_scope(&profile.provider_id, accounts, providers);
-        refresh_resolver_snapshot(snapshot, accounts);
-        if let Err(error) = store
-            .delete_provider_models(profile.provider_id.clone())
-            .await
-        {
-            respond_management_error(&job.route, &error);
-            return;
-        }
-        prune_catalog_cache(store, accounts, providers).await;
-    }
     if catalog_producer.as_ref().is_some_and(|producer| {
         configure_catalog_producer(
             profile_id,
