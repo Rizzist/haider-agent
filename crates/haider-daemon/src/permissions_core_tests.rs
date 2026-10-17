@@ -293,6 +293,11 @@ fn workflow_capabilities_are_sparse_and_grant_scoped() {
 #[test]
 fn session_permission_overrides_grant_only_their_named_effect_families() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -456,6 +461,11 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
 #[test]
 fn autonomous_effect_defaults_allow_every_ask_class() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -582,6 +592,11 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
 #[test]
 fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -1141,6 +1156,7 @@ fn append_permission_checkpoint(
                     name: "exec".into(),
                     args: serde_json::json!({"command":"printf old"}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }))
             .expect("item payload")
@@ -2093,4 +2109,34 @@ fn agent_type_identity_line_is_bounded_and_names_the_signature() {
         "the tail line stays bounded: {}",
         line.len()
     );
+}
+#[test]
+fn activity_is_derived_from_registered_routes_only() {
+    use haider_protocol::activity::ActivityKind as A;
+    for (name, expected) in [
+        ("computer", Some(A::Computer)),
+        ("mobile", Some(A::Mobile)),
+        ("web_fetch", Some(A::Web)),
+        ("web_search", Some(A::Web)),
+        ("ssh_shell", Some(A::Remote)),
+        ("fs_read", Some(A::Read)),
+        ("fs_write", Some(A::Edit)),
+        ("process_exec", Some(A::Run)),
+        ("spawn_subagent", Some(A::Orchestrate)),
+        ("list_models", Some(A::Read)),
+        ("session_transcript", Some(A::Read)),
+        ("peer_list", Some(A::Read)),
+        ("computer ", None),
+        ("COMPUTER", None),
+        ("mcp__server__computer", None),
+        ("browser_open", None),
+        ("web_tool", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            registered_tool_route(name).and_then(super::worker::RegisteredToolRoute::activity),
+            expected,
+            "{name}"
+        );
+    }
 }

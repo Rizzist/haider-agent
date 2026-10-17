@@ -98,6 +98,11 @@ pub fn transcript() -> Vec<WireFrame> {
         end_seq: 9,
     };
     let fork_metadata = SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -149,6 +154,7 @@ pub fn transcript() -> Vec<WireFrame> {
             client_instance_id: "client-instance-1".into(),
             client_kind: ClientKind::Gui,
             capabilities_requested: capabilities([Capability::View, Capability::Control]),
+            features_requested: Default::default(),
             max_receive_frame: TEST_FRAME_LIMIT as u32,
             encodings: Vec::new(),
         }),
@@ -206,6 +212,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    latest_context_footprint: None,
                     session_id: session_id.clone(),
                     head_seq: 9,
                     worker_generation: 7,
@@ -244,6 +251,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list-roster"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    latest_context_footprint: None,
                     session_id: session_id.clone(),
                     head_seq: 9,
                     worker_generation: 7,
@@ -421,6 +429,11 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 1,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    selection_epoch: None,
+                    route_reset_epoch: None,
+                    budget_clamp_notice_epoch: None,
+                    resolved_route_alias: None,
+                    resolved_route_seen: false,
                     launch_origin: None,
                     workspace_allocation: None,
                     provider_base_url: None,
@@ -1810,6 +1823,7 @@ pub fn transcript() -> Vec<WireFrame> {
                             started_at_ms: 1_753_500_040_000,
                             terminal_at_ms: None,
                             live: true,
+                            activity: None,
                             tool_attempts: 2,
                             usage: Some(AgentUsageMetrics {
                                 logical_input_tokens: 800,
@@ -1827,6 +1841,8 @@ pub fn transcript() -> Vec<WireFrame> {
                                 breakdowns: Vec::new(),
                             }),
                         }),
+                        activity: None,
+                        activities: Vec::new(),
                         folded_children: 0,
                         children: Vec::new(),
                     }],
@@ -1877,6 +1893,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list-workspace"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    latest_context_footprint: None,
                     session_id: SessionId::new("session-workspace"),
                     head_seq: 17,
                     worker_generation: 15,
@@ -1955,6 +1972,8 @@ pub fn transcript() -> Vec<WireFrame> {
                         parent_agent_id: None,
                         state: FleetAgentStateWire::Done,
                         metrics: None,
+                        activity: None,
+                        activities: Vec::new(),
                         folded_children: 3,
                         children: Vec::new(),
                     }],
@@ -2468,6 +2487,7 @@ fn append_prompt_fork_contract_tail(frames: &mut Vec<WireFrame>, metadata: Sessi
         },
         WireFrame::SessionRosterDelta {
             summaries: vec![SessionSummary {
+                latest_context_footprint: None,
                 session_id: child_session_id,
                 head_seq: 58,
                 worker_generation: 7,
@@ -2541,6 +2561,8 @@ fn append_fleet_identity_contract_tail(frames: &mut Vec<WireFrame>) {
                         parent_agent_id: None,
                         state: FleetAgentStateWire::Live,
                         metrics: None,
+                        activity: None,
+                        activities: Vec::new(),
                         folded_children: 0,
                         children: Vec::new(),
                     }],

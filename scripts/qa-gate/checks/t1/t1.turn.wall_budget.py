@@ -79,6 +79,9 @@ def run(ctx) -> list[Evidence]:
     report = run_harness(
         ctx.bin_dir,
         budget_ms=WALL_BUDGET_MS,
+        # Attribution is diagnostic work, requested separately through the
+        # harness CLI. The gate's 60-case wall arm must be uninstrumented.
+        phases=False,
     )
     if not report["measurement_accepted"]:
         evidence = []

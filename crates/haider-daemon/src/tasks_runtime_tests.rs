@@ -53,6 +53,11 @@ fn overrides() -> Option<SessionPermissionOverridesV1> {
 
 fn task_metadata(cwd: &str) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -1377,6 +1382,10 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
         hub.worker_generation(),
     )
     .expect("test broker");
+    // The precise no-op above must not be pre-empted by the production 500 ms
+    // receipt budget on a loaded machine: an assumed mutation has no durable
+    // intent here, so its completion fact would be rejected.
+    broker.set_workspace_receipt_wall_time_for_tests(haider_tools::TEST_RECEIPT_WALL_TIME);
     let mut policy = haider_tools::PermissionPolicy::default();
     policy.allow(haider_protocol::effect::EffectClass::ProcessExec);
     let spawn_result = facade

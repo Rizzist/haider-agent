@@ -397,6 +397,9 @@ pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
 /// display identity plus its resolved model/provider pair. Every field is
 /// absence-preserving; clients must not infer coordinates when it is absent.
 pub const FEATURE_SESSION_FLEET_IDENTITY_V1: &str = "session_fleet_identity_v1";
+/// Activity fields and provider-transport effects are sent only to clients
+/// that explicitly request this token in Hello and receive it in Welcome.
+pub const FEATURE_SESSION_ACTIVITY_V1: &str = "session_activity_v1";
 /// Daemon implements the reconnectable, per-child-cursor descendant stream.
 pub const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
@@ -799,6 +802,10 @@ pub struct Hello {
     /// never invents a capability the client did not ask for.
     #[serde(default)]
     pub capabilities_requested: CapabilitySet,
+    /// Optional additive feature opt-ins. Old daemons ignore this field;
+    /// unlike an unknown Capability enum value it cannot reject the Hello.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub features_requested: BTreeSet<String>,
     /// Largest encoded body this client can receive.
     ///
     /// The daemon must not send a frame larger than the smaller of this value
@@ -2110,6 +2117,10 @@ pub struct SessionSummary {
     /// Present exactly when `footprint_tokens` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footprint_truth: Option<ContextFootprintTruth>,
+    /// The child's own durable snapshot, including its request selection
+    /// epoch. Older daemons omit it; totals above remain usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_footprint: Option<ContextFootprint>,
     /// Additive G2 field: the committed session title, so launcher rosters
     /// name rows without attaching. `None` for untitled sessions and when
     /// an older daemon omits the field — readers must not infer anything
@@ -2584,6 +2595,17 @@ pub struct FleetNodeWire {
     /// `(terminal_at_ms | snapshot.generated_at_ms) - started_at_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<AgentMetricsSnapshot>,
+    /// 973-activity-icons: what this agent is DOING at `generated_at_ms`
+    /// (not its state), derived from typed tool identity in its own journal
+    /// by [`haider_protocol::activity::ActivityTracker`]. Absent when it is
+    /// quiet, terminal, or the daemon predates the field; old clients ignore
+    /// it. Unknown future kinds decode as `unknown` and render nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<haider_protocol::activity::ActivityKind>,
+    /// Every activity this agent has used so far, highest priority first
+    /// (the detail view's history). Empty when none or when not reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activities: Vec<haider_protocol::activity::ActivityKind>,
     /// Exact number of this node's direct durable children omitted by the
     /// snapshot bounds. Zero means the empty `children` list is a real leaf.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -5325,6 +5347,11 @@ pub enum ResponseBody {
         /// budget exceeded the new model's maximum.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+        /// Previous explicit account pin cleared by a cross-provider pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleared_account_pin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleared_provider_endpoint: Option<String>,
     },
     /// Durable coordinates of a committed rename (G2): the NORMALIZED title
     /// — never an echo of the request — plus the committed journal sequence

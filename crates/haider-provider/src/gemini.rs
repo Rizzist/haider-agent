@@ -1329,6 +1329,7 @@ fn gemini_request_json_with_boundary_inner(
                     preview,
                     truncated,
                     images,
+                    ..
                 } if matches!(message.role, MessageRole::User | MessageRole::Tool) => {
                     let name = tool_names.get(call_id).ok_or_else(|| {
                         invalid_request(format!(
@@ -2500,6 +2501,7 @@ impl GeminiDecoder {
                         call_id: call_id.clone(),
                         name: "web_search".into(),
                         args: serde_json::json!({"query": query}),
+                        activity: Some(haider_protocol::activity::ActivityKind::Web),
                     });
                     events.push(StreamEvent::ServerToolResult {
                         call_id,

@@ -45,6 +45,7 @@ fn attachment(n: usize) -> AttachmentId {
 
 fn summary(n: usize, head_seq: u64) -> SessionSummary {
     SessionSummary {
+        latest_context_footprint: None,
         session_id: sid(n),
         head_seq,
         worker_generation: 7,
@@ -538,6 +539,7 @@ fn a_created_session_attaches_exactly_once_through_the_loop() {
             worker_generation: 7,
             cwd: "~/dev".to_owned(),
             model: "fable-5".to_owned(),
+            metadata: None,
         }),
     );
     assert_eq!(

@@ -145,6 +145,10 @@ pub enum TurnItem {
         name: String,
         args: serde_json::Value,
         status: ToolStatus,
+        /// Daemon-verified route or trusted adapter classification. Display
+        /// names and old journal rows have no activity authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<crate::activity::ActivityKind>,
     },
     CommandExecution {
         call_id: String,

@@ -13,20 +13,24 @@ use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
 };
 use haider_core::{
-    ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitchCause,
-    ProviderPairSwitchTarget, QueueConsumeCommand, QueuePromoteCommand, SessionCreateCommand,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    SqliteStoreHandle, StoreHandle, TurnAcceptCommand, TurnAdmissionDisposition,
+    EventIdGenerator, ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitch,
+    ProviderPairSwitchCause, ProviderPairSwitchCommitter, ProviderPairSwitchTarget,
+    ProviderRouteCommitter, QueueConsumeCommand, QueuePromoteCommand, ResolvedProviderAttempt,
+    SessionCreateCommand, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
+    TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
+use haider_protocol::context::ContextFootprint;
+use haider_protocol::credential::{RotationCause, RotationEvent};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{CredentialAlias, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::provider::{Block, FinishReason};
+use haider_protocol::provider::{Block, FinishReason, Usage, UsageSource};
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
 };
@@ -40,6 +44,77 @@ use haider_rpc::{
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
+
+/// A compaction promotion updates the route committer's pair and epoch before
+/// the promoted model's credential rotates in the same turn.
+#[tokio::test]
+async fn rotation_after_compaction_promotion_records_the_promoted_route() {
+    let world = PairSwitchWorld::boot(
+        "promotion-rotation",
+        Arc::new(FakeProvider::new(text_turn("a"))),
+        Arc::new(FakeProvider::new(text_turn("b"))),
+    )
+    .await;
+    let lease = world
+        .hub
+        .acquire_worker_lease(world.session_id.clone())
+        .await
+        .expect("lease");
+    let selection = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed");
+    let shared = Arc::new(tokio::sync::Mutex::new(selection));
+    let route = super::DaemonProviderRouteCommitter {
+        store: lease.clone(),
+        selection: Arc::clone(&shared),
+    };
+    let pair = super::DaemonProviderPairSwitchCommitter {
+        store: lease,
+        branch_id: None,
+        device_id: world.device_id.clone(),
+        event_ids: Arc::new(EventIdGenerator::new("promotion-route-test")),
+        turn_selection: shared,
+    };
+    let promoted_epoch = pair
+        .commit(&ProviderPairSwitch {
+            run_id: RunId::new("promotion-rotation-run"),
+            switch_ordinal: 0,
+            from_provider: "fake-a".into(),
+            from_model: "model-a".into(),
+            to_provider: "fake-b".into(),
+            to_model: "model-b".into(),
+            cause: ProviderPairSwitchCause::CompactionGuard,
+        })
+        .await
+        .expect("promotion commit");
+    let rotated_epoch = route
+        .commit(
+            "fake-b",
+            "model-b",
+            &CredentialAlias::new("promoted-rotated-account"),
+        )
+        .await
+        .expect("rotation commit");
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed");
+    assert_eq!(
+        (metadata.provider.as_str(), metadata.model.as_str()),
+        ("fake-b", "model-b")
+    );
+    assert_eq!(
+        metadata.resolved_route_alias.as_deref(),
+        Some("promoted-rotated-account")
+    );
+    assert!(rotated_epoch >= promoted_epoch);
+    world.shutdown().await;
+}
 
 #[derive(Default)]
 struct GraphSelectionSink(Mutex<Vec<WireFrame>>);
@@ -72,6 +147,34 @@ struct RoutingProviderFactory {
     providers: HashMap<String, Arc<FakeProvider>>,
     cache_reconciliations: Arc<Mutex<Vec<(SessionId, String)>>>,
     fallback_enabled: bool,
+    rotation_enabled: bool,
+}
+
+#[derive(Debug)]
+struct RuntimeRotationResolver {
+    target: Arc<FakeProvider>,
+}
+
+#[async_trait::async_trait]
+impl ProviderAttemptResolver for RuntimeRotationResolver {
+    async fn resolve(
+        &self,
+        current_account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        let to = CredentialAlias::new("fake-a-account-b");
+        Ok(ProviderAttemptDecision::Rotate(ResolvedProviderAttempt {
+            provider: Arc::clone(&self.target) as Arc<dyn haider_provider::Provider>,
+            account: to.clone(),
+            account_incarnation: Some(2),
+            rotation: RotationEvent {
+                provider: "fake-a".into(),
+                from: current_account.clone(),
+                to,
+                cause: RotationCause::Error,
+            },
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -125,7 +228,11 @@ impl ProviderFactory for RoutingProviderFactory {
                 false,
             )
         })?;
-        let attempt_resolver =
+        let attempt_resolver = if self.rotation_enabled && metadata.provider == "fake-a" {
+            Some(Arc::new(RuntimeRotationResolver {
+                target: Arc::clone(self.providers.get("fake-b").expect("rotation target")),
+            }) as Arc<dyn ProviderAttemptResolver>)
+        } else {
             (self.fallback_enabled && metadata.provider == "fake-a").then(|| {
                 Arc::new(RuntimeFallbackResolver {
                     target: Arc::clone(
@@ -134,7 +241,8 @@ impl ProviderFactory for RoutingProviderFactory {
                             .expect("fallback target is registered"),
                     ),
                 }) as Arc<dyn ProviderAttemptResolver>
-            });
+            })
+        };
         Ok(ResolvedTurnProvider {
             provider: Arc::clone(provider) as Arc<dyn haider_provider::Provider>,
             provider_name: metadata.provider.clone(),
@@ -206,6 +314,24 @@ impl PairSwitchWorld {
         fake_b: Arc<FakeProvider>,
         fallback_enabled: bool,
     ) -> Self {
+        Self::boot_with_attempt_mode(prefix, fake_a, fake_b, fallback_enabled, false).await
+    }
+
+    async fn boot_with_rotation(
+        prefix: &str,
+        fake_a: Arc<FakeProvider>,
+        fake_b: Arc<FakeProvider>,
+    ) -> Self {
+        Self::boot_with_attempt_mode(prefix, fake_a, fake_b, false, true).await
+    }
+
+    async fn boot_with_attempt_mode(
+        prefix: &str,
+        fake_a: Arc<FakeProvider>,
+        fake_b: Arc<FakeProvider>,
+        fallback_enabled: bool,
+        rotation_enabled: bool,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temp profile");
         let store = SqliteStoreHandle::open(root.path()).await.expect("store");
         // Leak the tempdir handle so the profile outlives this constructor;
@@ -226,6 +352,7 @@ impl PairSwitchWorld {
                     ]),
                     cache_reconciliations: Arc::clone(&cache_reconciliations),
                     fallback_enabled,
+                    rotation_enabled,
                 }),
                 // Pair-switch scripts explicitly include delegation; retain
                 // its declaration across provider changes.
@@ -462,6 +589,7 @@ impl PairSwitchWorld {
             provider: "fake-b".into(),
             model: "model-b".into(),
             expected_pair: None,
+            account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("{command_id}-event")),
             device_id: self.device_id.clone(),
@@ -686,6 +814,357 @@ async fn pinned_loom_workflow_runs_its_next_turn_after_registry_edit() {
     world.shutdown().await;
 }
 
+/// An ordinary RPC create stays unpinned; an in-turn account rotation then
+/// advances only that session's route epoch and finishes on the alternate.
+#[tokio::test]
+async fn rpc_created_unpinned_session_can_rotate_and_commit_its_route_epoch() {
+    let first = Arc::new(FakeProvider::new(vec![FakeStep::Error {
+        kind: haider_provider::ProviderErrorKind::Authentication,
+        message: "first account failed authentication".into(),
+        retry_after_ms: None,
+    }]));
+    let alternate = Arc::new(FakeProvider::new(text_turn("alternate account answered")));
+    let mut world = PairSwitchWorld::boot_with_rotation(
+        "rpc-rotation-runtime",
+        Arc::clone(&first),
+        Arc::clone(&alternate),
+    )
+    .await;
+    let archived = world.session_id.clone();
+    let sink = Arc::new(GraphSelectionSink::default());
+    let connection = world
+        .hub
+        .open_connection(
+            BTreeSet::from([Capability::Control, Capability::View]),
+            Arc::clone(&sink) as Arc<dyn FrameSink>,
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("local RPC connection");
+    connection
+        .request(
+            RequestId::new("rpc-rotation-create"),
+            RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: CommandId::new("rpc-rotation-create-command"),
+                cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                    .expect("canonical cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                provider: "fake-a".into(),
+                model: "model-a".into(),
+                max_tokens: 4_096,
+                permission_overrides: None,
+                workspace_allocation: None,
+                cache_policy: None,
+                interaction_mode: Default::default(),
+                ssh_scope: None,
+                account_alias: None,
+                resolve_provider: false,
+                resolve_model: false,
+                effort: None,
+                fast: None,
+            },
+        )
+        .await
+        .expect("RPC create");
+    let ResponseBody::SessionCreate {
+        session_id,
+        metadata: created,
+        ..
+    } = graph_response(&sink, "rpc-rotation-create").expect("create response")
+    else {
+        panic!("unexpected create response")
+    };
+    assert_eq!(created.account_alias, None);
+    assert_eq!(created.selection_epoch, Some(0));
+    world.session_id = session_id;
+    let (run_id, disposition) = world
+        .submit_turn(
+            "rpc-rotation-turn",
+            "rotate and answer",
+            DeliveryMode::Steer,
+        )
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    let terminal = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some((_, state)) = world
+                .latest_run_states()
+                .await
+                .into_iter()
+                .find(|(candidate, _)| candidate == &run_id)
+                && matches!(
+                    state,
+                    RunState::Done | RunState::Errored | RunState::Cancelled
+                )
+            {
+                break state;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let journal = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("journal");
+    assert!(
+        matches!(terminal, Ok(RunState::Done)),
+        "rotation did not finish ({terminal:?}): {:?}",
+        journal
+            .iter()
+            .map(|event| event.payload.decode_event())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(first.requests().len(), 1);
+    assert_eq!(alternate.requests().len(), 1);
+    let committed = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("session");
+    assert_eq!(committed.account_alias, None, "rotation must not pin");
+    assert_eq!(
+        committed.resolved_route_alias.as_deref(),
+        Some("fake-a-account-b")
+    );
+    assert!(committed.selection_epoch.unwrap_or(0) > 0);
+    let events = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("journal");
+    assert!(events.iter().any(|event| {
+        ModelSelected::from_payload_value(&event.payload).is_some_and(|fact| {
+            fact.provider == "fake-a"
+                && fact.model == "model-a"
+                && fact.selection_epoch == committed.selection_epoch
+        })
+    }));
+    assert!(events.iter().any(|event| {
+        event.payload.decode_event().is_ok_and(|payload| {
+            matches!(
+                payload,
+                EventPayload::Rotation(RotationEvent {
+                    cause: RotationCause::Error,
+                    ..
+                })
+            )
+        })
+    }));
+    assert_eq!(
+        world
+            .store
+            .session_metadata(&archived)
+            .await
+            .expect("archived metadata")
+            .expect("archived row")
+            .selection_epoch,
+        Some(0),
+        "an unrelated session is untouched"
+    );
+    connection.close().await.expect("connection closes");
+    world.shutdown().await;
+}
+
+/// A global default change is lazy: sessions which already served a turn
+/// retain their own recorded route and epoch until they serve again.
+#[tokio::test]
+async fn global_account_switch_does_not_advance_served_sessions() {
+    let mut steps = text_turn("first session answered");
+    steps.extend(text_turn("second session answered"));
+    let fake_a = Arc::new(FakeProvider::new(steps));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("unused")));
+    let mut world = PairSwitchWorld::boot("switch-served", fake_a, fake_b).await;
+    let first = world.session_id.clone();
+    world.run_turn("switch-served-first", "hello first").await;
+
+    let second = SessionId::new("switch-served-second-session");
+    world
+        .hub
+        .create_internal_session(SessionCreateCommand {
+            command_id: "switch-served-second-create".into(),
+            request_digest: "switch-served-second-digest".into(),
+            request_json: "{}".into(),
+            session_id: second.clone(),
+            cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake-a".into(),
+            model: "model-a".into(),
+            max_tokens: 4096,
+            max_tokens_source: None,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("switch-served-second-created"),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("second session created");
+    world.session_id = second.clone();
+    world.run_turn("switch-served-second", "hello second").await;
+
+    let mut before_rows = Vec::new();
+    for id in [first.clone(), second.clone()] {
+        let metadata = world
+            .store
+            .session_metadata(&id)
+            .await
+            .expect("metadata read")
+            .expect("typed metadata");
+        let head = world.store.latest_seq(&id).await.expect("journal head");
+        assert!(metadata.resolved_route_seen, "{id} served a turn");
+        before_rows.push((id, metadata, head));
+    }
+
+    let old = haider_protocol::credential::CredentialDescriptor {
+        alias: CredentialAlias::new("old-fake"),
+        provider: "fake-a".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "synthetic old".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let new = haider_protocol::credential::CredentialDescriptor {
+        alias: CredentialAlias::new("new-fake"),
+        active: false,
+        ..old.clone()
+    };
+    let (login, mut queued) = tokio::sync::mpsc::channel(1);
+    world
+        .hub
+        .install_accounts(crate::accounts::AccountsFacade {
+            login: Some(login),
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+            management: crate::accounts::ManagementSnapshot::new(
+                0,
+                vec![old, new],
+                vec![model_summary("fake-a", &["model-a"])],
+            ),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            sources: Arc::new(Mutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts installed");
+    let sink = Arc::new(GraphSelectionSink::default());
+    let connection = world
+        .hub
+        .open_connection(
+            BTreeSet::from([Capability::Control]),
+            sink,
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("switch connection");
+    connection
+        .request(
+            RequestId::new("switch-served-request"),
+            RequestBody::AccountSetActive {
+                command_id: CommandId::new("switch-served-command"),
+                alias: "new-fake".into(),
+                confirm_new_epoch: true,
+            },
+        )
+        .await
+        .expect("switch preflight");
+    assert!(matches!(
+        queued.try_recv(),
+        Ok(crate::accounts::AccountCommand::SetActive(_))
+    ));
+    for (id, metadata, head) in before_rows {
+        assert_eq!(
+            world
+                .store
+                .session_metadata(&id)
+                .await
+                .expect("metadata after"),
+            Some(metadata),
+            "global switch must leave {id}'s route and epoch untouched"
+        );
+        assert_eq!(world.store.latest_seq(&id).await.expect("head after"), head);
+    }
+    drop(connection);
+    world.shutdown().await;
+}
+
+/// An explicit selection can land after a turn started but before its first
+/// provider attempt rotates. The old turn may finish on the alternate; its
+/// route commit must leave the newer selection's metadata alone.
+#[tokio::test]
+async fn rotation_after_midturn_model_selection_finishes_without_overwriting_route() {
+    let fake_a = Arc::new(FakeProvider::new(vec![
+        FakeStep::Delay { ms: 500 },
+        FakeStep::Error {
+            kind: haider_provider::ProviderErrorKind::Authentication,
+            message: "old account rejected".into(),
+            retry_after_ms: None,
+        },
+    ]));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("rotated turn completed")));
+    let world = PairSwitchWorld::boot_with_rotation(
+        "midturn-rotation-selection",
+        Arc::clone(&fake_a),
+        Arc::clone(&fake_b),
+    )
+    .await;
+    let (run_id, disposition) = world
+        .submit_turn(
+            "midturn-rotation-selection-turn",
+            "hello",
+            DeliveryMode::Steer,
+        )
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    timeout(Duration::from_secs(5), async {
+        while fake_a.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first provider request started");
+    let SessionSelectModelOutcome::Committed { selected, .. } = world
+        .store
+        .select_session_model(world.select_command("midturn-rotation-explicit"))
+        .await
+        .expect("explicit model selection")
+    else {
+        panic!("new selection must commit");
+    };
+    world.await_run_state(&run_id, RunState::Done).await;
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed metadata");
+    assert_eq!(
+        (&*metadata.provider, &*metadata.model),
+        ("fake-b", "model-b")
+    );
+    assert_eq!(metadata.selection_epoch, Some(selected.selected_seq));
+    assert_ne!(
+        metadata.resolved_route_alias.as_deref(),
+        Some("fake-a-account-b")
+    );
+    assert_eq!(
+        fake_b.requests().len(),
+        1,
+        "rotated attempt served the turn"
+    );
+    world.shutdown().await;
+}
+
 /// LAW: an authentication wall with no within-provider alternate commits the
 /// exact receipted pair-selection transaction, surfaces both the cold epoch
 /// and human-readable hop reason, and finishes the SAME run on provider B.
@@ -726,6 +1205,8 @@ async fn fallback_chain_switch_is_durable_visible_and_finishes_the_same_turn() {
         (metadata.provider.as_str(), metadata.model.as_str()),
         ("fake-b", "model-b")
     );
+    assert_eq!(metadata.account_alias, None, "fallback must stay unpinned");
+    assert!(metadata.selection_epoch.unwrap_or(0) > 0);
 
     let request_json = serde_json::json!({
         "automatic": true,
@@ -843,9 +1324,17 @@ async fn invalid_request_never_engages_the_fallback_chain() {
         .await
         .expect("journal")
         .into_iter()
-        .filter(|event| ModelSelected::from_payload_value(&event.payload).is_some())
-        .count();
-    assert_eq!(model_facts, 0);
+        .filter_map(|event| ModelSelected::from_payload_value(&event.payload))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_facts.iter().filter(|fact| !fact.route_only).count(),
+        0
+    );
+    assert_eq!(
+        model_facts.iter().filter(|fact| fact.route_only).count(),
+        1,
+        "first request publishes one serving-route fact"
+    );
     world.shutdown().await;
 }
 
@@ -915,9 +1404,18 @@ async fn pair_switch_is_receipted_and_next_turn_resolves_the_new_provider() {
         .await
         .expect("read journal")
         .into_iter()
-        .filter(|event| ModelSelected::from_payload_value(&event.payload).is_some())
-        .count();
-    assert_eq!(facts, 1, "replay must not append a second fact");
+        .filter_map(|event| ModelSelected::from_payload_value(&event.payload))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts.iter().filter(|fact| !fact.route_only).count(),
+        1,
+        "replay must not append a second model selection"
+    );
+    assert_eq!(
+        facts.iter().filter(|fact| fact.route_only).count(),
+        1,
+        "first request publishes one serving-route fact"
+    );
 
     // …and the durable metadata is the new pair.
     let metadata = world
@@ -1259,9 +1757,18 @@ async fn stale_generation_select_is_refused_and_mutates_nothing() {
         .await
         .expect("read journal")
         .into_iter()
-        .filter(|event| ModelSelected::from_payload_value(&event.payload).is_some())
-        .count();
-    assert_eq!(facts, 0, "a refused selection must not append a fact");
+        .filter_map(|event| ModelSelected::from_payload_value(&event.payload))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts.iter().filter(|fact| !fact.route_only).count(),
+        0,
+        "a refused selection must not append a model selection"
+    );
+    assert_eq!(
+        facts.iter().filter(|fact| fact.route_only).count(),
+        1,
+        "first request publishes one serving-route fact"
+    );
     let metadata = world
         .store
         .session_metadata(&world.session_id)
@@ -1880,6 +2387,7 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
                 ]),
                 cache_reconciliations: Arc::new(Mutex::new(Vec::new())),
                 fallback_enabled: false,
+                rotation_enabled: false,
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
@@ -1923,6 +2431,111 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+/// A request freezes the selection epoch before provider I/O. A selection
+/// committed while that request is waiting cannot turn its later footprint
+/// into current truth; the next request carries the newly committed epoch.
+#[tokio::test]
+async fn in_flight_request_footprint_keeps_its_begin_selection_epoch() {
+    let usage = Usage {
+        input: 100,
+        output: 10,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let fake_a = Arc::new(FakeProvider::new(vec![
+        FakeStep::Delay { ms: 1500 },
+        FakeStep::EmitText {
+            text: "old request completed".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: usage.clone(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let fake_b = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "new request completed".into(),
+        },
+        FakeStep::EmitUsage { usage },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let world = PairSwitchWorld::boot("inflight-epoch", fake_a.clone(), fake_b).await;
+    let (old_run, disposition) = world
+        .submit_turn(
+            "inflight-epoch-old",
+            "start before selection",
+            DeliveryMode::Queue,
+        )
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    timeout(Duration::from_secs(5), async {
+        while fake_a.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old provider request started");
+
+    let SessionSelectModelOutcome::Committed { selected, .. } = world
+        .hub
+        .select_session_model(world.select_command("inflight-epoch-select"))
+        .await
+        .expect("selection during old request")
+    else {
+        panic!("new pair must commit");
+    };
+    assert!(selected.selected_seq > 0);
+    world.await_done(&old_run).await;
+    let old_footprint = world
+        .store
+        .read(&world.session_id, 0, 512)
+        .await
+        .expect("old request journal")
+        .into_iter()
+        .filter(|event| event.seq > selected.selected_seq)
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                ContextFootprint::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("old request footprint committed after selection");
+    assert_eq!(old_footprint.selection_epoch, Some(0));
+
+    let new_run = world
+        .run_turn("inflight-epoch-new", "start after selection")
+        .await;
+    let new_footprint = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("new request journal")
+        .into_iter()
+        .filter(|event| event.run_id.as_ref() == Some(&new_run))
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                ContextFootprint::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("new request footprint");
+    assert_eq!(new_footprint.selection_epoch, Some(selected.selected_seq));
+    world.shutdown().await;
 }
 
 /// LAW (switch_during_manual_compaction_lands_after_it, F3): a pair switch
@@ -1988,6 +2601,22 @@ async fn switch_during_manual_compaction_lands_after_it() {
     );
     assert_eq!(fake_a.requests()[1].model, "model-a");
     assert!(fake_b.requests().is_empty());
+    let reset = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("compaction journal")
+        .into_iter()
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                ContextFootprint::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("in-flight compaction reset footprint");
+    assert_eq!(reset.selection_epoch, Some(0));
+    assert!(selected.selected_seq > 0);
 
     // The FIRST post-compaction turn resolves through the new pair.
     world

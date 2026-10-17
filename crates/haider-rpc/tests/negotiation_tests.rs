@@ -18,6 +18,7 @@ fn hello(protocol_min: u32, protocol_max: u32) -> Hello {
             Capability::Control,
             Capability::Unknown,
         ]),
+        features_requested: Default::default(),
         max_receive_frame: 1024 * 1024,
         encodings: Vec::new(),
     }

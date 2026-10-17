@@ -433,6 +433,18 @@
     <string name="cd_fleet_refresh">Re-read the fleet</string>
     <string name="cd_open_subagent">%1$s, %2$s, %3$s. Opens this agent\'s transcript.</string>
     <string name="cd_subagent_no_session">%1$s, %2$s. Session not published yet; opens the subagent panel.</string>
+    <!-- 973-activity-icons: what a subagent is doing (spoken beside its row). -->
+    <string name="activity_computer">using the computer</string>
+    <string name="activity_mobile">using the phone</string>
+    <string name="activity_web">on the web</string>
+    <string name="activity_remote">working remotely</string>
+    <string name="activity_edit">editing files</string>
+    <string name="activity_run">running commands</string>
+    <string name="activity_read">reading</string>
+    <string name="activity_orchestrate">orchestrating</string>
+    <string name="cd_fleet_activity">%1$s. Now %2$s.</string>
+    <string name="settings_activity_icons">Subagent activity icons</string>
+    <string name="settings_activity_icons_detail">Show what each subagent is doing (reading, editing, running…) beside its name.</string>
     <string name="cd_fleet_jump">%1$s, %2$s, %3$s, %4$s. Opens this agent\'s session.</string>
     <string name="cd_fleet_open_transcript">Open the transcript for %1$s</string>
     <string name="cd_back_to_parent">Back to %1$s</string>

@@ -73,7 +73,7 @@ impl ConfigOptions {
 }
 
 #[derive(Serialize)]
-struct SessionConfigDocument {
+pub(crate) struct SessionConfigDocument {
     schema: &'static str,
     session_id: String,
     title: String,
@@ -84,6 +84,12 @@ struct SessionConfigDocument {
     speed: &'static str,
     fast: bool,
     account_alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared_account_pin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared_provider_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    selection_notices: Vec<String>,
     agent_type: Option<String>,
     context_window: Option<u64>,
     workspace_cwd: String,
@@ -325,11 +331,11 @@ async fn execute(
     // scan (256 summaries paged linearly to find ONE session). The digest
     // carries the same roster-truth fields from the same truth functions.
     let mut digest = session_digest(client, session_id.clone()).await?;
+    let mut effects = MutationEffects::default();
     let providers = provider_summaries(client).await?;
     if options.mutates() {
         let (attachment_id, mut worker_generation) =
             control_attachment(client, session_id.clone(), digest.head_seq).await?;
-        let mut applied = Vec::new();
         let mutation = apply_mutations(
             client,
             &session_id,
@@ -337,23 +343,35 @@ async fn execute(
             &providers,
             &options,
             &mut worker_generation,
-            &mut applied,
+            &mut effects,
         )
         .await;
         detach(client, attachment_id).await;
         mutation.map_err(|error| {
-            if applied.is_empty() {
+            if effects.applied.is_empty() {
                 error
             } else {
                 ConfigError::Partial {
-                    applied,
+                    applied: std::mem::take(&mut effects.applied),
                     error: Box::new(error),
                 }
             }
         })?;
         digest = session_digest(client, session_id).await?;
     }
-    document(digest, &providers)
+    let mut result = document(digest, &providers)?;
+    result.cleared_account_pin = effects.cleared_account_pin;
+    result.cleared_provider_endpoint = effects.cleared_provider_endpoint;
+    result.selection_notices = effects.selection_notices;
+    Ok(result)
+}
+
+#[derive(Default)]
+struct MutationEffects {
+    applied: Vec<&'static str>,
+    cleared_account_pin: Option<String>,
+    cleared_provider_endpoint: Option<String>,
+    selection_notices: Vec<String>,
 }
 
 async fn apply_mutations(
@@ -363,7 +381,7 @@ async fn apply_mutations(
     providers: &[ProviderSummaryWire],
     options: &ConfigOptions,
     worker_generation: &mut u64,
-    applied: &mut Vec<&'static str>,
+    effects: &mut MutationEffects,
 ) -> Result<(), ConfigError> {
     if options.account.is_some() {
         return Err(ConfigError::AccountSelectionUnsupported);
@@ -390,12 +408,33 @@ async fn apply_mutations(
             .await
             .map_err(ConfigError::Client)?;
         if let ResponseBody::SessionSelectModel {
-            output_budget: Some(budget),
+            cleared_account_pin,
+            cleared_provider_endpoint,
+            provider,
+            output_budget,
             ..
         } = &response
-            && let Some(clamp) = budget.clamped
         {
-            eprintln!("haider session config: {}", clamp.notice());
+            effects.cleared_account_pin.clone_from(cleared_account_pin);
+            effects
+                .cleared_provider_endpoint
+                .clone_from(cleared_provider_endpoint);
+            if let Some(notice) = haider_protocol::session::model_selection_clear_notice(
+                cleared_account_pin.as_deref(),
+                cleared_provider_endpoint.as_deref(),
+                provider,
+            ) {
+                eprintln!("haider session config: {notice}");
+                effects.selection_notices.push(notice);
+            }
+            if let Some(clamp) = output_budget
+                .as_ref()
+                .and_then(|budget| budget.clamped.as_ref())
+            {
+                let notice = clamp.notice();
+                eprintln!("haider session config: {notice}");
+                effects.selection_notices.push(notice);
+            }
         }
         *worker_generation = selected_generation(
             response,
@@ -403,7 +442,7 @@ async fn apply_mutations(
             SelectionKind::Model,
             "session.select_model response method mismatch",
         )?;
-        applied.push("model");
+        effects.applied.push("model");
     }
     if let Some(effort) = options.effort.as_ref() {
         let response = client
@@ -422,7 +461,7 @@ async fn apply_mutations(
             SelectionKind::Effort,
             "session.select_effort response method mismatch",
         )?;
-        applied.push("effort");
+        effects.applied.push("effort");
     }
     if let Some(selector) = options.agent_type.as_ref() {
         // `none` is the spoken revert — a session goes back to plain.
@@ -442,7 +481,7 @@ async fn apply_mutations(
             SelectionKind::AgentType,
             "session.select_agent_type response method mismatch",
         )?;
-        applied.push("agent-type");
+        effects.applied.push("agent-type");
     }
     if let Some(enabled) = options.fast {
         let response = client
@@ -461,7 +500,7 @@ async fn apply_mutations(
             SelectionKind::Fast,
             "session.select_fast response method mismatch",
         )?;
-        applied.push("speed");
+        effects.applied.push("speed");
     }
     Ok(())
 }
@@ -655,7 +694,7 @@ async fn detach(client: &haider_client::RpcClient, attachment_id: AttachmentId) 
         .await;
 }
 
-fn document(
+pub(crate) fn document(
     digest: SessionObserveDigest,
     providers: &[ProviderSummaryWire],
 ) -> Result<SessionConfigDocument, ConfigError> {
@@ -689,7 +728,10 @@ fn document(
         effort: metadata.effort,
         speed: if metadata.fast { "fast" } else { "normal" },
         fast: metadata.fast,
-        account_alias: None,
+        account_alias: metadata.account_alias,
+        cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        selection_notices: Vec::new(),
         agent_type: metadata.agent_type,
         context_window,
         workspace_cwd: metadata.cwd,
@@ -746,6 +788,21 @@ fn write_document(document: &SessionConfigDocument) -> ExitCode {
 }
 
 fn write_human(document: &SessionConfigDocument) -> ExitCode {
+    let text = human_text(document);
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    if let Err(error) = output
+        .write_all(text.as_bytes())
+        .and_then(|()| output.flush())
+    {
+        eprintln!("haider session config: stdout failed: {error}");
+        ExitCode::from(EX_IOERR)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+pub(crate) fn human_text(document: &SessionConfigDocument) -> String {
     let footprint = document.footprint.as_ref().map_or_else(
         || "unknown".to_owned(),
         |footprint| format!("{}:{}", footprint.truth, footprint.tokens),
@@ -754,7 +811,7 @@ fn write_human(document: &SessionConfigDocument) -> ExitCode {
     let context_window = document
         .context_window
         .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string());
-    let text = format!(
+    format!(
         "{} — {}\nstate: {}\nprovider/model: {}/{}\neffort: {}\nspeed: {}\naccount: {}\ncontext_window: {}\nfootprint: {}\nworkspace: {}\n",
         document.session_id,
         document.title.replace('\n', " "),
@@ -767,18 +824,7 @@ fn write_human(document: &SessionConfigDocument) -> ExitCode {
         context_window,
         footprint,
         document.workspace_cwd,
-    );
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    if let Err(error) = output
-        .write_all(text.as_bytes())
-        .and_then(|()| output.flush())
-    {
-        eprintln!("haider session config: stdout failed: {error}");
-        ExitCode::from(EX_IOERR)
-    } else {
-        ExitCode::SUCCESS
-    }
+    )
 }
 
 fn failure(error: &ConfigError) -> ExitCode {

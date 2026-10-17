@@ -1074,6 +1074,20 @@ fn loom_editor_has_a_dedicated_draft_surface() {
 }
 
 #[test]
+fn loom_pathlike_and_unknown_slash_prose_stays_in_the_draft() {
+    for prose in ["/tmp/input is the source", "/modeling the response"] {
+        let mut model = live_bound_model();
+        model.screen = Screen::Loom;
+        model.loom_pane = LoomPane::Workflows;
+        model.composer.set_text(prose);
+        model.handle(key(KeyCode::Enter));
+        assert!(model.requests.iter().any(|request| matches!(request,
+            AppRequest::LoomAuthorDraft { prose: sent, .. } if sent == prose)));
+        assert_eq!(model.composer.text(), prose);
+    }
+}
+
+#[test]
 fn pending_authoring_locks_edits_and_navigation() {
     let mut model = live_bound_model();
     model.screen = Screen::Loom;
@@ -1404,6 +1418,8 @@ fn fleet_node(task: &str) -> FleetNodeWire {
         parent_agent_id: None,
         state: FleetAgentStateWire::Live,
         metrics: None,
+        activity: None,
+        activities: Vec::new(),
         folded_children: 0,
         children: Vec::new(),
     }

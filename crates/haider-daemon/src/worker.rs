@@ -85,12 +85,13 @@ use haider_core::{
     ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
     ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit, ProviderDeadlineGuard,
     ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
-    ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint, RouteWaitCheckpoint,
-    SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    TurnTraceContext, UserCommandOutput, build_cache_request_diagnostic, build_context_accounting,
-    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
+    ProviderRouteCommitter, ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint,
+    RouteWaitCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult,
+    ToolDispatcher, TurnHandle, TurnTraceContext, UserCommandOutput,
+    build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
+    context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
     presentation_for_haider_error, register_turn_trace, registered_turn_trace,
     sanitized_failure_message,
@@ -371,6 +372,51 @@ struct DaemonProviderPairSwitchCommitter {
     branch_id: Option<BranchId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
+    turn_selection: Arc<Mutex<haider_protocol::session::SessionMetadataV1>>,
+}
+
+struct DaemonProviderRouteCommitter {
+    store: HubStoreHandle,
+    /// The pair and epoch admitted for this turn, including its initial
+    /// resolved route. A later selection must not donate its new epoch to
+    /// this older turn's rotation.
+    selection: Arc<Mutex<haider_protocol::session::SessionMetadataV1>>,
+}
+
+impl std::fmt::Debug for DaemonProviderRouteCommitter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonProviderRouteCommitter")
+            .field("session_id", self.store.session_id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
+    async fn commit(
+        &self,
+        provider: &str,
+        model: &str,
+        to: &haider_protocol::ids::CredentialAlias,
+    ) -> Result<u64, HaiderError> {
+        let selection = self.selection.lock().await.clone();
+        if selection.provider != provider || selection.model != model {
+            return Ok(selection.selection_epoch.unwrap_or(0));
+        }
+        let epoch = self
+            .store
+            .commit_resolved_route(&selection, Some(to.as_str()))
+            .await?;
+        let mut current = self.selection.lock().await;
+        if current.provider == selection.provider
+            && current.model == selection.model
+            && current.selection_epoch == selection.selection_epoch
+        {
+            current.selection_epoch = Some(epoch);
+        }
+        Ok(epoch)
+    }
 }
 
 impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
@@ -384,7 +430,7 @@ impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
 
 #[async_trait]
 impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
-    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError> {
         let live_source_policy = self
             .store
             .hub()
@@ -478,6 +524,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             // rev933b finding 7: the automatic switch observed this exact
             // pair; a concurrent explicit selection moves it and must win.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
+            account_alias: None,
             // No validated model row exists on this path: keep the stored
             // budget. An oversized budget on the fallback model is recovered
             // by the provider's one-shot `max_tokens too large` retry.
@@ -487,9 +534,15 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
         };
         match self.store.hub().select_session_model(command).await {
             Ok(
-                SessionSelectModelOutcome::Committed { .. }
-                | SessionSelectModelOutcome::IdempotentReplay { .. },
-            ) => Ok(()),
+                SessionSelectModelOutcome::Committed { selected, .. }
+                | SessionSelectModelOutcome::IdempotentReplay { selected },
+            ) => {
+                let mut current = self.turn_selection.lock().await;
+                current.provider = selected.provider;
+                current.model = selected.model;
+                current.selection_epoch = Some(selected.selected_seq);
+                Ok(selected.selected_seq)
+            }
             Err(error) => Err(hub_error(error)),
         }
     }
@@ -505,6 +558,7 @@ fn lockdown_pair_switch_allowed(
 
 #[derive(Clone)]
 struct DaemonContextCompactor {
+    selection_epoch: Option<u64>,
     store: HubStoreHandle,
     provider: Arc<dyn Provider>,
     model: String,
@@ -2420,6 +2474,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 &[],
             );
             let footprint = ContextFootprint {
+                selection_epoch: self.selection_epoch,
                 input_tokens: post_compaction_input,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -7699,6 +7754,11 @@ async fn perform_manual_compaction(
     .await?
     .cache_cohort();
     let compactor = DaemonContextCompactor {
+        selection_epoch: Some(
+            lease
+                .commit_resolved_route(metadata, resolved.account_alias.as_deref())
+                .await?,
+        ),
         store: lease.clone(),
         provider: resolved.provider,
         model: resolved.model,
@@ -9506,6 +9566,17 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
+    let route_epoch = lease
+        .commit_resolved_route(metadata, resolved.account_alias.as_deref())
+        .await?;
+    config.selection_epoch = Some(route_epoch);
+    let mut route_selection = metadata.clone();
+    route_selection.selection_epoch = Some(route_epoch);
+    let turn_selection = Arc::new(Mutex::new(route_selection));
+    config.provider_route_committer = Some(Arc::new(DaemonProviderRouteCommitter {
+        store: lease.clone(),
+        selection: Arc::clone(&turn_selection),
+    }));
     config.turn_trace = turn_trace.clone();
     config.agent_spawn = headless
         .as_ref()
@@ -9721,6 +9792,7 @@ async fn start_turn(
     // take the degraded fallback) — a cost edge, never a correctness one.
     // Re-resolving at compact time needs live-lane threading; tracked.
     config.context_compactor = Some(Arc::new(DaemonContextCompactor {
+        selection_epoch: config.selection_epoch,
         store: lease.clone(),
         provider: Arc::clone(&resolved.provider),
         model: config.model.clone(),
@@ -9778,6 +9850,7 @@ async fn start_turn(
         branch_id: accepted.branch_id.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
+        turn_selection,
     }));
     config.supervisor_commits_cancelled = true;
     config.prompt_retraction_enabled = true;
@@ -14258,6 +14331,43 @@ pub(crate) enum RegisteredToolRoute {
     SshShell,
 }
 
+impl RegisteredToolRoute {
+    pub(crate) fn activity(self) -> Option<haider_protocol::activity::ActivityKind> {
+        use haider_protocol::activity::ActivityKind;
+        Some(match self {
+            Self::Computer => ActivityKind::Computer,
+            Self::Mobile => ActivityKind::Mobile,
+            Self::WebFetch | Self::WebSearch => ActivityKind::Web,
+            Self::SshShell => ActivityKind::Remote,
+            Self::FsWrite | Self::FsEdit | Self::FsPath => ActivityKind::Edit,
+            Self::ProcessExec
+            | Self::TestRun
+            | Self::ToolScript
+            | Self::TaskOutput
+            | Self::TaskKill => ActivityKind::Run,
+            Self::FsRead
+            | Self::FsGlob
+            | Self::FsSearch
+            | Self::SshList
+            | Self::ListModels
+            | Self::SessionTranscript
+            | Self::PeerList
+            | Self::ListTools => ActivityKind::Read,
+            Self::SpawnSubagent
+            | Self::MessageSubagent
+            | Self::WorkflowAuthor
+            | Self::LoomRegister
+            | Self::PeerSend => ActivityKind::Orchestrate,
+            Self::RequestInput
+            | Self::Plan
+            | Self::TodoWrite
+            | Self::TaskOutcome
+            | Self::GraphEvidence
+            | Self::Monitor => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RegisteredTool {
     pub(crate) manifest: ToolManifest,
@@ -17053,12 +17163,28 @@ async fn create_broker_tool_dispatcher(
         device_id: context.device_id.clone(),
         event_ids: Arc::clone(&context.event_ids),
     };
+    // 973-activity-icons: a SUBAGENT names itself on any presence badge it
+    // raises. Best-effort and read-only: a missing record or callsign keeps
+    // the generic badge rather than failing the run.
+    let presence_actor = if context.agent_id.is_some() {
+        context
+            .store
+            .hub()
+            .delegation_for_child_session(session_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.manifest.callsign)
+    } else {
+        None
+    };
     let cu_presence = crate::cu_presence::PresenceLease::for_run(
         presence,
         context.store.hub().clone(),
         session_id.clone(),
         context.run_id.clone(),
-    );
+    )
+    .with_actor(presence_actor);
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
         pending_workspace: Mutex::new(pending_workspace),
@@ -19518,6 +19644,7 @@ impl BrokerToolDispatcher {
                 name: tool.to_owned(),
                 args: args.clone(),
                 status: haider_protocol::item::ToolStatus::InProgress,
+                activity: None,
             },
         });
         let mut events = vec![start];
@@ -20695,6 +20822,7 @@ impl BrokerToolDispatcher {
             name: pending.tool.clone(),
             args: pending.args.0.clone(),
             status: result.status.item_status(),
+            activity: None,
         };
         let mut prefix = vec![
             EventPayload::ToolResult {
@@ -21027,8 +21155,107 @@ async fn recover_orchestration_child(
     }
 }
 
+fn live_activity_for_route(
+    name: &str,
+    lockdown_allowed: Option<&[String]>,
+    has_web_search: bool,
+) -> Option<haider_protocol::activity::ActivityKind> {
+    if lockdown_allowed.is_some_and(|allowed| !allowed.iter().any(|tool| tool == name)) {
+        return None;
+    }
+    if name == "web_search" && !has_web_search {
+        return None;
+    }
+    match registered_tool_route(name)? {
+        RegisteredToolRoute::WebSearch => Some(haider_protocol::activity::ActivityKind::Web),
+        RegisteredToolRoute::SessionTranscript
+        | RegisteredToolRoute::ListModels
+        | RegisteredToolRoute::PeerList => Some(haider_protocol::activity::ActivityKind::Read),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn live_activity_respects_lockdown_and_backend_availability() {
+    use haider_protocol::activity::ActivityKind;
+    let allowed = vec!["web_search".to_owned(), "peer_list".to_owned()];
+    let denied = vec!["peer_list".to_owned()];
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&denied), true),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), false),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), true),
+        Some(ActivityKind::Web)
+    );
+    assert_eq!(
+        live_activity_for_route("peer_list", Some(&allowed), false),
+        Some(ActivityKind::Read)
+    );
+    assert_eq!(
+        live_activity_for_route("unknown", Some(&allowed), true),
+        None
+    );
+    for name in [
+        "web_search",
+        "session_transcript",
+        "list_models",
+        "peer_list",
+    ] {
+        let only_this = vec![name.to_owned()];
+        assert!(
+            live_activity_for_route(name, Some(&only_this), true).is_some(),
+            "{name} positive control"
+        );
+        assert_eq!(
+            live_activity_for_route(name, Some(&[]), true),
+            None,
+            "empty lockdown {name}"
+        );
+        assert_eq!(
+            live_activity_for_route(name, None, false).is_none(),
+            name == "web_search",
+            "only search requires that backend"
+        );
+    }
+    for name in [
+        "Web_Search",
+        " web_search",
+        "web_search ",
+        "",
+        "computer",
+        "fs_write",
+    ] {
+        assert_eq!(
+            live_activity_for_route(name, None, true),
+            None,
+            "not an effectless live route: {name:?}"
+        );
+    }
+}
+
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
+    fn activity_for_route(&self, name: &str) -> Option<haider_protocol::activity::ActivityKind> {
+        registered_tool_route(name).and_then(RegisteredToolRoute::activity)
+    }
+    fn live_activity_for_route(
+        &self,
+        name: &str,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        live_activity_for_route(
+            name,
+            self.lockdown
+                .as_ref()
+                .map(|lockdown| lockdown.tools_allowed.as_slice()),
+            self.web_search.is_some(),
+        )
+    }
     fn platform_tool_supported(&self, name: &str) -> bool {
         !crate::android_policy::enabled() || registered_tool_route(name).is_some()
     }
@@ -23646,16 +23873,34 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     };
                     // A capturable indicator (Linux notification popup) is
                     // taken off screen for the model-facing capture.
-                    let _revealed_after_capture = if matches!(
+                    let revealed_after_capture = if matches!(
                         operation.action(),
                         haider_protocol::computer::ComputerAction::Screenshot
                             | haider_protocol::computer::ComputerAction::Inspect { .. }
                     ) {
-                        self.cu_presence.conceal_for_capture().await
+                        match self.cu_presence.conceal_for_capture().await {
+                            Ok(guard) => Some(guard),
+                            Err(message) => {
+                                let error = ComputerError::Backend { message };
+                                broker
+                                    .journal_computer_outcome(
+                                        &intent,
+                                        EffectOutcome::Failed {
+                                            error: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                return Ok(computer_failure_result(&error));
+                            }
+                        }
                     } else {
                         None
                     };
-                    match self.computer.execute(operation.action(), &action_cancel).await {
+                    let execution = self.computer.execute(operation.action(), &action_cancel).await;
+                    // The model-facing pixels exist when execute returns. Restore
+                    // Stop before redaction, bounding, journaling or recording.
+                    drop(revealed_after_capture);
+                    match execution {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
                             let stored = self
                                 .admit_computer_screenshot_region(png, &action_cancel, operation.region())

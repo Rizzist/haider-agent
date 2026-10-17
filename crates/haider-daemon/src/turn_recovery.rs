@@ -1056,9 +1056,7 @@ async fn park_ambiguous_admission_retry(
     let payloads = vec![
         EventPayload::Effect(EffectPhase::Intent(EffectIntent {
             effect: effect_id.clone(),
-            class: EffectClass::Network {
-                host: "provider-request".into(),
-            },
+            class: EffectClass::ProviderTransport,
             summary: summary.clone(),
             args_digest,
             workspace_revision: None,
@@ -2240,6 +2238,7 @@ fn interrupted_terminal_payloads(
                     serde_json::from_str(&open.args).unwrap_or(serde_json::Value::String(open.args))
                 },
                 status: tool_status,
+                activity: None,
             },
             TurnItem::CommandExecution {
                 call_id,
@@ -2802,6 +2801,7 @@ mod plan_recovery_tests {
                     name: "plan".into(),
                     args: args.clone(),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
             EventPayload::MenuOpened(menu),
@@ -2874,6 +2874,7 @@ mod plan_recovery_tests {
                     name: "request_input".into(),
                     args: args.clone(),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
             EventPayload::MenuOpened(menu),

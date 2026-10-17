@@ -19,6 +19,7 @@ fn aid(n: u64) -> AttachmentId {
 }
 fn summary(head_seq: u64) -> SessionSummary {
     SessionSummary {
+        latest_context_footprint: None,
         session_id: sid(),
         head_seq,
         worker_generation: 7,

@@ -1152,6 +1152,7 @@ async fn repeated_identical_provider_tool_results_do_not_reset_the_streak() {
             call_id: "first".into(),
             name: "web_search".into(),
             args: serde_json::json!({"query": "same topic"}),
+            activity: None,
         },
         FakeStep::EmitServerToolResult {
             call_id: "first".into(),
@@ -1170,6 +1171,7 @@ async fn repeated_identical_provider_tool_results_do_not_reset_the_streak() {
             call_id: "second".into(),
             name: "web_search".into(),
             args: serde_json::json!({"query": "same topic"}),
+            activity: None,
         },
         FakeStep::EmitServerToolResult {
             call_id: "second".into(),
@@ -1581,12 +1583,12 @@ struct RecordingPairSwitchCommitter {
 
 #[async_trait]
 impl ProviderPairSwitchCommitter for RecordingPairSwitchCommitter {
-    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError> {
         self.switches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(switch.clone());
-        Ok(())
+        Ok(1)
     }
 }
 
@@ -1905,6 +1907,7 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     let promoted_window = estimated_input_tokens(&bounded, &continued_messages).saturating_add(1);
     assert!(promoted_window > window);
     bounded.context_window = Some(window);
+    bounded.selection_epoch = Some(0);
     bounded.context_compaction_v1 = true;
     bounded.compaction_guard_v1 = true;
     let compactor = Arc::new(IneffectiveContextCompactor::default());
@@ -1936,7 +1939,8 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     let committer = Arc::new(RecordingPairSwitchCommitter::default());
     bounded.provider_pair_switch_committer = Some(committer.clone());
 
-    let handle = HarnessActor::spawn(bounded, original.clone(), Arc::new(MemoryStore::new()));
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(bounded, original.clone(), store.clone());
     let outcome = handle
         .submit_committed_turn(SubmitCommittedTurn {
             run_id: RunId::new("ineffective-compaction-promotes"),
@@ -1955,16 +1959,31 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].model, "model-large");
     assert_eq!(requests[1].model, "model-large");
-    let switches = committer
-        .switches
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(switches.len(), 1);
-    assert_eq!(switches[0].from_provider, "fake-a");
-    assert_eq!(switches[0].from_model, "model-small");
-    assert_eq!(switches[0].to_provider, "fake-a");
-    assert_eq!(switches[0].to_model, "model-large");
-    assert_eq!(switches[0].cause, ProviderPairSwitchCause::CompactionGuard);
+    {
+        let switches = committer
+            .switches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(switches.len(), 1);
+        assert_eq!(switches[0].from_provider, "fake-a");
+        assert_eq!(switches[0].from_model, "model-small");
+        assert_eq!(switches[0].to_provider, "fake-a");
+        assert_eq!(switches[0].to_model, "model-large");
+        assert_eq!(switches[0].cause, ProviderPairSwitchCause::CompactionGuard);
+    }
+    let footprints: Vec<_> = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .iter()
+        .filter_map(completed_footprint)
+        .collect();
+    assert!(
+        !footprints.is_empty()
+            && footprints
+                .iter()
+                .all(|footprint| footprint.selection_epoch == Some(0)),
+        "a mid-turn selection cannot relabel the request's frozen begin-epoch"
+    );
 }
 
 /// MUTATION CHECK: change the strict window ordering to `>=` or trust only
@@ -7253,6 +7272,7 @@ fn completed_tool_call_is_pending_execution() {
         name: "tool".into(),
         args: serde_json::json!({}),
         status: ToolStatus::Pending,
+        activity: None,
     };
     assert!(matches!(
         item,
@@ -7531,6 +7551,7 @@ async fn usage_batches_context_footprint_before_usage() {
     let store = Arc::new(BatchRecordingStore::new());
     let mut runtime_config = config();
     runtime_config.context_compaction_v1 = true;
+    runtime_config.selection_epoch = Some(17);
     let handle = HarnessActor::spawn(runtime_config, provider, store.clone());
 
     let outcome = handle
@@ -7569,6 +7590,15 @@ async fn usage_batches_context_footprint_before_usage() {
             && ContextFootprint::from_extension_item(started_item).is_some()
             && ContextFootprint::from_extension_item(completed_item).is_some()
     ));
+    let EventPayload::Item(ItemEvent::Completed { item, .. }) = &usage_batch[1] else {
+        panic!("footprint completion")
+    };
+    assert_eq!(
+        ContextFootprint::from_extension_item(item)
+            .expect("footprint")
+            .selection_epoch,
+        Some(17)
+    );
 }
 
 /// MUTATION CHECK: move `RunningTool` after dispatcher execution, or split the
@@ -8396,6 +8426,7 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
             call_id: "srvtoolu_1".into(),
             name: "web_search".into(),
             args: serde_json::json!({"query": "rust sse"}),
+            activity: Some(haider_protocol::activity::ActivityKind::Web),
         },
         FakeStep::Finish {
             reason: FinishReason::PauseTurn,
@@ -8523,9 +8554,10 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
                         name,
                         args,
                         status,
+                        activity,
                     },
                 ..
-            }) => Some((call_id, name, args, status)),
+            }) => Some((call_id, name, args, status, activity)),
             _ => None,
         })
         .expect("completed server row");
@@ -8536,6 +8568,7 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
             "web_search".into(),
             serde_json::json!({"query": "rust sse"}),
             ToolStatus::Completed,
+            Some(haider_protocol::activity::ActivityKind::Web),
         )
     );
 
@@ -8588,6 +8621,9 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
 
 #[path = "support/request_budget_laws.rs"]
 mod request_budget_laws;
+
+#[path = "support/loop_guard_screen_digits.rs"]
+mod loop_guard_screen_digits;
 
 struct AppliedFailureDispatcher {
     calls: AtomicUsize,
@@ -8746,4 +8782,42 @@ async fn toolshape_fatal_applied_effects_are_journaled_once_before_errored_and_r
     );
     handle.stop().await.expect("stop actor");
     actor_task.await.expect("join actor");
+}
+#[tokio::test]
+async fn orphan_server_result_has_no_web_activity() {
+    let (handle, store, _) = runtime(vec![
+        FakeStep::EmitServerToolResult {
+            call_id: "orphan".into(),
+            preview: "result without use".into(),
+            is_error: false,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("inspect"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let row = events
+        .iter()
+        .find_map(|envelope| match typed(envelope) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::ToolCall { name, activity, .. },
+                ..
+            }) => Some((name, activity)),
+            _ => None,
+        })
+        .expect("orphan has a display row");
+    assert_eq!(row, ("web_tool".into(), None));
+    let mut tracker = haider_protocol::activity::ActivityTracker::new();
+    for envelope in &events {
+        tracker.observe(&typed(envelope), envelope.committed_at_ms);
+    }
+    assert!(tracker.used().is_empty());
 }
