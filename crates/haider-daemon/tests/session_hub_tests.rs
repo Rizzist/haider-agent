@@ -2720,6 +2720,7 @@ async fn append_fleet_metrics(
                 name: "fs_read".into(),
                 args: serde_json::json!({}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }))
         .expect("tool event"),
@@ -2923,6 +2924,7 @@ async fn a_stale_v5_file_rebuilds_with_rejected_tool_status() {
                 name: "fs_write".into(),
                 args: serde_json::json!({"path": "guarded"}),
                 status: ToolStatus::Rejected,
+                activity: None,
             },
         }),
     );
@@ -5020,6 +5022,7 @@ async fn session_list_publishes_compact_agent_metrics_at_committed_head() {
         name: "fs_read".into(),
         args: serde_json::json!({}),
         status,
+        activity: None,
     };
     let mut started = envelope(&session_id, "metrics-started", generation);
     started.run_id = Some(run_id.clone());
@@ -6621,6 +6624,38 @@ async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capabil
         live_node.children[0].parent_agent_id.as_ref(),
         Some(&live.agent_id)
     );
+    // 973-activity-icons: every child only STARTED a model-requested
+    // `fs_read` item — no effect was ever dispatched — so no node reads
+    // (F1: a requested tool name alone sets no icon and no history). The
+    // live parent still orchestrates its live child, and terminal nodes are
+    // quiet.
+    {
+        use haider_protocol::activity::ActivityKind;
+        assert_eq!(live_node.activity, Some(ActivityKind::Orchestrate));
+        assert_eq!(live_node.activities, vec![ActivityKind::Orchestrate]);
+        assert_eq!(live_node.children[0].activity, None);
+        assert!(live_node.children[0].activities.is_empty());
+        for node in &snapshot.roots {
+            if matches!(
+                node.state,
+                FleetAgentStateWire::Done
+                    | FleetAgentStateWire::Failed
+                    | FleetAgentStateWire::Cancelled
+            ) {
+                assert_eq!(node.activity, None, "{}", node.agent_id);
+                assert!(node.activities.is_empty(), "{}", node.agent_id);
+            }
+        }
+        let json = serde_json::to_value(&snapshot).expect("fleet json");
+        let live_json = json["roots"]
+            .as_array()
+            .expect("roots")
+            .iter()
+            .find(|node| node["agent_id"] == "fleet-agent-live")
+            .expect("live json node");
+        assert_eq!(live_json["activity"], "orchestrate");
+        assert_eq!(live_json["activities"], serde_json::json!(["orchestrate"]));
+    }
 
     let denied_sink = Arc::new(CollectSink::default());
     let denied = hub
@@ -9942,6 +9977,7 @@ async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() 
                 name: "shell".into(),
                 args: serde_json::json!({"cmd": "printf hot"}),
                 status: haider_protocol::item::ToolStatus::Completed,
+                activity: None,
             },
         }),
     );

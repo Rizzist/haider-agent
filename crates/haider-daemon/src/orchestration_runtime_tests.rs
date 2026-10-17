@@ -691,6 +691,7 @@ async fn assert_recovery_boundary(label: &str, boundary: CrashBoundary, effectle
             name: "fs_read".into(),
             args: serde_json::json!({"path":"input.txt"}),
             status: haider_protocol::item::ToolStatus::InProgress,
+            activity: None,
         },
     })];
     if !matches!(boundary, CrashBoundary::Started) {

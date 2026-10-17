@@ -13,6 +13,13 @@ fn point(x: f64, y: f64) -> Option<PresencePoint> {
     Some(PresencePoint { x, y })
 }
 
+fn show(commands: &[PresenceCommand]) -> Option<String> {
+    commands.iter().find_map(|command| match command {
+        PresenceCommand::Show { label, .. } => Some(label.clone()),
+        _ => None,
+    })
+}
+
 #[test]
 fn first_action_shows_the_surface_once_and_every_action_moves_the_pointer() {
     let mut machine = PresenceMachine::<String>::default();
@@ -528,6 +535,372 @@ fn linux_notification_plan_offers_stop_only_when_the_server_draws_actions() {
     }
 }
 
+#[test]
+fn a_named_subagent_raises_the_activity_badge_for_each_surface() {
+    let mut machine = PresenceMachine::<String>::default();
+    let now = Instant::now();
+    let actor = Some(PresenceActor {
+        name: "Ammar".into(),
+        emoji: true,
+    });
+    let (_, commands) = machine
+        .begin_action_as(
+            key("sub"),
+            PresenceSurface::Screen,
+            PresenceMark::Observe,
+            None,
+            now,
+            actor,
+        )
+        .expect("not stopped");
+    assert_eq!(
+        commands.first(),
+        Some(&PresenceCommand::Show {
+            surface: PresenceSurface::Screen,
+            label: "\u{1F5A5}\u{FE0F} Ammar is using your screen".into(),
+        })
+    );
+    // The same run on the phone keeps its name with the phone glyph.
+    let (_, commands) = machine
+        .begin_action(
+            key("sub"),
+            PresenceSurface::Phone,
+            PresenceMark::Click,
+            None,
+            now,
+        )
+        .expect("not stopped");
+    assert_eq!(
+        commands.first(),
+        Some(&PresenceCommand::Show {
+            surface: PresenceSurface::Phone,
+            label: "\u{1F4F1} Ammar is using your phone".into(),
+        })
+    );
+    assert_eq!(
+        PresenceSurface::Browser.actor_label("Ammar", false),
+        "Ammar is using this browser"
+    );
+}
+
+#[test]
+fn a_different_actor_on_a_shown_surface_relabels_the_badge() {
+    // F3: A raises the badge; B then acts on the same shown screen within
+    // the idle window — the badge must name B, and the main thread's action
+    // restores the generic badge. Repeat actions by the same actor re-show
+    // nothing.
+    let mut machine = PresenceMachine::<String>::default();
+    let now = Instant::now();
+    let actor = |name: &str| {
+        Some(PresenceActor {
+            name: name.into(),
+            emoji: false,
+        })
+    };
+    let show = |commands: &[PresenceCommand]| {
+        commands.iter().find_map(|command| match command {
+            PresenceCommand::Show { label, .. } => Some(label.clone()),
+            _ => None,
+        })
+    };
+    let (_, first) = machine
+        .begin_action_as(
+            key("a"),
+            PresenceSurface::Screen,
+            PresenceMark::Observe,
+            None,
+            now,
+            actor("Amina"),
+        )
+        .expect("not stopped");
+    assert_eq!(show(&first).as_deref(), Some("Amina is using your screen"));
+    let (_, again) = machine
+        .begin_action_as(
+            key("a"),
+            PresenceSurface::Screen,
+            PresenceMark::Click,
+            None,
+            now,
+            None,
+        )
+        .expect("not stopped");
+    assert_eq!(show(&again), None, "same actor: no re-show");
+    let (_, other) = machine
+        .begin_action_as(
+            key("b"),
+            PresenceSurface::Screen,
+            PresenceMark::Click,
+            None,
+            now,
+            actor("Bilal"),
+        )
+        .expect("not stopped");
+    assert_eq!(show(&other), None, "relabel is debounced");
+    assert_eq!(
+        show(&machine.tick(now + Duration::from_millis(150))).as_deref(),
+        Some("Bilal is using your screen")
+    );
+    let (_, main) = machine
+        .begin_action(
+            key("main"),
+            PresenceSurface::Screen,
+            PresenceMark::Click,
+            None,
+            now,
+        )
+        .expect("not stopped");
+    assert_eq!(show(&main), None);
+    assert_eq!(
+        show(&machine.tick(now + Duration::from_millis(150))).as_deref(),
+        Some("Haider is controlling this screen")
+    );
+}
+
+#[test]
+fn alternating_actors_coalesce_show_and_keep_final_label() {
+    let mut machine = PresenceMachine::<String>::default();
+    let now = Instant::now();
+    let mut shows = 0;
+    for index in 0..100 {
+        let actor = if index % 2 == 0 { "Amina" } else { "Bilal" };
+        let (_, commands) = machine
+            .begin_action_as(
+                key(actor),
+                PresenceSurface::Screen,
+                PresenceMark::Click,
+                None,
+                now + Duration::from_millis(index),
+                Some(PresenceActor {
+                    name: actor.into(),
+                    emoji: false,
+                }),
+            )
+            .expect("not stopped");
+        shows += commands
+            .iter()
+            .filter(|command| matches!(command, PresenceCommand::Show { .. }))
+            .count();
+    }
+    assert_eq!(shows, 1, "100 rapid alternations cost one initial Show");
+    let commands = machine.tick(now + Duration::from_millis(249));
+    assert_eq!(
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                PresenceCommand::Show { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["Bilal is using your screen"],
+    );
+}
+
+// ---- 6-opus-gate repro (F3-V1): a steady NEW actor with a sub-150 ms cadence
+// never gets its relabel because every begin_action_as resets the pending timer.
+#[test]
+fn opus_gate6_repro_steady_new_actor_relabels_during_a_fast_burst() {
+    let shows = |commands: Vec<PresenceCommand>| -> Vec<String> {
+        commands
+            .into_iter()
+            .filter_map(|command| match command {
+                PresenceCommand::Show { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut machine = PresenceMachine::<String>::default();
+    let now = Instant::now();
+    let (_, first) = machine
+        .begin_action_as(
+            key("amina"),
+            PresenceSurface::Screen,
+            PresenceMark::Click,
+            None,
+            now,
+            Some(PresenceActor {
+                name: "Amina".into(),
+                emoji: false,
+            }),
+        )
+        .expect("not stopped");
+    let mut labels = shows(first);
+    // Bilal alone acts every 100 ms for 3 s; the daemon ticks about once a second.
+    for index in 1..=30u64 {
+        let at = now + Duration::from_millis(index * 100);
+        let (_, commands) = machine
+            .begin_action_as(
+                key("bilal"),
+                PresenceSurface::Screen,
+                PresenceMark::Click,
+                None,
+                at,
+                Some(PresenceActor {
+                    name: "Bilal".into(),
+                    emoji: false,
+                }),
+            )
+            .expect("not stopped");
+        labels.extend(shows(commands));
+        if index % 10 == 0 {
+            labels.extend(shows(machine.tick(at + Duration::from_millis(50))));
+        }
+    }
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "Bilal is using your screen"),
+        "after 3 s of Bilal alone the badge still names Amina: {labels:?}"
+    );
+}
+
+#[test]
+fn steady_relabel_preserves_first_pending_instant_at_fast_cadences() {
+    for surface in [
+        PresenceSurface::Screen,
+        PresenceSurface::Phone,
+        PresenceSurface::Browser,
+    ] {
+        for cadence_ms in [10_u64, 100, 149] {
+            let mut machine = PresenceMachine::<String>::default();
+            let now = Instant::now();
+            machine
+                .begin_action_as(
+                    key("amina"),
+                    surface,
+                    PresenceMark::Click,
+                    None,
+                    now,
+                    Some(PresenceActor {
+                        name: "Amina".into(),
+                        emoji: false,
+                    }),
+                )
+                .expect("initial action");
+            let first_b = now + Duration::from_millis(cadence_ms);
+            let boundary = first_b + Duration::from_millis(150);
+            let mut at = first_b;
+            while at < boundary {
+                machine
+                    .begin_action_as(
+                        key("bilal"),
+                        surface,
+                        PresenceMark::Click,
+                        None,
+                        at,
+                        Some(PresenceActor {
+                            name: "Bilal".into(),
+                            emoji: false,
+                        }),
+                    )
+                    .expect("steady actor");
+                at += Duration::from_millis(cadence_ms);
+            }
+            assert!(
+                show(&machine.tick(first_b + Duration::from_millis(149))).is_none(),
+                "{cadence_ms} ms early"
+            );
+            if at == boundary {
+                machine
+                    .begin_action_as(
+                        key("bilal"),
+                        surface,
+                        PresenceMark::Click,
+                        None,
+                        at,
+                        Some(PresenceActor {
+                            name: "Bilal".into(),
+                            emoji: false,
+                        }),
+                    )
+                    .expect("action on threshold");
+            }
+            assert_eq!(
+                show(&machine.tick(boundary)).as_deref(),
+                Some(surface.actor_label("Bilal", false).as_str()),
+                "{cadence_ms} ms exact boundary"
+            );
+        }
+    }
+}
+
+#[test]
+fn relabel_change_restarts_timer_and_return_to_shown_label_cancels_it() {
+    let now = Instant::now();
+    let mut machine = PresenceMachine::<String>::default();
+    let act = |machine: &mut PresenceMachine<String>, name: &str, at| {
+        machine
+            .begin_action_as(
+                key(name),
+                PresenceSurface::Screen,
+                PresenceMark::Click,
+                None,
+                at,
+                Some(PresenceActor {
+                    name: name.into(),
+                    emoji: false,
+                }),
+            )
+            .expect("action")
+            .1
+    };
+    assert!(show(&act(&mut machine, "Amina", now)).is_some());
+    assert!(show(&act(&mut machine, "Bilal", now + Duration::from_millis(10))).is_none());
+    assert!(show(&act(&mut machine, "Cora", now + Duration::from_millis(100))).is_none());
+    assert!(show(&machine.tick(now + Duration::from_millis(249))).is_none());
+    assert_eq!(
+        show(&machine.tick(now + Duration::from_millis(250))).as_deref(),
+        Some("Cora is using your screen")
+    );
+    assert!(
+        show(&act(
+            &mut machine,
+            "Bilal",
+            now + Duration::from_millis(300)
+        ))
+        .is_none()
+    );
+    assert!(show(&act(&mut machine, "Cora", now + Duration::from_millis(350))).is_none());
+    assert!(
+        show(&machine.tick(now + Duration::from_millis(1_000))).is_none(),
+        "returning to the shown label must not call Show"
+    );
+}
+
+#[test]
+fn relabels_emit_at_most_one_show_per_surface_tick() {
+    let mut machine = PresenceMachine::<String>::default();
+    let now = Instant::now();
+    let mut shows = 0;
+    for index in 0..=3_u64 {
+        for offset in 0..100_u64 {
+            let name = if offset % 2 == 0 { "Amina" } else { "Bilal" };
+            let (_, commands) = machine
+                .begin_action_as(
+                    key(name),
+                    PresenceSurface::Screen,
+                    PresenceMark::Click,
+                    None,
+                    now + Duration::from_millis(index * 1_000 + offset),
+                    Some(PresenceActor {
+                        name: name.into(),
+                        emoji: false,
+                    }),
+                )
+                .expect("alternating action");
+            shows += commands
+                .iter()
+                .filter(|command| matches!(command, PresenceCommand::Show { .. }))
+                .count();
+        }
+        let tick = machine.tick(now + Duration::from_millis(index * 1_000 + 1_000));
+        shows += tick
+            .iter()
+            .filter(|command| matches!(command, PresenceCommand::Show { .. }))
+            .count();
+        assert!(shows <= index as usize + 2, "no per-action Show storm");
+    }
+}
+
 /// Verifier finding B3 (8c614f6c): the Linux helper matched `ActionInvoked`
 /// only against the current notification id and reset it on close, so a
 /// Stop the human pressed on notification N — still queued on the bus when
@@ -604,4 +977,170 @@ fn linux_stale_stop_never_reaches_a_later_generation() {
     router.show();
     router.posted(0);
     assert!(!router.on_action(0, "stop"));
+}
+
+fn apply_surface_labels(
+    commands: Vec<PresenceCommand>,
+    labels: &mut BTreeMap<PresenceSurface, String>,
+) {
+    for command in commands {
+        match command {
+            PresenceCommand::Show { surface, label } => {
+                labels.insert(surface, label);
+            }
+            PresenceCommand::Hide { surface, .. } => {
+                labels.remove(&surface);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn released_owners_never_keep_current_or_deferred_surface_labels() {
+    for surface in [
+        PresenceSurface::Screen,
+        PresenceSurface::Phone,
+        PresenceSurface::Browser,
+    ] {
+        let secondary = if surface == PresenceSurface::Phone {
+            PresenceSurface::Browser
+        } else {
+            PresenceSurface::Phone
+        };
+        for (a, b) in [
+            (Some("Amina"), Some("Bilal")),
+            (Some("Bilal"), Some("Amina")),
+            (None, Some("Bilal")),
+            (Some("same"), Some("same")),
+        ] {
+            for emoji in [false, true] {
+                for matured in [false, true] {
+                    for release in ["end", "cancel", "idle", "stop"] {
+                        let mut m = PresenceMachine::<String>::new(Duration::from_secs(1));
+                        let t = Instant::now();
+                        let mut labels = BTreeMap::new();
+                        let actor = |name: Option<&str>| {
+                            name.map(|name| PresenceActor {
+                                name: name.into(),
+                                emoji,
+                            })
+                        };
+                        for (key, name, ms) in [("a", a, 0), ("b", b, 10)] {
+                            apply_surface_labels(
+                                m.begin_action_as(
+                                    key.into(),
+                                    surface,
+                                    PresenceMark::Wait,
+                                    None,
+                                    t + Duration::from_millis(ms),
+                                    actor(name),
+                                )
+                                .unwrap()
+                                .1,
+                                &mut labels,
+                            );
+                        }
+                        if matured {
+                            apply_surface_labels(
+                                m.tick(t + Duration::from_millis(170)),
+                                &mut labels,
+                            );
+                        }
+                        match release {
+                            "end" | "cancel" => apply_surface_labels(
+                                m.end(
+                                    &"b".into(),
+                                    if release == "end" {
+                                        PresenceEndReason::RunEnded
+                                    } else {
+                                        PresenceEndReason::Cancelled
+                                    },
+                                ),
+                                &mut labels,
+                            ),
+                            "idle" => {
+                                m.finish_action(&"b".into(), t + Duration::from_millis(20));
+                                apply_surface_labels(
+                                    m.tick(t + Duration::from_secs(2)),
+                                    &mut labels,
+                                );
+                            }
+                            "stop" => {
+                                apply_surface_labels(
+                                    m.begin_action_as(
+                                        "b".into(),
+                                        secondary,
+                                        PresenceMark::Wait,
+                                        None,
+                                        t + Duration::from_millis(180),
+                                        actor(b),
+                                    )
+                                    .unwrap()
+                                    .1,
+                                    &mut labels,
+                                );
+                                apply_surface_labels(
+                                    m.stop_at(secondary, t + Duration::from_millis(190)).1,
+                                    &mut labels,
+                                );
+                            }
+                            _ => unreachable!(),
+                        }
+                        let expected = a.map_or_else(
+                            || surface.badge_label().to_owned(),
+                            |name| surface.actor_label(name, emoji),
+                        );
+                        assert_eq!(
+                            labels.get(&surface),
+                            Some(&expected),
+                            "{surface:?} {a:?}/{b:?} {release} matured={matured} emoji={emoji}"
+                        );
+                        assert_eq!(m.labels[&surface].owner, "a");
+                        apply_surface_labels(m.tick(t + Duration::from_secs(3)), &mut labels);
+                        assert_eq!(labels.get(&surface), Some(&expected));
+                        apply_surface_labels(
+                            m.end(&"a".into(), PresenceEndReason::RunEnded),
+                            &mut labels,
+                        );
+                        assert!(labels.is_empty());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn equal_named_new_lease_cannot_inherit_a_released_pending_generation() {
+    let t = Instant::now();
+    let surface = PresenceSurface::Screen;
+    let mut m = PresenceMachine::<String>::default();
+    let mut labels = BTreeMap::new();
+    for i in 0..20 {
+        apply_surface_labels(
+            m.begin_action_as(
+                "a".into(),
+                surface,
+                PresenceMark::Wait,
+                None,
+                t + Duration::from_millis(i * 20),
+                Some(PresenceActor {
+                    name: "same".into(),
+                    emoji: true,
+                }),
+            )
+            .unwrap()
+            .1,
+            &mut labels,
+        );
+        apply_surface_labels(
+            m.end(&"a".into(), PresenceEndReason::Cancelled),
+            &mut labels,
+        );
+        assert!(labels.is_empty());
+        assert!(m.pending_labels.is_empty());
+        apply_surface_labels(m.tick(t + Duration::from_millis(i * 20 + 200)), &mut labels);
+        assert!(labels.is_empty());
+    }
 }

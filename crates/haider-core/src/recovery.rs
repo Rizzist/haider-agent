@@ -974,6 +974,7 @@ mod reducer_filter_tests {
             name: "fixture".into(),
             args: serde_json::json!({}),
             status: ToolStatus::Completed,
+            activity: None,
         };
         let task_completed = TaskCompleted {
             completion_consumer: None,

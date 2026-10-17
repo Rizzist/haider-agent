@@ -100,6 +100,8 @@ fn node(
         parent_agent_id: None,
         state: FleetAgentStateWire::Done,
         metrics: None,
+        activity: None,
+        activities: Vec::new(),
         folded_children: 0,
         children,
     }
@@ -553,6 +555,7 @@ fn the_child_auth_label_comes_from_the_childs_own_usage() {
         started_at_ms: SPAWN_MS,
         terminal_at_ms: None,
         live: true,
+        activity: None,
         tool_attempts: 3,
         usage: Some(usage(AuthMethod::ApiKey)),
     });

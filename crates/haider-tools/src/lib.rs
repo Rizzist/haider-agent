@@ -28,6 +28,9 @@ mod output_redactor;
 mod plan;
 pub mod presence;
 mod process;
+#[cfg(all(test, unix))]
+#[path = "process_receipt_tests.rs"]
+mod process_receipt_tests;
 pub use output_redactor::{
     OutputRedactor, redact_process_output, redact_process_output_with_redaction,
 };
@@ -169,6 +172,9 @@ pub use webfetch::{
     WEB_FETCH_TOOL_OUTPUT_CAP_BYTES, WebFetch, web_fetch_manifest, web_search_manifest,
 };
 pub use workflow_author::{WorkflowAuthor, workflow_author_manifest};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use workspace_receipt::TEST_RECEIPT_WALL_TIME;
 pub use workspace_receipt::{
     WorkspaceReceiptCoverage, WorkspaceReceiptStrategy, WorkspaceReceiptUnknownReason,
     WorkspaceStateReceipt, workspace_state_digest, workspace_state_receipt,

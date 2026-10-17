@@ -21,7 +21,7 @@ use crate::acp::client::{
 use crate::acp::wire::{
     ACP_ERROR_AUTH_REQUIRED, AcpModelCatalog, AuthMethod, AuthMethodType, ClientInfo, ContentBlock,
     SessionConfigOption, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdate,
+    ToolCallUpdate, ToolKind,
 };
 use crate::{
     Block, MessageRole, Provider, ProviderError, ProviderErrorKind, ProviderStream,
@@ -581,6 +581,14 @@ pub fn finish_reason(reason: StopReason) -> FinishReason {
 struct AcpTurnDecoder {
     /// Tool call id -> whether a result row has already been emitted.
     tool_calls: HashMap<String, bool>,
+    tool_identity: HashMap<
+        String,
+        (
+            String,
+            serde_json::Value,
+            Option<haider_protocol::activity::ActivityKind>,
+        ),
+    >,
     /// The session's model cache, refreshed in place by a mid-turn
     /// `config_option_update`.
     models: Arc<Mutex<SessionModels>>,
@@ -590,6 +598,7 @@ impl AcpTurnDecoder {
     fn new(models: Arc<Mutex<SessionModels>>) -> Self {
         Self {
             tool_calls: HashMap::new(),
+            tool_identity: HashMap::new(),
             models,
         }
     }
@@ -678,10 +687,21 @@ impl AcpTurnDecoder {
         if !self.track(&call.tool_call_id) {
             return Vec::new();
         }
+        if self.tool_calls.get(&call.tool_call_id) == Some(&true) {
+            return Vec::new();
+        }
+        let name = display_name(&call.title, call.kind.as_str());
+        let args = call.raw_input.clone().unwrap_or(serde_json::Value::Null);
+        let activity = acp_activity(call.kind);
+        self.tool_identity.insert(
+            call.tool_call_id.clone(),
+            (name.clone(), args.clone(), activity),
+        );
         let mut events = vec![StreamEvent::ServerToolUse {
             call_id: call.tool_call_id.clone(),
-            name: display_name(&call.title, call.kind.as_str()),
-            args: call.raw_input.clone().unwrap_or(serde_json::Value::Null),
+            name,
+            args,
+            activity,
         }];
         if call.status.is_terminal() {
             events.extend(self.finish_tool_call(
@@ -696,20 +716,60 @@ impl AcpTurnDecoder {
 
     fn decode_tool_call_update(&mut self, update: &ToolCallUpdate) -> Vec<StreamEvent> {
         let mut events = Vec::new();
+        if self.tool_calls.get(&update.tool_call_id) == Some(&true) {
+            return events;
+        }
         if !self.tool_calls.contains_key(&update.tool_call_id) {
             // An update for a call whose opening frame was lost or elided
             // still opens a display row so the result has something to close.
             if !self.track(&update.tool_call_id) {
                 return events;
             }
+            let name = display_name(
+                update.title.as_deref().unwrap_or_default(),
+                update.kind.unwrap_or_default().as_str(),
+            );
+            let args = update.raw_input.clone().unwrap_or(serde_json::Value::Null);
+            let activity = acp_activity(update.kind.unwrap_or_default());
+            self.tool_identity.insert(
+                update.tool_call_id.clone(),
+                (name.clone(), args.clone(), activity),
+            );
             events.push(StreamEvent::ServerToolUse {
                 call_id: update.tool_call_id.clone(),
-                name: display_name(
-                    update.title.as_deref().unwrap_or_default(),
-                    update.kind.unwrap_or_default().as_str(),
-                ),
-                args: update.raw_input.clone().unwrap_or(serde_json::Value::Null),
+                name,
+                args,
+                activity,
             });
+        } else if let Some((name, args, activity)) =
+            self.tool_identity.get_mut(&update.tool_call_id)
+        {
+            let mut changed = false;
+            if let Some(title) = update.title.as_deref().filter(|title| !title.is_empty())
+                && name.as_str() != title
+            {
+                *name = title.to_owned();
+                changed = true;
+            }
+            if let Some(input) = &update.raw_input {
+                *args = input.clone();
+                changed = true;
+            }
+            if let Some(kind) = update.kind {
+                let next = acp_activity(kind);
+                if *activity != next {
+                    *activity = next;
+                    changed = true;
+                }
+            }
+            if changed {
+                events.push(StreamEvent::ServerToolUse {
+                    call_id: update.tool_call_id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    activity: *activity,
+                });
+            }
         }
         if update.status.is_some_and(ToolCallStatus::is_terminal) {
             let status = update.status.unwrap_or_default();
@@ -768,6 +828,17 @@ fn display_name(title: &str, kind: &str) -> String {
     } else {
         title.to_owned()
     }
+}
+
+fn acp_activity(kind: ToolKind) -> Option<haider_protocol::activity::ActivityKind> {
+    use haider_protocol::activity::ActivityKind;
+    Some(match kind {
+        ToolKind::Read | ToolKind::Search => ActivityKind::Read,
+        ToolKind::Edit | ToolKind::Delete | ToolKind::Move => ActivityKind::Edit,
+        ToolKind::Execute => ActivityKind::Run,
+        ToolKind::Fetch => ActivityKind::Web,
+        ToolKind::Think | ToolKind::SwitchMode | ToolKind::Other => return None,
+    })
 }
 
 /// Builds the bounded, display-only result preview.
