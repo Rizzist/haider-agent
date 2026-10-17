@@ -51,6 +51,88 @@ pub struct UnixProcessIdentity {
     pub arguments: Vec<OsString>,
 }
 
+/// Numeric macOS process state for timeout diagnostics. No executable path,
+/// argument vector, environment, or process name is exposed.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacosProcessState {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub group_id: u32,
+    /// The kernel's `p_stat` value (for example, 2 is running and 5 is zombie).
+    pub status: u32,
+}
+
+/// Takes a best-effort numeric snapshot without spawning the setuid `ps`,
+/// which macOS refuses to execute inside a sandbox. Processes disappearing or
+/// refusing inspection during the snapshot are omitted; the list is not atomic.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn macos_process_states() -> std::io::Result<Vec<MacosProcessState>> {
+    // SAFETY: a null buffer with zero capacity asks libproc only for its PID
+    // count estimate. It writes nothing and retains no pointer.
+    let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let mut capacity = usize::try_from(estimate)
+        .ok()
+        .filter(|count| *count > 0)
+        .and_then(|count| count.checked_mul(2))
+        .and_then(|count| count.checked_add(32))
+        .ok_or_else(|| std::io::Error::other("process-list estimate unavailable"))?;
+    for _ in 0..3 {
+        let mut pids = vec![0_i32; capacity];
+        let bytes = std::mem::size_of_val(pids.as_slice());
+        let bytes = libc::c_int::try_from(bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "process list is too large")
+        })?;
+        // SAFETY: pids is an initialized, aligned writable pid_t buffer; its
+        // exact byte capacity is supplied and libproc retains no pointer.
+        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| std::io::Error::other("process-list query unavailable"))?;
+        if count >= pids.len() {
+            capacity = capacity.checked_mul(2).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "process list is too large")
+            })?;
+            continue;
+        }
+        let mut states = Vec::with_capacity(count);
+        for pid in pids.into_iter().take(count).filter(|pid| *pid > 0) {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdshortinfo>::uninit();
+            let bytes = std::mem::size_of::<libc::proc_bsdshortinfo>();
+            // SAFETY: info is aligned storage of exactly the requested native
+            // structure size. Only a complete successful write is read below.
+            let written = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDT_SHORTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    bytes as libc::c_int,
+                )
+            };
+            if usize::try_from(written).ok() != Some(bytes) {
+                continue;
+            }
+            // SAFETY: proc_pidinfo reported initialization of the entire
+            // structure. All its fields have integer/byte representations.
+            let info = unsafe { info.assume_init() };
+            states.push(MacosProcessState {
+                pid: info.pbsi_pid,
+                parent_pid: info.pbsi_ppid,
+                group_id: info.pbsi_pgid,
+                status: info.pbsi_status,
+            });
+        }
+        return Ok(states);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "process list kept growing during the snapshot",
+    ))
+}
+
 /// Reads the kernel-owned executable and argv for `pid`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn unix_process_identity(pid: ProcessId) -> std::io::Result<UnixProcessIdentity> {

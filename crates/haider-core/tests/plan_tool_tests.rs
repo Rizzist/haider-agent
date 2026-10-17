@@ -11,7 +11,6 @@ use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep};
 use std::sync::Arc;
-use std::time::Duration;
 
 const SESSION: &str = "plan-tool-session";
 
@@ -67,7 +66,7 @@ async fn plan_journals_the_document_and_auto_accepts_without_parking() {
         .submit_turn(SubmitTurn::new("propose the datacenter"))
         .await
         .expect("turn accepted");
-    let outcome = tokio::time::timeout(Duration::from_secs(1), turn.wait())
+    let outcome = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, turn.wait())
         .await
         .expect("autonomous plan must not wait for input")
         .expect("turn completes");

@@ -68,6 +68,7 @@ tui-workflow-rejects	linux	haider-tui	test:workflow_live_view_tests	evidence_les
 tui-branch-interleaving	linux	haider-tui	test:b2b_branch_state_tests	interleaved_branch_seqs_advance_one_cursor_and_switching_never_rewinds	crates/haider-tui/tests/b2b_branch_state_tests.rs
 tui-rapid-submit	linux	haider-tui	test:tui31_lifecycle_tests	two_rapid_aura_submits_cannot_interleave	crates/haider-tui/tests/tui31_lifecycle_tests.rs
 tui-effect-interleaving	linux	haider-tui	test:f2_error_visibility_tests	interleaved_results_attribute_each_effect_to_its_own_row	crates/haider-tui/tests/f2_error_visibility_tests.rs
+tui-frame-publication	all	haider-tui	lib	a_reader_racing_frame_publication_keeps_the_previous_arrival_stamp	crates/haider-tui/src/input_typeahead_tests.rs
 # Timing-window tests whose names do not contain an explicit race token.
 platform-phase-cpu-accounting	linux	haider-platform	lib	nested_cpu_is_exclusive_and_thread_time_does_not_charge_sleep	crates/haider-platform/src/phase_trace/native_tests.rs
 cli-one-shot-daemon-reap	macos	haider-cli	test:cli_tests	one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure	crates/haider-cli/tests/cli_tests.rs
@@ -80,4 +81,33 @@ daemon-native-close-replay	linux	haider-daemon	lib	native_close_joins_detached_r
 daemon-native-close-publication	linux	haider-daemon	lib	native_close_refuses_monitor_registration_between_commit_and_publication	crates/haider-daemon/src/session_close_tests.rs
 daemon-native-close-process-owner	linux	haider-daemon	lib	native_close_waits_for_cancelled_process_owner_cleanup	crates/haider-daemon/src/session_close_tests.rs
 warm-projection-seed-share	macos	haider-daemon	lib	concurrent_warm_readers_share_one_reducer_seed	crates/haider-daemon/src/worker_warm_journal_projection_tests.rs
-tui-frame-publication	all	haider-tui	lib	a_reader_racing_frame_publication_keeps_the_previous_arrival_stamp	crates/haider-tui/src/input_typeahead_tests.rs
+# Lock ownership and fixture readiness under parallel load (lane 973-file-lock-flake).
+lock-file-refresh-lease-release-does-not-wait-for-a-duplicated-descriptor	linux	haider-accounts	lib	file_refresh_lease_release_does_not_wait_for_a_duplicated_descriptor	crates/haider-accounts/src/file_vault_tests.rs
+lock-capture-waits-for-eof-from-both-descendant-streams	linux	haider-cli	test:autospawn_tests	capture_waits_for_eof_from_both_descendant_streams	crates/haider-cli/tests/autospawn_tests.rs
+lock-capture-timeout-identifies-the-retained-stream-and-child-state	all	haider-cli	test:autospawn_tests	capture_timeout_identifies_the_retained_stream_and_child_state	crates/haider-cli/tests/autospawn_tests.rs
+lock-parent-exit-liveness-assertion-rejects-a-stopped-daemon	linux	haider-cli	test:autospawn_tests	parent_exit_liveness_assertion_rejects_a_stopped_daemon	crates/haider-cli/tests/autospawn_tests.rs
+lock-stderr-capture-cancellation-closes-the-reader-while-the-writer-is-alive	linux	haider-cli	test:update_restart_tests	stderr_capture_cancellation_closes_the_reader_while_the_writer_is_alive	crates/haider-cli/tests/update_restart_tests.rs
+lock-parked-pointer-fixture-waits-for-stop-even-after-the-policy-ack-window	linux	haider-daemon	lib	parked_pointer_fixture_waits_for_stop_even_after_the_policy_ack_window	crates/haider-daemon/src/cu_presence_tests.rs
+lock-conceal-fixture-accepts-a-late-ack-while-the-policy-still-times-out	linux	haider-daemon	lib	conceal_fixture_accepts_a_late_ack_while_the_policy_still_times_out	crates/haider-daemon/src/cu_presence_tests.rs
+lock-fake-request-readiness-accepts-a-late-start-without-changing-the-result	linux	haider-daemon	lib	fake_request_readiness_accepts_a_late_start_without_changing_the_result	crates/haider-daemon/src/run_budget_tests.rs
+lock-workspace-directory-duplicates-are-close-on-exec-and-retain-the-anchor	linux	haider-platform	lib	workspace_directory_duplicates_are_close_on_exec_and_retain_the_anchor	crates/haider-platform/src/directory_unix_tests.rs
+lock-duplicated-workspace-anchor-is-absent-after-spawn	linux	haider-platform	lib	duplicated_workspace_anchor_is_absent_after_spawn	crates/haider-platform/src/directory_unix_tests.rs
+lock-supplied-inheritable-descriptors-are-fenced-before-locking	linux	haider-platform	lib	supplied_inheritable_descriptors_are_fenced_before_locking	crates/haider-platform/src/file_lock_tests.rs
+lock-forked-descriptor-does-not-outlive-the-lock-owner	linux	haider-platform	lib	forked_descriptor_does_not_outlive_the_lock_owner	crates/haider-platform/src/file_lock_tests.rs
+lock-closing-a-forked-guard-cannot-unlock-the-live-parent	linux	haider-platform	lib	closing_a_forked_guard_cannot_unlock_the_live_parent	crates/haider-platform/src/file_lock_tests.rs
+lock-exec-and-spawn-do-not-retain-the-lock-descriptor	linux	haider-platform	lib	exec_and_spawn_do_not_retain_the_lock_descriptor	crates/haider-platform/src/file_lock_tests.rs
+lock-background-spawn-fork-window-does-not-extend-the-lock-owner	linux	haider-platform	lib	background_spawn_fork_window_does_not_extend_the_lock_owner	crates/haider-platform/src/file_lock_tests.rs
+lock-stream-barrier-preserves-prior-events-and-waits-for-release	linux	haider-provider	test:fake_provider_tests	stream_barrier_preserves_prior_events_and_waits_for_release	crates/haider-provider/tests/fake_provider_tests.rs
+lock-forked-profile-guard-cannot-remove-the-live-owners-diagnostics	linux	haider-store	lib	forked_profile_guard_cannot_remove_the_live_owners_diagnostics	crates/haider-store/src/profile_lock_tests.rs
+lock-anchored-mutation-lock-release-does-not-wait-for-a-duplicate	linux	haider-tools	lib	anchored_mutation_lock_release_does_not_wait_for_a_duplicate	crates/haider-tools/src/filesystem/tests/w4a12.rs
+lock-cancel-settlement-gate	linux	haider-daemon	lib	cancellation_settlement_gate_waits_for_fixture_release_or_daemon_drain	crates/haider-daemon/src/cancellation_gate_tests.rs
+lock-forked-shared-descriptor-does-not-outlive-the-lock-owner	linux	haider-platform	lib	forked_shared_descriptor_does_not_outlive_the_lock_owner	crates/haider-platform/src/file_lock_tests.rs
+lock-shared-owners-coexist-and-fence-writers-until-the-last-owner-releases	linux	haider-platform	lib	shared_owners_coexist_and_fence_writers_until_the_last_owner_releases	crates/haider-platform/src/file_lock_tests.rs
+lock-closing-a-forked-shared-guard-cannot-unlock-the-live-parent	linux	haider-platform	lib	closing_a_forked_shared_guard_cannot_unlock_the_live_parent	crates/haider-platform/src/file_lock_tests.rs
+lock-file-lock-fences-another-opener-until-unlock-or-close	linux	haider-platform	lib	file_lock_fences_another_opener_until_unlock_or_close	crates/haider-platform/src/file_lock_tests.rs
+lock-parent-exit-liveness	linux	haider-cli	test:autospawn_tests	parent_exit_leaves_the_daemon_running	crates/haider-cli/tests/autospawn_tests.rs
+lock-owned-observer-teardown-confirmed	linux	haider-tools	lib	exit_observer_failure_sweeps_the_owned_process_group	crates/haider-tools/src/process.rs
+lock-background-observer-teardown-confirmed	linux	haider-tools	lib	exit_observer_failure_sweeps_the_background_process_group	crates/haider-tools/src/tasks.rs
+lock-content-budget-watchdog	linux	haider-tools	lib	observed_length_content_budget_is_explicitly_elided	crates/haider-tools/src/workspace_receipt_tests.rs
+lock-cancellation-receipt-nonblocking-reader	all	haider-cli	test:autospawn_tests	cancellation_gate_receipt_waits_for_an_inherited_nonblocking_reader	crates/haider-cli/tests/autospawn_tests.rs
+lock-cancellation-receipt-eof-control	all	haider-cli	test:autospawn_tests	cancellation_gate_receipt_preserves_eof_failure	crates/haider-cli/tests/autospawn_tests.rs

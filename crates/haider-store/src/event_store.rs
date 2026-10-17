@@ -29833,3 +29833,7 @@ mod group_commit_tests;
 #[cfg(test)]
 #[path = "embedded_store_synchronous_tests.rs"]
 mod embedded_store_synchronous_tests;
+
+#[cfg(test)]
+#[path = "event_store/session_recency_tests.rs"]
+mod session_recency_tests;
