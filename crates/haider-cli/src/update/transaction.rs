@@ -7,7 +7,7 @@ use super::staging::{
     sync_dir,
 };
 use serde_json::{Value, json};
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -192,27 +192,9 @@ fn validate_recoverable_binary(path: &Path, name: &str) -> Result<(), UpdateErro
     Ok(())
 }
 
-/// Exclusively flocked update-lock descriptor released by explicit unlock.
-///
-/// Dropping the `File` alone is not a reliable release: `flock` locks belong
-/// to the open file description, and fork/posix_spawn duplicates the whole
-/// descriptor table, so a concurrently spawned child between clone and exec
-/// keeps the description — and its lock — alive after this process closes its
-/// own descriptor (`O_CLOEXEC` only applies at exec). Explicit `LOCK_UN`
-/// releases the description's lock immediately regardless of surviving
-/// duplicates, so an immediate re-acquire cannot be spuriously refused as a
-/// concurrent update.
-struct UpdateLock(File);
-
-impl Drop for UpdateLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
 pub struct PreparedTransaction {
     layout: InstallLayout,
-    _lock: UpdateLock,
+    _lock: haider_platform::FileLock,
 }
 
 impl PreparedTransaction {
@@ -253,8 +235,8 @@ impl PreparedTransaction {
                 "update lock is not owner-only and owned by this user".into(),
             ));
         }
-        match lock.try_lock() {
-            Ok(()) => {}
+        let lock = match haider_platform::FileLock::try_exclusive(lock) {
+            Ok(lock) => lock,
             Err(TryLockError::WouldBlock) => {
                 return Err(UpdateError::Refused(
                     "another haider update is already running".into(),
@@ -263,8 +245,7 @@ impl PreparedTransaction {
             Err(TryLockError::Error(error)) => {
                 return Err(UpdateError::io("lock update transaction", error));
             }
-        }
-        let lock = UpdateLock(lock);
+        };
         recover_pending(&layout)?;
         layout.validate()?;
         Ok(Self {
@@ -278,8 +259,8 @@ impl PreparedTransaction {
     /// table between clone and exec.
     #[cfg(test)]
     #[allow(dead_code)]
-    pub fn duplicate_lock_handle_for_test(&self) -> std::io::Result<File> {
-        self._lock.0.try_clone()
+    pub fn duplicate_lock_handle_for_test(&self) -> std::io::Result<fs::File> {
+        self._lock.file().try_clone()
     }
 }
 
@@ -475,7 +456,7 @@ impl Marker {
 pub struct CommittedUpdate {
     layout: InstallLayout,
     marker: Marker,
-    _lock: UpdateLock,
+    _lock: haider_platform::FileLock,
 }
 
 impl CommittedUpdate {
@@ -720,7 +701,7 @@ fn make_backup(source: &Path, backup: &Path) -> Result<(), UpdateError> {
     // executing image. Its directory-entry durability remains the documented
     // platform sync_directory limitation, and needs native crash testing.
     #[cfg(unix)]
-    File::open(backup)
+    fs::File::open(backup)
         .and_then(|file| file.sync_all())
         .map_err(|error| UpdateError::io("fsync binary backup", error))?;
     sync_dir(backup.parent().unwrap_or_else(|| Path::new(".")))

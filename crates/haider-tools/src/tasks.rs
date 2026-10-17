@@ -653,7 +653,7 @@ pub struct BackgroundExitStatus {
     pub exit_code: Option<i32>,
     /// Terminating signal when no conventional exit code exists.
     pub signal: Option<i32>,
-    /// True when the kill ladder was requested before the leader exited.
+    /// True when the kill ladder was requested before natural exit was observed.
     pub killed: bool,
     /// Supervision fault detail (probe/signal/reap errors), if any.
     pub fault: Option<String>,
@@ -733,6 +733,7 @@ async fn supervise_background_with_exit_observation(
     let mut leader_exit_observed = false;
     let mut leader_is_zombie = false;
     let mut leader_reaped = false;
+    let mut sweep_group = Some(group);
     #[cfg(windows)]
     let mut normal_completion_relinquished = false;
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
@@ -740,7 +741,7 @@ async fn supervise_background_with_exit_observation(
     if *kill.borrow() {
         killed = true;
         begin_group_termination(
-            group,
+            sweep_group,
             pid,
             false,
             grace,
@@ -748,19 +749,22 @@ async fn supervise_background_with_exit_observation(
             &mut fatal,
             &mut escalation_notes,
             &mut lifecycle_events,
-        );
+        )
+        .await;
     }
 
     while !leader_reaped || output_open || kill_deadline.is_some() || pipe_drain_deadline.is_some()
     {
         tokio::select! {
             biased;
-            changed = kill.changed(), if kill_open && !killed => {
+            // Exit observation ends natural-completion ownership. In
+            // particular, never signal the numeric group after reaping it.
+            changed = kill.changed(), if kill_open && !killed && !leader_exit_observed => {
                 match changed {
                     Ok(()) if *kill.borrow() => {
-                        killed = !leader_exit_observed;
+                        killed = true;
                         begin_group_termination(
-                            group,
+                            sweep_group,
                             pid,
                             leader_is_zombie,
                             grace,
@@ -768,7 +772,7 @@ async fn supervise_background_with_exit_observation(
                             &mut fatal,
                             &mut escalation_notes,
                             &mut lifecycle_events,
-                        );
+                        ).await;
                     }
                     Ok(()) => {}
                     Err(_) => kill_open = false,
@@ -813,7 +817,7 @@ async fn supervise_background_with_exit_observation(
                         fatal.get_or_insert(error);
                         killed = true;
                         begin_group_termination(
-                            group,
+                            sweep_group,
                             pid,
                             false,
                             grace,
@@ -821,11 +825,12 @@ async fn supervise_background_with_exit_observation(
                             &mut fatal,
                             &mut escalation_notes,
                             &mut lifecycle_events,
-                        );
+                        ).await;
                         false
                     }
                 };
                 if kill_deadline.is_none() {
+                    sweep_group = None;
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -889,7 +894,7 @@ async fn supervise_background_with_exit_observation(
                                 pid,
                                 Signal::KILL,
                                 leader_is_zombie,
-                            )
+                            ).await
                         {
                             escalation_notes.push(format!(
                                 "SIGKILL escalation failed for background task group {}: {error}",
@@ -910,6 +915,7 @@ async fn supervise_background_with_exit_observation(
                     }
                 }
                 if kill_deadline.is_none() && leader_exit_observed && !leader_reaped {
+                    sweep_group = None;
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -1011,6 +1017,66 @@ mod supervisor_tests {
         }
     }
 
+    /// Queue the kill after its arm was polled Pending and real exit was
+    /// observed. The next drain poll is after reap; the descendant must still
+    /// answer a fresh FIFO request after supervision returns.
+    #[tokio::test]
+    async fn late_kill_during_natural_output_drain_leaves_descendant_alive() {
+        let mut fixture = crate::process::NaturalExitFixture::new();
+        let mut broker = EffectBroker::new_at(
+            Box::new(NoopJournal),
+            fixture.workspace(),
+            SessionId::new("background-late-kill-session"),
+            1,
+            1_700_000_000_000,
+        )
+        .expect("create broker");
+        let mut policy = PermissionPolicy::default();
+        policy.allow(EffectClass::ProcessExec);
+        let operation = BackgroundExec::new(
+            ProcessExec::new("background-late-kill", fixture.command()),
+            "background-late-kill",
+        )
+        .expect("valid background operation");
+        let spawn = broker
+            .process_exec_background(&operation, &policy)
+            .await
+            .expect("spawn background fixture");
+        let pid = spawn.pid_handle;
+        let (kill, kill_signal) = task_kill_channel();
+        let exit_observation: BackgroundLeaderExitObservation = Box::pin(async move {
+            observe_process_leader_exit(pid).await?;
+            kill.kill();
+            Ok(())
+        });
+        let output = shared_task_output(1024, 64);
+        let status = tokio::time::timeout(
+            haider_platform::TEST_WAIT_TIMEOUT,
+            supervise_background_with_exit_observation(
+                spawn,
+                kill_signal,
+                Arc::clone(&output),
+                Duration::from_millis(10),
+                exit_observation,
+            ),
+        )
+        .await
+        .expect("natural background completion stays bounded");
+        assert_eq!(status.exit_code, Some(0));
+        assert!(
+            !status.killed,
+            "late kill must not relabel natural completion: {status:?}"
+        );
+        assert!(
+            status.fault.is_none(),
+            "late kill must not start a sweep: {status:?}"
+        );
+        assert_eq!(lock_task_output(&output).retained(), b"leader");
+        fixture.assert_alive().await;
+        fixture.finish().await;
+        broker.close().await.expect("broker closes");
+    }
+
     /// A background exit-observer error while the leader is live is a
     /// supervision failure, not a natural-completion detach boundary.
     #[tokio::test]
@@ -1036,7 +1102,7 @@ mod supervisor_tests {
                     "/usr/bin/perl -e '$SIG{TERM}=q(IGNORE); ",
                     "open $started, q(>), q(background-observer-started.log); ",
                     "print $started q(started); close $started; ",
-                    "select undef, undef, undef, 0.3; ",
+                    "alarm 600; while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
                     "open $survived, q(>), q(background-observer-survived.log); ",
                     "print $survived q(survived); close $survived; sleep 30' & ",
                     "while :; do :; done",
@@ -1050,10 +1116,12 @@ mod supervisor_tests {
             .await
             .expect("spawn background process");
         let pid = spawn.pid;
+        let mut fixture_group = crate::process::FixtureProcessGroup::new(spawn.process_group);
         let (_kill, kill_signal) = task_kill_channel();
         let observer_started = descendant_started.clone();
         let exit_observation: BackgroundLeaderExitObservation = Box::pin(async move {
-            for _ in 0..200 {
+            let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+            while std::time::Instant::now() < deadline {
                 if observer_started.exists() {
                     return Err(ToolError::Runtime {
                         message: "injected background exit-observer failure".into(),
@@ -1067,7 +1135,7 @@ mod supervisor_tests {
         });
 
         let status = tokio::time::timeout(
-            Duration::from_secs(3),
+            haider_platform::TEST_WAIT_TIMEOUT,
             supervise_background_with_exit_observation(
                 spawn,
                 kill_signal,
@@ -1091,15 +1159,12 @@ mod supervisor_tests {
             "observer failure was not preserved: {status:?}"
         );
         assert!(descendant_started.exists(), "owned descendant starts");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        fixture_group.assert_swept(pid).await;
+        std::fs::write(workspace.path().join("release-descendant"), b"released")
+            .expect("release descendant after teardown");
         assert!(
             !descendant_survived.exists(),
             "background observer failure detached instead of sweeping the group"
-        );
-        assert_eq!(
-            probe_group_liveness(pid),
-            PidLiveness::Dead,
-            "background process group remains live after observer-failure teardown"
         );
         broker.close().await.expect("broker closes");
     }
@@ -1160,10 +1225,9 @@ pub fn probe_group_liveness_evidence(pid_raw: i32) -> EvidencePidLiveness {
 /// Reaps one stale background process group after a daemon restart: probe
 /// liveness through the injected seam, then TERM → grace → KILL the pgid.
 /// The orphan was reparented when the previous daemon died, so `ESRCH` at
-/// any rung means the group is gone. Both rungs pass the zombie-tolerant
-/// sweep flag: an `EPERM` here can only mean an unreaped same-pgid zombie
-/// (a caller-owned child in tests) — a live foreign-uid group was already
-/// impossible for a group the previous daemon spawned.
+/// any rung means the group is gone. A permission denial is not proof of
+/// cleanup: only a caller-owned unreaped zombie with no remaining group members
+/// can be confirmed as swept. Non-child orphan groups retain signal failures.
 pub async fn reap_orphan_group<P>(pid_raw: i32, grace: Duration, probe: P) -> OrphanReap
 where
     P: Fn(i32) -> PidLiveness,
@@ -1176,7 +1240,7 @@ where
             message: format!("orphan pid {pid_raw} is not representable"),
         };
     };
-    match signal_group_for_sweep(pid, Signal::TERM, true) {
+    match signal_group_for_sweep(pid, Signal::TERM, false).await {
         Ok(true) => {}
         Ok(false) => return OrphanReap::AlreadyDead,
         Err(error) => {
@@ -1188,7 +1252,7 @@ where
     sleep(grace).await;
     match process_group_exists(pid) {
         Ok(false) => OrphanReap::Killed,
-        Ok(true) => match signal_group_for_sweep(pid, Signal::KILL, true) {
+        Ok(true) => match signal_group_for_sweep(pid, Signal::KILL, false).await {
             Ok(_) => OrphanReap::Killed,
             Err(error) => OrphanReap::Failed {
                 message: format!("orphan KILL failed: {error}"),

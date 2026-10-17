@@ -901,7 +901,7 @@ async fn dropping_openai_stream_aborts_its_hanging_source() {
     ));
     drop(stream);
 
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !dropped.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
@@ -1097,7 +1097,7 @@ async fn validated_hostname_addresses_are_pinned_through_connection_establishmen
         "Bearer rebind-pin-sentinel"
     );
     tokio::time::timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         provider.http.client.execute(request),
     )
     .await
@@ -1272,7 +1272,7 @@ async fn openai_oauth_subscription_is_codex_bearer_lite_and_fixed_origin() {
         result = &mut execution => {
             panic!("fixed connection resolver did not stall the request: {result:?}");
         }
-        observed = tokio::time::timeout(Duration::from_secs(1), resolution_observed) => {
+        observed = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, resolution_observed) => {
             observed.expect("reqwest must consume the pinned fixed resolver");
         }
     }

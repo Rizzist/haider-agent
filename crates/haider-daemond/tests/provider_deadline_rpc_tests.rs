@@ -206,7 +206,7 @@ async fn never_opening_provider_is_structured_terminal_before_client_deadline() 
     assert_eq!(presentation.allowed_actions, vec![ErrorAction::None]);
     drain.await.expect("headless event drain");
 
-    timeout(Duration::from_millis(250), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while in_flight.load(Ordering::SeqCst) != 0 {
             tokio::task::yield_now().await;
         }

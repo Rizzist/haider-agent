@@ -238,7 +238,7 @@ async fn anthropic_oauth_subscription_is_bearer_beta_without_api_key_and_fixed_o
         result = &mut execution => {
             panic!("fixed connection resolver did not stall the request: {result:?}");
         }
-        observed = tokio::time::timeout(Duration::from_secs(1), resolution_observed) => {
+        observed = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, resolution_observed) => {
             observed.expect("reqwest must consume the pinned fixed resolver");
         }
     }
@@ -2333,7 +2333,7 @@ async fn non_reading_peer_hits_typed_request_upload_deadline() {
         .expect("server received request headers");
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(270)).await;
-    let error = tokio::time::timeout(Duration::from_secs(1), opening)
+    let error = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, opening)
         .await
         .expect("upload must have a deadline")
         .expect("provider task")
@@ -3575,10 +3575,11 @@ async fn binding_stream_case(case: &str, fallback_status: u16, fallback_body: &s
     let server = tokio::spawn(async move {
         let mut policies = Vec::new();
         for ordinal in 0..4 {
-            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("physical request missing")
-                .expect("accept");
+            let (mut socket, _) =
+                tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, listener.accept())
+                    .await
+                    .expect("physical request missing")
+                    .expect("accept");
             let (headers, payload) = read_http_request(&mut socket).await;
             let policy = payload.pointer("/thinking/block_binding").is_some();
             let beta = headers
@@ -4283,7 +4284,8 @@ async fn fixed_error_fake(
 
     let mut policies = Vec::new();
     for _ in 0..requests {
-        let Ok(accepted) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+        let Ok(accepted) =
+            tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, listener.accept()).await
         else {
             break;
         };

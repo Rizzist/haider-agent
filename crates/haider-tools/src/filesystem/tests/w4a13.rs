@@ -34,7 +34,7 @@ fn apfs_clone_snapshot_never_false_passes_a_map_shared_torn_read() {
         Mode::empty(),
     )
     .expect("open parent");
-    let mut source = fs::File::open(&target).expect("open target");
+    let source = fs::File::open(&target).expect("open target");
     let writer = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -60,7 +60,7 @@ fn apfs_clone_snapshot_never_false_passes_a_map_shared_torn_read() {
 
     let snapshot = file_snapshot_with_reader(
         &parent,
-        &mut source,
+        &source,
         &target,
         try_clone_file_at,
         |read_file, buffer| {
@@ -149,11 +149,11 @@ fn clone_unavailable_degrades_to_metadata_guarded_best_effort() {
         Mode::empty(),
     )
     .expect("open parent");
-    let mut source = fs::File::open(&target).expect("open target");
+    let source = fs::File::open(&target).expect("open target");
 
     let snapshot = file_snapshot_with_reader(
         &parent,
-        &mut source,
+        &source,
         &target,
         |_parent, _source| None,
         |read_file, buffer| read_file.read_at(buffer, 0),

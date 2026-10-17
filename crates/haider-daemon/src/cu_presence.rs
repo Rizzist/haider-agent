@@ -112,6 +112,12 @@ pub(crate) struct CuPresence {
     /// cancellation (zero in production). Models a slow cancel commit so the
     /// Stop-refusal path is observable before the cancellation lands.
     stop_cancel_delay: StdMutex<Duration>,
+    #[cfg(test)]
+    fixture_pointer_ack_timeout: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    fixture_conceal_ack_timeout: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    fixture_idle_clock: StdMutex<Option<(Instant, tokio::time::Instant)>>,
     me: Weak<CuPresence>,
 }
 
@@ -131,8 +137,28 @@ impl CuPresence {
             tick_interval,
             next_conceal_seq: std::sync::atomic::AtomicU64::new(CONCEAL_ACK_SEQ_START),
             stop_cancel_delay: StdMutex::new(Duration::ZERO),
+            #[cfg(test)]
+            fixture_pointer_ack_timeout: StdMutex::new(None),
+            #[cfg(test)]
+            fixture_conceal_ack_timeout: StdMutex::new(None),
+            #[cfg(test)]
+            fixture_idle_clock: StdMutex::new(None),
             me: me.clone(),
         })
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some((wall, monotonic)) = *lock(&self.fixture_idle_clock) {
+            return wall + tokio::time::Instant::now().saturating_duration_since(monotonic);
+        }
+        Instant::now()
+    }
+
+    /// Pair the presence machine's standard clock with paused Tokio timers.
+    #[cfg(test)]
+    pub(crate) fn set_idle_clock_for_test(&self) {
+        *lock(&self.fixture_idle_clock) = Some((Instant::now(), tokio::time::Instant::now()));
     }
 
     /// Delays every Stop hook's turn cancellation (tests only).
@@ -145,6 +171,18 @@ impl CuPresence {
     /// webextract-2 browser adapter plugs in here for `Browser`.
     pub(crate) fn register_renderer(&self, surface: PresenceSurface, factory: RendererFactory) {
         lock(&self.factories).insert(surface, factory);
+    }
+
+    /// Real-store fixtures that press Stop must own the parked-ack window.
+    /// Production and the virtual-clock policy probes retain the 250 ms bound.
+    #[cfg(test)]
+    pub(crate) fn set_pointer_ack_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.fixture_pointer_ack_timeout) = Some(timeout);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_conceal_ack_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.fixture_conceal_ack_timeout) = Some(timeout);
     }
 
     fn event_sink(&self, surface: PresenceSurface) -> EventSink {
@@ -175,7 +213,7 @@ impl CuPresence {
             surface,
             mark,
             point,
-            Instant::now(),
+            self.now(),
             actor,
         )?;
         state.hooks.insert(
@@ -206,7 +244,7 @@ impl CuPresence {
     /// The action begun for `key` finished; its idle window starts now.
     pub(crate) fn finish(&self, key: &str) {
         let mut state = lock(&self.state);
-        state.machine.finish_action(&key.to_owned(), Instant::now());
+        state.machine.finish_action(&key.to_owned(), self.now());
         if let Some(hooks) = state.hooks.get_mut(key) {
             hooks.in_flight = None;
         }
@@ -427,7 +465,7 @@ impl CuPresence {
 
     fn tick(&self) -> bool {
         let mut state = lock(&self.state);
-        let commands = state.machine.tick(Instant::now());
+        let commands = state.machine.tick(self.now());
         self.dispatch(&mut state, commands);
         let live = state.machine.has_leases();
         if !live {
@@ -665,7 +703,10 @@ impl PresenceLease {
         let guard = ActionGuard { lease: self };
         if let Some(ack) = ack {
             // Bounded: a slow or dead overlay never blocks control.
-            let _ = tokio::time::timeout(POINTER_ACK_TIMEOUT, ack).await;
+            let timeout = POINTER_ACK_TIMEOUT;
+            #[cfg(test)]
+            let timeout = lock(&self.presence.fixture_pointer_ack_timeout).unwrap_or(timeout);
+            let _ = tokio::time::timeout(timeout, ack).await;
             // Stop may have landed while we waited (it also releases the
             // ack): re-check so a stopped run's click is never posted.
             if self.presence.is_stopped(&self.key) {
@@ -728,9 +769,12 @@ impl PresenceLease {
             presence: Arc::clone(&self.presence),
             surface: PresenceSurface::Screen,
         };
+        let timeout = CONCEAL_ACK_TIMEOUT;
+        #[cfg(test)]
+        let timeout = lock(&self.presence.fixture_conceal_ack_timeout).unwrap_or(timeout);
         if let Some(mut ack) = ack
             && !matches!(
-                tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack.wait_for(|acked| *acked)).await,
+                tokio::time::timeout(timeout, ack.wait_for(|acked| *acked)).await,
                 Ok(Ok(_))
             )
         {

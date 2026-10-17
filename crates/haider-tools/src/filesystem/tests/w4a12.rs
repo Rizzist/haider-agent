@@ -19,11 +19,11 @@ fn mid_read_in_place_edit_never_false_passes_a_torn_content_hash() {
     let torn_mix = [prefix_before.as_slice(), suffix_after.as_slice()].concat();
     fs::write(&target, initial).expect("seed target");
     let initial_inode = fs::metadata(&target).expect("initial metadata").ino();
-    let mut source = fs::File::open(&target).expect("open target");
+    let source = fs::File::open(&target).expect("open target");
     let mut edited = false;
 
     let snapshot =
-        metadata_guarded_file_snapshot_with_reader(&mut source, &target, |source, buffer| {
+        metadata_guarded_file_snapshot_with_reader(&source, &target, |source, buffer| {
             let prefix_read = source.read_at(&mut buffer[..FIRST_READ_BYTES], 0)?;
             if !edited {
                 fs::write(&target, &final_bytes).expect("rewrite target in place");
@@ -201,4 +201,31 @@ fn cooperating_edits_serialize_across_verify_and_rename() {
         fs::read_to_string(&target).expect("read serialized target"),
         "first"
     );
+}
+
+/// The actual mutation lock owner must release even when another process
+/// could still retain a duplicate of its open-file description.
+#[test]
+fn anchored_mutation_lock_release_does_not_wait_for_a_duplicate() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("lock-target");
+    fs::write(&path, b"before").expect("seed target");
+    let parent = rustix::fs::open(
+        directory.path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("open anchored parent");
+    let (owner, _) = open_locked_current_at(&parent, OsStr::new("lock-target"), &path)
+        .expect("actual mutation lock");
+    let duplicate = owner.file().try_clone().expect("retained descriptor");
+    let probe = fs::File::open(&path).expect("independent opener");
+    assert!(matches!(
+        haider_platform::try_lock_file_exclusive(&probe),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(owner);
+    haider_platform::try_lock_file_exclusive(&probe).expect("owner release is authoritative");
+    haider_platform::unlock_file(&probe).expect("release independent lock");
+    drop(duplicate);
 }

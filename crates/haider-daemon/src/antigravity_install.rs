@@ -1019,20 +1019,9 @@ impl InstallOutcome {
 /// version forever.
 #[derive(Debug)]
 pub struct AntigravityLease {
-    file: File,
+    file: haider_platform::FileLock,
     path: PathBuf,
     version: String,
-}
-
-impl Drop for AntigravityLease {
-    fn drop(&mut self) {
-        // Explicit unlock, not just handle close: `flock` locks belong to the
-        // open file description, and a concurrently spawned child between
-        // clone and exec keeps that description — and its lock — alive after
-        // this process closes its own descriptor. The file itself is left for
-        // the sweeper, which is exactly the crashed-holder path.
-        let _ = self.file.unlock();
-    }
 }
 
 impl AntigravityLease {
@@ -1053,8 +1042,7 @@ impl AntigravityLease {
     /// Safe to skip: a holder that dies without calling this leaves an
     /// unlocked file that the next sweep reclaims.
     pub fn release(self) -> Result<(), AntigravityInstallError> {
-        self.file
-            .unlock()
+        haider_platform::unlock_file(self.file.file())
             .map_err(|error| io_error("release antigravity lease", &self.path, error))?;
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -1546,23 +1534,20 @@ impl AntigravityInstaller {
                 let _ = std::fs::remove_file(&staged);
                 return Err(io_error("write antigravity lease", &staged, error));
             }
-            match file.try_lock() {
-                Ok(()) => {}
+            let file = match haider_platform::FileLock::try_exclusive(file) {
+                Ok(file) => file,
                 Err(TryLockError::WouldBlock) => {
                     // Unreachable with a 128-bit fresh name; treated as a
                     // collision rather than trusted.
-                    drop(file);
                     let _ = std::fs::remove_file(&staged);
                     continue;
                 }
                 Err(TryLockError::Error(error)) => {
-                    drop(file);
                     let _ = std::fs::remove_file(&staged);
                     return Err(io_error("lock antigravity lease", &staged, error));
                 }
-            }
+            };
             if let Err(error) = std::fs::rename(&staged, &target) {
-                let _ = file.unlock();
                 drop(file);
                 let _ = std::fs::remove_file(&staged);
                 return Err(io_error("publish antigravity lease", &target, error));
@@ -1612,10 +1597,10 @@ impl AntigravityInstaller {
                 // running child may be executing from.
                 Err(_) => return Ok(true),
             };
-            match file.try_lock() {
-                Ok(()) => {
+            match haider_platform::FileLock::try_exclusive(file) {
+                Ok(lock) => {
                     let _ = std::fs::remove_file(&path);
-                    let _ = file.unlock();
+                    drop(lock);
                 }
                 Err(TryLockError::WouldBlock) => return Ok(true),
                 // Same fail-closed reasoning as an unopenable lease.

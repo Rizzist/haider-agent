@@ -967,7 +967,7 @@ async fn losing_menu_answer_is_rejected_while_the_followup_provider_hangs() {
         tokio::task::yield_now().await;
     }
     let stale = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         handle.answer_menu(answer),
     )
     .await

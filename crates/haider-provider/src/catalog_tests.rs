@@ -212,7 +212,7 @@ async fn unpinned_compatible_catalog_still_discovers() {
         socket.write_all(body).await.expect("write catalog body");
     });
 
-    let deadline = std::time::Duration::from_secs(2);
+    let deadline = haider_platform::TEST_WAIT_TIMEOUT;
     let catalog = tokio::time::timeout(
         deadline,
         discover_models(CatalogSource::OpenAiCompatible { origin }, None, None),

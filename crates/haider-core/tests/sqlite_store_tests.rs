@@ -53,7 +53,7 @@ fn typed(envelope: &RawEnvelope) -> EventPayload {
 
 async fn finish_actor(handle: haider_core::HarnessHandle, actor: JoinHandle<()>) {
     drop(handle);
-    timeout(Duration::from_secs(1), actor)
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, actor)
         .await
         .expect("actor stops after its handle is dropped")
         .expect("actor task succeeds");
@@ -75,9 +75,12 @@ async fn append_completion_is_held_until_commit_and_precedes_broadcast() {
         .await
         .expect("turn accepted");
 
-    timeout(Duration::from_secs(1), gated.append_committed.notified())
-        .await
-        .expect("first append commits and reaches the gate");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        gated.append_committed.notified(),
+    )
+    .await
+    .expect("first append commits and reaches the gate");
     assert!(
         timeout(Duration::from_millis(50), subscriber.recv())
             .await
@@ -91,7 +94,7 @@ async fn append_completion_is_held_until_commit_and_precedes_broadcast() {
     assert_eq!(first_durable.len(), 1);
 
     gated.release.notify_one();
-    let first_broadcast = timeout(Duration::from_secs(1), subscriber.recv())
+    let first_broadcast = timeout(haider_platform::TEST_WAIT_TIMEOUT, subscriber.recv())
         .await
         .expect("broadcast arrives after append is released")
         .expect("broadcast remains open");
@@ -102,7 +105,7 @@ async fn append_completion_is_held_until_commit_and_precedes_broadcast() {
 
     let mut received = vec![first_broadcast];
     loop {
-        let envelope = timeout(Duration::from_secs(1), subscriber.recv())
+        let envelope = timeout(haider_platform::TEST_WAIT_TIMEOUT, subscriber.recv())
             .await
             .expect("broadcast arrives")
             .expect("broadcast remains open");
@@ -125,7 +128,7 @@ async fn append_completion_is_held_until_commit_and_precedes_broadcast() {
         }
     }
 
-    let outcome = timeout(Duration::from_secs(1), turn.wait())
+    let outcome = timeout(haider_platform::TEST_WAIT_TIMEOUT, turn.wait())
         .await
         .expect("turn terminates")
         .expect("turn outcome");

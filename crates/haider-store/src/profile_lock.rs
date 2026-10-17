@@ -35,6 +35,7 @@ static NEXT_OWNER_STAGING: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct ProfileLock {
     file: File,
+    owner_pid: u32,
     owner_path: PathBuf,
     #[cfg(target_os = "macos")]
     lock_path: PathBuf,
@@ -42,6 +43,17 @@ pub(crate) struct ProfileLock {
 
 impl Drop for ProfileLock {
     fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl ProfileLock {
+    fn release(&mut self) {
+        // A forked copy closes its own descriptor without releasing or
+        // deleting the live parent's lock and diagnostics.
+        if std::process::id() != self.owner_pid {
+            return;
+        }
         // Remove the diagnostic while the singleton lock is still ours. That
         // ordering prevents a departing owner from deleting its successor's
         // freshly published token.
@@ -59,9 +71,7 @@ impl Drop for ProfileLock {
         #[cfg(not(target_os = "macos"))]
         let _ = haider_platform::unlock_file(&self.file);
     }
-}
 
-impl ProfileLock {
     /// Takes the exclusive profile lock, or fails with `StoreLocked` if
     /// another live process holds it.
     pub(crate) fn acquire(root: &Path) -> StoreResult<Self> {
@@ -153,6 +163,7 @@ impl ProfileLock {
 
         let lock = Self {
             file,
+            owner_pid: std::process::id(),
             owner_path: root.join("lock.owner"),
             #[cfg(target_os = "macos")]
             lock_path,

@@ -66,7 +66,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 
-const DEADLINE: Duration = Duration::from_secs(10);
+// This only caps a missing event; scheduler latency is not an acceptance bound.
+const DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
 fn envelope(
     session_id: &SessionId,
@@ -900,6 +901,26 @@ async fn sidecar_wait_requires_committed_coverage_before_returning() {
         settled,
         "an unchanged current file is a valid positive control"
     );
+}
+
+/// Warm the live writer with a complete seed projection, including coverage.
+/// An unchanged file can still precede queued work; final observations instead
+/// join the writer with `hub.shutdown()` before reading.
+async fn wait_for_sidecar(path: &std::path::Path, expected: &str) {
+    let mut observed = None;
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if let Ok(body) = std::fs::read_to_string(path) {
+            if body == expected {
+                return;
+            }
+            observed = Some(body);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "sidecar did not reach the seed projection: expected={expected:?}; observed={observed:?}"
+    )
 }
 
 async fn append_delta(
@@ -4317,13 +4338,66 @@ async fn list_uses_opaque_stable_order_cursor_and_read_does_not_subscribe() {
     store.close().await.expect("store closes");
 }
 
+async fn poison_unlisted_recency_metadata(
+    root: &tempfile::TempDir,
+    store: &SqliteStoreHandle,
+    session_count: usize,
+) -> (SessionId, String) {
+    // Selecting only recency keys does not warm any summary/observe fold.
+    let keys = store
+        .session_recency_page(None, session_count)
+        .await
+        .expect("fixture recency keys read");
+    assert_eq!(keys.len(), session_count);
+    let session_id = keys
+        .last()
+        .expect("unlisted last row")
+        .key
+        .session_id
+        .clone();
+    let connection = rusqlite::Connection::open(root.path().join("store.sqlite"))
+        .expect("fixture database opens");
+    let original = connection
+        .query_row(
+            "SELECT meta_json FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("fixture metadata reads");
+    connection
+        .execute(
+            "UPDATE sessions SET meta_json = '{' WHERE id = ?1",
+            [session_id.as_str()],
+        )
+        .expect("install unlisted metadata tripwire");
+    assert_eq!(
+        store
+            .session_metadata(&session_id)
+            .await
+            .expect_err("tripwire rejects a summary read")
+            .code,
+        ErrorCode::StoreCorrupt
+    );
+    (session_id, original)
+}
+
+fn restore_recency_metadata(root: &tempfile::TempDir, session_id: &SessionId, original: &str) {
+    rusqlite::Connection::open(root.path().join("store.sqlite"))
+        .expect("fixture database opens")
+        .execute(
+            "UPDATE sessions SET meta_json = ?1 WHERE id = ?2",
+            rusqlite::params![original, session_id.as_str()],
+        )
+        .expect("restore valid fixture metadata");
+}
+
 /// P0 session-loss regression: a cold 400-session profile is listed newest
 /// first on page one, independent of ids/titles, with durable metadata and
 /// lineage present. Exactly 40 rows are marked seen; the other 360 exercise
 /// the production `NULL seen_at_ms` shape.
 #[tokio::test]
 async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() {
-    let (_root, store, hub) = open_hub(None, 8).await;
+    let (root, store, hub) = open_hub(None, 8).await;
     let generation = store.worker_generation();
     let latest = SessionId::new("session-000");
     let child = SessionId::new("session-001");
@@ -4426,7 +4500,10 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
             ConnectionTransport::LocalSameUid,
         )
         .expect("connection");
-    let list_400_started = std::time::Instant::now();
+    // An unreadable last-row metadata record is a deterministic tripwire
+    // against materializing summaries outside the selected page. Restore it
+    // before deliberately paging through all 400 rows below.
+    let (unlisted_400, metadata_400) = poison_unlisted_recency_metadata(&root, &store, 400).await;
     connection
         .request(
             RequestId::new("recency-list-400"),
@@ -4449,11 +4526,12 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
     else {
         panic!("expected first recency page");
     };
-    let list_400_elapsed = list_400_started.elapsed();
     assert!(
-        list_400_elapsed < Duration::from_millis(500),
-        "full cold session.list at 400 sessions exceeded 500 ms: {list_400_elapsed:?}"
+        sessions
+            .iter()
+            .all(|summary| summary.session_id != unlisted_400)
     );
+    restore_recency_metadata(&root, &unlisted_400, &metadata_400);
     assert_eq!(sessions.len(), 100, "MAX_LIST_PAGE remains the page cap");
     assert!(
         cursor.starts_with("hr1."),
@@ -4561,7 +4639,8 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
     assert_eq!(all_ids.len(), 400, "all four pages have no skips");
 
     // Scale the same cold-list path without warming the new rows' observe
-    // folds. Fixture creation is intentionally outside the timed region.
+    // folds. The indexed query has a SQLite-instruction budget in the store
+    // suite; this RPC fixture pins page-bounded summary materialization.
     for index in 400..5_000_u16 {
         create_typed_session(
             &store,
@@ -4570,7 +4649,8 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
         )
         .await;
     }
-    let list_5000_started = std::time::Instant::now();
+    let (unlisted_5000, metadata_5000) =
+        poison_unlisted_recency_metadata(&root, &store, 5_000).await;
     connection
         .request(
             RequestId::new("recency-list-5000"),
@@ -4589,16 +4669,13 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
     else {
         panic!("expected 5,000-session recency page");
     };
-    let list_5000_elapsed = list_5000_started.elapsed();
     assert_eq!(sessions.len(), 100);
     assert!(
-        list_5000_elapsed < Duration::from_millis(500),
-        "full cold session.list at 5,000 sessions exceeded 500 ms: {list_5000_elapsed:?}"
+        sessions
+            .iter()
+            .all(|summary| summary.session_id != unlisted_5000)
     );
-    eprintln!(
-        "full cold session.list page: 400 sessions {list_400_elapsed:?}; \
-         5,000 sessions {list_5000_elapsed:?} (500ms budget each)"
-    );
+    restore_recency_metadata(&root, &unlisted_5000, &metadata_5000);
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
@@ -9834,10 +9911,8 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
     events[3].branch_id = Some(BranchId::new("branch-sidecar"));
 
     hub.append(&mut events).await.expect("pipe batch commits");
-    let head = events.last().expect("pipe batch has events").seq;
-    let bytes = sidecar_through(&sidecar_path(&root, &session_id), head)
-        .await
-        .into_bytes();
+    hub.shutdown().await.expect("hub joins sidecar writer");
+    let bytes = std::fs::read(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     assert_eq!(
         bytes,
         expected_sidecar(&session_id, 1, &events).into_bytes()
@@ -9846,7 +9921,8 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         String::from_utf8(bytes).expect("sidecar utf8"),
         stored_sidecar(&store, &session_id, 1).await
     );
-    let sidecar = sidecar_through(&sidecar_path(&root, &session_id), head).await;
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     let values: Vec<serde_json::Value> = sidecar
         .lines()
         .skip(1)
@@ -9878,7 +9954,6 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         .filter_map(haider_protocol::pipe::sidecar_row_line)
         .collect();
     assert_eq!(row_lines, expected_rows);
-    hub.shutdown().await.expect("hub stops");
 }
 
 /// MUTATION CHECK: read sealed reasoning from `payload.delta.text` or emit the
@@ -10059,7 +10134,11 @@ async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() 
         "before",
     )];
     hub.append(&mut seed).await.expect("seed commits");
-    let _ = sidecar_through(&sidecar_path(&root, &session_id), seed[0].seq).await;
+    wait_for_sidecar(
+        &sidecar_path(&root, &session_id),
+        &expected_sidecar(&session_id, 1, &seed),
+    )
+    .await;
 
     let mut tool_call = pipe_event(
         &session_id,
@@ -10370,7 +10449,6 @@ async fn native_pipe_truncates_a_torn_tail_before_resume() {
     // #6 (935): drain the writer task (shutdown) before reading the settled
     // sidecar — maintenance no longer completes on the publish path.
     hub.shutdown().await.expect("second hub stops");
-    hub.shutdown().await.expect("second hub stops");
     assert_eq!(
         std::fs::read_to_string(&path).expect("settled sidecar reads"),
         expected_sidecar_batches(&session_id, 1, &[&first, &second])
@@ -10419,9 +10497,13 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         .await
         .expect("offline delta commits");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
-    let head = append_delta(&hub, &session_id, generation, "resume-trigger").await;
+    append_delta(&hub, &session_id, generation, "resume-trigger").await;
+    hub.shutdown()
+        .await
+        .expect("second hub joins sidecar writer");
 
-    let sidecar = sidecar_through(&sidecar_path(&root, &session_id), head).await;
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     let rows: Vec<&str> = sidecar
         .lines()
         .filter(|line| line.contains("\"role\""))
@@ -10431,7 +10513,6 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         serde_json::from_str(sidecar.lines().last().expect("tail")).expect("tail JSON");
     assert_eq!(tail["coverage"], missed[0].seq + 1);
     assert_eq!(tail["generation"], 1);
-    hub.shutdown().await.expect("second hub stops");
 }
 
 #[tokio::test]
@@ -10456,12 +10537,11 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
         .expect("out-of-daemon commit");
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
-    let head = append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
-    assert_eq!(
-        sidecar_through(&sidecar_path(&root, &session_id), head).await,
-        stored_sidecar(&store, &session_id, 1).await
-    );
-    let sidecar = sidecar_through(&sidecar_path(&root, &session_id), head).await;
+    append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
+    hub.shutdown().await.expect("hub joins sidecar writer");
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
+    assert_eq!(sidecar, stored_sidecar(&store, &session_id, 1).await);
     let tail: serde_json::Value =
         serde_json::from_str(sidecar.lines().last().expect("coverage tail"))
             .expect("coverage tail JSON");

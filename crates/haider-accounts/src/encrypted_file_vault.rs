@@ -250,8 +250,8 @@ impl Vault for EncryptedFileVault {
             .map_err(io_error)?,
         );
         validate(&file, EntryKind::RefreshLock)?;
-        match haider_platform::try_lock_file_exclusive(&file) {
-            Ok(()) => Ok(Some(VaultRefreshLock::new(move || drop(file)))),
+        match VaultRefreshLock::from_file(file) {
+            Ok(lock) => Ok(Some(lock)),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(_)) => Err(corrupt()),
         }

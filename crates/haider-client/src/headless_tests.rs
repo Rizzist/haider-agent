@@ -370,7 +370,7 @@ async fn timed_out_owned_daemon_reap_terminates_and_reaps_the_process_group() {
     );
 
     let group = haider_platform::process_group(Some(pid)).expect("owned process group");
-    let proof_deadline = StdInstant::now() + Duration::from_secs(1);
+    let proof_deadline = StdInstant::now() + haider_platform::TEST_WAIT_TIMEOUT;
     loop {
         let alive = haider_platform::process_group_exists(group)
             .expect("probe force-terminated process group");

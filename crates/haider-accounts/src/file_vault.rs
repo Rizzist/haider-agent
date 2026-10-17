@@ -193,8 +193,8 @@ impl Vault for FileVault {
         let file = options
             .open(path)
             .map_err(|error| io_error("open vault refresh lock", &error))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(VaultRefreshLock::new(move || drop(file)))),
+        match VaultRefreshLock::from_file(file) {
+            Ok(lock) => Ok(Some(lock)),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => {
                 Err(io_error("acquire vault refresh lock", &error))

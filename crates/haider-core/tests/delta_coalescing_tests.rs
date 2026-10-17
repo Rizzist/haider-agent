@@ -175,9 +175,9 @@ async fn window_elapse_flushes_a_buffered_delta_without_a_semantic_boundary() {
 /// this pin. The journal-shape pins cannot catch that mutation — the
 /// buffer-entry deadline check flushes once a NEXT delta arrives — so this
 /// pin observes the timer's distinct job: publishing during provider
-/// silence, long before the next semantic boundary. The 500ms bound is 10x
-/// the 50ms window (gate-load doctrine: wall-clock pins need wide margins).
-#[tokio::test]
+/// silence, long before the next semantic boundary. Paused time keeps the
+/// 500ms observation and 700ms silence independent of runner scheduling.
+#[tokio::test(start_paused = true)]
 async fn timed_flush_publishes_the_delta_during_provider_silence() {
     let (handle, _store) = runtime_with_window(
         vec![

@@ -671,7 +671,7 @@ async fn native_close_joins_peer_socket_and_does_not_republish_until_reopened() 
         .await
         .expect("close");
     let mut byte = [0];
-    let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+    let read = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, stream.read(&mut byte))
         .await
         .expect("closed peer cannot retain a handshake reader");
     assert!(matches!(read, Ok(0)) || read.is_err());
@@ -1191,7 +1191,7 @@ async fn cancelled_direct_recovery_keeps_its_native_owner() {
     caller.abort();
     // The caller can be joined while admitted recovery remains at its probe.
     // This deadline is only a failing watchdog; the successful witness is join.
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(2), caller).await;
+    let joined = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, caller).await;
     let refused = if joined.is_ok() {
         Some(close(&hub, attachment.clone()).await)
     } else {

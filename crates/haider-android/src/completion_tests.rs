@@ -24,7 +24,7 @@ fn timeout_retains_owner_and_waiters_observe_actual_quiescent_outcome() {
     assert_eq!(receipt.wait_for(Duration::ZERO), None);
     stop.send(()).expect("release reader");
     assert_eq!(
-        receipt.wait_for(Duration::from_secs(2)),
+        receipt.wait_for(haider_platform::TEST_WAIT_TIMEOUT),
         Some(NativeStatus::ShutdownForced)
     );
     assert!(!live.load(Ordering::Acquire));
@@ -41,7 +41,7 @@ fn timeout_retains_owner_and_waiters_observe_actual_quiescent_outcome() {
 fn concurrent_waiters_share_the_same_failure_receipt() {
     let receipt = Arc::new(CompletionReceipt::default());
     let waiting = Arc::clone(&receipt);
-    let waiter = std::thread::spawn(move || waiting.wait_for(Duration::from_secs(2)));
+    let waiter = std::thread::spawn(move || waiting.wait_for(haider_platform::TEST_WAIT_TIMEOUT));
     receipt.finish(NativeStatus::StoreRecoveryFailed, |_| ());
     assert_eq!(
         waiter.join().expect("waiter"),
@@ -69,7 +69,7 @@ fn timeout_and_terminal_observation_publish_as_one_lifecycle_state() {
         });
     });
     began_publish
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .expect("owner publishing");
     let waiting = Arc::clone(&receipt);
     let (entering, entered_wait) = mpsc::channel();
@@ -78,7 +78,7 @@ fn timeout_and_terminal_observation_publish_as_one_lifecycle_state() {
         waiting.wait_for(Duration::ZERO)
     });
     entered_wait
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .expect("waiter entering");
     release.send(()).expect("finish publication");
     owner.join().expect("owner");

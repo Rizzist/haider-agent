@@ -34,9 +34,9 @@ pub fn profile_lock_held(store_dir: &std::path::Path) -> Result<bool, String> {
             ));
         }
     };
-    match haider_platform::try_lock_file_exclusive(&file) {
-        Ok(()) => {
-            haider_platform::unlock_file(&file).map_err(|error| {
+    match haider_platform::FileLock::try_exclusive(file) {
+        Ok(lock) => {
+            haider_platform::unlock_file(lock.file()).map_err(|error| {
                 format!(
                     "cannot release profile lock probe {}: {error}",
                     lock_path.display()
