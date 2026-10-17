@@ -755,6 +755,7 @@ impl TranscriptJoiner {
                         name,
                         args,
                         status,
+                        ..
                     },
                 ..
             }) => {
@@ -1813,6 +1814,7 @@ mod tests {
                     name: "fs_write".into(),
                     args: serde_json::json!({"path": "guarded"}),
                     status: ToolStatus::Rejected,
+                    activity: None,
                 },
             }),
         );
@@ -1851,6 +1853,7 @@ mod tests {
                     name: "shell".into(),
                     args: serde_json::json!({"cmd": "true"}),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
         );

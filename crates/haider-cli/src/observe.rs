@@ -1157,6 +1157,19 @@ pub(crate) fn fleet_candidates(
 }
 
 pub(crate) fn fleet_human_text(snapshot: &SessionFleetSnapshot) -> String {
+    fleet_human_text_with(
+        snapshot,
+        haider_client::fleet::activity_display_from_env(None),
+    )
+}
+
+/// Human fleet tree. 973-activity-icons: each live node's current ACTIVITY
+/// glyph sits between its state glyph and its name (emoji, `[text]` label
+/// under NO_COLOR/limited terminals, or nothing when disabled).
+pub(crate) fn fleet_human_text_with(
+    snapshot: &SessionFleetSnapshot,
+    display: haider_client::fleet::ActivityDisplay,
+) -> String {
     use haider_client::fleet;
     let mut text = fleet::header_line(&fleet::rollup(&snapshot.roots));
     text.push('\n');
@@ -1165,6 +1178,10 @@ pub(crate) fn fleet_human_text(snapshot: &SessionFleetSnapshot) -> String {
         text.push_str(&" │ ".repeat(row.rel_depth));
         text.push_str(fleet::state_glyph(row.node.state));
         text.push(' ');
+        if let Some(glyph) = fleet::activity_glyph(row.node, display) {
+            text.push_str(glyph);
+            text.push(' ');
+        }
         text.push_str(fleet::callsign(row.node));
         if let Some(marker) = fleet::child_marker(row.node) {
             text.push(' ');

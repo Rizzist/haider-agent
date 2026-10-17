@@ -1351,6 +1351,8 @@ pub(crate) struct SessionFolder {
     provider_operation_runs: HashSet<String>,
     root_run_seen: bool,
     primary_agent: Option<AgentId>,
+    /// 973-activity-icons: per-agent typed activity, keyed like `timings`.
+    activity: HashMap<String, haider_protocol::activity::ActivityTracker>,
 }
 
 impl SessionFolder {
@@ -1365,6 +1367,7 @@ impl SessionFolder {
             provider_operation_runs: HashSet::new(),
             root_run_seen: false,
             primary_agent: None,
+            activity: HashMap::new(),
         }
     }
 
@@ -1525,6 +1528,15 @@ impl SessionFolder {
             .stats
             .last_committed_at_ms
             .max(envelope.committed_at_ms);
+        if matches!(
+            envelope.payload.get("type").and_then(|kind| kind.as_str()),
+            Some("item" | "run_state" | "effect" | "checkpoint_recorded")
+        ) {
+            self.activity
+                .entry(envelope_agent.clone())
+                .or_default()
+                .observe_raw(envelope);
+        }
         let Some(kind) = envelope.payload.get("type").and_then(|kind| kind.as_str()) else {
             return;
         };
@@ -1892,6 +1904,11 @@ impl SessionFolder {
                 .try_into()
                 .unwrap_or(u64::MAX),
             usage,
+            activity: self
+                .activity
+                .get(agent_key)
+                .filter(|tracker| !tracker.is_empty())
+                .map(haider_protocol::activity::ActivityTracker::state),
         })
     }
 

@@ -111,6 +111,7 @@ impl DuplexClient {
             client_instance_id: "duplex-cancellation-client".into(),
             client_kind: ClientKind::Headless,
             capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+            features_requested: Default::default(),
             max_receive_frame: u32::try_from(FRAME_LIMIT).expect("frame limit fits"),
             encodings: Vec::new(),
         }))

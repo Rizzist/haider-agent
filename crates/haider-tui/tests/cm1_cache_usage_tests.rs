@@ -97,6 +97,7 @@ fn footer_model(reread_basis_points: Option<u32>) -> AppModel {
         started_at_ms: 0,
         terminal_at_ms: None,
         live: true,
+        activity: None,
         tool_attempts: 0,
         usage: Some(AgentUsageMetrics {
             cache_hit_basis_points: Some(6_370),

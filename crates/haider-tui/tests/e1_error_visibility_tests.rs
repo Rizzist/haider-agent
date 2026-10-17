@@ -22,6 +22,7 @@ fn apply_tool(
         name: name.into(),
         args: serde_json::json!({}),
         status: ToolStatus::InProgress,
+        activity: None,
     };
     projection.apply(&EventPayload::Item(ItemEvent::Started {
         item_id: item_id.clone(),
@@ -51,6 +52,7 @@ fn apply_tool(
             name: name.into(),
             args: serde_json::json!({}),
             status: status.item_status(),
+            activity: None,
         },
     }));
 }

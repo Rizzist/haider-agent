@@ -167,3 +167,56 @@ pub fn truncation_footer(snapshot: &SessionFleetSnapshot) -> Option<String> {
         )
     })
 }
+
+// ------------------------------------------------------------ activity ----
+
+pub use haider_protocol::activity::{ActivityDisplay, ActivityKind};
+
+/// Environment override for every client surface: `emoji`, `text` or `off`
+/// (973-activity-icons). Wins over the TUI's persisted setting.
+pub const ACTIVITY_ICONS_ENV: &str = "HAIDER_ACTIVITY_ICONS";
+
+/// Resolve the activity display mode for this process from
+/// [`ACTIVITY_ICONS_ENV`], an optional persisted setting, `NO_COLOR` and
+/// `TERM` (see [`ActivityDisplay::resolve`]).
+#[must_use]
+pub fn activity_display_from_env(setting: Option<ActivityDisplay>) -> ActivityDisplay {
+    let override_value = std::env::var(ACTIVITY_ICONS_ENV).ok();
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let term = std::env::var("TERM").ok();
+    ActivityDisplay::resolve(
+        override_value.as_deref(),
+        setting,
+        no_color,
+        term.as_deref(),
+    )
+}
+
+/// The node's CURRENT activity glyph under `display`, if any. Terminal
+/// nodes never wear one, whatever an older daemon sent.
+#[must_use]
+pub fn activity_glyph(node: &FleetNodeWire, display: ActivityDisplay) -> Option<&'static str> {
+    if matches!(
+        node.state,
+        FleetAgentStateWire::Done | FleetAgentStateWire::Failed | FleetAgentStateWire::Cancelled
+    ) {
+        return None;
+    }
+    node.activity.and_then(|kind| display.glyph(kind))
+}
+
+/// The detail view's history line: every activity used so far, highest
+/// priority first, each as `glyph description` (or the text label alone in
+/// text mode). `None` when nothing was used or display is off.
+#[must_use]
+pub fn activities_summary(kinds: &[ActivityKind], display: ActivityDisplay) -> Option<String> {
+    let parts: Vec<String> = kinds
+        .iter()
+        .filter_map(|kind| {
+            display
+                .glyph(*kind)
+                .map(|glyph| format!("{glyph} {}", kind.description()))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}

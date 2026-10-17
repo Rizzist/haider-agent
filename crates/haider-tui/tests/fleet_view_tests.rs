@@ -124,6 +124,7 @@ fn metrics(agent: &str, usage: Option<AgentUsageMetrics>) -> AgentMetricsSnapsho
         started_at_ms: SPAWN_MS,
         terminal_at_ms: Some(SPAWN_MS + 42_000),
         live: false,
+        activity: None,
         tool_attempts: 3,
         usage,
     }
@@ -149,6 +150,8 @@ fn node(
         parent_agent_id: None,
         state,
         metrics: Some(metrics(agent, Some(oauth_usage(420_000)))),
+        activity: None,
+        activities: Vec::new(),
         folded_children: 0,
         children,
     }

@@ -71,6 +71,8 @@ mod binary_upload;
 mod cache_policy;
 #[cfg(test)]
 mod cache_policy_tests;
+#[cfg(all(test, unix))]
+mod checkpoint_test_support;
 mod completion;
 mod config;
 mod connection;

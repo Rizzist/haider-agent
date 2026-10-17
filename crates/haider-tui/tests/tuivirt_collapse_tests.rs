@@ -45,6 +45,7 @@ fn tool_completed(id: &str, name: &str, args: serde_json::Value) -> EventPayload
             name: name.to_owned(),
             args,
             status: ToolStatus::Completed,
+            activity: None,
         },
     })
 }
@@ -57,6 +58,7 @@ fn tool_started(id: &str, name: &str, args: serde_json::Value) -> EventPayload {
             name: name.to_owned(),
             args,
             status: ToolStatus::InProgress,
+            activity: None,
         },
     })
 }

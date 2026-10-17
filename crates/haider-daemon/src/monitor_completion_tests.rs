@@ -52,6 +52,7 @@ async fn action_result(world: &MonitorWorld, name: &str) -> EventId {
         name: name.into(),
         args: json!({}),
         status: ToolStatus::InProgress,
+        activity: None,
     };
     let result = tool_result(
         json!({"reconciled":true}),
@@ -74,6 +75,7 @@ async fn action_result(world: &MonitorWorld, name: &str) -> EventId {
                 name: name.into(),
                 args: json!({}),
                 status: ToolStatus::Completed,
+                activity: None,
             },
         }),
     ];

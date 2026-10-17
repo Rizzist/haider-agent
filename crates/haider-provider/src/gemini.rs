@@ -2501,6 +2501,7 @@ impl GeminiDecoder {
                         call_id: call_id.clone(),
                         name: "web_search".into(),
                         args: serde_json::json!({"query": query}),
+                        activity: Some(haider_protocol::activity::ActivityKind::Web),
                     });
                     events.push(StreamEvent::ServerToolResult {
                         call_id,

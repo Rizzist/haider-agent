@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{AgentId, BranchId, NodeId};
+use haider_protocol::ids::{BranchId, NodeId};
 
 use crate::app::ChipModel;
 use crate::projection::SessionProjection;
@@ -450,18 +450,15 @@ pub const fn is_aggregate(payload: &EventPayload) -> bool {
 /// background and parked paths can never diverge. Session-wide bookkeeping
 /// (turn flags, screen flips) is the caller's: a parked view owns only its
 /// own surfaces.
-pub fn absorb_into_view(
-    view: &mut BranchSurfaces,
-    payload: &EventPayload,
-    agent: Option<&AgentId>,
-    at_ms: u64,
-) {
+pub fn absorb_into_view(view: &mut BranchSurfaces, payload: &EventPayload, envelope: &RawEnvelope) {
+    let agent = envelope.agent_id.as_ref();
+    let at_ms = envelope.committed_at_ms;
     use crate::session::Destination;
     match crate::session::classify(&mut view.projection, &view.chips, payload, agent) {
         Destination::Agent => crate::session::apply_agent_payload(&mut view.chips, payload, at_ms),
         Destination::Chip(target) => {
             if let Some(chip) = crate::app::find_chip_mut(&mut view.chips, &target) {
-                crate::session::chip_apply(chip, payload, at_ms);
+                crate::session::chip_apply(chip, payload, envelope);
             }
         }
         Destination::Session => {

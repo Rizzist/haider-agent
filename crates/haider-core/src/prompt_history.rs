@@ -4855,6 +4855,7 @@ fn render_journal_with_facts(
                         | haider_protocol::item::ToolStatus::Conflict
                         | haider_protocol::item::ToolStatus::Failed
                         | haider_protocol::item::ToolStatus::Unknown,
+                    ..
                 } => {
                     // A malformed call retains its raw bytes in the journal,
                     // but providers require tool-call arguments to be objects.

@@ -164,6 +164,7 @@ fn the_phase_clock_is_armed_iff_an_animated_state_exists() {
                 name: "fs_read".to_owned(),
                 args: serde_json::json!({}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         },
     ))));
@@ -176,6 +177,7 @@ fn the_phase_clock_is_armed_iff_an_animated_state_exists() {
                 name: "fs_read".to_owned(),
                 args: serde_json::json!({}),
                 status: ToolStatus::Completed,
+                activity: None,
             },
         },
     ))));

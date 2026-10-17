@@ -3112,6 +3112,7 @@ fn catalog_order_older_unowned_reply_cannot_remove_current_owner() {
             revision: 3,
         },
     );
+    catalog_order_render(&model);
     assert!(
         model.display_identity().model_short.is_empty(),
         "account B's fetched choice must retire under C even after an older ownerless reply"

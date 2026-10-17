@@ -539,6 +539,8 @@ fn denied_effect_error(
                 EffectClass::ProcessExec => "process_exec",
                 EffectClass::RemoteExecution => "ssh_shell",
                 EffectClass::Network { .. } => "network",
+                EffectClass::ProviderTransport => "provider_transport",
+                EffectClass::CheckpointRestore => "checkpoint_restore",
                 EffectClass::GitOp => "git",
                 EffectClass::AgentSpawn => "spawn_subagent",
                 EffectClass::CredentialAccess => "credentials",

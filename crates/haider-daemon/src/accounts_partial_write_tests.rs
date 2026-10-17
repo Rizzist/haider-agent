@@ -126,6 +126,11 @@ async fn source_case(kind: CredentialSourceKind, entry: &str, same_account: bool
             .any(|p| p.models.contains(&"a-private-only".into()))
     );
     let store = open_store(dir.path()).await;
+    if entry == "publication" {
+        let database =
+            rusqlite::Connection::open(dir.path().join("store.sqlite")).expect("fixture database");
+        database.execute_batch("CREATE TRIGGER partial_revision_failure BEFORE UPDATE OF management_revision ON profile_meta BEGIN SELECT RAISE(ABORT, 'synthetic publication failure'); END;").expect("publication obstacle");
+    }
     let mut actor = source_actor(
         store.clone(),
         accounts,
@@ -154,7 +159,7 @@ async fn source_case(kind: CredentialSourceKind, entry: &str, same_account: bool
         sink,
     };
     let command = match entry {
-        "scan" | "gone" => AccountCommand::SourceScan { completed: route },
+        "scan" | "gone" | "publication" => AccountCommand::SourceScan { completed: route },
         "add" => AccountCommand::SourceAdd(Box::new(SourceAddJob {
             kind: kind.as_str().into(),
             root: root.display().to_string(),
@@ -247,6 +252,12 @@ async fn source_case(kind: CredentialSourceKind, entry: &str, same_account: bool
         "the descriptor commit precedes the source metadata error"
     );
     let view = management.read().expect("coherent management snapshot");
+    if entry == "publication" {
+        assert_eq!(
+            view.revision, 0,
+            "the injected publication write must fail while the retired inventory is still published"
+        );
+    }
     let current = view
         .providers
         .iter()
@@ -644,4 +655,9 @@ async fn partial_write_earlier_source_commit_survives_later_source_error() {
         retired,
         "an error from a later source cannot retain an earlier source's retired catalog"
     );
+}
+
+#[tokio::test]
+async fn partial_write_source_publication_error_keeps_admission_coherent() {
+    source_case(CredentialSourceKind::CodexHome, "publication", false).await;
 }

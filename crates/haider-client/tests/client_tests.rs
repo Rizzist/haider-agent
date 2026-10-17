@@ -109,9 +109,14 @@ where
             tokio::spawn(async move {
                 let mut decoder = uds_codec::Decoder::new(LIMIT);
                 let frames = read_frames(&mut stream, &mut decoder).await;
+                let Some(WireFrame::Hello(hello)) = frames.first() else {
+                    panic!("fake daemon expected Hello first");
+                };
                 assert!(
-                    matches!(frames.first(), Some(WireFrame::Hello(_))),
-                    "fake daemon expected Hello first"
+                    hello
+                        .features_requested
+                        .contains(haider_rpc::FEATURE_SESSION_ACTIVITY_V1),
+                    "the real client must opt into typed session activity on every connection"
                 );
                 match reply {
                     HelloReply::Welcome(welcome) => {

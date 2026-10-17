@@ -41,6 +41,7 @@ async fn usage_report_is_advertised_and_answers_typed_over_uds() {
                 client_instance_id: "client".into(),
                 client_kind: ClientKind::Headless,
                 capabilities_requested: CapabilitySet::from([Capability::View]),
+                features_requested: Default::default(),
                 max_receive_frame: u32::try_from(config.frame_limit).expect("frame limit"),
                 encodings: Vec::new(),
             }),

@@ -64,6 +64,7 @@ fn computer_control_raises_the_sacred_banner_and_screenshot_does_not() {
                 name: "computer".into(),
                 args: serde_json::json!({"action": "left_click", "x": 840, "y": 220}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     let (rows, _) = draw(&model, 118, 40);
@@ -88,6 +89,7 @@ fn computer_control_raises_the_sacred_banner_and_screenshot_does_not() {
                 name: "computer".into(),
                 args: serde_json::json!({"action": "screenshot"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     let (rows, _) = draw(&obs, 118, 40);
@@ -129,6 +131,7 @@ fn computer_use_presence_chip_is_session_scoped_in_the_header() {
                 name: "computer".into(),
                 args: serde_json::json!({"action": "screenshot"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     model
@@ -140,6 +143,7 @@ fn computer_use_presence_chip_is_session_scoped_in_the_header() {
                 name: "computer".into(),
                 args: serde_json::json!({"action": "screenshot"}),
                 status: ToolStatus::Completed,
+                activity: None,
             },
         }));
     let (rows, _) = draw(&model, 118, 40);
@@ -179,6 +183,7 @@ fn computer_use_presence_chip_is_session_scoped_in_the_header() {
                 name: "mobile".into(),
                 args: serde_json::json!({"action": "sms_read"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     assert_eq!(
@@ -195,6 +200,7 @@ fn computer_use_presence_chip_is_session_scoped_in_the_header() {
                 name: "mobile".into(),
                 args: serde_json::json!({"action": "tap", "x": 1, "y": 2}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     assert_eq!(
@@ -221,6 +227,7 @@ fn a_process_tool_calls_retained_output_tail_is_rendered() {
                 name: "process_exec".into(),
                 args: serde_json::json!({"command": "cargo test"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     let chunk = base64::Engine::encode(
@@ -245,6 +252,7 @@ fn a_process_tool_calls_retained_output_tail_is_rendered() {
                 name: "process_exec".into(),
                 args: serde_json::json!({"command": "cargo test"}),
                 status: ToolStatus::Completed,
+                activity: None,
             },
         }));
     let (rows, _) = draw(&model, 118, 40);

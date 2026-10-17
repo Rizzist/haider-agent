@@ -758,6 +758,7 @@ async fn capped_actor_recovery_uses_original_durable_tree_receipt_and_prior_tool
                         name,
                         args,
                         status: ToolStatus::Completed,
+                        ..
                     },
                 ..
             }) if call_id == "budget-tool-0" => Some((call_id, name, args)),
