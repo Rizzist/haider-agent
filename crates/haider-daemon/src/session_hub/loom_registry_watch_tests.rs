@@ -13,7 +13,7 @@ impl FrameSink for RegistryFrames {
 }
 
 async fn wait_for_seal(sink: &RegistryFrames, cursor: u64) {
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if sink.0.lock().expect("registry frames").iter().any(
                 |frame| matches!(frame, WireFrame::LoomRegistryCaughtUp { high_water_cursor, .. } if *high_water_cursor == cursor),

@@ -583,7 +583,7 @@ impl From<ToolError> for InstallStateError {
 }
 
 struct LockedCurrent {
-    _file: fs::File,
+    _file: haider_platform::FileLock,
     bytes: Vec<u8>,
 }
 
@@ -601,7 +601,7 @@ fn locked_current(path: &Path) -> ToolResult<Option<LockedCurrent>> {
             message: "checkpoint restore target is not a regular file".into(),
         });
     }
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .open(path)
         .map_err(|error| {
@@ -614,16 +614,17 @@ fn locked_current(path: &Path) -> ToolResult<Option<LockedCurrent>> {
                 ToolError::io("open checkpoint freshness", path, error)
             }
         })?;
-    haider_platform::lock_file_exclusive(&file)
+    let lock = haider_platform::FileLock::exclusive(file)
         .map_err(|error| ToolError::io("lock checkpoint freshness", path, error))?;
-    require_locked_path_identity(path, &file)?;
+    let mut file = lock.file();
+    require_locked_path_identity(path, file)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| ToolError::io("seek checkpoint freshness", path, error))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|error| ToolError::io("read checkpoint freshness", path, error))?;
-    require_locked_path_identity(path, &file)?;
-    Ok(Some(LockedCurrent { _file: file, bytes }))
+    require_locked_path_identity(path, file)?;
+    Ok(Some(LockedCurrent { _file: lock, bytes }))
 }
 
 #[cfg(unix)]

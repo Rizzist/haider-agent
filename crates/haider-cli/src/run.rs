@@ -1917,13 +1917,14 @@ struct AcceptedAnnouncement<'a> {
 }
 
 fn adapt_events(output: RunOutput, events: mpsc::Receiver<HeadlessEvent>) -> io::Result<()> {
-    let stdout = io::stdout();
-    let stderr = io::stderr();
+    // Lock only for each write/flush. Holding either global stream lock while
+    // waiting for events can block the producer's startup/error diagnostics
+    // before it can send Accepted (including session submit and resume).
     adapt_events_to(
         output,
         events,
-        io::BufWriter::new(stdout.lock()),
-        stderr.lock(),
+        io::BufWriter::new(io::stdout()),
+        io::stderr(),
     )
 }
 
@@ -2495,6 +2496,50 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The initial event proves the adapter has constructed its writers and
+    /// entered receive. A producer must then be able to write diagnostics
+    /// before sending another event. Dropping the sender unwinds even the
+    /// old lock cycle, so this regression fails under a bounded watchdog.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn waiting_event_adapter_does_not_lock_producer_diagnostics() {
+        for output in [RunOutput::Json, RunOutput::Jsonl, RunOutput::Print] {
+            let (sender, receiver) = mpsc::channel(1);
+            sender
+                .try_send(HeadlessEvent::Accepted {
+                    session_id: haider_protocol::ids::SessionId::new("stream-lock-probe"),
+                    head_seq: 1,
+                })
+                .expect("queue initial event");
+            let adapter = std::thread::spawn(move || adapt_events(output, receiver));
+            let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+            while sender.capacity() == 0 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let received = sender.capacity() == 1;
+            let (done, completion) = std::sync::mpsc::channel();
+            let producer = std::thread::spawn(move || {
+                // Write directly: libtest's thread-local print capture would
+                // bypass the global stream locks this test needs to exercise.
+                let result = io::stdout()
+                    .write_all(b"producer stdout diagnostic\n")
+                    .and_then(|()| io::stderr().write_all(b"producer stderr diagnostic\n"));
+                done.send(result).expect("report diagnostic completion");
+            });
+            let diagnostic = completion.recv_timeout(haider_platform::TEST_WAIT_TIMEOUT);
+            drop(sender);
+            adapter
+                .join()
+                .expect("adapter thread")
+                .expect("adapt events");
+            producer.join().expect("diagnostic thread");
+            assert!(received, "adapter never received its initial event");
+            diagnostic
+                .expect("waiting adapter blocked producer diagnostics")
+                .expect("write producer diagnostics");
+        }
+    }
 
     #[test]
     fn print_error_identity_includes_http_status() {

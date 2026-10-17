@@ -27,6 +27,63 @@ fn request() -> TurnRequest {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn stream_barrier_preserves_prior_events_and_waits_for_release() {
+    let (provider, barrier) = FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "before".into(),
+        },
+        FakeStep::EmitText {
+            text: "after".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ])
+    .with_stream_barrier(1, 1);
+    let mut stream = provider.stream_turn(request()).await.expect("stream");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.wait_for_requests(1),
+    )
+    .await
+    .expect("request readiness");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        barrier.wait_until_entered(),
+    )
+    .await
+    .expect("barrier readiness");
+    assert_eq!(
+        stream
+            .recv()
+            .await
+            .expect("prior event")
+            .expect("valid event"),
+        StreamEvent::TextDelta {
+            text: "before".into()
+        }
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.recv())
+            .await
+            .is_err(),
+        "no stream event may cross a retained barrier"
+    );
+    barrier.release();
+    assert_eq!(
+        stream
+            .recv()
+            .await
+            .expect("released event")
+            .expect("valid event"),
+        StreamEvent::TextDelta {
+            text: "after".into()
+        }
+    );
+    assert_eq!(provider.requests(), vec![request()]);
+}
+
 #[tokio::test]
 async fn json_fixture_drives_events_and_records_request() {
     let script = r#"[
@@ -227,7 +284,7 @@ async fn dropping_an_owned_stream_aborts_its_producer() {
     started_rx.await.expect("producer starts");
     drop(stream);
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, dropped_rx)
         .await
         .expect("producer is aborted")
         .expect("drop signal is delivered");

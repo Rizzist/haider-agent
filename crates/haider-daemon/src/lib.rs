@@ -143,6 +143,8 @@ mod subagent_core_tests;
 mod tasks;
 #[cfg(all(test, unix))]
 mod tasks_runtime_tests;
+#[cfg(test)]
+mod test_clock;
 mod turn_recovery;
 mod typed_agent_executor;
 mod typed_agent_installer;

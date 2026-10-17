@@ -29,6 +29,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,7 +40,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
 const STDERR_TAIL_LINES: usize = 80;
 const STDERR_LINE_BYTES: usize = 4096;
-const STDERR_FINISH_GRACE: Duration = Duration::from_secs(1);
+const STDERR_FINISH_GRACE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
 fn fixture_target() -> &'static str {
     cli_main::update::discovery::compiled_target().unwrap_or("aarch64-apple-darwin")
@@ -448,6 +449,8 @@ struct CapturedDaemon {
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_completion: Option<mpsc::Receiver<()>>,
     stderr_reader_note: Option<&'static str>,
+    stderr_cancel: Arc<AtomicBool>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CapturedDaemon {
@@ -468,23 +471,23 @@ impl CapturedDaemon {
         let reader_tail = Arc::clone(&stderr_tail);
         let reader_log_path = log_path.clone();
         let (completion_sender, stderr_completion) = mpsc::sync_channel(1);
+        let stderr_cancel = Arc::new(AtomicBool::new(false));
+        let reader_cancel = Arc::clone(&stderr_cancel);
         let stderr_reader = std::thread::Builder::new()
             .name("haiderd-stderr-capture".into())
             .spawn(move || {
-                capture_stderr(stderr, &reader_log_path, &reader_tail);
+                capture_stderr(stderr, &reader_log_path, &reader_tail, &reader_cancel);
                 let _ = completion_sender.send(());
             })
             .expect("spawn installed daemon stderr reader");
-        // Completion is observed through the bounded channel below. Detaching
-        // the handle keeps a descendant that inherited fd 2 from defeating the
-        // test's deadline by holding this reader open forever.
-        drop(stderr_reader);
         Self {
             child,
             log_path,
             stderr_tail,
             stderr_completion: Some(stderr_completion),
             stderr_reader_note: None,
+            stderr_cancel,
+            stderr_reader: Some(stderr_reader),
         }
     }
 
@@ -505,6 +508,11 @@ impl CapturedDaemon {
                 Some("<stderr reader stopped before reporting completion>")
             }
         };
+        // An inherited writer cannot retain this reader after the watchdog.
+        self.stderr_cancel.store(true, Ordering::Release);
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.join().expect("join owned stderr capture");
+        }
     }
 
     fn evidence(&self) -> String {
@@ -512,12 +520,35 @@ impl CapturedDaemon {
     }
 }
 
-fn capture_stderr(mut stderr: ChildStderr, log_path: &Path, tail: &Mutex<VecDeque<String>>) {
+impl Drop for CapturedDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.stderr_cancel.store(true, Ordering::Release);
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn capture_stderr(
+    mut stderr: ChildStderr,
+    log_path: &Path,
+    tail: &Mutex<VecDeque<String>>,
+    cancel: &AtomicBool,
+) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let flags = rustix::fs::fcntl_getfl(&stderr).expect("stderr reader flags");
+    rustix::fs::fcntl_setfl(&stderr, flags | rustix::fs::OFlags::NONBLOCK)
+        .expect("nonblocking stderr reader");
     let mut log = OpenOptions::new().append(true).open(log_path).ok();
     let mut buffer = [0_u8; 8192];
     let mut line = Vec::new();
     let mut line_truncated = false;
     loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
         match stderr.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
@@ -536,6 +567,15 @@ fn capture_stderr(mut stderr: ChildStderr, log_path: &Path, tail: &Mutex<VecDequ
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut descriptors = [PollFd::new(&stderr, PollFlags::IN)];
+                let wait =
+                    Timespec::try_from(Duration::from_millis(25)).expect("stderr poll bound");
+                match poll(&mut descriptors, Some(&wait)) {
+                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                    Err(_) => break,
+                }
+            }
             Err(_) => break,
         }
     }
@@ -545,6 +585,47 @@ fn capture_stderr(mut stderr: ChildStderr, log_path: &Path, tail: &Mutex<VecDequ
     if let Some(log) = log.as_mut() {
         let _ = log.flush();
     }
+}
+
+#[test]
+fn stderr_capture_cancellation_closes_the_reader_while_the_writer_is_alive() {
+    use std::os::fd::AsRawFd as _;
+    let directory = tempfile::tempdir().expect("capture fixture");
+    let mut child = Command::new("sh")
+        .args(["-c", "exec sleep 60"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("retained stderr writer");
+    let pipe = child.stderr.take().expect("stderr reader");
+    let fd_path = format!("/dev/fd/{}", pipe.as_raw_fd());
+    let identity = fs::metadata(&fd_path).expect("reader identity");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (completed, completion) = mpsc::channel();
+    let log_path = directory.path().join("capture.log");
+    fs::write(&log_path, b"").expect("log fixture");
+    let worker = std::thread::spawn(move || {
+        capture_stderr(
+            pipe,
+            &log_path,
+            &Mutex::new(VecDeque::new()),
+            &worker_cancel,
+        );
+        completed.send(()).expect("capture completion");
+    });
+    cancel.store(true, Ordering::Release);
+    let ended = completion.recv_timeout(haider_platform::TEST_WAIT_TIMEOUT);
+    let writer_alive = child.try_wait().expect("writer status").is_none();
+    let closed = fs::metadata(&fd_path).map_or(true, |current| {
+        (current.dev(), current.ino()) != (identity.dev(), identity.ino())
+    });
+    // Cleanup our pinned child before asserting, even for the no-cancel mutant.
+    let _ = child.kill();
+    let _ = child.wait();
+    worker.join().expect("capture worker joins");
+    ended.expect("reader observes cancellation independently of writer exit");
+    assert!(writer_alive);
+    assert!(closed, "reader must close while its writer is still alive");
 }
 
 fn retain_stderr_line(tail: &Mutex<VecDeque<String>>, line: &mut Vec<u8>, line_truncated: bool) {
