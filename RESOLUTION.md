@@ -6,6 +6,8 @@ Merged `origin/wave-973` at `a8b218079422dd0a70c6997a56fc6a4f5d4b051f` into the 
 
 The shared helper's explicit fake-model session also initializes `model_catalog_key: None`, matching the lane's session-creation contract and preserving its configured-model control.
 
+The imported activity-settings retry test used the former `(provider, model)` settings API. It now uses `LastModelPick` and retains all theme, notification, verbosity, dirty-intent and retry assertions. The same test checks legacy, configured and fetched saved picks, including their owner metadata, so an unrelated activity-setting write cannot discard saved model settings.
+
 `test-baseline.txt` was derived from the merged source and the new regression tests using `cargo run --locked --offline -p xtask -- test-count --update`. The resulting count is **6,774**. Neither parent's number was chosen. The round 16 `integrated-baseline-update.log` records the actual command and exit 0.
 
 The imported Android application changes are part of the wave. The model list repair adds no Android application UI change. Its standalone Rust feature, the shared fixture, and the full workspace gates are checked on the merged candidate.

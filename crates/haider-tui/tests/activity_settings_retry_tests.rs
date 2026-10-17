@@ -3,7 +3,7 @@
 use haider_protocol::activity::ActivityDisplay as D;
 use haider_tui::app::AppModel;
 use haider_tui::runtime::sync_activity_icons_persistence;
-use haider_tui::settings::SettingsStore;
+use haider_tui::settings::{LastModelPick, SettingsStore};
 use haider_tui::theme::{ThemeChoice, ThemeKey};
 
 #[test]
@@ -64,33 +64,42 @@ fn failed_rename_write_and_parent_creation_are_visible_and_literal_retry_succeed
 
 #[test]
 fn direct_store_retry_keeps_dirty_intent_and_other_settings() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("settings.json");
-    let theme = ThemeChoice::Fixed(ThemeKey::Dark);
-    let mut store = SettingsStore::at(path.clone());
-    store.set_notifications(false);
-    store.set_last_model(Some(("fake".into(), "fixture".into())));
-    store.set_verbosity(haider_tui::toolfold::Verbosity::Verbose);
-    std::fs::create_dir(&path).unwrap();
-    assert!(!store.save_activity_icons_if_changed(theme, D::Text));
-    assert!(store.activity_icons_dirty());
-    std::fs::remove_dir(&path).unwrap();
-    assert!(store.save_activity_icons_if_changed(theme, D::Text));
-    assert!(!store.activity_icons_dirty());
-    assert!(store.save_activity_icons_if_changed(theme, D::Off));
-    assert!(store.save_activity_icons_if_changed(theme, D::Text));
-    let reread = SettingsStore::at(path);
-    assert_eq!(reread.load(), Some(theme));
-    assert!(!reread.load_notifications());
-    assert_eq!(
-        reread.load_verbosity(),
-        haider_tui::toolfold::Verbosity::Verbose
-    );
-    assert_eq!(reread.load_activity_icons(), Some(D::Text));
-    assert_eq!(
-        reread.load_last_model(),
-        Some(("fake".into(), "fixture".into()))
-    );
+    for (catalog_key, scope_known) in [
+        (None, false),
+        (None, true),
+        (Some("synthetic-provider-scope"), true),
+    ] {
+        let pick = LastModelPick {
+            provider: "fake".into(),
+            model: "fixture".into(),
+            catalog_key: catalog_key.map(str::to_owned),
+            scope_known,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let theme = ThemeChoice::Fixed(ThemeKey::Dark);
+        let mut store = SettingsStore::at(path.clone());
+        store.set_notifications(false);
+        store.set_last_model(Some(pick.clone()));
+        store.set_verbosity(haider_tui::toolfold::Verbosity::Verbose);
+        std::fs::create_dir(&path).unwrap();
+        assert!(!store.save_activity_icons_if_changed(theme, D::Text));
+        assert!(store.activity_icons_dirty());
+        std::fs::remove_dir(&path).unwrap();
+        assert!(store.save_activity_icons_if_changed(theme, D::Text));
+        assert!(!store.activity_icons_dirty());
+        assert!(store.save_activity_icons_if_changed(theme, D::Off));
+        assert!(store.save_activity_icons_if_changed(theme, D::Text));
+        let reread = SettingsStore::at(path);
+        assert_eq!(reread.load(), Some(theme));
+        assert!(!reread.load_notifications());
+        assert_eq!(
+            reread.load_verbosity(),
+            haider_tui::toolfold::Verbosity::Verbose
+        );
+        assert_eq!(reread.load_activity_icons(), Some(D::Text));
+        assert_eq!(reread.load_last_model(), Some(pick));
+    }
 }
 
 #[test]
