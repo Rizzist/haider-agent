@@ -1215,6 +1215,7 @@ fn hosted_web_search_call_captures_verbatim_and_citations_surface_as_sources() {
                 call_id: "ws_abc123".into(),
                 name: "web_search".into(),
                 args: serde_json::json!({"type": "search", "query": "rust sse decoding"}),
+                activity: Some(haider_protocol::activity::ActivityKind::Web),
             }),
             Ok(StreamEvent::ServerToolResult {
                 call_id: "ws_abc123".into(),

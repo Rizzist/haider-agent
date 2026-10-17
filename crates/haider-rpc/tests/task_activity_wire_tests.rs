@@ -67,6 +67,7 @@ fn activity_commands_are_unique_client_views_with_typed_argument_hints() {
     let specs = [
         ("collapse", "[all|expand|next|prev]", true),
         ("verbosity", "[quiet|default|verbose]", false),
+        ("icons", "[emoji|text|off]", false),
         ("tasks", "", true),
     ];
     for (name, hint, session_only) in specs {

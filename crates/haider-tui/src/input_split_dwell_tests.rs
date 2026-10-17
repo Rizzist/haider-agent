@@ -259,7 +259,11 @@ fn committing_keys_share_card_dwell_navigation_and_default() {
                 b.id = haider_protocol::ids::MenuId::new("B");
                 if kind == "child" {
                     let mut chip = super::runtime_pointer_tests::question_chip("child", "A");
-                    crate::session::chip_apply(&mut chip, &EventPayload::MenuOpened(menu), 0);
+                    super::input_typeahead_tests::apply_child_question(
+                        &mut chip,
+                        &EventPayload::MenuOpened(menu),
+                        0,
+                    );
                     m.chips.push(chip);
                     m.screen = Screen::Subagent;
                     m.view_path = vec!["child".into()];
@@ -271,7 +275,11 @@ fn committing_keys_share_card_dwell_navigation_and_default() {
                 dispatch_input_at(&mut m, &[], k(code), t);
                 assert_eq!(m.outbox.len(), 1, "{kind} {code:?}");
                 if kind == "child" {
-                    crate::session::chip_apply(&mut m.chips[0], &EventPayload::MenuOpened(b), 0);
+                    super::input_typeahead_tests::apply_child_question(
+                        &mut m.chips[0],
+                        &EventPayload::MenuOpened(b),
+                        0,
+                    );
                 } else {
                     m.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(b))));
                 }
@@ -410,7 +418,7 @@ fn outside_retirement_preserves_fresh_decision_commit_feedback_and_refuses_every
                         menu.options[0].key = "y".into();
                         menu.options[1].key = "n".into();
                         if child {
-                            crate::session::chip_apply(
+                            super::input_typeahead_tests::apply_child_question(
                                 &mut m.chips[0],
                                 &EventPayload::MenuOpened(menu),
                                 0,
@@ -528,7 +536,7 @@ fn unpainted_successors_cannot_borrow_a_mature_decision_clock_or_feedback() {
                     m.chips.push(super::runtime_pointer_tests::question_chip(
                         "child", "first",
                     ));
-                    crate::session::chip_apply(
+                    super::input_typeahead_tests::apply_child_question(
                         &mut m.chips[0],
                         &EventPayload::MenuOpened(menu.clone()),
                         0,
@@ -548,7 +556,11 @@ fn unpainted_successors_cannot_borrow_a_mature_decision_clock_or_feedback() {
                 if kind == "accounts" {
                     m.accounts.pending_replace = Some(crate::app::AccountAddKind::LmStudio);
                 } else if child {
-                    crate::session::chip_apply(&mut m.chips[0], &EventPayload::MenuOpened(menu), 0);
+                    super::input_typeahead_tests::apply_child_question(
+                        &mut m.chips[0],
+                        &EventPayload::MenuOpened(menu),
+                        0,
+                    );
                 } else {
                     m.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(menu))));
                 }
@@ -587,14 +599,18 @@ fn live_child_menu_metadata_is_available_without_demo_beats() {
     let mut chip = super::runtime_pointer_tests::question_chip("child", "old");
     chip.question = None;
     let menu = decision("live");
-    crate::session::chip_apply(&mut chip, &EventPayload::MenuOpened(menu), 10);
+    super::input_typeahead_tests::apply_child_question(
+        &mut chip,
+        &EventPayload::MenuOpened(menu),
+        10,
+    );
     assert_eq!(
         chip.question_menu().map(|menu| menu.id.as_str()),
         Some("live")
     );
     assert!(!chip.question.as_ref().unwrap().resolved);
     // Unrelated replies/closures cannot resolve this question.
-    crate::session::chip_apply(
+    super::input_typeahead_tests::apply_child_question(
         &mut chip,
         &EventPayload::MenuClosed {
             menu: haider_protocol::ids::MenuId::new("other"),
@@ -603,7 +619,7 @@ fn live_child_menu_metadata_is_available_without_demo_beats() {
         20,
     );
     assert!(chip.question_menu().is_some());
-    crate::session::chip_apply(
+    super::input_typeahead_tests::apply_child_question(
         &mut chip,
         &EventPayload::MenuClosed {
             menu: haider_protocol::ids::MenuId::new("live"),
@@ -613,7 +629,7 @@ fn live_child_menu_metadata_is_available_without_demo_beats() {
     );
     assert!(chip.question_menu().is_none());
     assert!(chip.question.as_ref().unwrap().resolved);
-    crate::session::chip_apply(
+    super::input_typeahead_tests::apply_child_question(
         &mut chip,
         &EventPayload::MenuOpened(decision("successor")),
         40,
@@ -799,7 +815,11 @@ fn child_free_text_question_renders_edits_and_obeys_commit_dwell() {
         let mut menu = decision("text");
         menu.options.clear();
         menu.title = "Child free-text question".into();
-        crate::session::chip_apply(&mut m.chips[0], &EventPayload::MenuOpened(menu), 0);
+        super::input_typeahead_tests::apply_child_question(
+            &mut m.chips[0],
+            &EventPayload::MenuOpened(menu),
+            0,
+        );
         m.screen = Screen::Subagent;
         m.view_path = vec!["child".into()];
         let t = Instant::now();
@@ -1109,7 +1129,11 @@ fn text_question(child: bool, id: &str) -> AppModel {
     if child {
         m.chips
             .push(super::runtime_pointer_tests::question_chip("child", id));
-        crate::session::chip_apply(&mut m.chips[0], &EventPayload::MenuOpened(menu), 0);
+        super::input_typeahead_tests::apply_child_question(
+            &mut m.chips[0],
+            &EventPayload::MenuOpened(menu),
+            0,
+        );
         m.screen = Screen::Subagent;
         m.view_path = vec!["child".into()];
     } else {
@@ -1140,7 +1164,11 @@ fn free_text_frames_distinguish_questions_and_incarnations_but_preserve_answer_e
                 let mut next = decision(if same_id { "first" } else { "second" });
                 next.options.clear();
                 if child {
-                    crate::session::chip_apply(&mut m.chips[0], &EventPayload::MenuOpened(next), 0);
+                    super::input_typeahead_tests::apply_child_question(
+                        &mut m.chips[0],
+                        &EventPayload::MenuOpened(next),
+                        0,
+                    );
                 } else {
                     m.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(next))));
                 }
@@ -1211,7 +1239,11 @@ fn completion_edits_preserve_mature_question_age_and_replacements_rearm_it() {
                 let mut menu = decision("same");
                 menu.options.clear();
                 if child {
-                    crate::session::chip_apply(&mut m.chips[0], &EventPayload::MenuOpened(menu), 0);
+                    super::input_typeahead_tests::apply_child_question(
+                        &mut m.chips[0],
+                        &EventPayload::MenuOpened(menu),
+                        0,
+                    );
                 } else {
                     m.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(menu))));
                 }
@@ -2046,7 +2078,11 @@ fn modified_control_and_clipboard_chords_match_their_real_dispatch() {
                 menu.options[0].key = "y".into();
                 if child {
                     let mut chip = super::runtime_pointer_tests::question_chip("child", "control");
-                    crate::session::chip_apply(&mut chip, &EventPayload::MenuOpened(menu), 0);
+                    super::input_typeahead_tests::apply_child_question(
+                        &mut chip,
+                        &EventPayload::MenuOpened(menu),
+                        0,
+                    );
                     m.chips.push(chip);
                     m.screen = Screen::Subagent;
                     m.view_path = vec!["child".into()];
@@ -2126,7 +2162,11 @@ fn typed_prose_never_commits_model_option_letters_at_any_dwell() {
                     if kind == "child" {
                         let mut chip =
                             super::runtime_pointer_tests::question_chip("child", "prose");
-                        crate::session::chip_apply(&mut chip, &EventPayload::MenuOpened(menu), 0);
+                        super::input_typeahead_tests::apply_child_question(
+                            &mut chip,
+                            &EventPayload::MenuOpened(menu),
+                            0,
+                        );
                         m.chips.push(chip);
                         m.screen = Screen::Subagent;
                         m.view_path = vec!["child".into()];

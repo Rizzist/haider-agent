@@ -808,6 +808,7 @@ async fn peer_endpoint_refuses_approval_frames_and_notifies_idle_once() {
         client_instance_id: "probe".into(),
         client_kind: haider_rpc::ClientKind::Cli,
         capabilities_requested: [haider_rpc::Capability::Control].into(),
+        features_requested: Default::default(),
         max_receive_frame: 128 * 1024,
         encodings: Vec::new(),
     });

@@ -354,6 +354,8 @@ pub(crate) async fn command(family: &str, args: &[String]) -> ExitCode {
     };
     let written = if json_output {
         write_json(&document)
+    } else if let Some(text) = agent_list_human_text(family, verb, &document) {
+        write_text(&text)
     } else {
         let payload = if document["error"].is_null() {
             &document["result"]
@@ -367,6 +369,21 @@ pub(crate) async fn command(family: &str, args: &[String]) -> ExitCode {
     } else {
         ExitCode::from(exit)
     }
+}
+
+/// 973-activity-icons: `haider agent list` without `--json` prints the
+/// human fleet tree (state glyph, current ACTIVITY glyph, name, task,
+/// metrics) instead of pretty JSON. `None` falls back to the generic
+/// pretty-JSON output (other verbs, errors, or an undecodable snapshot).
+fn agent_list_human_text(family: &str, verb: &str, document: &Value) -> Option<String> {
+    if family != "agent" || verb != "list" || !document["error"].is_null() {
+        return None;
+    }
+    let snapshot =
+        serde_json::from_value::<haider_rpc::SessionFleetSnapshot>(document["result"].clone())
+            .ok()?;
+    let text = super::observe::fleet_human_text(&snapshot);
+    Some(text.trim_end_matches('\n').to_owned())
 }
 
 async fn execute(options: &Options) -> Result<(Value, u8), Failure> {

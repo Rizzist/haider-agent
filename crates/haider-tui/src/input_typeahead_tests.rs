@@ -1060,3 +1060,41 @@ fn startup_free_text_question_requires_a_presented_target() {
     assert!(dispatch_queued_input(&mut m, &[], early));
     assert_eq!(m.composer.text(), "x");
 }
+
+/// Minimal committed child envelope for keyboard and rendering checks.
+pub(super) fn child_envelope(
+    payload: &EventPayload,
+    at_ms: u64,
+) -> haider_protocol::envelope::RawEnvelope {
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
+    use haider_protocol::ids::{AgentId, DeviceId, EventId, SessionId};
+    EventEnvelope {
+        schema_version: 1,
+        event_id: EventId::new(format!("keyboard-{at_ms}")),
+        seq: at_ms + 1,
+        session_id: SessionId::new("keyboard-session"),
+        branch_id: None,
+        run_id: None,
+        agent_id: Some(AgentId::new("child")),
+        device_id: DeviceId::new("keyboard-device"),
+        authority_epoch: 1,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: at_ms,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(payload).unwrap().into(),
+    }
+}
+
+pub(super) fn apply_child_question(
+    chip: &mut crate::app::ChipModel,
+    payload: &EventPayload,
+    at_ms: u64,
+) {
+    crate::session::chip_apply(chip, payload, &child_envelope(payload, at_ms));
+}

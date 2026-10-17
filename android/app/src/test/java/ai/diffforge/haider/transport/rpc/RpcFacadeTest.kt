@@ -22,6 +22,12 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 class RpcFacadeTest {
+    @Test
+    fun `Hello requests activity without using an unknown capability`() {
+        val hello = RpcWire.hello("0.0.973", "client", control = true)
+        assertEquals(listOf("session_activity_v1"), hello["features_requested"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(listOf("view", "control"), hello["capabilities_requested"]!!.jsonArray.map { it.jsonPrimitive.content })
+    }
     private fun snapshot(generation: Long = 1) = DaemonServiceSnapshot(true, DaemonPhase.Ready, "0.0.970", "0.0.970", 1,
         generation, RpcEndpoint("/private/h.sock", 1, generation), 0, null, NetworkState.Available, true, false,
         null, false, 1, 10, 200)

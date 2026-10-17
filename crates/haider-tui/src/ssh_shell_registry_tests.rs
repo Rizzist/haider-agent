@@ -306,12 +306,15 @@ fn ctrl_bracket_closes_a_connecting_terminal_and_retires_its_late_shell() {
         KeyModifiers::CONTROL,
     )));
     assert!(model.ssh_terminal.is_none());
-    model.apply_ssh_shell_opened(shell(
-        "late-shell",
-        haider_rpc::ShellKindWire::Ssh {
-            profile: "prod".into(),
-        },
-    ));
+    model.apply_ssh_shell_opened(
+        0,
+        shell(
+            "late-shell",
+            haider_rpc::ShellKindWire::Ssh {
+                profile: "prod".into(),
+            },
+        ),
+    );
     assert!(
         matches!(model.requests.last(), Some(AppRequest::ShellClose { id }) if id == "late-shell")
     );
@@ -435,7 +438,7 @@ fn pending_shell_reply_can_be_cancelled_before_connecting_and_running_is_separat
         },
     );
     pending.status = haider_rpc::ShellStatusWire::Starting;
-    model.apply_ssh_shell_opened(pending.clone());
+    model.apply_ssh_shell_opened(0, pending.clone());
     assert!(
         model
             .ssh_terminal
@@ -470,7 +473,7 @@ fn pending_shell_reply_can_be_cancelled_before_connecting_and_running_is_separat
     ));
     pending.id = "deliberate-new-shell".into();
     pending.status = haider_rpc::ShellStatusWire::Starting;
-    model.apply_ssh_shell_opened(pending.clone());
+    model.apply_ssh_shell_opened(0, pending.clone());
     pending.status = haider_rpc::ShellStatusWire::Running;
     model.apply_shell_event(pending);
     assert!(
@@ -496,7 +499,7 @@ fn failed_pending_setup_keeps_the_owned_error_visible() {
         },
     );
     pending.status = haider_rpc::ShellStatusWire::Starting;
-    model.apply_ssh_shell_opened(pending.clone());
+    model.apply_ssh_shell_opened(0, pending.clone());
     model.apply_ssh_shell_output(&pending.id, b"SSH fixture setup failed\r\n");
     pending.status = haider_rpc::ShellStatusWire::Exited { code: None };
     model.apply_shell_event(pending);
@@ -526,7 +529,7 @@ fn typed_setup_failure_is_visible_only_on_its_owned_terminal() {
             },
         );
         pending.status = haider_rpc::ShellStatusWire::Starting;
-        model.apply_ssh_shell_opened(pending.clone());
+        model.apply_ssh_shell_opened(0, pending.clone());
         pending.status = haider_rpc::ShellStatusWire::Exited { code: None };
         pending.setup_error = Some(haider_rpc::ShellSetupErrorWire {
             code: code.into(),

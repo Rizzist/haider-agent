@@ -7126,6 +7126,7 @@ async fn panic_exit_after_cancelling_closes_item_and_menu_before_cancelled() {
                     name: "request_input".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ),

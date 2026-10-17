@@ -939,6 +939,8 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
             options: q.options,
             resolved: q.resolved,
         }),
+        // Activity is live-only display state; a reload starts quiet.
+        activity: haider_protocol::activity::ActivityTracker::new(),
         closed: dto.closed,
         // A persisted closed chip is mid-removal by definition; guard 4's
         // sweep drops it before it ever renders.

@@ -196,7 +196,12 @@ mod tests {
     #[test]
     fn continuation_cancels_deadline_but_partial_sequences_and_paste_do_not_expire() {
         let now = Instant::now();
-        for prefix in [b"\x1b[".as_slice(), b"\xce", b"\x1b[200~a\x1b"] {
+        for prefix in [
+            b"\x1b[".as_slice(),
+            b"\xce",
+            #[cfg(feature = "bracketed-paste")]
+            b"\x1b[200~a\x1b",
+        ] {
             let mut parser = Parser::default();
             parser.advance_at(prefix, false, now);
             assert_eq!(parser.poll_timeout_at(None, now), None);
@@ -254,6 +259,7 @@ mod tests {
         assert_eq!(parser.finish_pending_escape_at(now + ESCAPE_TIMEOUT), None);
     }
 
+    #[cfg(feature = "bracketed-paste")]
     #[test]
     fn large_paste_is_opaque_across_tty_buffer_and_utf8_boundaries() {
         let text = format!("{}β漢\x1b[B\x03\r\n{}", "a".repeat(1017), "z".repeat(1024));

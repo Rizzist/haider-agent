@@ -11,12 +11,12 @@ use crate::script::{
     AUTO_TITLE_MS, Beat, COMPACT_IDLE_GAP_MS, DemoEvent, TALK_HOLD_MS, compaction_beats,
     respond_preamble, title_note,
 };
+use crate::terminal_backend::CellBackend;
 use crate::theme::{Rgb, ThemeKey};
 use haider_protocol::EventPayload;
 use haider_protocol::provider::{Usage, UsageSource};
 use haider_protocol::state::{HarnessStatus, RunState};
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
@@ -814,6 +814,54 @@ pub fn sync_notification_persistence(
     }
 }
 
+/// 973-activity-icons: persist an `/icons` choice (mirrors the notification
+/// sync).
+pub fn sync_activity_icons_persistence(
+    model: &mut crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.activity_display_commits == *seen_commits
+        || model.activity_display_commits == model.activity_display_attempted_commits
+    {
+        return;
+    }
+    let Some(choice) = model.activity_display_choice else {
+        return;
+    };
+    model.activity_display_attempted_commits = model.activity_display_commits;
+    if settings
+        .as_mut()
+        .is_some_and(|store| store.save_activity_icons_if_changed(model.theme_choice, choice))
+    {
+        *seen_commits = model.activity_display_commits;
+        model.flash = Some(format!("· activity icons {} saved", choice.name()));
+    } else {
+        model.flash = Some(format!(
+            "! Could not save activity icons; retry /icons {}",
+            choice.name()
+        ));
+    }
+    model.dirty = true;
+}
+
+/// 973-activity-icons: boot-time activity display — the persisted `/icons`
+/// choice, overridden by `HAIDER_ACTIVITY_ICONS`, else `NO_COLOR`/`TERM`
+/// heuristics. Mirrors the explicit choice into the store.
+pub fn seed_activity_display(
+    model: &mut crate::app::AppModel,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    let chosen = settings
+        .as_ref()
+        .and_then(crate::settings::SettingsStore::load_activity_icons);
+    model.activity_display_choice = chosen;
+    model.activity_display = haider_client::fleet::activity_display_from_env(chosen);
+    if let Some(store) = settings.as_mut() {
+        store.set_activity_icons(chosen);
+    }
+}
+
 /// Model retention (owner 2026-08-15): persist a committed model pick so the
 /// next boot opens the harness on it (mirrors the theme/notification sync).
 pub fn sync_model_persistence(
@@ -1065,7 +1113,7 @@ pub async fn run_demo(
 ) -> std::io::Result<()> {
     seed_footprint_replay(&mut model);
     let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut terminal = Terminal::new(CellBackend::new(stdout()))?;
     let initial_size = terminal.size()?;
     model.handle_terminal_resize(initial_size.width, initial_size.height);
     // Sync the emulator's own background (window padding) to the theme
@@ -1079,6 +1127,8 @@ pub async fn run_demo(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 973-activity-icons: persisted `/icons` choice, env override, NO_COLOR.
+    seed_activity_display(&mut model, &mut settings);
     // 971-tui-collapse: seed the tool-output verbosity from the persisted
     // setting (default `normal`) so a prior ⌥V survives a restart, and
     // mirror it into the store so a later theme save never drops it. The
@@ -1126,6 +1176,7 @@ pub async fn run_demo(
     let mut seen_theme_commits = model.theme_commits;
     let mut seen_model_commits = model.model_commits;
     let mut seen_verbosity_commits = model.verbosity_commits;
+    let mut seen_activity_commits = model.activity_display_commits;
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
@@ -1324,6 +1375,7 @@ pub async fn run_demo(
         sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        sync_activity_icons_persistence(&mut model, &mut seen_activity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
         // 971-tui-collapse: observe tool start/finish against the shared
         // clock, so a collapsed row can carry an honest duration (the
@@ -3089,7 +3141,9 @@ impl DemoDriver {
             }
             DemoEvent::ChipEmit { agent, payload } => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut model.chips, &agent) {
-                    chip.note_event_at(now_epoch_ms());
+                    let now = now_epoch_ms();
+                    chip.note_event_at(now);
+                    chip.activity.observe(&payload, now);
                     chip.transcript.apply(&payload);
                     model.dirty = true;
                 }
@@ -3342,7 +3396,9 @@ pub fn absorb_demo_event(state: &mut crate::session::SessionState, event: DemoEv
         }
         DemoEvent::ChipEmit { agent, payload } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
-                chip.note_event_at(now_epoch_ms());
+                let now = now_epoch_ms();
+                chip.note_event_at(now);
+                chip.activity.observe(&payload, now);
                 chip.transcript.apply(&payload);
             }
         }
@@ -3580,7 +3636,7 @@ impl Player {
 }
 
 fn draw(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CellBackend<Stdout>>,
     model: &AppModel,
 ) -> std::io::Result<Vec<(ratatui::layout::Rect, crate::app::Hit)>> {
     let mut hits = Vec::new();
@@ -3589,7 +3645,7 @@ fn draw(
 }
 
 fn present_frame(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CellBackend<Stdout>>,
     model: &mut AppModel,
     hit_map: &mut Vec<(ratatui::layout::Rect, crate::app::Hit)>,
     pointer: Option<(u16, u16)>,
@@ -4358,7 +4414,7 @@ pub async fn run_live(
     let talk_runtime = crate::stt_runtime::TalkRuntime::spawn(talk_tx, store_dir);
 
     let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut terminal = Terminal::new(CellBackend::new(stdout()))?;
     let initial_size = terminal.size()?;
     model.handle_terminal_resize(initial_size.width, initial_size.height);
     sync_terminal_bg(model.theme);
@@ -4368,6 +4424,8 @@ pub async fn run_live(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 973-activity-icons: persisted `/icons` choice, env override, NO_COLOR.
+    seed_activity_display(&mut model, &mut settings);
     // 971-tui-collapse: seed the tool-output verbosity from the persisted
     // setting (default `normal`) so a prior ⌥V survives a restart, and
     // mirror it into the store so a later theme save never drops it. The
@@ -4431,6 +4489,7 @@ pub async fn run_live(
     let mut seen_notification_commits = model.notification_commits;
     let mut seen_model_commits = model.model_commits;
     let mut seen_verbosity_commits = model.verbosity_commits;
+    let mut seen_activity_commits = model.activity_display_commits;
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
@@ -4745,6 +4804,7 @@ pub async fn run_live(
         sync_notification_persistence(&model, &mut seen_notification_commits, &mut settings);
         sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        sync_activity_icons_persistence(&mut model, &mut seen_activity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
         // 971-tui-collapse: see the demo loop.
         model.note_tool_timings();
@@ -4809,3 +4869,7 @@ mod runtime_pointer_tests;
 #[cfg(test)]
 #[path = "input_split_dwell_tests.rs"]
 mod input_split_dwell_tests;
+
+#[cfg(test)]
+#[path = "terminal_input_reply_tests.rs"]
+mod terminal_input_reply_tests;

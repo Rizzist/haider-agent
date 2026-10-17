@@ -2200,6 +2200,66 @@ fn additive_handshake_identity_fields_have_tolerant_decode_defaults() {
     assert!(!user_command_withheld);
 }
 
+#[test]
+fn activity_request_hello_decodes_with_released_daemon_shape() {
+    #[derive(Deserialize)]
+    struct OldHello {
+        v: u32,
+        kind: String,
+        protocol_min: u32,
+        protocol_max: u32,
+        client_name: String,
+        client_version: String,
+        client_instance_id: String,
+        client_kind: haider_rpc::ClientKind,
+        capabilities_requested: haider_rpc::CapabilitySet,
+        max_receive_frame: u32,
+        encodings: Vec<String>,
+    }
+    let frame = WireFrame::Hello(Hello {
+        protocol_min: 1,
+        protocol_max: 1,
+        client_name: "new-client".into(),
+        client_version: "0.0.973".into(),
+        client_instance_id: "client-1".into(),
+        client_kind: haider_rpc::ClientKind::Tui,
+        capabilities_requested: [haider_rpc::Capability::View].into_iter().collect(),
+        features_requested: [haider_rpc::FEATURE_SESSION_ACTIVITY_V1.to_owned()]
+            .into_iter()
+            .collect(),
+        max_receive_frame: 1_048_576,
+        encodings: vec!["json".into()],
+    });
+    for encoding in [
+        haider_rpc::WireEncoding::Json,
+        haider_rpc::WireEncoding::MessagePack,
+    ] {
+        let bytes = uds_codec::encode_with(&frame, 1_048_576, encoding).expect("new Hello encodes");
+        let old: OldHello = match encoding {
+            haider_rpc::WireEncoding::Json => {
+                serde_json::from_slice(&bytes[4..]).expect("old JSON Hello")
+            }
+            haider_rpc::WireEncoding::MessagePack => {
+                rmp_serde::from_slice(&bytes[4..]).expect("old MessagePack Hello")
+            }
+        };
+        assert_eq!(
+            (old.v, old.kind.as_str(), old.protocol_min, old.protocol_max),
+            (1, "hello", 1, 1)
+        );
+        assert_eq!(old.client_name, "new-client");
+        assert_eq!(old.client_version, "0.0.973");
+        assert_eq!(old.client_instance_id, "client-1");
+        assert_eq!(old.client_kind, haider_rpc::ClientKind::Tui);
+        assert!(
+            old.capabilities_requested
+                .contains(&haider_rpc::Capability::View)
+        );
+        assert_eq!(old.max_receive_frame, 1_048_576);
+        assert_eq!(old.encodings, vec!["json".to_owned()]);
+    }
+}
+
 /// MUTATION CHECK: make `permission_overrides` required or default either
 /// boolean to true. Expected RUNTIME failure: the legacy create fails to
 /// decode or no longer normalizes to a fail-closed `None` override.

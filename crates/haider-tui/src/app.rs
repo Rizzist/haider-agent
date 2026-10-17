@@ -1806,6 +1806,10 @@ pub struct ChipModel {
     /// (`agent_graph_rollup_v1`). `None` = the child runs no pinned
     /// workflow (or an older daemon) — the row keeps plain activity.
     pub graph: Option<haider_protocol::agent::AgentGraphRollupV1>,
+    /// 973-activity-icons: live ACTIVITY (what the child is doing, not its
+    /// state), folded from the typed items this chip applies — see
+    /// [`haider_protocol::activity`] for the priority and timing contract.
+    pub activity: haider_protocol::activity::ActivityTracker,
     pub closed: bool,
     pub removing: bool,
     pub children: Vec<ChipModel>,
@@ -1845,6 +1849,7 @@ impl ChipModel {
                                 name: name.clone(),
                                 args: serde_json::json!({ "desc": desc, "meta": meta }),
                                 status: haider_protocol::item::ToolStatus::Completed,
+                                activity: None,
                             },
                         },
                     ));
@@ -1875,6 +1880,7 @@ impl ChipModel {
             metrics: None,
             question: None,
             graph: None,
+            activity: haider_protocol::activity::ActivityTracker::new(),
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -1944,6 +1950,7 @@ impl ChipModel {
             metrics: None,
             question: None,
             graph: None,
+            activity: haider_protocol::activity::ActivityTracker::new(),
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -3259,6 +3266,7 @@ impl std::fmt::Debug for SshTerminalInput {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SshTerminalPane {
+    pub attempt_id: u64,
     pub profile: String,
     pub shell_id: Option<String>,
     pub connecting: bool,
@@ -3273,6 +3281,7 @@ impl std::fmt::Debug for SshTerminalPane {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SshTerminalPane")
+            .field("attempt_id", &self.attempt_id)
             .field("profile", &self.profile)
             .field("shell_id", &self.shell_id)
             .field("output", &"<remote terminal bytes>")
@@ -3286,6 +3295,7 @@ impl SshTerminalPane {
 
     fn opening(profile: String, size: haider_rpc::SshPtySizeWire) -> Self {
         Self {
+            attempt_id: 0,
             profile,
             shell_id: None,
             connecting: true,
@@ -3682,6 +3692,7 @@ pub enum AppRequest {
         profile: String,
     },
     SshShellOpen {
+        attempt_id: u64,
         profile: String,
         size: haider_rpc::SshPtySizeWire,
     },
@@ -5786,6 +5797,16 @@ pub struct AppModel {
     /// commit counter the runtime watches to persist a change.
     pub notifications_enabled: bool,
     pub notification_commits: u64,
+    /// 973-activity-icons: how subagent ACTIVITY renders (emoji · text ·
+    /// off). `AppModel::new` defaults to emoji; boot resolves the persisted
+    /// setting, `HAIDER_ACTIVITY_ICONS`, `NO_COLOR` and `TERM`. `/icons`
+    /// changes it and bumps the commit counter the runtime persists.
+    pub activity_display: haider_protocol::activity::ActivityDisplay,
+    pub activity_display_commits: u64,
+    /// Explicit intent, independent of the environment-resolved display.
+    pub activity_display_choice: Option<haider_protocol::activity::ActivityDisplay>,
+    /// Last attempted commit; failed saves stay dirty without retrying every frame.
+    pub activity_display_attempted_commits: u64,
     /// Model retention (owner 2026-08-15): bumped on every COMMITTED model
     /// pick so the runtime persists the pair and the next boot opens on it.
     pub model_commits: u64,
@@ -5867,6 +5888,7 @@ pub struct AppModel {
     /// Full-body interactive SSH pane. Distinct from the shell-list overlay,
     /// monitor details, and subagent surfaces.
     pub ssh_terminal: Option<SshTerminalPane>,
+    ssh_open_generation: u64,
     /// Existing monitor details floated over the body from the band's
     /// `· N monitors` count.
     pub monitors_open: bool,
@@ -6298,6 +6320,10 @@ impl Default for AppModel {
             focus_reported: false,
             notifications_enabled: true,
             notification_commits: 0,
+            activity_display: haider_protocol::activity::ActivityDisplay::Emoji,
+            activity_display_commits: 0,
+            activity_display_choice: None,
+            activity_display_attempted_commits: 0,
             model_commits: 0,
             notification_run_state: None,
             background_notification_states: std::collections::HashMap::new(),
@@ -6335,6 +6361,7 @@ impl Default for AppModel {
                 pixel_height: 0,
             },
             ssh_terminal: None,
+            ssh_open_generation: 0,
             monitors_open: false,
             monitors_cursor: 0,
             monitors_stop_armed: None,
@@ -7340,6 +7367,151 @@ impl AppModel {
         self.notifications_enabled = enabled;
     }
 
+    /// 973-activity-icons: set the activity display mode from `/icons`,
+    /// bumping the commit counter the runtime watches to persist it.
+    /// `None` cycles emoji → text → off → emoji.
+    pub fn set_activity_display(
+        &mut self,
+        mode: Option<haider_protocol::activity::ActivityDisplay>,
+    ) {
+        use haider_protocol::activity::ActivityDisplay as D;
+        let next = mode.unwrap_or(match self.activity_display {
+            D::Emoji => D::Text,
+            D::Text => D::Off,
+            D::Off => D::Emoji,
+        });
+        self.activity_display = next;
+        self.activity_display_choice = Some(next);
+        self.activity_display_commits += 1;
+        self.flash = Some(format!("· activity icons {} (saving…)", next.name()));
+        self.dirty = true;
+    }
+
+    /// 973-activity-icons: one chip's CURRENT activity at the model clock.
+    /// Terminal and closing chips show none; a chip with live children is
+    /// orchestrating when otherwise quiet.
+    #[must_use]
+    pub fn chip_activity(
+        &self,
+        chip: &ChipModel,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        self.chip_activity_with(chip, false)
+    }
+
+    /// [`Self::chip_activity`] with extra live-children knowledge (a fleet
+    /// snapshot can see grandchildren the chip tree does not hold).
+    fn chip_activity_with(
+        &self,
+        chip: &ChipModel,
+        known_live_children: bool,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return None;
+        }
+        use crate::script::ChipDisplayState as S;
+        if chip.closed || matches!(chip.display_state(), S::Done | S::Error) {
+            return None;
+        }
+        let live_children = known_live_children
+            || chip
+                .children
+                .iter()
+                .any(|child| !child.closed && !matches!(child.display_state(), S::Done | S::Error));
+        if !chip.activity.is_empty() {
+            return chip.activity.current(self.clock_ms, live_children);
+        }
+        // Live mode: the child's typed tool items live in ITS session; the
+        // daemon publishes their activity state inside the child's agent
+        // metrics (session summaries), evaluated here on our clock.
+        self.chip_metrics(chip)
+            .and_then(|metrics| metrics.activity.as_ref())
+            .map(haider_protocol::activity::ActivityTracker::from_state)
+            .map_or_else(
+                || live_children.then_some(haider_protocol::activity::ActivityKind::Orchestrate),
+                |tracker| tracker.current(self.clock_ms, live_children),
+            )
+    }
+
+    /// 973-activity-icons: a fleet node's current activity — the local chip's
+    /// live tracker when this session holds the chip (fresher than any
+    /// snapshot), else the daemon snapshot's figure.
+    #[must_use]
+    pub fn node_activity(
+        &self,
+        node: &haider_rpc::FleetNodeWire,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return None;
+        }
+        use haider_rpc::FleetAgentStateWire as F;
+        if matches!(node.state, F::Done | F::Failed | F::Cancelled) {
+            return None;
+        }
+        let live_children = node
+            .children
+            .iter()
+            .any(|child| !matches!(child.state, F::Done | F::Failed | F::Cancelled));
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            return self.chip_activity_with(chip, live_children);
+        }
+        // A deeper member has no chip; its own session summary carries the
+        // live activity state (fresher than the snapshot's instant).
+        // Freshest of the two daemon projections (replace-by-head law):
+        // the session summary and the fleet snapshot's own metrics.
+        let freshest = [
+            self.session_metrics.get(&node.session_id),
+            node.metrics.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|metrics| metrics.activity.is_some())
+        .max_by_key(|metrics| metrics.head_seq);
+        match freshest.and_then(|metrics| metrics.activity.as_ref()) {
+            Some(state) => haider_protocol::activity::ActivityTracker::from_state(state)
+                .current(self.clock_ms, live_children),
+            None => node.activity,
+        }
+    }
+
+    /// 973-activity-icons: every activity a node used so far (detail view),
+    /// merging the snapshot history with the local chip tracker.
+    #[must_use]
+    pub fn node_activities(
+        &self,
+        node: &haider_rpc::FleetNodeWire,
+    ) -> Vec<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return Vec::new();
+        }
+        let mut used = node.activities.clone();
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            used.extend(chip.activity.used());
+            if !chip.children.is_empty() {
+                used.push(haider_protocol::activity::ActivityKind::Orchestrate);
+            }
+            if let Some(state) = self
+                .chip_metrics(chip)
+                .and_then(|metrics| metrics.activity.as_ref())
+            {
+                used.extend(state.touched.iter().map(|touch| touch.kind));
+            }
+        }
+        if let Some(state) = self
+            .session_metrics
+            .get(&node.session_id)
+            .and_then(|metrics| metrics.activity.as_ref())
+        {
+            used.extend(state.touched.iter().map(|touch| touch.kind));
+        }
+        if !node.children.is_empty() || node.folded_children > 0 {
+            used.push(haider_protocol::activity::ActivityKind::Orchestrate);
+        }
+        used.retain(|kind| *kind != haider_protocol::activity::ActivityKind::Unknown);
+        used.sort_by_key(|kind| kind.rank());
+        used.dedup();
+        used
+    }
+
     /// W-C M2: flip (or set) the desktop-notification toggle and bump the
     /// commit counter the runtime watches to persist the change.
     pub fn toggle_notifications(&mut self, enable: Option<bool>) {
@@ -8119,9 +8291,7 @@ impl AppModel {
                 if !self.accepts_injected_edits() {
                     return;
                 }
-                self.composer_replacement_epoch = self.composer_replacement_epoch.wrapping_add(1);
-                self.composer.set_text(text);
-                self.dirty = true;
+                self.edit_composer_from_outside(|composer| composer.set_text(text));
             }
             AppEvent::Envelope(payload) => {
                 self.dirty = true;
@@ -10220,12 +10390,15 @@ impl AppModel {
                 InputOwner::Composer(Screen::Session)
             }
             Screen::Subagent => {
-                if self.viewed_chip().is_some_and(|chip| {
-                    chip.question_menu()
-                        .is_some_and(|menu| !menu.options.is_empty())
-                }) {
-                    InputOwner::SubagentQuestion
-                } else if self.effort_picker.is_some() {
+                if let Some(menu) = self.viewed_chip().and_then(ChipModel::question_menu) {
+                    // The visible answer line owns input, just as it does on
+                    // the session screen. Local pickers yield while it is up.
+                    if menu.options.is_empty() {
+                        return InputOwner::Composer(Screen::Subagent);
+                    }
+                    return InputOwner::SubagentQuestion;
+                }
+                if self.effort_picker.is_some() {
                     InputOwner::EffortPicker
                 } else if self.theme_picker.is_some() {
                     InputOwner::ThemePicker
@@ -10483,10 +10656,12 @@ impl AppModel {
                         .and_then(|prompt| prompt.seq)
                 )
             }),
-            InputOwner::SshTerminal => self
-                .ssh_terminal
-                .as_ref()
-                .map(|terminal| format!("{}:{:?}", terminal.profile, terminal.shell_id)),
+            InputOwner::SshTerminal => self.ssh_terminal.as_ref().map(|terminal| {
+                format!(
+                    "{}:{}:{:?}",
+                    terminal.attempt_id, terminal.profile, terminal.shell_id
+                )
+            }),
             InputOwner::Screen(Screen::Usage) => self.usage.report.as_ref().map(|report| {
                 let groups = self.usage.groups();
                 let alias = groups
@@ -10917,6 +11092,17 @@ impl AppModel {
     /// The only authority for editing and selecting the visible composer.
     fn composer_owns_input(&self) -> bool {
         self.input_owner().accepts_composer_edits()
+    }
+
+    /// Retire input read for the previous draft before accepting an outside
+    /// write, including an equal-value write. Local typing keeps its queue.
+    pub(crate) fn edit_composer_from_outside(
+        &mut self,
+        edit: impl FnOnce(&mut crate::composer::Composer),
+    ) {
+        self.composer_replacement_epoch = self.composer_replacement_epoch.wrapping_add(1);
+        edit(&mut self.composer);
+        self.dirty = true;
     }
 
     /// The composer-edit epilogue every text-changing key shares (the sim
@@ -16816,6 +17002,19 @@ impl AppModel {
             // a display preference, not a session command); bare `/notifications`
             // flips it, `on`/`off` set it explicitly, and the runtime persists
             // the change to the TUI settings file.
+            // 973-activity-icons: subagent activity glyphs — `/icons emoji`,
+            // `/icons text` (bracketed labels for terminals without emoji
+            // fonts / screen readers), `/icons off`; bare cycles. Display
+            // preference only; the runtime persists it.
+            "icons" | "activity-icons" => match arg.as_deref() {
+                None | Some("toggle") => self.set_activity_display(None),
+                Some(value) => match haider_protocol::activity::ActivityDisplay::parse(value) {
+                    Some(mode) => self.set_activity_display(Some(mode)),
+                    None => {
+                        self.flash = Some(format!("· /icons {value} — try emoji · text · off"));
+                    }
+                },
+            },
             "notifications" | "notify" => match arg.as_deref() {
                 Some("on") => self.toggle_notifications(Some(true)),
                 Some("off") => self.toggle_notifications(Some(false)),
@@ -18488,8 +18687,11 @@ impl AppModel {
 
     fn open_ssh_terminal(&mut self, profile: String) {
         self.ssh_open = false;
-        let terminal = SshTerminalPane::opening(profile.clone(), self.ssh_terminal_size);
+        self.ssh_open_generation += 1;
+        let mut terminal = SshTerminalPane::opening(profile.clone(), self.ssh_terminal_size);
+        terminal.attempt_id = self.ssh_open_generation;
         self.requests.push(AppRequest::SshShellOpen {
+            attempt_id: terminal.attempt_id,
             profile,
             size: terminal.size,
         });
@@ -18578,8 +18780,9 @@ impl AppModel {
         self.dirty = true;
     }
 
-    pub(crate) fn apply_ssh_shell_opened(&mut self, shell: haider_rpc::ShellWire) {
+    pub(crate) fn apply_ssh_shell_opened(&mut self, attempt_id: u64, shell: haider_rpc::ShellWire) {
         if let Some(terminal) = self.ssh_terminal.as_mut()
+            && terminal.attempt_id == attempt_id
             && matches!(
                 &shell.kind,
                 haider_rpc::ShellKindWire::Ssh { profile } if profile == &terminal.profile
@@ -19311,12 +19514,7 @@ impl AppModel {
                                 ));
                             }
                             if admission == Admission::Apply {
-                                self.route_admitted(
-                                    &payload,
-                                    envelope.branch_id.as_ref(),
-                                    envelope.agent_id.as_ref(),
-                                    envelope.committed_at_ms,
-                                );
+                                self.route_admitted(&payload, envelope);
                             }
                         }
                         // S3/W-A/L3: additive agent, task, and workflow graph
@@ -19361,13 +19559,8 @@ impl AppModel {
     /// branch-stamped envelope they land session-global), then branch
     /// (outer), then agent. `SessionState::route_admitted` is the
     /// background twin.
-    fn route_admitted(
-        &mut self,
-        payload: &EventPayload,
-        branch: Option<&haider_protocol::ids::BranchId>,
-        agent: Option<&haider_protocol::ids::AgentId>,
-        at_ms: u64,
-    ) {
+    fn route_admitted(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let branch = envelope.branch_id.as_ref();
         use crate::branch::BranchScope;
         if let EventPayload::Usage(usage) = payload {
             self.cache_usage.note(usage);
@@ -19389,17 +19582,17 @@ impl AppModel {
                 // aggregate never lands in a chip transcript.
                 self.handle_envelope(payload);
             }
-            BranchScope::Active => self.absorb_scoped(payload, agent, at_ms),
+            BranchScope::Active => self.absorb_scoped(payload, envelope),
             BranchScope::ParkedMain => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.parked_main_mut() {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::ParkedNamed(id) => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.view_mut(&id) {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::Orphan => self.branch_state.count_orphan(),
@@ -19703,12 +19896,9 @@ impl AppModel {
 
     /// The attached path's scope router — the same [`crate::session::classify`]
     /// decision the background path takes, applied to the live fields.
-    fn absorb_scoped(
-        &mut self,
-        payload: &EventPayload,
-        agent: Option<&haider_protocol::ids::AgentId>,
-        at_ms: u64,
-    ) {
+    fn absorb_scoped(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let agent = envelope.agent_id.as_ref();
+        let at_ms = envelope.committed_at_ms;
         use crate::session::Destination;
         match crate::session::classify(&mut self.projection, &self.chips, payload, agent) {
             Destination::Agent => {
@@ -19721,7 +19911,7 @@ impl AppModel {
                     self.menu_selection = 0;
                 }
                 if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
-                    crate::session::chip_apply(chip, payload, at_ms);
+                    crate::session::chip_apply(chip, payload, envelope);
                 }
             }
             Destination::Session => {

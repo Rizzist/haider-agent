@@ -47,7 +47,7 @@ use crate::projection::RawOutcome;
 
 fn replace_loom_author_text(model: &mut AppModel, text: &str) {
     if model.screen == crate::app::Screen::Loom {
-        model.composer.set_text(text);
+        model.edit_composer_from_outside(|composer| composer.set_text(text));
     } else {
         model
             .drafts
@@ -422,6 +422,7 @@ pub enum LiveCommand {
         changes: haider_rpc::SshProfileUpdateWire,
     },
     SshShellOpen {
+        attempt_id: u64,
         profile: String,
         session: Option<SessionId>,
         size: haider_rpc::SshPtySizeWire,
@@ -1660,6 +1661,7 @@ pub enum LiveReply {
         message: String,
     },
     SshShellOpened {
+        attempt_id: u64,
         shell: haider_rpc::ShellWire,
     },
     SshShellOutput {
@@ -1667,6 +1669,7 @@ pub enum LiveReply {
         chunk_b64: haider_rpc::TerminalOutputWire,
     },
     SshShellFailed {
+        attempt_id: u64,
         code: String,
         message: String,
     },
@@ -4148,8 +4151,8 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
-            LiveReply::SshShellOpened { shell } => {
-                model.apply_ssh_shell_opened(shell);
+            LiveReply::SshShellOpened { attempt_id, shell } => {
+                model.apply_ssh_shell_opened(attempt_id, shell);
                 Vec::new()
             }
             LiveReply::SshShellOutput { id, chunk_b64 } => {
@@ -4166,7 +4169,18 @@ impl LiveDriver {
                 }
                 Vec::new()
             }
-            LiveReply::SshShellFailed { code, message } => {
+            LiveReply::SshShellFailed {
+                attempt_id,
+                code,
+                message,
+            } => {
+                if model
+                    .ssh_terminal
+                    .as_ref()
+                    .is_none_or(|pane| pane.attempt_id != attempt_id)
+                {
+                    return Vec::new();
+                }
                 model.ssh_terminal = None;
                 model.flash = Some(format!("· SSH terminal refused [{code}] — {message}"));
                 model.dirty = true;
@@ -6297,15 +6311,15 @@ impl LiveDriver {
                         haider_rpc::SurfaceInjectOp::Set { text }
                             if model.accepts_injected_edits() =>
                         {
-                            model.composer.set_text(text);
+                            model.edit_composer_from_outside(|composer| composer.set_text(text));
                         }
                         haider_rpc::SurfaceInjectOp::Insert { text }
                             if model.accepts_injected_edits() =>
                         {
-                            model.composer.insert_str(&text);
+                            model.edit_composer_from_outside(|composer| composer.insert_str(&text));
                         }
                         haider_rpc::SurfaceInjectOp::Clear if model.accepts_injected_edits() => {
-                            model.composer.clear();
+                            model.edit_composer_from_outside(crate::composer::Composer::clear);
                         }
                         haider_rpc::SurfaceInjectOp::Submit if model.accepts_injected_submit() => {
                             // Exactly the Enter path — mid-turn queue modes,
@@ -8010,8 +8024,13 @@ impl LiveDriver {
                 mutation,
                 secret: None,
             } => ssh_profile_command(mutation, None).into_iter().collect(),
-            AppRequest::SshShellOpen { profile, size } => {
+            AppRequest::SshShellOpen {
+                attempt_id,
+                profile,
+                size,
+            } => {
                 vec![LiveCommand::SshShellOpen {
+                    attempt_id,
                     profile,
                     session: model.active_session.clone(),
                     size,

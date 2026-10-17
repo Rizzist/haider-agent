@@ -64,6 +64,7 @@ fn tool(id: &str, name: &str, args: serde_json::Value, status: ToolStatus) -> Tu
         name: name.to_owned(),
         args,
         status,
+        activity: None,
     }
 }
 
