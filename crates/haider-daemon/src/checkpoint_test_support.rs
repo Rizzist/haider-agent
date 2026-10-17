@@ -51,6 +51,7 @@ pub(crate) async fn seed_checkpoint_change(
             session_id: session.clone(),
             cwd: cwd.display().to_string(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
