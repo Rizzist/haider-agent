@@ -4839,10 +4839,8 @@ async fn unanswered_delegated_question_returns_child_still_running() {
     harness.store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: send the exhausted path through `bounded_wait(0, cancel)`
-/// instead of its nonblocking persist-before-wake enqueue. Expected runtime
-/// failure: Tokio never polls the cancellation future and the child remains
-/// InputRequired rather than reaching Cancelled and the following Idle fence.
+/// An expired durable child-cancellation handoff still reaches Cancelled and
+/// the following Idle fence through the production recovery path.
 #[tokio::test]
 #[cfg(unix)]
 async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
@@ -4852,16 +4850,19 @@ async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
         Duration::from_secs(30),
     )
     .await;
-    let ticket = DeferredTicket {
-        id: harness.child.agent_id.as_str().to_owned(),
-        manifest: harness.child.manifest.clone(),
-    };
-    timeout(
-        // The production run deadline is already zero. This watchdog bounds
-        // the durable handoff receipt without extending the child-wait budget.
+    let delegation = DelegationHandle::new(harness.hub.clone());
+    let handoff = timeout(
         haider_platform::TEST_WAIT_TIMEOUT,
-        DelegationHandle::new(harness.hub.clone())
-            .cancel_ticket(&ticket, Some(tokio::time::Instant::now())),
+        delegation.begin_terminal_mirror_handoff_for_test(&harness.child, Duration::ZERO),
+    )
+    .await
+    .expect("expired child handoff is bounded by the fixture watchdog")
+    .expect("expired child handoff is durable");
+    timeout(
+        // The durable handoff deadline is already zero. This watchdog bounds
+        // the observer without extending the child-cancellation budget.
+        haider_platform::TEST_WAIT_TIMEOUT,
+        delegation.recover_terminal_mirror_handoff(harness.child.clone(), handoff),
     )
     .await
     .expect("expired cleanup handoff returns without extending the run deadline")
