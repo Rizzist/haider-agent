@@ -12823,6 +12823,21 @@ impl AppModel {
         }
     }
 
+    /// Exact session account pins bypass the default account selection.
+    fn catalog_account_for(
+        &self,
+        provider: &str,
+        session: Option<&SessionId>,
+    ) -> Option<&AccountRow> {
+        let pinned_account = session
+            .and_then(|id| self.session_catalog_routes.get(id))
+            .and_then(|(_, account)| account.as_deref());
+        self.accounts.rows.iter().find(|account| {
+            account.provider == provider
+                && pinned_account.map_or(account.selected, |alias| account.alias == alias)
+        })
+    }
+
     /// Every current composer judges the selected model against the same
     /// catalog owner and the session's explicit route. Account replies can
     /// prove the former owner retired before a new provider reply arrives.
@@ -12847,17 +12862,17 @@ impl AppModel {
                                 .zip(scope.account_incarnation)
                                 .is_none_or(|(alias, incarnation)| {
                                     incarnation != 0
-                                        && self.accounts.rows.iter().any(|account| {
-                                            account.selected
-                                                && account.provider == provider
-                                                && account.alias == alias
-                                                && self
-                                                    .accounts
-                                                    .catalog_incarnations
-                                                    .get(alias)
-                                                    .copied()
-                                                    == Some(incarnation)
-                                        })
+                                        && self.catalog_account_for(provider, session).is_some_and(
+                                            |account| {
+                                                account.alias == alias
+                                                    && self
+                                                        .accounts
+                                                        .catalog_incarnations
+                                                        .get(alias)
+                                                        .copied()
+                                                        == Some(incarnation)
+                                            },
+                                        )
                                 }))
                 })
                 && session
@@ -13048,10 +13063,7 @@ impl AppModel {
         self.fence_provider_catalogs();
         self.project_provider_inventories();
         let current_scope = self
-            .accounts
-            .rows
-            .iter()
-            .find(|row| row.selected && row.provider == self.identity.provider)
+            .catalog_account_for(&self.identity.provider, self.active_session.as_ref())
             .and_then(|row| {
                 self.accounts
                     .catalog_incarnations

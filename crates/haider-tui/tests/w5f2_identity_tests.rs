@@ -3269,11 +3269,13 @@ fn catalog_order_child_case(changed: bool) {
     catalog_order_child_snapshot_case(changed, true);
 }
 
-fn catalog_order_child_snapshot_case(changed: bool, provider_reply: bool) {
+fn catalog_order_steer_child(
+    model: &mut AppModel,
+    child_session: &haider_protocol::ids::SessionId,
+) {
     use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
     use haider_protocol::ids::{AgentId, LeaseId, SessionId};
     use haider_tui::app::{ChipModel, Screen};
-    let (mut model, mut driver, child_session) = catalog_order_setup();
     let parent = SessionId::new("catalog-child-parent");
     model.upsert_live_session(&parent);
     model.open_session(&parent);
@@ -3302,6 +3304,11 @@ fn catalog_order_child_snapshot_case(changed: bool, provider_reply: bool) {
     model.chips = vec![chip];
     model.view_path = vec!["catalog-child".into()];
     model.screen = Screen::Subagent;
+}
+
+fn catalog_order_child_snapshot_case(changed: bool, provider_reply: bool) {
+    let (mut model, mut driver, child_session) = catalog_order_setup();
+    catalog_order_steer_child(&mut model, &child_session);
     assert!(
         model
             .surface_composer_identity(100)
@@ -3733,4 +3740,78 @@ fn catalog_order_child_account_reply_retires_before_provider_reply() {
 #[test]
 fn catalog_order_child_same_account_reply_keeps_model_while_provider_is_delayed() {
     catalog_order_child_snapshot_case(false, false);
+}
+
+fn catalog_order_pinned_account_case(child: bool, producing_account_changed: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        "custom",
+        "shared-model",
+        30,
+        "synthetic-producer-42",
+        (None, Some("work")),
+    );
+    if child {
+        catalog_order_steer_child(&mut model, &session);
+    }
+    assert!(
+        model
+            .surface_composer_identity(100)
+            .is_some_and(|label| label.contains("shared-model")),
+        "explicit-pin positive control"
+    );
+    catalog_order_render(&model);
+
+    let mut pinned = oauth_descriptor("custom", "work", false);
+    pinned.incarnation = if producing_account_changed { 43 } else { 42 };
+    let mut default = oauth_descriptor("custom", "other", true);
+    default.incarnation = 99;
+    default.identity = "other@example.test".into();
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![pinned, default],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    // Keep the provider reply delayed. A pin names its own producing account,
+    // so the newly selected default alone cannot retire that account's data.
+    catalog_order_render(&model);
+    let identity = model.surface_composer_identity(100);
+    if producing_account_changed {
+        assert!(
+            !identity.is_some_and(|label| label.contains("shared-model")),
+            "an explicit account pin must retire a changed producing account"
+        );
+    } else {
+        assert!(
+            identity.is_some_and(|label| label.contains("shared-model")),
+            "an explicit account pin must preserve its unchanged producing account"
+        );
+    }
+}
+
+#[test]
+fn catalog_order_pinned_parent_keeps_unchanged_producer() {
+    catalog_order_pinned_account_case(false, false);
+}
+
+#[test]
+fn catalog_order_pinned_child_keeps_unchanged_producer() {
+    catalog_order_pinned_account_case(true, false);
+}
+
+#[test]
+fn catalog_order_pinned_parent_retires_changed_producer() {
+    catalog_order_pinned_account_case(false, true);
+}
+
+#[test]
+fn catalog_order_pinned_child_retires_changed_producer() {
+    catalog_order_pinned_account_case(true, true);
 }
