@@ -991,11 +991,11 @@ impl LockdownManager {
     ) -> Result<T, LockdownError> {
         let lock_path = self.root.join(QUOTA_LOCK_FILE);
         let lock = private_open(&lock_path, true)?;
-        haider_platform::lock_file_exclusive(&lock)
+        let lock = haider_platform::FileLock::exclusive(lock)
             .map_err(|source| io_error("lock", &lock_path, source))?;
         cleanup_stale_temporaries(&self.root)?;
         let result = operation();
-        let unlocked = haider_platform::unlock_file(&lock)
+        let unlocked = haider_platform::unlock_file(lock.file())
             .map_err(|source| io_error("unlock", &lock_path, source));
         #[cfg(test)]
         let unlocked = unlocked.and_then(|()| publication_io_fault(4, &lock_path));

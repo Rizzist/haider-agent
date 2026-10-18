@@ -7,6 +7,34 @@ use haider_protocol::ids::CredentialAlias;
 use crate::file_vault::FileVault;
 use crate::vault::Vault;
 
+#[test]
+fn file_refresh_lease_release_does_not_wait_for_a_duplicated_descriptor() {
+    let root = temp_root();
+    let path = root.path().join("synthetic-refresh.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("synthetic lock file");
+    // Same description as the fork-to-exec copy, without a machine timing race.
+    let duplicate = file.try_clone().expect("duplicate descriptor");
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("independent opener");
+    let lock = crate::vault::VaultRefreshLock::from_file(file).expect("refresh lease");
+    assert!(matches!(
+        haider_platform::try_lock_file_exclusive(&probe),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(lock);
+    haider_platform::try_lock_file_exclusive(&probe).expect("owner release despite duplicate");
+    haider_platform::unlock_file(&probe).expect("probe release");
+    drop(duplicate);
+}
+
 fn temp_root() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }

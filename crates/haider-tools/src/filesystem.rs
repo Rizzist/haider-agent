@@ -2696,7 +2696,7 @@ async fn insert_memoized_read_if_current(
 fn read_footprint_is_current(workspace_dir: OwnedFd, footprint: &ReadFootprint) -> bool {
     let mut hasher = blake3::Hasher::new();
     for expected in &footprint.entries {
-        let Ok(root) = rustix::io::dup(&workspace_dir) else {
+        let Ok(root) = haider_platform::duplicate_workspace_directory(&workspace_dir) else {
             return false;
         };
         let Ok(metadata) = freshness_stat_at(root, &expected.path) else {
@@ -2820,9 +2820,9 @@ fn read_path_at(
 }
 
 #[cfg(unix)]
-fn read_utf8_file(mut file: fs::File, display_path: &Path) -> ToolResult<String> {
+fn read_utf8_file(file: fs::File, display_path: &Path) -> ToolResult<String> {
     let bytes =
-        metadata_guarded_file_snapshot_with_reader(&mut file, display_path, |snapshot, buffer| {
+        metadata_guarded_file_snapshot_with_reader(&file, display_path, |snapshot, buffer| {
             snapshot.read_at(buffer, 0)
         })?;
     String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
@@ -3791,7 +3791,7 @@ fn push_repository_footprint(
 
 #[cfg(unix)]
 fn freshness_stamp_at(workspace_dir: &OwnedFd, path: &Path) -> Option<FreshnessStamp> {
-    let root = rustix::io::dup(workspace_dir).ok()?;
+    let root = haider_platform::duplicate_workspace_directory(workspace_dir).ok()?;
     let metadata = freshness_stat_at(root, path).ok()?;
     Some(FreshnessStamp {
         path: path.to_path_buf(),
@@ -3814,7 +3814,7 @@ fn open_search_file(
     relative: &Path,
     display_path: &Path,
 ) -> ToolResult<fs::File> {
-    let root = rustix::io::dup(workspace_dir)
+    let root = haider_platform::duplicate_workspace_directory(workspace_dir)
         .map_err(|error| ToolError::io("duplicate workspace root", display_path, error))?;
     let file = open_target_at(
         root,
@@ -4965,7 +4965,7 @@ pub(crate) fn read_checkpoint_state_anchored(
     relative: &Path,
 ) -> ToolResult<Option<Vec<u8>>> {
     let display_path = workspace_root.join(relative);
-    let traversal_root = rustix::io::dup(workspace_dir)
+    let traversal_root = haider_platform::duplicate_workspace_directory(workspace_dir)
         .map_err(|error| ToolError::io("duplicate checkpoint workspace", workspace_root, error))?;
     let (parent, leaf) = open_parent_at(traversal_root, relative, &display_path)?;
     match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
@@ -4976,8 +4976,8 @@ pub(crate) fn read_checkpoint_state_anchored(
             error,
         )),
         Ok(_) => {
-            let (mut file, _) = open_locked_current_at(&parent, &leaf, &display_path)?;
-            let (bytes, _) = file_snapshot(&parent, &mut file, &display_path)?.parts();
+            let (file, _) = open_locked_current_at(&parent, &leaf, &display_path)?;
+            let (bytes, _) = file_snapshot(&parent, file.file(), &display_path)?.parts();
             Ok(Some(bytes))
         }
     }
@@ -5012,14 +5012,14 @@ fn install_checkpoint_state_in(
 ) -> Result<(), crate::checkpoint::InstallStateError> {
     use crate::checkpoint::InstallStateError;
     let display_path = workspace_root.join(relative);
-    let traversal_root = rustix::io::dup(workspace_dir)
+    let traversal_root = haider_platform::duplicate_workspace_directory(workspace_dir)
         .map_err(|error| ToolError::io("duplicate checkpoint workspace", workspace_root, error))?;
     let (parent, leaf) = open_parent_at(traversal_root, relative, &display_path)?;
     let mut current = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => {
-            let (mut file, metadata) = open_locked_current_at(&parent, &leaf, &display_path)
+            let (file, metadata) = open_locked_current_at(&parent, &leaf, &display_path)
                 .map_err(checkpoint_install_error)?;
-            let (current_bytes, _) = file_snapshot(&parent, &mut file, &display_path)
+            let (current_bytes, _) = file_snapshot(&parent, file.file(), &display_path)
                 .map_err(checkpoint_install_error)?
                 .parts();
             let current_digest = freshness_digest_for_expected(&current_bytes, expected_digest);
@@ -5077,7 +5077,8 @@ fn install_checkpoint_state_in(
         }
     };
     if let Some((file, _, source_hash)) = current.as_mut()
-        && let Err(error) = require_unchanged_content(&parent, file, *source_hash, &display_path)
+        && let Err(error) =
+            require_unchanged_content(&parent, file.file(), *source_hash, &display_path)
     {
         if let Some(name) = staged.as_deref() {
             remove_temporary(&parent, name);
@@ -5188,9 +5189,9 @@ pub(crate) fn install_checkpoint_state(
         Ok(metadata) => {
             require_windows_regular_file(&target, &display_path, &metadata)
                 .map_err(checkpoint_install_error)?;
-            let mut file = open_windows_locked_file(&target, &display_path)
+            let file = open_windows_locked_file(&target, &display_path)
                 .map_err(checkpoint_install_error)?;
-            let snapshot = windows_stable_snapshot(&mut file, &display_path)
+            let snapshot = windows_stable_snapshot(file.file(), &display_path)
                 .map_err(checkpoint_install_error)?;
             let current_digest = freshness_digest_for_expected(&snapshot.bytes, expected_digest);
             match expected_digest {
@@ -5202,6 +5203,7 @@ pub(crate) fn install_checkpoint_state(
                 }
             }
             let permissions = file
+                .file()
                 .metadata()
                 .map_err(|error| {
                     ToolError::io("inspect checkpoint permissions", &display_path, error)
@@ -5237,7 +5239,7 @@ pub(crate) fn install_checkpoint_state(
                     .map(|(_, _, _, permissions)| permissions.clone()),
             )?;
             if let Some((file, _, _, _)) = current.as_ref()
-                && let Err(error) = copy_windows_dacl(file, &staged.file, &display_path)
+                && let Err(error) = copy_windows_dacl(file.file(), &staged.file, &display_path)
             {
                 let _ = delete_windows_entry(staged.file, &display_path);
                 return Err(error.into());
@@ -5253,7 +5255,7 @@ pub(crate) fn install_checkpoint_state(
             &parent,
             &target,
             &display_path,
-            Some((file, *identity, *hash)),
+            Some((file.file(), *identity, *hash)),
         ),
         None => revalidate_windows_mutation(
             &workspace_dir,
@@ -5424,8 +5426,8 @@ fn apply_windows_write(
         windows_mutation_target(workspace_root, relative, &operation.path, true)?;
     let mut existing = match fs::symlink_metadata(&target) {
         Ok(_) => {
-            let mut file = open_windows_locked_file(&target, &operation.path)?;
-            let source = windows_stable_snapshot(&mut file, &operation.path)?;
+            let file = open_windows_locked_file(&target, &operation.path)?;
+            let source = windows_stable_snapshot(file.file(), &operation.path)?;
             let current_digest = freshness_digest_for_expected(&source.bytes, expected_digest);
             let Some(expected_digest) = expected_digest else {
                 return Err(ToolError::UnreadFile {
@@ -5461,6 +5463,7 @@ fn apply_windows_write(
         .map(|source| {
             source
                 ._file
+                .file()
                 .metadata()
                 .map(|metadata| metadata.permissions())
         })
@@ -5468,7 +5471,7 @@ fn apply_windows_write(
         .map_err(|error| ToolError::io("inspect target permissions", &operation.path, error))?;
     let temporary = stage_windows_content(parent.path(), &operation.path, bytes, permissions)?;
     if let Some(source) = existing.as_ref()
-        && let Err(error) = copy_windows_dacl(&source._file, &temporary.file, &operation.path)
+        && let Err(error) = copy_windows_dacl(source._file.file(), &temporary.file, &operation.path)
     {
         let _ = delete_windows_entry(temporary.file, &operation.path);
         return Err(error);
@@ -5481,7 +5484,7 @@ fn apply_windows_write(
         &operation.path,
         existing
             .as_mut()
-            .map(|source| (&mut source._file, source.identity, source.hash)),
+            .map(|source| (source._file.file(), source.identity, source.hash)),
     ) {
         Ok(revalidated) => revalidated,
         Err(error) => {
@@ -5555,8 +5558,8 @@ fn apply_windows_edit(
 ) -> ToolResult<AppliedMutation> {
     let (parent, target) =
         windows_mutation_target(workspace_root, relative, &operation.path, false)?;
-    let mut source_file = open_windows_locked_file(&target, &operation.path)?;
-    let source = windows_stable_snapshot(&mut source_file, &operation.path)?;
+    let source_file = open_windows_locked_file(&target, &operation.path)?;
+    let source = windows_stable_snapshot(source_file.file(), &operation.path)?;
     let current_digest = freshness_digest_for_expected(&source.bytes, expected_digest);
     let Some(expected_digest) = expected_digest else {
         return Err(ToolError::UnreadFile {
@@ -5578,12 +5581,13 @@ fn apply_windows_edit(
     let (edited, replacements, edit_spans) = apply_edit_changes(operation, edited)?;
     let bytes = edited.as_bytes();
     let permissions = source_file
+        .file()
         .metadata()
         .map_err(|error| ToolError::io("inspect target permissions", &operation.path, error))?
         .permissions();
     let temporary =
         stage_windows_content(parent.path(), &operation.path, bytes, Some(permissions))?;
-    if let Err(error) = copy_windows_dacl(&source_file, &temporary.file, &operation.path) {
+    if let Err(error) = copy_windows_dacl(source_file.file(), &temporary.file, &operation.path) {
         let _ = delete_windows_entry(temporary.file, &operation.path);
         return Err(error);
     }
@@ -5593,7 +5597,7 @@ fn apply_windows_edit(
         &parent,
         &target,
         &operation.path,
-        Some((&mut source_file, source.identity, source_hash)),
+        Some((source_file.file(), source.identity, source_hash)),
     ) {
         Ok(revalidated) => revalidated,
         Err(error) => {
@@ -5710,7 +5714,7 @@ struct WindowsSnapshot {
 
 #[cfg(windows)]
 struct WindowsSource {
-    _file: fs::File,
+    _file: haider_platform::FileLock,
     identity: haider_platform::WindowsFileIdentity,
     hash: blake3::Hash,
     bytes: Vec<u8>,
@@ -5738,16 +5742,18 @@ fn open_windows_current(target: &Path, display_path: &Path) -> ToolResult<fs::Fi
 }
 
 #[cfg(windows)]
-fn open_windows_locked_file(target: &Path, display_path: &Path) -> ToolResult<fs::File> {
+fn open_windows_locked_file(
+    target: &Path,
+    display_path: &Path,
+) -> ToolResult<haider_platform::FileLock> {
     let file = open_windows_current(target, display_path)?;
-    file.lock()
-        .map_err(|error| ToolError::io("lock mutation target", display_path, error))?;
-    Ok(file)
+    haider_platform::FileLock::exclusive(file)
+        .map_err(|error| ToolError::io("lock mutation target", display_path, error))
 }
 
 #[cfg(windows)]
 fn windows_stable_snapshot(
-    file: &mut fs::File,
+    mut file: &fs::File,
     display_path: &Path,
 ) -> ToolResult<WindowsSnapshot> {
     use std::os::windows::fs::MetadataExt as _;
@@ -5990,7 +5996,7 @@ fn revalidate_windows_mutation(
     target: &Path,
     display_path: &Path,
     expected_source: Option<(
-        &mut fs::File,
+        &fs::File,
         haider_platform::WindowsFileIdentity,
         blake3::Hash,
     )>,
@@ -6046,13 +6052,13 @@ fn revalidate_windows_mutation(
 
 #[cfg(windows)]
 fn publish_windows_temporary(
-    mut temporary: WindowsStagedFile,
+    temporary: WindowsStagedFile,
     target: &Path,
     replace_existing: bool,
     replacement_hash: blake3::Hash,
     display_path: &Path,
 ) -> ToolResult<()> {
-    let snapshot = windows_stable_snapshot(&mut temporary.file, display_path)?;
+    let snapshot = windows_stable_snapshot(&temporary.file, display_path)?;
     if blake3::hash(&snapshot.bytes) != replacement_hash {
         let _ = delete_windows_entry(temporary.file, display_path);
         return Err(ToolError::PathChanged {
@@ -6678,7 +6684,7 @@ fn copy_windows_entry_from_handle(
     source_display: &Path,
     destination_display: &Path,
     evidence: &mut CopyEvidence<'_>,
-    mut source_entry: WindowsPathEntry,
+    source_entry: WindowsPathEntry,
 ) -> ToolResult<WindowsPathEntry> {
     let source_identity = source_entry.identity;
     evidence.redacted |=
@@ -6745,7 +6751,7 @@ fn copy_windows_entry_from_handle(
         const GENERIC_READ: u32 = 0x8000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
-        let snapshot = windows_stable_snapshot(&mut source_entry.handle, source_display)?;
+        let snapshot = windows_stable_snapshot(&source_entry.handle, source_display)?;
         if snapshot.identity != source_identity.file {
             return Err(ToolError::PathChanged {
                 path: source_display.to_path_buf(),
@@ -7043,7 +7049,7 @@ fn apply_write_at(
     operation: &FsWrite,
     expected_digest: Option<&str>,
 ) -> ToolResult<AppliedMutation> {
-    let traversal_root = rustix::io::dup(&workspace_dir)
+    let traversal_root = haider_platform::duplicate_workspace_directory(&workspace_dir)
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
     let (parent, leaf) = open_parent_creating_at(traversal_root, relative, &operation.path)?;
     // Keep the advisory-exclusive lock on the current inode alive through
@@ -7054,9 +7060,9 @@ fn apply_write_at(
     // typed and no-follow.
     let mut source = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => {
-            let (mut source, metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
+            let (source, metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
             let (source_bytes, _source_basis) =
-                file_snapshot(&parent, &mut source, &operation.path)?.parts();
+                file_snapshot(&parent, source.file(), &operation.path)?.parts();
             let current_digest = freshness_digest_for_expected(&source_bytes, expected_digest);
             let Some(expected_digest) = expected_digest else {
                 return Err(ToolError::UnreadFile {
@@ -7110,7 +7116,7 @@ fn apply_write_at(
         };
     if let Some((source, _, source_hash, _)) = source.as_mut()
         && let Err(error) =
-            require_unchanged_content(&parent, source, *source_hash, &operation.path)
+            require_unchanged_content(&parent, source.file(), *source_hash, &operation.path)
     {
         remove_temporary(&parent, &temporary_name);
         return Err(error);
@@ -7277,12 +7283,12 @@ fn apply_edit_at_with_commit_hooks(
     before_replace: impl FnOnce(),
     before_commit: impl FnOnce(),
 ) -> ToolResult<AppliedMutation> {
-    let traversal_root = rustix::io::dup(&workspace_dir)
+    let traversal_root = haider_platform::duplicate_workspace_directory(&workspace_dir)
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
     let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
-    let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
+    let (source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
     let (source_bytes, _source_basis) =
-        file_snapshot(&parent, &mut source, &operation.path)?.parts();
+        file_snapshot(&parent, source.file(), &operation.path)?.parts();
     let current_digest = freshness_digest_for_expected(&source_bytes, expected_digest);
     let Some(expected_digest) = expected_digest else {
         return Err(ToolError::UnreadFile {
@@ -7330,7 +7336,7 @@ fn apply_edit_at_with_commit_hooks(
             }
         };
     if let Err(error) =
-        require_unchanged_content(&parent, &mut source, source_hash, &operation.path)
+        require_unchanged_content(&parent, source.file(), source_hash, &operation.path)
     {
         remove_temporary(&parent, &temporary_name);
         return Err(error);
@@ -7503,7 +7509,7 @@ fn apply_path_at_with_commit_hook(
             "fs_path refuses to mutate the workspace root",
         ));
     }
-    let source_root = rustix::io::dup(&workspace_dir)
+    let source_root = haider_platform::duplicate_workspace_directory(&workspace_dir)
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.source, error))?;
     let (source_parent, source_leaf) =
         open_parent_at(source_root, source_relative, &operation.source)?;
@@ -7592,8 +7598,10 @@ fn apply_path_at_with_commit_hook(
             }
             structural.push(0);
             structural.extend_from_slice(relative_path_argument(destination_relative)?.as_bytes());
-            let destination_root = rustix::io::dup(&workspace_dir)
-                .map_err(|error| ToolError::io("duplicate workspace root", destination, error))?;
+            let destination_root = haider_platform::duplicate_workspace_directory(&workspace_dir)
+                .map_err(|error| {
+                ToolError::io("duplicate workspace root", destination, error)
+            })?;
             let (destination_parent, destination_leaf) =
                 open_parent_at(destination_root, destination_relative, destination)?;
             let destination_metadata = match rustix::fs::statat(
@@ -8088,9 +8096,9 @@ fn copy_entry_at(
                 "open copy source",
                 source_path,
             )?;
-            let mut source = fs::File::from(source);
+            let source = fs::File::from(source);
             let bytes = metadata_guarded_file_snapshot_with_reader(
-                &mut source,
+                &source,
                 source_path,
                 |snapshot, buffer| snapshot.read_at(buffer, 0),
             )?;
@@ -8215,7 +8223,7 @@ fn replace_temporary_at_commit(
 #[cfg(unix)]
 fn require_unchanged_content(
     parent: &OwnedFd,
-    source: &mut fs::File,
+    source: &fs::File,
     expected: blake3::Hash,
     display_path: &Path,
 ) -> ToolResult<()> {
@@ -8257,7 +8265,7 @@ impl FileSnapshot {
 #[cfg(unix)]
 fn file_snapshot(
     parent: &OwnedFd,
-    source: &mut fs::File,
+    source: &fs::File,
     display_path: &Path,
 ) -> ToolResult<FileSnapshot> {
     file_snapshot_with_reader(
@@ -8272,21 +8280,17 @@ fn file_snapshot(
 #[cfg(unix)]
 fn file_snapshot_with_reader(
     parent: &OwnedFd,
-    source: &mut fs::File,
+    source: &fs::File,
     display_path: &Path,
     clone_source: impl FnOnce(&OwnedFd, &fs::File) -> Option<fs::File>,
     mut read_once: impl FnMut(&fs::File, &mut [u8]) -> std::io::Result<usize>,
 ) -> ToolResult<FileSnapshot> {
-    if let Some(mut clone) = clone_source(parent, source) {
-        return metadata_guarded_file_snapshot_with_reader(
-            &mut clone,
-            display_path,
-            &mut read_once,
-        )
-        .map(|bytes| FileSnapshot {
-            bytes,
-            basis: SnapshotBasis::CowClone,
-        });
+    if let Some(clone) = clone_source(parent, source) {
+        return metadata_guarded_file_snapshot_with_reader(&clone, display_path, &mut read_once)
+            .map(|bytes| FileSnapshot {
+                bytes,
+                basis: SnapshotBasis::CowClone,
+            });
     }
     metadata_guarded_file_snapshot_with_reader(source, display_path, read_once).map(|bytes| {
         FileSnapshot {
@@ -8303,12 +8307,12 @@ fn file_snapshot_with_reader(
 /// fields unchanged, and ordinary writes may evade coarse timestamps.
 #[cfg(unix)]
 fn metadata_guarded_file_snapshot_with_reader(
-    source: &mut fs::File,
+    source: &fs::File,
     display_path: &Path,
     mut read_once: impl FnMut(&fs::File, &mut [u8]) -> std::io::Result<usize>,
 ) -> ToolResult<Vec<u8>> {
     for _ in 0..SNAPSHOT_ATTEMPTS {
-        let before = rustix::fs::fstat(&*source)
+        let before = rustix::fs::fstat(source)
             .map_err(|error| ToolError::io("inspect patch snapshot", display_path, error))?;
         let expected_len = usize::try_from(before.st_size).map_err(|_| ToolError::Runtime {
             message: format!(
@@ -8338,7 +8342,7 @@ fn metadata_guarded_file_snapshot_with_reader(
         bytes.resize(buffer_len, 0);
         let bytes_read = read_once(source, &mut bytes)
             .map_err(|error| ToolError::io("read patch snapshot", display_path, error))?;
-        let after = rustix::fs::fstat(&*source)
+        let after = rustix::fs::fstat(source)
             .map_err(|error| ToolError::io("reinspect patch snapshot", display_path, error))?;
         if bytes_read == expected_len && snapshot_metadata_matches(&before, &after) {
             bytes.truncate(expected_len);
@@ -8447,9 +8451,10 @@ fn revalidate_anchored_commit_parent(
     held_parent: &OwnedFd,
     display_path: &Path,
 ) -> ToolResult<OwnedFd> {
-    let current_root = rustix::io::dup(workspace_dir).map_err(|error| {
-        ToolError::io("duplicate retained checkpoint root", display_path, error)
-    })?;
+    let current_root =
+        haider_platform::duplicate_workspace_directory(workspace_dir).map_err(|error| {
+            ToolError::io("duplicate retained checkpoint root", display_path, error)
+        })?;
     let mut components = normal_components(relative);
     components.pop();
     let current_parent = walk_directories(
@@ -8594,15 +8599,14 @@ fn open_locked_current_at(
     parent: &OwnedFd,
     leaf: &OsStr,
     display_path: &Path,
-) -> ToolResult<(fs::File, rustix::fs::Stat)> {
+) -> ToolResult<(haider_platform::FileLock, rustix::fs::Stat)> {
     const MAX_STALE_OPEN_RETRIES: usize = 16;
     for _ in 0..MAX_STALE_OPEN_RETRIES {
         let source_fd =
             openat_nofollow(parent, leaf, OFlags::RDONLY, "open for patch", display_path)?;
-        let source = fs::File::from(source_fd);
-        haider_platform::lock_file_exclusive(&source)
+        let source = haider_platform::FileLock::exclusive(fs::File::from(source_fd))
             .map_err(|error| ToolError::io("lock for patch", display_path, error))?;
-        let locked = rustix::fs::fstat(&source)
+        let locked = rustix::fs::fstat(source.file())
             .map_err(|error| ToolError::io("inspect locked patch", display_path, error))?;
         let current = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| anchored_io_error("inspect current patch", display_path, error))?;
@@ -9281,7 +9285,7 @@ fn capture_unix_entry_preimage(
             )),
         });
     }
-    let (bytes, _) = file_snapshot(parent, &mut source, display_path)?.parts();
+    let (bytes, _) = file_snapshot(parent, &source, display_path)?.parts();
     let current = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| anchored_io_error("recheck checkpoint pre-image", display_path, error))?;
     let snapshot = rustix::fs::fstat(&source)
@@ -9342,7 +9346,7 @@ fn capture_windows_entry_preimage(
             )),
         });
     }
-    let snapshot = windows_stable_snapshot(&mut entry.handle, display_path)?;
+    let snapshot = windows_stable_snapshot(&entry.handle, display_path)?;
     if snapshot.identity != entry.identity.file {
         return Err(ToolError::PathChanged {
             path: display_path.to_path_buf(),
@@ -9904,8 +9908,7 @@ mod windows_tests {
             .expect("publish created content");
         assert_eq!(fs::read(&target).expect("read created target"), created);
 
-        let mut existing =
-            open_windows_locked_file(&target, &target).expect("lock existing target");
+        let existing = open_windows_locked_file(&target, &target).expect("lock existing target");
         let replaced = b"replaced through the staged publish primitive";
         let temporary = stage_windows_content(&parent, &target, replaced, None)
             .expect("stage replacement content");
@@ -9914,6 +9917,7 @@ mod windows_tests {
         assert_eq!(fs::read(&target).expect("read replaced target"), replaced);
         let mut old_bytes = Vec::new();
         existing
+            .file()
             .read_to_end(&mut old_bytes)
             .expect("read held old target");
         assert_eq!(old_bytes, created);
