@@ -994,7 +994,7 @@ async fn racing_launcher_never_owns_the_other_launchers_winner() {
     let endpoint = profile.endpoint_path.clone();
     let profile_id = profile.profile_id.clone();
     let winner = tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
         while !marker.exists() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1117,7 +1117,7 @@ async fn closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a
     let endpoint = profile.endpoint_path.clone();
     let profile_id = profile.profile_id.clone();
     let winner = tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
         while !marker.exists() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1167,7 +1167,7 @@ async fn closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a
     assert!(ensured.ownership.is_none());
     assert_live_peer_notified(ensured.client.close());
     drop(ensured);
-    tokio::time::timeout(Duration::from_secs(2), winner)
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, winner)
         .await
         .expect("winner join deadline")
         .expect("winner joins after client closes");

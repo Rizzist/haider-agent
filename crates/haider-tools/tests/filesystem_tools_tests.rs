@@ -1540,10 +1540,13 @@ async fn finalizer_and_unknown_race_forces_the_loser_before_the_winner_append() 
         .await
         .expect("release successful ledger append");
     terminal_reached.notified().await;
-    tokio::time::timeout(Duration::from_millis(100), broker.journal_unknown(&intent))
-        .await
-        .expect("claim loser returns before the winner append is released")
-        .expect("claim loser is a no-op");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        broker.journal_unknown(&intent),
+    )
+    .await
+    .expect("claim loser returns before the winner append is released")
+    .expect("claim loser is a no-op");
     assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(terminal_completions.load(Ordering::SeqCst), 0);
     assert_eq!(terminal_phases(&observed_journal.effect_phases()).len(), 0);

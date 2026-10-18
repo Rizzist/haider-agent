@@ -37,6 +37,11 @@ pub struct VaultRefreshLock {
 }
 
 impl VaultRefreshLock {
+    pub(crate) fn from_file(file: std::fs::File) -> Result<Self, std::fs::TryLockError> {
+        let lock = haider_platform::FileLock::try_exclusive(file)?;
+        Ok(Self::new(move || drop(lock)))
+    }
+
     pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
         Self {
             release: Some(Box::new(release)),

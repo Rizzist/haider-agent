@@ -219,9 +219,9 @@ fn subscriber_start_observation_timeout(
         + HOOK_OBSERVATION_POLL_INTERVAL
 }
 
-// Snapshot-only waits do not spawn a process: one second is the product idle
-// delay and two seconds cover the test observer's SQLite/runtime scheduling.
-const SNAPSHOT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(3);
+// Snapshot-only readiness follows the observed journal state. Use the shared
+// watchdog for SQLite/runtime scheduling; the product idle timer is unchanged.
+const SNAPSHOT_OBSERVATION_TIMEOUT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
 #[cfg(unix)]
 fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {

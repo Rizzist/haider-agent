@@ -4644,7 +4644,7 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
         assert_eq!(notices, 1, "{label} receives exactly one drain notice");
     }
     task.shutdown_handle().request("test complete");
-    let (outcome, (), ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let (outcome, (), ()) = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         tokio::join!(
             task.join(),
             consume_shutdown(&mut client, "parent"),
