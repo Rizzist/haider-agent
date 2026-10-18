@@ -226,29 +226,54 @@ fn spawned_daemon_startup_descriptors_survive_the_bounded_sweep() {
 #[cfg(unix)]
 #[test]
 fn timed_out_child_wait_does_not_pin_runtime_shutdown() {
-    let child = std::process::Command::new("sh")
-        .args(["-c", "sleep 2"])
+    let cat = if cfg!(target_os = "android") {
+        "/system/bin/cat"
+    } else {
+        "/bin/cat"
+    };
+    let mut child = std::process::Command::new(cat)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn wait fixture");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("build fixture runtime");
-    let started = std::time::Instant::now();
-    let timed_out = runtime.block_on(async {
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            super::wait_for_child_exit(child),
-        )
-        .await
-        .is_err()
+    let gate = child.stdin.take().expect("child exit gate");
+    let monitor = super::ProcessExitMonitor::capture(
+        super::ProcessId::from_raw(child.id() as i32).expect("child PID"),
+    )
+    .expect("pin fixture child");
+    let (completed, completion) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build fixture runtime");
+        let timed_out = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                super::wait_for_child_exit(child),
+            )
+            .await
+            .is_err()
+        });
+        drop(runtime);
+        let _ = completed.send(timed_out);
     });
-    assert!(timed_out, "fixture child should outlive the wait deadline");
-    drop(runtime);
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "runtime shutdown waited for the detached child waiter"
-    );
+    // Runtime shutdown must finish while this exact child is still gated.
+    // Always release before asserting, including a blocking-wait mutation.
+    let result = completion.recv_timeout(crate::TEST_WAIT_TIMEOUT);
+    drop(gate);
+    worker.join().expect("runtime fixture thread joins");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("cleanup runtime");
+    runtime.block_on(async {
+        tokio::time::timeout(crate::TEST_WAIT_TIMEOUT, monitor.wait())
+            .await
+            .expect("owned fixture child exits")
+            .expect("monitor child exit");
+    });
+    assert!(result.expect("runtime shutdown must not wait for the gated child"));
 }
 
 #[cfg(target_os = "linux")]

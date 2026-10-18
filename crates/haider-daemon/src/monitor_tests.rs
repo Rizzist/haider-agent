@@ -10,7 +10,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::{oneshot as tokio_oneshot, watch as tokio_watch};
 use tokio::time::timeout;
 
-const MONITOR_REPORT_WAIT: Duration = Duration::from_secs(3);
+const MONITOR_REPORT_WAIT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
 fn monitor_report_wait() -> Duration {
     #[cfg(windows)]
@@ -610,7 +610,7 @@ impl MonitorWorld {
     }
 
     async fn wait_for_count(&self, expected: usize) -> BoundedResult {
-        timeout(Duration::from_secs(3), async {
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
             loop {
                 let result = self.execute("list-poll", MonitorRequest::List).await;
                 let count = serde_json::from_str::<serde_json::Value>(&result.preview)
@@ -1112,7 +1112,7 @@ async fn client_mutation_rechecks_shutdown_after_waiting_for_the_mutation_lock()
     service.inner.shutdown.send_replace(true);
     drop(guard);
 
-    let receipt = timeout(Duration::from_secs(3), task)
+    let receipt = timeout(haider_platform::TEST_WAIT_TIMEOUT, task)
         .await
         .expect("racing mutation did not stop")
         .expect("racing mutation task");
@@ -1336,7 +1336,7 @@ async fn failed_durable_delete_rollback_restores_registry_timeout_and_pending_de
         1,
     )
     .expect("publish pending delete event");
-    timeout(Duration::from_secs(3), delivery_started)
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, delivery_started)
         .await
         .expect("pending delivery did not start")
         .expect("pending delivery start sender dropped");
@@ -1415,7 +1415,7 @@ async fn published_sms_wakes_a_normal_durable_turn_through_default_sink() {
     .expect("publish SMS monitor event");
     assert_eq!(receipt.subscriber_count, 1);
 
-    timeout(Duration::from_secs(3), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = world
                 .store
@@ -1635,7 +1635,7 @@ async fn failed_delivery_retries_the_same_durable_report() {
     assert_eq!(report.monitor_id, monitor_id);
     assert_eq!(report.coalesced_count, 1);
     assert!(attempts.load(Ordering::SeqCst) >= 2);
-    timeout(Duration::from_secs(3), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if world
                 .hub
@@ -1672,7 +1672,7 @@ async fn stalled_delivery_retains_a_bounded_follow_up_occurrence() {
     }));
     let sources = world.hub.monitor_source_hub();
     publish_sms_incoming(&sources, "+1", "first occurrence", 1).expect("publish first occurrence");
-    timeout(Duration::from_secs(3), delivery_started)
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, delivery_started)
         .await
         .expect("first delivery did not start")
         .expect("first delivery start sender dropped");
@@ -1682,7 +1682,7 @@ async fn stalled_delivery_retains_a_bounded_follow_up_occurrence() {
     // follow-up slot rather than disappear as AlreadyPending.
     publish_sms_incoming(&sources, "+1", "second occurrence", 2)
         .expect("publish second occurrence");
-    timeout(Duration::from_secs(3), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if world
                 .hub
@@ -1716,7 +1716,7 @@ async fn stalled_delivery_retains_a_bounded_follow_up_occurrence() {
     assert!(second.events.iter().any(|event| {
         matches!(&event.payload, MonitorEventPayload::Sms(sms) if sms.body == "second occurrence")
     }));
-    timeout(Duration::from_secs(3), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if world
                 .hub
@@ -1760,7 +1760,7 @@ async fn terminal_pending_report_rejects_a_second_manual_trigger_and_cleans_up()
         )
         .await;
     assert_eq!(first.status, ToolResultStatus::Completed);
-    timeout(Duration::from_secs(3), delivery_started)
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, delivery_started)
         .await
         .expect("terminal delivery did not start")
         .expect("terminal delivery start sender dropped");
@@ -2097,7 +2097,7 @@ async fn oversized_file_snapshot_reads_only_the_bounded_tail() {
     drop(file);
 
     let snapshot = timeout(
-        Duration::from_secs(2),
+        haider_platform::TEST_WAIT_TIMEOUT,
         read_file_snapshot(&path, root.path(), None),
     )
     .await
@@ -2264,7 +2264,7 @@ async fn completed_leader_with_pipe_holding_descendant_is_bounded() {
     let workspace = root.path().to_string_lossy().into_owned();
     let (_cancel, mut cancelled) = tokio_oneshot::channel();
     let error = timeout(
-        Duration::from_secs(2),
+        haider_platform::TEST_WAIT_TIMEOUT,
         run_command_capped(
             &command,
             Some(&workspace),
@@ -2289,7 +2289,7 @@ async fn completed_leader_with_pipe_holding_descendant_is_bounded() {
         .insert(&watch.owner_session_id, watch.clone());
     let (_cancel, cancelled) = tokio_oneshot::channel();
     let task = tokio::spawn(run_monitor_source(service, watch, cancelled));
-    let terminal = timeout(Duration::from_secs(3), async {
+    let terminal = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let event = subscription.recv().await.expect("process event");
             if matches!(
@@ -2310,7 +2310,7 @@ async fn completed_leader_with_pipe_holding_descendant_is_bounded() {
             ..
         }
     ));
-    timeout(Duration::from_secs(1), task)
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, task)
         .await
         .expect("process runner did not finish")
         .expect("process runner task");
@@ -2322,7 +2322,7 @@ async fn process_runner_emits_lines_exit_and_on_failure_restart() {
     async fn collect_terminal(subscription: &mut MonitorSubscription) -> Vec<MonitorEventPayload> {
         let mut payloads = Vec::new();
         loop {
-            let event = timeout(Duration::from_secs(4), subscription.recv())
+            let event = timeout(haider_platform::TEST_WAIT_TIMEOUT, subscription.recv())
                 .await
                 .expect("process event timeout")
                 .expect("process event");

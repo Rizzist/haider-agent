@@ -1340,11 +1340,11 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     let bounded =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let collected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         bounded.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await
@@ -1691,9 +1691,12 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
         .expect("delegation lookup")
         .expect("delegation row");
     delegation.launch(&established).await.expect("launch child");
-    timeout(Duration::from_secs(5), provider.gate_started.notified())
-        .await
-        .expect("first child request");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.gate_started.notified(),
+    )
+    .await
+    .expect("first child request");
     let first_request = provider.requests().remove(0);
     let handoff_line = format!(
         "Ephemeral parent handoff directory: {manifest_handoff} (EPHEMERAL; use it for shared specs, never durable storage)."
@@ -1750,7 +1753,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
     assert!(conflict.1.contains("different semantics"));
     provider.release_gate.notify_one();
 
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while provider.requests().len() < 2 {
             tokio::task::yield_now().await;
         }
@@ -2024,9 +2027,12 @@ async fn message_subagent_starts_an_idle_child_immediately() {
         serde_json::from_str(&tool_result.preview).expect("decode tool delivery receipt");
     assert_eq!(receipt.delivery, AgentMessageDelivery::DeliveredQueued);
     assert_ne!(receipt.child_run_id, child_record.child_run_id);
-    timeout(Duration::from_secs(5), provider.gate_started.notified())
-        .await
-        .expect("idle child starts second request");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.gate_started.notified(),
+    )
+    .await
+    .expect("idle child starts second request");
     let running_tool_result = dispatcher
         .execute(
             &parent_run,
@@ -2052,7 +2058,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
     );
     assert_eq!(running_receipt.child_run_id, receipt.child_run_id);
     provider.release_gate.notify_one();
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while provider.requests().len() < 3 {
             tokio::task::yield_now().await;
         }
@@ -2630,7 +2636,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .await
         .expect("submit parent worker");
 
-    timeout(Duration::from_secs(10), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&parent_session, 0, 512)
@@ -2987,7 +2993,7 @@ async fn wait_for_state(
     session_id: &SessionId,
     expected: impl Fn(&RunState) -> bool,
 ) {
-    let observed = timeout(Duration::from_secs(5), async {
+    let observed = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store.read(session_id, 0, 1024).await.expect("read run");
             if events.iter().any(|event| {
@@ -3164,7 +3170,7 @@ async fn autonomous_parent_keeps_delegated_request_input_answerable() {
         .submit(accepted)
         .await
         .expect("submit parent");
-    let child = timeout(Duration::from_secs(5), async {
+    let child = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if let Some(child) = hub
                 .delegations_for_parent_run(parent_session.clone(), parent_run.clone())
@@ -3285,6 +3291,7 @@ async fn start_parked_child(
         stall_deadline,
         Duration::from_secs(241),
         Duration::from_secs(1),
+        None,
     )
     .await
 }
@@ -3296,6 +3303,7 @@ async fn start_parked_child_with_wait_budgets(
     stall_deadline: Duration,
     run_wait_timeout: Duration,
     settlement_tail_timeout: Duration,
+    stall_clock: Option<Arc<StallDeadlineTestClock>>,
 ) -> ParkedChildHarness {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -3357,12 +3365,21 @@ async fn start_parked_child_with_wait_budgets(
                 provider: provider.clone(),
             }),
             tool_factory: delegation_tool_factory(),
-            delegation: Some(DelegationHandle::with_wait_budgets(
-                hub.clone(),
-                stall_deadline,
-                run_wait_timeout,
-                settlement_tail_timeout,
-            )),
+            delegation: Some(match stall_clock {
+                Some(clock) => DelegationHandle::with_wait_budgets_and_stall_clock(
+                    hub.clone(),
+                    stall_deadline,
+                    run_wait_timeout,
+                    settlement_tail_timeout,
+                    clock,
+                ),
+                None => DelegationHandle::with_wait_budgets(
+                    hub.clone(),
+                    stall_deadline,
+                    run_wait_timeout,
+                    settlement_tail_timeout,
+                ),
+            }),
             web_search: None,
         },
         false,
@@ -3433,7 +3450,7 @@ async fn wait_for_parent_delegated_menu(
     parent_session: &SessionId,
     agent: &AgentId,
 ) -> (Menu, u64, u64) {
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(parent_session, 0, 1024)
@@ -3699,11 +3716,11 @@ impl UdsControlClient {
         drop(drain_sender);
         let _ = stream.shutdown().await;
         drop(stream);
-        timeout(Duration::from_secs(5), serve_task)
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, serve_task)
             .await
             .expect("UDS serve task stops")
             .expect("UDS serve task joins");
-        timeout(Duration::from_secs(5), writer_owner)
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, writer_owner)
             .await
             .expect("UDS writer owner stops")
             .expect("UDS writer owner joins");
@@ -3717,7 +3734,7 @@ async fn wait_for_chip(
     agent: &haider_protocol::ids::AgentId,
     expected: ChipState,
 ) {
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let payloads = typed_payloads(
                 &store
@@ -3773,17 +3790,26 @@ async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
 #[tokio::test]
 #[cfg(unix)]
 async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
-    // 300ms: under parallel suite load the child's first round can
-    // exceed a 35ms stall deadline BEFORE the park commits — a legal
-    // pre-park nudge that the parked-silence law must not miss-read
-    // (5/5 standalone, flaky in-suite at 35ms).
-    let harness = start_parked_child(
+    // Freeze the stall clock throughout child startup. No amount of executor
+    // delay can consume a stall interval before the durable human-input park.
+    let stall_clock = Arc::new(StallDeadlineTestClock::default());
+    let harness = start_parked_child_with_wait_budgets(
         "permission-stall",
         ParkedChildMode::StallAfterApproval,
         Duration::from_millis(300),
+        Duration::from_secs(241),
+        Duration::from_secs(1),
+        Some(Arc::clone(&stall_clock)),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(160)).await;
+    stall_clock.set_now_ms(u64::MAX);
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while stall_clock.parked_checks_at(u64::MAX) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("collector observes the park after the stall clock expires");
     let parked_payloads = typed_payloads(
         &harness
             .store
@@ -3869,19 +3895,23 @@ async fn parent_user_answers_delegated_question_over_uds_and_child_continues() {
         harness.hub.clone(),
         Duration::from_millis(75),
     );
-    // Registry #94 test arithmetic: the outer 250ms observer contains the
-    // production 75ms mirror bound plus 175ms of executor scheduling margin.
-    let first_wait_timed_out = timeout(
-        Duration::from_millis(250),
-        terminal_mirror
-            .terminal_mirror_times_out_for_test(&harness.child, Duration::from_millis(75)),
+    // The 75ms mirror deadline is policy input. The outer watchdog only
+    // detects a stuck fixture; the returned timeout outcome is the assertion.
+    let first_wait_timeout = timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        terminal_mirror.terminal_mirror_timeout_for_test(&harness.child, Duration::from_millis(75)),
     )
     .await
-    .expect("terminal mirror first wait honors its production bound")
-    .expect("terminal mirror reads child journal");
+    .expect("terminal mirror returns its timeout outcome")
+    .expect("terminal mirror reads child journal")
+    .expect("an InputRequired child is not terminal completion evidence");
+    assert_eq!(
+        first_wait_timeout.operation(),
+        "delegated child terminal mirror"
+    );
     assert!(
-        first_wait_timed_out,
-        "an InputRequired child is not terminal completion evidence"
+        first_wait_timeout.limit() <= Duration::from_millis(75),
+        "the production wait must use the requested mirror budget: {first_wait_timeout}"
     );
     let mut control = UdsControlClient::connect(harness.hub.clone()).await;
     let replayed = control.attach_control(harness.parent_session.clone()).await;
@@ -4309,18 +4339,27 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
 }
 
 /// MUTATION CHECK: remove `bounded_wait` around the delegated active wait.
-/// Expected RUNTIME failure: the outer five-second state observer times out
-/// because the parent remains Waiting(LocalChild). Returning token/tool
+/// Expected RUNTIME failure: the external fixture watchdog catches a parent
+/// that remains Waiting(LocalChild). Returning token/tool
 /// counters as completion also fails because the typed timeout disappears.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[cfg(unix)]
 async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
+    // Real store work must not consume the policy clock during startup or
+    // delivery. The external test runner bounds a genuinely stuck fixture.
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let wait_clock = Arc::new(StallDeadlineTestClock::for_paused_wait_deadline());
     let harness = start_parked_child_with_wait_budgets(
         "unanswered-bound",
         ParkedChildMode::Complete,
         Duration::from_secs(1),
         Duration::from_millis(2_250),
         Duration::from_millis(250),
+        Some(wait_clock),
     )
     .await;
     let _ = wait_for_parent_delegated_menu(
@@ -4330,6 +4369,10 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
     )
     .await;
 
+    // Expire the absolute active wait only after the parked child and its
+    // forwarded parent menu are durable, independent of host scheduling.
+    tokio::time::advance(Duration::from_millis(2_250)).await;
+
     wait_for_state(&harness.store, &harness.parent_session, |state| {
         *state == RunState::Errored
     })
@@ -4338,7 +4381,7 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
         *state == RunState::Cancelled
     })
     .await;
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = harness
                 .store
@@ -4388,6 +4431,8 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
     harness.manager.shutdown().await.expect("manager shutdown");
     harness.hub.shutdown().await.expect("hub shutdown");
     harness.store.close().await.expect("store close");
+    clock_guard.abort();
+    let _ = clock_guard.await;
 }
 
 /// MUTATION CHECK: send the exhausted path through `bounded_wait(0, cancel)`
@@ -4408,10 +4453,9 @@ async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
         manifest: harness.child.manifest.clone(),
     };
     timeout(
-        // Registry #94: the production run deadline is already zero. The
-        // outer 250ms covers only one local journal append and nonblocking
-        // actor enqueue; it grants no extra child-wait budget.
-        Duration::from_millis(250),
+        // The production run deadline is already zero. This watchdog bounds
+        // the durable handoff receipt without extending the child-wait budget.
+        haider_platform::TEST_WAIT_TIMEOUT,
         DelegationHandle::new(harness.hub.clone())
             .cancel_ticket(&ticket, Some(tokio::time::Instant::now())),
     )
@@ -4423,7 +4467,7 @@ async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
         *state == RunState::Cancelled
     })
     .await;
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = harness
                 .store
@@ -4668,10 +4712,9 @@ async fn committed_child_progress_resets_the_stall_deadline() {
 #[cfg(unix)]
 async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     const STALL_DEADLINE: Duration = Duration::from_millis(100);
-    // Outer observation bound: twenty complete supervision cycles, each
-    // initial deadline + grace deadline + two 25ms collector polls:
-    // 20 * (100ms + 100ms + 25ms + 25ms) = 5_000ms.
-    const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+    // The injected stall clock and durable progress receipts define the
+    // semantic boundaries. This outer watchdog only catches a stuck fixture.
+    const OBSERVATION_TIMEOUT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -4979,9 +5022,9 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     })
     .to_string();
     timeout(
-        // Registry #94 test arithmetic: the cancellation path owns no wait
-        // beyond the 1s mirror tail; the extra 1s contains actor scheduling.
-        Duration::from_secs(2),
+        // Observe cancellation completion independently of scheduler delay;
+        // the configured one-second terminal-mirror tail remains unchanged.
+        haider_platform::TEST_WAIT_TIMEOUT,
         hub.cancel_internal_turn(TurnCancelCommand {
             command_id: "cancel-w6c-parent".into(),
             request_digest: blake3::hash(cancel_json.as_bytes()).to_hex().to_string(),
@@ -4997,9 +5040,9 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     .expect("parent cancellation completes inside the terminal-mirror bound")
     .expect("cancel parent");
     timeout(
-        // Registry #94: the production cleanup fallback journals and owns a
-        // 1s terminal tail; 250ms contains executor/store scheduling only.
-        Duration::from_millis(1_250),
+        // The production cleanup fallback keeps its one-second terminal
+        // tail. Observe its durable completion independently of scheduling.
+        haider_platform::TEST_WAIT_TIMEOUT,
         async {
             loop {
                 let events = store
@@ -5048,7 +5091,7 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
         *state == RunState::Cancelled
     })
     .await;
-    let child_head = timeout(Duration::from_secs(5), async {
+    let child_head = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&child.child_session_id, 0, 1024)
@@ -5094,7 +5137,7 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     })
     .await
     .expect("child reaches durable idle fence");
-    let terminal_metrics = timeout(Duration::from_secs(5), async {
+    let terminal_metrics = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&parent_session, 0, 1024)
@@ -6117,11 +6160,11 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     let bounded =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let collected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         bounded.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await
@@ -6153,11 +6196,11 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     let restarted =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let recollected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         restarted.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await

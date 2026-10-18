@@ -342,7 +342,7 @@ async fn finalization_failure_journals_top_level_workflow_unfinished_without_par
     let handle = HarnessActor::spawn(runtime_config, provider, store.clone());
 
     let outcome = timeout(
-        Duration::from_secs(2),
+        haider_platform::TEST_WAIT_TIMEOUT,
         handle
             .submit_turn(SubmitTurn::new("finish"))
             .await
@@ -4770,7 +4770,7 @@ async fn link_drop_mid_stream_is_waiting_not_a_provider_fault() {
         .submit_turn(SubmitTurn::new("survive a local link drop"))
         .await
         .expect("turn accepted");
-    timeout(Duration::from_secs(2), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if matches!(
                 states.borrow().as_ref(),
@@ -6534,7 +6534,7 @@ async fn cancellation_mid_tool_completes_tool_as_cancelled_never_failed() {
         .submit_turn(SubmitTurn::new("cancel mid tool"))
         .await
         .expect("turn accepted");
-    timeout(Duration::from_secs(1), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let event = subscriber.recv().await.expect("event");
             if matches!(
@@ -6571,25 +6571,27 @@ async fn cancellation_mid_tool_completes_tool_as_cancelled_never_failed() {
 
 #[tokio::test]
 async fn cancellation_mid_stream_is_terminal_and_discards_later_events() {
-    let (handle, store, _) = runtime(vec![
+    let (provider, barrier) = FakeProvider::new(vec![
         FakeStep::EmitText {
             text: "first".into(),
         },
-        FakeStep::Delay { ms: 200 },
         FakeStep::EmitText {
             text: "second".into(),
         },
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
         },
-    ]);
+    ])
+    .with_stream_barrier(1, 1);
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), Arc::new(provider), store.clone());
     let mut subscriber = handle.subscribe();
     let turn = handle
         .submit_turn(SubmitTurn::new("cancel me"))
         .await
         .expect("turn accepted");
 
-    timeout(Duration::from_secs(1), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let event = subscriber.recv().await.expect("event");
             if matches!(typed(&event), EventPayload::Item(ItemEvent::Delta { .. })) {
@@ -6599,6 +6601,7 @@ async fn cancellation_mid_stream_is_terminal_and_discards_later_events() {
     })
     .await
     .expect("first delta arrives");
+    barrier.wait_until_entered().await;
     turn.cancel();
     let outcome = turn.wait().await.expect("outcome");
     assert_eq!(outcome.state, RunState::Cancelled);
@@ -6629,7 +6632,11 @@ async fn cancellation_mid_stream_is_terminal_and_discards_later_events() {
             }) if text == "second"
         )
     }));
-    sleep(Duration::from_millis(250)).await;
+    barrier.release();
+    handle
+        .stop()
+        .await
+        .expect("cancelled actor joins before the final journal read");
     let after = store.events(&SessionId::new(SESSION)).await;
     assert_eq!(after.len(), before.len(), "nothing follows Cancelled");
 }
@@ -6651,12 +6658,12 @@ async fn cancellation_during_finish_item_close_wins_before_done() {
         .await
         .expect("turn accepted");
 
-    timeout(Duration::from_secs(1), store.blocked.notified())
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, store.blocked.notified())
         .await
         .expect("item completion reached store");
     turn.cancel();
     store.release.notify_one();
-    let outcome = timeout(Duration::from_secs(1), turn.wait())
+    let outcome = timeout(haider_platform::TEST_WAIT_TIMEOUT, turn.wait())
         .await
         .expect("turn terminates")
         .expect("outcome");
@@ -6682,11 +6689,14 @@ async fn cancellation_interrupts_provider_stream_startup() {
         .await
         .expect("turn accepted");
 
-    timeout(Duration::from_secs(1), provider.entered.notified())
-        .await
-        .expect("provider startup entered");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.entered.notified(),
+    )
+    .await
+    .expect("provider startup entered");
     turn.cancel();
-    let outcome = timeout(Duration::from_secs(1), turn.wait())
+    let outcome = timeout(haider_platform::TEST_WAIT_TIMEOUT, turn.wait())
         .await
         .expect("startup cancellation terminates")
         .expect("outcome");
@@ -6709,7 +6719,7 @@ async fn hanging_provider_can_always_be_cancelled() {
         .submit_turn(SubmitTurn::new("hang"))
         .await
         .expect("turn accepted");
-    timeout(Duration::from_secs(1), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let event = subscriber.recv().await.expect("event");
             if matches!(typed(&event), EventPayload::RunState(RunState::Streaming)) {
@@ -6721,7 +6731,7 @@ async fn hanging_provider_can_always_be_cancelled() {
     .expect("streaming state arrives");
 
     turn.cancel();
-    let outcome = timeout(Duration::from_secs(1), turn.wait())
+    let outcome = timeout(haider_platform::TEST_WAIT_TIMEOUT, turn.wait())
         .await
         .expect("cancel completes")
         .expect("outcome");
@@ -6758,7 +6768,7 @@ async fn daemon_nudge_reaches_the_next_safe_provider_boundary_in_the_same_turn()
         .submit_turn(SubmitTurn::new("initial child work"))
         .await
         .expect("turn accepted");
-    timeout(Duration::from_secs(1), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let event = subscriber.recv().await.expect("event");
             if matches!(typed(&event), EventPayload::RunState(RunState::Streaming)) {
@@ -6772,7 +6782,7 @@ async fn daemon_nudge_reaches_the_next_safe_provider_boundary_in_the_same_turn()
     handle
         .nudge("report your status or conclude")
         .expect("nudge accepted without blocking the actor");
-    let outcome = timeout(Duration::from_secs(1), turn.wait())
+    let outcome = timeout(haider_platform::TEST_WAIT_TIMEOUT, turn.wait())
         .await
         .expect("nudged turn completes")
         .expect("turn outcome");
@@ -6991,7 +7001,7 @@ async fn subturn_holds_the_pending_tool_and_reprompts_before_dispatch() {
         .await
         .expect("turn accepted");
 
-    timeout(Duration::from_secs(1), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let event = subscriber.recv().await.expect("text event");
             if matches!(
@@ -7011,7 +7021,7 @@ async fn subturn_holds_the_pending_tool_and_reprompts_before_dispatch() {
         .subturn(subturn_text)
         .expect("subturn accepted without blocking");
 
-    let outcome = timeout(Duration::from_secs(2), turn.wait())
+    let outcome = timeout(haider_platform::TEST_WAIT_TIMEOUT, turn.wait())
         .await
         .expect("subturn turn completes")
         .expect("turn outcome");
@@ -7092,7 +7102,7 @@ async fn subturn_without_a_tool_degrades_to_turn_end_delivery() {
         .submit_turn(SubmitTurn::new("answer directly"))
         .await
         .expect("turn accepted");
-    timeout(Duration::from_secs(1), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let event = subscriber.recv().await.expect("text event");
             if matches!(
@@ -7109,7 +7119,7 @@ async fn subturn_without_a_tool_degrades_to_turn_end_delivery() {
     .await
     .expect("initial text arrives");
     handle.subturn(subturn_text).expect("subturn accepted");
-    let outcome = timeout(Duration::from_secs(2), turn.wait())
+    let outcome = timeout(haider_platform::TEST_WAIT_TIMEOUT, turn.wait())
         .await
         .expect("degraded subturn completes")
         .expect("turn outcome");
@@ -7136,9 +7146,12 @@ async fn submit_flood_is_bounded_and_cannot_starve_provider_progress() {
         .submit_turn(SubmitTurn::new("active stream"))
         .await
         .expect("first turn accepted");
-    timeout(Duration::from_secs(1), provider.first_started.notified())
-        .await
-        .expect("provider stream starts");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.first_started.notified(),
+    )
+    .await
+    .expect("provider stream starts");
 
     let stop = Arc::new(AtomicBool::new(false));
     let busy_count = Arc::new(AtomicUsize::new(0));
@@ -7173,7 +7186,7 @@ async fn submit_flood_is_bounded_and_cannot_starve_provider_progress() {
         }));
     }
 
-    timeout(Duration::from_secs(1), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while busy_count.load(Ordering::Relaxed) < 100 {
             tokio::task::yield_now().await;
         }
@@ -7192,7 +7205,7 @@ async fn submit_flood_is_bounded_and_cannot_starve_provider_progress() {
     );
 
     provider.release.notify_one();
-    let outcome = timeout(Duration::from_secs(1), first.wait())
+    let outcome = timeout(haider_platform::TEST_WAIT_TIMEOUT, first.wait())
         .await
         .expect("provider progress is not starved by command flood")
         .expect("first outcome");

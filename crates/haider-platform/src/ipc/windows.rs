@@ -1453,7 +1453,7 @@ mod tests {
         );
 
         let client = connect(endpoint.address()).await.expect("connect client");
-        let (server, ()) = tokio::time::timeout(Duration::from_secs(1), bound.accept())
+        let (server, ()) = tokio::time::timeout(crate::TEST_WAIT_TIMEOUT, bound.accept())
             .await
             .expect("retained listener accepts before deadline")
             .expect("retained listener accepts");
@@ -1476,7 +1476,7 @@ mod tests {
 
         drop(client);
 
-        tokio::time::timeout(Duration::from_secs(1), watcher.wait())
+        tokio::time::timeout(crate::TEST_WAIT_TIMEOUT, watcher.wait())
             .await
             .expect("peer watcher observes pipe close before deadline")
             .expect("peer watcher accepts ordinary pipe close");
