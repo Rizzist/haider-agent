@@ -82,6 +82,15 @@ daemon-native-close-process-owner	linux	haider-daemon	lib	native_close_waits_for
 warm-projection-seed-share	macos	haider-daemon	lib	concurrent_warm_readers_share_one_reducer_seed	crates/haider-daemon/src/worker_warm_journal_projection_tests.rs
 lockdown-global-thread-writers	all	haider-daemon	lib	concurrent_bindings_and_quota_writes_keep_both_global_ledgers_serialized	crates/haider-daemon/src/lockdown_binding_tests.rs
 lockdown-global-process-writers	all	haider-daemon	lib	concurrent_profile_processes_share_bindings_and_global_quota	crates/haider-daemon/src/lockdown_binding_tests.rs
+lockdown-save-cancelled	all	haider-daemon	lib	cancelled_and_superseded_saves_cannot_activate_either_path	crates/haider-daemon/src/lockdown_save_tests.rs
+lockdown-save-publication	all	haider-daemon	lib	cancellation_after_a_durable_save_refuses_memory_publication	crates/haider-daemon/src/lockdown_save_tests.rs
+lockdown-save-await-revocation	all	haider-daemon	lib	dropped_awaiting_future_revokes_its_detached_blocking_save	crates/haider-daemon/src/lockdown_save_tests.rs
+lockdown-save-file-fence	all	haider-daemon	lib	ownership_is_rechecked_under_the_file_lock_and_before_replacement	crates/haider-daemon/src/lockdown_save_tests.rs
+lockdown-save-owner-scope	all	haider-daemon	lib	save_identity_scope_and_hub_shutdown_do_not_fence_other_owners	crates/haider-daemon/src/lockdown_save_tests.rs
+lockdown-save-worker-retirement	all	haider-daemon	lib	replaced_and_retired_worker_leases_cannot_register_late_saves	crates/haider-daemon/src/lockdown_save_tests.rs
+lockdown-durable-crash-boundary	all	haider-daemon	lib	crash_between_durable_publish_and_execute_recovers_the_frozen_binding	crates/haider-daemon/src/lockdown_binding_tests.rs
+lockdown-startup-publication	all	haider-daemon	test:lockdown_startup_tests	lockdown_join_precedes_every_startup_publication_surface	crates/haider-daemon/tests/lockdown_startup_tests.rs
+lockdown-startup-exits	all	haider-daemon	test:lockdown_startup_tests	early_startup_failures_join_lockdown_initialization	crates/haider-daemon/tests/lockdown_startup_tests.rs
 # Lock ownership and fixture readiness under parallel load (lane 973-file-lock-flake).
 lock-file-refresh-lease-release-does-not-wait-for-a-duplicated-descriptor	linux	haider-accounts	lib	file_refresh_lease_release_does_not_wait_for_a_duplicated_descriptor	crates/haider-accounts/src/file_vault_tests.rs
 lock-capture-waits-for-eof-from-both-descendant-streams	linux	haider-cli	test:autospawn_tests	capture_waits_for_eof_from_both_descendant_streams	crates/haider-cli/tests/autospawn_tests.rs
