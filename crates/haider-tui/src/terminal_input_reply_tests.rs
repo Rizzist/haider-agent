@@ -906,12 +906,24 @@ fn remote_result_order_all_setup_results_survive_lists_and_equal_timestamps() {
             "ssh_profile_not_found",
             "ssh_profile_invalid",
             "ssh_channel_closed",
+            "legacy_setup_text",
         ] {
             for list in ["none", "empty", "older", "same-ms"] {
                 let mut m = result_order_model();
+                if code == "legacy_setup_text" {
+                    m.daemon_features
+                        .remove(haider_rpc::FEATURE_SSH_TYPED_SETUP_ERRORS_V1);
+                }
                 let mut live = LiveDriver::new("result-order");
                 let context = open_profile(&mut m, &mut live, "profile-a");
-                let result = setup_result(code);
+                let mut result = setup_result(code);
+                if code == "legacy_setup_text" {
+                    result.setup_error = None;
+                    m.apply_ssh_shell_output(
+                        "current-shell",
+                        b"legacy_setup_text: setup failed\r\n",
+                    );
+                }
                 live.apply(&mut m, LiveReply::ShellChanged { shell: result });
                 if list != "none" {
                     let mut stale = admitted("current-shell", "profile-a");
