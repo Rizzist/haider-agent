@@ -3277,6 +3277,8 @@ pub struct SshTerminalPane {
     // Results can precede the admission reply. Keep them with this attempt,
     // independently of shell-list snapshots, until the reply identifies its shell.
     observed_shells: Vec<haider_rpc::ShellWire>,
+    // Completion can replace Running before the reply binds the shell ID.
+    observed_running_shells: HashSet<String>,
     pending_output: Vec<(String, zeroize::Zeroizing<Vec<u8>>)>,
     output: zeroize::Zeroizing<Vec<u8>>,
     pub size: haider_rpc::SshPtySizeWire,
@@ -3307,6 +3309,7 @@ impl SshTerminalPane {
             reported_running: false,
             typed_setup_errors: false,
             observed_shells: Vec::new(),
+            observed_running_shells: HashSet::new(),
             pending_output: Vec::new(),
             output: zeroize::Zeroizing::new(Vec::new()),
             size,
@@ -3330,6 +3333,9 @@ impl SshTerminalPane {
             || self.shell_id.as_ref().is_some_and(|id| id != &shell.id)
         {
             return;
+        }
+        if shell.status == haider_rpc::ShellStatusWire::Running {
+            self.observed_running_shells.insert(shell.id.clone());
         }
         let progress = |status: &haider_rpc::ShellStatusWire| match status {
             haider_rpc::ShellStatusWire::Starting => 0,
@@ -18836,7 +18842,8 @@ impl AppModel {
             }
             terminal.connecting =
                 shell.status == haider_rpc::ShellStatusWire::Starting && terminal.output.is_empty();
-            terminal.reported_running = shell.status == haider_rpc::ShellStatusWire::Running;
+            terminal.reported_running = terminal.observed_running_shells.contains(&shell.id);
+            terminal.observed_running_shells.clear();
             terminal.shell_id = Some(shell.id.clone());
             self.flash = Some(
                 if terminal.connecting {

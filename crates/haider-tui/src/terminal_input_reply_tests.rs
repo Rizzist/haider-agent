@@ -1120,6 +1120,59 @@ fn remote_result_order_ordinary_output_keeps_the_command_exit_code() {
                 }
             }
         }
+        // Running and completion can both precede admission. Keep the proof
+        // that this command ran even after its terminal snapshot replaces Running.
+        for typed in [false, true] {
+            for code in [Some(0), Some(17), None] {
+                for list in ["none", "empty", "older", "same-ms"] {
+                    let mut m = result_order_model();
+                    if !typed {
+                        m.daemon_features
+                            .remove(haider_rpc::FEATURE_SSH_TYPED_SETUP_ERRORS_V1);
+                    }
+                    let mut live = LiveDriver::new("result-order");
+                    let context = open_profile(&mut m, &mut live, "profile-a");
+                    m.apply_shell_event(admitted_with_status(
+                        "current-shell",
+                        "profile-a",
+                        haider_rpc::ShellStatusWire::Running,
+                    ));
+                    m.apply_ssh_shell_output("current-shell", b"hello\r\n");
+                    m.apply_shell_event(admitted_with_status(
+                        "current-shell",
+                        "profile-a",
+                        haider_rpc::ShellStatusWire::Exited { code },
+                    ));
+                    if list != "none" {
+                        let mut stale = admitted("current-shell", "profile-a");
+                        stale.last_activity_ms = u64::from(list == "same-ms");
+                        result_order_list(
+                            &mut m,
+                            &mut live,
+                            if list == "empty" { vec![] } else { vec![stale] },
+                        );
+                    }
+                    apply_response(
+                        &mut m,
+                        &mut live,
+                        &context,
+                        haider_rpc::ResponseBody::SshShellOpen {
+                            shell: admitted("current-shell", "profile-a"),
+                        },
+                    );
+                    assert!(m.ssh_terminal.is_none());
+                    assert_eq!(
+                        m.flash,
+                        Some(code.map_or_else(
+                            || "· remote terminal exited".into(),
+                            |code| format!("· remote terminal exited {code}"),
+                        )),
+                        "early completion/typed={typed}/{code:?}/{list}/{w}x{h}"
+                    );
+                    assert!(!snapshot(&m, w, h).contains("opening remote terminal"));
+                }
+            }
+        }
     }
 }
 
@@ -1151,6 +1204,52 @@ fn remote_result_order_only_the_admitted_shell_can_settle_the_attempt() {
         assert!(m.ssh_terminal.as_ref().unwrap().connecting);
         m.apply_ssh_shell_output("old-shell", b"unrelated output");
         assert!(!snapshot(&m, 118, 36).contains("unrelated output"));
+    }
+    for (w, h) in [(118, 36), (80, 24)] {
+        for same_profile in [false, true] {
+            let mut m = result_order_model();
+            m.daemon_features
+                .remove(haider_rpc::FEATURE_SSH_TYPED_SETUP_ERRORS_V1);
+            let mut live = LiveDriver::new("result-order");
+            let context = open_profile(&mut m, &mut live, "profile-a");
+            // A different shell's Running event cannot change this attempt's
+            // genuine legacy setup failure into an ordinary completion.
+            m.apply_shell_event(admitted_with_status(
+                if same_profile {
+                    "other-shell"
+                } else {
+                    "current-shell"
+                },
+                if same_profile {
+                    "profile-a"
+                } else {
+                    "profile-b"
+                },
+                haider_rpc::ShellStatusWire::Running,
+            ));
+            m.apply_ssh_shell_output("current-shell", b"legacy_setup_text: setup failed\r\n");
+            m.apply_shell_event(admitted_with_status(
+                "current-shell",
+                "profile-a",
+                haider_rpc::ShellStatusWire::Exited { code: None },
+            ));
+            apply_response(
+                &mut m,
+                &mut live,
+                &context,
+                haider_rpc::ResponseBody::SshShellOpen {
+                    shell: admitted("current-shell", "profile-a"),
+                },
+            );
+            assert!(m.ssh_terminal.is_none());
+            assert!(
+                m.flash
+                    .as_deref()
+                    .unwrap()
+                    .contains("failed: legacy_setup_text")
+            );
+            assert!(!snapshot(&m, w, h).contains("opening remote terminal"));
+        }
     }
 }
 
