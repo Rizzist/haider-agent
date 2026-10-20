@@ -3273,6 +3273,10 @@ pub struct SshTerminalPane {
     // Older daemons emit setup failures as output before terminalizing.
     // Keep that fallback distinct from output-based connection recovery.
     reported_running: bool,
+    // Results can precede the admission reply. Keep them with this attempt,
+    // independently of shell-list snapshots, until the reply identifies its shell.
+    observed_shells: Vec<haider_rpc::ShellWire>,
+    pending_output: Vec<(String, zeroize::Zeroizing<Vec<u8>>)>,
     output: zeroize::Zeroizing<Vec<u8>>,
     pub size: haider_rpc::SshPtySizeWire,
 }
@@ -3300,6 +3304,8 @@ impl SshTerminalPane {
             shell_id: None,
             connecting: true,
             reported_running: false,
+            observed_shells: Vec::new(),
+            pending_output: Vec::new(),
             output: zeroize::Zeroizing::new(Vec::new()),
             size,
         }
@@ -3315,6 +3321,35 @@ impl SshTerminalPane {
             self.output.drain(..remove);
         }
         self.output.extend_from_slice(&bytes[bytes.len() - keep..]);
+    }
+
+    fn observe_shell(&mut self, shell: &haider_rpc::ShellWire) {
+        if !matches!(&shell.kind, haider_rpc::ShellKindWire::Ssh { profile } if profile == &self.profile)
+            || self.shell_id.as_ref().is_some_and(|id| id != &shell.id)
+        {
+            return;
+        }
+        let progress = |status: &haider_rpc::ShellStatusWire| match status {
+            haider_rpc::ShellStatusWire::Starting => 0,
+            haider_rpc::ShellStatusWire::Running => 1,
+            haider_rpc::ShellStatusWire::Exited { .. } | haider_rpc::ShellStatusWire::Closed => 2,
+        };
+        if let Some(prior) = self.observed_shells.iter_mut().find(|s| s.id == shell.id) {
+            // A shell cannot return to setup or running after completion. An
+            // older/empty list must not erase observed progress, even when the
+            // admission and result have equal millisecond timestamps.
+            if progress(&shell.status) < progress(&prior.status)
+                || (progress(&shell.status) == progress(&prior.status)
+                    && (prior.last_activity_ms > shell.last_activity_ms
+                        || (progress(&prior.status) == 2
+                            && (prior.setup_error.is_some() || shell.setup_error.is_none()))))
+            {
+                return;
+            }
+            *prior = shell.clone();
+        } else {
+            self.observed_shells.push(shell.clone());
+        }
     }
 
     #[must_use]
@@ -18788,9 +18823,17 @@ impl AppModel {
                 haider_rpc::ShellKindWire::Ssh { profile } if profile == &terminal.profile
             )
         {
-            terminal.connecting = shell.status == haider_rpc::ShellStatusWire::Starting;
+            terminal.observe_shell(&shell);
+            terminal.observed_shells.retain(|s| s.id == shell.id);
+            for (id, output) in std::mem::take(&mut terminal.pending_output) {
+                if id == shell.id {
+                    terminal.push_output(&output);
+                }
+            }
+            terminal.connecting =
+                shell.status == haider_rpc::ShellStatusWire::Starting && terminal.output.is_empty();
             terminal.reported_running = shell.status == haider_rpc::ShellStatusWire::Running;
-            terminal.shell_id = Some(shell.id);
+            terminal.shell_id = Some(shell.id.clone());
             self.flash = Some(
                 if terminal.connecting {
                     "· opening remote terminal…"
@@ -18800,6 +18843,7 @@ impl AppModel {
                 .into(),
             );
             self.dirty = true;
+            self.apply_ssh_shell_terminal_state(&shell);
         } else {
             // The user closed the connecting pane before the open reply.
             self.requests.push(AppRequest::ShellClose { id: shell.id });
@@ -18807,6 +18851,35 @@ impl AppModel {
     }
 
     pub(crate) fn apply_ssh_shell_output(&mut self, id: &str, bytes: &[u8]) {
+        if let Some(terminal) = self.ssh_terminal.as_mut()
+            && terminal.shell_id.is_none()
+        {
+            // The reply has not identified the shell yet. Bound all provisional
+            // output together, and display only the admitted shell's bytes.
+            let used: usize = terminal
+                .pending_output
+                .iter()
+                .map(|(_, bytes)| bytes.len())
+                .sum();
+            let keep = bytes
+                .len()
+                .min(SshTerminalPane::OUTPUT_CAPACITY.saturating_sub(used));
+            if keep > 0 {
+                let index = terminal
+                    .pending_output
+                    .iter()
+                    .position(|(shell, _)| shell == id)
+                    .unwrap_or_else(|| {
+                        terminal
+                            .pending_output
+                            .push((id.into(), zeroize::Zeroizing::new(Vec::new())));
+                        terminal.pending_output.len() - 1
+                    });
+                terminal.pending_output[index]
+                    .1
+                    .extend_from_slice(&bytes[..keep]);
+            }
+        }
         if let Some(terminal) = self.ssh_terminal.as_mut()
             && terminal.shell_id.as_deref() == Some(id)
         {
@@ -18822,6 +18895,18 @@ impl AppModel {
     }
 
     pub(crate) fn apply_ssh_shell_terminal_state(&mut self, shell: &haider_rpc::ShellWire) {
+        let Some(terminal) = self.ssh_terminal.as_mut() else {
+            return;
+        };
+        terminal.observe_shell(shell);
+        let Some(shell) = terminal
+            .observed_shells
+            .iter()
+            .find(|s| terminal.shell_id.as_deref() == Some(s.id.as_str()) && s.id == shell.id)
+            .cloned()
+        else {
+            return;
+        };
         if shell.status == haider_rpc::ShellStatusWire::Running
             && let Some(terminal) = self.ssh_terminal.as_mut()
             && terminal.shell_id.as_deref() == Some(shell.id.as_str())
@@ -18848,6 +18933,15 @@ impl AppModel {
                 .or_else(|| {
                     // Older daemons report setup failure as terminal output.
                     terminal
+                        // Legacy setup failures end without an exit code.
+                        // A coded command exit must never relabel its ordinary
+                        // output as a failed connection after a dropped Running.
+                        .filter(|_| {
+                            matches!(
+                                shell.status,
+                                haider_rpc::ShellStatusWire::Exited { code: None }
+                            )
+                        })
                         .filter(|pane| !pane.reported_running)
                         .map(|pane| pane.display_text())
                 })
@@ -18925,9 +19019,15 @@ impl AppModel {
     }
 
     pub(crate) fn apply_shell_list(&mut self, shells: Vec<haider_rpc::ShellWire>) {
+        // Background resynchronization must not erase a connection result.
+        if self.shells_open {
+            self.flash = None;
+        }
+        for shell in &shells {
+            self.apply_ssh_shell_terminal_state(shell);
+        }
         self.shells = shells;
         self.shells_cursor = self.shells_cursor.min(self.shells.len().saturating_sub(1));
-        self.flash = None;
         self.dirty = true;
     }
 

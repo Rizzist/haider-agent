@@ -732,3 +732,410 @@ fn keyboard_input_for_old_connection_cannot_cancel_a_new_attempt() {
         assert!(m.ssh_terminal.is_none());
     }
 }
+
+fn result_order_model() -> AppModel {
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Session;
+    model
+}
+
+fn result_order_list(m: &mut AppModel, live: &mut LiveDriver, shells: Vec<haider_rpc::ShellWire>) {
+    live.apply(m, LiveReply::ShellListed { shells });
+}
+
+#[test]
+fn remote_result_order_reviewer_corpus() {
+    let mut failures = Vec::new();
+    for (w, h) in [(118, 36), (80, 24)] {
+        for state in [
+            "starting",
+            "running",
+            "closed",
+            "exited",
+            "ssh_timeout",
+            "ssh_connection_failed",
+            "ssh_authentication_failed",
+            "ssh_host_key_changed",
+        ] {
+            for order in ["state-first", "reply-first"] {
+                let mut m = result_order_model();
+                m.mode = RuntimeMode::Live;
+                m.screen = Screen::Session;
+                let mut live = LiveDriver::new("terminal-result-order");
+                let context = open_profile(&mut m, &mut live, "profile-a");
+                m.requests.clear();
+                let starting = admitted("current-shell", "profile-a");
+                let mut latest = starting.clone();
+                latest.last_activity_ms = 2;
+                latest.status = match state {
+                    "starting" => haider_rpc::ShellStatusWire::Starting,
+                    "running" => haider_rpc::ShellStatusWire::Running,
+                    "closed" => haider_rpc::ShellStatusWire::Closed,
+                    "exited" => haider_rpc::ShellStatusWire::Exited { code: Some(17) },
+                    _ => haider_rpc::ShellStatusWire::Exited { code: None },
+                };
+                if state.starts_with("ssh_") {
+                    latest.setup_error = Some(haider_rpc::ShellSetupErrorWire {
+                        code: state.into(),
+                        message: "synthetic terminal setup result".into(),
+                        retryable: false,
+                    });
+                }
+                if order == "state-first" {
+                    live.apply(
+                        &mut m,
+                        LiveReply::ShellChanged {
+                            shell: latest.clone(),
+                        },
+                    );
+                }
+                apply_response(
+                    &mut m,
+                    &mut live,
+                    &context,
+                    haider_rpc::ResponseBody::SshShellOpen { shell: starting },
+                );
+                if order == "reply-first" {
+                    live.apply(&mut m, LiveReply::ShellChanged { shell: latest });
+                }
+                let before_key = m.ssh_terminal.clone();
+                let flash = m.flash.clone();
+                let frame = snapshot(&m, w, h);
+                let pass = if state == "starting" {
+                    m.requests.clear();
+                    m.handle(AppEvent::Key(KeyEvent::new(
+                        KeyCode::Char('c'),
+                        KeyModifiers::CONTROL,
+                    )));
+                    before_key.as_ref().is_some_and(|pane| pane.connecting && pane.shell_id.as_deref()==Some("current-shell"))
+                        && m.requests.iter().any(|r| matches!(r, crate::app::AppRequest::ShellClose { id } if id == "current-shell"))
+                } else if state == "running" {
+                    m.requests.clear();
+                    m.handle(AppEvent::Key(KeyEvent::new(
+                        KeyCode::Char('c'),
+                        KeyModifiers::CONTROL,
+                    )));
+                    before_key.as_ref().is_some_and(|pane| !pane.connecting)
+                        && m.requests.iter().any(|r| matches!(r, crate::app::AppRequest::SshShellInput { id, .. } if id == "current-shell"))
+                        && !m.requests.iter().any(|r| matches!(r, crate::app::AppRequest::ShellClose { .. }))
+                } else {
+                    before_key.is_none()
+                        && (!state.starts_with("ssh_")
+                            || flash.as_ref().is_some_and(|v| v.contains(state)))
+                };
+                println!(
+                    "ORDER {}",
+                    serde_json::json!({"width":w,"height":h,"state":state,"order":order,"passed":pass,"pane_present":before_key.is_some(),"connecting":before_key.as_ref().map(|p|p.connecting),"flash":flash,"cached_status":m.shells.first().map(|s|format!("{:?}",s.status))})
+                );
+                if !pass {
+                    failures.push(format!("{w}x{h}/{state}/{order}"));
+                    println!("{frame}");
+                }
+            }
+        }
+        for order in ["output-first", "reply-first"] {
+            let mut m = result_order_model();
+            m.mode = RuntimeMode::Live;
+            m.screen = Screen::Session;
+            let mut live = LiveDriver::new("terminal-result-order");
+            let context = open_profile(&mut m, &mut live, "profile-a");
+            if order == "output-first" {
+                m.apply_ssh_shell_output("current-shell", b"EARLY_TERMINAL_OUTPUT\r\n");
+            }
+            apply_response(
+                &mut m,
+                &mut live,
+                &context,
+                haider_rpc::ResponseBody::SshShellOpen {
+                    shell: admitted("current-shell", "profile-a"),
+                },
+            );
+            if order == "reply-first" {
+                m.apply_ssh_shell_output("current-shell", b"EARLY_TERMINAL_OUTPUT\r\n");
+            }
+            let frame = snapshot(&m, w, h);
+            let pass = frame.contains("EARLY_TERMINAL_OUTPUT")
+                && m.ssh_terminal.as_ref().is_some_and(|p| !p.connecting);
+            println!(
+                "ORDER {}",
+                serde_json::json!({"width":w,"height":h,"state":"terminal-output","order":order,"passed":pass,"visible_output":frame.contains("EARLY_TERMINAL_OUTPUT"),"connecting":m.ssh_terminal.as_ref().map(|p|p.connecting)})
+            );
+            if !pass {
+                failures.push(format!("{w}x{h}/output/{order}"));
+                println!("{frame}");
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "terminal state/output was lost before its connection reply: {failures:?}"
+    );
+}
+
+fn setup_result(code: &str) -> haider_rpc::ShellWire {
+    let mut shell = admitted_with_status(
+        "current-shell",
+        "profile-a",
+        haider_rpc::ShellStatusWire::Exited { code: None },
+    );
+    shell.setup_error = Some(haider_rpc::ShellSetupErrorWire {
+        code: code.into(),
+        message: "synthetic setup result".into(),
+        retryable: false,
+    });
+    shell
+}
+
+#[test]
+fn remote_result_order_all_setup_results_survive_lists_and_equal_timestamps() {
+    for (w, h) in [(118, 36), (80, 24)] {
+        for code in [
+            "ssh_timeout",
+            "ssh_connection_failed",
+            "ssh_authentication_failed",
+            "ssh_host_key_changed",
+            "ssh_channel_quota",
+            "ssh_agent_unavailable",
+            "ssh_key_invalid",
+            "ssh_vault_error",
+            "ssh_profile_store_corrupt",
+            "ssh_profile_not_found",
+            "ssh_profile_invalid",
+            "ssh_channel_closed",
+        ] {
+            for list in ["none", "empty", "older", "same-ms"] {
+                let mut m = result_order_model();
+                let mut live = LiveDriver::new("result-order");
+                let context = open_profile(&mut m, &mut live, "profile-a");
+                let result = setup_result(code);
+                live.apply(&mut m, LiveReply::ShellChanged { shell: result });
+                if list != "none" {
+                    let mut stale = admitted("current-shell", "profile-a");
+                    stale.last_activity_ms = u64::from(list == "same-ms");
+                    result_order_list(
+                        &mut m,
+                        &mut live,
+                        if list == "empty" { vec![] } else { vec![stale] },
+                    );
+                }
+                apply_response(
+                    &mut m,
+                    &mut live,
+                    &context,
+                    haider_rpc::ResponseBody::SshShellOpen {
+                        shell: admitted("current-shell", "profile-a"),
+                    },
+                );
+                assert!(m.ssh_terminal.is_none(), "{code}/{list}/{w}x{h}");
+                assert!(m.flash.as_deref().unwrap().contains(code), "{code}/{list}");
+                // Narrow frames may clip the message, but must leave the opening pane.
+                assert!(!snapshot(&m, w, h).contains("opening remote terminal"));
+            }
+        }
+    }
+}
+
+#[test]
+fn remote_result_order_running_survives_lists_and_keeps_command_input() {
+    for (w, h) in [(118, 36), (80, 24)] {
+        for list in ["empty", "older", "same-ms"] {
+            let mut m = result_order_model();
+            let mut live = LiveDriver::new("result-order");
+            let context = open_profile(&mut m, &mut live, "profile-a");
+            m.apply_shell_event(admitted_with_status(
+                "current-shell",
+                "profile-a",
+                haider_rpc::ShellStatusWire::Running,
+            ));
+            m.apply_ssh_shell_output("current-shell", b"EARLY_OUTPUT\r\n");
+            let mut stale = admitted("current-shell", "profile-a");
+            stale.last_activity_ms = u64::from(list == "same-ms");
+            result_order_list(
+                &mut m,
+                &mut live,
+                if list == "empty" { vec![] } else { vec![stale] },
+            );
+            apply_response(
+                &mut m,
+                &mut live,
+                &context,
+                haider_rpc::ResponseBody::SshShellOpen {
+                    shell: admitted("current-shell", "profile-a"),
+                },
+            );
+            assert!(!m.ssh_terminal.as_ref().unwrap().connecting, "{list}");
+            assert!(snapshot(&m, w, h).contains("EARLY_OUTPUT"));
+            m.requests.clear();
+            m.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(
+                matches!(m.requests.as_slice(), [crate::app::AppRequest::SshShellInput { id, input }] if id == "current-shell" && input.as_slice() == b"\x03")
+            );
+        }
+    }
+}
+
+#[test]
+fn remote_result_order_fresh_list_recovers_dropped_status() {
+    for (w, h) in [(118, 36), (80, 24)] {
+        for state in ["running", "failed", "exited", "closed"] {
+            let mut m = result_order_model();
+            let mut live = LiveDriver::new("result-order");
+            let context = open_profile(&mut m, &mut live, "profile-a");
+            apply_response(
+                &mut m,
+                &mut live,
+                &context,
+                haider_rpc::ResponseBody::SshShellOpen {
+                    shell: admitted("current-shell", "profile-a"),
+                },
+            );
+            let result = match state {
+                "failed" => setup_result("ssh_timeout"),
+                "running" => admitted_with_status(
+                    "current-shell",
+                    "profile-a",
+                    haider_rpc::ShellStatusWire::Running,
+                ),
+                "exited" => admitted_with_status(
+                    "current-shell",
+                    "profile-a",
+                    haider_rpc::ShellStatusWire::Exited { code: Some(0) },
+                ),
+                _ => admitted_with_status(
+                    "current-shell",
+                    "profile-a",
+                    haider_rpc::ShellStatusWire::Closed,
+                ),
+            };
+            result_order_list(&mut m, &mut live, vec![result]);
+            if state == "running" {
+                assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
+                result_order_list(
+                    &mut m,
+                    &mut live,
+                    vec![admitted("current-shell", "profile-a")],
+                );
+                assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
+            } else {
+                assert!(m.ssh_terminal.is_none(), "{state}/{w}x{h}");
+                assert!(m.flash.as_deref().unwrap().contains(match state {
+                    "failed" => "ssh_timeout",
+                    "exited" => "exited 0",
+                    _ => "closed",
+                }));
+            }
+            assert!(!snapshot(&m, w, h).contains("opening remote terminal"));
+            let notice = m.flash.clone();
+            result_order_list(&mut m, &mut live, vec![]);
+            assert_eq!(m.flash, notice, "background list erased {state} result");
+        }
+    }
+}
+
+#[test]
+fn remote_result_order_ordinary_output_keeps_the_command_exit_code() {
+    for (w, h) in [(118, 36), (80, 24)] {
+        for running in ["early", "dropped", "reply-first"] {
+            for code in [0, 17] {
+                let mut m = result_order_model();
+                let mut live = LiveDriver::new("result-order");
+                let context = open_profile(&mut m, &mut live, "profile-a");
+                let result = admitted_with_status(
+                    "current-shell",
+                    "profile-a",
+                    haider_rpc::ShellStatusWire::Running,
+                );
+                if running == "early" {
+                    m.apply_shell_event(result.clone());
+                }
+                apply_response(
+                    &mut m,
+                    &mut live,
+                    &context,
+                    haider_rpc::ResponseBody::SshShellOpen {
+                        shell: admitted("current-shell", "profile-a"),
+                    },
+                );
+                if running == "reply-first" {
+                    m.apply_shell_event(result);
+                }
+                m.apply_ssh_shell_output("current-shell", b"hello\r\n");
+                assert!(snapshot(&m, w, h).contains("hello"));
+                assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
+                m.apply_shell_event(admitted_with_status(
+                    "current-shell",
+                    "profile-a",
+                    haider_rpc::ShellStatusWire::Exited { code: Some(code) },
+                ));
+                assert!(m.ssh_terminal.is_none());
+                assert_eq!(
+                    m.flash,
+                    Some(format!("· remote terminal exited {code}")),
+                    "{running}/{w}x{h}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn remote_result_order_only_the_admitted_shell_can_settle_the_attempt() {
+    for same_profile in [false, true] {
+        let mut m = result_order_model();
+        let mut live = LiveDriver::new("result-order");
+        let context = open_profile(&mut m, &mut live, "profile-a");
+        let mut other = setup_result("ssh_timeout");
+        if same_profile {
+            other.id = "old-shell".into();
+        } else {
+            other.kind = haider_rpc::ShellKindWire::Ssh {
+                profile: "profile-b".into(),
+            };
+        }
+        m.apply_shell_event(other.clone());
+        result_order_list(&mut m, &mut live, vec![other]);
+        m.apply_ssh_shell_output("old-shell", b"unrelated output");
+        apply_response(
+            &mut m,
+            &mut live,
+            &context,
+            haider_rpc::ResponseBody::SshShellOpen {
+                shell: admitted("current-shell", "profile-a"),
+            },
+        );
+        assert!(m.ssh_terminal.as_ref().unwrap().connecting);
+        m.apply_ssh_shell_output("old-shell", b"unrelated output");
+        assert!(!snapshot(&m, 118, 36).contains("unrelated output"));
+    }
+}
+
+#[test]
+fn remote_result_order_typed_result_enriches_a_plain_completion_snapshot() {
+    let mut m = result_order_model();
+    let mut live = LiveDriver::new("result-order");
+    let context = open_profile(&mut m, &mut live, "profile-a");
+    result_order_list(
+        &mut m,
+        &mut live,
+        vec![admitted_with_status(
+            "current-shell",
+            "profile-a",
+            haider_rpc::ShellStatusWire::Exited { code: None },
+        )],
+    );
+    m.apply_shell_event(setup_result("ssh_timeout"));
+    apply_response(
+        &mut m,
+        &mut live,
+        &context,
+        haider_rpc::ResponseBody::SshShellOpen {
+            shell: admitted("current-shell", "profile-a"),
+        },
+    );
+    assert!(m.ssh_terminal.is_none());
+    assert!(m.flash.as_deref().unwrap().contains("ssh_timeout"));
+}
