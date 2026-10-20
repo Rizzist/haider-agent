@@ -19792,7 +19792,14 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
             }
         }
         actor.shutdown().await;
-        let expected = snapshot.lock().expect("snapshot").clone();
+        let mut expected = snapshot.lock().expect("snapshot").clone();
+        if case == "missing-y" {
+            // Model a valid earlier projection, with X still selected. Startup
+            // restores the committed Y without taking X's saved active slot.
+            for row in &mut expected {
+                row.active = row.alias.as_str() == "work";
+            }
+        }
         assert_eq!(
             expected.len(),
             match case {
@@ -19874,6 +19881,11 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
             serde_json::to_vec(&written).expect("rows"),
         )
         .expect("write account projection");
+        let persisted = AccountStore::new(haider_accounts::JsonFileStore::new(&directory))
+            .unwrap_or_else(|error| {
+                panic!("{case}: constructed account projection must load: {error:?}")
+            });
+        assert_eq!(persisted.list(), written.as_slice());
         let file_vault = haider_accounts::FileVault::new(directory.join("vault"));
         for alias in vault.list().expect("synthetic slots") {
             let secret = vault.resolve(&alias).expect("synthetic slot");
