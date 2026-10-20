@@ -702,7 +702,7 @@ async fn startup_backfill_synthesizes_stable_anthropic_meter_identity() {
 }
 
 #[derive(Default)]
-struct TestProviderStore(StdMutex<Vec<ProviderProfileV1>>);
+pub(super) struct TestProviderStore(StdMutex<Vec<ProviderProfileV1>>);
 
 impl ProviderRegistryStoreLike for TestProviderStore {
     fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError> {
@@ -725,7 +725,7 @@ fn login_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
 
 /// A gcloud source no test may reach: any invocation is a loud failure so a
 /// mis-scripted test can never shell out to a real `gcloud`.
-struct UnreachableGcloud;
+pub(super) struct UnreachableGcloud;
 
 impl crate::gcloud::GcloudAccessTokenSource for UnreachableGcloud {
     fn print_access_token(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, HaiderError> {
@@ -4116,7 +4116,7 @@ impl FrameSink for ChannelSink {
     }
 }
 
-fn channel_sink() -> (Arc<dyn FrameSink>, mpsc::UnboundedReceiver<WireFrame>) {
+pub(super) fn channel_sink() -> (Arc<dyn FrameSink>, mpsc::UnboundedReceiver<WireFrame>) {
     let (sender, receiver) = mpsc::unbounded_channel();
     (Arc::new(ChannelSink(sender)), receiver)
 }
@@ -7726,18 +7726,18 @@ async fn provider_trust_toggle_is_receipted_persisted_and_journaled_raw() {
 }
 
 #[derive(Clone)]
-struct EndpointEditProviderStore {
+pub(super) struct EndpointEditProviderStore {
     profiles: Arc<StdMutex<Vec<ProviderProfileV1>>>,
 }
 
 impl EndpointEditProviderStore {
-    fn new(profiles: Vec<ProviderProfileV1>) -> Self {
+    pub(super) fn new(profiles: Vec<ProviderProfileV1>) -> Self {
         Self {
             profiles: Arc::new(StdMutex::new(profiles)),
         }
     }
 
-    fn snapshot(&self) -> Vec<ProviderProfileV1> {
+    pub(super) fn snapshot(&self) -> Vec<ProviderProfileV1> {
         self.profiles
             .lock()
             .map(|profiles| profiles.clone())
@@ -7775,7 +7775,7 @@ impl ProviderEndpointValidator for EndpointEditCanonicalValidator {
     }
 }
 
-fn endpoint_edit_profile(provider: &str, origin: &str) -> ProviderProfileV1 {
+pub(super) fn endpoint_edit_profile(provider: &str, origin: &str) -> ProviderProfileV1 {
     ProviderProfileV1 {
         provider_id: provider.to_owned(),
         display_name: provider.to_owned(),
@@ -7825,7 +7825,7 @@ fn endpoint_edit_registry(
         .expect("endpoint-edit provider registry")
 }
 
-fn endpoint_repoint_input(provider: &str, origin: &str) -> ProviderConfigureInput {
+pub(super) fn endpoint_repoint_input(provider: &str, origin: &str) -> ProviderConfigureInput {
     ProviderConfigureInput {
         provider: provider.to_owned(),
         api_family: None,
@@ -15014,7 +15014,7 @@ fn linked_source_jwt(payload: &serde_json::Value) -> String {
     format!("{header}.{body}.{signature}")
 }
 
-fn write_linked_codex_source(root: &std::path::Path, account_id: &str, email: &str) {
+pub(super) fn write_linked_codex_source(root: &std::path::Path, account_id: &str, email: &str) {
     std::fs::create_dir_all(root).expect("create Codex root");
     let access = linked_source_jwt(&serde_json::json!({
         "exp": 4_102_444_800u64,
@@ -15282,7 +15282,7 @@ async fn credential_source_watcher_observes_atomic_origin_rotation() {
 /// reuse detection, so a second spender breaks the origin CLI's next refresh.
 const ORIGIN_REFRESH_MARKER: &str = "REFRESH_THIS_MUST_NEVER_ENTER_A_LINKED_BUNDLE";
 
-fn write_linked_grok_source(root: &std::path::Path, user_id: &str, email: &str) {
+pub(super) fn write_linked_grok_source(root: &std::path::Path, user_id: &str, email: &str) {
     std::fs::create_dir_all(root).expect("create Grok root");
     let document = serde_json::json!({
         "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
@@ -15307,7 +15307,11 @@ fn write_linked_grok_source(root: &std::path::Path, user_id: &str, email: &str) 
     .expect("write Grok source");
 }
 
-fn write_linked_kimi_source(root: &std::path::Path, access_token: &str, file_name: &str) {
+pub(super) fn write_linked_kimi_source(
+    root: &std::path::Path,
+    access_token: &str,
+    file_name: &str,
+) {
     let directory = root.join("credentials");
     std::fs::create_dir_all(&directory).expect("create Kimi credentials dir");
     let document = serde_json::json!({
@@ -16744,7 +16748,7 @@ async fn customprov_probe_is_read_only_and_never_echoes_a_staged_key() {
     }
 }
 
-struct CustomprovCanonicalEndpoint;
+pub(super) struct CustomprovCanonicalEndpoint;
 
 #[async_trait::async_trait]
 impl ProviderEndpointValidator for CustomprovCanonicalEndpoint {
@@ -17064,7 +17068,7 @@ fn customprov_manual_key_acceptance_requires_nonempty_utf8_without_controls() {
     }
 }
 
-async fn create_provider_trust_test_session(
+pub(super) async fn create_provider_trust_test_session(
     store: &SqliteStoreHandle,
     dir: &std::path::Path,
     name: &str,
@@ -18952,6 +18956,3 @@ async fn refresh_completion_restores_reactivated_owner_rejection_before_uncertai
     }
     store.close().await.expect("close");
 }
-
-#[path = "accounts_partial_write_tests.rs"]
-mod partial_write_tests;

@@ -14500,6 +14500,10 @@ mod persisted_model_tests;
 #[path = "accounts_tests.rs"]
 mod accounts_tests;
 
+#[cfg(test)]
+#[path = "accounts_partial_write_tests.rs"]
+mod partial_write_tests;
+
 #[cfg(all(test, feature = "android-standalone"))]
 #[path = "android_accounts_tests.rs"]
 mod android_accounts_tests;
