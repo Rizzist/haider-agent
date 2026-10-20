@@ -4543,6 +4543,18 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
 #[tokio::test]
 #[cfg(unix)]
 async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
+    assert_cancellation_mirror_handoff_recovery(Duration::from_secs(2)).await;
+}
+
+/// An expired legacy handoff is reconciled before startup admits live collectors.
+#[tokio::test]
+#[cfg(unix)]
+async fn expired_cancellation_mirror_handoff_survives_restart() {
+    assert_cancellation_mirror_handoff_recovery(Duration::ZERO).await;
+}
+
+#[cfg(unix)]
+async fn assert_cancellation_mirror_handoff_recovery(budget: Duration) {
     use crate::delegation::DelegationMirrorHandoffPhase;
     use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 
@@ -4565,7 +4577,7 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
     first_manager.crash().await;
 
     let handoff = DelegationHandle::new(first_hub.clone())
-        .begin_terminal_mirror_handoff_for_test(&child, Duration::from_secs(2))
+        .begin_terminal_mirror_handoff_for_test(&child, budget)
         .await
         .expect("journal pending terminal-mirror handoff");
     let mut parent_cancelling = [EventEnvelope {
@@ -4622,11 +4634,20 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
             .await
             .expect("first recovered child journal"),
     );
-    assert!(
-        first_child_payloads
-            .iter()
-            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
-    );
+    let cancelled = first_child_payloads
+        .iter()
+        .position(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
+        .expect("recovery commits child cancellation");
+    let idle = first_child_payloads
+        .iter()
+        .position(|payload| {
+            matches!(
+                payload,
+                EventPayload::SessionState(haider_protocol::state::SessionState::Idle { .. })
+            )
+        })
+        .expect("recovery commits the child idle fence");
+    assert!(idle > cancelled, "child idle follows cancellation");
     drop(first_recovered);
     first_recovered_store
         .close()
@@ -4670,9 +4691,9 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
     hub.install_worker_manager(manager.handle())
         .expect("install recovery manager");
     timeout(
-        // Registry #94: the persisted 2s deadline already spent the first
-        // restart + 100ms crash window; 2.5s is only the outer scheduling
-        // allowance and the recovered payload must retain the original bound.
+        // The persisted deadline includes the first restart and crash window.
+        // This is only the outer scheduling watchdog; the recovered handoff
+        // must retain the original deadline, including an already expired one.
         Duration::from_millis(2_500),
         DelegationHandle::new(hub.clone())
             .recover_terminal_mirror_handoff(recovered_mirror.record, recovered_mirror.handoff),
@@ -4839,78 +4860,6 @@ async fn unanswered_delegated_question_returns_child_still_running() {
     harness.store.close().await.expect("store close");
 }
 
-/// An expired durable child-cancellation handoff still reaches Cancelled and
-/// the following Idle fence through the production recovery path.
-#[tokio::test]
-#[cfg(unix)]
-async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
-    let harness = start_parked_child(
-        "expired-cancel",
-        ParkedChildMode::Complete,
-        Duration::from_secs(30),
-    )
-    .await;
-    let delegation = DelegationHandle::new(harness.hub.clone());
-    let handoff = timeout(
-        haider_platform::TEST_WAIT_TIMEOUT,
-        delegation.begin_terminal_mirror_handoff_for_test(&harness.child, Duration::ZERO),
-    )
-    .await
-    .expect("expired child handoff is bounded by the fixture watchdog")
-    .expect("expired child handoff is durable");
-    timeout(
-        // The durable handoff deadline is already zero. This watchdog bounds
-        // the observer without extending the child-cancellation budget.
-        haider_platform::TEST_WAIT_TIMEOUT,
-        delegation.recover_terminal_mirror_handoff(harness.child.clone(), handoff),
-    )
-    .await
-    .expect("expired cleanup handoff returns without extending the run deadline")
-    .expect("expired cleanup handoff is durably owned");
-
-    wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
-        *state == RunState::Cancelled
-    })
-    .await;
-    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
-        loop {
-            let events = harness
-                .store
-                .read(&harness.child.child_session_id, 0, 1024)
-                .await
-                .expect("expired cancellation child journal");
-            let cancelled = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(payload, EventPayload::RunState(RunState::Cancelled))
-                })
-            });
-            let idle = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(
-                        payload,
-                        EventPayload::SessionState(
-                            haider_protocol::state::SessionState::Idle { .. }
-                        )
-                    )
-                })
-            });
-            if cancelled
-                .zip(idle)
-                .is_some_and(|(cancelled, idle)| idle > cancelled)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("zero-remaining cancellation reaps the live child without restart");
-
-    harness.manager.shutdown().await.expect("manager shutdown");
-    harness.hub.shutdown().await.expect("hub shutdown");
-    harness.store.close().await.expect("store close");
-}
-
 #[tokio::test]
 #[cfg(unix)]
 async fn cancelling_parent_after_wait_ms_detach_leaves_child_running() {
@@ -5023,8 +4972,8 @@ async fn cancelling_parent_after_wait_ms_detach_leaves_child_running() {
 // (`cancel_ticket` / "cleanup_fallback" handoff) was removed — a stopped
 // parent detaches its children instead of cancelling them — so the former
 // `expired_cancellation_handoff_reaps_live_child_without_restart` pin has no
-// production path left. Recovery of a legacy pending handoff stays pinned by
-// `cancellation_mirror_handoff_survives_crash_until_durable_completion`.
+// production path left. Legacy recovery is covered with both live and expired
+// deadlines by `assert_cancellation_mirror_handoff_recovery`.
 
 #[tokio::test]
 #[cfg(unix)]
