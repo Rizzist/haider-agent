@@ -12948,6 +12948,7 @@ async fn reconcile_oauth_add_receipts_from(
                         &row.command_id,
                         &provider,
                         &alias,
+                        target_published,
                     )? {
                         StagedOAuthAdd::Wrote(target) => {
                             if !restore_staged_oauth_target(
@@ -12992,6 +12993,7 @@ async fn reconcile_oauth_add_receipts_from(
                         &row.command_id,
                         &provider,
                         &alias,
+                        target_published,
                     )? {
                         StagedOAuthAdd::Wrote(target) => {
                             if !restore_staged_oauth_target(
@@ -13065,14 +13067,16 @@ enum StagedOAuthAdd {
 }
 
 /// Finds the row whose vaulted bundle is the one staged for `command_id`
-/// (same provider, constant-time equal access token). Only secret-free
-/// aliases leave this function.
+/// (same provider, constant-time equal access token and captured stable account
+/// coordinate). A published target excludes other rows even when their saved
+/// values match. Only secret-free aliases leave this function.
 fn staged_oauth_add_target(
     vault: &dyn Vault,
     accounts: &AccountStore<Box<dyn StoreLike>>,
     command_id: &str,
     provider: &str,
     recovery_alias: &CredentialAlias,
+    target_published: bool,
 ) -> Result<StagedOAuthAdd, HaiderError> {
     let staged = match vault.resolve(&oauth_staging_alias(command_id)) {
         Ok(staged) => staged,
@@ -13086,6 +13090,8 @@ fn staged_oauth_add_target(
     else {
         return Ok(StagedOAuthAdd::NotYetWritten);
     };
+    let staged_account_id = AccountPrincipal::new(provider, staged.account_identity.as_ref())
+        .and_then(AccountPrincipal::stable_account_id);
     let missing = accounts
         .get(recovery_alias)
         .is_none()
@@ -13096,6 +13102,7 @@ fn staged_oauth_add_target(
         .filter(|row| row.provider == provider && row.auth_method == AuthMethod::OAuth)
         .map(|row| &row.alias)
         .chain(missing)
+        .filter(|alias| !target_published || *alias == recovery_alias)
     {
         let Ok(stored) = vault.resolve(alias) else {
             continue;
@@ -13105,6 +13112,11 @@ fn staged_oauth_add_target(
         };
         if stored.provider_id == provider
             && stored.provider_id == staged.provider_id
+            && staged_account_id.is_none_or(|expected| {
+                AccountPrincipal::new(provider, stored.account_identity.as_ref())
+                    .and_then(AccountPrincipal::stable_account_id)
+                    == Some(expected)
+            })
             && bool::from(stored.access_token().ct_eq(staged.access_token()))
         {
             return Ok(StagedOAuthAdd::Wrote(alias.clone()));

@@ -19583,6 +19583,7 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
         "missing-y",
         "imported-x",
         "pending-retarget",
+        "pending-shared-value",
     ] {
         let directory = root.join(case);
         std::fs::create_dir(&directory).expect("new fixture");
@@ -19603,7 +19604,11 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
         let sequence: Vec<(&str, &str)> = match case {
             "ordinary" => vec![("a", "work"), ("b", "other")],
             "aba" => vec![("a", "work"), ("b", "other"), ("a", "requested")],
-            "retarget" | "missing-y" | "imported-x" | "pending-retarget" => {
+            "retarget"
+            | "missing-y"
+            | "imported-x"
+            | "pending-retarget"
+            | "pending-shared-value" => {
                 vec![("a", "work"), ("b", "other"), ("b", "work")]
             }
             "explicit" => vec![("a", "named-account"), ("a", "explicit-request")],
@@ -19616,18 +19621,19 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
             } else {
                 format!("account={who};organization=team")
             };
-            let bundle = if provider == OPENAI_OAUTH_PROVIDER_NAME {
-                openai_import_test_bundle(command.as_bytes(), b"synthetic-refresh", 1)
-                    .with_account_identity(stable_test_identity(
-                        "same@example.test",
-                        Some(&account_id),
-                    ))
+            let value: &[u8] = if case == "pending-shared-value" {
+                b"synthetic-shared-profile"
             } else {
-                claude_relogin_bundle(command.as_bytes(), &account_id, u64::MAX - 1)
-                    .with_account_identity(stable_test_identity(
-                        "same@example.test",
-                        Some(&account_id),
-                    ))
+                command.as_bytes()
+            };
+            let bundle = if provider == OPENAI_OAUTH_PROVIDER_NAME {
+                openai_import_test_bundle(value, b"synthetic-refresh", 1).with_account_identity(
+                    stable_test_identity("same@example.test", Some(&account_id)),
+                )
+            } else {
+                claude_relogin_bundle(value, &account_id, u64::MAX - 1).with_account_identity(
+                    stable_test_identity("same@example.test", Some(&account_id)),
+                )
             };
             actor
                 .commands()
@@ -19741,8 +19747,13 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
             expected.len(),
             match case {
                 "removed" => 0,
-                "ordinary" | "aba" | "retarget" | "missing-y" | "imported-x"
-                | "pending-retarget" => 2,
+                "ordinary"
+                | "aba"
+                | "retarget"
+                | "missing-y"
+                | "imported-x"
+                | "pending-retarget"
+                | "pending-shared-value" => 2,
                 _ => 1,
             }
         );
@@ -19760,7 +19771,7 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
             .expect("historical coordinates");
             database.execute("UPDATE command_receipts SET request_json = ?1, recovery_json = NULL WHERE command_id = 'a23-historical-1'", [request]).expect("historical fixture");
         }
-        if case == "pending-retarget" {
+        if matches!(case, "pending-retarget" | "pending-shared-value") {
             v2_claim_pending_add(&store, "a23-interrupted", "work").await;
             store
                 .prepare_account_add_target("a23-interrupted".into(), "other".into())
@@ -19797,7 +19808,7 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
                 .put(&alias, secret.expose_secret())
                 .expect("write synthetic slot");
         }
-        manifest.push(serde_json::json!({"case":case,"expected":expected,"candidate_first":case=="historical","pending":case=="pending-retarget","fixture":"actual actor sign-ins; historical and missing projection are explicitly named fixtures"}));
+        manifest.push(serde_json::json!({"case":case,"expected":expected,"candidate_first":case=="historical","pending":matches!(case,"pending-retarget"|"pending-shared-value"),"fixture":"actual actor sign-ins; historical and missing projection are explicitly named fixtures"}));
     }
     std::fs::write(
         root.join("manifest.json"),
@@ -19988,4 +19999,170 @@ async fn a23_interrupted_target_publication_requires_the_command_owned_stage() {
         );
         store.close().await.expect("close");
     }
+}
+
+#[tokio::test]
+async fn a23_staged_recovery_proves_the_saved_target_when_values_match() {
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        for published in [false, true] {
+            for written in [false, true] {
+                for shared_value in [false, true] {
+                    a23_check_staged_recovery_values(
+                        provider,
+                        published,
+                        written,
+                        shared_value,
+                        false,
+                    )
+                    .await;
+                    if published {
+                        a23_check_staged_recovery_values(
+                            provider,
+                            published,
+                            written,
+                            shared_value,
+                            true,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn a23_check_staged_recovery_values(
+    provider: &str,
+    published: bool,
+    written: bool,
+    shared_value: bool,
+    same_identity: bool,
+) {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let mut accounts = memory_accounts();
+    let bundle = |who: &str, value: &[u8]| {
+        if provider == OPENAI_OAUTH_PROVIDER_NAME {
+            openai_import_test_bundle(value, b"synthetic-refresh", 1).with_account_identity(
+                stable_test_identity(
+                    "same@example.test",
+                    Some(&format!("user:1:{who};workspace:4:team")),
+                ),
+            )
+        } else {
+            claude_relogin_bundle(
+                value,
+                &format!("account={who};organization=team"),
+                u64::MAX - 1,
+            )
+        }
+    };
+    let x = bundle(
+        if same_identity { "b" } else { "a" },
+        if shared_value {
+            b"synthetic-new"
+        } else {
+            b"synthetic-x"
+        },
+    );
+    let old_y = bundle("b", b"synthetic-prior");
+    let new_y = bundle("b", b"synthetic-new");
+    for (name, value, status, active) in [
+        ("alpha", &x, CredentialStatus::Revoked, false),
+        ("zulu", &old_y, CredentialStatus::Expired, true),
+    ] {
+        let alias = CredentialAlias::new(name);
+        vault
+            .put(&alias, &value.encode().expect("encode fixture"))
+            .expect("seed fixture");
+        let mut descriptor = oauth_descriptor_for(provider, &alias, value, active);
+        descriptor.status = status;
+        accounts.add(descriptor).expect("seed account");
+    }
+    let identity = OAuthAddIdentity {
+        provider: provider.into(),
+        physical_alias: "alpha".into(),
+        display_alias: "alpha".into(),
+        auth_method: "oauth".into(),
+        recovery_target: None,
+    };
+    let request = identity.canonical_json().expect("coordinates");
+    store
+        .account_add_claim_receipt(
+            "a23-equal-value".into(),
+            blake3::hash(request.as_bytes()).to_hex().to_string(),
+            request,
+        )
+        .await
+        .expect("claim");
+    if published {
+        store
+            .prepare_account_add_target("a23-equal-value".into(), "zulu".into())
+            .await
+            .expect("publish target");
+    }
+    put_oauth_staging(
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        &oauth_staging_alias("a23-equal-value"),
+        &new_y,
+    )
+    .await
+    .expect("stage target");
+    if written {
+        vault
+            .put(
+                &CredentialAlias::new("zulu"),
+                &new_y.encode().expect("encode target"),
+            )
+            .expect("write target");
+    }
+    reconcile_oauth_add_receipts(
+        &store,
+        &mut accounts,
+        &VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
+    )
+    .await
+    .expect("recover");
+    let rows = store.account_add_receipts().await.expect("receipts");
+    assert_eq!(
+        rows[0].state,
+        if written { "committed" } else { "pending" },
+        "recovery must prove Y was written: {provider}/{published}/{written}/{shared_value}/{same_identity}",
+    );
+    if written {
+        let response: AccountAddReceiptResponse =
+            serde_json::from_str(rows[0].response_json.as_deref().expect("response"))
+                .expect("decode response");
+        assert_eq!(
+            response.descriptor.alias.as_str(),
+            "zulu",
+            "the saved coordinate belongs to Y"
+        );
+    }
+    assert_eq!(
+        accounts
+            .get(&CredentialAlias::new("alpha"))
+            .expect("X")
+            .status,
+        CredentialStatus::Revoked,
+        "recovery must not change X's health"
+    );
+    assert!(
+        vault
+            .resolve(&CredentialAlias::new("alpha"))
+            .expect("X bundle")
+            .expose_secret()
+            == x.encode().expect("X encoding").as_slice(),
+        "recovery must leave X's saved sign-in unchanged"
+    );
+    assert_eq!(accounts.list().len(), 2, "saved aliases stay separate");
+    assert_eq!(
+        vault
+            .resolve(&oauth_staging_alias("a23-equal-value"))
+            .is_ok(),
+        !written,
+        "only a completed target write consumes the stage"
+    );
+    store.close().await.expect("close");
 }
