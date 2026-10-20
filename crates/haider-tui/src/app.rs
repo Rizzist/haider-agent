@@ -19020,7 +19020,7 @@ impl AppModel {
 
     pub(crate) fn apply_shell_list(&mut self, shells: Vec<haider_rpc::ShellWire>) {
         // Background resynchronization must not erase a connection result.
-        if self.shells_open {
+        if self.flash.as_deref() == Some("· reading terminal registry…") {
             self.flash = None;
         }
         for shell in &shells {

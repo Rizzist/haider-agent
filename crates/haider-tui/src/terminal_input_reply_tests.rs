@@ -982,56 +982,64 @@ fn remote_result_order_running_survives_lists_and_keeps_command_input() {
 fn remote_result_order_fresh_list_recovers_dropped_status() {
     for (w, h) in [(118, 36), (80, 24)] {
         for state in ["running", "failed", "exited", "closed"] {
-            let mut m = result_order_model();
-            let mut live = LiveDriver::new("result-order");
-            let context = open_profile(&mut m, &mut live, "profile-a");
-            apply_response(
-                &mut m,
-                &mut live,
-                &context,
-                haider_rpc::ResponseBody::SshShellOpen {
-                    shell: admitted("current-shell", "profile-a"),
-                },
-            );
-            let result = match state {
-                "failed" => setup_result("ssh_timeout"),
-                "running" => admitted_with_status(
-                    "current-shell",
-                    "profile-a",
-                    haider_rpc::ShellStatusWire::Running,
-                ),
-                "exited" => admitted_with_status(
-                    "current-shell",
-                    "profile-a",
-                    haider_rpc::ShellStatusWire::Exited { code: Some(0) },
-                ),
-                _ => admitted_with_status(
-                    "current-shell",
-                    "profile-a",
-                    haider_rpc::ShellStatusWire::Closed,
-                ),
-            };
-            result_order_list(&mut m, &mut live, vec![result]);
-            if state == "running" {
-                assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
-                result_order_list(
+            for registry_open in [false, true] {
+                let mut m = result_order_model();
+                let mut live = LiveDriver::new("result-order");
+                let context = open_profile(&mut m, &mut live, "profile-a");
+                apply_response(
                     &mut m,
                     &mut live,
-                    vec![admitted("current-shell", "profile-a")],
+                    &context,
+                    haider_rpc::ResponseBody::SshShellOpen {
+                        shell: admitted("current-shell", "profile-a"),
+                    },
                 );
-                assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
-            } else {
-                assert!(m.ssh_terminal.is_none(), "{state}/{w}x{h}");
-                assert!(m.flash.as_deref().unwrap().contains(match state {
-                    "failed" => "ssh_timeout",
-                    "exited" => "exited 0",
-                    _ => "closed",
-                }));
+                m.shells_open = registry_open;
+                if registry_open {
+                    m.flash = Some("· reading terminal registry…".into());
+                    result_order_list(&mut m, &mut live, vec![]);
+                    assert!(m.flash.is_none(), "registry loading notice was not settled");
+                }
+                let result = match state {
+                    "failed" => setup_result("ssh_timeout"),
+                    "running" => admitted_with_status(
+                        "current-shell",
+                        "profile-a",
+                        haider_rpc::ShellStatusWire::Running,
+                    ),
+                    "exited" => admitted_with_status(
+                        "current-shell",
+                        "profile-a",
+                        haider_rpc::ShellStatusWire::Exited { code: Some(0) },
+                    ),
+                    _ => admitted_with_status(
+                        "current-shell",
+                        "profile-a",
+                        haider_rpc::ShellStatusWire::Closed,
+                    ),
+                };
+                result_order_list(&mut m, &mut live, vec![result]);
+                if state == "running" {
+                    assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
+                    result_order_list(
+                        &mut m,
+                        &mut live,
+                        vec![admitted("current-shell", "profile-a")],
+                    );
+                    assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
+                } else {
+                    assert!(m.ssh_terminal.is_none(), "{state}/{w}x{h}");
+                    assert!(m.flash.as_deref().unwrap().contains(match state {
+                        "failed" => "ssh_timeout",
+                        "exited" => "exited 0",
+                        _ => "closed",
+                    }));
+                }
+                assert!(!snapshot(&m, w, h).contains("opening remote terminal"));
+                let notice = m.flash.clone();
+                result_order_list(&mut m, &mut live, vec![]);
+                assert_eq!(m.flash, notice, "background list erased {state} result");
             }
-            assert!(!snapshot(&m, w, h).contains("opening remote terminal"));
-            let notice = m.flash.clone();
-            result_order_list(&mut m, &mut live, vec![]);
-            assert_eq!(m.flash, notice, "background list erased {state} result");
         }
     }
 }
