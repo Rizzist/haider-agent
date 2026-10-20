@@ -1596,6 +1596,7 @@ fn process_start_observer_surfaces_second_permission_and_terminal_exec_text() {
                         name: "exec".into(),
                         args: serde_json::json!({}),
                         status: haider_protocol::item::ToolStatus::InProgress,
+                        activity: None,
                     },
                 }),
             ),
@@ -1659,6 +1660,7 @@ fn process_start_observer_surfaces_second_permission_and_terminal_exec_text() {
                         name: "exec".into(),
                         args: serde_json::json!({}),
                         status: haider_protocol::item::ToolStatus::Failed,
+                        activity: None,
                     },
                 }),
             ),
@@ -5166,6 +5168,22 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
         })
         .expect("shell item has a durable run");
     assert_eq!(receipt_run_id, run_id);
+    let mut activity = haider_protocol::activity::ActivityTracker::new();
+    for envelope in durable
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+    {
+        activity.observe_raw(envelope);
+        assert!(
+            activity.used().is_empty(),
+            "direct user shell must not add agent history"
+        );
+        assert_eq!(
+            activity.current(envelope.committed_at_ms, false),
+            None,
+            "direct user shell must not open a live agent icon"
+        );
+    }
     let payloads = payloads_for_run(&durable, &run_id).collect::<Vec<_>>();
     assert_eq!(
         payloads
@@ -7913,6 +7931,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
             client_instance_id: "feature-inspector".into(),
             client_kind: ClientKind::Headless,
             capabilities_requested: CapabilitySet::from([Capability::View]),
+            features_requested: Default::default(),
             max_receive_frame: u32::try_from(config.frame_limit).expect("frame limit"),
             encodings: Vec::new(),
         }),

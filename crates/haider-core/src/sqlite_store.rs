@@ -1533,6 +1533,18 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn prepare_account_add_target(
+        &self,
+        command_id: String,
+        alias: String,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.prepare_account_add_target(&command_id, &alias))
+        })
+        .await
+    }
+
     pub async fn finalize_account_add_receipt(
         &self,
         command_id: String,
@@ -3484,7 +3496,7 @@ mod error_wave_tests {
 
         // Simulates a profile-level `let _ = mutation(...)` call site.
         let _ = handle.advance_management_revision().await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), faults.changed())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, faults.changed())
             .await
             .expect("profile write fault must surface promptly")
             .expect("fault edge");
@@ -3550,7 +3562,7 @@ mod error_wave_tests {
         // must happen inside the shared store owner before the caller drops
         // the typed mutation error.
         let _ = StoreHandle::append(&handle, &mut failed).await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), faults.changed())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, faults.changed())
             .await
             .expect("journal write fault must surface promptly")
             .expect("fault edge");

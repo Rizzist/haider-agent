@@ -214,25 +214,44 @@ pub(crate) fn turn_trace_enabled() -> bool {
 const SUPERVISOR_IDLE_TTL: Duration = Duration::from_secs(30);
 const COMPUTER_PERMISSION_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const COMPUTER_PERMISSION_MENU_ORIGIN: &str = "computer-os-permission";
-const TEST_CANCEL_SETTLE_DELAY_ENV: &str = "HAIDER_TEST_CANCEL_SETTLE_DELAY_MS";
-const MAX_TEST_CANCEL_SETTLE_DELAY_MS: u64 = 10_000;
-
-async fn delay_fake_provider_cancellation_settlement() {
-    let delay_ms = std::env::var(TEST_CANCEL_SETTLE_DELAY_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|delay| {
-            *delay > 0
-                && *delay <= MAX_TEST_CANCEL_SETTLE_DELAY_MS
-                && std::env::var_os("HAIDER_TEST_FAKE_PROVIDER").is_some()
-        });
-    if let Some(delay_ms) = delay_ms {
-        // Real-process lifecycle tests use a stalled fake-provider turn to
-        // hold the committed Cancelling state across a short launcher linger.
-        // Production providers never enter this explicit test-only boundary.
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+async fn wait_fake_provider_cancellation_settlement(
+    _drain_wakes: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    #[cfg(unix)]
+    if std::env::var_os("HAIDER_TEST_FAKE_PROVIDER").is_some()
+        && let Some(path) = std::env::var_os("HAIDER_TEST_CANCEL_SETTLE_GATE")
+    {
+        // Hold the committed cancellation until the real daemon starts drain,
+        // or the owning fixture releases it. No scheduler-sized state window.
+        let result = tokio::time::timeout(
+            haider_platform::TEST_WAIT_TIMEOUT,
+            fake_cancellation_settlement_gate(Path::new(&path), _drain_wakes),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!(?result, "fake cancellation settlement gate failed");
+        }
     }
 }
+
+#[cfg(unix)]
+async fn fake_cancellation_settlement_gate(
+    path: &Path,
+    drain_wakes: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::UnixStream::connect(path).await?;
+    stream.write_all(&[1]).await?;
+    let mut release = [0];
+    tokio::select! {
+        result = stream.read_exact(&mut release) => result.map(|_| ()),
+        _ = drain_wakes.wait_for(|draining| *draining) => Ok(()),
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "cancellation_gate_tests.rs"]
+mod cancellation_gate_tests;
 
 #[cfg(windows)]
 fn windows_test_process_trace_enabled() -> bool {
@@ -294,6 +313,12 @@ pub(crate) struct AcceptedCompaction {
 /// not session identity.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
+    /// Per-fixture wall/monotonic clock pair for paused-time deadline tests.
+    #[cfg(test)]
+    fn deadline_clock_for_test(&self) -> Option<ProviderDeadlineTestClock> {
+        None
+    }
+
     async fn resolve_for_turn(
         &self,
         metadata: &SessionMetadataV1,
@@ -323,6 +348,31 @@ pub trait ProviderFactory: Send + Sync {
     #[doc(hidden)]
     fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
         None
+    }
+}
+
+/// Keep persisted Unix deadlines and Tokio timers on one injected clock.
+/// Each factory owns its fixture clock; concurrent tests share no clock state.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub struct ProviderDeadlineTestClock {
+    unix_ms: u64,
+    monotonic: tokio::time::Instant,
+}
+
+#[cfg(test)]
+impl ProviderDeadlineTestClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            unix_ms: unix_time_ms(),
+            monotonic: tokio::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn now_ms(self) -> u64 {
+        let elapsed = tokio::time::Instant::now().saturating_duration_since(self.monotonic);
+        self.unix_ms
+            .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
     }
 }
 
@@ -1145,6 +1195,8 @@ struct DaemonGraphFinalizationGuard {
     event_ids: Arc<EventIdGenerator>,
     budget_check: Option<BudgetCheckContext>,
     request_deadline_unix_ms: Option<u64>,
+    #[cfg(test)]
+    deadline_clock: Option<ProviderDeadlineTestClock>,
     request_deadline_fact_persisted: Arc<Mutex<bool>>,
 }
 
@@ -1195,7 +1247,12 @@ impl DaemonGraphFinalizationGuard {
             // durable terminal delivery: an early provider timeout is not a
             // claim that the caller deadline elapsed. Route-wait/recovery can
             // arrive after the absolute timestamp and records the fact below.
-            if unix_time_ms() < request_deadline {
+            let now_ms = unix_time_ms();
+            #[cfg(test)]
+            let now_ms = self
+                .deadline_clock
+                .map_or(now_ms, ProviderDeadlineTestClock::now_ms);
+            if now_ms < request_deadline {
                 return Ok(None);
             }
             let mut persisted = self.request_deadline_fact_persisted.lock().await;
@@ -5672,7 +5729,7 @@ async fn run_supervisor(
                         let cancelled =
                             idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
                         if cancelled {
-                            delay_fake_provider_cancellation_settlement().await;
+                            wait_fake_provider_cancellation_settlement(&mut drain_wakes).await;
                             // Reduce durable lifecycle truth again after the
                             // harness stops. If core cancellation itself
                             // failed while closing an item/menu, finish those
@@ -8708,6 +8765,14 @@ async fn start_turn(
         .turn_start_journal_projection(&accepted.run_id)
         .await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
+    #[cfg(test)]
+    let deadline_clock = dependencies.provider_factory.deadline_clock_for_test();
+    #[cfg(test)]
+    if let Some(clock) = deadline_clock {
+        provider_deadline = headless.as_ref().and_then(|context| {
+            provider_request_deadline_at(&context.spec, context.accepted_at_ms, clock.now_ms())
+        });
+    }
     let mut pinned_metadata = metadata.clone();
     pinned_metadata.context_economy = refresh_context_economy_from_journal(
         lease,
@@ -9730,6 +9795,8 @@ async fn start_turn(
         request_deadline_unix_ms: headless
             .as_ref()
             .and_then(|context| context.spec.request_deadline_unix_ms),
+        #[cfg(test)]
+        deadline_clock,
         request_deadline_fact_persisted: Arc::new(Mutex::new(
             headless
                 .as_ref()
@@ -11917,6 +11984,14 @@ fn provider_request_deadline_for(
     spec: &HeadlessRunSpecV1,
     accepted_at_ms: u64,
 ) -> Option<tokio::time::Instant> {
+    provider_request_deadline_at(spec, accepted_at_ms, unix_time_ms())
+}
+
+fn provider_request_deadline_at(
+    spec: &HeadlessRunSpecV1,
+    accepted_at_ms: u64,
+    now_ms: u64,
+) -> Option<tokio::time::Instant> {
     let budget_deadline = spec
         .budget
         .max_time_ms
@@ -11927,9 +12002,8 @@ fn provider_request_deadline_for(
         (None, Some(request)) => Some(request),
         (None, None) => None,
     }?;
-    tokio::time::Instant::now().checked_add(Duration::from_millis(
-        deadline_ms.saturating_sub(unix_time_ms()),
-    ))
+    tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(deadline_ms.saturating_sub(now_ms)))
 }
 
 struct HeadlessBudgetExpiry {
@@ -14279,6 +14353,43 @@ pub(crate) enum RegisteredToolRoute {
     PeerSend,
     SshList,
     SshShell,
+}
+
+impl RegisteredToolRoute {
+    pub(crate) fn activity(self) -> Option<haider_protocol::activity::ActivityKind> {
+        use haider_protocol::activity::ActivityKind;
+        Some(match self {
+            Self::Computer => ActivityKind::Computer,
+            Self::Mobile => ActivityKind::Mobile,
+            Self::WebFetch | Self::WebSearch => ActivityKind::Web,
+            Self::SshShell => ActivityKind::Remote,
+            Self::FsWrite | Self::FsEdit | Self::FsPath => ActivityKind::Edit,
+            Self::ProcessExec
+            | Self::TestRun
+            | Self::ToolScript
+            | Self::TaskOutput
+            | Self::TaskKill => ActivityKind::Run,
+            Self::FsRead
+            | Self::FsGlob
+            | Self::FsSearch
+            | Self::SshList
+            | Self::ListModels
+            | Self::SessionTranscript
+            | Self::PeerList
+            | Self::ListTools => ActivityKind::Read,
+            Self::SpawnSubagent
+            | Self::MessageSubagent
+            | Self::WorkflowAuthor
+            | Self::LoomRegister
+            | Self::PeerSend => ActivityKind::Orchestrate,
+            Self::RequestInput
+            | Self::Plan
+            | Self::TodoWrite
+            | Self::TaskOutcome
+            | Self::GraphEvidence
+            | Self::Monitor => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -17042,12 +17153,28 @@ async fn create_broker_tool_dispatcher(
         device_id: context.device_id.clone(),
         event_ids: Arc::clone(&context.event_ids),
     };
+    // 973-activity-icons: a SUBAGENT names itself on any presence badge it
+    // raises. Best-effort and read-only: a missing record or callsign keeps
+    // the generic badge rather than failing the run.
+    let presence_actor = if context.agent_id.is_some() {
+        context
+            .store
+            .hub()
+            .delegation_for_child_session(session_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.manifest.callsign)
+    } else {
+        None
+    };
     let cu_presence = crate::cu_presence::PresenceLease::for_run(
         presence,
         context.store.hub().clone(),
         session_id.clone(),
         context.run_id.clone(),
-    );
+    )
+    .with_actor(presence_actor);
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
         pending_workspace: Mutex::new(pending_workspace),
@@ -19507,6 +19634,7 @@ impl BrokerToolDispatcher {
                 name: tool.to_owned(),
                 args: args.clone(),
                 status: haider_protocol::item::ToolStatus::InProgress,
+                activity: None,
             },
         });
         let mut events = vec![start];
@@ -20684,6 +20812,7 @@ impl BrokerToolDispatcher {
             name: pending.tool.clone(),
             args: pending.args.0.clone(),
             status: result.status.item_status(),
+            activity: None,
         };
         let mut prefix = vec![
             EventPayload::ToolResult {
@@ -21016,8 +21145,107 @@ async fn recover_orchestration_child(
     }
 }
 
+fn live_activity_for_route(
+    name: &str,
+    lockdown_allowed: Option<&[String]>,
+    has_web_search: bool,
+) -> Option<haider_protocol::activity::ActivityKind> {
+    if lockdown_allowed.is_some_and(|allowed| !allowed.iter().any(|tool| tool == name)) {
+        return None;
+    }
+    if name == "web_search" && !has_web_search {
+        return None;
+    }
+    match registered_tool_route(name)? {
+        RegisteredToolRoute::WebSearch => Some(haider_protocol::activity::ActivityKind::Web),
+        RegisteredToolRoute::SessionTranscript
+        | RegisteredToolRoute::ListModels
+        | RegisteredToolRoute::PeerList => Some(haider_protocol::activity::ActivityKind::Read),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn live_activity_respects_lockdown_and_backend_availability() {
+    use haider_protocol::activity::ActivityKind;
+    let allowed = vec!["web_search".to_owned(), "peer_list".to_owned()];
+    let denied = vec!["peer_list".to_owned()];
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&denied), true),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), false),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), true),
+        Some(ActivityKind::Web)
+    );
+    assert_eq!(
+        live_activity_for_route("peer_list", Some(&allowed), false),
+        Some(ActivityKind::Read)
+    );
+    assert_eq!(
+        live_activity_for_route("unknown", Some(&allowed), true),
+        None
+    );
+    for name in [
+        "web_search",
+        "session_transcript",
+        "list_models",
+        "peer_list",
+    ] {
+        let only_this = vec![name.to_owned()];
+        assert!(
+            live_activity_for_route(name, Some(&only_this), true).is_some(),
+            "{name} positive control"
+        );
+        assert_eq!(
+            live_activity_for_route(name, Some(&[]), true),
+            None,
+            "empty lockdown {name}"
+        );
+        assert_eq!(
+            live_activity_for_route(name, None, false).is_none(),
+            name == "web_search",
+            "only search requires that backend"
+        );
+    }
+    for name in [
+        "Web_Search",
+        " web_search",
+        "web_search ",
+        "",
+        "computer",
+        "fs_write",
+    ] {
+        assert_eq!(
+            live_activity_for_route(name, None, true),
+            None,
+            "not an effectless live route: {name:?}"
+        );
+    }
+}
+
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
+    fn activity_for_route(&self, name: &str) -> Option<haider_protocol::activity::ActivityKind> {
+        registered_tool_route(name).and_then(RegisteredToolRoute::activity)
+    }
+    fn live_activity_for_route(
+        &self,
+        name: &str,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        live_activity_for_route(
+            name,
+            self.lockdown
+                .as_ref()
+                .map(|lockdown| lockdown.tools_allowed.as_slice()),
+            self.web_search.is_some(),
+        )
+    }
     fn platform_tool_supported(&self, name: &str) -> bool {
         !crate::android_policy::enabled() || registered_tool_route(name).is_some()
     }

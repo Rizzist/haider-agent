@@ -3195,6 +3195,56 @@ fn derived_antigravity_source(row: &crate::app::AccountRow) -> crate::app::Accou
     }
 }
 
+/// The full notice is a separate paged surface; actions and the exit stay pinned.
+fn render_account_notice(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let width = usize::from(area.width.saturating_sub(1)).max(1);
+    let text = model
+        .accounts
+        .message_details
+        .as_ref()
+        .or(model.accounts.message.as_ref())
+        .map_or("", String::as_str);
+    let lines = text
+        .lines()
+        .flat_map(|line| wrap_words(line, width))
+        .map(Line::raw)
+        .collect::<Vec<_>>();
+    let action = model.accounts.message_action.as_deref().unwrap_or("");
+    let action_lines = wrap_words(action, width)
+        .into_iter()
+        .map(|line| Line::styled(line, theme.gold_style()))
+        .collect::<Vec<_>>();
+    let band = bottom_band(model, theme, frame, area, BandHeights::new(1, 1, 1), hits);
+    let [title, body, command] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(action_lines.len() as u16),
+    ])
+    .areas(band.content);
+    frame.render_widget(Paragraph::new("ACCOUNT NOTICE"), title);
+    let max = lines.len().saturating_sub(usize::from(body.height));
+    model.accounts.message_scroll_max.set(max);
+    let offset = model.accounts.message_scroll.get().min(max);
+    model.accounts.message_scroll.set(offset);
+    let visible = lines
+        .into_iter()
+        .skip(offset)
+        .take(usize::from(body.height))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), body);
+    frame.render_widget(Paragraph::new(action_lines), command);
+    frame.render_widget(
+        Paragraph::new("↑↓ PgUp/PgDn Home/End scroll · F2 / esc close notice"),
+        band.slot,
+    );
+}
+
 fn render_accounts(
     model: &AppModel,
     theme: &Theme,
@@ -3202,6 +3252,10 @@ fn render_accounts(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
+    if model.accounts.message_expanded {
+        render_account_notice(model, theme, frame, area, hits);
+        return;
+    }
     // Declared BEFORE `lines` so the derived rows outlive the frame that
     // borrows them. A Google account that the daemon DID enrol a source for
     // keeps that source and gets no second badge.
@@ -3249,6 +3303,7 @@ fn render_accounts(
             theme.dim_style(),
         ),
     ]));
+    model.accounts.message_expandable.set(false);
     // Replacement confirmation still belongs beside its owning form.
     if let Some(message) = model
         .accounts
@@ -3261,8 +3316,27 @@ fn render_accounts(
         // WHICH alias was saved and that the old one still needs attention).
         // One column stays free for the `⋮` scroll gutter.
         let width = usize::from(area.width.saturating_sub(1)).max(1);
-        for chunk in wrap_words(message, width) {
-            notice_lines.push(Line::styled(chunk, theme.gold_style()));
+        let wrapped = message
+            .lines()
+            .flat_map(|line| wrap_words(line, width))
+            .collect::<Vec<_>>();
+        let bounded = wrapped.len() > 4;
+        for (index, chunk) in wrapped.iter().enumerate() {
+            // Keep the bounded alias summary at the end even when a long
+            // saved-account explanation consumes the opening rows.
+            if !bounded || index < 2 || index >= wrapped.len() - 2 {
+                notice_lines.push(Line::styled(chunk.clone(), theme.gold_style()));
+            }
+        }
+        let expandable = bounded || model.accounts.message_details.is_some();
+        model.accounts.message_expandable.set(expandable);
+        if expandable {
+            notice_lines.push(Line::styled("… · F2 full notice", theme.gold_style()));
+        }
+        if let Some(action) = &model.accounts.message_action {
+            for chunk in wrap_words(action, width) {
+                notice_lines.push(Line::styled(chunk, theme.gold_style()));
+            }
         }
     }
     // 970 owner decision: `google-antigravity` ships ENABLED BY DEFAULT with
@@ -9278,6 +9352,17 @@ fn render_subtree(
             }
             return;
         }
+        // 973-activity-icons: every row reserves the same activity slot so
+        // callsigns align; no activity anywhere → no slot.
+        let activity_glyphs: Vec<Option<&'static str>> = rows
+            .iter()
+            .map(|(_, chip)| {
+                model
+                    .chip_activity(chip)
+                    .and_then(|kind| model.activity_display.glyph(kind))
+            })
+            .collect();
+        let activity_slot = activity_slot_width(&activity_glyphs);
         for (index, (depth, chip)) in rows.iter().enumerate() {
             let connector = if chip.closed {
                 "⊘"
@@ -9330,18 +9415,23 @@ fn render_subtree(
             let mut spans = vec![
                 Span::styled(format!(" {indent}{connector} "), theme.faint_style()),
                 Span::styled(format!("{glyph} "), glyph_style),
-                Span::styled(
-                    format!("{} {}", chip.callsign, chip.hon),
-                    if chip.closed {
-                        theme.faint_style()
-                    } else if viewing {
-                        // The viewed node is bold (owner item 3).
-                        theme.bright_style().add_modifier(Modifier::BOLD)
-                    } else {
-                        theme.bright_style()
-                    },
-                ),
             ];
+            spans.extend(activity_slot_span(
+                activity_glyphs.get(index).copied().flatten(),
+                activity_slot,
+                theme,
+            ));
+            spans.push(Span::styled(
+                format!("{} {}", chip.callsign, chip.hon),
+                if chip.closed {
+                    theme.faint_style()
+                } else if viewing {
+                    // The viewed node is bold (owner item 3).
+                    theme.bright_style().add_modifier(Modifier::BOLD)
+                } else {
+                    theme.bright_style()
+                },
+            ));
             // D1: a typed child's task label leads with `@type ·` (the C2
             // spawn convention) — paint the type segment in its Loom accent
             // and glyph so specialization reads at a glance.
@@ -9446,6 +9536,39 @@ fn render_subtree(
             ));
         }
     }
+}
+
+/// 973-activity-icons: the widest activity glyph among a set of rows — the
+/// column slot every row reserves so NAMES stay aligned. Zero when no row
+/// has an activity (then no slot at all: the row is byte-identical to a
+/// fleet without activity).
+fn activity_slot_width(glyphs: &[Option<&'static str>]) -> usize {
+    glyphs
+        .iter()
+        .flatten()
+        .map(|glyph| unicode_width::UnicodeWidthStr::width(*glyph))
+        .max()
+        .unwrap_or(0)
+}
+
+/// 973-activity-icons: one row's activity slot — the glyph padded to
+/// `slot` measured columns (emoji width is measured per grapheme, VS16
+/// included), plus a separating space; blanks for a row with none.
+fn activity_slot_span(
+    glyph: Option<&'static str>,
+    slot: usize,
+    theme: &Theme,
+) -> Option<Span<'static>> {
+    if slot == 0 {
+        return None;
+    }
+    Some(match glyph {
+        Some(glyph) => {
+            let pad = slot.saturating_sub(unicode_width::UnicodeWidthStr::width(glyph));
+            Span::styled(format!("{glyph}{} ", " ".repeat(pad)), theme.dim_style())
+        }
+        None => Span::raw(" ".repeat(slot + 1)),
+    })
 }
 
 /// One fleet list row's glyph ink — the mockup's `.fg` vocabulary: live
@@ -10944,6 +11067,57 @@ fn render_fleet(
                 if !metric.is_empty() {
                     lines.push(Line::styled(format!("  {metric}"), theme.dim_style()));
                 }
+                // 973-activity-icons: what the member is doing NOW and every
+                // activity it has used so far. Nothing when icons are off
+                // or nothing was observed.
+                let display = model.activity_display;
+                let used = model.node_activities(node);
+                if display != haider_protocol::activity::ActivityDisplay::Off && !used.is_empty() {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled("activity", theme.gold_style()));
+                    let now = model
+                        .node_activity(node)
+                        .and_then(|kind| display.glyph(kind).map(|glyph| (kind, glyph)));
+                    lines.push(match now {
+                        Some((kind, glyph)) => Line::from(vec![
+                            Span::styled("  now  ", theme.dim_style()),
+                            Span::styled(
+                                format!("{glyph} {}", kind.description()),
+                                theme.text_style(),
+                            ),
+                        ]),
+                        None => Line::styled("  now  quiet", theme.dim_style()),
+                    });
+                    if let Some(summary) = fleet::activities_summary(&used, display) {
+                        let budget = width.saturating_sub(8);
+                        let summary = if unicode_width::UnicodeWidthStr::width(summary.as_str())
+                            > budget
+                        {
+                            // Drop whole entries from the tail, never a glyph half.
+                            let mut kept = String::new();
+                            for part in summary.split(" · ") {
+                                let next = if kept.is_empty() {
+                                    part.to_owned()
+                                } else {
+                                    format!("{kept} · {part}")
+                                };
+                                if unicode_width::UnicodeWidthStr::width(next.as_str()) + 2 > budget
+                                {
+                                    kept.push_str(" …");
+                                    break;
+                                }
+                                kept = next;
+                            }
+                            kept
+                        } else {
+                            summary
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled("  used ", theme.dim_style()),
+                            Span::styled(summary, theme.dim_style()),
+                        ]));
+                    }
+                }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled("workflow", theme.gold_style()));
                 match &view.detail_graph {
@@ -11111,6 +11285,20 @@ fn render_fleet(
             } else {
                 sel.saturating_sub(body_rows.saturating_sub(1))
             };
+            // 973-activity-icons: one aligned activity slot per visible page.
+            let activity_glyphs: Vec<Option<&'static str>> = rows
+                .iter()
+                .map(|row| {
+                    model
+                        .node_activity(row.node)
+                        .and_then(|kind| model.activity_display.glyph(kind))
+                })
+                .collect();
+            let activity_slot = activity_slot_width(
+                activity_glyphs
+                    .get(scroll..(scroll + body_rows).min(activity_glyphs.len()))
+                    .unwrap_or(&[]),
+            );
             for (index, row) in rows.iter().enumerate().skip(scroll).take(body_rows) {
                 let node = row.node;
                 let selected = index == sel;
@@ -11131,8 +11319,18 @@ fn render_fleet(
                         glyph.to_owned(),
                         fleet_glyph_style(theme, node.state, model.anim_phase),
                     ),
-                    Span::styled(format!(" {callsign}"), name_style),
                 ];
+                if let Some(slot) = activity_slot_span(
+                    activity_glyphs.get(index).copied().flatten(),
+                    activity_slot,
+                    theme,
+                ) {
+                    spans.push(Span::raw(" "));
+                    spans.push(slot);
+                    spans.push(Span::styled(callsign.to_owned(), name_style));
+                } else {
+                    spans.push(Span::styled(format!(" {callsign}"), name_style));
+                }
                 if let Some(marker) = fleet::child_marker(node) {
                     spans.push(Span::styled(format!(" {marker}"), theme.faint_style()));
                 }
@@ -11292,8 +11490,37 @@ fn render_fleet(
                     };
                     let pad_l = (FLEET_CELL_W - 4) / 2;
                     let pad_r = FLEET_CELL_W - 4 - pad_l;
-                    for (target, row) in [(&mut matrix_a, &row_a), (&mut matrix_b, &row_b)] {
-                        target.push(Span::raw(" ".repeat(pad_l)));
+                    // 973-activity-icons: the cell's activity emoji sits in
+                    // the matrix's left margin (2 columns + gap = pad_l), so
+                    // the grid geometry never moves. Text labels do not fit
+                    // a cell; the plain/list surfaces carry them instead.
+                    let cell_emoji = if model.activity_display
+                        == haider_protocol::activity::ActivityDisplay::Emoji
+                    {
+                        model
+                            .node_activity(node)
+                            .map(haider_protocol::activity::ActivityKind::emoji)
+                            .filter(|emoji| {
+                                !emoji.is_empty()
+                                    && unicode_width::UnicodeWidthStr::width(*emoji) < pad_l
+                            })
+                    } else {
+                        None
+                    };
+                    for (matrix_row, (target, row)) in
+                        [(&mut matrix_a, &row_a), (&mut matrix_b, &row_b)]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        match cell_emoji.filter(|_| matrix_row == 0) {
+                            Some(emoji) => {
+                                let pad = pad_l
+                                    .saturating_sub(unicode_width::UnicodeWidthStr::width(emoji));
+                                target.push(Span::styled(emoji.to_owned(), theme.dim_style()));
+                                target.push(Span::raw(" ".repeat(pad)));
+                            }
+                            None => target.push(Span::raw(" ".repeat(pad_l))),
+                        }
                         target.extend(dot_span(row));
                         target.push(Span::raw(" ".repeat(pad_r)));
                         target.push(Span::raw(" ".repeat(FLEET_CELL_GAP)));

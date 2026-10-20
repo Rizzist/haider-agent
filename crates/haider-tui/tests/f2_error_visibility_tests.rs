@@ -391,6 +391,7 @@ fn failed_tool_rows_wear_the_error_glyph() {
                 args: serde_json::json!({"path": "x.rs"}),
                 status: ToolStatus::Failed,
                 call_id: String::new(),
+                activity: None,
             },
         }),
     ));
@@ -454,6 +455,7 @@ fn tool_started(item: &str, call: &str) -> EventPayload {
             args: serde_json::json!({"cmd": "cargo test"}),
             status: ToolStatus::InProgress,
             call_id: call.to_owned(),
+            activity: None,
         },
     })
 }
@@ -466,6 +468,7 @@ fn tool_completed(item: &str, call: &str, status: ToolStatus) -> EventPayload {
             args: serde_json::json!({"cmd": "cargo test"}),
             status,
             call_id: call.to_owned(),
+            activity: None,
         },
     })
 }

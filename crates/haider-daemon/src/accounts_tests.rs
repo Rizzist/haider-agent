@@ -998,7 +998,7 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
         )
         .await;
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
                 .await
                 .expect("set-active deadline"),
             Some(WireFrame::Response {
@@ -1341,6 +1341,7 @@ fn oauth_identity_for(profile: &str, command: &str) -> OAuthAddIdentity {
         display_alias: "work-oauth".into(),
         physical_alias: physical_alias(profile, "fake-oauth", command),
         auth_method: "oauth".into(),
+        recovery_target: None,
     }
 }
 
@@ -3731,7 +3732,7 @@ async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
         })))
         .await
         .expect("send login");
-    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("login response deadline")
         .expect("login response");
@@ -3773,7 +3774,7 @@ async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
         })))
         .await
         .expect("send oauth add");
-    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("oauth response deadline")
         .expect("oauth response");
@@ -5666,7 +5667,7 @@ async fn login_publishes_only_after_receipt_and_revision_commit() {
     entered.notified().await;
     store.clone().close().await.expect("close receipt store");
     release.notify_one();
-    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("response deadline")
         .expect("response");
@@ -6392,7 +6393,7 @@ async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence(
         })))
         .await
         .expect("actor command");
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !vault.entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
@@ -6411,7 +6412,7 @@ async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence(
         *release.lock().expect("release") = true;
         wake.notify_all();
     }
-    let frame = tokio::time::timeout(Duration::from_secs(1), frames.recv())
+    let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("account response")
         .expect("account frame");
@@ -6515,7 +6516,7 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
         })))
         .await
         .expect("actor command");
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !vault.persisted.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
@@ -6535,7 +6536,7 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
         wake.notify_all();
     }
     let alias = CredentialAlias::new("work-oauth");
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while vault.resolve(&alias).is_err() {
             tokio::task::yield_now().await;
         }
@@ -6830,6 +6831,7 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
         display_alias: removed_alias.as_str().to_owned(),
         physical_alias: removed_alias.as_str().to_owned(),
         auth_method: "oauth".into(),
+        recovery_target: None,
     };
     let request_json = readd_identity.canonical_json().expect("re-add coordinates");
     let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
@@ -7397,7 +7399,7 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         })))
         .await
         .expect("send set-active");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("set-active deadline")
         .expect("set-active response")
@@ -7430,7 +7432,7 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         })))
         .await
         .expect("send remove");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("remove deadline")
         .expect("remove response")
@@ -7483,7 +7485,7 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         .await
         .expect("send re-add");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("re-add deadline")
             .expect("re-add response"),
@@ -7549,7 +7551,7 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         })))
         .await
         .expect("send set-active replay");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("replay deadline")
         .expect("replay response")
@@ -7745,7 +7747,7 @@ async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
         })))
         .await
         .expect("send login");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("login deadline")
         .expect("login response")
@@ -7791,7 +7793,7 @@ async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
         .await
         .expect("send replay");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("replay deadline")
             .expect("replay response"),
@@ -7903,7 +7905,7 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
         .expect("send API re-key");
 
     let (code, retryable) = expect_error(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("first API re-key deadline")
             .expect("first API re-key response"),
@@ -7928,7 +7930,7 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
         .await
         .expect("retry API re-key without another stage");
 
-    let descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    let descriptor = match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("API re-key deadline")
         .expect("API re-key response")
@@ -8052,7 +8054,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         ))
         .await
         .expect("send configure");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("configure deadline")
         .expect("configure response")
@@ -8095,7 +8097,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         .await
         .expect("send default");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("default deadline")
             .expect("default response"),
@@ -8127,7 +8129,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         .await
         .expect("send model update");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("model update deadline")
             .expect("model update response"),
@@ -8147,7 +8149,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         ))
         .await
         .expect("send committed replay");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("replay deadline")
         .expect("replay response")
@@ -8171,7 +8173,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         ))
         .await
         .expect("send stale mutation");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("stale deadline")
         .expect("stale response")
@@ -8224,7 +8226,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         .await
         .expect("send removed-model selection");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("removed-model deadline")
             .expect("removed-model response"),
@@ -8304,7 +8306,7 @@ async fn provider_trust_toggle_is_receipted_persisted_and_journaled_raw() {
         .await
         .expect("send trust toggle");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("trust response deadline")
             .expect("trust response"),
@@ -8552,7 +8554,7 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
         .await
         .expect("send origin repoint");
 
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("repoint deadline")
         .expect("repoint response")
@@ -8646,7 +8648,7 @@ async fn stale_expected_revision_refuses_origin_only_repoint() {
         .await
         .expect("send current repoint");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("current repoint deadline")
             .expect("current repoint response"),
@@ -8667,7 +8669,7 @@ async fn stale_expected_revision_refuses_origin_only_repoint() {
         ))
         .await
         .expect("send stale repoint");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("stale repoint deadline")
         .expect("stale repoint response")
@@ -8755,7 +8757,7 @@ async fn custom_provider_origin_repoint_rejects_invalid_origin() {
         .await
         .expect("send invalid repoint");
 
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("invalid repoint deadline")
         .expect("invalid repoint response")
@@ -8786,7 +8788,7 @@ async fn custom_provider_origin_repoint_rejects_invalid_origin() {
         ))
         .await
         .expect("send duplicate repoint");
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("duplicate repoint deadline")
         .expect("duplicate repoint response")
@@ -8857,7 +8859,7 @@ async fn custom_provider_origin_repoint_same_origin_is_revision_noop() {
         .await
         .expect("send same-origin repoint");
 
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("same-origin deadline")
         .expect("same-origin response")
@@ -8900,7 +8902,7 @@ async fn custom_provider_origin_repoint_same_origin_is_revision_noop() {
         .await
         .expect("send later provider mutation");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("later mutation deadline")
             .expect("later mutation response"),
@@ -8924,7 +8926,7 @@ async fn custom_provider_origin_repoint_same_origin_is_revision_noop() {
         .await
         .expect("replay same-origin repoint");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("same-origin replay deadline")
             .expect("same-origin replay response"),
@@ -8991,7 +8993,7 @@ async fn custom_provider_origin_create_semantics_remain_unchanged() {
         .await
         .expect("send provider create");
 
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("create deadline")
         .expect("create response")
@@ -9597,9 +9599,12 @@ async fn wh3_deepseek_catalog_source_populates_models_and_flips_available() {
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("mock DeepSeek GET started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("mock DeepSeek GET started");
     discoverer.release.notify_one();
     let discovered = discovery
         .await
@@ -9789,7 +9794,7 @@ async fn login_gemini_catalog_fixture(actor: &AccountActorHandle, suffix: &str) 
         .await
         .expect("Gemini login handoff");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("Gemini login response deadline")
             .expect("Gemini login response"),
@@ -9808,9 +9813,12 @@ async fn login_gemini_catalog_fixture(actor: &AccountActorHandle, suffix: &str) 
 async fn automatic_catalog_flight_coalesces_foreground_and_honors_discovery_disabled() {
     let (_dir, store, mut actor, broker, discoverer) = start_gemini_catalog_test_actor(false).await;
     login_gemini_catalog_fixture(&actor, "coalesce").await;
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("automatic catalog flight started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("automatic catalog flight started");
 
     let (sink, mut frames) = channel_sink();
     actor
@@ -9833,7 +9841,7 @@ async fn automatic_catalog_flight_coalesces_foreground_and_honors_discovery_disa
     );
     discoverer.release.notify_one();
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("coalesced refresh deadline")
             .expect("coalesced refresh response"),
@@ -9870,12 +9878,15 @@ async fn automatic_catalog_flight_coalesces_foreground_and_honors_discovery_disa
         })
         .await
         .expect("explicit refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("explicit catalog flight remains available");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("explicit catalog flight remains available");
     discoverer.release.notify_one();
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("explicit refresh deadline")
             .expect("explicit refresh response"),
@@ -10274,11 +10285,14 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         })
         .await
         .expect("key refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("key discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("key discovery started");
     discoverer.release.notify_one();
-    let key_frame = tokio::time::timeout(Duration::from_secs(2), key_frames.recv())
+    let key_frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, key_frames.recv())
         .await
         .expect("key refresh deadline")
         .expect("key refresh response");
@@ -10303,14 +10317,18 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         })
         .await
         .expect("Gemini refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("Gemini discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("Gemini discovery started");
     discoverer.release.notify_one();
-    let gemini_frame = tokio::time::timeout(Duration::from_secs(2), gemini_frames.recv())
-        .await
-        .expect("Gemini refresh deadline")
-        .expect("Gemini refresh response");
+    let gemini_frame =
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, gemini_frames.recv())
+            .await
+            .expect("Gemini refresh deadline")
+            .expect("Gemini refresh response");
     match gemini_frame {
         WireFrame::Response {
             body: ResponseBody::ProviderModelsRefresh { provider, .. },
@@ -10335,11 +10353,14 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         })
         .await
         .expect("no-auth refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("no-auth discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("no-auth discovery started");
     discoverer.release.notify_one();
-    let none_frame = tokio::time::timeout(Duration::from_secs(2), none_frames.recv())
+    let none_frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, none_frames.recv())
         .await
         .expect("no-auth refresh deadline")
         .expect("no-auth refresh response");
@@ -10574,9 +10595,12 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         })
         .await
         .expect("refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("discovery started");
 
     let (completed, resolved) = tokio::sync::oneshot::channel();
     actor
@@ -10588,7 +10612,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         })
         .await
         .expect("resolver handoff");
-    let resolved = tokio::time::timeout(Duration::from_secs(1), resolved)
+    let resolved = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, resolved)
         .await
         .expect("actor remained responsive")
         .expect("resolver response")
@@ -10597,7 +10621,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
 
     discoverer.release.notify_one();
     discoverer.release.notify_one();
-    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("refresh response deadline")
         .expect("refresh response");
@@ -10677,14 +10701,20 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         })
         .await
         .expect("conditional refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("conditional discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("conditional discovery started");
     discoverer.release.notify_one();
-    let frame = tokio::time::timeout(Duration::from_secs(2), not_modified_frames.recv())
-        .await
-        .expect("not-modified response deadline")
-        .expect("not-modified response");
+    let frame = tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        not_modified_frames.recv(),
+    )
+    .await
+    .expect("not-modified response deadline")
+    .expect("not-modified response");
     assert!(matches!(
         frame,
         WireFrame::Response {
@@ -10736,14 +10766,20 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         })
         .await
         .expect("unavailable refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("unavailable discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("unavailable discovery started");
     discoverer.release.notify_one();
-    let frame = tokio::time::timeout(Duration::from_secs(2), unavailable_frames.recv())
-        .await
-        .expect("unavailable response deadline")
-        .expect("unavailable response");
+    let frame = tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        unavailable_frames.recv(),
+    )
+    .await
+    .expect("unavailable response deadline")
+    .expect("unavailable response");
     match frame {
         WireFrame::Response {
             body:
@@ -10795,12 +10831,15 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         })
         .await
         .expect("panic refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("panic discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("panic discovery started");
     discoverer.release.notify_one();
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), panic_frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, panic_frames.recv())
             .await
             .expect("panic response deadline")
             .expect("panic response"),
@@ -10829,12 +10868,15 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         })
         .await
         .expect("post-panic refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("post-panic discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("post-panic discovery started");
     discoverer.release.notify_one();
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), recovered_frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, recovered_frames.recv())
             .await
             .expect("post-panic response deadline")
             .expect("post-panic response"),
@@ -10857,9 +10899,12 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         })
         .await
         .expect("draining refresh handoff");
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("draining discovery started");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("draining discovery started");
     let mut shutdown = tokio::spawn(async move {
         actor.shutdown().await;
         actor
@@ -10872,7 +10917,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     );
     discoverer.release.notify_one();
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), draining_frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, draining_frames.recv())
             .await
             .expect("draining response deadline")
             .expect("draining response"),
@@ -10881,7 +10926,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             ..
         }
     ));
-    let _actor = tokio::time::timeout(Duration::from_secs(2), shutdown)
+    let _actor = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, shutdown)
         .await
         .expect("graceful actor shutdown deadline")
         .expect("graceful actor shutdown");
@@ -10940,7 +10985,7 @@ async fn send_oauth_import(
 async fn import_codex_for_heal(actor: &AccountActorHandle) -> CredentialDescriptor {
     let (sink, mut frames) = channel_sink();
     send_oauth_import(&actor.commands(), sink, "import-codex-before-heal", "codex").await;
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("initial Codex import deadline")
         .expect("initial Codex import response")
@@ -10962,7 +11007,7 @@ async fn import_claude_for_heal(actor: &AccountActorHandle) -> CredentialDescrip
         "claude-code",
     )
     .await;
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("initial Claude import deadline")
         .expect("initial Claude import response")
@@ -10984,7 +11029,7 @@ async fn claude_subscription_import_is_policy_blocked(actor: &AccountActorHandle
         "claude-code",
     )
     .await;
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("Claude policy response deadline")
         .expect("Claude policy response")
@@ -11352,7 +11397,7 @@ async fn locked_store_waits_for_cached_expiry_then_significant_refresh_self_heal
         .await
         .expect("explicit discovery refresh");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("refresh deadline")
             .expect("refresh response"),
@@ -11452,7 +11497,7 @@ async fn success_after_denied_discovery_still_requires_explicit_import() {
         .await
         .expect("explicit discovery refresh");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("refresh deadline")
             .expect("refresh response"),
@@ -12011,6 +12056,7 @@ async fn oauth_import_source_ownership_tracks_the_latest_alias_incarnation() {
         display_alias: alias.as_str().to_owned(),
         physical_alias: alias.as_str().to_owned(),
         auth_method: "oauth".to_owned(),
+        recovery_target: None,
     };
     let loopback_json = loopback.canonical_json().expect("loopback coordinates");
     let loopback_digest = blake3::hash(loopback_json.as_bytes()).to_hex().to_string();
@@ -12285,7 +12331,7 @@ async fn codex_import_commits_refreshable_bundle_and_secret_free_receipt() {
     );
     let (sink, mut frames) = channel_sink();
     send_oauth_import(&actor.commands(), sink, "import-codex-1", "codex").await;
-    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("Codex import response deadline")
         .expect("Codex import response");
@@ -12411,7 +12457,7 @@ async fn claude_code_import_honors_expiry_and_anthropic_registration() {
     );
     let (sink, mut frames) = channel_sink();
     send_oauth_import(&actor.commands(), sink, "import-claude-1", "claude-code").await;
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("Claude import response deadline")
         .expect("Claude import response")
@@ -12475,7 +12521,7 @@ async fn claude_code_import_without_inference_scope_is_refused() {
     );
     let (sink, mut frames) = channel_sink();
     send_oauth_import(&actor.commands(), sink, "import-claude-9", "claude-code").await;
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("refusal deadline")
         .expect("refusal response")
@@ -12531,31 +12577,33 @@ async fn malformed_and_missing_imports_name_paths_and_commit_nothing() {
         "codex",
     )
     .await;
-    let malformed_message = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .expect("malformed response deadline")
-        .expect("malformed response")
-    {
-        WireFrame::Response {
-            body: ResponseBody::Error { message, .. },
-            ..
-        } => message,
-        other => panic!("malformed import unexpectedly succeeded: {other:?}"),
-    };
+    let malformed_message =
+        match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+            .await
+            .expect("malformed response deadline")
+            .expect("malformed response")
+        {
+            WireFrame::Response {
+                body: ResponseBody::Error { message, .. },
+                ..
+            } => message,
+            other => panic!("malformed import unexpectedly succeeded: {other:?}"),
+        };
     assert!(malformed_message.contains(&malformed_path.display().to_string()));
 
     send_oauth_import(&actor.commands(), sink, "import-missing", "claude-code").await;
-    let missing_message = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .expect("missing response deadline")
-        .expect("missing response")
-    {
-        WireFrame::Response {
-            body: ResponseBody::Error { message, .. },
-            ..
-        } => message,
-        other => panic!("missing import unexpectedly succeeded: {other:?}"),
-    };
+    let missing_message =
+        match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+            .await
+            .expect("missing response deadline")
+            .expect("missing response")
+        {
+            WireFrame::Response {
+                body: ResponseBody::Error { message, .. },
+                ..
+            } => message,
+            other => panic!("missing import unexpectedly succeeded: {other:?}"),
+        };
     assert_eq!(
         missing_message,
         "Claude Code subscription credentials remain owned by the official client"
@@ -12711,7 +12759,7 @@ async fn oauth_import_obeys_the_reserved_alias_fence() {
     );
     let (sink, mut frames) = channel_sink();
     send_oauth_import(&actor.commands(), sink, "import-reserved", "codex").await;
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("reserved response deadline")
         .expect("reserved response")
@@ -12764,7 +12812,7 @@ async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_acco
     let (sink, mut frames) = channel_sink();
     send_oauth_import(&commands, Arc::clone(&sink), "import-codex-first", "codex").await;
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("first import deadline")
             .expect("first import response"),
@@ -12796,7 +12844,7 @@ async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_acco
         .await
         .expect("add manual OAuth account");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("manual add deadline")
             .expect("manual add response"),
@@ -12816,39 +12864,41 @@ async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_acco
         })))
         .await
         .expect("activate manual OAuth");
-    let active_revision = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .expect("set active deadline")
-        .expect("set active response")
-    {
-        WireFrame::Response {
-            body: ResponseBody::AccountSetActive { revision, .. },
-            ..
-        } => revision,
-        other => panic!("unexpected set-active response: {other:?}"),
-    };
+    let active_revision =
+        match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+            .await
+            .expect("set active deadline")
+            .expect("set active response")
+        {
+            WireFrame::Response {
+                body: ResponseBody::AccountSetActive { revision, .. },
+                ..
+            } => revision,
+            other => panic!("unexpected set-active response: {other:?}"),
+        };
     assert!(active_revision >= 3);
 
     std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_2).expect("write Codex fixture 2");
     send_oauth_import(&commands, Arc::clone(&sink), "import-codex-second", "codex").await;
-    let imported_descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .expect("second import deadline")
-        .expect("second import response")
-    {
-        WireFrame::Response {
-            body:
-                ResponseBody::AccountOAuthImport {
-                    descriptor,
-                    revision,
-                },
-            ..
-        } => {
-            assert!(revision > active_revision);
-            descriptor
-        }
-        other => panic!("unexpected second import response: {other:?}"),
-    };
+    let imported_descriptor =
+        match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+            .await
+            .expect("second import deadline")
+            .expect("second import response")
+        {
+            WireFrame::Response {
+                body:
+                    ResponseBody::AccountOAuthImport {
+                        descriptor,
+                        revision,
+                    },
+                ..
+            } => {
+                assert!(revision > active_revision);
+                descriptor
+            }
+            other => panic!("unexpected second import response: {other:?}"),
+        };
     assert_eq!(
         imported_descriptor.alias.as_str(),
         OPENAI_OAUTH_PROVIDER_NAME
@@ -12956,7 +13006,7 @@ async fn reimport_over_a_retired_secret_restores_the_account() {
     // First import: descriptor + vault secret committed.
     send_oauth_import(&commands, Arc::clone(&sink), "import-pre-upgrade", "codex").await;
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("first import deadline")
             .expect("first import response"),
@@ -12977,7 +13027,7 @@ async fn reimport_over_a_retired_secret_restores_the_account() {
 
     // Re-import must RESTORE, not error.
     send_oauth_import(&commands, Arc::clone(&sink), "import-post-upgrade", "codex").await;
-    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("re-import deadline")
         .expect("re-import response")
@@ -13814,7 +13864,7 @@ async fn explicit_discovery_detects_codex_but_never_auto_imports() {
             })
             .await
             .expect("refresh cadence command");
-        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("refresh response deadline")
             .expect("refresh response");
@@ -13876,7 +13926,7 @@ async fn expect_import_device_error(
     frames: &mut mpsc::UnboundedReceiver<WireFrame>,
     expected_message: &str,
 ) {
-    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
         .await
         .expect("device import error deadline")
         .expect("device import error response");
@@ -13961,21 +14011,22 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
         &codex_candidate,
     )
     .await;
-    let codex_descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .expect("Codex device import deadline")
-        .expect("Codex device import response")
-    {
-        WireFrame::Response {
-            body:
-                ResponseBody::AccountImportDevice {
-                    descriptor,
-                    revision: 1,
-                },
-            ..
-        } => descriptor,
-        other => panic!("unexpected Codex device import response: {other:?}"),
-    };
+    let codex_descriptor =
+        match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+            .await
+            .expect("Codex device import deadline")
+            .expect("Codex device import response")
+        {
+            WireFrame::Response {
+                body:
+                    ResponseBody::AccountImportDevice {
+                        descriptor,
+                        revision: 1,
+                    },
+                ..
+            } => descriptor,
+            other => panic!("unexpected Codex device import response: {other:?}"),
+        };
     assert_eq!(codex_descriptor.alias.as_str(), OPENAI_OAUTH_PROVIDER_NAME);
     assert_eq!(codex_descriptor.provider, OPENAI_OAUTH_PROVIDER_NAME);
     assert_eq!(codex_descriptor.identity, "fake-account-1 · Codex");
@@ -14001,7 +14052,7 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
     )
     .await;
     let (kimi_descriptor, kimi_revision) =
-        match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        match tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
             .await
             .expect("Kimi device import deadline")
             .expect("Kimi device import response")
@@ -15884,14 +15935,17 @@ async fn credential_source_watcher_observes_atomic_origin_rotation() {
         .expect("enroll source");
     let registry = Arc::new(StdMutex::new(registry));
     let (changed_tx, mut changed_rx) = watch::channel(0_u64);
-    let _watcher = CredentialSourceWatcher::new(&registry, changed_tx);
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut watcher = CredentialSourceWatcher::new(&registry, changed_tx);
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        watcher.wait_for_initial_scan(),
+    )
+    .await
+    .expect("watcher captures initial source fingerprint");
 
     write_linked_codex_source(&root, "acct-watch", "rotated@example.test");
-    // 3s = twelve 250ms watcher cadences; this is a test-only scheduling
-    // allowance, not a product timeout.
-    tokio::time::timeout(Duration::from_secs(3), changed_rx.changed())
+    // Await the recorded source change independently of watcher scheduling.
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, changed_rx.changed())
         .await
         .expect("watch deadline")
         .expect("watch signal");
@@ -16376,17 +16430,21 @@ async fn credential_source_watcher_follows_a_kimi_endpoint_slot() {
     );
     let registry = Arc::new(StdMutex::new(registry));
     let (changed_tx, mut changed_rx) = watch::channel(0_u64);
-    let _watcher = CredentialSourceWatcher::new(&registry, changed_tx);
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut watcher = CredentialSourceWatcher::new(&registry, changed_tx);
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        watcher.wait_for_initial_scan(),
+    )
+    .await
+    .expect("watcher captures initial source fingerprint");
 
     write_linked_kimi_source(
         &root,
         "kimi-access-rotated",
         "kimi-code-env-0123456789abcdef.json",
     );
-    // 3s = twelve 250ms watcher cadences; a test-only scheduling allowance.
-    tokio::time::timeout(Duration::from_secs(3), changed_rx.changed())
+    // Await the recorded source change independently of watcher scheduling.
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, changed_rx.changed())
         .await
         .expect("watch deadline")
         .expect("watch signal");
@@ -17790,11 +17848,14 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         }),
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
-        .await
-        .expect("public discovery started without broker");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        discoverer.started.notified(),
+    )
+    .await
+    .expect("public discovery started without broker");
     discoverer.release.notify_one();
-    let completion = tokio::time::timeout(Duration::from_secs(2), received.recv())
+    let completion = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, received.recv())
         .await
         .expect("completion deadline")
         .expect("completion");
@@ -18453,6 +18514,7 @@ async fn v2_claim_pending_add(store: &SqliteStoreHandle, command_id: &str, alias
         physical_alias: alias.to_owned(),
         display_alias: alias.to_owned(),
         auth_method: "oauth".into(),
+        recovery_target: None,
     };
     let json = identity.canonical_json().expect("coordinates");
     let digest = blake3::hash(json.as_bytes()).to_hex().to_string();
@@ -18884,6 +18946,7 @@ async fn a18_commit_oauth_receipt(
             display_alias: requested.into(),
             physical_alias: requested.into(),
             auth_method: "oauth".into(),
+            recovery_target: None,
         }
         .canonical_json()
         .expect("add coordinates"),
@@ -18892,7 +18955,7 @@ async fn a18_commit_oauth_receipt(
         .account_add_claim_receipt(
             command.into(),
             blake3::hash(request.as_bytes()).to_hex().to_string(),
-            request,
+            request.clone(),
         )
         .await
         .expect("claim historical receipt");
@@ -18900,6 +18963,11 @@ async fn a18_commit_oauth_receipt(
         .finalize_account_add_receipt(command.into(), AccountAddReceiptResponse { descriptor })
         .await
         .expect("commit historical response");
+    // Keep this fixture historical even when the current finalizer normalizes
+    // its saved coordinate. No sign-in or key material is placed in SQLite.
+    let database =
+        rusqlite::Connection::open(store.root().join("store.sqlite")).expect("fixture database");
+    database.execute("UPDATE command_receipts SET request_json = ?2, recovery_json = NULL WHERE command_id = ?1", rusqlite::params![command, request]).expect("historical request coordinates");
 }
 
 fn a18_descriptor(alias: &str, provider: &str, identity: &str) -> CredentialDescriptor {
@@ -19321,4 +19389,603 @@ async fn a18_import_ownership_follows_saved_alias_and_keeps_untouched_source() {
     .expect_err("retargeted import retains source ownership");
     assert_eq!(native.reads(), 0, "no native credential source was read");
     store.close().await.expect("close");
+}
+
+/// The older reader must leave staged work pending instead of finalizing untouched X.
+/// The original request remains the same-command replay authority.
+#[tokio::test]
+async fn a23_pending_retarget_keeps_the_original_command_and_the_saved_target() {
+    for target in ["work", "other", "missing"] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        v2_claim_pending_add(&store, "a23-command", "work").await;
+        if target == "other" {
+            let database =
+                rusqlite::Connection::open(dir.path().join("store.sqlite")).expect("database");
+            database.execute("UPDATE command_receipts SET recovery_json = '{\"public_stage\":\"retained\"}' WHERE command_id = 'a23-command'", []).expect("existing additive metadata");
+        }
+        store
+            .prepare_account_add_target("a23-command".into(), target.into())
+            .await
+            .expect("prepare target");
+        let rows = store.account_add_receipts().await.expect("read");
+        if target == "other" {
+            let database =
+                rusqlite::Connection::open(dir.path().join("store.sqlite")).expect("database");
+            let metadata: String = database
+                .query_row(
+                    "SELECT recovery_json FROM command_receipts WHERE command_id = 'a23-command'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("metadata");
+            let metadata: serde_json::Value =
+                serde_json::from_str(&metadata).expect("public metadata");
+            assert_eq!(metadata["public_stage"], "retained");
+        }
+        let request: serde_json::Value =
+            serde_json::from_str(&rows[0].request_json).expect("request");
+        assert!(
+            request["physical_alias"]
+                .as_str()
+                .expect("previous coordinate")
+                .starts_with("__oauth_pending_")
+        );
+        assert_eq!(request["recovery_target"], target);
+        assert!(
+            request.get("source").is_none(),
+            "interactive ownership stays interactive for both readers"
+        );
+        assert!(
+            matches!(
+                serde_json::from_value::<OAuthReceiptIdentity>(request).expect("current reader"),
+                OAuthReceiptIdentity::Add(_)
+            ),
+            "interactive ownership is preserved"
+        );
+        let original = OAuthAddIdentity {
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+            physical_alias: "work".into(),
+            display_alias: "work".into(),
+            auth_method: "oauth".into(),
+            recovery_target: None,
+        }
+        .canonical_json()
+        .expect("request");
+        let digest = blake3::hash(original.as_bytes()).to_hex().to_string();
+        assert!(matches!(
+            store
+                .account_add_claim_receipt("a23-command".into(), digest.clone(), original.clone())
+                .await
+                .expect("resume"),
+            AccountAddClaim::ResumePending
+        ));
+        let descriptor = a18_descriptor(
+            target,
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            "account=a;organization=team",
+        );
+        store
+            .finalize_account_add_receipt(
+                "a23-command".into(),
+                AccountAddReceiptResponse { descriptor },
+            )
+            .await
+            .expect("finalize");
+        let database =
+            rusqlite::Connection::open(dir.path().join("store.sqlite")).expect("database");
+        let persisted: String = database
+            .query_row(
+                "SELECT request_json FROM command_receipts WHERE command_id = 'a23-command'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("persisted request");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&persisted).expect("persisted coordinates");
+        assert_eq!(
+            persisted["physical_alias"], target,
+            "finalization atomically publishes the actual alias for the previous reader"
+        );
+        assert!(persisted.get("recovery_target").is_none());
+        assert!(matches!(
+            store
+                .account_add_claim_receipt("a23-command".into(), digest.clone(), original)
+                .await
+                .expect("replay"),
+            AccountAddClaim::Committed(_)
+        ));
+        assert!(
+            store
+                .account_add_claim_receipt(
+                    "a23-command".into(),
+                    digest,
+                    serde_json::json!({"provider":"different"}).to_string(),
+                )
+                .await
+                .is_err(),
+            "different semantic request is refused"
+        );
+        let rows = store.account_add_receipts().await.expect("read committed");
+        let request: serde_json::Value =
+            serde_json::from_str(&rows[0].request_json).expect("request");
+        assert_eq!(request["physical_alias"], target);
+        assert!(
+            request.get("source").is_none(),
+            "committed interactive writes remain interactive for the previous reader"
+        );
+        store.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn a23_historical_committed_coordinates_are_normalized_for_the_previous_reader() {
+    for source in [None, Some("codex")] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        a18_commit_oauth_receipt(
+            &store,
+            "a23-historical",
+            "x",
+            a18_descriptor("y", OPENAI_OAUTH_PROVIDER_NAME, "user/workspace"),
+            source,
+        )
+        .await;
+        // Recreate an actual historical request after the new finalizer, retaining
+        // its original command request in the additive recovery field.
+        let database =
+            rusqlite::Connection::open(dir.path().join("store.sqlite")).expect("database");
+        let old = if let Some(source) = source {
+            serde_json::json!({"source":source,"alias":"x","provider":OPENAI_OAUTH_PROVIDER_NAME})
+        } else {
+            serde_json::json!({"provider":OPENAI_OAUTH_PROVIDER_NAME,"physical_alias":"x","display_alias":"x","auth_method":"oauth"})
+        };
+        database
+            .execute(
+                "UPDATE command_receipts SET request_json = ?1 WHERE command_id = 'a23-historical'",
+                [old.to_string()],
+            )
+            .expect("historical fixture");
+        let rows = store.account_add_receipts().await.expect("normalize");
+        let identity: OAuthReceiptIdentity =
+            serde_json::from_str(&rows[0].request_json).expect("identity");
+        assert_eq!(identity.alias(), "y");
+        assert_eq!(
+            matches!(identity, OAuthReceiptIdentity::Import(_)),
+            source.is_some(),
+            "normalization preserves ownership"
+        );
+        assert_eq!(rows[0].final_revision, Some(1));
+        store.close().await.expect("close");
+    }
+}
+
+/// Writes synthetic profiles through the actual account actor. The paired real
+/// daemon check optionally retains these fixtures in its private scratch root.
+#[tokio::test]
+async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() {
+    let temporary = test_store_dir();
+    let root = std::env::var_os("HAIDER_A23_PROFILE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary.path().to_path_buf());
+    std::fs::create_dir_all(&root).expect("fixture root");
+    let mut manifest = Vec::new();
+    for case in [
+        "ordinary",
+        "aa",
+        "aba",
+        "removed",
+        "openai",
+        "explicit",
+        "historical",
+        "readded",
+        "retarget",
+        "missing-y",
+        "imported-x",
+        "pending-retarget",
+    ] {
+        let directory = root.join(case);
+        std::fs::create_dir(&directory).expect("new fixture");
+        let store = open_store(&directory).await;
+        let vault = Arc::new(MemoryVault::new());
+        let (mut actor, snapshot, _) = start_oauth_import_test_actor(
+            &store,
+            Arc::clone(&vault),
+            HashSet::new(),
+            RefreshFenceRegistry::default(),
+        );
+        let (sink, mut frames) = channel_sink();
+        let provider = if case == "openai" || case == "imported-x" {
+            OPENAI_OAUTH_PROVIDER_NAME
+        } else {
+            ANTHROPIC_OAUTH_PROVIDER_NAME
+        };
+        let sequence: Vec<(&str, &str)> = match case {
+            "ordinary" => vec![("a", "work"), ("b", "other")],
+            "aba" => vec![("a", "work"), ("b", "other"), ("a", "requested")],
+            "retarget" | "missing-y" | "imported-x" | "pending-retarget" => {
+                vec![("a", "work"), ("b", "other"), ("b", "work")]
+            }
+            "explicit" => vec![("a", "named-account"), ("a", "explicit-request")],
+            _ => vec![("a", "work"), ("a", "requested")],
+        };
+        for (index, (who, requested)) in sequence.iter().enumerate() {
+            let command = format!("a23-{case}-{index}");
+            let account_id = if provider == OPENAI_OAUTH_PROVIDER_NAME {
+                format!("user:1:{who};workspace:4:team")
+            } else {
+                format!("account={who};organization=team")
+            };
+            let bundle = if provider == OPENAI_OAUTH_PROVIDER_NAME {
+                openai_import_test_bundle(command.as_bytes(), b"synthetic-refresh", 1)
+                    .with_account_identity(stable_test_identity(
+                        "same@example.test",
+                        Some(&account_id),
+                    ))
+            } else {
+                claude_relogin_bundle(command.as_bytes(), &account_id, u64::MAX - 1)
+                    .with_account_identity(stable_test_identity(
+                        "same@example.test",
+                        Some(&account_id),
+                    ))
+            };
+            actor
+                .commands()
+                .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+                    command_id: command.clone(),
+                    provider: provider.into(),
+                    display_alias: (*requested).into(),
+                    claim: Some(OAuthReadyClaim::for_account_test(
+                        provider, requested, bundle,
+                    )),
+                    route: LoginRoute {
+                        request_id: RequestId::new(&command),
+                        sink: Arc::clone(&sink),
+                    },
+                })))
+                .await
+                .expect("sign-in command");
+            let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+                .await
+                .expect("sign-in deadline")
+                .expect("sign-in response");
+            assert!(
+                matches!(
+                    frame,
+                    WireFrame::Response {
+                        body: ResponseBody::AccountAdd { .. },
+                        ..
+                    }
+                ),
+                "{case}: {frame:?}"
+            );
+            if case == "imported-x" && index == 0 {
+                let imported = snapshot.lock().expect("snapshot")[0].clone();
+                a18_commit_oauth_receipt(
+                    &store,
+                    "a23-import-owner",
+                    "work",
+                    imported,
+                    Some("codex"),
+                )
+                .await;
+            }
+        }
+        if case == "removed" || case == "readded" {
+            actor
+                .commands()
+                .send(AccountCommand::Remove(Box::new(RemoveAccountJob {
+                    command_id: format!("a23-{case}-remove"),
+                    alias: "work".into(),
+                    expected_revision: None,
+                    route: LoginRoute {
+                        request_id: RequestId::new("remove"),
+                        sink: Arc::clone(&sink),
+                    },
+                })))
+                .await
+                .expect("remove command");
+            let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+                .await
+                .expect("remove deadline")
+                .expect("remove response");
+            assert!(
+                matches!(
+                    frame,
+                    WireFrame::Response {
+                        body: ResponseBody::AccountRemove { .. },
+                        ..
+                    }
+                ),
+                "{frame:?}"
+            );
+            if case == "readded" {
+                let bundle = claude_relogin_bundle(
+                    b"synthetic-readded",
+                    "account=c;organization=team",
+                    u64::MAX - 1,
+                );
+                actor
+                    .commands()
+                    .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+                        command_id: "a23-readd".into(),
+                        provider: provider.into(),
+                        display_alias: "work".into(),
+                        claim: Some(OAuthReadyClaim::for_account_test(provider, "work", bundle)),
+                        route: LoginRoute {
+                            request_id: RequestId::new("readd"),
+                            sink: Arc::clone(&sink),
+                        },
+                    })))
+                    .await
+                    .expect("readd command");
+                let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+                    .await
+                    .expect("readd deadline")
+                    .expect("readd response");
+                assert!(
+                    matches!(
+                        frame,
+                        WireFrame::Response {
+                            body: ResponseBody::AccountAdd { .. },
+                            ..
+                        }
+                    ),
+                    "{frame:?}"
+                );
+            }
+        }
+        actor.shutdown().await;
+        let expected = snapshot.lock().expect("snapshot").clone();
+        assert_eq!(
+            expected.len(),
+            match case {
+                "removed" => 0,
+                "ordinary" | "aba" | "retarget" | "missing-y" | "imported-x"
+                | "pending-retarget" => 2,
+                _ => 1,
+            }
+        );
+        if case == "historical" {
+            let database =
+                rusqlite::Connection::open(directory.join("store.sqlite")).expect("database");
+            let request = OAuthAddIdentity {
+                provider: provider.into(),
+                display_alias: "requested".into(),
+                physical_alias: "requested".into(),
+                auth_method: "oauth".into(),
+                recovery_target: None,
+            }
+            .canonical_json()
+            .expect("historical coordinates");
+            database.execute("UPDATE command_receipts SET request_json = ?1, recovery_json = NULL WHERE command_id = 'a23-historical-1'", [request]).expect("historical fixture");
+        }
+        if case == "pending-retarget" {
+            v2_claim_pending_add(&store, "a23-interrupted", "work").await;
+            store
+                .prepare_account_add_target("a23-interrupted".into(), "other".into())
+                .await
+                .expect("pending target");
+            let bundle = vault
+                .resolve(&CredentialAlias::new("other"))
+                .expect("saved Y");
+            let bundle = haider_accounts::OAuthTokenBundleV1::decode(bundle.expose_secret())
+                .expect("synthetic bundle");
+            put_oauth_staging(
+                Arc::clone(&vault) as Arc<dyn Vault>,
+                &oauth_staging_alias("a23-interrupted"),
+                &bundle,
+            )
+            .await
+            .expect("staged Y");
+        }
+        store.close().await.expect("close fixture");
+        let written = expected
+            .iter()
+            .filter(|row| case != "missing-y" || row.alias.as_str() != "other")
+            .cloned()
+            .collect::<Vec<_>>();
+        std::fs::write(
+            directory.join("accounts.json"),
+            serde_json::to_vec(&written).expect("rows"),
+        )
+        .expect("write account projection");
+        let file_vault = haider_accounts::FileVault::new(directory.join("vault"));
+        for alias in vault.list().expect("synthetic slots") {
+            let secret = vault.resolve(&alias).expect("synthetic slot");
+            file_vault
+                .put(&alias, secret.expose_secret())
+                .expect("write synthetic slot");
+        }
+        manifest.push(serde_json::json!({"case":case,"expected":expected,"candidate_first":case=="historical","pending":case=="pending-retarget","fixture":"actual actor sign-ins; historical and missing projection are explicitly named fixtures"}));
+    }
+    std::fs::write(
+        root.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest"),
+    )
+    .expect("write manifest");
+}
+
+#[tokio::test]
+async fn a23_interrupted_target_publication_requires_the_command_owned_stage() {
+    for boundary in ["prepared", "staged", "written", "missing-projection"] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let vault = Arc::new(MemoryVault::new());
+        let mut accounts = memory_accounts();
+        let x = claude_relogin_bundle(b"synthetic-x", "account=a;organization=team", u64::MAX - 1);
+        let old_y = claude_relogin_bundle(
+            b"synthetic-y-old",
+            "account=b;organization=team",
+            u64::MAX - 1,
+        );
+        let new_y = claude_relogin_bundle(
+            b"synthetic-y-new",
+            "account=b;organization=team",
+            u64::MAX - 1,
+        );
+        v2_seed_claude_row(
+            &mut accounts,
+            &vault,
+            "work",
+            &x,
+            CredentialStatus::Revoked,
+            false,
+        );
+        v2_seed_claude_row(
+            &mut accounts,
+            &vault,
+            "other",
+            &old_y,
+            CredentialStatus::Expired,
+            true,
+        );
+        v2_claim_pending_add(&store, "a23-boundary", "work").await;
+        store
+            .prepare_account_add_target("a23-boundary".into(), "other".into())
+            .await
+            .expect("publish target");
+        if boundary != "prepared" {
+            put_oauth_staging(
+                Arc::clone(&vault) as Arc<dyn Vault>,
+                &oauth_staging_alias("a23-boundary"),
+                &new_y,
+            )
+            .await
+            .expect("stage");
+        }
+        if boundary == "written" || boundary == "missing-projection" {
+            vault
+                .put(
+                    &CredentialAlias::new("other"),
+                    &new_y.encode().expect("encode"),
+                )
+                .expect("durable Y");
+        }
+        if boundary == "missing-projection" {
+            accounts
+                .remove(&CredentialAlias::new("other"))
+                .expect("missing projection fixture");
+        }
+        reconcile_oauth_add_receipts(
+            &store,
+            &mut accounts,
+            &VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
+        )
+        .await
+        .expect("restart");
+        let completed = boundary == "written" || boundary == "missing-projection";
+        let rows = store.account_add_receipts().await.expect("receipts");
+        assert_eq!(
+            rows[0].state,
+            if completed { "committed" } else { "pending" },
+            "{boundary}"
+        );
+        let (mut actor, snapshot, _) = v2_actor_with(&store, accounts, Arc::clone(&vault));
+        let (sink, mut frames) = channel_sink();
+        if !completed {
+            actor
+                .commands()
+                .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+                    command_id: "a23-boundary".into(),
+                    provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+                    display_alias: "work".into(),
+                    claim: None,
+                    route: LoginRoute {
+                        request_id: RequestId::new("resume"),
+                        sink: Arc::clone(&sink),
+                    },
+                })))
+                .await
+                .expect("resume");
+            let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+                .await
+                .expect("resume deadline")
+                .expect("response");
+            if boundary == "prepared" {
+                assert!(
+                    !matches!(
+                        frame,
+                        WireFrame::Response {
+                            body: ResponseBody::AccountAdd { .. },
+                            ..
+                        }
+                    ),
+                    "no stage cannot acknowledge untouched X or Y: {frame:?}"
+                );
+                actor
+                    .commands()
+                    .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+                        command_id: "a23-boundary".into(),
+                        provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+                        display_alias: "work".into(),
+                        claim: Some(OAuthReadyClaim::for_account_test(
+                            ANTHROPIC_OAUTH_PROVIDER_NAME,
+                            "work",
+                            new_y,
+                        )),
+                        route: LoginRoute {
+                            request_id: RequestId::new("fresh-flow"),
+                            sink: Arc::clone(&sink),
+                        },
+                    })))
+                    .await
+                    .expect("fresh flow");
+                let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+                    .await
+                    .expect("fresh deadline")
+                    .expect("fresh response");
+                assert!(
+                    matches!(
+                        frame,
+                        WireFrame::Response {
+                            body: ResponseBody::AccountAdd { .. },
+                            ..
+                        }
+                    ),
+                    "{frame:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        frame,
+                        WireFrame::Response {
+                            body: ResponseBody::AccountAdd { .. },
+                            ..
+                        }
+                    ),
+                    "{frame:?}"
+                );
+            }
+        }
+        actor.shutdown().await;
+        let rows = store.account_add_receipts().await.expect("final receipt");
+        assert_eq!(rows[0].state, "committed");
+        let response: AccountAddReceiptResponse =
+            serde_json::from_str(rows[0].response_json.as_deref().expect("response"))
+                .expect("decode");
+        assert_eq!(response.descriptor.alias.as_str(), "other");
+        assert_eq!(snapshot.lock().expect("snapshot").len(), 2);
+        assert!(
+            snapshot
+                .lock()
+                .expect("snapshot")
+                .iter()
+                .any(|row| row.alias.as_str() == "other" && row.status == CredentialStatus::Ok),
+            "the durable bundle repairs Y's old health projection at {boundary}"
+        );
+        assert!(
+            vault
+                .resolve(&CredentialAlias::new("work"))
+                .expect("X")
+                .expose_secret()
+                == x.encode().expect("X encoding").as_slice(),
+            "X is untouched at {boundary}"
+        );
+        assert!(
+            vault.resolve(&oauth_staging_alias("a23-boundary")).is_err(),
+            "stage cleanup at {boundary}"
+        );
+        store.close().await.expect("close");
+    }
 }

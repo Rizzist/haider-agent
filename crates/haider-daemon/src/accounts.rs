@@ -136,7 +136,11 @@ fn source_reconcile_period(profile_id: &str) -> Duration {
     SOURCE_RECONCILE_BASE + Duration::from_millis(jitter)
 }
 
-struct CredentialSourceWatcher(tokio::task::JoinHandle<()>);
+struct CredentialSourceWatcher {
+    task: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    initial_scan: watch::Receiver<bool>,
+}
 
 impl CredentialSourceWatcher {
     fn new(
@@ -144,6 +148,8 @@ impl CredentialSourceWatcher {
         changed: watch::Sender<u64>,
     ) -> Self {
         let registry = Arc::clone(registry);
+        #[cfg(test)]
+        let (ready, initial_scan) = watch::channel(false);
         let task = tokio::spawn(async move {
             let mut observed = HashMap::new();
             let mut cadence = tokio::time::interval(Duration::from_millis(250));
@@ -168,15 +174,34 @@ impl CredentialSourceWatcher {
                     }
                 }
                 observed.retain(|source_id, _| live.contains(source_id));
+                #[cfg(test)]
+                ready.send_replace(true);
             }
         });
-        Self(task)
+        Self {
+            task,
+            #[cfg(test)]
+            initial_scan,
+        }
+    }
+}
+
+#[cfg(test)]
+impl CredentialSourceWatcher {
+    #[allow(clippy::expect_used)]
+    async fn wait_for_initial_scan(&mut self) {
+        while !*self.initial_scan.borrow_and_update() {
+            self.initial_scan
+                .changed()
+                .await
+                .expect("watcher remains live");
+        }
     }
 }
 
 impl Drop for CredentialSourceWatcher {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
 }
 
@@ -7392,6 +7417,8 @@ struct OAuthAddIdentity {
     display_alias: String,
     physical_alias: String,
     auth_method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -7433,7 +7460,10 @@ impl OAuthReceiptIdentity {
     fn alias(&self) -> &str {
         match self {
             Self::Import(identity) => &identity.alias,
-            Self::Add(identity) => &identity.physical_alias,
+            Self::Add(identity) => identity
+                .recovery_target
+                .as_deref()
+                .unwrap_or(&identity.physical_alias),
         }
     }
 }
@@ -7489,6 +7519,7 @@ async fn handle_oauth_add(
         physical_alias: display_alias.clone(),
         display_alias,
         auth_method: "oauth".into(),
+        recovery_target: None,
     };
     let requested_alias = CredentialAlias::new(identity.physical_alias.clone());
     let staging_alias = oauth_staging_alias(&command_id);
@@ -7550,6 +7581,21 @@ async fn handle_oauth_add(
         );
         return;
     }
+    let target_published = if resume {
+        let rows = match store.account_add_receipts().await {
+            Ok(rows) => rows,
+            Err(error) => {
+                respond_management_error(&route, &error);
+                return;
+            }
+        };
+        rows.iter()
+            .find(|row| row.command_id == command_id)
+            .and_then(|row| serde_json::from_str::<OAuthAddIdentity>(&row.request_json).ok())
+            .is_some_and(|identity| identity.recovery_target.is_some())
+    } else {
+        false
+    };
     // A staged bundle means the interrupted attempt targeted ANOTHER alias
     // (identity match or a different-account retarget); that attempt must be
     // replayed below, never finalized as if it had rewritten the requested
@@ -7570,7 +7616,8 @@ async fn handle_oauth_add(
     } else {
         false
     };
-    if resume && !staged_elsewhere && accounts.get(&requested_alias).is_some() {
+    if resume && !target_published && !staged_elsewhere && accounts.get(&requested_alias).is_some()
+    {
         if let Err(error) = promote_linked_alias_to_haider_oauth(
             source_registry,
             source_snapshot,
@@ -7601,7 +7648,7 @@ async fn handle_oauth_add(
         .await;
         return;
     }
-    let (mut bundle, resumed_from_staging) = if resume {
+    let (mut bundle, resumed_from_staging) = if resume && (!target_published || staged_elsewhere) {
         let stored = match resolve_optional_vault_secret(Arc::clone(&vault), &staging_alias).await {
             Ok(Some(stored)) => Some((stored, true)),
             Ok(None) => {
@@ -7743,6 +7790,14 @@ async fn handle_oauth_add(
     }
     let needs_staging = alias != requested_alias;
     if needs_staging
+        && let Err(error) = store
+            .prepare_account_add_target(command_id.clone(), alias.as_str().to_owned())
+            .await
+    {
+        respond_management_error(&route, &error);
+        return;
+    }
+    if needs_staging
         && !resumed_from_staging
         && let Err(error) = put_oauth_staging(Arc::clone(&vault), &staging_alias, &bundle).await
     {
@@ -7848,7 +7903,7 @@ async fn handle_oauth_add(
         &alias,
         &route,
         OAuthCommitResponse::Add,
-        needs_staging.then(|| (Arc::clone(&vault), staging_alias)),
+        (needs_staging || resumed_from_staging).then(|| (Arc::clone(&vault), staging_alias)),
     )
     .await;
 }
@@ -12826,7 +12881,30 @@ async fn reconcile_oauth_add_receipts_from(
             })?;
         let provider = identity.provider().to_owned();
         let alias = CredentialAlias::new(identity.alias());
+        let target_published = matches!(&identity, OAuthReceiptIdentity::Add(identity) if identity.recovery_target.is_some());
         let is_import = matches!(identity, OAuthReceiptIdentity::Import(_));
+        // Normalize an interrupted write from a build that did not publish
+        // its target before staging. Keep an unwritten stage pending for BOTH
+        // readers, even when the original requested row still exists.
+        if row.state == "pending"
+            && !is_import
+            && let VaultProvision::Available(vault) = vault
+            && let Ok(staged) = vault.resolve(&oauth_staging_alias(&row.command_id))
+        {
+            let bundle = haider_accounts::OAuthTokenBundleV1::decode(oauth_stage_payload(
+                staged.expose_secret(),
+            ))?;
+            let mut target = oauth_alias_for_identity(accounts, &provider, &alias, &bundle);
+            if target == alias && relogin_is_different_account(accounts, &provider, &alias, &bundle)
+            {
+                target = next_free_account_alias_excluding(accounts, &provider, reserved)?;
+            }
+            if !reserved.contains(target.as_str()) {
+                store
+                    .prepare_account_add_target(row.command_id.clone(), target.as_str().to_owned())
+                    .await?;
+            }
+        }
         // Pending/staged receipts still use the request and staged bundle.
         // Only a committed response proves where the write landed.
         if row.state == "pending" && reserved.contains(alias.as_str()) {
@@ -12869,8 +12947,18 @@ async fn reconcile_oauth_add_receipts_from(
                         accounts,
                         &row.command_id,
                         &provider,
+                        &alias,
                     )? {
                         StagedOAuthAdd::Wrote(target) => {
+                            if !restore_staged_oauth_target(
+                                accounts,
+                                vault.as_ref(),
+                                &target,
+                                &provider,
+                                durable_heads,
+                            )? {
+                                continue;
+                            }
                             finalize_oauth_reconciled(store, accounts, &row.command_id, &target)
                                 .await?;
                             let _ = vault.delete(&oauth_staging_alias(&row.command_id));
@@ -12879,6 +12967,9 @@ async fn reconcile_oauth_add_receipts_from(
                         StagedOAuthAdd::NotYetWritten => continue,
                         StagedOAuthAdd::NotStaged => {}
                     }
+                }
+                if target_published {
+                    continue;
                 }
                 finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
             }
@@ -12900,8 +12991,18 @@ async fn reconcile_oauth_add_receipts_from(
                         accounts,
                         &row.command_id,
                         &provider,
+                        &alias,
                     )? {
                         StagedOAuthAdd::Wrote(target) => {
+                            if !restore_staged_oauth_target(
+                                accounts,
+                                vault.as_ref(),
+                                &target,
+                                &provider,
+                                durable_heads,
+                            )? {
+                                continue;
+                            }
                             finalize_oauth_reconciled(store, accounts, &row.command_id, &target)
                                 .await?;
                             let _ = vault.delete(&oauth_staging_alias(&row.command_id));
@@ -12910,6 +13011,9 @@ async fn reconcile_oauth_add_receipts_from(
                         StagedOAuthAdd::NotYetWritten => continue,
                         StagedOAuthAdd::NotStaged => {}
                     }
+                }
+                if target_published {
+                    continue;
                 }
                 let Ok(stored) = vault.resolve(&alias) else {
                     // Browser state and ready refs die on restart. The pending
@@ -12968,6 +13072,7 @@ fn staged_oauth_add_target(
     accounts: &AccountStore<Box<dyn StoreLike>>,
     command_id: &str,
     provider: &str,
+    recovery_alias: &CredentialAlias,
 ) -> Result<StagedOAuthAdd, HaiderError> {
     let staged = match vault.resolve(&oauth_staging_alias(command_id)) {
         Ok(staged) => staged,
@@ -12981,24 +13086,65 @@ fn staged_oauth_add_target(
     else {
         return Ok(StagedOAuthAdd::NotYetWritten);
     };
-    for row in accounts
+    let missing = accounts
+        .get(recovery_alias)
+        .is_none()
+        .then_some(recovery_alias);
+    for alias in accounts
         .list()
         .iter()
         .filter(|row| row.provider == provider && row.auth_method == AuthMethod::OAuth)
+        .map(|row| &row.alias)
+        .chain(missing)
     {
-        let Ok(stored) = vault.resolve(&row.alias) else {
+        let Ok(stored) = vault.resolve(alias) else {
             continue;
         };
         let Ok(stored) = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) else {
             continue;
         };
-        if stored.provider_id == staged.provider_id
+        if stored.provider_id == provider
+            && stored.provider_id == staged.provider_id
             && bool::from(stored.access_token().ct_eq(staged.access_token()))
         {
-            return Ok(StagedOAuthAdd::Wrote(row.alias.clone()));
+            return Ok(StagedOAuthAdd::Wrote(alias.clone()));
         }
     }
     Ok(StagedOAuthAdd::NotYetWritten)
+}
+
+/// A matching staged write can restore a missing projection, but cannot undo a
+/// durable removal. Explicit same-command retry can still complete a newer add.
+fn restore_staged_oauth_target(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    alias: &CredentialAlias,
+    provider: &str,
+    heads: &HashMap<String, DurableAccountHead>,
+) -> Result<bool, HaiderError> {
+    let existing = accounts.get(alias);
+    if existing.is_none()
+        && heads
+            .get(alias.as_str())
+            .is_some_and(|head| head.mutation == DurableAccountMutation::Remove)
+    {
+        return Ok(false);
+    }
+    let active = existing.map_or_else(
+        || accounts.active_for_provider(provider).is_none(),
+        |row| row.active,
+    );
+    let stored = vault.resolve(alias)?;
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())?;
+    let descriptor = oauth_descriptor_for(provider, alias, &bundle, active);
+    if existing.is_some() {
+        // The key may have reached disk before the old row's health/identity
+        // projection. Replacement keeps its label, creation time and selection.
+        accounts.replace(descriptor)?;
+    } else {
+        accounts.add(descriptor)?;
+    }
+    Ok(true)
 }
 
 async fn reconcile_remove_receipts(

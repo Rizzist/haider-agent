@@ -25,7 +25,6 @@ use haider_store::TurnCancelCommand;
 use haider_store::{EventStore, Store};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, timeout};
 
 use crate::session_hub::{SessionHub, SessionHubConfig};
@@ -33,9 +32,9 @@ use crate::turn_recovery::{
     STARTUP_HYDRATION_PAYLOAD_KINDS, interrupted_recovery_payloads_for_test,
 };
 use crate::worker::{
-    BrokerToolFactory, ProviderFactory, QueuedBudgetArm, QueuedBudgetWake, ResolvedTurnProvider,
-    WorkerDependencies, WorkerManager, budget_request_is_unresolved_for_test,
-    budget_usage_from_envelopes_for_test, exhausted_budget,
+    BrokerToolFactory, ProviderDeadlineTestClock, ProviderFactory, QueuedBudgetArm,
+    QueuedBudgetWake, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
+    budget_request_is_unresolved_for_test, budget_usage_from_envelopes_for_test, exhausted_budget,
     projected_time_budget_exhaustion_for_test,
     route_retry_unresolved_attempt_is_chargeable_for_test, signal_queued_budget_change,
     wait_for_queued_budget_deadline_or_change,
@@ -719,6 +718,8 @@ struct NeverOpensProvider {
     fallback: FakeProvider,
     requests: AtomicUsize,
     in_flight: Arc<AtomicUsize>,
+    opened: tokio::sync::Notify,
+    dropped: Arc<tokio::sync::Notify>,
 }
 
 impl NeverOpensProvider {
@@ -727,15 +728,18 @@ impl NeverOpensProvider {
             fallback: FakeProvider::new(Vec::new()),
             requests: AtomicUsize::new(0),
             in_flight,
+            opened: tokio::sync::Notify::new(),
+            dropped: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
 
-struct InFlightRequest(Arc<AtomicUsize>);
+struct InFlightRequest(Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
 
 impl Drop for InFlightRequest {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        self.1.notify_one();
     }
 }
 
@@ -756,13 +760,15 @@ impl Provider for NeverOpensProvider {
     async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let _guard = InFlightRequest(Arc::clone(&self.in_flight));
+        let _guard = InFlightRequest(Arc::clone(&self.in_flight), Arc::clone(&self.dropped));
+        self.opened.notify_one();
         std::future::pending().await
     }
 }
 
 struct DeadlineProviderFactory {
     provider: Arc<NeverOpensProvider>,
+    clock: ProviderDeadlineTestClock,
 }
 
 struct FakeBudgetProviderFactory {
@@ -779,12 +785,49 @@ struct BudgetCaseOptions<'a> {
     native_pdf: Option<Vec<u8>>,
 }
 
-// Registry #94: action cases first spend at most 1 s waiting for request one.
-// After that separate bound returns, terminal reconciliation gets 4 s plus
-// one 10 ms journal-poll interval: the complete action case is bounded by
-// 1,000 ms + 4,010 ms = 5,010 ms.
-const BUDGET_CASE_DEADLINE: Duration = Duration::from_millis(4_010);
-const FAKE_REQUEST_START_DEADLINE: Duration = Duration::from_secs(1);
+// Fixture readiness is an event, not a performance claim. These hang
+// watchdogs cover two-slot/full-suite scheduling; semantic run budgets below
+// retain their production deadlines and assertions.
+const BUDGET_CASE_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
+const FAKE_REQUEST_START_DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
+
+/// Reinstating the old one-second first-request barrier fails deterministically
+/// even though the provider does start and completes normally. Virtual time
+/// gives this scheduling fixture no dependency on the host's actual load.
+#[tokio::test(start_paused = true)]
+async fn fake_request_readiness_accepts_a_late_start_without_changing_the_result() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let delayed = Arc::clone(&provider);
+    let producer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        delayed
+            .stream_turn(TurnRequest {
+                messages: Vec::new(),
+                model: "late-fixture".into(),
+                max_tokens: 64,
+                system_prompt: None,
+                tools: Vec::new(),
+                attachments: Vec::new(),
+                cache_metadata: None,
+                tool_result_image_projection: Default::default(),
+            })
+            .await
+            .expect("delayed provider starts")
+    });
+    timeout(FAKE_REQUEST_START_DEADLINE, provider.wait_for_requests(1))
+        .await
+        .expect("first request is observed through its readiness event");
+    let mut stream = producer.await.expect("fixture joins");
+    assert_eq!(
+        stream.recv().await.expect("finish").expect("valid event"),
+        haider_protocol::provider::StreamEvent::Finish {
+            reason: FinishReason::EndTurn
+        }
+    );
+    assert_eq!(provider.requests().len(), 1);
+}
 
 #[async_trait::async_trait]
 impl ProviderFactory for FakeBudgetProviderFactory {
@@ -899,11 +942,30 @@ async fn run_provider_budget_case_inner(
     } else {
         Arc::new(BrokerToolFactory)
     };
-    let provider = Arc::new(if native_pdf.is_some() {
+    let action_boundary = script
+        .iter()
+        .position(|step| matches!(step, FakeStep::Delay { .. } | FakeStep::Hang))
+        .unwrap_or(0);
+    let prior_usage = action.is_some()
+        && script[..action_boundary]
+            .iter()
+            .any(|step| matches!(step, FakeStep::EmitUsage { .. }));
+    let provider = if native_pdf.is_some() {
         FakeProvider::new(script).with_pdf_documents_native()
     } else {
         FakeProvider::new(script)
-    });
+    };
+    // Hold before the tool dispatch instead of hoping a 200 ms sleep leaves
+    // enough time for the test to deliver Subturn on a loaded runner. Usage,
+    // when present, is emitted before this point and is still reconciled.
+    let (provider, action_barrier) = if action.is_some() {
+        let before_step = action_boundary;
+        let (provider, barrier) = provider.with_stream_barrier(1, before_step);
+        (provider, Some(barrier))
+    } else {
+        (provider, None)
+    };
+    let provider = Arc::new(provider);
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
@@ -1008,12 +1070,34 @@ async fn run_provider_budget_case_inner(
         .expect("submit headless turn");
     if let Some(action) = action {
         timeout(FAKE_REQUEST_START_DEADLINE, async {
-            while provider.requests().is_empty() {
-                tokio::task::yield_now().await;
-            }
+            provider.wait_for_requests(1).await;
+            action_barrier
+                .as_ref()
+                .expect("action barrier")
+                .wait_until_entered()
+                .await;
         })
         .await
         .expect("first fake-provider request starts");
+        if prior_usage {
+            timeout(FAKE_REQUEST_START_DEADLINE, async {
+                loop {
+                    let events = store
+                        .read(&session_id, 0, 1024)
+                        .await
+                        .expect("usage journal");
+                    if events.iter().any(|event| {
+                        event.run_id.as_ref() == Some(&run_id)
+                            && matches!(event.payload.decode_event(), Ok(EventPayload::Usage(_)))
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("reported usage is durable before Subturn");
+        }
         match action {
             BudgetCaseAction::Subturn(text) => manager
                 .handle()
@@ -1046,6 +1130,7 @@ async fn run_provider_budget_case_inner(
                 .expect("cancel budget request");
             }
         }
+        action_barrier.as_ref().expect("action barrier").release();
     }
     let events = timeout(BUDGET_CASE_DEADLINE, async {
         loop {
@@ -1476,7 +1561,7 @@ async fn subturn_before_final_usage_cannot_open_a_second_provider_request() {
             FakeStep::EmitText {
                 text: "first request is live".into(),
             },
-            FakeStep::Delay { ms: 200 },
+            FakeStep::Delay { ms: 0 },
             FakeStep::EmitToolCall {
                 call_id: "budget-held-tool".into(),
                 name: "todo_write".into(),
@@ -1537,7 +1622,7 @@ async fn subturn_after_reported_usage_reconciles_before_the_next_projection() {
         },
         vec![
             FakeStep::EmitUsage { usage },
-            FakeStep::Delay { ms: 200 },
+            FakeStep::Delay { ms: 0 },
             FakeStep::EmitToolCall {
                 call_id: "budget-reported-held-tool".into(),
                 name: "todo_write".into(),
@@ -1874,8 +1959,8 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
         .await
         .expect("accept capped parent turn");
     handle.submit(accepted).await.expect("submit capped parent");
-    // Registry #94: 4,010ms = the delegation path's 1s settlement tail +
-    // 3s local scheduling/store allowance + one 10ms journal-poll interval.
+    // Observe the durable result; the delegation path retains its own
+    // one-second settlement tail independently of fixture scheduling.
     timeout(BUDGET_CASE_DEADLINE, async {
         loop {
             let done = store
@@ -1897,7 +1982,7 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
         }
     })
     .await
-    .expect("initial delegation settles inside the 1s tail plus 3.01s scheduling budget");
+    .expect("initial delegation publishes durable completion");
     let initial_parent_events = store
         .read(&parent_session, 0, 1024)
         .await
@@ -1927,10 +2012,9 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
         .expect("durable child record");
     assert_eq!(handle.supervisor_count(), 2);
 
-    // The production TTL is five minutes. Paused-time `sleep` lets every ready
-    // task run before Tokio advances the clock; `advance` plus a fixed yield
-    // count did not fence the supervisors' next-loop timer arm on loaded Linux
-    // runners (same determinism fix as manager_law_tests).
+    // Sleep past the production idle TTL in paused time. This lets ready
+    // tasks arm their timers before Tokio advances; the joined count below
+    // fences actual retirement without a fixed number of yields.
     let joined_before = handle.joined_supervisor_count();
     tokio::time::sleep(Duration::from_secs(5 * 60)).await;
     handle
@@ -1973,8 +2057,8 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
         .submit(resumed)
         .await
         .expect("recreate child supervisor transparently");
-    // Registry #94: the same 4,010ms local bound contains synchronous budget
-    // admission, 4s scheduling/store allowance, and one 10ms poll interval.
+    // The budget admission assertion is durable terminal state, with a
+    // separate fixture watchdog for store/executor scheduling.
     timeout(BUDGET_CASE_DEADLINE, async {
         loop {
             let terminal = store
@@ -1996,7 +2080,7 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
         }
     })
     .await
-    .expect("recreated admission terminalizes inside the 4.01s local budget");
+    .expect("recreated admission publishes durable terminal state");
     let resumed_events = store
         .read(&child.child_session_id, 0, 1024)
         .await
@@ -2057,6 +2141,10 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
 
 #[async_trait::async_trait]
 impl ProviderFactory for DeadlineProviderFactory {
+    fn deadline_clock_for_test(&self) -> Option<ProviderDeadlineTestClock> {
+        Some(self.clock)
+    }
+
     async fn resolve_for_turn(
         &self,
         metadata: &SessionMetadataV1,
@@ -2081,8 +2169,25 @@ impl ProviderFactory for DeadlineProviderFactory {
 /// early enough for the durable structured failure and terminal state to reach
 /// a headless client before the three-second run deadline. Dropping the open
 /// future must also release its request guard.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
+    // Keep virtual time fixed while SQLite and worker startup use real I/O.
+    // Only the provider-open/deadline race below may auto-advance the clock.
+    let keep_clock_fixed = || {
+        tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let clock_guard = keep_clock_fixed();
+    let clock = ProviderDeadlineTestClock::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (deadline_sender, mut deadline_event) = tokio::sync::oneshot::channel();
+    let deadline_task = tokio::spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        let _ = deadline_sender.send(());
+    });
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
@@ -2094,6 +2199,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             diagnostics: None,
             provider_factory: Arc::new(DeadlineProviderFactory {
                 provider: Arc::clone(&provider),
+                clock,
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
@@ -2131,14 +2237,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
     })
     .await
     .expect("create session");
-    let request_deadline_unix_ms = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock after Unix epoch")
-            .as_millis(),
-    )
-    .expect("test epoch milliseconds fit u64")
-    .saturating_add(3_000);
+    let request_deadline_unix_ms = clock.now_ms().saturating_add(3_000);
     let spec = HeadlessRunSpecV1 {
         agent_spawn: None,
         continuation_of: None,
@@ -2152,7 +2251,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         permission_overrides: SessionPermissionOverridesV1::default(),
         trust_hooks: false,
         budget: RunBudgetV1 {
-            max_time_ms: Some(5_000),
+            max_time_ms: None,
             ..RunBudgetV1::default()
         },
         request_deadline_unix_ms: Some(request_deadline_unix_ms),
@@ -2184,14 +2283,32 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         })
         .await
         .expect("accept headless turn");
-    let started = Instant::now();
     manager
         .handle()
         .submit(accepted)
         .await
         .expect("submit headless turn");
 
-    let failure = timeout(Duration::from_millis(2_900), async {
+    provider.opened.notified().await;
+    clock_guard.abort();
+    let _ = clock_guard.await;
+    tokio::select! {
+        biased;
+        result = &mut deadline_event => panic!("headless deadline event preceded provider cancellation: {result:?}"),
+        () = provider.dropped.notified() => {}
+    }
+    let clock_guard = keep_clock_fixed();
+    assert!(
+        Instant::now() < deadline,
+        "provider cancellation precedes deadline event"
+    );
+    assert_eq!(
+        in_flight.load(Ordering::SeqCst),
+        0,
+        "request guard drops with the open future"
+    );
+
+    let failure = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store.read(&session_id, 0, 512).await.expect("read run");
             let failure = events
@@ -2240,8 +2357,19 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         }
     })
     .await
-    .expect("structured terminal arrives before the three-second deadline");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    .expect("structured terminal arrives before the fixture watchdog");
+    assert!(
+        Instant::now() < deadline,
+        "durable terminal precedes deadline event"
+    );
+    let terminal_observed_at = Instant::now();
+    assert!(
+        matches!(
+            deadline_event.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "deadline event must still be pending after durable terminal delivery"
+    );
     assert_eq!(failure.0, ErrorCode::ProviderTimeout);
     assert!(failure.1.contains("reason=deadline_exhausted"));
     assert!(!failure.2, "no full retry can fit before the deadline");
@@ -2254,35 +2382,44 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             .as_str(),
         "provider-timeout"
     );
+    let terminal_events = store
+        .read(&session_id, 0, 512)
+        .await
+        .expect("read terminalized run");
     assert!(
-        !store
-            .read(&session_id, 0, 512)
-            .await
-            .expect("read terminalized run")
-            .iter()
-            .any(|event| {
-                event.run_id.as_ref() == Some(&run_id)
-                    && event.payload.decode_event().is_ok_and(|payload| {
-                        matches!(
-                            payload,
-                            EventPayload::RunState(RunState::Waiting {
-                                reason: haider_protocol::state::WaitReason::NetworkUnavailable
-                            })
-                        )
-                    })
-            }),
+        !terminal_events.iter().any(|event| {
+            matches!(
+                HeadlessRunEventPayload::from_payload_value(&event.payload),
+                Some(HeadlessRunEventPayload::RunDeadlineExceeded(_))
+            )
+        }),
+        "early provider terminalization is not a caller deadline event"
+    );
+    assert!(
+        !terminal_events.iter().any(|event| {
+            event.run_id.as_ref() == Some(&run_id)
+                && event.payload.decode_event().is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::RunState(RunState::Waiting {
+                            reason: haider_protocol::state::WaitReason::NetworkUnavailable
+                        })
+                    )
+                })
+        }),
         "a never-opening provider on a live route must not enter WaitingForRoute"
     );
-    timeout(Duration::from_millis(250), async {
-        while in_flight.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("timed-out provider request is not orphaned");
     assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
 
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+    clock_guard.abort();
+    let _ = clock_guard.await;
+    deadline_event
+        .await
+        .expect("headless deadline event fires after terminal delivery");
+    deadline_task.await.expect("deadline observer joins");
+    assert!(terminal_observed_at < Instant::now());
+    assert_eq!(Instant::now(), deadline);
 }

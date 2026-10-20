@@ -375,6 +375,14 @@ pub struct AccountsState {
     pub revision: Option<u64>,
     /// Last account action (sim `acctMsg`), shown under the head line.
     pub message: Option<String>,
+    /// Full notice and its separately pinned action. Expansion owns input.
+    pub message_details: Option<String>,
+    pub message_action: Option<String>,
+    pub message_expanded: bool,
+    /// Frame authority: expansion is offered only with a visible hint.
+    pub message_expandable: std::cell::Cell<bool>,
+    pub message_scroll: std::cell::Cell<usize>,
+    pub message_scroll_max: std::cell::Cell<usize>,
     /// In-flight `account.set_active` target. While `Some`, the rows do not
     /// move and further selects are refused (one at a time).
     pub pending_select: Option<String>,
@@ -708,7 +716,20 @@ impl AccountsState {
         if message.is_some() {
             self.follow_cursor.set(true);
         }
+        let expanded = self.message_expanded && message.is_some();
         self.message = message;
+        self.message_details = None;
+        self.message_action = None;
+        self.message_expanded = expanded;
+        self.message_expandable.set(false);
+        self.message_scroll.set(0);
+        self.message_scroll_max.set(0);
+    }
+
+    pub fn set_detailed_message(&mut self, summary: String, details: String, action: String) {
+        self.set_message(Some(summary));
+        self.message_details = Some(details);
+        self.message_action = Some(action);
     }
 
     /// Applies an `account.list` snapshot, gated on revision monotonicity.
@@ -1766,6 +1787,10 @@ pub struct ChipModel {
     /// (`agent_graph_rollup_v1`). `None` = the child runs no pinned
     /// workflow (or an older daemon) — the row keeps plain activity.
     pub graph: Option<haider_protocol::agent::AgentGraphRollupV1>,
+    /// 973-activity-icons: live ACTIVITY (what the child is doing, not its
+    /// state), folded from the typed items this chip applies — see
+    /// [`haider_protocol::activity`] for the priority and timing contract.
+    pub activity: haider_protocol::activity::ActivityTracker,
     pub closed: bool,
     pub removing: bool,
     pub children: Vec<ChipModel>,
@@ -1805,6 +1830,7 @@ impl ChipModel {
                                 name: name.clone(),
                                 args: serde_json::json!({ "desc": desc, "meta": meta }),
                                 status: haider_protocol::item::ToolStatus::Completed,
+                                activity: None,
                             },
                         },
                     ));
@@ -1835,6 +1861,7 @@ impl ChipModel {
             metrics: None,
             question: None,
             graph: None,
+            activity: haider_protocol::activity::ActivityTracker::new(),
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -1904,6 +1931,7 @@ impl ChipModel {
             metrics: None,
             question: None,
             graph: None,
+            activity: haider_protocol::activity::ActivityTracker::new(),
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -5722,6 +5750,16 @@ pub struct AppModel {
     /// commit counter the runtime watches to persist a change.
     pub notifications_enabled: bool,
     pub notification_commits: u64,
+    /// 973-activity-icons: how subagent ACTIVITY renders (emoji · text ·
+    /// off). `AppModel::new` defaults to emoji; boot resolves the persisted
+    /// setting, `HAIDER_ACTIVITY_ICONS`, `NO_COLOR` and `TERM`. `/icons`
+    /// changes it and bumps the commit counter the runtime persists.
+    pub activity_display: haider_protocol::activity::ActivityDisplay,
+    pub activity_display_commits: u64,
+    /// Explicit intent, independent of the environment-resolved display.
+    pub activity_display_choice: Option<haider_protocol::activity::ActivityDisplay>,
+    /// Last attempted commit; failed saves stay dirty without retrying every frame.
+    pub activity_display_attempted_commits: u64,
     /// Model retention (owner 2026-08-15): bumped on every COMMITTED model
     /// pick so the runtime persists the pair and the next boot opens on it.
     pub model_commits: u64,
@@ -6209,6 +6247,10 @@ impl Default for AppModel {
             focus_reported: false,
             notifications_enabled: true,
             notification_commits: 0,
+            activity_display: haider_protocol::activity::ActivityDisplay::Emoji,
+            activity_display_commits: 0,
+            activity_display_choice: None,
+            activity_display_attempted_commits: 0,
             model_commits: 0,
             notification_run_state: None,
             background_notification_states: std::collections::HashMap::new(),
@@ -7229,6 +7271,151 @@ impl AppModel {
         self.notifications_enabled = enabled;
     }
 
+    /// 973-activity-icons: set the activity display mode from `/icons`,
+    /// bumping the commit counter the runtime watches to persist it.
+    /// `None` cycles emoji → text → off → emoji.
+    pub fn set_activity_display(
+        &mut self,
+        mode: Option<haider_protocol::activity::ActivityDisplay>,
+    ) {
+        use haider_protocol::activity::ActivityDisplay as D;
+        let next = mode.unwrap_or(match self.activity_display {
+            D::Emoji => D::Text,
+            D::Text => D::Off,
+            D::Off => D::Emoji,
+        });
+        self.activity_display = next;
+        self.activity_display_choice = Some(next);
+        self.activity_display_commits += 1;
+        self.flash = Some(format!("· activity icons {} (saving…)", next.name()));
+        self.dirty = true;
+    }
+
+    /// 973-activity-icons: one chip's CURRENT activity at the model clock.
+    /// Terminal and closing chips show none; a chip with live children is
+    /// orchestrating when otherwise quiet.
+    #[must_use]
+    pub fn chip_activity(
+        &self,
+        chip: &ChipModel,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        self.chip_activity_with(chip, false)
+    }
+
+    /// [`Self::chip_activity`] with extra live-children knowledge (a fleet
+    /// snapshot can see grandchildren the chip tree does not hold).
+    fn chip_activity_with(
+        &self,
+        chip: &ChipModel,
+        known_live_children: bool,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return None;
+        }
+        use crate::script::ChipDisplayState as S;
+        if chip.closed || matches!(chip.display_state(), S::Done | S::Error) {
+            return None;
+        }
+        let live_children = known_live_children
+            || chip
+                .children
+                .iter()
+                .any(|child| !child.closed && !matches!(child.display_state(), S::Done | S::Error));
+        if !chip.activity.is_empty() {
+            return chip.activity.current(self.clock_ms, live_children);
+        }
+        // Live mode: the child's typed tool items live in ITS session; the
+        // daemon publishes their activity state inside the child's agent
+        // metrics (session summaries), evaluated here on our clock.
+        self.chip_metrics(chip)
+            .and_then(|metrics| metrics.activity.as_ref())
+            .map(haider_protocol::activity::ActivityTracker::from_state)
+            .map_or_else(
+                || live_children.then_some(haider_protocol::activity::ActivityKind::Orchestrate),
+                |tracker| tracker.current(self.clock_ms, live_children),
+            )
+    }
+
+    /// 973-activity-icons: a fleet node's current activity — the local chip's
+    /// live tracker when this session holds the chip (fresher than any
+    /// snapshot), else the daemon snapshot's figure.
+    #[must_use]
+    pub fn node_activity(
+        &self,
+        node: &haider_rpc::FleetNodeWire,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return None;
+        }
+        use haider_rpc::FleetAgentStateWire as F;
+        if matches!(node.state, F::Done | F::Failed | F::Cancelled) {
+            return None;
+        }
+        let live_children = node
+            .children
+            .iter()
+            .any(|child| !matches!(child.state, F::Done | F::Failed | F::Cancelled));
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            return self.chip_activity_with(chip, live_children);
+        }
+        // A deeper member has no chip; its own session summary carries the
+        // live activity state (fresher than the snapshot's instant).
+        // Freshest of the two daemon projections (replace-by-head law):
+        // the session summary and the fleet snapshot's own metrics.
+        let freshest = [
+            self.session_metrics.get(&node.session_id),
+            node.metrics.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|metrics| metrics.activity.is_some())
+        .max_by_key(|metrics| metrics.head_seq);
+        match freshest.and_then(|metrics| metrics.activity.as_ref()) {
+            Some(state) => haider_protocol::activity::ActivityTracker::from_state(state)
+                .current(self.clock_ms, live_children),
+            None => node.activity,
+        }
+    }
+
+    /// 973-activity-icons: every activity a node used so far (detail view),
+    /// merging the snapshot history with the local chip tracker.
+    #[must_use]
+    pub fn node_activities(
+        &self,
+        node: &haider_rpc::FleetNodeWire,
+    ) -> Vec<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return Vec::new();
+        }
+        let mut used = node.activities.clone();
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            used.extend(chip.activity.used());
+            if !chip.children.is_empty() {
+                used.push(haider_protocol::activity::ActivityKind::Orchestrate);
+            }
+            if let Some(state) = self
+                .chip_metrics(chip)
+                .and_then(|metrics| metrics.activity.as_ref())
+            {
+                used.extend(state.touched.iter().map(|touch| touch.kind));
+            }
+        }
+        if let Some(state) = self
+            .session_metrics
+            .get(&node.session_id)
+            .and_then(|metrics| metrics.activity.as_ref())
+        {
+            used.extend(state.touched.iter().map(|touch| touch.kind));
+        }
+        if !node.children.is_empty() || node.folded_children > 0 {
+            used.push(haider_protocol::activity::ActivityKind::Orchestrate);
+        }
+        used.retain(|kind| *kind != haider_protocol::activity::ActivityKind::Unknown);
+        used.sort_by_key(|kind| kind.rank());
+        used.dedup();
+        used
+    }
+
     /// W-C M2: flip (or set) the desktop-notification toggle and bump the
     /// commit counter the runtime watches to persist the change.
     pub fn toggle_notifications(&mut self, enable: Option<bool>) {
@@ -7685,6 +7872,12 @@ impl AppModel {
                 // moving on. Cleared BEFORE dispatch so the very key that
                 // raises a new one (⌃V) still shows it.
                 self.composer_notice = None;
+                if self.accounts_surface_visible() && self.accounts.message_expanded {
+                    if !self.accounts_scroll_gesture(key.code) {
+                        self.handle_accounts_key(key.code);
+                    }
+                    return;
+                }
                 // If the terminal forwards its paste chord, fetch the OS
                 // clipboard before a modal can ignore it or type a literal
                 // 'v'. Text re-enters the existing zeroizing Paste route,
@@ -7707,6 +7900,18 @@ impl AppModel {
                 // the custom card's fields, and every printable key stays
                 // private to the form that is holding it.
                 if self.accounts_scroll_gesture(key.code) {
+                    return;
+                }
+                // Function keys can open a visible notice without becoming
+                // input to an open sign-in form. The notice then owns all input.
+                if self.accounts_surface_visible()
+                    && key.code == KeyCode::F(2)
+                    && self.accounts.message_expandable.get()
+                    && self.accounts.message.is_some()
+                    && self.accounts.pending_replace.is_none()
+                {
+                    self.accounts.message_expanded = true;
+                    self.accounts.message_scroll.set(0);
                     return;
                 }
                 // 971 F1(b): the one-line "replace the pending form?"
@@ -7766,6 +7971,9 @@ impl AppModel {
                 self.handle_key(key, now);
             }
             AppEvent::Paste(text) => {
+                if self.accounts_surface_visible() && self.accounts.message_expanded {
+                    return;
+                }
                 self.dirty = true;
                 // The zeroizing wrapper is borrowed, never unwrapped
                 // (TUI6.3 fix 2): the wrapped copy wipes when `text`
@@ -13025,6 +13233,7 @@ impl AppModel {
             // The daemon may save under another alias than the card asked
             // for: an identity match, or a re-login through `requested` that
             // authenticated a different account (which never rewrites it).
+            let mut details = None;
             let saved = descriptor.alias.as_str();
             if !requested.is_empty() && requested != saved {
                 let existed = self.accounts.rows.iter().any(|row| row.alias == saved);
@@ -13107,11 +13316,30 @@ impl AppModel {
                         .map(|row| row.alias.as_str())
                         .collect::<Vec<_>>();
                 if !duplicates.is_empty() {
-                    message.push_str(&format!(
-                        " · matching aliases retained: {} · remove explicitly with `haider account remove {} --confirm`",
-                        duplicates.join(", "),
-                        duplicates[0]
-                    ));
+                    let action = format!("haider account remove {} --confirm", duplicates[0]);
+                    let full = format!(
+                        "{message}\nMatching aliases retained:\n{}",
+                        duplicates.join("\n")
+                    );
+                    let first = duplicates
+                        .iter()
+                        .take(2)
+                        .map(|alias| {
+                            let short = alias.chars().take(24).collect::<String>();
+                            if alias.chars().count() > 24 {
+                                format!("{short}…")
+                            } else {
+                                short
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let more = duplicates.len().saturating_sub(2);
+                    message.push_str(&format!(" · matching aliases retained: {first}"));
+                    if more > 0 {
+                        message.push_str(&format!(" and {more} more"));
+                    }
+                    details = Some((full, action));
                 } else if ambiguous_email {
                     message.push_str(" · email matches distinct account IDs; review aliases before removing a duplicate");
                 }
@@ -13120,7 +13348,11 @@ impl AppModel {
                     " · provider exposes no stable identity; re-login through this alias to update it",
                 );
             }
-            self.accounts.set_message(Some(message));
+            if let Some((full, action)) = details {
+                self.accounts.set_detailed_message(message, full, action);
+            } else {
+                self.accounts.set_message(Some(message));
+            }
             self.requests.push(AppRequest::AccountsRefresh);
             self.dirty = true;
         }
@@ -13411,6 +13643,21 @@ impl AppModel {
         true
     }
 
+    /// Matches the overlays rendered above the account list. Inline sign-in
+    /// forms still leave the notice visible; full-screen overlays cover it.
+    fn accounts_surface_visible(&self) -> bool {
+        self.screen == Screen::Accounts
+            && self.model_picker.is_none()
+            && self.ssh_terminal.is_none()
+            && self.tool_detail.is_none()
+            && !self.inbox_open
+            && !self.help_open
+            && !self.shells_open
+            && !self.ssh_open
+            && !self.monitors_open
+            && !self.lockdown_overlay
+    }
+
     /// The `/accounts` paging gestures, routed AHEAD of every add-form's
     /// modality (971 F1(a), verify round 1). Returns whether the key was
     /// consumed here.
@@ -13422,8 +13669,20 @@ impl AppModel {
     /// card on screen outranks the page (an invisible card eating keystrokes
     /// is the W5g-5 trap), so the offset the frame chooses wins.
     fn accounts_scroll_gesture(&mut self, code: KeyCode) -> bool {
-        if self.screen != Screen::Accounts {
+        if !self.accounts_surface_visible() {
             return false;
+        }
+        if self.accounts.message_expanded {
+            let current = self.accounts.message_scroll.get();
+            let max = self.accounts.message_scroll_max.get();
+            let next = match code {
+                KeyCode::PageUp => current.saturating_sub(8),
+                KeyCode::PageDown => current.saturating_add(8).min(max),
+                _ => return false,
+            };
+            self.accounts.message_scroll.set(next);
+            self.dirty = true;
+            return true;
         }
         match code {
             KeyCode::PageUp => {
@@ -14357,6 +14616,30 @@ impl AppModel {
     /// Keys on the `/accounts` screen (no composer; the login card, when
     /// open, is total-modal and never reaches here).
     fn handle_accounts_key(&mut self, code: KeyCode) {
+        if self.accounts.message_expanded {
+            match code {
+                KeyCode::Esc | KeyCode::F(2) => self.accounts.message_expanded = false,
+                KeyCode::Home => self.accounts.message_scroll.set(0),
+                KeyCode::End => self
+                    .accounts
+                    .message_scroll
+                    .set(self.accounts.message_scroll_max.get()),
+                KeyCode::Up => self
+                    .accounts
+                    .message_scroll
+                    .set(self.accounts.message_scroll.get().saturating_sub(1)),
+                KeyCode::Down => self.accounts.message_scroll.set(
+                    self.accounts
+                        .message_scroll
+                        .get()
+                        .saturating_add(1)
+                        .min(self.accounts.message_scroll_max.get()),
+                ),
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
         // 970 — the disclosure card owns the keyboard exactly like the other
         // accounts cards: nothing starts until `[1]`, and `[2]`/esc leaves
         // no record. It closes before `open_oauth_add` runs, so at most one
@@ -15906,6 +16189,19 @@ impl AppModel {
             // a display preference, not a session command); bare `/notifications`
             // flips it, `on`/`off` set it explicitly, and the runtime persists
             // the change to the TUI settings file.
+            // 973-activity-icons: subagent activity glyphs — `/icons emoji`,
+            // `/icons text` (bracketed labels for terminals without emoji
+            // fonts / screen readers), `/icons off`; bare cycles. Display
+            // preference only; the runtime persists it.
+            "icons" | "activity-icons" => match arg.as_deref() {
+                None | Some("toggle") => self.set_activity_display(None),
+                Some(value) => match haider_protocol::activity::ActivityDisplay::parse(value) {
+                    Some(mode) => self.set_activity_display(Some(mode)),
+                    None => {
+                        self.flash = Some(format!("· /icons {value} — try emoji · text · off"));
+                    }
+                },
+            },
             "notifications" | "notify" => match arg.as_deref() {
                 Some("on") => self.toggle_notifications(Some(true)),
                 Some("off") => self.toggle_notifications(Some(false)),
@@ -18310,12 +18606,7 @@ impl AppModel {
                                 ));
                             }
                             if admission == Admission::Apply {
-                                self.route_admitted(
-                                    &payload,
-                                    envelope.branch_id.as_ref(),
-                                    envelope.agent_id.as_ref(),
-                                    envelope.committed_at_ms,
-                                );
+                                self.route_admitted(&payload, envelope);
                             }
                         }
                         // S3/W-A/L3: additive agent, task, and workflow graph
@@ -18360,13 +18651,8 @@ impl AppModel {
     /// branch-stamped envelope they land session-global), then branch
     /// (outer), then agent. `SessionState::route_admitted` is the
     /// background twin.
-    fn route_admitted(
-        &mut self,
-        payload: &EventPayload,
-        branch: Option<&haider_protocol::ids::BranchId>,
-        agent: Option<&haider_protocol::ids::AgentId>,
-        at_ms: u64,
-    ) {
+    fn route_admitted(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let branch = envelope.branch_id.as_ref();
         use crate::branch::BranchScope;
         if let EventPayload::Usage(usage) = payload {
             self.cache_usage.note(usage);
@@ -18388,17 +18674,17 @@ impl AppModel {
                 // aggregate never lands in a chip transcript.
                 self.handle_envelope(payload);
             }
-            BranchScope::Active => self.absorb_scoped(payload, agent, at_ms),
+            BranchScope::Active => self.absorb_scoped(payload, envelope),
             BranchScope::ParkedMain => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.parked_main_mut() {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::ParkedNamed(id) => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.view_mut(&id) {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::Orphan => self.branch_state.count_orphan(),
@@ -18702,12 +18988,9 @@ impl AppModel {
 
     /// The attached path's scope router — the same [`crate::session::classify`]
     /// decision the background path takes, applied to the live fields.
-    fn absorb_scoped(
-        &mut self,
-        payload: &EventPayload,
-        agent: Option<&haider_protocol::ids::AgentId>,
-        at_ms: u64,
-    ) {
+    fn absorb_scoped(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let agent = envelope.agent_id.as_ref();
+        let at_ms = envelope.committed_at_ms;
         use crate::session::Destination;
         match crate::session::classify(&mut self.projection, &self.chips, payload, agent) {
             Destination::Agent => {
@@ -18715,7 +18998,7 @@ impl AppModel {
             }
             Destination::Chip(target) => {
                 if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
-                    crate::session::chip_apply(chip, payload, at_ms);
+                    crate::session::chip_apply(chip, payload, envelope);
                 }
             }
             Destination::Session => {
@@ -20021,7 +20304,7 @@ impl AppModel {
         self.flash = None;
         // A visible overlay owns the screen; hits from the covered frame
         // must not act through it.
-        if self.help_open {
+        if self.help_open || (self.accounts_surface_visible() && self.accounts.message_expanded) {
             return;
         }
         if self.tool_detail.is_some() {
@@ -20595,7 +20878,19 @@ impl AppModel {
         // input, and the card stays pinned in view above the offset it moves
         // (Astra: the DeepSeek card swallowed the wheel at both sizes). It
         // therefore runs BEFORE the modal gate below.
-        if self.screen == Screen::Accounts && !self.help_open {
+        if self.accounts_surface_visible() && self.accounts.message_expanded {
+            let current = self.accounts.message_scroll.get();
+            self.accounts.message_scroll.set(if up {
+                current.saturating_sub(3)
+            } else {
+                current
+                    .saturating_add(3)
+                    .min(self.accounts.message_scroll_max.get())
+            });
+            self.dirty = true;
+            return;
+        }
+        if self.accounts_surface_visible() {
             let max = self.accounts.scroll_max.get();
             let current = self.accounts.scroll.get().min(max);
             let next = if up {
@@ -22476,7 +22771,8 @@ impl AppModel {
     /// exact selection is retained so repeating it is an explicit confirm.
     pub fn cache_epoch_confirmation_required(&mut self, change: PendingCacheChange, message: &str) {
         self.pending_cache_change = Some(change);
-        let notice = format!("{message} · repeat this selection to create the new epoch");
+        let action = "repeat this selection to create the new epoch";
+        let notice = format!("{message} · {action}");
         match &mut self.pending_cache_change {
             Some(PendingCacheChange::Model { .. }) => {
                 if let Some(picker) = self.model_picker.as_mut() {
@@ -22492,7 +22788,11 @@ impl AppModel {
             }
             Some(PendingCacheChange::Account { .. }) => {
                 self.accounts.pending_select = None;
-                self.accounts.set_message(Some(notice.clone()));
+                self.accounts.set_detailed_message(
+                    message.to_owned(),
+                    message.to_owned(),
+                    action.to_owned(),
+                );
             }
             Some(PendingCacheChange::Fast { .. }) | None => {}
         }

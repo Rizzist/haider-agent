@@ -621,7 +621,7 @@ fn checkpoint_effect_envelopes(
     let payloads = vec![
         EventPayload::Effect(EffectPhase::Intent(EffectIntent {
             effect: effect_id.clone(),
-            class: EffectClass::FsWrite,
+            class: EffectClass::CheckpointRestore,
             summary: format!("{} workspace checkpoint", checkpoint.origin.as_str()),
             args_digest,
             workspace_revision: None,
@@ -1045,6 +1045,9 @@ async fn session_agent_metrics_truth(
 struct FleetChildTruth {
     state: haider_rpc::FleetAgentStateWire,
     metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
+    /// 973-activity-icons: the child's own typed tool activity, folded from
+    /// the same sealed journal head as its state and metrics.
+    activity: haider_protocol::activity::ActivityTracker,
 }
 
 /// Reduces one child's exact durable run and direct metrics from the same
@@ -1058,6 +1061,7 @@ async fn fleet_child_truth(
 ) -> Result<FleetChildTruth, HaiderError> {
     let mut folder = crate::usage_report::SessionFolder::new(initial_model);
     let mut latest_state = None;
+    let mut activity = haider_protocol::activity::ActivityTracker::new();
     let mut since_seq = 0;
     while since_seq < through_seq {
         let page = store
@@ -1083,6 +1087,15 @@ async fn fleet_child_truth(
             {
                 latest_state = Some(state);
             }
+            // Only the child's OWN facts: grandchild mirrors carry their
+            // own agent id and show on their own fleet node.
+            if envelope
+                .agent_id
+                .as_ref()
+                .is_none_or(|agent| agent == &record.agent_id)
+            {
+                activity.observe_raw(&envelope);
+            }
             folder.push(&envelope);
         }
         if !advanced {
@@ -1095,7 +1108,11 @@ async fn fleet_child_truth(
         Some(&record.agent_id),
         through_seq,
     );
-    Ok(FleetChildTruth { state, metrics })
+    Ok(FleetChildTruth {
+        state,
+        metrics,
+        activity,
+    })
 }
 
 fn fleet_agent_state(
@@ -1130,7 +1147,40 @@ struct FleetFlatNode {
     record: haider_core::DelegationRecord,
     state: haider_rpc::FleetAgentStateWire,
     metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
+    activity: haider_protocol::activity::ActivityTracker,
     direct_child_count: u32,
+}
+
+fn fleet_state_is_terminal(state: haider_rpc::FleetAgentStateWire) -> bool {
+    matches!(
+        state,
+        haider_rpc::FleetAgentStateWire::Done
+            | haider_rpc::FleetAgentStateWire::Failed
+            | haider_rpc::FleetAgentStateWire::Cancelled
+    )
+}
+
+/// 973-activity-icons: one node's current activity and history at the
+/// snapshot instant. A terminal node shows no current activity; a node with
+/// live children is orchestrating (see `haider_protocol::activity`).
+fn fleet_node_activity(
+    node: &FleetFlatNode,
+    generated_at_ms: u64,
+    live_parents: &std::collections::HashSet<SessionId>,
+) -> (
+    Option<haider_protocol::activity::ActivityKind>,
+    Vec<haider_protocol::activity::ActivityKind>,
+) {
+    use haider_protocol::activity::ActivityKind;
+    let mut used = node.activity.used();
+    if node.direct_child_count > 0 && !used.contains(&ActivityKind::Orchestrate) {
+        used.push(ActivityKind::Orchestrate);
+    }
+    if fleet_state_is_terminal(node.state) {
+        return (None, used);
+    }
+    let live_children = live_parents.contains(&node.record.child_session_id);
+    (node.activity.current(generated_at_ms, live_children), used)
 }
 
 fn fleet_snapshot(
@@ -1155,6 +1205,12 @@ fn fleet_snapshot(
         *count = count.saturating_add(1);
     }
     let (metrics, metrics_complete) = fleet_metrics_totals(&nodes, generated_at_ms);
+    // Parents with at least one non-terminal child are orchestrating.
+    let live_parents: std::collections::HashSet<SessionId> = nodes
+        .iter()
+        .filter(|node| !fleet_state_is_terminal(node.state))
+        .map(|node| node.record.parent_session_id.clone())
+        .collect();
     let rollup = haider_rpc::FleetRollupWire {
         node_count: u32::try_from(nodes.len()).unwrap_or(u32::MAX),
         states,
@@ -1174,6 +1230,7 @@ fn fleet_snapshot(
                 .or_default()
                 .push(index);
             let identity = fleet_node_identity(&node.record.manifest);
+            let (activity, activities) = fleet_node_activity(&node, generated_at_ms, &live_parents);
             Some(haider_rpc::FleetNodeWire {
                 agent_id: node.record.agent_id,
                 session_id: node.record.child_session_id,
@@ -1186,6 +1243,8 @@ fn fleet_snapshot(
                 parent_agent_id: node.record.parent_agent_id,
                 state: node.state,
                 metrics: node.metrics,
+                activity,
+                activities,
                 folded_children: node.direct_child_count,
                 children: Vec::new(),
             })
@@ -3762,6 +3821,8 @@ async fn effect_probe_observation(
         // peer delivery and local/remote execution. Keep this exhaustive so a
         // new authority class cannot inherit probe semantics accidentally.
         EffectClass::ProcessExec
+        | EffectClass::ProviderTransport
+        | EffectClass::CheckpointRestore
         | EffectClass::RemoteExecution
         | EffectClass::GitOp
         | EffectClass::PeerMessage
@@ -18207,6 +18268,7 @@ impl HubConnection {
                 record,
                 state: truth.state,
                 metrics: truth.metrics,
+                activity: truth.activity,
                 direct_child_count,
             });
         }
