@@ -738,6 +738,9 @@ fn result_order_model() -> AppModel {
     model.mode = RuntimeMode::Live;
     model.screen = Screen::Session;
     model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SSH_TYPED_SETUP_ERRORS_V1.into());
+    model
 }
 
 fn result_order_list(m: &mut AppModel, live: &mut LiveDriver, shells: Vec<haider_rpc::ShellWire>) {
@@ -1052,43 +1055,57 @@ fn remote_result_order_fresh_list_recovers_dropped_status() {
 fn remote_result_order_ordinary_output_keeps_the_command_exit_code() {
     for (w, h) in [(118, 36), (80, 24)] {
         for running in ["early", "dropped", "reply-first"] {
-            for code in [0, 17] {
-                let mut m = result_order_model();
-                let mut live = LiveDriver::new("result-order");
-                let context = open_profile(&mut m, &mut live, "profile-a");
-                let result = admitted_with_status(
-                    "current-shell",
-                    "profile-a",
-                    haider_rpc::ShellStatusWire::Running,
-                );
-                if running == "early" {
-                    m.apply_shell_event(result.clone());
+            for typed in [false, true] {
+                for code in [Some(0), Some(17), None] {
+                    let mut m = result_order_model();
+                    if !typed && code.is_none() && running == "dropped" {
+                        // A text-only legacy peer cannot distinguish this completion
+                        // from its uncoded setup failures without observing Running.
+                        continue;
+                    }
+                    if !typed {
+                        m.daemon_features
+                            .remove(haider_rpc::FEATURE_SSH_TYPED_SETUP_ERRORS_V1);
+                    }
+                    let mut live = LiveDriver::new("result-order");
+                    let context = open_profile(&mut m, &mut live, "profile-a");
+                    let result = admitted_with_status(
+                        "current-shell",
+                        "profile-a",
+                        haider_rpc::ShellStatusWire::Running,
+                    );
+                    if running == "early" {
+                        m.apply_shell_event(result.clone());
+                    }
+                    apply_response(
+                        &mut m,
+                        &mut live,
+                        &context,
+                        haider_rpc::ResponseBody::SshShellOpen {
+                            shell: admitted("current-shell", "profile-a"),
+                        },
+                    );
+                    if running == "reply-first" {
+                        m.apply_shell_event(result);
+                    }
+                    m.apply_ssh_shell_output("current-shell", b"hello\r\n");
+                    assert!(snapshot(&m, w, h).contains("hello"));
+                    assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
+                    m.apply_shell_event(admitted_with_status(
+                        "current-shell",
+                        "profile-a",
+                        haider_rpc::ShellStatusWire::Exited { code },
+                    ));
+                    assert!(m.ssh_terminal.is_none());
+                    assert_eq!(
+                        m.flash,
+                        Some(code.map_or_else(
+                            || "· remote terminal exited".into(),
+                            |code| format!("· remote terminal exited {code}"),
+                        )),
+                        "typed={typed}/{running}/{w}x{h}"
+                    );
                 }
-                apply_response(
-                    &mut m,
-                    &mut live,
-                    &context,
-                    haider_rpc::ResponseBody::SshShellOpen {
-                        shell: admitted("current-shell", "profile-a"),
-                    },
-                );
-                if running == "reply-first" {
-                    m.apply_shell_event(result);
-                }
-                m.apply_ssh_shell_output("current-shell", b"hello\r\n");
-                assert!(snapshot(&m, w, h).contains("hello"));
-                assert!(!m.ssh_terminal.as_ref().unwrap().connecting);
-                m.apply_shell_event(admitted_with_status(
-                    "current-shell",
-                    "profile-a",
-                    haider_rpc::ShellStatusWire::Exited { code: Some(code) },
-                ));
-                assert!(m.ssh_terminal.is_none());
-                assert_eq!(
-                    m.flash,
-                    Some(format!("· remote terminal exited {code}")),
-                    "{running}/{w}x{h}"
-                );
             }
         }
     }

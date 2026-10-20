@@ -3273,6 +3273,7 @@ pub struct SshTerminalPane {
     // Older daemons emit setup failures as output before terminalizing.
     // Keep that fallback distinct from output-based connection recovery.
     reported_running: bool,
+    typed_setup_errors: bool,
     // Results can precede the admission reply. Keep them with this attempt,
     // independently of shell-list snapshots, until the reply identifies its shell.
     observed_shells: Vec<haider_rpc::ShellWire>,
@@ -3304,6 +3305,7 @@ impl SshTerminalPane {
             shell_id: None,
             connecting: true,
             reported_running: false,
+            typed_setup_errors: false,
             observed_shells: Vec::new(),
             pending_output: Vec::new(),
             output: zeroize::Zeroizing::new(Vec::new()),
@@ -18725,6 +18727,8 @@ impl AppModel {
         self.ssh_open_generation += 1;
         let mut terminal = SshTerminalPane::opening(profile.clone(), self.ssh_terminal_size);
         terminal.attempt_id = self.ssh_open_generation;
+        terminal.typed_setup_errors =
+            self.daemon_serves(haider_rpc::FEATURE_SSH_TYPED_SETUP_ERRORS_V1);
         self.requests.push(AppRequest::SshShellOpen {
             attempt_id: terminal.attempt_id,
             profile,
@@ -18931,7 +18935,8 @@ impl AppModel {
                 .as_ref()
                 .map(|error| format!("{}: {}", error.code, error.message))
                 .or_else(|| {
-                    // Older daemons report setup failure as terminal output.
+                    // Only legacy peers report setup failure as terminal output.
+                    // Current peers also have uncoded ordinary command exits.
                     terminal
                         // Legacy setup failures end without an exit code.
                         // A coded command exit must never relabel its ordinary
@@ -18942,7 +18947,7 @@ impl AppModel {
                                 haider_rpc::ShellStatusWire::Exited { code: None }
                             )
                         })
-                        .filter(|pane| !pane.reported_running)
+                        .filter(|pane| !pane.typed_setup_errors && !pane.reported_running)
                         .map(|pane| pane.display_text())
                 })
                 .map(|text| text.chars().filter(|c| !c.is_control()).collect::<String>())

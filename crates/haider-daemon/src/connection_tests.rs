@@ -355,6 +355,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `FEATURE_SHELL_REGISTRY_V1`. Expected runtime failure: clients expose a
 /// management or terminal-registry surface that the handshake says is absent.
 ///
+/// MUTATION CHECK: remove `FEATURE_SSH_TYPED_SETUP_ERRORS_V1`. Expected
+/// runtime failure: clients cannot distinguish typed setup errors from legacy
+/// text-only setup errors after an uncoded command exit.
+///
 /// MUTATION CHECK: remove `FEATURE_SESSION_FLEET_IDENTITY_V1`. Expected
 /// RUNTIME failure: clients cannot distinguish manifest-backed name/model/
 /// provider rows from the legacy fleet shape.
@@ -366,9 +370,9 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        122,
-        "model output limits add one feature to the existing \
-         121-feature set"
+        123,
+        "typed SSH setup errors add one feature to the existing \
+         122-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -476,6 +480,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_LINEAGE_V1.to_owned(),
             FEATURE_SHELL_EXEC_V1.to_owned(),
             FEATURE_SSH_PROFILES_V1.to_owned(),
+            FEATURE_SSH_TYPED_SETUP_ERRORS_V1.to_owned(),
             FEATURE_SHELL_REGISTRY_V1.to_owned(),
             haider_rpc::FEATURE_USER_COMMAND_V1.to_owned(),
             FEATURE_TOOL_INVENTORY_V1.to_owned(),

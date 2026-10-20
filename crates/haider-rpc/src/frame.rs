@@ -639,6 +639,9 @@ pub const FEATURE_PEER_AGENT_INJECTION_V1: &str = "peer_agent_injection_v1";
 /// Daemon implements profile-scoped SSH profile management, session scope,
 /// and remote shell execution without exposing stored authentication data.
 pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
+/// SSH setup failures use `ShellWire::setup_error`; uncoded completion is not
+/// inferred to be a setup failure from ordinary terminal output.
+pub const FEATURE_SSH_TYPED_SETUP_ERRORS_V1: &str = "ssh_typed_setup_errors_v1";
 /// Daemon exposes one registry for local and SSH-backed terminal lifecycles.
 pub const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 /// Daemon-enforced provider trust ceilings, the fixed lockdown envelope, and
