@@ -960,138 +960,180 @@ fn cancellation_gate_receipt_preserves_eof_failure() {
     drop(writer);
 }
 
-/// Registry #158 signal matrix: a second client interrupt takes the immediate
-/// exit path after its durable `Cancelling` receipt. Test-only fake-provider
-/// settlement is gated until daemon drain so the run cannot terminalize
-/// first. Both the intact coordinate and a deliberately degraded coordinate
-/// must reach the same absolute launcher deadline, then durably cancel during
-/// graceful drain.
+/// Registry #158 signal matrix: the first interrupt commits cancellation and
+/// the second ends the client. A healthy endpoint extends its linger until the
+/// fixture releases pending settlement. A degraded endpoint instead starts
+/// graceful drain at its deadline. Keep both variants independently runnable.
 #[test]
-fn sigint_twice_with_nonterminal_run_honors_absolute_linger_for_both_endpoints() {
+fn double_interrupt_extends_healthy_linger_until_cancellation_settles() {
+    assert_double_interrupt_linger("endpoint_intact", false);
+}
+
+#[test]
+fn double_interrupt_retires_degraded_endpoint_with_pending_cancellation() {
+    assert_double_interrupt_linger("endpoint_absent", true);
+}
+
+fn assert_double_interrupt_linger(case: &str, remove_endpoint: bool) {
+    use std::io::Write as _;
+
     const IDLE_TTL_MS: u64 = 250;
 
     ensure_haiderd_built();
-    for (case, remove_endpoint) in [("endpoint_intact", false), ("endpoint_absent", true)] {
-        let store = tempfile::tempdir().expect("store dir");
-        let profile = resolved_for(store.path());
-        let guard = DaemonGuard {
-            store: store.path().to_path_buf(),
-        };
-        let gate_dir = tempfile::Builder::new()
-            .prefix("hcs-")
-            .tempdir_in("/tmp")
-            .expect("short cancellation gate directory");
-        let gate_path = gate_dir.path().join("cancel.sock");
-        let gate = std::os::unix::net::UnixListener::bind(&gate_path)
-            .expect("bind cancellation settlement gate");
-        gate.set_nonblocking(true)
-            .expect("nonblocking cancellation gate");
-        let mut launcher = haider_command(store.path());
-        launcher
-            .args([
-                "run",
-                "--provider",
-                "fake",
-                "--output",
-                "jsonl",
-                "--timeout",
-                "30s",
-                "-p",
-                "hold for double interrupt",
-            ])
-            .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
-            .env("HAIDER_TEST_CANCEL_SETTLE_GATE", &gate_path)
-            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string());
-        if remove_endpoint {
-            launcher.env("HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY", "1");
-        }
-        let mut launcher = launcher.spawn().expect("spawn stalled run launcher");
-        let daemon_pid = wait_for_daemon_ready(&profile, &guard);
-        let observed = observe_active_run(&mut launcher);
-
-        haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
-            .expect("first SIGINT to run client");
-        let cancellation_deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
-        let (mut settlement, _) = loop {
-            match gate.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < cancellation_deadline,
-                        "{case} first SIGINT did not reach cancellation settlement gate"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("{case} accept cancellation gate: {error}"),
-            }
-        };
-        let ready = cancellation_gate_receipt(&mut settlement)
-            .expect("committed cancellation gate receipt");
-        assert_eq!(ready, 1);
-        let (state, terminal) = durable_run_head(store.path(), &observed);
-        assert_eq!(
-            state, "cancelling",
-            "{case} gate must follow committed cancellation"
-        );
-        assert!(
-            !terminal,
-            "{case} gated cancellation must remain nonterminal"
-        );
-        haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
-            .expect("second SIGINT to run client");
-        if remove_endpoint {
-            std::fs::remove_file(&profile.endpoint_path)
-                .expect("unlink daemon endpoint during double-interrupt teardown");
-        }
-        let client = wait_for_output(launcher, &format!("{case} double-interrupt client"));
-        assert!(
-            !client.status.success(),
-            "double-interrupted client unexpectedly succeeded: stderr={}",
-            String::from_utf8_lossy(&client.stderr)
-        );
-
-        wait_for_daemon_exit(&profile, daemon_pid, case);
-        let log = std::fs::read_to_string(profile.store_dir.join(haider_client::DAEMON_LOG_FILE))
-            .expect("read daemon recovery log");
-        if remove_endpoint {
-            // A degraded endpoint keeps its immediate reap at the deadline.
-            assert!(
-                log.contains("durable_quiescent=false decision=shutdown"),
-                "{case} deadline did not prove the stalled run was still nonterminal: {log}"
-            );
-        } else {
-            // Orchestrator ruling O-1 (2026-09-25): the still-cancelling run
-            // EXTENDS the linger; the daemon retires only once it is terminal.
-            assert!(
-                log.contains("durable_quiescent=false decision=extend_linger"),
-                "{case} deadline did not extend the linger for the nonterminal run: {log}"
-            );
-            assert!(
-                log.contains("durable_quiescent=true decision=shutdown"),
-                "{case} did not retire only after the run settled: {log}"
-            );
-        }
-        if remove_endpoint {
-            assert!(
-                log.contains("endpoint-health event=coordinate_lost"),
-                "{case} did not observe the lost endpoint: {log}"
-            );
-            assert!(
-                log.contains("reason=degraded_endpoint_idle_deadline"),
-                "degraded linger did not own the shutdown decision: {log}"
-            );
-        } else {
-            assert!(
-                log.contains("reason=launcher_linger_deadline")
-                    && log.contains("endpoint_degraded=false"),
-                "intact endpoint did not reach the absolute launcher deadline: {log}"
-            );
-        }
-        let (final_state, terminal) = durable_run_head(store.path(), &observed);
-        assert!(terminal, "{case} graceful drain left the run nonterminal");
-        assert_eq!(final_state, "cancelled");
-        drop(settlement);
+    let store = tempfile::tempdir().expect("store dir");
+    let profile = resolved_for(store.path());
+    let guard = DaemonGuard {
+        store: store.path().to_path_buf(),
+    };
+    let gate_dir = tempfile::Builder::new()
+        .prefix("hcs-")
+        .tempdir_in("/tmp")
+        .expect("short cancellation gate directory");
+    let gate_path = gate_dir.path().join("cancel.sock");
+    let gate = std::os::unix::net::UnixListener::bind(&gate_path)
+        .expect("bind cancellation settlement gate");
+    gate.set_nonblocking(true)
+        .expect("nonblocking cancellation gate");
+    let mut launcher = haider_command(store.path());
+    launcher
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--output",
+            "jsonl",
+            "--timeout",
+            "30s",
+            "-p",
+            "hold for double interrupt",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
+        .env("HAIDER_TEST_CANCEL_SETTLE_GATE", &gate_path)
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string());
+    if remove_endpoint {
+        launcher.env("HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY", "1");
     }
+    let mut launcher = launcher.spawn().expect("spawn stalled run launcher");
+    let daemon_pid = wait_for_daemon_ready(&profile, &guard);
+    let observed = observe_active_run(&mut launcher);
+
+    haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
+        .expect("first SIGINT to run client");
+    let cancellation_deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    let (mut settlement, _) = loop {
+        match gate.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < cancellation_deadline,
+                    "{case} first SIGINT did not reach cancellation settlement gate"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("{case} accept cancellation gate: {error}"),
+        }
+    };
+    let ready =
+        cancellation_gate_receipt(&mut settlement).expect("committed cancellation gate receipt");
+    assert_eq!(ready, 1);
+    let (state, terminal) = durable_run_head(store.path(), &observed);
+    assert_eq!(
+        state, "cancelling",
+        "{case} gate must follow committed cancellation"
+    );
+    assert!(
+        !terminal,
+        "{case} gated cancellation must remain nonterminal"
+    );
+    haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
+        .expect("second SIGINT to run client");
+    if remove_endpoint {
+        std::fs::remove_file(&profile.endpoint_path)
+            .expect("unlink daemon endpoint during double-interrupt teardown");
+    }
+    let client = wait_for_output(launcher, &format!("{case} double-interrupt client"));
+    assert!(
+        !client.status.success(),
+        "double-interrupted client unexpectedly succeeded: stderr={}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+
+    if !remove_endpoint {
+        let deadline = Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+        loop {
+            let log = std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
+                .expect("read healthy linger receipt");
+            if log.lines().any(|line| {
+                line.contains("reason=launcher_linger_deadline")
+                    && line.contains("durable_quiescent=false decision=extend_linger")
+            }) {
+                break;
+            }
+            assert!(
+                process_exists(daemon_pid),
+                "{case} daemon retired before the fixture released cancellation: {log}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{case} did not extend the linger while cancellation was pending: {log}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (state, terminal) = durable_run_head(store.path(), &observed);
+        assert_eq!(state, "cancelling", "{case} settlement is still gated");
+        assert!(!terminal, "{case} cancellation settled before gate release");
+        assert!(
+            process_exists(daemon_pid),
+            "{case} live work keeps the daemon alive"
+        );
+        // Idle retirement waits for settlement. After observing extension,
+        // release this fixture's pause so cancellation can become terminal.
+        settlement
+            .write_all(&[1])
+            .expect("release cancellation after the healthy linger extends");
+    }
+
+    wait_for_daemon_exit(&profile, daemon_pid, case);
+    let log = std::fs::read_to_string(profile.store_dir.join(haider_client::DAEMON_LOG_FILE))
+        .expect("read daemon recovery log");
+    if remove_endpoint {
+        // A degraded endpoint keeps its immediate reap at the deadline.
+        assert!(
+            log.contains("durable_quiescent=false decision=shutdown"),
+            "{case} deadline did not prove the stalled run was still nonterminal: {log}"
+        );
+    } else {
+        // Orchestrator ruling O-1 (2026-09-25): the still-cancelling run
+        // EXTENDS the linger; the daemon retires only once it is terminal.
+        assert!(
+            log.contains("durable_quiescent=false decision=extend_linger"),
+            "{case} deadline did not extend the linger for the nonterminal run: {log}"
+        );
+        assert!(
+            log.contains("durable_quiescent=true decision=shutdown"),
+            "{case} did not retire only after the run settled: {log}"
+        );
+    }
+    if remove_endpoint {
+        assert!(
+            log.contains("endpoint-health event=coordinate_lost"),
+            "{case} did not observe the lost endpoint: {log}"
+        );
+        assert!(
+            log.contains("reason=degraded_endpoint_idle_deadline"),
+            "degraded linger did not own the shutdown decision: {log}"
+        );
+    } else {
+        assert!(
+            log.contains("reason=launcher_linger_deadline")
+                && log.contains("endpoint_degraded=false"),
+            "intact endpoint did not reach the absolute launcher deadline: {log}"
+        );
+    }
+    let (final_state, terminal) = durable_run_head(store.path(), &observed);
+    assert!(terminal, "{case} graceful drain left the run nonterminal");
+    assert_eq!(final_state, "cancelled");
+    drop(settlement);
 }
 
 /// When both autonomous recovery paths are test-disabled, `daemon stop`
@@ -1501,13 +1543,6 @@ fn launcher_linger_is_extended_while_a_run_is_live_until_explicit_stop() {
     assert_eq!(
         state, "cancelled",
         "graceful drain preserves a replayable terminal"
-    );
-    let daemon_log = std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
-        .expect("read absolute linger daemon log");
-    assert!(
-        daemon_log.contains("reason=launcher_linger_deadline")
-            && daemon_log.contains("durable_quiescent=false decision=shutdown"),
-        "absolute linger did not observe and drain the nonterminal run: {daemon_log}"
     );
     assert_idle_linger_receipt(store.path(), IDLE_TTL_MS);
 }
