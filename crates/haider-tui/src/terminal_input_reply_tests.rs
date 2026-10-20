@@ -940,40 +940,44 @@ fn remote_result_order_all_setup_results_survive_lists_and_equal_timestamps() {
 fn remote_result_order_running_survives_lists_and_keeps_command_input() {
     for (w, h) in [(118, 36), (80, 24)] {
         for list in ["empty", "older", "same-ms"] {
-            let mut m = result_order_model();
-            let mut live = LiveDriver::new("result-order");
-            let context = open_profile(&mut m, &mut live, "profile-a");
-            m.apply_shell_event(admitted_with_status(
-                "current-shell",
-                "profile-a",
-                haider_rpc::ShellStatusWire::Running,
-            ));
-            m.apply_ssh_shell_output("current-shell", b"EARLY_OUTPUT\r\n");
-            let mut stale = admitted("current-shell", "profile-a");
-            stale.last_activity_ms = u64::from(list == "same-ms");
-            result_order_list(
-                &mut m,
-                &mut live,
-                if list == "empty" { vec![] } else { vec![stale] },
-            );
-            apply_response(
-                &mut m,
-                &mut live,
-                &context,
-                haider_rpc::ResponseBody::SshShellOpen {
-                    shell: admitted("current-shell", "profile-a"),
-                },
-            );
-            assert!(!m.ssh_terminal.as_ref().unwrap().connecting, "{list}");
-            assert!(snapshot(&m, w, h).contains("EARLY_OUTPUT"));
-            m.requests.clear();
-            m.handle(AppEvent::Key(KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL,
-            )));
-            assert!(
-                matches!(m.requests.as_slice(), [crate::app::AppRequest::SshShellInput { id, input }] if id == "current-shell" && input.as_slice() == b"\x03")
-            );
+            for with_output in [false, true] {
+                let mut m = result_order_model();
+                let mut live = LiveDriver::new("result-order");
+                let context = open_profile(&mut m, &mut live, "profile-a");
+                m.apply_shell_event(admitted_with_status(
+                    "current-shell",
+                    "profile-a",
+                    haider_rpc::ShellStatusWire::Running,
+                ));
+                if with_output {
+                    m.apply_ssh_shell_output("current-shell", b"EARLY_OUTPUT\r\n");
+                }
+                let mut stale = admitted("current-shell", "profile-a");
+                stale.last_activity_ms = u64::from(list == "same-ms");
+                result_order_list(
+                    &mut m,
+                    &mut live,
+                    if list == "empty" { vec![] } else { vec![stale] },
+                );
+                apply_response(
+                    &mut m,
+                    &mut live,
+                    &context,
+                    haider_rpc::ResponseBody::SshShellOpen {
+                        shell: admitted("current-shell", "profile-a"),
+                    },
+                );
+                assert!(!m.ssh_terminal.as_ref().unwrap().connecting, "{list}");
+                assert_eq!(snapshot(&m, w, h).contains("EARLY_OUTPUT"), with_output);
+                m.requests.clear();
+                m.handle(AppEvent::Key(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                )));
+                assert!(
+                    matches!(m.requests.as_slice(), [crate::app::AppRequest::SshShellInput { id, input }] if id == "current-shell" && input.as_slice() == b"\x03")
+                );
+            }
         }
     }
 }
