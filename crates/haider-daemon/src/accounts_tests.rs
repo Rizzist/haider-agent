@@ -6436,6 +6436,7 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
 
     struct PutThenBlockVault {
         inner: MemoryVault,
+        target: CredentialAlias,
         persisted: AtomicBool,
         release: (StdMutex<bool>, Condvar),
     }
@@ -6447,6 +6448,9 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
             secret: &[u8],
         ) -> haider_accounts::AccountsResult<()> {
             self.inner.put(alias, secret)?;
+            if alias != &self.target {
+                return Ok(());
+            }
             self.persisted.store(true, Ordering::SeqCst);
             let (lock, wake) = &self.release;
             let mut released = lock.lock().expect("release lock");
@@ -6477,6 +6481,7 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
     let vault = Arc::new(PutThenBlockVault {
         inner: MemoryVault::new(),
+        target: CredentialAlias::new("work-oauth"),
         persisted: AtomicBool::new(false),
         release: (StdMutex::new(false), Condvar::new()),
     });
@@ -6523,6 +6528,11 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
     })
     .await
     .expect("vault persisted before crash");
+    assert!(
+        vault
+            .resolve(&oauth_staging_alias("oauth-crash-command"))
+            .is_ok()
+    );
 
     // Crash at the production seam: SQLite receipt is pending and the vault
     // write is durable, but the actor has not observed the worker return, so
@@ -6593,14 +6603,23 @@ async fn oauth_reconciliation_closes_crash_before_and_after_vault_put() {
         .account_add_claim_receipt("oauth-b".into(), digest_b, json_b)
         .await
         .expect("claim B");
+    let bundle_b = oauth_bundle();
+    put_oauth_staging(
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        &oauth_staging_alias("oauth-b"),
+        &bundle_b,
+    )
+    .await
+    .expect("current write stage B");
     vault
         .put(
             &CredentialAlias::new(identity_b.physical_alias.clone()),
-            &oauth_bundle().encode().expect("encode B"),
+            &bundle_b.encode().expect("encode B"),
         )
         .expect("vault B");
 
-    // C: vault + descriptor committed, crash before receipt finalization.
+    // C: a historical writer without stages saved the bundle and descriptor,
+    // then stopped before receipt finalization. Preserve its recovery too.
     let identity_c = oauth_identity_for("profile-r", "oauth-c");
     let json_c = identity_c.canonical_json().expect("identity C");
     let digest_c = blake3::hash(json_c.as_bytes()).to_hex().to_string();
@@ -6608,6 +6627,12 @@ async fn oauth_reconciliation_closes_crash_before_and_after_vault_put() {
         .account_add_claim_receipt("oauth-c".into(), digest_c, json_c)
         .await
         .expect("claim C");
+    let database = rusqlite::Connection::open(dir.path().join("store.sqlite"))
+        .expect("historical fixture database");
+    database.execute(
+        "UPDATE command_receipts SET request_json = ?1, recovery_json = NULL WHERE command_id = 'oauth-c'",
+        [identity_c.canonical_json().expect("historical coordinates C")],
+    ).expect("historical unstaged receipt C");
     let bundle_c = oauth_bundle();
     vault
         .put(
@@ -6662,6 +6687,7 @@ async fn oauth_reconciliation_closes_crash_before_and_after_vault_put() {
     assert_eq!(state("oauth-b"), "committed");
     assert_eq!(state("oauth-c"), "committed");
     assert_eq!(state("oauth-d"), "committed");
+    assert!(vault.resolve(&oauth_staging_alias("oauth-b")).is_err());
     assert!(
         accounts
             .get(&CredentialAlias::new(identity_a.physical_alias))
@@ -18508,7 +18534,12 @@ async fn v2_relogin_of_a_revoked_row_republishes_its_source_line() {
     store.close().await.expect("close store");
 }
 
-async fn v2_claim_pending_add(store: &SqliteStoreHandle, command_id: &str, alias: &str) {
+async fn v2_claim_pending_add(
+    store: &SqliteStoreHandle,
+    command_id: &str,
+    alias: &str,
+    directory: &std::path::Path,
+) {
     let identity = OAuthAddIdentity {
         provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
         physical_alias: alias.to_owned(),
@@ -18525,6 +18556,14 @@ async fn v2_claim_pending_add(store: &SqliteStoreHandle, command_id: &str, alias
             .expect("claim"),
         AccountAddClaim::Fresh
     ));
+    // Recreate the historical no-target receipt. New claims protect their
+    // requested alias atomically, which the fresh-claim regression covers.
+    let database = rusqlite::Connection::open(directory.join("store.sqlite"))
+        .expect("historical fixture database");
+    database.execute(
+        "UPDATE command_receipts SET request_json = ?2, recovery_json = NULL WHERE command_id = ?1",
+        rusqlite::params![command_id, identity.canonical_json().expect("historical coordinates")],
+    ).expect("historical pending coordinates");
 }
 
 /// Same-process resume of an interrupted different-account retarget replays
@@ -18552,7 +18591,7 @@ async fn v2_resume_of_an_interrupted_retarget_replays_the_staged_bundle() {
     // The interrupted attempt: receipt claimed and the retargeted bundle
     // staged, then the process stopped before any write.
     let command = "v2-interrupted-retarget";
-    v2_claim_pending_add(&store, command, "work").await;
+    v2_claim_pending_add(&store, command, "work", dir.path()).await;
     put_oauth_staging(
         Arc::clone(&vault) as Arc<dyn Vault>,
         &oauth_staging_alias(command),
@@ -18632,7 +18671,7 @@ async fn v2_restart_reconciles_a_pending_retarget_to_the_alias_it_wrote() {
         .expect("x");
     // Retarget durable in `anthropic-oauth`, receipt still pending.
     let wrote = "v2-restart-wrote";
-    v2_claim_pending_add(&store, wrote, "work").await;
+    v2_claim_pending_add(&store, wrote, "work", dir.path()).await;
     put_oauth_staging(
         Arc::clone(&vault) as Arc<dyn Vault>,
         &oauth_staging_alias(wrote),
@@ -18642,7 +18681,7 @@ async fn v2_restart_reconciles_a_pending_retarget_to_the_alias_it_wrote() {
     .expect("stage");
     // A second retarget that never reached its write.
     let unwritten = "v2-restart-unwritten";
-    v2_claim_pending_add(&store, unwritten, "work").await;
+    v2_claim_pending_add(&store, unwritten, "work", dir.path()).await;
     put_oauth_staging(
         Arc::clone(&vault) as Arc<dyn Vault>,
         &oauth_staging_alias(unwritten),
@@ -19398,7 +19437,7 @@ async fn a23_pending_retarget_keeps_the_original_command_and_the_saved_target() 
     for target in ["work", "other", "missing"] {
         let dir = test_store_dir();
         let store = open_store(dir.path()).await;
-        v2_claim_pending_add(&store, "a23-command", "work").await;
+        v2_claim_pending_add(&store, "a23-command", "work", dir.path()).await;
         if target == "other" {
             let database =
                 rusqlite::Connection::open(dir.path().join("store.sqlite")).expect("database");
@@ -19584,6 +19623,8 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
         "imported-x",
         "pending-retarget",
         "pending-shared-value",
+        "pending-email-only",
+        "pending-claim",
     ] {
         let directory = root.join(case);
         std::fs::create_dir(&directory).expect("new fixture");
@@ -19602,13 +19643,14 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
             ANTHROPIC_OAUTH_PROVIDER_NAME
         };
         let sequence: Vec<(&str, &str)> = match case {
-            "ordinary" => vec![("a", "work"), ("b", "other")],
+            "ordinary" | "pending-claim" => vec![("a", "work"), ("b", "other")],
             "aba" => vec![("a", "work"), ("b", "other"), ("a", "requested")],
             "retarget"
             | "missing-y"
             | "imported-x"
             | "pending-retarget"
-            | "pending-shared-value" => {
+            | "pending-shared-value"
+            | "pending-email-only" => {
                 vec![("a", "work"), ("b", "other"), ("b", "work")]
             }
             "explicit" => vec![("a", "named-account"), ("a", "explicit-request")],
@@ -19621,7 +19663,7 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
             } else {
                 format!("account={who};organization=team")
             };
-            let value: &[u8] = if case == "pending-shared-value" {
+            let value: &[u8] = if matches!(case, "pending-shared-value" | "pending-email-only") {
                 b"synthetic-shared-profile"
             } else {
                 command.as_bytes()
@@ -19634,6 +19676,14 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
                 claude_relogin_bundle(value, &account_id, u64::MAX - 1).with_account_identity(
                     stable_test_identity("same@example.test", Some(&account_id)),
                 )
+            };
+            let bundle = if case == "pending-email-only" {
+                bundle.with_account_identity(stable_test_identity(
+                    &format!("{who}@example.test"),
+                    None,
+                ))
+            } else {
+                bundle
             };
             actor
                 .commands()
@@ -19753,7 +19803,9 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
                 | "missing-y"
                 | "imported-x"
                 | "pending-retarget"
-                | "pending-shared-value" => 2,
+                | "pending-shared-value"
+                | "pending-email-only"
+                | "pending-claim" => 2,
                 _ => 1,
             }
         );
@@ -19771,8 +19823,29 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
             .expect("historical coordinates");
             database.execute("UPDATE command_receipts SET request_json = ?1, recovery_json = NULL WHERE command_id = 'a23-historical-1'", [request]).expect("historical fixture");
         }
-        if matches!(case, "pending-retarget" | "pending-shared-value") {
-            v2_claim_pending_add(&store, "a23-interrupted", "work").await;
+        if case == "pending-claim" {
+            let identity = OAuthAddIdentity {
+                provider: provider.into(),
+                physical_alias: "work".into(),
+                display_alias: "work".into(),
+                auth_method: "oauth".into(),
+                recovery_target: None,
+            };
+            let request = identity.canonical_json().expect("fresh claim coordinates");
+            store
+                .account_add_claim_receipt(
+                    "a23-interrupted".into(),
+                    blake3::hash(request.as_bytes()).to_hex().to_string(),
+                    request,
+                )
+                .await
+                .expect("fresh claim before target selection or staging");
+        }
+        if matches!(
+            case,
+            "pending-retarget" | "pending-shared-value" | "pending-email-only"
+        ) {
+            v2_claim_pending_add(&store, "a23-interrupted", "work", &directory).await;
             store
                 .prepare_account_add_target("a23-interrupted".into(), "other".into())
                 .await
@@ -19808,7 +19881,7 @@ async fn a23_same_schema_profiles_cover_identity_lifecycle_and_pending_writes() 
                 .put(&alias, secret.expose_secret())
                 .expect("write synthetic slot");
         }
-        manifest.push(serde_json::json!({"case":case,"expected":expected,"candidate_first":case=="historical","pending":matches!(case,"pending-retarget"|"pending-shared-value"),"fixture":"actual actor sign-ins; historical and missing projection are explicitly named fixtures"}));
+        manifest.push(serde_json::json!({"case":case,"expected":expected,"candidate_first":case=="historical","pending":matches!(case,"pending-retarget"|"pending-shared-value"|"pending-email-only"|"pending-claim"),"unwritten":case=="pending-claim","fixture":"actual actor sign-ins; historical, missing projection and pending boundaries are explicitly named fixtures"}));
     }
     std::fs::write(
         root.join("manifest.json"),
@@ -19851,7 +19924,7 @@ async fn a23_interrupted_target_publication_requires_the_command_owned_stage() {
             CredentialStatus::Expired,
             true,
         );
-        v2_claim_pending_add(&store, "a23-boundary", "work").await;
+        v2_claim_pending_add(&store, "a23-boundary", "work", dir.path()).await;
         store
             .prepare_account_add_target("a23-boundary".into(), "other".into())
             .await
@@ -20009,19 +20082,26 @@ async fn a23_staged_recovery_proves_the_saved_target_when_values_match() {
                 for shared_value in [false, true] {
                     a23_check_staged_recovery_values(
                         provider,
-                        published,
-                        written,
-                        shared_value,
-                        false,
+                        A23RecoveryCase {
+                            published,
+                            written,
+                            shared_value,
+                            stable_identity: true,
+                            ..A23RecoveryCase::default()
+                        },
                     )
                     .await;
                     if published {
                         a23_check_staged_recovery_values(
                             provider,
-                            published,
-                            written,
-                            shared_value,
-                            true,
+                            A23RecoveryCase {
+                                published,
+                                written,
+                                shared_value,
+                                stable_identity: true,
+                                same_identity: true,
+                                ..A23RecoveryCase::default()
+                            },
                         )
                         .await;
                     }
@@ -20031,19 +20111,134 @@ async fn a23_staged_recovery_proves_the_saved_target_when_values_match() {
     }
 }
 
-async fn a23_check_staged_recovery_values(
-    provider: &str,
+#[tokio::test]
+async fn a23_legacy_staged_recovery_proves_the_saved_email_only_account() {
+    for shared_email in [false, true] {
+        for published in [false, true] {
+            for written in [false, true] {
+                for shared_value in [false, true] {
+                    a23_check_staged_recovery_values(
+                        ANTHROPIC_OAUTH_PROVIDER_NAME,
+                        A23RecoveryCase {
+                            published,
+                            written,
+                            shared_value,
+                            shared_email,
+                            ..A23RecoveryCase::default()
+                        },
+                    )
+                    .await;
+                    if published {
+                        a23_check_staged_recovery_values(
+                            ANTHROPIC_OAUTH_PROVIDER_NAME,
+                            A23RecoveryCase {
+                                published,
+                                written,
+                                shared_value,
+                                shared_email,
+                                same_identity: true,
+                                ..A23RecoveryCase::default()
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a23_recovery_keeps_a_published_target_when_the_account_list_changes() {
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        for written in [false, true] {
+            a23_check_staged_recovery_values(
+                provider,
+                A23RecoveryCase {
+                    published: true,
+                    written,
+                    shared_value: true,
+                    same_identity: true,
+                    stable_identity: true,
+                    reused_target: true,
+                    ..A23RecoveryCase::default()
+                },
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a23_recovery_leaves_a_reserved_saved_target_pending() {
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        for published in [false, true] {
+            for written in [false, true] {
+                a23_check_staged_recovery_values(
+                    provider,
+                    A23RecoveryCase {
+                        published,
+                        written,
+                        stable_identity: true,
+                        reserved_target: true,
+                        ..A23RecoveryCase::default()
+                    },
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a23_legacy_recovery_publishes_the_saved_target_before_finalization() {
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        a23_check_staged_recovery_values(
+            provider,
+            A23RecoveryCase {
+                written: true,
+                same_identity: true,
+                stable_identity: true,
+                reused_target: true,
+                fail_finalization: true,
+                ..A23RecoveryCase::default()
+            },
+        )
+        .await;
+    }
+}
+
+#[derive(Default)]
+struct A23RecoveryCase {
     published: bool,
     written: bool,
     shared_value: bool,
     same_identity: bool,
-) {
+    stable_identity: bool,
+    shared_email: bool,
+    reused_target: bool,
+    reserved_target: bool,
+    fail_finalization: bool,
+}
+
+async fn a23_check_staged_recovery_values(provider: &str, case: A23RecoveryCase) {
+    let A23RecoveryCase {
+        published,
+        written,
+        shared_value,
+        same_identity,
+        stable_identity,
+        shared_email,
+        reused_target,
+        reserved_target,
+        fail_finalization,
+    } = case;
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
     let vault = Arc::new(MemoryVault::new());
     let mut accounts = memory_accounts();
     let bundle = |who: &str, value: &[u8]| {
-        if provider == OPENAI_OAUTH_PROVIDER_NAME {
+        let bundle = if provider == OPENAI_OAUTH_PROVIDER_NAME {
             openai_import_test_bundle(value, b"synthetic-refresh", 1).with_account_identity(
                 stable_test_identity(
                     "same@example.test",
@@ -20056,6 +20251,16 @@ async fn a23_check_staged_recovery_values(
                 &format!("account={who};organization=team"),
                 u64::MAX - 1,
             )
+        };
+        if stable_identity {
+            bundle
+        } else {
+            let email = if shared_email {
+                "same@example.test".to_owned()
+            } else {
+                format!("{who}@example.test")
+            };
+            bundle.with_account_identity(stable_test_identity(&email, None))
         }
     };
     let x = bundle(
@@ -20066,7 +20271,7 @@ async fn a23_check_staged_recovery_values(
             b"synthetic-x"
         },
     );
-    let old_y = bundle("b", b"synthetic-prior");
+    let old_y = bundle(if reused_target { "c" } else { "b" }, b"synthetic-prior");
     let new_y = bundle("b", b"synthetic-new");
     for (name, value, status, active) in [
         ("alpha", &x, CredentialStatus::Revoked, false),
@@ -20096,6 +20301,15 @@ async fn a23_check_staged_recovery_values(
         )
         .await
         .expect("claim");
+    if !published {
+        // This matrix includes receipts written before target publication.
+        let database = rusqlite::Connection::open(dir.path().join("store.sqlite"))
+            .expect("historical fixture database");
+        database.execute(
+            "UPDATE command_receipts SET request_json = ?1, recovery_json = NULL WHERE command_id = 'a23-equal-value'",
+            [identity.canonical_json().expect("historical coordinates")],
+        ).expect("historical pending coordinates");
+    }
     if published {
         store
             .prepare_account_add_target("a23-equal-value".into(), "zulu".into())
@@ -20117,20 +20331,58 @@ async fn a23_check_staged_recovery_values(
             )
             .expect("write target");
     }
-    reconcile_oauth_add_receipts(
-        &store,
-        &mut accounts,
-        &VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
-    )
-    .await
-    .expect("recover");
+    if fail_finalization {
+        let database =
+            rusqlite::Connection::open(dir.path().join("store.sqlite")).expect("fixture database");
+        database.execute_batch("CREATE TRIGGER a23_pause_finalization BEFORE UPDATE OF state ON command_receipts WHEN NEW.command_id = 'a23-equal-value' AND NEW.state = 'committed' BEGIN SELECT RAISE(ABORT, 'synthetic finalization pause'); END;").expect("pause only finalization after target publication");
+    }
+    let recovered = if reserved_target {
+        let rows = store
+            .account_add_receipts()
+            .await
+            .expect("pending receipts");
+        reconcile_oauth_add_receipts_from(
+            &store,
+            &mut accounts,
+            &VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
+            &rows,
+            &HashMap::new(),
+            &HashSet::from(["zulu".to_owned()]),
+        )
+        .await
+    } else {
+        reconcile_oauth_add_receipts(
+            &store,
+            &mut accounts,
+            &VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
+        )
+        .await
+    };
+    if fail_finalization {
+        assert!(
+            recovered.is_err(),
+            "the synthetic finalization pause must run"
+        );
+    } else {
+        recovered.expect("recover");
+    }
+    let committed = written && !reserved_target && !fail_finalization;
     let rows = store.account_add_receipts().await.expect("receipts");
     assert_eq!(
         rows[0].state,
-        if written { "committed" } else { "pending" },
-        "recovery must prove Y was written: {provider}/{published}/{written}/{shared_value}/{same_identity}",
+        if committed { "committed" } else { "pending" },
+        "recovery must prove Y was written: {provider}/{published}/{written}/{shared_value}/{same_identity}/{stable_identity}/{shared_email}/{reused_target}/{reserved_target}",
     );
-    if written {
+    if (published && !committed) || fail_finalization {
+        let identity: OAuthAddIdentity =
+            serde_json::from_str(&rows[0].request_json).expect("pending target");
+        assert_eq!(
+            identity.recovery_target.as_deref(),
+            Some("zulu"),
+            "startup must retain the published or already saved target"
+        );
+    }
+    if committed {
         let response: AccountAddReceiptResponse =
             serde_json::from_str(rows[0].response_json.as_deref().expect("response"))
                 .expect("decode response");
@@ -20156,13 +20408,242 @@ async fn a23_check_staged_recovery_values(
             == x.encode().expect("X encoding").as_slice(),
         "recovery must leave X's saved sign-in unchanged"
     );
+    if reserved_target {
+        assert_eq!(
+            accounts
+                .get(&CredentialAlias::new("zulu"))
+                .expect("reserved Y")
+                .status,
+            CredentialStatus::Expired,
+            "recovery must leave the reserved target unchanged"
+        );
+    }
     assert_eq!(accounts.list().len(), 2, "saved aliases stay separate");
     assert_eq!(
         vault
             .resolve(&oauth_staging_alias("a23-equal-value"))
             .is_ok(),
-        !written,
+        !committed,
         "only a completed target write consumes the stage"
     );
     store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn a23_fresh_interactive_claim_is_safe_before_target_selection() {
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        for alias in ["work".to_owned(), "a".repeat(58)] {
+            let dir = test_store_dir();
+            let store = open_store(dir.path()).await;
+            let identity = OAuthAddIdentity {
+                provider: provider.into(),
+                physical_alias: alias.clone(),
+                display_alias: alias.clone(),
+                auth_method: "oauth".into(),
+                recovery_target: None,
+            };
+            let request = identity.canonical_json().expect("coordinates");
+            let digest = blake3::hash(request.as_bytes()).to_hex().to_string();
+            store
+                .account_add_claim_receipt("a23-fresh".into(), digest.clone(), request.clone())
+                .await
+                .expect("claim");
+            let rows = store.account_add_receipts().await.expect("receipt");
+            let saved: serde_json::Value =
+                serde_json::from_str(&rows[0].request_json).expect("saved coordinates");
+            assert!(
+                saved["physical_alias"]
+                    .as_str()
+                    .expect("old-reader coordinate")
+                    .starts_with("__oauth_pending_"),
+                "a fresh claim must remain pending for the previous reader before alias selection"
+            );
+            assert_eq!(saved["recovery_target"].as_str(), Some(alias.as_str()));
+            assert!(matches!(
+                store
+                    .account_add_claim_receipt("a23-fresh".into(), digest, request)
+                    .await
+                    .expect("same semantic retry"),
+                AccountAddClaim::ResumePending
+            ));
+            store.close().await.expect("close");
+        }
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let request =
+            serde_json::json!({"source":"synthetic-import", "alias":"work", "provider":provider})
+                .to_string();
+        let digest = blake3::hash(request.as_bytes()).to_hex().to_string();
+        store
+            .account_add_claim_receipt("a23-import-control".into(), digest, request.clone())
+            .await
+            .expect("import claim");
+        assert_eq!(
+            store.account_add_receipts().await.expect("import receipt")[0].request_json,
+            request,
+            "source-bound imports retain their existing recovery coordinates"
+        );
+        store.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn a23_every_interactive_write_stages_its_final_generation() {
+    struct SavedWritePause {
+        inner: MemoryVault,
+        target: CredentialAlias,
+    }
+    impl Vault for SavedWritePause {
+        fn put(
+            &self,
+            alias: &CredentialAlias,
+            secret: &[u8],
+        ) -> haider_accounts::AccountsResult<()> {
+            if alias == &self.target {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "synthetic saved-write pause",
+                    true,
+                ));
+            }
+            self.inner.put(alias, secret)
+        }
+        fn resolve(
+            &self,
+            alias: &CredentialAlias,
+        ) -> haider_accounts::AccountsResult<SecretHandle> {
+            self.inner.resolve(alias)
+        }
+        fn delete(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<()> {
+            self.inner.delete(alias)
+        }
+        fn list(&self) -> haider_accounts::AccountsResult<Vec<CredentialAlias>> {
+            self.inner.list()
+        }
+    }
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        for retarget in [false, true] {
+            let dir = test_store_dir();
+            let store = open_store(dir.path()).await;
+            let target = CredentialAlias::new(if retarget { "other" } else { "work" });
+            let vault = Arc::new(SavedWritePause {
+                inner: MemoryVault::new(),
+                target: target.clone(),
+            });
+            let mut accounts = memory_accounts();
+            let bundle = |who: &str, value: &[u8]| {
+                if provider == OPENAI_OAUTH_PROVIDER_NAME {
+                    openai_import_test_bundle(value, b"synthetic-refresh", 1).with_account_identity(
+                        stable_test_identity(
+                            "same@example.test",
+                            Some(&format!("user:1:{who};workspace:4:team")),
+                        ),
+                    )
+                } else {
+                    claude_relogin_bundle(
+                        value,
+                        &format!("account={who};organization=team"),
+                        u64::MAX - 1,
+                    )
+                }
+            };
+            let mut previous = bundle("b", b"synthetic-prior");
+            previous.generation = 7;
+            vault
+                .inner
+                .put(&target, &previous.encode().expect("seed target"))
+                .expect("target fixture");
+            accounts
+                .add(oauth_descriptor_for(provider, &target, &previous, true))
+                .expect("target row");
+            if retarget {
+                let alias = CredentialAlias::new("work");
+                let original = bundle("a", b"synthetic-original");
+                vault
+                    .inner
+                    .put(&alias, &original.encode().expect("seed X"))
+                    .expect("X fixture");
+                accounts
+                    .add(oauth_descriptor_for(provider, &alias, &original, false))
+                    .expect("X row");
+            }
+            let snapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+            let mut actor = start_account_actor(AccountActorConfig {
+                store: store.clone(),
+                accounts,
+                vault: vault.clone() as Arc<dyn Vault>,
+                validator: Arc::new(ProviderCredentialValidator),
+                snapshot,
+                management: None,
+                device_discovery: DeviceDiscoverySnapshot::new(true),
+                profile_id: "a23-stage-final-generation".into(),
+                default_model: "unused".into(),
+                providers: test_provider_registry(),
+                provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+                reserved_aliases: HashSet::new(),
+                refresh_fences: RefreshFenceRegistry::default(),
+                source_registry: empty_source_registry(),
+                source_snapshot: empty_source_snapshot(),
+            });
+            let (sink, mut frames) = channel_sink();
+            actor
+                .commands()
+                .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+                    command_id: "a23-write-pause".into(),
+                    provider: provider.into(),
+                    display_alias: "work".into(),
+                    claim: Some(OAuthReadyClaim::for_account_test(
+                        provider,
+                        "work",
+                        bundle("b", b"synthetic-new"),
+                    )),
+                    route: LoginRoute {
+                        request_id: RequestId::new("write-pause"),
+                        sink,
+                    },
+                })))
+                .await
+                .expect("send sign-in");
+            let response = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+                .await
+                .expect("response deadline")
+                .expect("response");
+            actor.shutdown().await;
+            assert!(
+                matches!(
+                    response,
+                    WireFrame::Response {
+                        body: ResponseBody::Error { .. },
+                        ..
+                    }
+                ),
+                "the saved-write pause must run"
+            );
+            let stage = vault
+                .resolve(&oauth_staging_alias("a23-write-pause"))
+                .expect(
+                    "every interactive write retains its command-owned stage before persistence",
+                );
+            let stage = haider_accounts::OAuthTokenBundleV1::decode(oauth_stage_payload(
+                stage.expose_secret(),
+            ))
+            .expect("staged bundle");
+            assert_eq!(
+                stage.generation, 8,
+                "the stage contains the generation that will be written"
+            );
+            let saved = vault.resolve(&target).expect("original saved bundle");
+            let saved = haider_accounts::OAuthTokenBundleV1::decode(saved.expose_secret())
+                .expect("original bundle");
+            assert_eq!(
+                saved.generation, 7,
+                "failed persistence leaves the saved generation unchanged"
+            );
+            assert_eq!(
+                store.account_add_receipts().await.expect("pending receipt")[0].state,
+                "pending"
+            );
+            store.close().await.expect("close");
+        }
+    }
 }

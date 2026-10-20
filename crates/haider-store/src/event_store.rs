@@ -13083,6 +13083,19 @@ impl Store {
             request_json,
             now_ms()?,
         )?;
+        if !existed {
+            let request: serde_json::Value = serde_json::from_str(request_json)
+                .map_err(|error| corrupt(format!("invalid saved account request: {error}")))?;
+            if let Some(alias) = request
+                .get("physical_alias")
+                .and_then(serde_json::Value::as_str)
+            {
+                // Claim and protect an interactive write in one transaction.
+                // The previous reader must not acknowledge an untouched row
+                // while this command is still choosing its saved alias.
+                set_account_add_target(&transaction, command_id, alias, true)?;
+            }
+        }
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(if existed {
             AccountAddClaim::ResumePending

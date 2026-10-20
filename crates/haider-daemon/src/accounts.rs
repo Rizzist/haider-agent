@@ -7480,7 +7480,7 @@ impl OAuthAddIdentity {
     }
 }
 
-/// Durable OAuth add: receipt claim -> vault bundle -> descriptor -> receipt.
+/// Durable OAuth add: receipt claim -> command stage -> vault bundle -> descriptor -> receipt.
 ///
 /// The claimed bundle is command-owned before this function is entered.
 /// Neither it nor the ready reference is ever serialized into SQLite.
@@ -7536,9 +7536,7 @@ async fn handle_oauth_add(
         .await;
     let resume = match receipt {
         Ok(AccountAddClaim::Committed(response)) => {
-            if response.descriptor.alias != requested_alias
-                && let Err(error) = delete_oauth_staging(Arc::clone(&vault), &staging_alias).await
-            {
+            if let Err(error) = delete_oauth_staging(Arc::clone(&vault), &staging_alias).await {
                 respond_error(
                     &route,
                     ERROR_CODE_PROVIDER_ERROR,
@@ -7596,11 +7594,9 @@ async fn handle_oauth_add(
     } else {
         false
     };
-    // A staged bundle means the interrupted attempt targeted ANOTHER alias
-    // (identity match or a different-account retarget); that attempt must be
-    // replayed below, never finalized as if it had rewritten the requested
-    // alias.
-    let staged_elsewhere = if resume {
+    // A command-owned stage reaches the write boundary. Replay it below;
+    // an existing requested row alone cannot prove this command completed.
+    let has_staged_bundle = if resume {
         match resolve_optional_vault_secret(Arc::clone(&vault), &staging_alias).await {
             Ok(staged) => staged.is_some(),
             Err(error) => {
@@ -7616,7 +7612,7 @@ async fn handle_oauth_add(
     } else {
         false
     };
-    if resume && !target_published && !staged_elsewhere && accounts.get(&requested_alias).is_some()
+    if resume && !target_published && !has_staged_bundle && accounts.get(&requested_alias).is_some()
     {
         if let Err(error) = promote_linked_alias_to_haider_oauth(
             source_registry,
@@ -7648,7 +7644,7 @@ async fn handle_oauth_add(
         .await;
         return;
     }
-    let (mut bundle, resumed_from_staging) = if resume && (!target_published || staged_elsewhere) {
+    let mut bundle = if resume && (!target_published || has_staged_bundle) {
         let stored = match resolve_optional_vault_secret(Arc::clone(&vault), &staging_alias).await {
             Ok(Some(stored)) => Some((stored, true)),
             Ok(None) => {
@@ -7689,7 +7685,7 @@ async fn handle_oauth_add(
         } else {
             stored.expose_secret()
         };
-        let bundle = match haider_accounts::OAuthTokenBundleV1::decode(encoded) {
+        match haider_accounts::OAuthTokenBundleV1::decode(encoded) {
             Ok(bundle) => bundle,
             Err(_) => {
                 respond_error(
@@ -7700,8 +7696,7 @@ async fn handle_oauth_add(
                 );
                 return;
             }
-        };
-        (bundle, from_staging)
+        }
     } else {
         let Some(claim) = claim else {
             respond_error(
@@ -7712,7 +7707,7 @@ async fn handle_oauth_add(
             );
             return;
         };
-        (claim.bundle, false)
+        claim.bundle
     };
     if bundle.provider_id != identity.provider {
         respond_error(
@@ -7788,25 +7783,11 @@ async fn handle_oauth_add(
         );
         return;
     }
-    let needs_staging = alias != requested_alias;
-    if needs_staging
-        && let Err(error) = store
-            .prepare_account_add_target(command_id.clone(), alias.as_str().to_owned())
-            .await
+    if let Err(error) = store
+        .prepare_account_add_target(command_id.clone(), alias.as_str().to_owned())
+        .await
     {
         respond_management_error(&route, &error);
-        return;
-    }
-    if needs_staging
-        && !resumed_from_staging
-        && let Err(error) = put_oauth_staging(Arc::clone(&vault), &staging_alias, &bundle).await
-    {
-        respond_error(
-            &route,
-            ERROR_CODE_PROVIDER_ERROR,
-            &error.message,
-            error.retryable,
-        );
         return;
     }
     let prior_secret = match resolve_optional_vault_secret(Arc::clone(&vault), &alias).await {
@@ -7843,6 +7824,15 @@ async fn handle_oauth_add(
                 return;
             }
         };
+    }
+    if let Err(error) = put_oauth_staging(Arc::clone(&vault), &staging_alias, &bundle).await {
+        respond_error(
+            &route,
+            ERROR_CODE_PROVIDER_ERROR,
+            &error.message,
+            error.retryable,
+        );
+        return;
     }
     let before = accounts.list().to_vec();
     if let Err(error) = persist_oauth_bundle(
@@ -7903,7 +7893,7 @@ async fn handle_oauth_add(
         &alias,
         &route,
         OAuthCommitResponse::Add,
-        (needs_staging || resumed_from_staging).then(|| (Arc::clone(&vault), staging_alias)),
+        Some((Arc::clone(&vault), staging_alias)),
     )
     .await;
 }
@@ -12885,8 +12875,10 @@ async fn reconcile_oauth_add_receipts_from(
         let is_import = matches!(identity, OAuthReceiptIdentity::Import(_));
         // Normalize an interrupted write from a build that did not publish
         // its target before staging. Keep an unwritten stage pending for BOTH
-        // readers, even when the original requested row still exists.
+        // readers, even when the original requested row still exists. Startup
+        // keeps a published target; only explicit retry may select another row.
         if row.state == "pending"
+            && !target_published
             && !is_import
             && let VaultProvision::Available(vault) = vault
             && let Ok(staged) = vault.resolve(&oauth_staging_alias(&row.command_id))
@@ -12894,15 +12886,32 @@ async fn reconcile_oauth_add_receipts_from(
             let bundle = haider_accounts::OAuthTokenBundleV1::decode(oauth_stage_payload(
                 staged.expose_secret(),
             ))?;
-            let mut target = oauth_alias_for_identity(accounts, &provider, &alias, &bundle);
-            if target == alias && relogin_is_different_account(accounts, &provider, &alias, &bundle)
-            {
-                target = next_free_account_alias_excluding(accounts, &provider, reserved)?;
-            }
-            if !reserved.contains(target.as_str()) {
-                store
-                    .prepare_account_add_target(row.command_id.clone(), target.as_str().to_owned())
-                    .await?;
+            let target = match staged_oauth_add_target(
+                vault.as_ref(),
+                accounts,
+                &row.command_id,
+                &provider,
+                &alias,
+                false,
+            )? {
+                StagedOAuthAdd::Wrote(target) => target,
+                StagedOAuthAdd::NotYetWritten => {
+                    let target = oauth_alias_for_identity(accounts, &provider, &alias, &bundle);
+                    if target == alias
+                        && relogin_is_different_account(accounts, &provider, &alias, &bundle)
+                    {
+                        next_free_account_alias_excluding(accounts, &provider, reserved)?
+                    } else {
+                        target
+                    }
+                }
+                StagedOAuthAdd::NotStaged => continue,
+            };
+            store
+                .prepare_account_add_target(row.command_id.clone(), target.as_str().to_owned())
+                .await?;
+            if reserved.contains(target.as_str()) {
+                continue;
             }
         }
         // Pending/staged receipts still use the request and staged bundle.
@@ -13067,9 +13076,10 @@ enum StagedOAuthAdd {
 }
 
 /// Finds the row whose vaulted bundle is the one staged for `command_id`
-/// (same provider, constant-time equal access token and captured stable account
-/// coordinate). A published target excludes other rows even when their saved
-/// values match. Only secret-free aliases leave this function.
+/// (same provider, constant-time equal access token and captured account
+/// identity). A legacy identity must match its captured facts; its missing
+/// stable coordinate is not a wildcard. A published target excludes other rows
+/// even when their saved values match. Only secret-free aliases leave here.
 fn staged_oauth_add_target(
     vault: &dyn Vault,
     accounts: &AccountStore<Box<dyn StoreLike>>,
@@ -13112,11 +13122,17 @@ fn staged_oauth_add_target(
         };
         if stored.provider_id == provider
             && stored.provider_id == staged.provider_id
-            && staged_account_id.is_none_or(|expected| {
-                AccountPrincipal::new(provider, stored.account_identity.as_ref())
-                    .and_then(AccountPrincipal::stable_account_id)
-                    == Some(expected)
-            })
+            && staged_account_id.map_or_else(
+                || {
+                    stored.account_identity == staged.account_identity
+                        && stored.identity == staged.identity
+                },
+                |expected| {
+                    AccountPrincipal::new(provider, stored.account_identity.as_ref())
+                        .and_then(AccountPrincipal::stable_account_id)
+                        == Some(expected)
+                },
+            )
             && bool::from(stored.access_token().ct_eq(staged.access_token()))
         {
             return Ok(StagedOAuthAdd::Wrote(alias.clone()));
