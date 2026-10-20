@@ -5530,8 +5530,8 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
 /// Owner decision 2026-09-25 (973-LANES.md "subagent stop semantics"): this
 /// test previously required a parent cancel to cancel the waited-on child
 /// through the `cleanup_fallback` handoff. A parent stop now DETACHES the
-/// child: the parent cancel still completes inside the same bound, the
-/// child keeps running, and the durable still-running marker is journalled.
+/// child: the parent cancel completes, the child keeps running, and the
+/// durable owed-delivery fact and still-running marker are journalled.
 /// The explicit stop-all walk then cancels the child, whose terminal metrics
 /// still mirror to the parent through the detached-delivery watcher.
 ///
@@ -5540,6 +5540,10 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
 /// child is Cancelled by the parent stop, or no terminal metrics mirror.
 #[tokio::test]
 async fn cancel_while_waiting_on_child_detaches_it_within_bound() {
+    use haider_protocol::subagent_stop::{
+        DetachedDeliveryPhaseV1, DetachedDeliveryV1, DetachedReasonV1,
+    };
+
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let provider = Arc::new(FakeProvider::new(vec![
@@ -5599,8 +5603,8 @@ async fn cancel_while_waiting_on_child_detaches_it_within_bound() {
     })
     .to_string();
     timeout(
-        // Observe cancellation completion independently of scheduler delay;
-        // the configured one-second terminal-mirror tail remains unchanged.
+        // Observe the main-only stop without making it wait for the live
+        // child; this deadline bounds the fixture's scheduling wait.
         haider_platform::TEST_WAIT_TIMEOUT,
         hub.cancel_internal_turn(TurnCancelCommand {
             command_id: "cancel-w6c-parent".into(),
@@ -5614,52 +5618,34 @@ async fn cancel_while_waiting_on_child_detaches_it_within_bound() {
         }),
     )
     .await
-    .expect("parent cancellation completes inside the terminal-mirror bound")
+    .expect("parent cancellation completes without waiting for its child")
     .expect("cancel parent");
-    timeout(
-        // The production cleanup fallback keeps its one-second terminal
-        // tail. Observe its durable completion independently of scheduling.
-        haider_platform::TEST_WAIT_TIMEOUT,
-        async {
-            loop {
-                let events = store
-                    .read(&child.child_session_id, 0, 1024)
-                    .await
-                    .expect("production fallback handoff journal");
-                let mut pending = std::collections::HashSet::new();
-                let mut completed = std::collections::HashSet::new();
-                for event in events {
-                    let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                        event.payload.decode_event()
-                    else {
-                        continue;
-                    };
-                    let Some(handoff) =
-                        crate::delegation::DelegationMirrorHandoff::from_item(&item)
-                    else {
-                        continue;
-                    };
-                    if handoff.source != "cleanup_fallback" {
-                        continue;
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        loop {
+            let owed = store
+                .read(&parent_session, 0, 1024)
+                .await
+                .expect("parent detached-delivery journal")
+                .iter()
+                .filter_map(|event| match event.payload.decode_event() {
+                    Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                        DetachedDeliveryV1::from_extension_item(&item)
                     }
-                    match handoff.phase {
-                        crate::delegation::DelegationMirrorHandoffPhase::Pending => {
-                            pending.insert(handoff.handoff_id);
-                        }
-                        crate::delegation::DelegationMirrorHandoffPhase::Completed => {
-                            completed.insert(handoff.handoff_id);
-                        }
-                    }
-                }
-                if pending.iter().any(|id| completed.contains(id)) {
-                    break;
-                }
-                tokio::task::yield_now().await;
+                    _ => None,
+                })
+                .any(|delivery| {
+                    delivery.agent == child.agent_id
+                        && delivery.phase == DetachedDeliveryPhaseV1::Owed
+                        && delivery.reason == DetachedReasonV1::MainStopped
+                });
+            if owed {
+                break;
             }
-        },
-    )
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
-    .expect("production cleanup mirror commits completion inside its bound");
+    .expect("main-only stop durably owes the detached child's result");
     wait_for_state(&store, &parent_session, |state| {
         *state == RunState::Cancelled
     })
