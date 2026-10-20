@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1100,6 +1101,92 @@ exec /usr/bin/mktemp "$@"
         self.detach_leftover_test_mounts()
         self.assert_no_test_mounts()
 
+    def test_builder_inventory_busy_recovery_uses_four_attempts(self):
+        for phase in ('snapshot', 'attached'):
+            with self.subTest(phase=phase):
+                (self.base / 'inventory-count').unlink(missing_ok=True)
+                (self.base / 'inventory-parents').unlink(missing_ok=True)
+                (self.base / 'attachments').unlink(missing_ok=True)
+                (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = info ] && { [ "$INVENTORY_PHASE" = snapshot ] || [ -f "$HDIUTIL_TEST_DIR/attachments" ]; }; then
+  count=0
+  [ ! -f "$HDIUTIL_TEST_DIR/inventory-count" ] || count=$(cat "$HDIUTIL_TEST_DIR/inventory-count")
+  if [ "$count" -lt 4 ]; then
+    count=$((count + 1))
+    echo "$count" > "$HDIUTIL_TEST_DIR/inventory-count"
+    echo "$PPID" >> "$HDIUTIL_TEST_DIR/inventory-parents"
+    if [ "$count" -lt 4 ]; then echo 'Resource busy' >&2; exit 1; fi
+  fi
+fi
+native_hdiutil "$@"
+''')
+                result = self.run_builder(self.base / ('inventory-recovery-' + phase), INVENTORY_PHASE=phase)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.base / 'inventory-count').read_text().strip(), '4')
+                self.assertEqual(len(set((self.base / 'inventory-parents').read_text().splitlines())), 1,
+                                 'inventory retries escaped the original attachment audit')
+                self.assertIn('macOS installer gate PASS', result.stdout)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assert_no_test_mounts()
+
+    def test_builder_malformed_attach_plists_use_verified_inventory_fallback(self):
+        cases = [
+            ('date', '<plist><dict><key>date</key><date>invalid</date></dict></plist>'),
+            ('truncated', '<plist><dict>'),
+            ('scalar', plistlib.dumps(['invalid']).decode()),
+            ('entity', plistlib.dumps({'system-entities': [1]}).decode()),
+            ('valid-date', ''),
+        ]
+        for label, body in cases:
+            with self.subTest(plist=label):
+                (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = attach ]; then
+  native_hdiutil "$@" > "$HDIUTIL_TEST_DIR/native-attach.plist" || exit $?
+  if [ "$ATTACH_CASE" = valid-date ]; then
+    python3 - "$HDIUTIL_TEST_DIR/native-attach.plist" <<'PLIST'
+import datetime, pathlib, plistlib, sys
+attached = plistlib.loads(pathlib.Path(sys.argv[1]).read_bytes())
+attached['checked-at'] = datetime.datetime(2026, 10, 20)
+sys.stdout.buffer.write(plistlib.dumps(attached))
+PLIST
+  else
+    printf '%s\\n' "$ATTACH_PLIST"
+  fi
+  exit 0
+fi
+native_hdiutil "$@"
+''')
+                try:
+                    result = self.run_builder(self.base / ('attach-plist-' + label),
+                                              ATTACH_CASE=label, ATTACH_PLIST=body)
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('macOS installer gate PASS', result.stdout)
+                finally:
+                    self.detach_leftover_test_mounts()
+                    self.assert_no_test_mounts()
+
+    def test_builder_failed_snapshot_retains_output_without_attaching(self):
+        for status, diagnostic in ((16, 'Resource busy'), (9, 'Invalid argument'), (0, 'invalid plist')):
+            with self.subTest(status=status):
+                (self.base / 'calls').unlink(missing_ok=True)
+                (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = info ]; then
+  echo "$INVENTORY_DIAGNOSTIC" >&''' + ('1' if status == 0 else '2') + '''
+  exit "$INVENTORY_STATUS"
+fi
+native_hdiutil "$@"
+''')
+                output = self.base / ('failed-snapshot-' + str(status))
+                result = self.run_builder(output, INVENTORY_STATUS=str(status), INVENTORY_DIAGNOSTIC=diagnostic)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('retaining', result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assertNotIn('attach', (self.base / 'calls').read_text().splitlines())
+                self.assertTrue(list(output.glob('*.dmg')), 'uncertain image was deleted')
+                self.assertFalse(list(output.glob('*.sha256')))
+                self.assert_no_test_mounts()
+
     def test_incomplete_inventory_is_requeried(self):
         info = plistlib.dumps({'images': []})
         warning = b'hdiutil: info: cannot get IO media array for IOHDIXHDDriveOutKernel'
@@ -1953,9 +2040,20 @@ native_hdiutil "$@"
                         ledger.unlink()
 
     def test_create_alias_and_incomplete_inventory_preserve_attached_backing(self):
-        for alias, mode in (('case', 'none'), ('unicode', 'none'), ('same', 'late'), ('case', 'always'), ('unicode', 'busy')):
+        python = self.shim / 'python3'
+        python.write_text('''#!/bin/bash
+if [[ "$1" == */macos-image-identity.py ]]; then
+  export HDIUTIL_TEST_IDENTITY_ACTION="$2"
+fi
+exec "$HDIUTIL_REAL_PYTHON" "$@"
+''')
+        python.chmod(0o755)
+        for alias, mode in (('case', 'none'), ('unicode', 'none'), ('same', 'late'),
+                            ('case', 'always'), ('same', 'path-loop'), ('unicode', 'busy')):
             for mounted in (False, True):
                 with self.subTest(alias=alias, mode=mode, mounted=mounted):
+                    (self.base / 'busy-info-count').unlink(missing_ok=True)
+                    (self.base / 'clone.json').unlink(missing_ok=True)
                     (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + """
 if [ "$1" = create ]; then
   native_hdiutil "$@" || exit $?
@@ -1978,26 +2076,41 @@ else:
 attached = subprocess.run(args, capture_output=True, check=True)
 (root / 'clone.plist').write_bytes(attached.stdout)
 (root / 'clone.json').write_text(json.dumps({
-    'path': str(image), 'sha256': hashlib.sha256(image.read_bytes()).hexdigest()}))
+    'path': str(image), 'identity': [image.stat().st_dev, image.stat().st_ino],
+    'sha256': hashlib.sha256(image.read_bytes()).hexdigest()}))
 CLONE
   if [ "$INVENTORY_MODE" = busy ]; then echo 'Resource busy' >&2; exit 16; fi
   exit 0
 fi
 if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/clone.json" ]; then
+  if [ "$INVENTORY_MODE" = busy ]; then
+    count=0
+    [ ! -f "$HDIUTIL_TEST_DIR/busy-info-count" ] || count=$(cat "$HDIUTIL_TEST_DIR/busy-info-count")
+    echo "$((count + 1))" > "$HDIUTIL_TEST_DIR/busy-info-count"
+    echo 'Resource busy' >&2
+    exit 16
+  fi
   python3 - "$HDIUTIL_TEST_DIR" "$INVENTORY_MODE" <<'OMIT'
 import json, os, pathlib, plistlib, subprocess, sys
 root = pathlib.Path(sys.argv[1]); mode = sys.argv[2]
 p = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'], capture_output=True)
-# The shell shim is the parent; its parent is the finish/clean helper.
-ppid = subprocess.check_output(['/bin/ps', '-o', 'ppid=', '-p', str(os.getppid())], text=True).strip()
-parent = subprocess.check_output(['/bin/ps', '-o', 'command=', '-p', ppid], text=True)
-if mode in ('always', 'busy') or (mode == 'late' and 'macos-image-identity.py clean ' in parent):
+if p.returncode:
+    sys.stderr.buffer.write(p.stderr)
+    sys.exit(p.returncode)
+if mode in ('always', 'busy', 'path-loop') or (mode == 'late' and os.environ.get('HDIUTIL_TEST_IDENTITY_ACTION') == 'clean'):
     raw = pathlib.Path(json.loads((root / 'clone.json').read_text())['path'])
     info = plistlib.loads(p.stdout)
     def same_file(image):
         try: return pathlib.Path(image.get('image-path', '')).samefile(raw)
         except OSError: return False
-    info['images'] = [i for i in info.get('images', []) if not same_file(i)]
+    if mode == 'path-loop':
+        loop = root / 'inventory-path-loop'
+        loop.unlink(missing_ok=True)
+        loop.symlink_to(loop.name)
+        for image in info.get('images', []):
+            if same_file(image): image['image-path'] = str(loop)
+    else:
+        info['images'] = [i for i in info.get('images', []) if not same_file(i)]
     p.stdout = plistlib.dumps(info)
 sys.stdout.buffer.write(p.stdout); sys.stderr.buffer.write(p.stderr); sys.exit(p.returncode)
 OMIT
@@ -2010,18 +2123,30 @@ native_hdiutil "$@"
                     mktemp.chmod(0o755)
                     try:
                         result = self.run_builder(self.base / f'clone-output-{alias}-{mode}-{mounted}',
-                                                  FOREIGN_MOUNTED=str(int(mounted)), ALIAS=alias, INVENTORY_MODE=mode)
+                                                  FOREIGN_MOUNTED=str(int(mounted)), ALIAS=alias, INVENTORY_MODE=mode,
+                                                  HDIUTIL_REAL_PYTHON=sys.executable)
                         self.assertNotEqual(result.returncode, 0, result.stderr)
                         self.assertIn('retaining', result.stderr)
+                        self.assertNotIn('Traceback', result.stderr)
+                        if mode == 'busy':
+                            self.assertEqual(result.returncode, 16, result.stderr)
+                            # remove and the exit trap's withdraw-image each
+                            # exhaust exactly four inventory attempts.
+                            self.assertEqual((self.base / 'busy-info-count').read_text().strip(), '8')
                         self.assertNotIn('macOS installer gate PASS', result.stdout)
                         record = json.loads((self.base / 'clone.json').read_text())
                         image = Path(record['path'])
+                        retained_stat = image.stat()
+                        self.assertEqual([retained_stat.st_dev, retained_stat.st_ino], record['identity'])
                         self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), record['sha256'])
                         attached = plistlib.loads((self.base / 'clone.plist').read_bytes())
                         for entity in attached['system-entities']:
                             device = entity.get('dev-entry', '')
                             if re.fullmatch(r'/dev/disk[0-9]+', device):
-                                self.assertTrue(self.image_for_device(device), 'foreign clone ejected')
+                                current = self.image_for_device(device)
+                                self.assertIsNotNone(current, 'foreign clone ejected')
+                                self.assertTrue(Path(current['image-path']).samefile(image),
+                                                'retained device now refers to another image')
                         self.assert_no_test_mounts()
                     finally:
                         ledger = self.base / 'clone.plist'

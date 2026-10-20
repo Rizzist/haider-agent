@@ -1,5 +1,28 @@
 # Release chain and Android completion gate
 
+## macOS image inventory failures
+
+The image identity helper and builder attachment audits share a bounded
+`hdiutil info -plist` query (60 seconds per call). Exit 16, busy diagnostics
+(`Resource busy`, `Device busy`, `Resource temporarily unavailable`, `EBUSY`)
+and the incomplete-media warning get at most four attempts, with 0.1, 0.2 and
+0.3 second backoffs. The attachment audit uses the same four-attempt bound for
+an omitted live device or unresolved mount. Other failed commands, unexpected
+warnings, malformed plists, unavailable tools and timeouts refuse the audit.
+Missing or undecodable attach metadata uses the existing fallback: only new
+same-path devices with a matching backing inode in a complete inventory can
+belong to the attach. Attach metadata alone never establishes ownership.
+
+An inventory refusal prints a `retaining` diagnostic and exits 1 from the
+identity CLI or attachment audit. The builder preserves an earlier native
+create/attach failure status, including 16, when cleanup cannot prove ownership.
+`finish`, `clean`, `remove` and `withdraw-image` all audit before deletion;
+uncertain images and staging directories remain for manual cleanup. The exit
+trap retains unresolved mounts, clears stale device instructions and preserves
+the build's failure status. The independent `lsof` audit also fails closed when
+its query is unavailable or times out; a helper-descriptor query with no reliable
+answer grants no device ownership.
+
 ## Windows PE import allowlist
 
 The Windows release gate (`python3 scripts/release_packaging.py verify-windows-imports`)

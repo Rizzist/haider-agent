@@ -39,9 +39,12 @@ def backing_identity(image, expected):
     pid = image.get('hdid-pid')
     if not isinstance(pid, int) or pid <= 0:
         return None
-    result = subprocess.run(['/usr/sbin/lsof', '-a', '-p', str(pid), '-nP', '-F0fDtin'],
-                            capture_output=True, timeout=60)
-    if result.returncode:
+    try:
+        result = subprocess.run(['/usr/sbin/lsof', '-a', '-p', str(pid), '-nP', '-F0fDtin'],
+                                capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode or result.stderr:
         return None
     fields = result.stdout.split(b'\0') if b'\0' in result.stdout else result.stdout.splitlines()
     records = []
@@ -62,7 +65,11 @@ def backing_identity(image, expected):
             continue
         if 'D' not in item or 'i' not in item:
             continue
-        if [int(item['D'], 16), int(item['i'])] == expected:
+        try:
+            observed = [int(item['D'], 16), int(item['i'])]
+        except ValueError:
+            return None
+        if observed == expected:
             return True
         # A missing descriptor is uncertainty, not evidence that the attachment
         # disappeared. A confirmed different backing vnode can be disowned.
@@ -139,14 +146,63 @@ def create(path, record, staging, arguments):
     return 0
 
 
+class InventoryError(RuntimeError):
+    def __init__(self, message, retryable=False):
+        super().__init__(message + '; retaining image output')
+        self.retryable = retryable
+
+
+def inventory_snapshot():
+    """One bounded query; a failed or malformed inventory grants no ownership.
+
+    Busy statuses/diagnostics and the known incomplete-media warning may be
+    retried four times by the caller. Other failures stop cleanup immediately.
+    """
+    try:
+        result = subprocess.run(['hdiutil', 'info', '-plist'], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise InventoryError('hdiutil attachment inventory unavailable: ' + str(error)) from None
+    busy = result.returncode == 16 or re.search(
+        rb'resource busy|device busy|resource temporarily unavailable|\bebusy\b',
+        result.stderr, re.IGNORECASE)
+    if result.returncode or busy:
+        detail = os.fsdecode(result.stderr).strip()
+        raise InventoryError('hdiutil attachment inventory failed (exit %s): %s' %
+                             (result.returncode, detail), retryable=bool(busy))
+    if b'cannot get IO media array' in result.stderr:
+        raise InventoryError('hdiutil attachment inventory remained incomplete', retryable=True)
+    if result.stderr:
+        raise InventoryError('hdiutil attachment inventory warning: ' + os.fsdecode(result.stderr).strip())
+    try:
+        info = plistlib.loads(result.stdout)
+        images = info['images']
+        if not isinstance(images, list) or any(
+                not isinstance(image, dict) or
+                not isinstance(image.get('image-path'), str) or
+                ('hdid-pid' in image and type(image['hdid-pid']) is not int) or
+                not isinstance(image.get('system-entities'), list) or
+                any(not isinstance(entity, dict) or any(
+                    key in entity and not isinstance(entity[key], str)
+                    for key in ('dev-entry', 'mount-point'))
+                    for entity in image.get('system-entities', []))
+                for image in images):
+            raise ValueError('invalid image entries')
+    except Exception:
+        # plistlib also raises AttributeError for malformed dates, and its
+        # decoder errors vary between stock macOS Python and newer versions.
+        # No undecodable inventory grants permission to remove an image.
+        raise InventoryError('invalid hdiutil attachment inventory') from None
+    return images
+
+
 def staging_inventory():
     for attempt in range(4):
-        inventory = subprocess.run(['hdiutil', 'info', '-plist'], capture_output=True, check=True)
-        if b'cannot get IO media array' not in inventory.stderr:
-            return plistlib.loads(inventory.stdout).get('images', [])
-        if attempt == 3:
-            raise RuntimeError('incomplete create-output inventory; retaining staging')
-        time.sleep(.1 * (attempt + 1))
+        try:
+            return inventory_snapshot()
+        except InventoryError as error:
+            if not error.retryable or attempt == 3:
+                raise
+            time.sleep(.1 * (attempt + 1))
 
 
 def image_users_snapshot(path, descriptor):
@@ -157,8 +213,11 @@ def image_users_snapshot(path, descriptor):
     the positive control that the query actually accounted for this file.
     Unknown readers are uncertainty, never permission to delete a backing file.
     """
-    result = subprocess.run(['/usr/sbin/lsof', '-nP', '-F0pfDti', '--', str(path)],
-                            capture_output=True, timeout=60)
+    try:
+        result = subprocess.run(['/usr/sbin/lsof', '-nP', '-F0pfDti', '--', str(path)],
+                                capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError('backing-file inventory unavailable; retaining ' + str(path)) from error
     if result.returncode or result.stderr:
         raise RuntimeError('incomplete backing-file inventory; retaining ' + str(path))
     expected = identity(os.fstat(descriptor))
@@ -405,7 +464,7 @@ def checksum(path, record, sidecar):
         check(path, expected)
 
 
-if __name__ == '__main__':
+def main():
     action, filename, ledger, *args = sys.argv[1:]
     path, record = Path(filename), Path(ledger)
     if action == 'create':
@@ -443,3 +502,12 @@ if __name__ == '__main__':
         checksum(path, record, Path(args[0]))
     if action == 'compare':
         sys.exit(compare(path, record, Path(args[0])))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(str(error) + ('' if 'retaining' in str(error) else '; retaining image output'),
+              file=sys.stderr)
+        sys.exit(1)

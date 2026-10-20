@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 import platform
+import plistlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,6 +18,156 @@ SPEC = importlib.util.spec_from_file_location(
     'image_identity', ROOT / 'packaging/installers/macos-image-identity.py')
 IMAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(IMAGE)
+INVALID_DATE_INVENTORY = (
+    b'<plist><dict><key>images</key><array/><key>date</key>'
+    b'<date>invalid</date></dict></plist>')
+
+
+class InventoryTests(unittest.TestCase):
+    def response(self, status=0, output=None, error=b''):
+        return subprocess.CompletedProcess([], status,
+            plistlib.dumps({'images': []}) if output is None else output, error)
+
+    def test_busy_and_incomplete_inventory_retry_by_count(self):
+        for status, diagnostic in ((16, b''), (0, b'Resource busy'), (1, b'Resource busy'), (9, b'DEVICE BUSY'),
+                (1, b'Resource temporarily unavailable'), (1, b'error: EBUSY.'),
+                (0, b'cannot get IO media array')):
+            for failures in (1, 3, 4):
+                with self.subTest(status=status, diagnostic=diagnostic, failures=failures), \
+                        patch.object(IMAGE.subprocess, 'run', side_effect=
+                            [self.response(status, error=diagnostic)] * failures + [self.response()]) as query, \
+                        patch.object(IMAGE.time, 'sleep') as sleep:
+                    if failures == 4:
+                        with self.assertRaisesRegex(IMAGE.InventoryError, 'retaining'):
+                            IMAGE.staging_inventory()
+                    else:
+                        self.assertEqual(IMAGE.staging_inventory(), [])
+                    self.assertEqual(query.call_count, min(failures + 1, 4))
+                    self.assertEqual(sleep.call_count, min(failures, 3))
+                    self.assertTrue(all(call.kwargs['timeout'] == 60 for call in query.call_args_list))
+
+    def test_other_failed_or_invalid_inventory_stops_immediately(self):
+        responses = [self.response(9, error=b'Invalid argument'),
+                     self.response(1, error=b'not_ebusy_suffix'),
+                     self.response(error=b'unexpected inventory warning'),
+                     self.response(output=INVALID_DATE_INVENTORY),
+                     self.response(output=b'truncated plist'),
+                     self.response(output=b'<?xml version="1.0"?><plist><dict>')]
+        responses += [self.response(output=plistlib.dumps(value)) for value in
+                      ({}, [], {'images': {}}, {'images': [False]}, {'images': [{}]},
+                       {'images': [{'system-entities': {}}]},
+                       {'images': [{'system-entities': [False]}]},
+                       {'images': [{'image-path': 1}]},
+                       {'images': [{'image-path': '/a', 'system-entities': [], 'hdid-pid': []}]},
+                       {'images': [{'system-entities': [{'dev-entry': 1}]}]})]
+        for response in responses:
+            with self.subTest(response=response), \
+                    patch.object(IMAGE.subprocess, 'run', return_value=response) as query, \
+                    patch.object(IMAGE.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(IMAGE.InventoryError, 'retaining'):
+                    IMAGE.staging_inventory()
+                self.assertEqual(query.call_count, 1)
+                sleep.assert_not_called()
+        for error in (AttributeError('invalid date'), OverflowError('invalid value'),
+                      RecursionError('nested plist')):
+            with self.subTest(parser_error=error), \
+                    patch.object(IMAGE.subprocess, 'run', return_value=self.response()) as query, \
+                    patch.object(IMAGE.plistlib, 'loads', side_effect=error), \
+                    patch.object(IMAGE.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(IMAGE.InventoryError, 'retaining'):
+                    IMAGE.staging_inventory()
+                self.assertEqual(query.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_unavailable_inventory_and_reader_queries_fail_closed(self):
+        for error in (OSError('unavailable'), subprocess.TimeoutExpired('inventory', 60)):
+            with self.subTest(error=error), \
+                    patch.object(IMAGE.subprocess, 'run', side_effect=error) as query:
+                with self.assertRaisesRegex(IMAGE.InventoryError, 'retaining'):
+                    IMAGE.staging_inventory()
+                self.assertEqual(query.call_count, 1)
+                self.assertIsNone(IMAGE.backing_identity({'hdid-pid': 973}, [1, 2]))
+                with patch.object(IMAGE.time, 'sleep'):
+                    with self.assertRaisesRegex(RuntimeError, 'retaining'):
+                        IMAGE.open_image_users(Path('/unused'), 0)
+        for response in (subprocess.CompletedProcess([], 9, b'', b''),
+                subprocess.CompletedProcess([], 0, b'f3\0tREG\0Dinvalid\0i2\0', b''),
+                subprocess.CompletedProcess([], 0, b'f3\0tREG\0D0x1\0i2\0', b'warning')):
+            with self.subTest(response=response), patch.object(IMAGE.subprocess, 'run', return_value=response):
+                self.assertIsNone(IMAGE.backing_identity({'hdid-pid': 973}, [1, 2]))
+
+    def test_complete_inventory_preserves_legitimate_entries(self):
+        images = [{'image-path': '/tmp/É image.dmg', 'hdid-pid': 973,
+                   'system-entities': [{'dev-entry': '/dev/disk973'}]}]
+        for expected in ([], images):
+            with self.subTest(images=expected), patch.object(IMAGE.subprocess, 'run',
+                    return_value=self.response(output=plistlib.dumps({'images': expected}))) as query:
+                self.assertEqual(IMAGE.staging_inventory(), expected)
+                self.assertEqual(query.call_count, 1)
+        valid_date = INVALID_DATE_INVENTORY.replace(b'invalid', b'2026-10-20T00:00:00Z')
+        with patch.object(IMAGE.subprocess, 'run', return_value=self.response(output=valid_date)) as query:
+            self.assertEqual(IMAGE.staging_inventory(), [])
+            self.assertEqual(query.call_count, 1)
+
+    def prepare_cli_image(self, root, *, invalid_record=False):
+        path = root / 'image.dmg'
+        path.write_bytes(b'retained image bytes')
+        record = root / 'identity.json'
+        expected = IMAGE.identity(path.stat())
+        record.write_text(json.dumps({} if invalid_record else {'identity': expected, 'copying': True}))
+        saved = {'path': str(path), 'directory': IMAGE.identity(root.stat())}
+        if not invalid_record:
+            saved['identity'] = expected
+        (root / 'staged-image.json').write_text(json.dumps(saved))
+        (root / 'retain-create').write_text(str(path))
+        return path, record
+
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX image descriptors and a shell fixture')
+    def test_cli_inventory_refusals_retain_files_without_tracebacks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shim = root / 'hdiutil'
+            count = root / 'calls'
+            for status, output in ((16, 'Resource busy'), (9, 'Invalid argument'),
+                                   (0, 'invalid plist'), (0, INVALID_DATE_INVENTORY.decode())):
+                shim.write_text('#!/bin/sh\necho info >> "' + str(count) + '"\n'
+                                'echo "' + output + '" >&' + ('1' if status == 0 else '2') + '\n'
+                                'exit ' + str(status) + '\n')
+                shim.chmod(0o755)
+                for action in ('finish', 'clean', 'remove', 'withdraw-image'):
+                    with self.subTest(action=action, status=status, output=output):
+                        count.unlink(missing_ok=True)
+                        path, record = self.prepare_cli_image(root)
+                        result = subprocess.run([sys.executable, str(SPEC.origin), action,
+                            str(path), str(record), str(root)], capture_output=True, text=True,
+                            env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH']}, timeout=30)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('retaining', result.stderr)
+                        self.assertNotIn('Traceback', result.stderr)
+                        self.assertEqual(path.read_bytes(), b'retained image bytes')
+                        self.assertTrue((root / 'retain-create').exists())
+                        self.assertEqual(len(count.read_text().splitlines()), 4 if status == 16 else 1)
+
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX image descriptors and a shell fixture')
+    def test_cli_invalid_identity_records_retain_files_before_inventory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            count = root / 'calls'
+            shim = root / 'hdiutil'
+            shim.write_text('#!/bin/sh\necho info >> "' + str(count) + '"\nexit 9\n')
+            shim.chmod(0o755)
+            for action in ('finish', 'clean', 'remove', 'withdraw-image'):
+                with self.subTest(action=action):
+                    path, record = self.prepare_cli_image(root, invalid_record=True)
+                    result = subprocess.run([sys.executable, str(SPEC.origin), action,
+                        str(path), str(record), str(root)], capture_output=True, text=True,
+                        env={**os.environ, 'PATH':str(root) + os.pathsep + os.environ['PATH']}, timeout=30)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn('retaining', result.stderr)
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertEqual(path.read_bytes(), b'retained image bytes')
+                    self.assertTrue((root / 'retain-create').exists())
+                    self.assertFalse(count.exists(), 'queried inventory before proving the image identity')
 
 
 @unittest.skipUnless(platform.system() == 'Darwin', 'requires macOS backing-inode lifecycle semantics')
