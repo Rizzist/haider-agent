@@ -1100,8 +1100,13 @@ pub struct SessionSelectModelCommand {
     /// against the pair it observed (compare-and-swap). `Some` refuses the
     /// commit with RevisionConflict when the durable pair moved underneath
     /// it (a concurrent explicit selection wins). Explicit selections pass
-    /// `None` — the user's latest word is unconditional.
+    /// `None` — the user's latest word is unconditional. Active-run switches
+    /// also provide `automatic_run`, which fences explicit route generations.
     pub expected_pair: Option<(String, String)>,
+    /// An automatic selection belongs to an active run. The journal generation
+    /// is checked inside the selection transaction, independently of next-turn
+    /// settings. Its prepared fact owns the later Core switch observation.
+    pub automatic_run: Option<AutomaticRunSelection>,
     /// Resolved account binding for this selection. An absent value keeps
     /// a same-provider binding; a provider change clears the old binding.
     pub account_alias: Option<String>,
@@ -1111,6 +1116,15 @@ pub struct SessionSelectModelCommand {
     pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub event_id: EventId,
     pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomaticRunSelection {
+    pub run_id: RunId,
+    pub branch_id: Option<BranchId>,
+    pub rebind_seq: u64,
+    pub resolved_alias: String,
+    pub selection_epoch: Option<u64>,
 }
 
 /// Stable response stored in the committed `session.select_model` receipt.
@@ -8814,6 +8828,16 @@ impl Store {
         }
     }
 
+    /// Legacy automatic selections already named their run in the receipt.
+    /// Read that provenance once; do not reconstruct history per selection.
+    pub fn automatic_run_switches(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<std::collections::BTreeMap<u64, RunId>> {
+        let connection = self.connection()?;
+        run_output_history::automatic_run_switches(&connection, session_id)
+    }
+
     /// Committed session pair and budget through a journal boundary. New
     /// runs use their durable pin; this view reconstructs pre-pin journals.
     pub fn session_output_pair_at(
@@ -10165,7 +10189,19 @@ impl Store {
                 false,
             ));
         };
-        if let Some((expected_provider, expected_model)) = &command.expected_pair
+        if let Some(automatic) = &command.automatic_run {
+            let rebind_seq =
+                run_output_history::latest_rebind_seq(&transaction, &command.session_id)?;
+            if rebind_seq != automatic.rebind_seq {
+                return Err(store_error(
+                    ErrorCode::RevisionConflict,
+                    "automatic switch route generation changed",
+                    true,
+                ));
+            }
+        }
+        if command.automatic_run.is_none()
+            && let Some((expected_provider, expected_model)) = &command.expected_pair
             && (&metadata.provider != expected_provider || &metadata.model != expected_model)
         {
             return Err(store_error(
@@ -10177,7 +10213,39 @@ impl Store {
                 false,
             ));
         }
-        let no_op = metadata.provider == command.provider
+        // A later ordinary selection configures the next turn. It cannot
+        // cancel this run's switch, nor may this switch overwrite that choice.
+        // Coordinates govern publication to the next turn; installation of
+        // this run's target was fenced separately by its rebind generation.
+        let publish_pair_matches =
+            command
+                .expected_pair
+                .as_ref()
+                .is_none_or(|(provider, model)| {
+                    &metadata.provider == provider && &metadata.model == model
+                });
+        let publish_selection = if let Some(automatic) = &command.automatic_run {
+            publish_pair_matches && (metadata.selection_epoch == automatic.selection_epoch
+                || transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM command_receipts WHERE session_id = ?1
+                     AND method = 'session.select_model' AND state = 'committed'
+                     AND json_extract(response_json, '$.selected_seq') = ?2
+                     AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.automatic') = 1
+                     AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.run_id') = ?3)",
+                        params![
+                            command.session_id.as_str(),
+                            metadata.selection_epoch.map(to_sqlite_integer).transpose()?,
+                            automatic.run_id.as_str()
+                        ],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(map_sqlite_error)?)
+        } else {
+            true
+        };
+        let no_op = command.automatic_run.is_none()
+            && metadata.provider == command.provider
             && metadata.model == command.model
             && command
                 .account_alias
@@ -10198,15 +10266,16 @@ impl Store {
                 .checked_add(1)
                 .ok_or_else(|| corrupt("event sequence space is exhausted"))?
         };
-        let cleared_account_pin = if metadata.provider != command.provider {
+        let cleared_account_pin = if publish_selection && metadata.provider != command.provider {
             metadata.account_alias.clone()
         } else {
             None
         };
-        let cleared_provider_endpoint = (metadata.provider != command.provider)
+        let cleared_provider_endpoint = (publish_selection
+            && metadata.provider != command.provider)
             .then(|| metadata.provider_base_url.clone())
             .flatten();
-        if metadata.provider != command.provider {
+        if publish_selection && metadata.provider != command.provider {
             // Accounts and route overrides belong to their selected
             // provider. A cross-provider model choice cannot carry either
             // into the next adapter.
@@ -10217,13 +10286,15 @@ impl Store {
             metadata.resolved_route_seen = false;
             metadata.route_reset_epoch = Some(selection_epoch);
         }
-        if let Some(alias) = &command.account_alias {
-            metadata.account_alias = Some(alias.clone());
+        if publish_selection {
+            if let Some(alias) = &command.account_alias {
+                metadata.account_alias = Some(alias.clone());
+            }
+            metadata.provider = command.provider.clone();
+            metadata.model = command.model.clone();
+            metadata.selection_epoch = Some(selection_epoch);
         }
-        metadata.provider = command.provider.clone();
-        metadata.model = command.model.clone();
-        metadata.selection_epoch = Some(selection_epoch);
-        if let Some(budget) = command.output_budget {
+        if publish_selection && let Some(budget) = command.output_budget {
             metadata.max_tokens = budget.max_tokens;
             metadata.max_tokens_source = Some(budget.source);
             metadata.budget_clamp_notice_epoch = budget.clamped.map(|_| selection_epoch);
@@ -10254,30 +10325,42 @@ impl Store {
         if updated_rows != 1 {
             return Err(corrupt("session row disappeared during model selection"));
         }
+        let mut selected_payload = ModelSelected {
+            selection_epoch: Some(selection_epoch),
+            provider: command.provider.clone(),
+            model: command.model.clone(),
+            route_only: !publish_selection,
+            cleared_account_pin: cleared_account_pin.clone(),
+            cleared_provider_endpoint: cleared_provider_endpoint.clone(),
+            output_budget_clamp: command.output_budget.and_then(|budget| budget.clamped),
+        }
+        .to_payload_value_with_route(&metadata)
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize model-selected payload: {error}"),
+                false,
+            )
+        })?;
+        if let Some(automatic) = &command.automatic_run {
+            selected_payload["automatic_rebind_seq"] = automatic.rebind_seq.into();
+            selected_payload["automatic_resolved_alias"] = automatic.resolved_alias.clone().into();
+            selected_payload["automatic_only"] = (!publish_selection).into();
+        }
         let mut envelopes = vec![unstamped_raw_command_envelope(
             command.event_id.clone(),
             &command.session_id,
-            None,
-            None,
+            command
+                .automatic_run
+                .as_ref()
+                .and_then(|automatic| automatic.branch_id.clone()),
+            command
+                .automatic_run
+                .as_ref()
+                .map(|automatic| automatic.run_id.clone()),
             command.device_id.clone(),
             self.worker_generation,
-            ModelSelected {
-                selection_epoch: Some(selection_epoch),
-                provider: command.provider.clone(),
-                model: command.model.clone(),
-                route_only: false,
-                cleared_account_pin: cleared_account_pin.clone(),
-                cleared_provider_endpoint: cleared_provider_endpoint.clone(),
-                output_budget_clamp: command.output_budget.and_then(|budget| budget.clamped),
-            }
-            .to_payload_value_with_route(&metadata)
-            .map_err(|error| {
-                store_error(
-                    ErrorCode::InvalidArgument,
-                    format!("cannot serialize model-selected payload: {error}"),
-                    false,
-                )
-            })?,
+            selected_payload,
             PromptRender::Omit,
         )?];
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;

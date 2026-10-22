@@ -12395,6 +12395,7 @@ impl HubConnection {
             provider: resolved_provider,
             model: resolved_model,
             expected_pair: None,
+            automatic_run: None,
             // A model or output-budget choice never selects an account. The
             // descriptor above is only for cache preflight; passing it to the
             // store would turn an unpinned session into a durable pin.

@@ -295,3 +295,75 @@ impl RunOutputRouteHistory {
         }
     }
 }
+
+/// A new writer names the active rebind generation directly. Older switch
+/// facts refer to a prepared selection, or have only a legacy receipt witness.
+#[derive(Debug, Clone, Copy)]
+pub enum RunOutputSwitchReference {
+    Generation(u64),
+    Selection(Option<u64>),
+}
+
+/// Ownership of automatic switches while reducing one session journal.
+/// Equal provider/model values never replace a rebind-generation check.
+#[derive(Debug, Default)]
+pub struct RunOutputSwitchOwnership {
+    prepared: std::collections::BTreeMap<u64, SwitchOwner>,
+}
+#[derive(Debug)]
+struct SwitchOwner {
+    run: haider_protocol::ids::RunId,
+    provider: String,
+    model: String,
+    rebind_seq: u64,
+}
+impl RunOutputSwitchOwnership {
+    pub fn prepare(
+        &mut self,
+        seq: u64,
+        run: &haider_protocol::ids::RunId,
+        provider: &str,
+        model: &str,
+        rebind_seq: u64,
+    ) {
+        self.prepared.insert(
+            seq,
+            SwitchOwner {
+                run: run.clone(),
+                provider: provider.into(),
+                model: model.into(),
+                rebind_seq,
+            },
+        );
+    }
+    #[must_use]
+    pub fn allows(
+        &self,
+        reference: RunOutputSwitchReference,
+        run: &haider_protocol::ids::RunId,
+        provider: &str,
+        model: Option<&str>,
+        rebind_seq: u64,
+        rebound_since_boundary: bool,
+    ) -> bool {
+        let selection_seq = match reference {
+            RunOutputSwitchReference::Generation(generation) => return generation == rebind_seq,
+            RunOutputSwitchReference::Selection(selection) => selection,
+        };
+        let matches = |owner: &&SwitchOwner| {
+            &owner.run == run
+                && owner.provider == provider
+                && model.is_none_or(|model| owner.model == model)
+        };
+        let owner = match selection_seq {
+            Some(seq) => self.prepared.get(&seq).filter(matches),
+            None => self.prepared.values().rev().find(matches),
+        };
+        match owner {
+            Some(owner) => owner.rebind_seq == rebind_seq,
+            // Older unscoped facts without receipts are usable only when no
+            // active rebind can have superseded their unresolved owner.
+            None => selection_seq.is_none() && !rebound_since_boundary,
+        }
+    }
+}

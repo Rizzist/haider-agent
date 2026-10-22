@@ -23,6 +23,7 @@ struct RunRoute {
     started: bool,
     ended: bool,
     configured_provider: Option<String>,
+    rebound_since_boundary: bool,
 }
 
 impl RunRoute {
@@ -35,6 +36,7 @@ impl RunRoute {
             started: false,
             ended: false,
             configured_provider: None,
+            rebound_since_boundary: false,
         }
     }
 }
@@ -101,6 +103,12 @@ pub(super) fn at_child_creation(
         initial_seq,
         cutoff,
     } = witness;
+    let automatic_runs = super::super::run_output_history::automatic_run_switches(
+        connection,
+        &SessionId::new(parent),
+    )?;
+    let mut ownership = crate::RunOutputSwitchOwnership::default();
+    let mut latest_rebind_seq = 0;
     let mut runs = BTreeMap::<String, RunRoute>::new();
     let mut session_route = RunOutputRouteHistory::from_creation(&metadata);
     let mut statement = connection.prepare(
@@ -113,6 +121,7 @@ pub(super) fn at_child_creation(
         let event = decode_envelope_column(connection, row, 0)
             .map_err(|error| corrupt(format!("invalid inheritance event: {error}")))?;
         if let Some(rebound) = SessionProviderRebound::from_payload_value(&event.payload) {
+            latest_rebind_seq = event.seq;
             session_route.rebind_legacy(metadata.provider != rebound.provider, &rebound);
             if let Some(snapshot) = event.payload.get("route_snapshot") {
                 session_route.record(serde_json::from_value(snapshot.clone()).map_err(
@@ -123,11 +132,14 @@ pub(super) fn at_child_creation(
                 .values_mut()
                 .filter(|run| (run.pinned || run.started) && !run.ended)
             {
+                running.rebound_since_boundary = true;
                 running.provider.clone_from(&rebound.provider);
                 running.route = Some(session_route.clone());
             }
             rebound.apply_to_metadata(&mut metadata);
-        } else if let Some(selected) = ModelSelected::from_payload_value(&event.payload) {
+        } else if event.payload.get("automatic_only").and_then(Value::as_bool) != Some(true)
+            && let Some(selected) = ModelSelected::from_payload_value(&event.payload)
+        {
             if selected.route_only {
                 session_route.resolve_legacy(&selected);
             } else {
@@ -154,6 +166,48 @@ pub(super) fn at_child_creation(
                 session_route.record(serde_json::from_value(snapshot.clone()).map_err(
                     |error| corrupt(format!("invalid inherited route snapshot: {error}")),
                 )?);
+            }
+        }
+        if let Some(selected) = ModelSelected::from_payload_value(&event.payload) {
+            let scoped = event
+                .payload
+                .get("automatic_rebind_seq")
+                .and_then(Value::as_u64);
+            let owner = if scoped.is_some() {
+                event.run_id.as_ref()
+            } else {
+                automatic_runs.get(&event.seq)
+            };
+            if let Some(run_id) = owner {
+                let rebind_seq = scoped.unwrap_or(latest_rebind_seq);
+                ownership.prepare(
+                    event.seq,
+                    run_id,
+                    &selected.provider,
+                    &selected.model,
+                    rebind_seq,
+                );
+                if rebind_seq == latest_rebind_seq
+                    && let Some(running) = runs.get_mut(run_id.as_str())
+                    && (running.pinned || running.started)
+                    && !running.ended
+                {
+                    if running.provider != selected.provider
+                        && let Some(route) = running.route.as_mut()
+                    {
+                        route.clear_selectors();
+                    }
+                    running.provider.clone_from(&selected.provider);
+                    if let Some(route) = running.route.as_mut() {
+                        route.record_switch_observation(
+                            event
+                                .payload
+                                .get("automatic_resolved_alias")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        );
+                    }
+                }
             }
         }
         let Some(run_id) = event.run_id.as_ref() else {
@@ -256,6 +310,26 @@ pub(super) fn at_child_creation(
                     && !running.ended
                     && let Some(provider) = data.get("to_provider").and_then(Value::as_str)
                 {
+                    let reference = data
+                        .get("source_rebind_seq")
+                        .and_then(Value::as_u64)
+                        .map_or(
+                            crate::RunOutputSwitchReference::Selection(
+                                data.get("selection_seq").and_then(Value::as_u64),
+                            ),
+                            crate::RunOutputSwitchReference::Generation,
+                        );
+                    let owned = ownership.allows(
+                        reference,
+                        run_id,
+                        provider,
+                        data.get("to_model").and_then(Value::as_str),
+                        latest_rebind_seq,
+                        running.rebound_since_boundary,
+                    );
+                    if !owned {
+                        continue;
+                    }
                     if running.provider != provider
                         && let Some(history) = running.route.as_mut()
                     {

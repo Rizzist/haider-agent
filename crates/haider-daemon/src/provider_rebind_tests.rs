@@ -214,6 +214,7 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
             provider: "fake".into(),
             model: model.into(),
             expected_pair,
+            automatic_run: None,
             account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("selected-{ordinal}")),
@@ -487,6 +488,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 provider: "fake".into(),
                 model: model.into(),
                 expected_pair: None,
+                automatic_run: None,
                 output_budget: Some(haider_protocol::output_budget::SessionOutputBudgetV1 {
                     max_tokens: budget,
                     source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
@@ -651,6 +653,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 model: "pending-next-turn-model".into(),
                 output_budget: None,
                 expected_pair: None,
+                automatic_run: None,
                 event_id: EventId::new("pending-model-selected"),
                 device_id: device_id.clone(),
                 account_alias: None,
@@ -1045,6 +1048,7 @@ async fn astra_divergent_headless_recovery_reapplies_active_limit() {
                 model: "pending-next-turn-model".into(),
                 output_budget: None,
                 expected_pair: None,
+                automatic_run: None,
                 account_alias: None,
                 event_id: EventId::new("pending-model-selected"),
                 device_id: device_id.clone(),
@@ -1334,6 +1338,7 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
             provider: "fake-next".into(),
             model: metadata.model.clone(),
             expected_pair: None,
+            automatic_run: None,
             account_alias: None,
             output_budget: None,
             event_id: EventId::new("next-route"),
@@ -1745,6 +1750,7 @@ async fn pinned_route_resolution_keeps_the_active_run_branch() {
         provider: "fake-next".into(),
         model: metadata.model.clone(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: None,
         event_id: EventId::new("branch-route-next"),
@@ -1875,6 +1881,7 @@ pub(super) async fn select_rotation_test_model(
         provider: provider.into(),
         model: model.into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: account.map(str::to_owned),
         output_budget: budget.map(|max_tokens| {
             haider_protocol::output_budget::SessionOutputBudgetV1 {
@@ -2475,3 +2482,6 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
         "run-scoped epoch allocation failures: {failures:#?}"
     );
 }
+
+#[path = "automatic_switch_rebind_tests.rs"]
+mod automatic_switch_rebind_tests;

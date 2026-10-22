@@ -908,6 +908,7 @@ fn candidate_pick(store: &Store, session: &SessionId, index: usize, provider: &s
             provider: provider.into(),
             model: model.into(),
             expected_pair: None,
+            automatic_run: None,
             account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("candidate-picked-{session}-{index}")),
@@ -1485,6 +1486,7 @@ fn frozen_child_route_precedes_next_turn_parent_route_on_legacy_replay() {
                 provider: "anthropic".into(),
                 model: "claude-sonnet-5".into(),
                 expected_pair: None,
+                automatic_run: None,
                 account_alias: None,
                 output_budget: None,
                 event_id: EventId::new("next-parent"),
@@ -1626,11 +1628,14 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
             })
             .expect("accept parent run");
     }
+    let mut delayed_failures = Vec::new();
     for case in [
         "pinned",
         "legacy-rebound",
         "same-provider-auto",
         "cross-provider-auto",
+        "same-provider-delayed-auto",
+        "cross-provider-delayed-auto",
         "other-run-auto",
         "queued-only",
         "completed",
@@ -1664,6 +1669,10 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                     event_id: EventId::new("running-route"),
                     device_id: DeviceId::new("test"),
                 };
+                if case.contains("delayed") {
+                    binding.account = None;
+                    binding.base_url = None;
+                }
                 store
                     .rebind_session_provider(&binding)
                     .expect("original route");
@@ -1722,6 +1731,57 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                     } else {
                         run.clone()
                     };
+                    if case.contains("delayed") {
+                        // The previous writer's production selection receipt
+                        // names the run even though its event was unscoped.
+                        store
+                            .select_session_model(&haider_store::SessionSelectModelCommand {
+                                command_id: "automatic-prepared".into(),
+                                request_digest: "automatic-prepared".into(),
+                                request_json: json!({"automatic":true,"run_id":run}).to_string(),
+                                session_id: parent.session_id.clone(),
+                                worker_generation: store.worker_generation(),
+                                provider: if case.starts_with("same-provider") {
+                                    "bedrock"
+                                } else {
+                                    "anthropic"
+                                }
+                                .into(),
+                                model: "automatic-model".into(),
+                                expected_pair: None,
+                                automatic_run: None,
+                                account_alias: None,
+                                output_budget: None,
+                                event_id: EventId::new("automatic-prepared"),
+                                device_id: DeviceId::new("test"),
+                            })
+                            .expect("legacy automatic selection");
+                        binding.command_id = "newer-explicit-route".into();
+                        binding.request_digest = "newer-explicit-route".into();
+                        binding.event_id = EventId::new("newer-explicit-route");
+                        binding.account = pin.then(|| "running-pin".into());
+                        binding.base_url = endpoint.then(|| "http://127.0.0.1:8020".into());
+                        store
+                            .rebind_session_provider(&binding)
+                            .expect("newer explicit route");
+                        store
+                            .select_session_model(&haider_store::SessionSelectModelCommand {
+                                command_id: "next-parent".into(),
+                                request_digest: "next-parent".into(),
+                                request_json: "{}".into(),
+                                session_id: parent.session_id.clone(),
+                                worker_generation: store.worker_generation(),
+                                provider: "anthropic".into(),
+                                model: "claude-sonnet-5".into(),
+                                expected_pair: None,
+                                automatic_run: None,
+                                account_alias: None,
+                                output_budget: None,
+                                event_id: EventId::new("next-parent"),
+                                device_id: DeviceId::new("test"),
+                            })
+                            .expect("ordinary target lookalike is next-turn only");
+                    }
                     append(
                         &store,
                         &parent.session_id,
@@ -1731,7 +1791,7 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                             item_id: ItemId::new("automatic-switch"),
                             item: TurnItem::Extension {
                                 kind: "provider_pair_switch_v1".into(),
-                                data: json!({"to_provider": if case == "same-provider-auto" { "bedrock" } else { "anthropic" }, "to_model": "automatic-model"}),
+                                data: json!({"to_provider": if case.starts_with("same-provider") { "bedrock" } else { "anthropic" }, "to_model": "automatic-model"}),
                             },
                         }),
                     );
@@ -1755,6 +1815,7 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                         provider: "anthropic".into(),
                         model: "claude-sonnet-5".into(),
                         expected_pair: None,
+                        automatic_run: None,
                         account_alias: None,
                         output_budget: None,
                         event_id: EventId::new("next-parent"),
@@ -1901,6 +1962,17 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                     )
                     .expect("original admission proof")
                     .expect("receipt");
+                if case.contains("delayed")
+                    && (serde_json::to_value(&admission.account_alias).expect("account")
+                        != new["inherited_account_alias"]
+                        || serde_json::to_value(&admission.provider_base_url).expect("endpoint")
+                            != new["inherited_provider_base_url"]
+                        || serde_json::to_value(&admission.provider_rebind_id).expect("rebind")
+                            != new["inherited_provider_rebind_id"])
+                {
+                    delayed_failures.push(format!("{case}/pin={pin}/endpoint={endpoint}/source={source_present}: newer rebind lost in legacy child receipt"));
+                    continue;
+                }
                 if case != "ambiguous" {
                     assert_eq!(
                         serde_json::to_value(admission.account_alias).expect("account_alias JSON"),
@@ -1962,4 +2034,8 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
             }
         }
     }
+    assert!(
+        delayed_failures.is_empty(),
+        "delayed automatic facts must preserve the inherited newer rebind: {delayed_failures:#?}"
+    );
 }

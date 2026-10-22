@@ -8,7 +8,7 @@ mod tests;
 mod run_route_recovery_tests;
 
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A headless spec pins run tuning, while an explicit durable rebind owns the
 /// provider route. Restoring only the spec provider would combine its adapter
@@ -113,6 +113,7 @@ pub(crate) struct DaemonProviderRebindResolver {
     metadata: std::sync::Mutex<SessionMetadataV1>,
     web_degrade: WebCapabilityDegrade,
     seen_revision: AtomicU64,
+    initialized: AtomicBool,
 }
 
 impl std::fmt::Debug for DaemonProviderRebindResolver {
@@ -136,9 +137,10 @@ impl DaemonProviderRebindResolver {
             factory,
             metadata: std::sync::Mutex::new(metadata),
             web_degrade,
-            // Start at zero: a commit during turn setup must be picked up
-            // even if it preceded construction of this resolver.
+            // The first boundary also consults durable state after a restart,
+            // where the process-local revision counter starts at zero.
             seen_revision: AtomicU64::new(0),
+            initialized: AtomicBool::new(false),
         }
     }
 }
@@ -151,7 +153,9 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         reasoning_settings: &str,
     ) -> Result<Option<haider_core::ProviderRebindTarget>, HaiderError> {
         let revision = self.store.hub().provider_rebind_revision();
-        if revision == self.seen_revision.load(Ordering::Acquire) {
+        if self.initialized.load(Ordering::Acquire)
+            && revision == self.seen_revision.load(Ordering::Acquire)
+        {
             return Ok(None);
         }
         let mut metadata = fresh_turn_metadata(&self.store).await?;
@@ -183,8 +187,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             .store
             .hub()
             .run_output_pair(self.store.session_id(), &self.run_id)
-            .await?
-            .filter(|pair| pair.model == current_model);
+            .await?;
         // The durable run route survives ordinary selections for the next
         // turn, including selections that clear the session's rebind id.
         if let Some(pair) = active_pair.as_ref() {
@@ -195,10 +198,15 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             || previous.provider_rebind_id == metadata.provider_rebind_id
         {
             self.seen_revision.store(revision, Ordering::Release);
+            self.initialized.store(true, Ordering::Release);
             return Ok(None);
         }
-        let recorded_active =
-            active_pair.map(
+        let rebind_seq = active_pair
+            .as_ref()
+            .map_or(0, |pair| pair.latest_rebind_seq);
+        let recorded_active = active_pair
+            .filter(|pair| pair.model == current_model)
+            .map(
                 |pair| haider_protocol::output_budget::SessionOutputBudgetV1 {
                     max_tokens: pair.max_tokens,
                     source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
@@ -323,6 +331,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             // Preserve the factory's retry policy: default-account binding
             // may rotate, while an explicitly pinned route stays pinned.
             attempt_resolver: resolved.attempt_resolver,
+            rebind_seq,
             route_epoch,
             initial_rotation: resolved.initial_rotation,
             rotation_budget_consumed: resolved.rotation_budget_consumed,
@@ -337,6 +346,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         // Store the revision captured BEFORE resolution. A concurrent newer
         // commit therefore remains visible to the following request.
         self.seen_revision.store(revision, Ordering::Release);
+        self.initialized.store(true, Ordering::Release);
         Ok(Some(target))
     }
 }

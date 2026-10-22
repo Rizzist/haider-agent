@@ -932,12 +932,16 @@ pub(crate) struct ResolvedRouteCommitProbe {
     pub pause_run_route: bool,
     pub run_route_reached: tokio::sync::Notify,
     pub run_route_release: tokio::sync::Notify,
+    pub pause_pair_switch: bool,
+    pub pair_switch_reached: tokio::sync::Notify,
+    pub pair_switch_release: tokio::sync::Notify,
 }
 
 pub(crate) struct ActiveRunOutputPairSnapshot {
     branch_id: Option<BranchId>,
     pub durably_pinned: bool,
     pub complete_pin: bool,
+    pub latest_rebind_seq: u64,
     pub run_id: RunId,
     pub provider: String,
     pub model: String,
@@ -956,6 +960,13 @@ impl ActiveRunOutputPairSnapshot {
 }
 
 enum RunOutputPairChange {
+    SwitchPrepared {
+        run_id: RunId,
+        provider: String,
+        model: String,
+        rebind_seq: Option<u64>,
+        resolved_alias: Option<String>,
+    },
     LegacyCheckpoint {
         run_id: RunId,
         selection_epoch: u64,
@@ -965,6 +976,8 @@ enum RunOutputPairChange {
         provider: String,
         model: String,
         resolved_alias: Option<String>,
+        selection_seq: Option<u64>,
+        source_rebind_seq: Option<u64>,
     },
     Rebind {
         rebound: Box<haider_protocol::session::SessionProviderRebound>,
@@ -6845,6 +6858,11 @@ impl SessionHub {
         // Keep pair-changing facts in order so legacy runs can be seeded
         // before the same reduction used by newly pinned runs.
         let mut changes = Vec::new();
+        let automatic_runs = self
+            .inner
+            .store
+            .automatic_run_switches(session_id.clone())
+            .await?;
         loop {
             let page = self
                 .inner
@@ -6893,6 +6911,47 @@ impl SessionHub {
                         RunOutputPairChange::Rebind {
                             rebound: Box::new(rebound),
                             route,
+                        },
+                    ));
+                }
+                // Legacy automatic receipts prove the run owner. Ordinary
+                // selections with equal coordinates do not enter this map.
+                if event.run_id.is_none()
+                    && let Some(run_id) = automatic_runs.get(&event.seq)
+                    && let Some(selected) =
+                        haider_protocol::session::ModelSelected::from_payload_value(&event.payload)
+                {
+                    changes.push((
+                        event.seq,
+                        RunOutputPairChange::SwitchPrepared {
+                            run_id: run_id.clone(),
+                            provider: selected.provider,
+                            model: selected.model,
+                            rebind_seq: None,
+                            resolved_alias: None,
+                        },
+                    ));
+                }
+                if let Some(run_id) = event.run_id.as_ref()
+                    && let Some(rebind_seq) = event
+                        .payload
+                        .get("automatic_rebind_seq")
+                        .and_then(serde_json::Value::as_u64)
+                    && let Some(selected) =
+                        haider_protocol::session::ModelSelected::from_payload_value(&event.payload)
+                {
+                    changes.push((
+                        event.seq,
+                        RunOutputPairChange::SwitchPrepared {
+                            run_id: run_id.clone(),
+                            provider: selected.provider,
+                            model: selected.model,
+                            rebind_seq: Some(rebind_seq),
+                            resolved_alias: event
+                                .payload
+                                .get("automatic_resolved_alias")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
                         },
                     ));
                 }
@@ -6965,6 +7024,7 @@ impl SessionHub {
                                     branch_id: event.branch_id.clone(),
                                     durably_pinned: true,
                                     complete_pin,
+                                    latest_rebind_seq: 0,
                                     run_id: run_id.clone(),
                                     provider: pin.provider,
                                     model: pin.model,
@@ -7039,6 +7099,12 @@ impl SessionHub {
                                 run_id: run_id.clone(),
                                 provider: provider.to_owned(),
                                 model: model.to_owned(),
+                                source_rebind_seq: data
+                                    .get("source_rebind_seq")
+                                    .and_then(serde_json::Value::as_u64),
+                                selection_seq: data
+                                    .get("selection_seq")
+                                    .and_then(serde_json::Value::as_u64),
                                 resolved_alias: data
                                     .get("resolved_alias")
                                     .and_then(serde_json::Value::as_str)
@@ -7139,6 +7205,7 @@ impl SessionHub {
                         branch_id: branches.get(run_id).cloned().flatten(),
                         durably_pinned: false,
                         complete_pin: false,
+                        latest_rebind_seq: 0,
                         run_id: run_id.clone(),
                         provider: spec.map_or(snapshot.provider, |spec| spec.provider.clone()),
                         model: spec.map_or(snapshot.model, |spec| spec.model.clone()),
@@ -7153,9 +7220,39 @@ impl SessionHub {
                 ));
             }
         }
+        let mut prepared = haider_store::RunOutputSwitchOwnership::default();
+        let mut last_active_rebind = 0;
+        let mut latest_rebind_seq = 0;
         let mut legacy_checkpoint_tainted = false;
         for (seq, change) in changes {
             match change {
+                RunOutputPairChange::SwitchPrepared {
+                    run_id,
+                    provider,
+                    model,
+                    rebind_seq,
+                    resolved_alias,
+                } => {
+                    let rebind_seq = rebind_seq.unwrap_or(latest_rebind_seq);
+                    // Installing the target and its served-account witness is
+                    // part of the selection transaction. A subsequent rebind
+                    // must validate this model and own its replacement route,
+                    // even while Core is awaiting cache-transition bookkeeping.
+                    if rebind_seq == latest_rebind_seq
+                        && pinned_at.get(&run_id).is_some_and(|pin| *pin < seq)
+                        && terminal_at.get(&run_id).is_none_or(|end| *end >= seq)
+                        && let Some(pair) = pairs.get_mut(&run_id)
+                    {
+                        if pair.provider != provider {
+                            pair.route_snapshot.clear_selectors();
+                        }
+                        pair.provider.clone_from(&provider);
+                        pair.model.clone_from(&model);
+                        pair.route_snapshot
+                            .record_switch_observation(resolved_alias);
+                    }
+                    prepared.prepare(seq, &run_id, &provider, &model, rebind_seq);
+                }
                 RunOutputPairChange::LegacyCheckpoint {
                     run_id,
                     selection_epoch,
@@ -7175,10 +7272,27 @@ impl SessionHub {
                     provider,
                     model,
                     resolved_alias,
+                    selection_seq,
+                    source_rebind_seq,
                 } => {
                     if pinned_at.get(&run_id).is_none_or(|pin| *pin >= seq)
                         || terminal_at.get(&run_id).is_some_and(|end| *end < seq)
                     {
+                        continue;
+                    }
+                    let reference = source_rebind_seq.map_or(
+                        haider_store::RunOutputSwitchReference::Selection(selection_seq),
+                        haider_store::RunOutputSwitchReference::Generation,
+                    );
+                    let owned = prepared.allows(
+                        reference,
+                        &run_id,
+                        &provider,
+                        Some(&model),
+                        latest_rebind_seq,
+                        last_active_rebind != 0,
+                    );
+                    if !owned {
                         continue;
                     }
                     if let Some(pair) = pairs.get_mut(&run_id) {
@@ -7232,6 +7346,12 @@ impl SessionHub {
                     }
                 }
                 RunOutputPairChange::Rebind { rebound, route } => {
+                    latest_rebind_seq = seq;
+                    if route_boundary.is_some_and(|boundary| seq > boundary)
+                        && terminal_at.get(target).is_none_or(|end| *end >= seq)
+                    {
+                        last_active_rebind = seq;
+                    }
                     if !pairs.keys().any(|run_id| {
                         pinned_at.get(run_id).is_some_and(|pin| *pin < seq)
                             && terminal_at.get(run_id).is_none_or(|end| *end >= seq)
@@ -7254,6 +7374,7 @@ impl SessionHub {
                         {
                             continue;
                         }
+                        last_active_rebind = seq;
                         pair.provider.clone_from(&rebound.provider);
                         pair.route_snapshot = route.clone();
                         legacy_checkpoint_tainted = false;
@@ -7337,6 +7458,9 @@ impl SessionHub {
                     }
                 }
             }
+        }
+        for pair in pairs.values_mut() {
+            pair.latest_rebind_seq = latest_rebind_seq;
         }
         let pair = pairs.remove(target);
         if requested_run.is_some()
@@ -7424,6 +7548,38 @@ impl SessionHub {
             },
         )
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_pair_switch_commit_probe(
+        &self,
+        session_id: &SessionId,
+    ) -> Arc<ResolvedRouteCommitProbe> {
+        self.install_route_probe(
+            session_id,
+            ResolvedRouteCommitProbe {
+                pause_pair_switch: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_pair_switch_commit(&self, session_id: &SessionId) {
+        let probe = self
+            .inner
+            .resolved_route_probes
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        if let Some(probe) = probe
+            && probe.pause_pair_switch
+        {
+            probe.pair_switch_reached.notify_one();
+            probe.pair_switch_release.notified().await;
+        }
     }
 
     #[cfg(test)]

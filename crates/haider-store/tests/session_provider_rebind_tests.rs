@@ -49,6 +49,7 @@ fn legacy_omitted_budget_source_does_not_mint_a_noop_selection_epoch() {
         provider: "source".into(),
         model: "test-model".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: Some(SessionOutputBudgetV1 {
             max_tokens: 4096,
@@ -111,6 +112,7 @@ fn cross_provider_pick_clears_pin_and_old_route_with_typed_notice() {
         provider: "source".into(),
         model: "test-model".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: Some("bed-a".into()),
         output_budget: None,
         event_id: EventId::new("pin-source-event"),
@@ -511,6 +513,7 @@ fn model_provider_switch_clears_rebind_override_but_same_provider_preserves_it()
         provider: "proxy".into(),
         model: "model-2".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: None,
         event_id: EventId::new("model-selected-1"),
@@ -574,6 +577,7 @@ fn selection_epoch_survives_restart_and_advances_for_budget_model_and_route() {
         provider: "source".into(),
         model: "test-model".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: Some(SessionOutputBudgetV1 {
             max_tokens: 20_000,
@@ -833,6 +837,7 @@ fn endpoint_only_and_both_choices_get_complete_clear_receipts_and_facts() {
             provider: "target".into(),
             model: "target-model".into(),
             expected_pair: None,
+            automatic_run: None,
             account_alias: None,
             output_budget: None,
             event_id: EventId::new("clear-endpoint-fact"),
@@ -895,6 +900,7 @@ fn clamps_survive_selection_replay_and_unreported_legacy_route_gets_one_fact() {
         provider: "source".into(),
         model: "smaller".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: Some(SessionOutputBudgetV1 {
             max_tokens: 8192,
@@ -1023,6 +1029,7 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                 }
                 .into(),
                 expected_pair: None,
+                automatic_run: None,
                 account_alias: None,
                 output_budget: (variant == "budget").then_some(SessionOutputBudgetV1 {
                     max_tokens: 8192,

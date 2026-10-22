@@ -367,6 +367,7 @@ pub(super) async fn setup_opaque_selection(
         provider: "fake".into(),
         model: "initial-model".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: Some("selected-account".into()),
         output_budget: None,
         event_id: EventId::new("opaque-before"),

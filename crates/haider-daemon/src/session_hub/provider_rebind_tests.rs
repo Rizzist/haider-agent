@@ -323,6 +323,7 @@ async fn assert_active_budget_from_origin(origin: &str) {
         provider: "mock-a".into(),
         model: "wide".into(),
         expected_pair: None,
+        automatic_run: None,
         output_budget: Some(SessionOutputBudgetV1 {
             max_tokens: 6_000,
             source: SessionOutputBudgetSourceV1::UserSet { requested: 6_000 },
@@ -928,6 +929,7 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
             provider: "pending-provider".into(),
             model: "test-model".into(),
             expected_pair: None,
+            automatic_run: None,
             account_alias: None,
             output_budget: None,
             event_id: EventId::new("selected"),

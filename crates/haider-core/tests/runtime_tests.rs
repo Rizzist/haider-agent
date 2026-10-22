@@ -1908,6 +1908,7 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     assert!(promoted_window > window);
     bounded.context_window = Some(window);
     bounded.selection_epoch = Some(0);
+    bounded.provider_rebind_seq = 77;
     bounded.context_compaction_v1 = true;
     bounded.compaction_guard_v1 = true;
     let compactor = Arc::new(IneffectiveContextCompactor::default());
@@ -1970,7 +1971,25 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
         assert_eq!(switches[0].to_provider, "fake-a");
         assert_eq!(switches[0].to_model, "model-large");
         assert_eq!(switches[0].cause, ProviderPairSwitchCause::CompactionGuard);
+        assert_eq!(switches[0].source_rebind_seq, 77);
     }
+    let marker = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .find(|event| {
+            event
+                .payload
+                .get("item")
+                .and_then(|item| item.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("provider_pair_switch_v1")
+        })
+        .expect("owned switch fact");
+    assert_eq!(
+        marker.payload["item"]["data"]["source_rebind_seq"],
+        serde_json::json!(77)
+    );
     let footprints: Vec<_> = store
         .events(&SessionId::new(SESSION))
         .await
@@ -6143,6 +6162,7 @@ async fn provider_rebind_initial_rotation_is_durable_before_target_request() {
             provider_request_state: Default::default(),
             auth_scope: "api_key".into(),
             attempt_resolver: None,
+            rebind_seq: 0,
             route_epoch: "factory-rotated-rebind".into(),
             initial_rotation: Some(rotation.clone()),
             // The Rotation itself also spends the budget; these two facts
@@ -6234,6 +6254,7 @@ async fn provider_rebind_cannot_refund_or_drop_consumed_rotation_budget() {
                 provider_request_state: Default::default(),
                 auth_scope: "api_key".into(),
                 attempt_resolver: Some(resolver.clone()),
+                rebind_seq: 0,
                 route_epoch: "rebind-budget".into(),
                 initial_rotation: rotation,
                 rotation_budget_consumed: target_consumed,
@@ -6312,6 +6333,7 @@ async fn provider_rebind_replaces_active_request_output_budget() {
             provider_request_state: Default::default(),
             auth_scope: "none".into(),
             attempt_resolver: None,
+            rebind_seq: 0,
             route_epoch: "bounded-rebind".into(),
             initial_rotation: None,
             rotation_budget_consumed: false,
@@ -8882,4 +8904,124 @@ async fn orphan_server_result_has_no_web_activity() {
         tracker.observe(&typed(envelope), envelope.committed_at_ms);
     }
     assert!(tracker.used().is_empty());
+}
+
+/// One object exposes a newer rebind only after declining the stale promotion.
+struct RebindAfterDeclinedPromotion {
+    target: Mutex<Option<ProviderRebindTarget>>,
+    pending: AtomicBool,
+    commits: AtomicUsize,
+}
+impl std::fmt::Debug for RebindAfterDeclinedPromotion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebindAfterDeclinedPromotion")
+            .finish_non_exhaustive()
+    }
+}
+#[async_trait]
+impl ProviderPairSwitchCommitter for RebindAfterDeclinedPromotion {
+    async fn commit(&self, _: &ProviderPairSwitch) -> Result<u64, HaiderError> {
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        self.pending.store(true, Ordering::Release);
+        Err(HaiderError::new(
+            ErrorCode::RevisionConflict,
+            "newer explicit rebind",
+            true,
+        ))
+    }
+}
+#[async_trait]
+impl ProviderRebindResolver for RebindAfterDeclinedPromotion {
+    async fn refresh(&self, _: &str, _: &str) -> Result<Option<ProviderRebindTarget>, HaiderError> {
+        Ok(if self.pending.swap(false, Ordering::AcqRel) {
+            self.target.lock().expect("rebind target").take()
+        } else {
+            None
+        })
+    }
+}
+
+#[tokio::test]
+async fn declined_compaction_promotion_revisits_healthy_rebind_before_dispatch() {
+    let messages = vec![
+        Message::user_text("promotion history ".repeat(500)),
+        Message::user_text("current"),
+    ];
+    let mut bounded = config();
+    bounded.model = "model-small".into();
+    bounded.usage_scope.provider = "fake-a".into();
+    bounded.usage_scope.model = bounded.model.clone();
+    bounded.usage_account = Some(CredentialAlias::new("initial-account"));
+    bounded.reserved_output_tokens = 1;
+    let used = estimated_input_tokens(&bounded, &messages);
+    let window = used.saturating_mul(100).saturating_add(84) / 85;
+    bounded.context_window = Some(window);
+    bounded.context_compaction_v1 = true;
+    bounded.compaction_guard_v1 = true;
+    let compactor = Arc::new(IneffectiveContextCompactor::default());
+    bounded.context_compactor = Some(compactor.clone());
+    let original = Arc::new(FakeProvider::new(Vec::new()));
+    let stale = Arc::new(FakeProvider::new(Vec::new()));
+    let healthy = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    bounded.compaction_promotion = Some(ProviderPairSwitchTarget {
+        provider: stale.clone(),
+        account: CredentialAlias::new("automatic-account"),
+        account_incarnation: Some(1),
+        provider_name: "fake-a".into(),
+        model: "model-large".into(),
+        context_window: Some(window * 10),
+        cached_input_is_subset: true,
+        provider_request_state: Default::default(),
+        auth_scope: "none".into(),
+        attempt_resolver: None,
+        cause: ProviderPairSwitchCause::CompactionGuard,
+    });
+    let boundary = Arc::new(RebindAfterDeclinedPromotion {
+        target: Mutex::new(Some(ProviderRebindTarget {
+            provider: healthy.clone(),
+            provider_name: "fake-a".into(),
+            account: Some(CredentialAlias::new("rebound-account")),
+            account_incarnation: Some(2),
+            context_window: Some(window * 10),
+            max_tokens: 4096,
+            cached_input_is_subset: true,
+            provider_request_state: Default::default(),
+            auth_scope: "none".into(),
+            attempt_resolver: None,
+            rebind_seq: 0,
+            route_epoch: "newer-rebind".into(),
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+        })),
+        pending: AtomicBool::new(false),
+        commits: AtomicUsize::new(0),
+    });
+    bounded.provider_pair_switch_committer = Some(boundary.clone());
+    bounded.provider_rebind_resolver = Some(boundary.clone());
+    let handle = HarnessActor::spawn(bounded, original.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("declined-promotion"),
+            messages,
+        })
+        .await
+        .expect("submit")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(
+        outcome.state,
+        RunState::Done,
+        "newer healthy rebind must continue after a declined compaction target: {:?}",
+        outcome.error
+    );
+    assert_eq!(boundary.commits.load(Ordering::Relaxed), 1);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert!(original.requests().is_empty());
+    assert!(stale.requests().is_empty());
+    assert_eq!(healthy.requests().len(), 1);
+    assert_eq!(healthy.requests()[0].model, "model-small");
+    handle.stop().await.expect("stop");
 }

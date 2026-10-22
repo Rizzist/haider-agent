@@ -49,6 +49,7 @@ fn every_session_origin_seeds_the_run_budget_snapshot() {
             provider: "fake".into(),
             model: "fake-model".into(),
             expected_pair: None,
+            automatic_run: None,
             output_budget: Some(SessionOutputBudgetV1 {
                 max_tokens: 20_000,
                 source: budget_source,

@@ -773,6 +773,15 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn automatic_run_switches(
+        &self,
+        session_id: SessionId,
+    ) -> Result<std::collections::BTreeMap<u64, RunId>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.automatic_run_switches(&session_id)))
+            .await
+    }
+
     pub async fn session_output_pair_at(
         &self,
         session_id: SessionId,

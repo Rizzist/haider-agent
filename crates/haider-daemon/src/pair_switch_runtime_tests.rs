@@ -129,6 +129,8 @@ async fn rotation_after_compaction_promotion_records_the_promoted_route() {
         .commit(&ProviderPairSwitch {
             run_id: RunId::new("promotion-rotation-run"),
             switch_ordinal: 0,
+            source_rebind_seq: 0,
+            target_account: "promoted-account".into(),
             from_provider: "fake-a".into(),
             from_model: "model-a".into(),
             to_provider: "fake-b".into(),
@@ -719,6 +721,7 @@ impl PairSwitchWorld {
             provider: "fake-b".into(),
             model: "model-b".into(),
             expected_pair: None,
+            automatic_run: None,
             account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("{command_id}-event")),
@@ -2249,11 +2252,25 @@ async fn fallback_chain_switch_is_durable_visible_and_finishes_the_same_turn() {
     assert_eq!(metadata.account_alias, None, "fallback must stay unpinned");
     assert!(metadata.selection_epoch.unwrap_or(0) > 0);
 
+    let events = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("journal");
+    let branch_id = events
+        .iter()
+        .find(|event| event.run_id.as_ref() == Some(&run_id))
+        .expect("run-scoped journal")
+        .branch_id
+        .clone();
     let request_json = serde_json::json!({
         "automatic": true,
         "session_id": world.session_id,
         "run_id": run_id,
+        "branch_id": branch_id,
         "switch_ordinal": 0,
+        "source_rebind_seq": 0,
+        "target_account": "fake-b-account",
         "worker_generation": world.store.worker_generation(),
         "from_provider": "fake-a",
         "from_model": "model-a",
@@ -2278,14 +2295,16 @@ async fn fallback_chain_switch_is_durable_visible_and_finishes_the_same_turn() {
         ("fake-b", "model-b")
     );
 
-    let events = world
-        .store
-        .read(&world.session_id, 0, 1024)
-        .await
-        .expect("journal");
     assert!(events.iter().any(|event| {
-        ModelSelected::from_payload_value(&event.payload)
-            .is_some_and(|fact| fact.provider == "fake-b" && fact.model == "model-b")
+        event.run_id.as_ref() == Some(&run_id)
+            && event.branch_id == branch_id
+            && event
+                .payload
+                .get("automatic_rebind_seq")
+                .and_then(serde_json::Value::as_u64)
+                == Some(0)
+            && ModelSelected::from_payload_value(&event.payload)
+                .is_some_and(|fact| fact.provider == "fake-b" && fact.model == "model-b")
     }));
     let completed_extensions = events.iter().filter_map(|event| {
         let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
@@ -4351,11 +4370,43 @@ async fn automatic_pair_switch_waits_for_session_selection_fence() {
         Arc::new(FakeProvider::new(Vec::new())),
     )
     .await;
+    let run = RunId::new("automatic-lock-run");
+    world
+        .hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "automatic-lock-accept".into(),
+            request_digest: "automatic-lock-accept".into(),
+            request_json: "{}".into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            run_id: run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "automatic selection boundary".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("automatic-lock-queued"),
+            user_event_id: EventId::new("automatic-lock-user"),
+            active_event_id: EventId::new("automatic-lock-active"),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("accept active run");
     let lease = world
         .hub
         .acquire_worker_lease(world.session_id.clone())
         .await
         .expect("lease");
+    super::append_payloads(
+        &lease,
+        &world.device_id,
+        &run,
+        None,
+        &EventIdGenerator::new("automatic-lock-start"),
+        vec![EventPayload::RunState(RunState::Thinking)],
+    )
+    .await
+    .expect("start active run");
     let committer = super::DaemonProviderPairSwitchCommitter {
         store: lease,
         branch_id: None,
@@ -4378,6 +4429,8 @@ async fn automatic_pair_switch_waits_for_session_selection_fence() {
             .commit(&haider_core::ProviderPairSwitch {
                 run_id: RunId::new("automatic-lock-run"),
                 switch_ordinal: 1,
+                source_rebind_seq: 0,
+                target_account: "promoted-account".into(),
                 from_provider: "fake-a".into(),
                 from_model: "model-a".into(),
                 to_provider: "fake-b".into(),

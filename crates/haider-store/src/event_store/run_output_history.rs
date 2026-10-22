@@ -70,6 +70,15 @@ pub(super) fn at(
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let event = decode_envelope_column(connection, row, 0)
             .map_err(|error| corrupt(format!("invalid route history event: {error}")))?;
+        // A run-only automatic preparation preserves the next-turn choice.
+        if event
+            .payload
+            .get("automatic_only")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            continue;
+        }
         let rebound = SessionProviderRebound::from_payload_value(&event.payload);
         let selected = ModelSelected::from_payload_value(&event.payload);
         let route_fact = rebound.is_some() || selected.is_some();
@@ -119,4 +128,66 @@ pub(super) fn at(
         max_tokens: metadata.max_tokens,
         source: metadata.max_tokens_source,
     }))
+}
+
+pub(super) fn automatic_run_switches(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<std::collections::BTreeMap<u64, RunId>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT accepted_seq, request_json FROM command_receipts
+             WHERE session_id = ?1 AND method = 'session.select_model'
+             AND state = 'committed' AND accepted_seq IS NOT NULL ORDER BY accepted_seq",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut selections = std::collections::BTreeMap::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let request: String = row.get(1).map_err(map_sqlite_error)?;
+        if let Ok(request) = serde_json::from_str::<serde_json::Value>(&request)
+            && request
+                .get("automatic")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && let Some(run) = request.get("run_id").and_then(serde_json::Value::as_str)
+        {
+            let seq = u64::try_from(row.get::<_, i64>(0).map_err(map_sqlite_error)?)
+                .map_err(|_| corrupt("negative automatic selection sequence"))?;
+            selections.insert(seq, RunId::new(run));
+        }
+    }
+    Ok(selections)
+}
+
+/// Envelopes use the journal's binary/CAS codec as well as legacy JSON.
+/// The transaction owning this read serializes the target install with rebinds.
+pub(super) fn latest_rebind_seq(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<u64> {
+    let mut statement = connection
+        .prepare("SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY seq DESC")
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let event = decode_envelope_column(connection, row, 0)
+            .map_err(|error| corrupt(format!("invalid rebind generation witness: {error}")))?;
+        if event
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("session_provider_rebound")
+        {
+            if SessionProviderRebound::from_payload_value(&event.payload).is_none() {
+                return Err(corrupt("invalid rebind generation witness"));
+            }
+            return Ok(event.seq);
+        }
+    }
+    Ok(0)
 }

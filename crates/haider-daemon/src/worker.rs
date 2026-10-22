@@ -563,7 +563,10 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             "automatic": true,
             "session_id": self.store.session_id(),
             "run_id": switch.run_id,
+            "branch_id": self.branch_id,
             "switch_ordinal": switch.switch_ordinal,
+            "source_rebind_seq": switch.source_rebind_seq,
+            "target_account": switch.target_account,
             "worker_generation": self.store.worker_generation(),
             "from_provider": switch.from_provider,
             "from_model": switch.from_model,
@@ -577,6 +580,26 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             "automatic-pair-switch-{}",
             request_digest.get(..24).unwrap_or(&request_digest)
         );
+        let hub = self.store.hub();
+        let _selection = hub.lock_workflow_selection(self.store.session_id()).await;
+        let pair = hub
+            .run_output_pair(self.store.session_id(), &switch.run_id)
+            .await?
+            .ok_or_else(|| {
+                haider_protocol::session::run_route_history_unavailable(
+                    "automatic switch has no active run route",
+                )
+            })?;
+        if pair.latest_rebind_seq != switch.source_rebind_seq {
+            return Err(HaiderError::new(
+                ErrorCode::RevisionConflict,
+                "automatic switch target belongs to an older rebind",
+                true,
+            ));
+        }
+        let mut active_selection = self.turn_selection.lock().await.clone();
+        pair.restore_route(&mut active_selection)?;
+        let selection_epoch = active_selection.selection_epoch;
         let command = SessionSelectModelCommand {
             command_id,
             request_digest,
@@ -585,9 +608,16 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             worker_generation: self.store.worker_generation(),
             provider: switch.to_provider.clone(),
             model: switch.to_model.clone(),
-            // rev933b finding 7: the automatic switch observed this exact
-            // pair; a concurrent explicit selection moves it and must win.
+            // Preserve a later next-turn choice while fencing this active
+            // run against concurrent explicit rebinds.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
+            automatic_run: Some(haider_store::AutomaticRunSelection {
+                run_id: switch.run_id.clone(),
+                branch_id: self.branch_id.clone(),
+                rebind_seq: pair.latest_rebind_seq,
+                resolved_alias: switch.target_account.clone(),
+                selection_epoch,
+            }),
             account_alias: None,
             // No validated model row exists on this path: keep the stored
             // budget. An oversized budget on the fallback model is recovered
@@ -596,8 +626,8 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
-        let hub = self.store.hub();
-        let _selection = hub.lock_workflow_selection(self.store.session_id()).await;
+        #[cfg(test)]
+        hub.pause_pair_switch_commit(self.store.session_id()).await;
         match hub.select_session_model(command).await {
             Ok(
                 SessionSelectModelOutcome::Committed { selected, .. }
@@ -617,6 +647,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
                 current.model = selected.model;
                 Ok(selected.selected_seq)
             }
+            Err(crate::session_hub::SessionHubError::Store(error)) => Err(error),
             Err(error) => Err(hub_error(error)),
         }
     }
@@ -8825,7 +8856,7 @@ async fn start_turn(
     // The selection fence fixes the native pair at pickup and makes the
     // durable pin visible to rebind before provider resolution can suspend.
     // Recovery reuses that pin rather than the mutable next-turn selection.
-    let mut pinned_metadata = {
+    let (mut pinned_metadata, run_rebind_seq) = {
         let _selection = lease
             .hub()
             .lock_workflow_selection(lease.session_id())
@@ -8905,7 +8936,12 @@ async fn start_turn(
             })],
         )
         .await?;
-        fresh
+        let rebind_seq = lease
+            .hub()
+            .run_output_pair(lease.session_id(), &accepted.run_id)
+            .await?
+            .map_or(0, |pair| pair.latest_rebind_seq);
+        (fresh, rebind_seq)
     };
     pinned_metadata.context_economy = refresh_context_economy_from_journal(
         lease,
@@ -9728,6 +9764,26 @@ async fn start_turn(
         .resolved_route_alias
         .clone_from(&resolved.account_alias);
     route_selection.resolved_route_seen = true;
+    // A recovered automatic route may have released every selector. Its
+    // durable rebind sequence still owns the run. Only adopt a fresher
+    // sequence when it describes the exact route resolved by this factory.
+    config.provider_rebind_seq = run_rebind_seq;
+    if let Some(pair) = lease
+        .hub()
+        .run_output_pair(lease.session_id(), &accepted.run_id)
+        .await?
+    {
+        let mut current = route_selection.clone();
+        pair.restore_route(&mut current)?;
+        if pair.provider == route_selection.provider
+            && pair.model == route_selection.model
+            && haider_protocol::session::RunOutputRouteSnapshotV1::capture(&current)
+                == haider_protocol::session::RunOutputRouteSnapshotV1::capture(&route_selection)
+        {
+            config.provider_rebind_seq = pair.latest_rebind_seq;
+        }
+    }
+
     let turn_selection = Arc::new(Mutex::new(route_selection));
     config.provider_route_committer = Some(Arc::new(DaemonProviderRouteCommitter {
         store: lease.clone(),

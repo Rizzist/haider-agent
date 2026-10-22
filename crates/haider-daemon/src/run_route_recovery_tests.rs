@@ -25,7 +25,7 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                 let mut session =
                     SessionId::new(format!("o29-legacy-{binding}-{durable}-{variant}"));
                 let run = RunId::new("rebind-test-run");
-                if binding == "child" {
+                if binding.starts_with("child") {
                     create_child_route_parent(&hub, &session, root.path()).await;
                 } else {
                     create_rebind_test_session(&hub, &session).await;
@@ -43,6 +43,7 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                         | "automatic_switch"
                         | "headless_automatic_switch"
                         | "child"
+                        | "child_delayed"
                         | "resolved_create"
                         | "resolved_fork"
                         | "resolved_metafork"
@@ -176,7 +177,7 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                     .await
                     .expect("append pin");
                 }
-                if binding.ends_with("automatic_switch") {
+                if binding.ends_with("automatic_switch") || binding == "child_delayed" {
                     let switch_provider = if binding == "same_provider_automatic_switch" {
                         "fake"
                     } else {
@@ -199,6 +200,13 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                         &haider_core::ProviderPairSwitch {
                             run_id: run.clone(),
                             switch_ordinal: 0,
+                            source_rebind_seq: hub
+                                .run_output_pair(&session, &run)
+                                .await
+                                .expect("source boundary")
+                                .expect("run")
+                                .latest_rebind_seq,
+                            target_account: "switch-account".into(),
                             from_provider: original.provider.clone(),
                             from_model: original.model.clone(),
                             to_provider: switch_provider.into(),
@@ -208,6 +216,14 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                     )
                     .await
                     .expect("production automatic selection");
+                    if binding == "child_delayed" {
+                        commit_test_rebind(&hub, &session, store.worker_generation(), 2).await;
+                        original = hub
+                            .session_metadata(&session)
+                            .await
+                            .expect("rebound parent")
+                            .expect("typed");
+                    }
                     append_payloads(&lease, &DeviceId::new("o29"), &run, None,
                     &EventIdGenerator::new("automatic-switch"), vec![EventPayload::Item(ItemEvent::Completed {
                         item_id: haider_protocol::ids::ItemId::new("automatic-switch"),
@@ -216,21 +232,23 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                             "to_provider": switch_provider, "to_model": "switched-model", "resolved_alias": "switch-account"
                         }) }
                     })]).await.expect("automatic switch");
-                    if original.provider != switch_provider {
-                        original.provider_base_url = None;
-                        original.provider_rebind_id = None;
+                    if binding != "child_delayed" {
+                        if original.provider != switch_provider {
+                            original.provider_base_url = None;
+                            original.provider_rebind_id = None;
+                        }
+                        original.provider = switch_provider.into();
+                        original.model = "switched-model".into();
+                        original.account_alias = None;
+                        original.resolved_route_alias = None;
+                        original.resolved_route_seen = false;
+                        let live = turn_selection.lock().await;
+                        if route_json(&live) != route_json(&original) {
+                            failures.push(format!("{binding}/{durable}/{variant}: live automatic switch changed the run's route provenance"));
+                        }
+                        original.resolved_route_alias = Some("switch-account".into());
+                        original.resolved_route_seen = true;
                     }
-                    original.provider = switch_provider.into();
-                    original.model = "switched-model".into();
-                    original.account_alias = None;
-                    original.resolved_route_alias = None;
-                    original.resolved_route_seen = false;
-                    let live = turn_selection.lock().await;
-                    if route_json(&live) != route_json(&original) {
-                        failures.push(format!("{binding}/{durable}/{variant}: live automatic switch changed the run's route provenance"));
-                    }
-                    original.resolved_route_alias = Some("switch-account".into());
-                    original.resolved_route_seen = true;
                 }
                 match variant {
                     "cross_provider"
@@ -425,7 +443,7 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                 // actual metadata delivered to the provider factory, not only the snapshot.
                 accepted.worker_generation = store.worker_generation();
                 let mut steps = Vec::new();
-                if binding == "child" {
+                if binding.starts_with("child") {
                     steps.extend([
                     haider_provider::FakeStep::EmitToolCall { call_id: "spawn-route".into(), name: "spawn_subagent".into(),
                         args: serde_json::json!({"task": "route witness", "prompt": "report route"}) },
@@ -457,14 +475,14 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                                 .ends_with("automatic_switch")
                                 .then(|| "switch-account".to_owned()),
                         }),
-                        tool_factory: if binding == "child" {
+                        tool_factory: if binding.starts_with("child") {
                             crate::worker::DaemonDependencies::default()
                                 .with_tool_exposure(Some(vec!["spawn_subagent".into()]))
                                 .tool_factory
                         } else {
                             Arc::new(BrokerToolFactory)
                         },
-                        delegation: (binding == "child")
+                        delegation: (binding.starts_with("child"))
                             .then(|| crate::delegation::DelegationHandle::new(hub.clone())),
                         web_search: None,
                         diagnostics: None,
@@ -532,11 +550,11 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                         .collect::<Vec<_>>(),
                     provider.requests().len()
                 );
-                let expected_dispatches = if binding == "child" { 3 } else { 1 };
-                if calls.len() != (if binding == "child" { 2 } else { 1 })
+                let expected_dispatches = if binding.starts_with("child") { 3 } else { 1 };
+                if calls.len() != (if binding.starts_with("child") { 2 } else { 1 })
                     || provider.requests().len() != expected_dispatches
                 {
-                    if binding == "child" {
+                    if binding.starts_with("child") {
                         for event in store
                             .read(&session, 0, 4096)
                             .await
@@ -554,7 +572,7 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                     }
                     failures.push(format!("binding={binding} durable={durable} variant={variant}: recovery did not dispatch exactly once"));
                 } else {
-                    if binding == "child" {
+                    if binding.starts_with("child") {
                         let child = &calls[1];
                         if (
                             &child.provider,
@@ -1153,4 +1171,13 @@ async fn legacy_automatic_switch_without_account_observation_fails_closed() {
             .as_str(),
         "run-route-history-unavailable"
     );
+}
+
+#[tokio::test]
+async fn recovered_parent_child_inherits_newer_rebind_after_delayed_automatic_fact() {
+    recovery_matrix(
+        &["child_delayed"],
+        &["cross_provider", "account_pin", "provider_roundtrip"],
+    )
+    .await;
 }
