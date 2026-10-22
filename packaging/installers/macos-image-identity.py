@@ -205,6 +205,67 @@ def staging_inventory():
             time.sleep(.1 * (attempt + 1))
 
 
+def image_reader_records(output):
+    """Validate every lsof process/file set before trusting any reader PID.
+
+    In -F0 output, NUL terminates fields and newline terminates sets. A process
+    set owns subsequent file sets until the next process set. Compact listings
+    must repeat p for each file: without set boundaries, inheriting a PID could
+    hide a missing process header. Neither form may end in a partial set.
+    """
+    if b'\n' in output:
+        sets = output.split(b'\n')
+        if sets.pop() != b'':
+            raise ValueError('unterminated reader set')
+        sets = [item.split(b'\0') for item in sets]
+    else:
+        fields = output.split(b'\0')
+        if fields.pop() != b'':
+            raise ValueError('unterminated reader field')
+        sets = []
+        while fields:
+            record, fields = fields[:5], fields[5:]
+            if [field[:1] for field in record] != [b'p', b'f', b't', b'D', b'i']:
+                raise ValueError('incomplete compact reader record')
+            sets.extend([[record[0], b''], [*record[1:], b'']])
+    pid = None
+    records = []
+    processes, descriptors = set(), set()
+    has_file = False
+    for fields in sets:
+        if fields.pop() != b'':
+            raise ValueError('unterminated reader field')
+        keys = [field[:1] for field in fields]
+        if keys == [b'p']:
+            if pid is not None and not has_file:
+                raise ValueError('process without reader records')
+            value = fields[0][1:]
+            if not re.fullmatch(rb'[0-9]+', value) or int(value) <= 0:
+                raise ValueError('invalid reader PID')
+            pid = int(value)
+            if pid in processes:
+                raise ValueError('duplicate reader process')
+            processes.add(pid)
+            has_file = False
+        elif keys == [b'f', b't', b'D', b'i'] and pid is not None:
+            fd, kind, device, inode = [field[1:] for field in fields]
+            if (not re.fullmatch(rb'[0-9]+', fd) or kind != b'REG' or
+                    not re.fullmatch(rb'(?:0[xX])?[0-9a-fA-F]+', device) or
+                    not re.fullmatch(rb'[0-9]+', inode)):
+                raise ValueError('invalid reader file fields')
+            descriptor = (pid, int(fd))
+            if descriptor in descriptors:
+                raise ValueError('duplicate reader descriptor')
+            descriptors.add(descriptor)
+            records.append((pid, [int(device, 16), int(inode)]))
+            has_file = True
+        else:
+            raise ValueError('incomplete or out-of-order reader set')
+    if not has_file:
+        raise ValueError('missing reader file set')
+    return records
+
+
 def image_users_snapshot(path, descriptor):
     """Cross-check inventory against readers of the pinned vnode.
 
@@ -221,24 +282,11 @@ def image_users_snapshot(path, descriptor):
     if result.returncode or result.stderr:
         raise RuntimeError('incomplete backing-file inventory; retaining ' + str(path))
     expected = identity(os.fstat(descriptor))
-    pid = None
-    current = {}
-    records = []
-    for field in result.stdout.split(b'\0'):
-        field = field.lstrip(b'\n')
-        if not field:
-            continue
-        key, value = chr(field[0]), os.fsdecode(field[1:])
-        if key in ('p', 'f'):
-            records.append((pid, current))
-            current = {}
-        if key == 'p':
-            pid = int(value)
-        current[key] = value
-    records.append((pid, current))
-    users = {pid for pid, item in records if item.get('f', '')[:1].isdigit()
-             and item.get('t') == 'REG' and 'D' in item and 'i' in item
-             and [int(item['D'], 16), int(item['i'])] == expected}
+    try:
+        records = image_reader_records(result.stdout)
+    except ValueError as error:
+        raise RuntimeError('incomplete backing-file inventory; retaining ' + str(path)) from error
+    users = {pid for pid, observed in records if observed == expected}
     if os.getpid() not in users:
         raise RuntimeError('pinned image absent from backing-file inventory; retaining ' + str(path))
     return users - {os.getpid(), os.getppid()}
