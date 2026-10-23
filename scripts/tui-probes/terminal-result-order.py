@@ -8,6 +8,7 @@ or existing connection settings are used. Captures are actual tmux text/ANSI.
 """
 from pathlib import Path
 import argparse
+import base64
 import copy
 import io
 import json
@@ -30,6 +31,10 @@ args = argparse.ArgumentParser(
 )
 args.add_argument("--bin-dir", type=Path, required=True)
 args.add_argument("--evidence", type=Path, required=True)
+args.add_argument(
+    "--legacy-peer-limit", action="store_true",
+    help="Negotiate the previous Welcome ceiling and exercise legacy setup-error text.",
+)
 config = args.parse_args()
 B = config.bin_dir.resolve()
 E = config.evidence.resolve()
@@ -71,6 +76,16 @@ def receive(s):
 def encode(d):
     data = json.dumps(d, separators=(",", ":")).encode()
     return struct.pack(">I", len(data)) + data
+
+
+def omit_typed_setup_fields(value):
+    if isinstance(value, dict):
+        value.pop("setup_error", None)
+        for child in value.values():
+            omit_typed_setup_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            omit_typed_setup_fields(child)
 
 
 class Proxy:
@@ -121,6 +136,34 @@ class Proxy:
         with c["lock"]:
             c["client"].sendall(encode(frame))
 
+    def legacy_wire(self, c, frame):
+        if frame.get("kind") == "welcome":
+            assert "ssh_typed_setup_errors_v1" not in frame["features"]
+            self.trace.append({
+                "kind": "new capability withheld by daemon",
+                "welcome": copy.deepcopy(frame),
+            })
+        # Adapt the actual setup result to the old wire shape. The handshake
+        # is unmodified; this fixture explicitly models an older error payload.
+        shell = frame.get("shell", {})
+        error = shell.get("setup_error")
+        if frame.get("kind") == "shell.state" and error:
+            text = f"{error['code']}: {error['message']}\r\n"
+            legacy = {
+                "v": 1,
+                "kind": "shell.output",
+                "id": shell["id"],
+                "stream": "stderr",
+                "chunk_b64": base64.b64encode(text.encode()).decode(),
+            }
+            self.trace.append({
+                "kind": "legacy wire fixture from actual setup result",
+                "source": copy.deepcopy(shell),
+                "frame": copy.deepcopy(legacy),
+            })
+            self.send(c, legacy)
+        omit_typed_setup_fields(frame)
+
     def relay(self, c, outgoing):
         try:
             while not self.stop:
@@ -130,6 +173,19 @@ class Proxy:
                         c["tui"] = frame.get("client_kind") == "tui"
                         if c["tui"]:
                             self.tui = c
+                            if config.legacy_peer_limit:
+                                # Discover this disposable daemon's identity fields,
+                                # then request its exact pre-capability byte ceiling.
+                                with socket.socket(socket.AF_UNIX) as probe:
+                                    probe.connect(str(self.real))
+                                    probe.sendall(encode(frame))
+                                    previous = receive(probe)
+                                previous["features"].remove("ssh_typed_setup_errors_v1")
+                                frame["max_receive_frame"] = len(encode(previous)) - 4
+                                self.trace.append({
+                                    "kind": "previous Welcome ceiling requested",
+                                    "limit": frame["max_receive_frame"],
+                                })
                     body = frame.get("body", {})
                     method = body.get("method")
                     if c["tui"] and method:
@@ -158,6 +214,8 @@ class Proxy:
                 else:
                     with c["lock"]:
                         if c["tui"]:
+                            if config.legacy_peer_limit:
+                                self.legacy_wire(c, frame)
                             if frame.get("kind") in [
                                 "shell.opened",
                                 "shell.state",
@@ -615,6 +673,12 @@ for size in [(118, 36), (80, 24)]:
                     p.proxy.release()
                     time.sleep(0.8)
                 frame = p.capture("after-both-arrived")
+                row["legacy_peer_limit"] = config.legacy_peer_limit
+                if config.legacy_peer_limit:
+                    assert any(
+                        x["kind"] == "new capability withheld by daemon"
+                        for x in p.proxy.trace
+                    )
                 row["opening_still_visible"] = (
                     "opening remote terminal" in frame.lower()
                 )
@@ -623,8 +687,14 @@ for size in [(118, 36), (80, 24)]:
                     row["typed_result_visible"] = bool(
                         row["actual_setup_code"] and row["actual_setup_code"] in frame
                     )
+                    row["legacy_result_visible"] = "ssh_connection_failed" in frame
                     row["passed"] = (
-                        not row["opening_still_visible"] and row["typed_result_visible"]
+                        not row["opening_still_visible"]
+                        and (
+                            row["legacy_result_visible"]
+                            if config.legacy_peer_limit
+                            else row["typed_result_visible"]
+                        )
                     )
                 else:
                     p.key("C-c", delay=0.8)

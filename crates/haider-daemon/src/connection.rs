@@ -2604,6 +2604,8 @@ fn encode_welcome_for_peer(
                 });
             }
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(FEATURE_SSH_TYPED_SETUP_ERRORS_V1) => {}
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(FEATURE_SESSION_ACTIVITY_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(haider_rpc::FEATURE_AGENT_CLI_V1) => {}

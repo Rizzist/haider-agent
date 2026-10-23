@@ -505,7 +505,7 @@ fn welcome_features_pin_served_management_families() {
 }
 
 #[test]
-fn activity_token_requires_hello_request_and_is_first_withheld() {
+fn activity_token_requires_hello_request_and_follows_newer_withholding() {
     let mut hello = Hello {
         protocol_min: 1,
         protocol_max: 1,
@@ -560,7 +560,20 @@ fn activity_token_requires_hello_request_and_is_first_withheld() {
         - 4;
     let granted = encode_welcome_for_peer(welcome.clone(), full_len).expect("grant fits");
     assert!(granted.features.contains(FEATURE_SESSION_ACTIVITY_V1));
-    let withheld = encode_welcome_for_peer(welcome, full_len - 1).expect("activity withheld");
+    let newest_withheld =
+        encode_welcome_for_peer(welcome.clone(), full_len - 1).expect("newest token withheld");
+    assert!(
+        !newest_withheld
+            .features
+            .contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1)
+    );
+    assert!(
+        newest_withheld
+            .features
+            .contains(FEATURE_SESSION_ACTIVITY_V1)
+    );
+    let withheld = encode_welcome_for_peer(welcome, newest_withheld.bytes.len() - 5)
+        .expect("activity withheld after the newer token");
     assert!(!withheld.features.contains(FEATURE_SESSION_ACTIVITY_V1));
     assert!(
         withheld
@@ -577,7 +590,11 @@ fn activity_token_requires_hello_request_and_is_first_withheld() {
             ..summary
         }],
     };
-    for (features, has_activity) in [(granted.features, true), (withheld.features, false)] {
+    for (features, has_activity) in [
+        (granted.features, true),
+        (newest_withheld.features, true),
+        (withheld.features, false),
+    ] {
         for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
             let sink = ConnectionFrameSink {
                 lane: OutboundLane::new(1, 1_048_576, 1_048_576),
@@ -640,268 +657,190 @@ fn welcome_advertises_resident_session_binding_token_echo() {
     );
 }
 
-/// MUTATION CHECK: reverse the withholding order or omit the retained feature
-/// set. Expected runtime failure: a peer at a preceding Welcome limit no
-/// longer receives byte-identical pre-runperm/pre-K1/pre-X1/v0.0.965 bytes,
-/// or the grant admits a shape that its Welcome did not advertise.
-///
-/// MUTATION CHECK: replace `welcome.user_command_withheld = true` in the
-/// second fallback with `false`. Expected runtime failure: the older tight
-/// Welcome loses the already-shipped causal marker pinned below.
+// Literal reply bodies and byte ceilings emitted by 56e4a29a's encoder, before
+// ssh_typed_setup_errors_v1 existed. Never build the predecessor from today's
+// feature list: that would let an additive token move every compatibility limit.
+#[derive(serde::Deserialize)]
+struct PreviousWelcome {
+    activity: bool,
+    control: bool,
+    encoding: Option<String>,
+    withheld_count: usize,
+    limit: usize,
+    reply: String,
+}
+
+fn previous_welcomes() -> Vec<PreviousWelcome> {
+    let rows: Vec<PreviousWelcome> = serde_json::from_str(include_str!("welcome-wave56.json"))
+        .expect("pinned wave Welcome bytes");
+    assert_eq!(rows.len(), 64);
+    rows
+}
+
+fn previous_welcome(row: &PreviousWelcome) -> Welcome {
+    assert_eq!(row.reply.len(), row.limit, "literal previous byte ceiling");
+    let welcome: Welcome = serde_json::from_str(&row.reply).expect("previous Welcome");
+    assert!(!welcome.features.contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1));
+    assert_eq!(welcome.user_command_withheld, row.withheld_count == 7);
+    welcome
+}
+
+fn current_welcome(row: &PreviousWelcome) -> Welcome {
+    let mut welcome = previous_welcome(row);
+    welcome.features = welcome_features();
+    if row.activity {
+        welcome
+            .features
+            .insert(FEATURE_SESSION_ACTIVITY_V1.to_owned());
+    }
+    welcome.user_command_withheld = false;
+    welcome
+}
+
+fn pinned_welcome_bytes(body: &str) -> Vec<u8> {
+    let mut bytes = u32::try_from(body.len())
+        .expect("fixture length")
+        .to_be_bytes()
+        .to_vec();
+    bytes.extend_from_slice(body.as_bytes());
+    bytes
+}
+
+/// Killed mutations: never withhold the new token; withhold it after an older
+/// capability; derive expected bytes from the current set. The fixture is fixed
+/// independently of welcome_features(), including its eight old boundaries.
 #[test]
-fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
-    let welcome = Welcome {
-        protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
-        instance_id: "instance".into(),
-        daemon_generation: 7,
-        frame_limit: 1_024,
-        profile_id: "profile".into(),
-        daemon_version: "test".into(),
-        lifecycle_phase: LifecyclePhase::Ready,
-        capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
-        features: welcome_features(),
-        user_command_withheld: false,
-        encoding: None,
-    };
-    let full = uds_codec::encode(&WireFrame::Welcome(welcome.clone()), usize::MAX)
-        .expect("full Welcome encodes");
-    let full_body_len = full.len() - 4;
-
-    let ample = encode_welcome_for_peer(welcome.clone(), full_body_len)
-        .expect("exact full limit carries every feature");
-    assert_eq!(ample.bytes.as_slice(), full.as_slice());
-    assert_eq!(ample.features, welcome.features);
+fn tight_welcome_preserves_all_64_wave56_replies() {
+    let mut failures = Vec::new();
+    for row in previous_welcomes() {
+        let expected = pinned_welcome_bytes(&row.reply);
+        // An actual old feature list remains a negative control.
+        let old = encode_welcome_for_peer(previous_welcome(&row), row.limit)
+            .expect("unchanged previous reply fits");
+        assert_eq!(old.bytes.as_slice(), expected);
+        let result = encode_welcome_for_peer(current_welcome(&row), row.limit);
+        let exact = result.as_ref().is_ok_and(|encoded| {
+            encoded.bytes.as_slice() == expected
+                && encoded.features == previous_welcome(&row).features
+        });
+        println!(
+            "previous Welcome: encoding={:?} activity={} control={} boundary={} limit={} preserved={exact}",
+            row.encoding, row.activity, row.control, row.withheld_count, row.limit
+        );
+        if !exact {
+            failures.push((row.encoding, row.activity, row.control, row.withheld_count));
+        }
+    }
     assert!(
-        !std::str::from_utf8(&ample.bytes[4..])
-            .expect("Welcome is JSON")
-            .contains("\"uw\""),
-        "nothing withheld serializes no marker, never false"
+        failures.is_empty(),
+        "previous connection capability list changed: {failures:?}"
     );
-    let mut ample_decoder = uds_codec::Decoder::new(full_body_len);
-    let ample_frames = ample_decoder.push(&ample.bytes).frames;
-    assert!(matches!(
-        ample_frames.as_slice(),
-        [WireFrame::Welcome(Welcome { features, user_command_withheld, .. })]
-            if features == &welcome.features && !user_command_withheld
-    ));
-
-    let mut pre_agent_cli_welcome = welcome.clone();
-    assert!(
-        pre_agent_cli_welcome
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
-    );
-    let pre_agent_cli = uds_codec::encode(
-        &WireFrame::Welcome(pre_agent_cli_welcome.clone()),
-        usize::MAX,
-    )
-    .expect("pre-agent-CLI Welcome encodes");
-    let pre_agent_cli_body_len = pre_agent_cli.len() - 4;
-    let agent_cli_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
-        .expect("tight peer first withholds only the new agent CLI shape");
-    assert_eq!(agent_cli_tight.bytes.as_slice(), pre_agent_cli.as_slice());
-    assert_eq!(agent_cli_tight.features, pre_agent_cli_welcome.features);
-
-    let mut pre_read_only_welcome = pre_agent_cli_welcome.clone();
-    assert!(
-        pre_read_only_welcome
-            .features
-            .remove(FEATURE_SESSION_READ_ONLY_V1)
-    );
-    let pre_read_only = uds_codec::encode(
-        &WireFrame::Welcome(pre_read_only_welcome.clone()),
-        usize::MAX,
-    )
-    .expect("pre-read-only Welcome encodes");
-    let pre_read_only_body_len = pre_read_only.len() - 4;
-    let read_only_tight = encode_welcome_for_peer(welcome.clone(), pre_agent_cli_body_len - 1)
-        .expect("tight peer retains the exact pre-read-only handshake");
-    assert_eq!(read_only_tight.bytes.as_slice(), pre_read_only.as_slice());
-    assert_eq!(read_only_tight.features, pre_read_only_welcome.features);
-    assert!(
-        !read_only_tight
-            .features
-            .contains(FEATURE_SESSION_READ_ONLY_V1)
-    );
-
-    let mut pre_cancel_welcome = pre_read_only_welcome.clone();
-    assert!(
-        pre_cancel_welcome
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CANCEL_V1)
-    );
-    let pre_cancel = uds_codec::encode(&WireFrame::Welcome(pre_cancel_welcome.clone()), usize::MAX)
-        .expect("pre-cancel Welcome encodes");
-    let pre_cancel_body_len = pre_cancel.len() - 4;
-    let cancel_tight = encode_welcome_for_peer(welcome.clone(), pre_read_only_body_len - 1)
-        .expect("tight peer retains the exact pre-cancel handshake");
-    assert_eq!(cancel_tight.bytes.as_slice(), pre_cancel.as_slice());
-    assert_eq!(cancel_tight.features, pre_cancel_welcome.features);
-    assert!(
-        !cancel_tight
-            .features
-            .contains(haider_rpc::FEATURE_AGENT_CANCEL_V1)
-    );
-
-    let mut pre_identity_welcome = pre_cancel_welcome.clone();
-    assert!(
-        pre_identity_welcome
-            .features
-            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
-    );
-    let pre_identity = uds_codec::encode(
-        &WireFrame::Welcome(pre_identity_welcome.clone()),
-        usize::MAX,
-    )
-    .expect("pre-identity Welcome encodes");
-    let pre_identity_body_len = pre_identity.len() - 4;
-    let identity_tight = encode_welcome_for_peer(welcome.clone(), pre_cancel_body_len - 1)
-        .expect("tight peer retains the exact pre-identity handshake");
-    assert_eq!(identity_tight.bytes.as_slice(), pre_identity.as_slice());
-    assert_eq!(identity_tight.features, pre_identity_welcome.features);
-    assert!(
-        !identity_tight
-            .features
-            .contains(FEATURE_SESSION_FLEET_IDENTITY_V1)
-    );
-
-    let mut pre_prompt_welcome = pre_identity_welcome.clone();
-    assert!(
-        pre_prompt_welcome
-            .features
-            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
-    );
-    let pre_prompt = uds_codec::encode(&WireFrame::Welcome(pre_prompt_welcome.clone()), usize::MAX)
-        .expect("pre-prompt Welcome encodes");
-    let pre_prompt_body_len = pre_prompt.len() - 4;
-    let prompt_tight = encode_welcome_for_peer(welcome.clone(), pre_identity_body_len - 1)
-        .expect("tight peer retains the exact pre-prompt handshake");
-    assert_eq!(prompt_tight.bytes.as_slice(), pre_prompt.as_slice());
-    assert_eq!(prompt_tight.features, pre_prompt_welcome.features);
-    assert!(
-        !prompt_tight
-            .features
-            .contains(FEATURE_SESSION_PROMPT_FORK_V1)
-    );
-
-    let tight = encode_welcome_for_peer(welcome.clone(), pre_prompt_body_len - 1)
-        .expect("older user-command fallback still fits");
-    let mut without_features = pre_prompt_welcome.clone();
-    assert!(without_features.features.remove(FEATURE_USER_COMMAND_V1));
-    let without_features = uds_codec::encode(&WireFrame::Welcome(without_features), usize::MAX)
-        .expect("unmarked Welcome without either additive feature encodes");
-    let without_features_body_len = without_features.len() - 4;
-    let tight_body_len = tight.bytes.len() - 4;
-    assert_eq!(
-        pre_prompt_body_len - without_features_body_len,
-        18,
-        "the real encoder's feature-array element costs 18 bytes"
-    );
-    assert_eq!(
-        tight_body_len - without_features_body_len,
-        10,
-        "the short true marker costs 10 bytes"
-    );
-    assert_eq!(
-        pre_prompt_body_len - tight_body_len,
-        8,
-        "replacement must be strictly smaller than the withheld token"
-    );
-    assert!(
-        std::str::from_utf8(&tight.bytes[4..])
-            .expect("Welcome is JSON")
-            .contains("\"uw\":true"),
-        "a withheld token carries the causal marker"
-    );
-    let mut tight_decoder = uds_codec::Decoder::new(pre_prompt_body_len - 1);
-    let tight_frames = tight_decoder.push(&tight.bytes).frames;
-    let mut expected = pre_prompt_welcome.features.clone();
-    assert!(expected.remove(FEATURE_USER_COMMAND_V1));
-    assert_eq!(tight.features, expected);
-    assert!(matches!(
-        tight_frames.as_slice(),
-        [WireFrame::Welcome(Welcome { features, user_command_withheld, .. })]
-            if features == &expected && *user_command_withheld
-    ));
-
-    let mut selected_encoding = welcome;
-    selected_encoding.encoding = Some("msgpack".into());
-    let mut selected_unmarked = selected_encoding.clone();
-    assert!(
-        selected_unmarked
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
-    );
-    assert!(
-        selected_unmarked
-            .features
-            .remove(FEATURE_SESSION_READ_ONLY_V1)
-    );
-    assert!(
-        selected_unmarked
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CANCEL_V1)
-    );
-    assert!(
-        selected_unmarked
-            .features
-            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
-    );
-    assert!(
-        selected_unmarked
-            .features
-            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
-    );
-    assert!(selected_unmarked.features.remove(FEATURE_USER_COMMAND_V1));
-    let selected_unmarked = uds_codec::encode(&WireFrame::Welcome(selected_unmarked), usize::MAX)
-        .expect("selected-encoding unmarked Welcome encodes");
-    let mut selected_pre_prompt = selected_encoding.clone();
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
-    );
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(FEATURE_SESSION_READ_ONLY_V1)
-    );
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CANCEL_V1)
-    );
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
-    );
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
-    );
-    let selected_pre_prompt =
-        uds_codec::encode(&WireFrame::Welcome(selected_pre_prompt), usize::MAX)
-            .expect("selected-encoding pre-prompt Welcome encodes");
-    let selected_pre_prompt_body_len = selected_pre_prompt.len() - 4;
-    let selected_tight =
-        encode_welcome_for_peer(selected_encoding, selected_pre_prompt_body_len - 1)
-            .expect("selected-encoding fallback fits");
-    assert_eq!(
-        selected_pre_prompt_body_len - (selected_unmarked.len() - 4),
-        18
-    );
-    assert_eq!(
-        (selected_tight.bytes.len() - 4) - (selected_unmarked.len() - 4),
-        10
-    );
-    assert_eq!(
-        selected_pre_prompt_body_len - (selected_tight.bytes.len() - 4),
-        8
-    );
-
     assert_unadvertised_fleet_identity_is_byte_identical();
+}
+
+#[test]
+fn tight_welcome_preserves_non_ready_wave56_replies_and_ample_peers() {
+    for row in previous_welcomes() {
+        let current = current_welcome(&row);
+        let full = uds_codec::encode(&WireFrame::Welcome(current.clone()), usize::MAX)
+            .expect("ample Welcome");
+        let ample = encode_welcome_for_peer(current.clone(), full.len() - 4).expect("ample peer");
+        assert_eq!(ample.bytes.as_slice(), full);
+        assert!(ample.features.contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1));
+        for (phase, name) in [
+            (LifecyclePhase::Starting, "starting"),
+            (LifecyclePhase::Recovering, "recovering"),
+            (LifecyclePhase::Draining, "draining"),
+            (LifecyclePhase::Finalizing, "finalizing"),
+            (LifecyclePhase::Stopped, "stopped"),
+            (LifecyclePhase::Failed, "failed"),
+            (LifecyclePhase::Unknown, "unknown"),
+        ] {
+            // Only the lifecycle spelling changes in these literal old bytes.
+            let body = row.reply.replace(
+                "\"lifecycle_phase\":\"ready\"",
+                &format!("\"lifecycle_phase\":\"{name}\""),
+            );
+            assert_ne!(body, row.reply);
+            let mut welcome = current.clone();
+            welcome.lifecycle_phase = phase;
+            let encoded =
+                encode_welcome_for_peer(welcome, body.len()).expect("non-Ready old ceiling");
+            assert_eq!(
+                encoded.bytes.as_slice(),
+                pinned_welcome_bytes(&body),
+                "{name}"
+            );
+        }
+        if row.withheld_count == 7 {
+            assert!(
+                encode_welcome_for_peer(current, row.limit - 1).is_err(),
+                "a peer below the shipped minimum still cannot connect"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tight_welcome_dispatch_preserves_wave56_bytes_with_cold_and_warm_cache() {
+    let (_root, hub) = liveness_hub().await;
+    let mut context = liveness_context(hub);
+    context.instance_id = "local-instance".into();
+    context.profile_id = "local-profile".into();
+    let (_sender, drain) = watch::channel(None);
+    // Tight first, then ample, then tight again: a cached full reply must not
+    // displace old capabilities, and a tight reply must never poison the cache.
+    for ample in [false, true, false] {
+        for row in previous_welcomes() {
+            let lane = OutboundLane::new(1, 1_048_576, 1_048_576);
+            let mut grant = None;
+            let hello = Hello {
+                protocol_min: 1,
+                protocol_max: 1,
+                client_name: "local-peer-check".into(),
+                client_version: "synthetic".into(),
+                client_instance_id: "local-peer".into(),
+                client_kind: haider_rpc::ClientKind::Tui,
+                capabilities_requested: previous_welcome(&row).capabilities_granted,
+                features_requested: if row.activity {
+                    BTreeSet::from([FEATURE_SESSION_ACTIVITY_V1.to_owned()])
+                } else {
+                    BTreeSet::new()
+                },
+                max_receive_frame: if ample {
+                    1_048_576
+                } else {
+                    u32::try_from(row.limit).expect("peer limit")
+                },
+                encodings: row.encoding.iter().cloned().collect(),
+            };
+            let encoding = negotiate_hello(
+                hello,
+                &context,
+                &drain,
+                &lane,
+                &mut grant,
+                if ample { 1_048_576 } else { row.limit },
+            )
+            .expect("previous peer connects");
+            assert_eq!(
+                encoding,
+                Some(if row.encoding.is_some() {
+                    WireEncoding::MessagePack
+                } else {
+                    WireEncoding::Json
+                })
+            );
+            let bytes = outbound_bytes(lane.recv().await.expect("Welcome queued").bytes);
+            let grant = grant.expect("connection grant");
+            if ample {
+                assert!(grant.features.contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1));
+            } else {
+                assert_eq!(bytes, pinned_welcome_bytes(&row.reply));
+                assert_eq!(grant.features, previous_welcome(&row).features);
+            }
+        }
+    }
 }
 
 fn identity_gate_metrics() -> haider_protocol::agent::AgentMetricsSnapshot {
