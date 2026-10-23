@@ -640,14 +640,54 @@ class ImageIdentityTests(unittest.TestCase):
         self.assertFalse((self.root / 'digest').exists())
 
     def test_backing_identity_requires_an_open_numeric_descriptor(self):
-        for output, expected in ((b'f3\ntREG\nD0x10\ni42\nn/x/image.dmg\n', True),
-                                 (b'f3\ntREG\nD0x10\ni43\nn/x/image.dmg\n', False),
-                                 (b'f3\ntREG\nD0x11\ni42\nn/x/image.dmg\n', False),
-                                 (b'ftxt\nD0x10\ni42\n', None)):
+        for output, expected in ((b'p123\0\nf3\0tREG\0D0x10\0i42\0n/x/image.dmg\0\n', True),
+                                 (b'p123\0\nf3\0tREG\0D0x10\0i43\0n/x/image.dmg\0\n', False),
+                                 (b'p123\0\nf3\0tREG\0D0x11\0i42\0n/x/image.dmg\0\n', False),
+                                 (b'p123\0\nftxt\0D0x10\0i42\0\n', None)):
             with self.subTest(output=output), patch.object(IMAGE.subprocess, 'run',
                     return_value=subprocess.CompletedProcess([], 0, output)):
                 self.assertEqual(IMAGE.backing_identity({'hdid-pid': 123, 'image-path': '/x/image.dmg'}, [16, 42]), expected)
         self.assertFalse(IMAGE.backing_identity({}, [16, 42]))
+
+    def test_backing_identity_judges_each_file_set_on_its_own(self):
+        # Shape of a real diskimages-helper listing (-F0fDtin): cwd, txt and
+        # character-device sets carry no backing authority and are skipped.
+        head = (b'p973\0\nfcwd\0tDIR\0D0x10\0i2\0n/\0\n'
+                b'ftxt\0tREG\0D0x10\0i9\0n/System/diskimages-helper\0\nftxt\0tREG\0n/lib\0\n'
+                b'f0\0tCHR\0D0xdd\0i336\0n/dev/null\0\nf4\0tPIPE\0n->0x1\0\nf5\0tunix\0\n')
+        image = {'hdid-pid': 973, 'image-path': '/x/image.dmg'}
+        def query(output):
+            with patch.object(IMAGE.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, output, b'')):
+                return IMAGE.backing_identity(image, [16, 42])
+        own = b'f3\0tREG\0D0x10\0i42\0n/x/image.dmg\0\n'
+        other = b'f6\0tREG\0D0x10\0i7\0n/x/other\0\n'
+        self.assertTrue(query(head + own))
+        self.assertTrue(query(head + other + own))
+        self.assertTrue(query(head + own[:-1]))
+        self.assertTrue(query(head + b'f3\0tREG\0D0x10\0i42\0\n'))
+        self.assertIsNone(query(head + other))
+        self.assertFalse(query(head + b'f3\0tREG\0D0x10\0i43\0n/x/image.dmg\0\n'))
+        # D and i of different records can never pair, whichever fields were lost.
+        uncertain = {
+            'second set lost f and D': other + b'tREG\0i42\0n/y/lib\0\n',
+            'first lost i, second lost f and D': b'f6\0tREG\0D0x10\0n/x/other\0\ntREG\0i42\0n/y/lib\0\n',
+            'second set lost f, t and D': b'f6\0tREG\0D0x10\0n/x/other\0\ni42\0n/y/lib\0\n',
+            'regular file lost D': b'f6\0tREG\0i42\0n/x/image.dmg\0\n',
+            'regular file lost i': b'f6\0tREG\0D0x10\0n/x/image.dmg\0\n',
+            'regular file lost D and i': b'f6\0tREG\0n/x/image.dmg\0\n',
+            'numeric descriptor lost t': b'f6\0D0x10\0i42\0n/x/image.dmg\0\n',
+            'invalid D': b'f6\0tREG\0D0xg\0i42\0\n',
+            'invalid i': b'f6\0tREG\0D0x10\0i4x\0\n',
+            'lost set delimiter': other[:-1] + own,
+            'duplicate field': b'f3\0tREG\0D0x10\0i42\0i42\0\n',
+            'empty field': b'f3\0tREG\0\0D0x10\0i42\0\n',
+            'unterminated field': own + b'f7\0tREG\0D0x10\0i4',
+            'process set with file fields': b'p974\0f3\0tREG\0D0x10\0i42\0\n',
+        }
+        for name, tail in uncertain.items():
+            with self.subTest(name=name):
+                self.assertIsNone(query(head + tail))
+                self.assertIsNone(query(head + own + tail))
 
     def test_backing_inode_matches_without_reopening_a_replaced_path(self):
         output = b'f3\0tREG\0D0x10\0i42\0n/a name with\nnewline.dmg\0'

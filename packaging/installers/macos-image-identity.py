@@ -29,6 +29,48 @@ def file_digest(source, algorithm):
     return digest
 
 
+def helper_file_sets(output):
+    """Split a native -F0 listing into sets; None when any set is uncertain.
+
+    NUL ends a field and a newline right after it ends the set, so each file
+    set is judged on its own: fields of different records can never pair. A
+    regular file on a numeric descriptor must carry its own D and i. Other
+    descriptors (cwd, txt, pipes, sockets) are not backing files and are
+    skipped, but a set without its leading f has lost its boundary.
+    """
+    fields = output.split(b'\0')
+    if fields.pop() not in (b'', b'\n'):
+        return None
+    sets = []
+    for field in fields:
+        if not sets or field[:1] == b'\n':
+            field = field[1:] if field[:1] == b'\n' else field
+            sets.append({})
+        key, value = field[:1], field[1:]
+        if not key or key in sets[-1]:
+            return None
+        sets[-1][key] = value
+    records = []
+    for item in sets:
+        if list(item) == [b'p']:
+            continue
+        if list(item)[:1] != [b'f']:
+            return None
+        if not re.fullmatch(rb'[0-9]+', item[b'f']):
+            continue
+        if b't' not in item:
+            return None
+        if item[b't'] != b'REG':
+            continue
+        device, inode = item.get(b'D', b''), item.get(b'i', b'')
+        if (not re.fullmatch(rb'(?:0[xX])?[0-9a-fA-F]+', device) or
+                not re.fullmatch(rb'[0-9]+', inode)):
+            return None
+        name = os.fsdecode(item[b'n']) if b'n' in item else None
+        records.append((name, [int(device, 16), int(inode)]))
+    return records
+
+
 def backing_identity(image, expected):
     """Inspect the helper's open vnode, never stat its mutable backing pathname.
 
@@ -46,35 +88,17 @@ def backing_identity(image, expected):
         return None
     if result.returncode or result.stderr:
         return None
-    fields = result.stdout.split(b'\0') if b'\0' in result.stdout else result.stdout.splitlines()
-    records = []
-    current = {}
-    for field in fields:
-        field = field.lstrip(b'\n')
-        if not field:
-            continue
-        key, value = chr(field[0]), os.fsdecode(field[1:])
-        if key == 'f':
-            records.append(current)
-            current = {}
-        current[key] = value
-    records.append(current)
+    records = helper_file_sets(result.stdout)
+    if records is None:
+        return None
     confirmed_different = False
-    for item in records:
-        if not item.get('f', '')[:1].isdigit() or item.get('t') != 'REG':
-            continue
-        if 'D' not in item or 'i' not in item:
-            continue
-        try:
-            observed = [int(item['D'], 16), int(item['i'])]
-        except ValueError:
-            return None
+    for name, observed in records:
         if observed == expected:
             return True
         # A missing descriptor is uncertainty, not evidence that the attachment
         # disappeared. A confirmed different backing vnode can be disowned.
-        if item.get('n') and image.get('image-path'):
-            name = item['n'].removesuffix(' (deleted)')
+        if name and image.get('image-path'):
+            name = name.removesuffix(' (deleted)')
             if Path(name).resolve() == Path(image['image-path']).resolve():
                 confirmed_different = True
     return False if confirmed_different else None
@@ -209,7 +233,9 @@ def image_reader_records(output):
     """Validate every lsof process/file set before trusting any reader PID.
 
     In -F0 output, NUL terminates fields and newline terminates sets. A process
-    set owns subsequent file sets until the next process set. Compact listings
+    set owns subsequent file sets until the next process set, so a lost process
+    set silently credits its files to the previous process: callers must verify
+    descriptors, never trust a PID. Compact listings
     must repeat p for each file: without set boundaries, inheriting a PID could
     hide a missing process header. Neither form may end in a partial set.
     """
@@ -257,13 +283,31 @@ def image_reader_records(output):
             if descriptor in descriptors:
                 raise ValueError('duplicate reader descriptor')
             descriptors.add(descriptor)
-            records.append((pid, [int(device, 16), int(inode)]))
+            records.append((pid, int(fd), [int(device, 16), int(inode)]))
             has_file = True
         else:
             raise ValueError('incomplete or out-of-order reader set')
     if not has_file:
         raise ValueError('missing reader file set')
     return records
+
+
+def declared_parent_descriptors():
+    """Descriptors the parent declares it holds on the image (builder: fd 9)."""
+    value = os.environ.get('HAIDER_IMAGE_PARENT_FDS', '')
+    if not value:
+        return set()
+    if not re.fullmatch(r'[0-9]+(?:,[0-9]+)*', value):
+        raise ValueError('invalid declared parent descriptors')
+    return {int(fd) for fd in value.split(',')}
+
+
+def holds_image(fd, expected):
+    """Confirm in-process that a descriptor is open on the pinned vnode."""
+    try:
+        return identity(os.fstat(fd)) == expected
+    except (OSError, OverflowError):
+        return False
 
 
 def image_users_snapshot(path, descriptor):
@@ -284,12 +328,27 @@ def image_users_snapshot(path, descriptor):
     expected = identity(os.fstat(descriptor))
     try:
         records = image_reader_records(result.stdout)
+        declared = declared_parent_descriptors()
     except ValueError as error:
         raise RuntimeError('incomplete backing-file inventory; retaining ' + str(path)) from error
-    users = {pid for pid, observed in records if observed == expected}
-    if os.getpid() not in users:
+    # A reader whose process set was lost is credited to the preceding
+    # process, so nothing is excluded by PID. Only descriptors verified to be
+    # ours, or the parent's declared descriptors confirmed through the
+    # inherited copy, are excluded; every other record is a reader.
+    own, parent = os.getpid(), os.getppid()
+    inherited = {fd for fd in declared if holds_image(fd, expected)}
+    users = set()
+    for pid, fd, observed in records:
+        if observed != expected:
+            raise RuntimeError('unattributed backing-file record; retaining ' + str(path))
+        if pid == own:
+            if not holds_image(fd, expected):
+                raise RuntimeError('unverified own backing-file descriptor; retaining ' + str(path))
+        elif pid != parent or fd not in inherited:
+            users.add(pid)
+    if (own, descriptor) not in {(pid, fd) for pid, fd, observed in records}:
         raise RuntimeError('pinned image absent from backing-file inventory; retaining ' + str(path))
-    return users - {os.getpid(), os.getppid()}
+    return users
 
 
 def open_image_users(path, descriptor):

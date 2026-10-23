@@ -755,6 +755,26 @@ exec /usr/bin/cmp "$@"
         self.assertFalse((self.base / 'comparison-ran').exists())
         self.assert_no_test_mounts()
 
+    def test_builder_withdraws_its_pinned_image_after_a_failed_comparison(self):
+        # The exit trap runs while this shell still pins the image as fd 9. The
+        # helper excludes only that declared descriptor, so the unchanged,
+        # detached image is withdrawn instead of being retained as in use.
+        (self.shim / 'cmp').write_text('''#!/bin/bash
+/usr/sbin/lsof -a -p "$PPID" -d 9 -Fn > "$HDIUTIL_TEST_DIR/comparison-pin"
+exit 1
+''')
+        (self.shim / 'cmp').chmod(0o755)
+        output = self.base / 'failed-comparison-output'
+        result = self.run_builder(output)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('macOS installer gate PASS', result.stdout)
+        self.assertIn('haider-v' + VERSION + '-' + TARGET + '.dmg',
+                      (self.base / 'comparison-pin').read_text())
+        self.assertFalse(list(output.glob('*.dmg')), result.stderr)
+        self.assertFalse(list(output.glob('*.pkg')), result.stderr)
+        self.assertNotIn('Retaining', result.stderr)
+        self.assert_no_test_mounts()
+
     def test_builder_pins_created_dmg_until_attachment_finishes(self):
         (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
 if [ "$1" = attach ]; then
