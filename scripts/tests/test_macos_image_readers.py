@@ -1,4 +1,5 @@
 """Deterministic reader-inventory corruption must never authorize cleanup."""
+import fcntl
 import importlib.util
 import json
 import os
@@ -57,6 +58,16 @@ import os, plistlib, runpy, subprocess, sys
 from unittest.mock import patch
 helper, helper_pid, shape, *arguments = sys.argv[1:]
 real = subprocess.run
+# Hold descriptors 3-9 on another file, so our audit descriptor cannot share a
+# number with the helper's (3 in practice): a shared number is the separate,
+# duplicate-descriptor case, and would let this test pass without the fix.
+held = []
+while True:
+    fd = os.open(os.devnull, os.O_RDONLY)
+    if fd >= 10:
+        os.close(fd)
+        break
+    held.append(fd)
 def query(command, **kwargs):
     if command == ['hdiutil', 'info', '-plist']:
         # hdiutil info silently omits the attachment, an already supported condition.
@@ -76,6 +87,8 @@ def query(command, **kwargs):
         lost = int(helper_pid)
         host = os.getpid() if shape == 'after-own' else os.getppid()
         assert lost in order and host in order, (shape, result.stdout)
+        numbers = lambda sets: {line.split(b'\\0', 1)[0] for line in sets}
+        assert not numbers(files[lost]) & numbers(files[host]), (shape, result.stdout)
         order.remove(lost)
         files[host] += files.pop(lost)
         result.stdout = b''.join(b'p%d\\0\\n' % pid + b''.join(files[pid]) for pid in order)
@@ -419,7 +432,12 @@ class NativeReaderTests(unittest.TestCase):
 
     def run_action(self, action, shape='real', helper_pid=0, declare=True):
         # Like the builder, the parent pins the image and the CLI inherits it.
-        pin = os.open(self.path, os.O_RDONLY)
+        # A high number keeps it apart from the helper's descriptors.
+        low = os.open(self.path, os.O_RDONLY)
+        try:
+            pin = fcntl.fcntl(low, fcntl.F_DUPFD, 100)
+        finally:
+            os.close(low)
         try:
             environment = {key: value for key, value in os.environ.items()
                            if key != 'HAIDER_IMAGE_PARENT_FDS'}
