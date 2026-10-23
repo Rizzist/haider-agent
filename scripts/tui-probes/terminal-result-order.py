@@ -33,7 +33,7 @@ args.add_argument("--bin-dir", type=Path, required=True)
 args.add_argument("--evidence", type=Path, required=True)
 args.add_argument(
     "--legacy-peer-limit", action="store_true",
-    help="Negotiate the previous Welcome ceiling and exercise legacy setup-error text.",
+    help="Probe the previous Welcome ceiling and show its features with legacy setup text.",
 )
 config = args.parse_args()
 B = config.bin_dir.resolve()
@@ -138,13 +138,19 @@ class Proxy:
 
     def legacy_wire(self, c, frame):
         if frame.get("kind") == "welcome":
+            # General TUI startup messages can exceed the old Welcome ceiling.
+            # Supply the actual separately negotiated tight-limit Welcome while
+            # keeping an ample transport for the remaining application messages.
+            assert "ssh_typed_setup_errors_v1" in frame["features"]
+            frame.clear()
+            frame.update(copy.deepcopy(c["legacy_welcome"]))
             assert "ssh_typed_setup_errors_v1" not in frame["features"]
             self.trace.append({
                 "kind": "new capability withheld by daemon",
                 "welcome": copy.deepcopy(frame),
             })
-        # Adapt the actual setup result to the old wire shape. The handshake
-        # is unmodified; this fixture explicitly models an older error payload.
+        # The feature list comes from the actual tight-limit handshake. This
+        # fixture explicitly models the older setup-result wire shape.
         shell = frame.get("shell", {})
         error = shell.get("setup_error")
         if frame.get("kind") == "shell.state" and error:
@@ -181,10 +187,20 @@ class Proxy:
                                     probe.sendall(encode(frame))
                                     previous = receive(probe)
                                 previous["features"].remove("ssh_typed_setup_errors_v1")
-                                frame["max_receive_frame"] = len(encode(previous)) - 4
+                                tight_hello = copy.deepcopy(frame)
+                                tight_hello["max_receive_frame"] = len(encode(previous)) - 4
+                                with socket.socket(socket.AF_UNIX) as probe:
+                                    probe.connect(str(self.real))
+                                    probe.sendall(encode(tight_hello))
+                                    actual = receive(probe)
+                                assert actual == previous, "actual old-limit Welcome"
+                                c["legacy_welcome"] = actual
                                 self.trace.append({
                                     "kind": "previous Welcome ceiling requested",
-                                    "limit": frame["max_receive_frame"],
+                                    "limit": tight_hello["max_receive_frame"],
+                                    "actual_reply": copy.deepcopy(actual),
+                                    "previous_reply_preserved": True,
+                                    "tui_transport": "original ample receive limit",
                                 })
                     body = frame.get("body", {})
                     method = body.get("method")
@@ -674,6 +690,10 @@ for size in [(118, 36), (80, 24)]:
                     time.sleep(0.8)
                 frame = p.capture("after-both-arrived")
                 row["legacy_peer_limit"] = config.legacy_peer_limit
+                if config.legacy_peer_limit:
+                    row["legacy_transport"] = (
+                        "Actual tight-limit Welcome; ample subsequent transport"
+                    )
                 if config.legacy_peer_limit:
                     assert any(
                         x["kind"] == "new capability withheld by daemon"
