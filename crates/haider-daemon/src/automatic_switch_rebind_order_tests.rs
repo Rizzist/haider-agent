@@ -1,5 +1,10 @@
 #![allow(clippy::expect_used)]
+use super::tests::{
+    RecordingRebindFactory, commit_test_rebind, create_rebind_test_session,
+    start_legacy_rebind_test_run,
+};
 use super::*;
+use haider_core::ProviderRebindResolver as _;
 // Independent review: the production automatic-selection commit and Core's
 // later provider_pair_switch_v1 append have an await boundary between them.
 #[tokio::test]

@@ -7,6 +7,18 @@ mod tests;
 #[path = "run_route_recovery_tests.rs"]
 mod run_route_recovery_tests;
 
+#[cfg(test)]
+#[path = "automatic_switch_rebind_tests.rs"]
+mod automatic_switch_rebind_tests;
+
+#[cfg(test)]
+#[path = "automatic_switch_rebind_order_tests.rs"]
+mod automatic_switch_rebind_order_tests;
+
+#[cfg(test)]
+#[path = "automatic_switch_rebind_recovery_tests.rs"]
+mod automatic_switch_rebind_recovery_tests;
+
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

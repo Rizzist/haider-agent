@@ -1,20 +1,19 @@
 #![allow(clippy::expect_used)]
+use super::tests::{
+    RecordingRebindFactory, commit_test_rebind, create_rebind_test_session,
+    rebound_recovery_headless_spec, select_rotation_test_model, start_legacy_rebind_test_run,
+};
 use super::*;
-
-#[path = "automatic_switch_rebind_order_tests.rs"]
-mod ordering;
-
-#[path = "automatic_switch_rebind_recovery_tests.rs"]
-mod recovery;
+use haider_core::ProviderRebindResolver as _;
 
 #[derive(Clone, Copy, Debug)]
-enum BoundaryMode {
+pub(super) enum BoundaryMode {
     Native,
     Headless,
     Legacy,
 }
 
-async fn start_ordering_run(
+pub(super) async fn start_ordering_run(
     hub: &SessionHub,
     sid: &SessionId,
     generation: u64,
@@ -87,7 +86,7 @@ async fn start_ordering_run(
     }
 }
 
-async fn ordering_rebind(
+pub(super) async fn ordering_rebind(
     hub: &SessionHub,
     sid: &SessionId,
     generation: u64,
@@ -333,8 +332,8 @@ impl haider_core::ProviderPairSwitchCommitter for RebindBeforeAutomaticInstall {
 }
 
 #[derive(Debug)]
-struct StaleAutomaticFallback {
-    target: haider_core::ProviderPairSwitchTarget,
+pub(super) struct StaleAutomaticFallback {
+    pub(super) target: haider_core::ProviderPairSwitchTarget,
 }
 #[async_trait]
 impl haider_core::ProviderAttemptResolver for StaleAutomaticFallback {

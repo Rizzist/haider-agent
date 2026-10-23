@@ -2482,6 +2482,3 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
         "run-scoped epoch allocation failures: {failures:#?}"
     );
 }
-
-#[path = "automatic_switch_rebind_tests.rs"]
-mod automatic_switch_rebind_tests;

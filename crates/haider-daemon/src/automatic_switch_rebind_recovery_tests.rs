@@ -1,4 +1,11 @@
 #![allow(clippy::expect_used)]
+use super::automatic_switch_rebind_tests::{
+    BoundaryMode, StaleAutomaticFallback, ordering_rebind, start_ordering_run,
+};
+use super::tests::{
+    RecordingRebindFactory, commit_test_rebind, create_rebind_test_session,
+    rebound_recovery_headless_spec,
+};
 use super::*;
 
 struct RecoveredFallbackFactory {
