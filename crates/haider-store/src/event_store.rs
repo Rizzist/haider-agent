@@ -10325,8 +10325,18 @@ impl Store {
         if updated_rows != 1 {
             return Err(corrupt("session row disappeared during model selection"));
         }
+        // A run-only preparation has no authority to advance a client's
+        // next-turn selection. Keep its active boundary epoch while the
+        // envelope and receipt retain their fresh journal identity.
+        let fact_selection_epoch = command
+            .automatic_run
+            .as_ref()
+            .filter(|_| !publish_selection)
+            .map_or(selection_epoch, |automatic| {
+                automatic.selection_epoch.unwrap_or(0)
+            });
         let mut selected_payload = ModelSelected {
-            selection_epoch: Some(selection_epoch),
+            selection_epoch: Some(fact_selection_epoch),
             provider: command.provider.clone(),
             model: command.model.clone(),
             route_only: !publish_selection,

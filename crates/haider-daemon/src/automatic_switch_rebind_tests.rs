@@ -539,6 +539,35 @@ async fn automatic_switch_after_selector_reset_retains_generation_without_disabl
         )
         .await
         .expect("legitimate automatic switch");
+        let events = store.read(&sid, 0, 4096).await.expect("journal");
+        let published = events
+            .iter()
+            .find(|event| {
+                event
+                    .payload
+                    .get("automatic_only")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                    && event
+                        .payload
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(target)
+                    && event
+                        .payload
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(to_model)
+            })
+            .expect("published automatic selection");
+        assert_eq!(
+            published
+                .payload
+                .get("selection_epoch")
+                .and_then(serde_json::Value::as_u64),
+            Some(seq),
+            "a published global selection must keep its newly allocated epoch"
+        );
         append_payloads(&lease,&DeviceId::new("reset"),&run,None,&EventIdGenerator::new(format!("reset-{ordinal}")),vec![EventPayload::Item(ItemEvent::Completed{item_id:haider_protocol::ids::ItemId::new(format!("reset-{ordinal}")),item:TurnItem::Extension{kind:"provider_pair_switch_v1".into(),data:serde_json::json!({"selection_seq":seq,"to_provider":target,"to_model":to_model,"resolved_alias":"automatic-account"})}})]).await.expect("switch fact");
         let pair = hub
             .run_output_pair(&sid, &run)
@@ -706,6 +735,29 @@ async fn next_turn_selection_control(reset_route: bool) {
     )
     .await
     .expect("ordinary next-turn settings cannot cancel this run");
+    let events = store.read(&sid, 0, 4096).await.expect("journal");
+    let prepared = events
+        .iter()
+        .find(|event| {
+            event
+                .payload
+                .get("automatic_only")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .expect("run-only automatic preparation");
+    assert_eq!(
+        prepared
+            .payload
+            .get("selection_epoch")
+            .and_then(serde_json::Value::as_u64),
+        Some(expected_epoch.unwrap_or(0)),
+        "a run-only preparation must not advance a client's global selection epoch"
+    );
+    assert!(
+        seq > next.selection_epoch.unwrap_or(0),
+        "the command receipt still gets a fresh identity"
+    );
     append_payloads(&lease,&DeviceId::new("ordering"),&run,None,&EventIdGenerator::new("next-fact"),vec![EventPayload::Item(ItemEvent::Completed{item_id:haider_protocol::ids::ItemId::new("next-fact"),item:TurnItem::Extension{kind:"provider_pair_switch_v1".into(),data:serde_json::json!({"selection_seq":seq,"to_provider":"fake-next","to_model":"switched-model","resolved_alias":"automatic-account"})}})]).await.expect("switch fact");
     assert_eq!(
         hub.session_metadata(&sid)
