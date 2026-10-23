@@ -3,6 +3,16 @@
 
 Run after building haider, haiderd and haider-tui, inside a build-slot ticket:
   python terminal-result-order.py --bin-dir <target/debug> --evidence <output>
+Modes:
+  (default)            current peer, ample limits, every result shape;
+  --legacy-peer-limit  text-fallback compatibility (proxied): the real tight-limit
+                       Welcome on an ample transport, with an explicit adapter that
+                       models the older setup-result wire (setup_error stripped,
+                       setup text synthesised as terminal output);
+  --tight-peer-limit   real tight-limit peer: the TUI's own Hello carries the
+                       previous Welcome ceiling, so the daemon withholds
+                       ssh_typed_setup_errors_v1 on that connection, and every
+                       daemon frame reaches the TUI byte for byte (no rewrite).
 Requires tmux, paramiko and cryptography. All profiles are disposable; no provider
 or existing connection settings are used. Captures are actual tmux text/ANSI.
 """
@@ -31,11 +41,17 @@ args = argparse.ArgumentParser(
 )
 args.add_argument("--bin-dir", type=Path, required=True)
 args.add_argument("--evidence", type=Path, required=True)
-args.add_argument(
+mode_group = args.add_mutually_exclusive_group()
+mode_group.add_argument(
     "--legacy-peer-limit", action="store_true",
-    help="Probe the previous Welcome ceiling and show its features with legacy setup text.",
+    help="Text-fallback compatibility (proxied): previous Welcome features with a modelled legacy setup-result wire.",
+)
+mode_group.add_argument(
+    "--tight-peer-limit", action="store_true",
+    help="Real tight-limit peer: the TUI's Hello carries the previous ceiling; daemon frames are relayed unmodified.",
 )
 config = args.parse_args()
+TOKEN = "ssh_typed_setup_errors_v1"
 B = config.bin_dir.resolve()
 E = config.evidence.resolve()
 E.mkdir(parents=True, exist_ok=True)
@@ -69,8 +85,17 @@ def read(s, n):
     return data
 
 
+def receive_raw(s):
+    body = read(s, struct.unpack(">I", read(s, 4))[0])
+    return body, json.loads(body)
+
+
 def receive(s):
-    return json.loads(read(s, struct.unpack(">I", read(s, 4))[0]))
+    return receive_raw(s)[1]
+
+
+def raw_frame(body):
+    return struct.pack(">I", len(body)) + body
 
 
 def encode(d):
@@ -132,9 +157,36 @@ class Proxy:
             threading.Thread(target=self.relay, args=(c, True), daemon=True).start()
             threading.Thread(target=self.relay, args=(c, False), daemon=True).start()
 
-    def send(self, c, frame):
+    def send(self, c, frame, raw=None):
         with c["lock"]:
-            c["client"].sendall(encode(frame))
+            c["client"].sendall(raw_frame(raw) if raw is not None else encode(frame))
+
+    def tight_hello(self, c, frame):
+        # Discover this disposable daemon's own replies, then present the TUI's
+        # actual Hello with the largest receive limit at which the daemon must
+        # withhold the new token: exactly the previous Welcome's byte length.
+        with socket.socket(socket.AF_UNIX) as probe:
+            probe.connect(str(self.real))
+            probe.sendall(encode(frame))
+            full_raw, full = receive_raw(probe)
+        assert TOKEN in full["features"], "ample peer receives the new token"
+        below_full = copy.deepcopy(frame)
+        below_full["max_receive_frame"] = len(full_raw) - 1
+        with socket.socket(socket.AF_UNIX) as probe:
+            probe.connect(str(self.real))
+            probe.sendall(encode(below_full))
+            tight_raw, tight = receive_raw(probe)
+        assert set(full["features"]) - set(tight["features"]) == {TOKEN}, "only the new token is withheld"
+        assert set(tight["features"]) <= set(full["features"])
+        c["tight_limit"] = len(tight_raw)
+        c["tight_probe_raw"] = tight_raw
+        frame["max_receive_frame"] = c["tight_limit"]
+        self.trace.append({
+            "kind": "TUI Hello sent with previous Welcome ceiling",
+            "full_welcome_bytes": len(full_raw),
+            "max_receive_frame": c["tight_limit"],
+            "withheld": [TOKEN],
+        })
 
     def legacy_wire(self, c, frame):
         if frame.get("kind") == "welcome":
@@ -173,12 +225,14 @@ class Proxy:
     def relay(self, c, outgoing):
         try:
             while not self.stop:
-                frame = receive(c["client"] if outgoing else c["upstream"])
+                raw, frame = receive_raw(c["client"] if outgoing else c["upstream"])
                 if outgoing:
                     if frame.get("kind") == "hello":
                         c["tui"] = frame.get("client_kind") == "tui"
                         if c["tui"]:
                             self.tui = c
+                            if config.tight_peer_limit:
+                                self.tight_hello(c, frame)
                             if config.legacy_peer_limit:
                                 # Discover this disposable daemon's identity fields,
                                 # then request its exact pre-capability byte ceiling.
@@ -232,6 +286,17 @@ class Proxy:
                         if c["tui"]:
                             if config.legacy_peer_limit:
                                 self.legacy_wire(c, frame)
+                            if config.tight_peer_limit:
+                                c["max_relayed"] = max(c.get("max_relayed", 0), len(raw))
+                                if frame.get("kind") == "welcome":
+                                    self.trace.append({
+                                        "kind": "actual tight-limit Welcome relayed unmodified",
+                                        "bytes": len(raw),
+                                        "limit": c["tight_limit"],
+                                        "token_present": TOKEN in frame.get("features", []),
+                                        "identical_to_probe": raw == c["tight_probe_raw"],
+                                        "welcome": copy.deepcopy(frame),
+                                    })
                             if frame.get("kind") in [
                                 "shell.opened",
                                 "shell.state",
@@ -260,20 +325,23 @@ class Proxy:
                                 "hold_id" in c
                                 and frame.get("request_id") == c["hold_id"]
                             ):
-                                self.held.append((c, copy.deepcopy(frame)))
+                                self.held.append(
+                                    (c, copy.deepcopy(frame), raw if config.tight_peer_limit else None)
+                                )
                                 c.pop("hold_id", None)
                                 continue
-                        self.send(c, frame)
+                        # Tight mode forwards the daemon's exact bytes.
+                        self.send(c, frame, raw if config.tight_peer_limit else None)
         except (EOFError, OSError):
             return
 
     def release(self):
-        c, frame = self.held.pop(0)
+        c, frame, raw = self.held.pop(0)
         shell = copy.deepcopy(frame.get("body", {}).get("shell"))
         self.trace.append(
             {"kind": "released delayed admission reply", "reply": copy.deepcopy(frame)}
         )
-        self.send(c, frame)
+        self.send(c, frame, raw)
         return shell
 
     def close(self):
@@ -387,6 +455,11 @@ class Profile:
         ).strip()
         assert actual == f"{size[0]}x{size[1]}", actual
         self.until(lambda s: "[ IDLE ]" in s, "launcher")
+        if config.tight_peer_limit:
+            # A ~3 KiB transport cannot carry the session-creation replies of a
+            # seed turn (33-sol-r11-cap2 first attempt); the SSH journey's
+            # frames fit, so it runs on the launcher directly.
+            return
         self.literal("seed live terminal")
         self.key("Enter")
         self.until(lambda s: "LIVE_READY" in s, "seed completion")
@@ -614,8 +687,13 @@ class LocalTerminal(Fixture):
 
 
 rows = []
+MODES = (
+    ["failed-setup"]
+    if config.tight_peer_limit
+    else ["failed-setup", "silent-running", "early-output"]
+)
 for size in [(118, 36), (80, 24)]:
-    for mode in ["failed-setup", "silent-running", "early-output"]:
+    for mode in MODES:
         for order in ["reply-first", "result-first"]:
             tag = f"terminal-order-{mode}-{order}-{size[0]}x{size[1]}"
             p = None
@@ -690,9 +768,33 @@ for size in [(118, 36), (80, 24)]:
                     time.sleep(0.8)
                 frame = p.capture("after-both-arrived")
                 row["legacy_peer_limit"] = config.legacy_peer_limit
+                row["tight_peer_limit"] = config.tight_peer_limit
                 if config.legacy_peer_limit:
+                    row["journey_label"] = "text-fallback compatibility (proxied)"
                     row["legacy_transport"] = (
-                        "Actual tight-limit Welcome; ample subsequent transport"
+                        "Actual tight-limit Welcome; ample subsequent transport; "
+                        "modelled older setup-result wire"
+                    )
+                if config.tight_peer_limit:
+                    row["journey_label"] = "real tight-limit peer (daemon frames unmodified)"
+                    welcomes = [
+                        x for x in p.proxy.trace
+                        if x["kind"] == "actual tight-limit Welcome relayed unmodified"
+                    ]
+                    tui_conns = [x for x in p.proxy.connections if x["tui"]]
+                    row["tui_connections"] = len(tui_conns)
+                    row["tight_limit"] = p.proxy.tui["tight_limit"]
+                    row["max_frame_relayed_to_tui"] = max(
+                        x.get("max_relayed", 0) for x in tui_conns
+                    )
+                    row["welcome_token_present"] = any(x["token_present"] for x in welcomes)
+                    row["welcome_identical_to_probe"] = bool(welcomes) and all(
+                        x["identical_to_probe"] for x in welcomes
+                    )
+                    row["actual_setup_error_delivered"] = bool(row["actual_setup_code"])
+                    row["setup_text_as_output"] = any(
+                        x.get("kind") == "shell.output" and x.get("id") == shell_id
+                        for x in events()
                     )
                 if config.legacy_peer_limit:
                     assert any(
@@ -716,6 +818,15 @@ for size in [(118, 36), (80, 24)]:
                             else row["typed_result_visible"]
                         )
                     )
+                    if config.tight_peer_limit:
+                        row["passed"] = (
+                            row["passed"]
+                            and row["actual_setup_error_delivered"]
+                            and not row["setup_text_as_output"]
+                            and not row["welcome_token_present"]
+                            and row["welcome_identical_to_probe"]
+                            and "remote terminal failed: " + row["actual_setup_code"] in frame.replace("\n", "")
+                        )
                 else:
                     p.key("C-c", delay=0.8)
                     p.capture("after-control-c")
@@ -753,5 +864,5 @@ for size in [(118, 36), (80, 24)]:
                     json.dumps(rows, indent=2) + "\n"
                 )
                 print(json.dumps(row), flush=True)
-assert len(rows) == 12
+assert len(rows) == 4 * len(MODES)
 sys.exit(0 if all(r["passed"] for r in rows) else 1)

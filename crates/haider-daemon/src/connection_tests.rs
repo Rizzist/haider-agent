@@ -660,6 +660,10 @@ fn welcome_advertises_resident_session_binding_token_echo() {
 // Literal reply bodies and byte ceilings emitted by 56e4a29a's encoder, before
 // ssh_typed_setup_errors_v1 existed. Never build the predecessor from today's
 // feature list: that would let an additive token move every compatibility limit.
+// Never regenerate welcome-wave56.json from a later tree, including for a
+// release-identity bump: tests that compare against the real daemon's own
+// serialisation substitute only the pinned daemon_version (see
+// `pinned_reply_for_current_daemon`).
 #[derive(serde::Deserialize)]
 struct PreviousWelcome {
     activity: bool,
@@ -695,6 +699,26 @@ fn current_welcome(row: &PreviousWelcome) -> Welcome {
     }
     welcome.user_command_withheld = false;
     welcome
+}
+
+/// The version every wave-56 row was pinned with. The fixture stays literal.
+const WAVE56_DAEMON_VERSION_FIELD: &str = "\"daemon_version\":\"0.0.972\"";
+
+/// The pinned reply as today's daemon serialises it: exactly one substitution,
+/// the pinned `daemon_version` for this crate's version. The real dispatch path
+/// writes `env!("CARGO_PKG_VERSION")`, so a version bump must not move the
+/// expected bytes or their ceiling; every other byte stays literal.
+fn pinned_reply_for_current_daemon(reply: &str) -> String {
+    assert_eq!(
+        reply.matches(WAVE56_DAEMON_VERSION_FIELD).count(),
+        1,
+        "each pinned reply carries the pinned daemon_version exactly once"
+    );
+    reply.replacen(
+        WAVE56_DAEMON_VERSION_FIELD,
+        &format!("\"daemon_version\":\"{}\"", env!("CARGO_PKG_VERSION")),
+        1,
+    )
 }
 
 fn pinned_welcome_bytes(body: &str) -> Vec<u8> {
@@ -792,6 +816,9 @@ async fn tight_welcome_dispatch_preserves_wave56_bytes_with_cold_and_warm_cache(
     // displace old capabilities, and a tight reply must never poison the cache.
     for ample in [false, true, false] {
         for row in previous_welcomes() {
+            // The peer limit is the ceiling of the reply this daemon would have
+            // sent, sized from the substituted body, not from today's set.
+            let reply = pinned_reply_for_current_daemon(&row.reply);
             let lane = OutboundLane::new(1, 1_048_576, 1_048_576);
             let mut grant = None;
             let hello = Hello {
@@ -810,7 +837,7 @@ async fn tight_welcome_dispatch_preserves_wave56_bytes_with_cold_and_warm_cache(
                 max_receive_frame: if ample {
                     1_048_576
                 } else {
-                    u32::try_from(row.limit).expect("peer limit")
+                    u32::try_from(reply.len()).expect("peer limit")
                 },
                 encodings: row.encoding.iter().cloned().collect(),
             };
@@ -820,7 +847,7 @@ async fn tight_welcome_dispatch_preserves_wave56_bytes_with_cold_and_warm_cache(
                 &drain,
                 &lane,
                 &mut grant,
-                if ample { 1_048_576 } else { row.limit },
+                if ample { 1_048_576 } else { reply.len() },
             )
             .expect("previous peer connects");
             assert_eq!(
@@ -836,7 +863,7 @@ async fn tight_welcome_dispatch_preserves_wave56_bytes_with_cold_and_warm_cache(
             if ample {
                 assert!(grant.features.contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1));
             } else {
-                assert_eq!(bytes, pinned_welcome_bytes(&row.reply));
+                assert_eq!(bytes, pinned_welcome_bytes(&reply));
                 assert_eq!(grant.features, previous_welcome(&row).features);
             }
         }
