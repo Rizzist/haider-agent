@@ -302,6 +302,8 @@ fn authenticated_release_request_does_not_follow_or_forward_redirects() {
     let saw_auth = Arc::new(AtomicBool::new(false));
     let observed_requests = Arc::clone(&requests);
     let observed_auth = Arc::clone(&saw_auth);
+    let done = Arc::new(AtomicBool::new(false));
+    let request_done = Arc::clone(&done);
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept authenticated request");
         observed_requests.fetch_add(1, Ordering::SeqCst);
@@ -326,21 +328,11 @@ fn authenticated_release_request_does_not_follow_or_forward_redirects() {
         listener
             .set_nonblocking(true)
             .expect("nonblocking redirect listener");
-        for _ in 0..30 {
-            match listener.accept() {
-                Ok((_leaked, _)) => {
-                    observed_requests.fetch_add(1, Ordering::SeqCst);
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("poll redirect target: {error}"),
-            }
-        }
+        observe_redirect_requests(listener, &observed_requests, &request_done);
     });
     let transport = CurlTransport::with_token_for_test("fixture-secret");
     let _ = transport.authenticated_get_for_test(&format!("http://{address}/releases"), 4096);
+    done.store(true, Ordering::Release);
     server.join().expect("redirect fixture server");
     assert!(saw_auth.load(Ordering::SeqCst));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -359,6 +351,8 @@ fn authenticated_asset_redirect_is_validated_before_tokenless_fetch() {
     let address = listener.local_addr().expect("asset redirect address");
     let requests = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&requests);
+    let done = Arc::new(AtomicBool::new(false));
+    let request_done = Arc::clone(&done);
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept asset API request");
         observed.fetch_add(1, Ordering::SeqCst);
@@ -380,31 +374,18 @@ fn authenticated_asset_redirect_is_validated_before_tokenless_fetch() {
         listener
             .set_nonblocking(true)
             .expect("nonblocking asset listener");
-        for _ in 0..30 {
-            match listener.accept() {
-                Ok((_leaked, _)) => {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("poll asset redirect target: {error}"),
-            }
-        }
+        observe_redirect_requests(listener, &observed, &request_done);
     });
     let destination = tempfile::NamedTempFile::new().expect("asset destination");
     let transport = CurlTransport::with_token_for_test("fixture-secret");
-    assert!(
-        transport
-            .authenticated_asset_for_test(
-                &format!("http://{address}/asset-api"),
-                destination.path(),
-                4096,
-            )
-            .is_err()
+    let result = transport.authenticated_asset_for_test(
+        &format!("http://{address}/asset-api"),
+        destination.path(),
+        4096,
     );
+    done.store(true, Ordering::Release);
     server.join().expect("asset redirect server");
+    assert!(result.is_err());
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
@@ -1944,4 +1925,29 @@ fn concurrent_staging_verifies_all_signatures_before_any_smoke() {
     bundle
         .verify_immutable()
         .expect("all frozen member digests");
+}
+
+// Keep observing until the curl invocation returns: a slow erroneous redirect
+// must remain visible instead of escaping a short polling window.
+fn observe_redirect_requests(listener: TcpListener, requests: &AtomicUsize, done: &AtomicBool) {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((_leaked, _)) => {
+                requests.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "curl redirect fixture did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("poll redirect target: {error}"),
+        }
+    }
 }

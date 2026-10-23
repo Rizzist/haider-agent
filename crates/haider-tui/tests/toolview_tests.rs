@@ -578,6 +578,16 @@ fn workspace_alias_to_multiuser_root_keeps_the_account_mask() {
     let temp = tempfile::tempdir().expect("temporary workspace alias");
     let alias = temp.path().join("account-roots");
     symlink(ancestor, &alias).expect("alias");
+    assert!(haider_client::launch_origin::is_multiuser_workspace_root(
+        &alias
+    ));
+    let narrow = temp.path().join("project");
+    std::fs::create_dir(&narrow).expect("narrow workspace");
+    let narrow_alias = temp.path().join("project-alias");
+    symlink(&narrow, &narrow_alias).expect("narrow alias");
+    assert!(!haider_client::launch_origin::is_multiuser_workspace_root(
+        &narrow_alias
+    ));
     let context = PathContext {
         workspace: Some(alias.display().to_string()),
         homes: vec!["C:/Users/alice".into()],
@@ -592,6 +602,9 @@ fn workspace_alias_to_multiuser_root_keeps_the_account_mask() {
     std::fs::create_dir(&registered_home).expect("registered home");
     let filesystem_alias = temp.path().join("filesystem-root");
     symlink("/", &filesystem_alias).expect("filesystem root alias");
+    assert!(haider_client::launch_origin::is_multiuser_workspace_root(
+        &filesystem_alias
+    ));
     let context = PathContext {
         workspace: Some(filesystem_alias.display().to_string()),
         homes: vec![registered_home.clone()],
@@ -1625,6 +1638,7 @@ fn assert_pattern_routes(pattern: &str, expected: &str, context: &PathContext) {
                 name: name.into(),
                 args,
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
         let plain = render_plain_with_context(&projection, 0, None, context);

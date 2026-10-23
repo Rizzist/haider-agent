@@ -21,7 +21,7 @@ fn seeded_display_homes_reach_the_rendered_tool_row() {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
     let homes = vec![PathBuf::from("C:/Users/alice")];
-    seed_display_dirs(&mut model, Path::new("C:/Users/alice/work"), &homes);
+    seed_display_dirs(&mut model, Some(Path::new("C:/Users/alice/work")), &homes);
     assert_eq!(model.display_homes, homes);
     assert_eq!(model.tool_path_context().homes, homes);
     assert_eq!(
@@ -37,6 +37,7 @@ fn seeded_display_homes_reach_the_rendered_tool_row() {
                 name: "fs_read".into(),
                 args: serde_json::json!({"path": "C:/Users/alice/notes.md"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     model
@@ -48,6 +49,7 @@ fn seeded_display_homes_reach_the_rendered_tool_row() {
                 name: "fs_read".into(),
                 args: serde_json::json!({"path": r"C:/Users/alice/work/..\..\bob\x"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     model
@@ -59,6 +61,7 @@ fn seeded_display_homes_reach_the_rendered_tool_row() {
                 name: "fs_search".into(),
                 args: serde_json::json!({"query": "x", "glob": "C:/Users/alice/**"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
     let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
@@ -90,7 +93,7 @@ fn live_demo_and_origin_use_identical_path_projection() {
         let homes = homes.into_iter().map(PathBuf::from).collect::<Vec<_>>();
         let expected = workspace_display_path_with_homes(path, &homes);
         let mut live = AppModel::new();
-        apply_cwd_for_path(&mut live, Path::new(path), &homes);
+        apply_cwd_for_path(&mut live, Some(Path::new(path)), &homes);
         assert_eq!(live.launcher_dir, expected, "live {path}");
         assert_eq!(live.session_dir, expected, "live {path}");
         assert_eq!(
@@ -103,7 +106,7 @@ fn live_demo_and_origin_use_identical_path_projection() {
             "real cwd was redacted: {path}"
         );
         let mut demo = AppModel::new();
-        seed_display_dirs(&mut demo, Path::new(path), &homes);
+        seed_display_dirs(&mut demo, Some(Path::new(path)), &homes);
         assert_eq!(demo.launcher_dir, expected, "demo {path}");
         assert_eq!(demo.session_dir, expected, "demo {path}");
         let mut origin_model = AppModel::new();
@@ -122,6 +125,49 @@ fn live_demo_and_origin_use_identical_path_projection() {
             haider_protocol::session::LaunchOriginPathKindV1::Absolute
         };
         assert_eq!(origin.kind, expected_kind, "origin kind {path}");
+    }
+}
+
+#[test]
+fn unavailable_cwd_keeps_display_homes_and_existing_directory_context() {
+    for homes in [
+        vec![],
+        vec![PathBuf::from("C:/Users/alice")],
+        vec![PathBuf::from("H:/work"), PathBuf::from("C:/Users/alice")],
+    ] {
+        for live in [false, true] {
+            let mut model = AppModel::new();
+            model.cwd = "C:/project".into();
+            model.session_workspace_cwd = Some(model.cwd.clone());
+            model.launcher_dir = "previous launcher".into();
+            model.session_dir = "previous session".into();
+            model.display_homes = vec![PathBuf::from("C:/Users/previous")];
+            if live {
+                apply_cwd_for_path(&mut model, None, &homes);
+            } else {
+                seed_display_dirs(&mut model, None, &homes);
+            }
+            assert_eq!(model.display_homes, homes);
+            assert_eq!(model.tool_path_context().homes, homes);
+            assert_eq!(model.cwd, "C:/project");
+            assert_eq!(model.session_workspace_cwd.as_deref(), Some("C:/project"));
+            assert_eq!(model.launcher_dir, "previous launcher");
+            assert_eq!(model.session_dir, "previous session");
+            let context = model.tool_path_context();
+            assert_eq!(context.shorten("C:/project/src/lib.rs"), "src/lib.rs");
+            assert_eq!(
+                context.shorten("C:/Users/bob/notes.md"),
+                "C:/Users/<user>/notes.md"
+            );
+            assert_eq!(
+                context.shorten("C:/Users/alice/notes.md"),
+                if homes.is_empty() {
+                    "C:/Users/<user>/notes.md"
+                } else {
+                    "~/notes.md"
+                }
+            );
+        }
     }
 }
 

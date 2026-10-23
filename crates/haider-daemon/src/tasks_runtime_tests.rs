@@ -37,7 +37,6 @@ use haider_provider::{FakeProvider, Provider, ProviderError, ProviderStream, Tur
 use haider_tools::PidLiveness;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, timeout};
 
@@ -279,13 +278,14 @@ fn monitor_marker_command(marker: &std::path::Path) -> String {
         .to_string_lossy();
     #[cfg(unix)]
     {
-        format!("printf authorized > '{marker}'")
+        format!("printf authorized > '{marker}.tmp' && mv '{marker}.tmp' '{marker}'")
     }
     #[cfg(windows)]
     {
         let marker = marker.replace('\'', "''");
         format!(
-            "[IO.File]::WriteAllBytes('{marker}',[byte[]](97,117,116,104,111,114,105,122,101,100))"
+            "[IO.File]::WriteAllBytes('{marker}.tmp',[byte[]](97,117,116,104,111,114,105,122,101,100)); \
+             [IO.File]::Move('{marker}.tmp','{marker}')"
         )
     }
 }
@@ -362,7 +362,6 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
         }
         ToolDispatchResult::Deferred(_) => panic!("Ask became a deferred tool result"),
     }
-    tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(!ask_marker.exists(), "Ask started the monitor command");
     let ask_phases = process_effect_phases(&store, &ask_session).await;
     assert!(ask_phases.iter().any(|phase| matches!(
@@ -414,7 +413,7 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
         .await
         .expect("autonomous Ask resolves to Allow");
     assert!(matches!(autonomous, ToolDispatchResult::Completed(_)));
-    timeout(Duration::from_secs(3), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !autonomous_marker.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -469,7 +468,7 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
         .await
         .expect("Allow monitor dispatch");
     assert!(matches!(allowed, ToolDispatchResult::Completed(_)));
-    timeout(Duration::from_secs(3), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !allow_marker.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -506,6 +505,18 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
     hub.shutdown()
         .await
         .expect("monitor dispatcher hub shutdown");
+    // Join all monitor owners before the final negative observation, so a
+    // delayed erroneous dispatch cannot pass merely by running after Ask.
+    assert!(
+        !ask_marker.exists(),
+        "Ask dispatched before joined shutdown"
+    );
+    assert!(
+        !process_effect_phases(&store, &ask_session)
+            .await
+            .iter()
+            .any(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
+    );
     store.close().await.expect("monitor dispatcher store close");
 }
 
@@ -636,17 +647,26 @@ fn started_fact(envelopes: &[RawEnvelope], task: &TaskId) -> Option<(RawEnvelope
 }
 
 async fn wait_for_completed(
+    hub: &SessionHub,
     store: &SqliteStoreHandle,
     session_id: &SessionId,
     task: &TaskId,
 ) -> (RawEnvelope, TaskCompleted) {
-    timeout(Duration::from_secs(10), async {
+    // Subscribe before scanning: a post-commit wake can precede the scan's
+    // return, but cannot disappear between the scan and this receiver.
+    let mut committed = hub.subscribe_completion_reconcile();
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let envelopes = read_all(store, session_id).await;
             if let Some(found) = completed_fact(&envelopes, task) {
                 return found;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            match committed.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("commit notifications closed before task completion");
+                }
+            }
         }
     })
     .await
@@ -658,7 +678,7 @@ fn pgid_dead(pid: i32) -> bool {
 }
 
 async fn wait_for_pgid_death(pid: i32) {
-    timeout(Duration::from_secs(10), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !pgid_dead(pid) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -677,12 +697,13 @@ fn workspace() -> (tempfile::TempDir, String) {
 /// MUTATION CHECK (LT1 + LT5): make the background dispatch wait for the
 /// child, skip the started fact, drop the kill effect journaling, or signal
 /// only the leader. Expected RUNTIME failure: the dispatch no longer returns
-/// a running receipt while a 30s child runs, the durable facts/effect phases
+/// a running receipt while the child is explicitly held, the durable facts
+/// and effect phases
 /// below disappear, or the group probe stays alive after the kill.
 #[tokio::test]
 async fn background_dispatch_is_immediate_and_kill_is_brokered_end_to_end() {
     let profile = tempfile::tempdir().expect("profile");
-    let (_workspace, cwd) = workspace();
+    let (workspace, cwd) = workspace();
     let store = SqliteStoreHandle::open(profile.path())
         .await
         .expect("store");
@@ -692,22 +713,33 @@ async fn background_dispatch_is_immediate_and_kill_is_brokered_end_to_end() {
     prepare_tool_run(&hub, &session_id, &run_id, "task-e2e").await;
     let dispatcher = task_dispatcher(&hub, &session_id, &cwd, "task-e2e", &run_id).await;
 
-    let started = Instant::now();
-    let receipt = dispatch(
-        &dispatcher,
-        &run_id,
-        "task-e2e-spawn",
-        "process_exec",
-        serde_json::json!({
-            "command": "printf ready; sleep 30",
-            "background": true,
-        }),
+    // Release on unwind before hub/dispatcher teardown, including when a
+    // mutant incorrectly waits for child completion inside dispatch.
+    struct ReleaseChild(std::path::PathBuf);
+    impl Drop for ReleaseChild {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+    let release_path = workspace.path().join("task-e2e-release");
+    let _release_child = ReleaseChild(release_path.clone());
+    let command = "printf ready; while [ ! -f task-e2e-release ]; do sleep 0.02; done";
+    let receipt = timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        dispatch(
+            &dispatcher,
+            &run_id,
+            "task-e2e-spawn",
+            "process_exec",
+            serde_json::json!({
+                "command": command,
+                "background": true,
+            }),
+        ),
     )
-    .await;
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "background dispatch must return immediately"
-    );
+    .await
+    .expect("background dispatch returns while its child is held");
+    assert!(!release_path.exists(), "the child has not been released");
     assert_eq!(receipt["state"], "running");
     assert_eq!(receipt["name"], "printf");
     let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
@@ -717,11 +749,11 @@ async fn background_dispatch_is_immediate_and_kill_is_brokered_end_to_end() {
         started_fact(&envelopes, &task).expect("durable task_started fact");
     assert!(started_envelope.render.ui && started_envelope.render.durable);
     assert_eq!(started_envelope.render.prompt, PromptRender::Verbatim);
-    assert_eq!(started_payload.command, "printf ready; sleep 30");
+    assert_eq!(started_payload.command, command);
     assert!(!pgid_dead(started_payload.pid), "the task group is alive");
 
     // Live bounded reads: tail without a cursor, then a cursor page (LT5).
-    let tail = timeout(Duration::from_secs(5), async {
+    let tail = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let output = dispatch(
                 &dispatcher,
@@ -791,7 +823,7 @@ async fn background_dispatch_is_immediate_and_kill_is_brokered_end_to_end() {
         }),
         "kill effect terminalizes Ok"
     );
-    let (_, completed) = wait_for_completed(&store, &session_id, &task).await;
+    let (_, completed) = wait_for_completed(&hub, &store, &session_id, &task).await;
     assert_eq!(completed.state, TaskTerminalState::Killed);
 
     dispatcher.close().await.expect("dispatcher close");
@@ -896,7 +928,7 @@ async fn e1a_background_nonzero_exit_is_failed() {
     )
     .await;
     let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
-    let (_, completed) = wait_for_completed(&store, &session_id, &task).await;
+    let (_, completed) = wait_for_completed(&hub, &store, &session_id, &task).await;
     assert_eq!(
         completed.state,
         TaskTerminalState::Failed {
@@ -917,7 +949,7 @@ async fn e1a_background_nonzero_exit_is_failed() {
     )
     .await;
     let signal_task = TaskId::new(signal_receipt["task_id"].as_str().expect("task id"));
-    let (_, signalled) = wait_for_completed(&store, &session_id, &signal_task).await;
+    let (_, signalled) = wait_for_completed(&hub, &store, &session_id, &signal_task).await;
     assert!(matches!(
         signalled.state,
         TaskTerminalState::Failed { ref reason }
@@ -963,7 +995,7 @@ async fn completion_event_arrives_with_digest_and_paging_handle() {
     .await;
     let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
     terminalize_tool_run(&hub, &session_id, &run_id, "task-digest").await;
-    let (_envelope, completed) = wait_for_completed(&store, &session_id, &task).await;
+    let (_envelope, completed) = wait_for_completed(&hub, &store, &session_id, &task).await;
     assert_eq!(
         completed.state,
         TaskTerminalState::Completed { exit_code: Some(0) }
@@ -1070,7 +1102,7 @@ async fn run_task_to_completion(label: &str, command: &str) -> (TaskCompleted, V
     .await;
     let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
     terminalize_tool_run(&hub, &session_id, &run_id, label).await;
-    let (_envelope, completed) = wait_for_completed(&store, &session_id, &task).await;
+    let (_envelope, completed) = wait_for_completed(&hub, &store, &session_id, &task).await;
     let bytes = match completed.artifact.as_ref() {
         Some(artifact) => store.get(artifact).await.expect("artifact bytes"),
         None => Vec::new(),
@@ -1178,7 +1210,7 @@ async fn idle_completion_fact_is_bounded_with_cas_artifact_and_prompt_notice() {
     // must deliver queued, with the fact carrying the prompt notice.
     terminalize_tool_run(&hub, &session_id, &run_id, "task-idle").await;
 
-    let (envelope, completed) = wait_for_completed(&store, &session_id, &task).await;
+    let (envelope, completed) = wait_for_completed(&hub, &store, &session_id, &task).await;
     assert_eq!(
         completed.state,
         TaskTerminalState::Completed { exit_code: Some(0) }
@@ -1246,6 +1278,7 @@ impl haider_tools::JournalSink for DropJournal {
 struct GatedProvider {
     requests: Mutex<Vec<TurnRequest>>,
     request_count: AtomicUsize,
+    requests_changed: Notify,
     gate_started: Arc<Notify>,
     release_gate: Arc<Notify>,
 }
@@ -1255,6 +1288,7 @@ impl GatedProvider {
         Self {
             requests: Mutex::new(Vec::new()),
             request_count: AtomicUsize::new(0),
+            requests_changed: Notify::new(),
             gate_started: Arc::new(Notify::new()),
             release_gate: Arc::new(Notify::new()),
         }
@@ -1262,6 +1296,20 @@ impl GatedProvider {
 
     fn requests(&self) -> Vec<TurnRequest> {
         self.requests.lock().expect("request lock").clone()
+    }
+
+    async fn wait_for_requests(&self, count: usize) {
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+            loop {
+                let changed = self.requests_changed.notified();
+                if self.requests().len() >= count {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("provider request receipt arrives");
     }
 }
 
@@ -1273,6 +1321,7 @@ impl Provider for GatedProvider {
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         self.requests.lock().expect("request lock").push(request);
+        self.requests_changed.notify_waiters();
         let request_index = self.request_count.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = mpsc::channel(4);
         if request_index == 0 {
@@ -1366,9 +1415,12 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
     hub.submit_internal_turn(accepted)
         .await
         .expect("submit live turn");
-    timeout(Duration::from_secs(5), provider.gate_started.notified())
-        .await
-        .expect("live turn reaches the provider");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.gate_started.notified(),
+    )
+    .await
+    .expect("live turn reaches the provider");
 
     // A fast task completes WHILE the run is active. The spawn goes through
     // the facade with its own broker: acquiring a second worker lease here
@@ -1382,6 +1434,10 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
         hub.worker_generation(),
     )
     .expect("test broker");
+    // The precise no-op above must not be pre-empted by the production 500 ms
+    // receipt budget on a loaded machine: an assumed mutation has no durable
+    // intent here, so its completion fact would be rejected.
+    broker.set_workspace_receipt_wall_time_for_tests(haider_tools::TEST_RECEIPT_WALL_TIME);
     let mut policy = haider_tools::PermissionPolicy::default();
     policy.allow(haider_protocol::effect::EffectClass::ProcessExec);
     let spawn_result = facade
@@ -1405,7 +1461,7 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
         serde_json::from_str(&spawn_result.preview).expect("running receipt");
     assert_eq!(receipt["state"], "running");
     let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
-    let (envelope, completed) = wait_for_completed(&store, &session_id, &task).await;
+    let (envelope, completed) = wait_for_completed(&hub, &store, &session_id, &task).await;
     assert_eq!(completed.delivery, TaskCompletionDelivery::DeliveredSteer);
     assert_eq!(
         envelope.render.prompt,
@@ -1414,13 +1470,7 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
     );
 
     provider.release_gate.notify_one();
-    timeout(Duration::from_secs(5), async {
-        while provider.requests().len() < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("steered provider round starts");
+    provider.wait_for_requests(2).await;
     let requests = provider.requests();
     let notice_in_round = |request: &TurnRequest| {
         request.messages.iter().any(|message| {
@@ -1453,7 +1503,7 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
         .count();
     assert_eq!(durable_steers, 1, "steer delivery journals EXACTLY once");
 
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let envelopes = read_all(&store, &session_id).await;
             let done = envelopes.iter().any(|envelope| {
@@ -1549,7 +1599,7 @@ async fn ninth_task_is_refused_and_shutdown_fence_kills_running_groups() {
     .await;
     assert_eq!(receipt["state"], "running");
     let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
-    let (_, completed) = wait_for_completed(&store, &session_id, &task).await;
+    let (_, completed) = wait_for_completed(&hub, &store, &session_id, &task).await;
     assert_eq!(
         completed.state,
         TaskTerminalState::Completed { exit_code: Some(0) }
@@ -1776,7 +1826,7 @@ async fn activity_observe_reads_live_process_output_without_journaling_or_cross_
         "background":true,
     })).await;
     let task = TaskId::new(receipt["task_id"].as_str().expect("task"));
-    timeout(Duration::from_secs(10), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if hub
                 .task_registry()
@@ -1866,7 +1916,7 @@ async fn activity_observe_reads_live_process_output_without_journaling_or_cross_
     assert_eq!(metadata.tasks, None);
     assert_eq!(metadata.shells, None);
     std::fs::write(workspace.path().join("activity-finish"), b"done").expect("release child");
-    wait_for_completed(&store, &session_id, &task).await;
+    wait_for_completed(&hub, &store, &session_id, &task).await;
     assert!(hub.task_registry().observe_tasks(&session_id).is_empty());
     assert_eq!(hub.shell_registry().inventory().count, 0);
     connection.close().await.expect("connection close");
@@ -1911,7 +1961,7 @@ async fn activity_real_interleaved_pipes_cannot_split_pem_redaction() {
             "stream-finish",
         ),
     ] {
-        timeout(Duration::from_secs(10), async {
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
             loop {
                 let tasks = hub.task_registry().observe_tasks(&session);
                 if let Some(live) = tasks.first() {
@@ -1928,7 +1978,7 @@ async fn activity_real_interleaved_pipes_cannot_split_pem_redaction() {
         .expect("supervisor captures gated stream phase");
         std::fs::write(workspace.path().join(release), b"release").expect("release pipe phase");
     }
-    wait_for_completed(&store, &session, &task).await;
+    wait_for_completed(&hub, &store, &session, &task).await;
     dispatcher.close().await.expect("dispatcher close");
     hub.shutdown().await.expect("hub close");
     store.close().await.expect("store close");
@@ -1964,7 +2014,7 @@ async fn background_capture_redacts_before_paging_and_completion_journaling() {
     )
     .await;
     let task = TaskId::new(spawned["task_id"].as_str().expect("task id"));
-    let (_, completed) = wait_for_completed(&store, &session, &task).await;
+    let (_, completed) = wait_for_completed(&hub, &store, &session, &task).await;
     assert_eq!(completed.output_bytes, safe.len() as u64);
     assert!(completed.tail.ends_with("[REDACTED:api_key]"));
     assert!(!completed.tail.contains("AA=="));

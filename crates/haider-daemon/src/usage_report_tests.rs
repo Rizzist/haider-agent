@@ -861,6 +861,7 @@ fn completed_tool(name: &str, args: serde_json::Value) -> serde_json::Value {
                 name: name.into(),
                 args,
                 status: haider_protocol::item::ToolStatus::Completed,
+                activity: None,
             },
         },
     ))
@@ -934,6 +935,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
                     name: "fs_edit".into(),
                     args: serde_json::json!({"edits":[{"old":"zzz\n","new":"qqq\n"}]}),
                     status: haider_protocol::item::ToolStatus::Failed,
+                    activity: None,
                 },
             },
         ))
@@ -1482,6 +1484,7 @@ fn mv1_tool_count_uniqueness_started_completed_delta_and_command() {
         name: "fs_read".into(),
         args: serde_json::json!({}),
         status,
+        activity: None,
     };
     let command = TurnItem::CommandExecution {
         call_id: "cmd-1".into(),

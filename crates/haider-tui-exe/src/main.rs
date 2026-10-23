@@ -517,13 +517,11 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("translit")) {
         model.sanctum_tier = SanctumTier::Translit;
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        seed_display_dirs(
-            &mut model,
-            &cwd,
-            &haider_client::launch_origin::process_display_homes(),
-        );
-    }
+    seed_display_dirs(
+        &mut model,
+        std::env::current_dir().ok().as_deref(),
+        &haider_client::launch_origin::process_display_homes(),
+    );
     if !interactive {
         // The plain/CI oracle stays deterministic: no demo-store load, no
         // save, no terminal probe — `system` resolves to the dark default.
@@ -789,19 +787,22 @@ fn apply_cwd(model: &mut AppModel) {
 }
 
 fn apply_cwd_with_homes(model: &mut AppModel, homes: &[PathBuf]) {
-    let Ok(cwd) = std::env::current_dir() else {
+    apply_cwd_for_path(model, std::env::current_dir().ok().as_deref(), homes);
+}
+
+fn apply_cwd_for_path(model: &mut AppModel, cwd: Option<&std::path::Path>, homes: &[PathBuf]) {
+    seed_display_dirs(model, cwd, homes);
+    if let Some(cwd) = cwd {
+        model.cwd = cwd.display().to_string();
+    }
+}
+
+fn seed_display_dirs(model: &mut AppModel, cwd: Option<&std::path::Path>, homes: &[PathBuf]) {
+    // A removed launch directory must not discard the independent home snapshot.
+    model.display_homes = homes.to_vec();
+    let Some(cwd) = cwd else {
         return;
     };
-    apply_cwd_for_path(model, &cwd, homes);
-}
-
-fn apply_cwd_for_path(model: &mut AppModel, cwd: &std::path::Path, homes: &[PathBuf]) {
-    seed_display_dirs(model, cwd, homes);
-    model.cwd = cwd.display().to_string();
-}
-
-fn seed_display_dirs(model: &mut AppModel, cwd: &std::path::Path, homes: &[PathBuf]) {
-    model.display_homes = homes.to_vec();
     let display =
         haider_tui::live::workspace_display_path_with_homes(&cwd.to_string_lossy(), homes);
     model.launcher_dir = display.clone();

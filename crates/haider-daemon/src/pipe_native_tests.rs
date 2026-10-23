@@ -224,6 +224,7 @@ fn queued_head_delays_unresolved_tool_eof_flush() {
                 name: "shell".into(),
                 args: serde_json::json!({"cmd": "printf queued"}),
                 status: ToolStatus::Completed,
+                activity: None,
             },
         }),
     );

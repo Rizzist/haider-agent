@@ -325,6 +325,7 @@ fn plain_tool_paths_use_the_shared_account_projection() {
                 name: name.into(),
                 args,
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
         let plain = render_plain(&projection, 0, None);
@@ -397,6 +398,7 @@ fn plain_session_paths_keep_workspace_context_for_all_path_keys() {
                             name: name.into(),
                             args,
                             status: ToolStatus::InProgress,
+                            activity: None,
                         },
                     }));
                 let plain = run_demo_plain(model);
@@ -501,6 +503,7 @@ fn plain_pattern_scope_uses_session_context() {
                     name: name.into(),
                     args,
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }));
         let plain = run_demo_plain(model);

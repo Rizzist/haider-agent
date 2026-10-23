@@ -92,6 +92,7 @@ fn tool_out(
         name: name.to_owned(),
         args: serde_json::json!({ "desc": desc }),
         status,
+        activity: None,
     };
     apply(
         model,
@@ -125,6 +126,7 @@ fn settle(model: &mut AppModel, id: &str, name: &str, status: ToolStatus, desc: 
                 name: name.to_owned(),
                 args: serde_json::json!({ "desc": desc }),
                 status,
+                activity: None,
             },
         }),
     );

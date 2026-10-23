@@ -112,6 +112,12 @@ pub(crate) struct CuPresence {
     /// cancellation (zero in production). Models a slow cancel commit so the
     /// Stop-refusal path is observable before the cancellation lands.
     stop_cancel_delay: StdMutex<Duration>,
+    #[cfg(test)]
+    fixture_pointer_ack_timeout: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    fixture_conceal_ack_timeout: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    fixture_idle_clock: StdMutex<Option<(Instant, tokio::time::Instant)>>,
     me: Weak<CuPresence>,
 }
 
@@ -131,8 +137,28 @@ impl CuPresence {
             tick_interval,
             next_conceal_seq: std::sync::atomic::AtomicU64::new(CONCEAL_ACK_SEQ_START),
             stop_cancel_delay: StdMutex::new(Duration::ZERO),
+            #[cfg(test)]
+            fixture_pointer_ack_timeout: StdMutex::new(None),
+            #[cfg(test)]
+            fixture_conceal_ack_timeout: StdMutex::new(None),
+            #[cfg(test)]
+            fixture_idle_clock: StdMutex::new(None),
             me: me.clone(),
         })
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some((wall, monotonic)) = *lock(&self.fixture_idle_clock) {
+            return wall + tokio::time::Instant::now().saturating_duration_since(monotonic);
+        }
+        Instant::now()
+    }
+
+    /// Pair the presence machine's standard clock with paused Tokio timers.
+    #[cfg(test)]
+    pub(crate) fn set_idle_clock_for_test(&self) {
+        *lock(&self.fixture_idle_clock) = Some((Instant::now(), tokio::time::Instant::now()));
     }
 
     /// Delays every Stop hook's turn cancellation (tests only).
@@ -147,6 +173,18 @@ impl CuPresence {
         lock(&self.factories).insert(surface, factory);
     }
 
+    /// Real-store fixtures that press Stop must own the parked-ack window.
+    /// Production and the virtual-clock policy probes retain the 250 ms bound.
+    #[cfg(test)]
+    pub(crate) fn set_pointer_ack_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.fixture_pointer_ack_timeout) = Some(timeout);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_conceal_ack_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.fixture_conceal_ack_timeout) = Some(timeout);
+    }
+
     fn event_sink(&self, surface: PresenceSurface) -> EventSink {
         let me = self.me.clone();
         Arc::new(move |event| {
@@ -158,6 +196,7 @@ impl CuPresence {
 
     /// Starts one CU action. On success returns an optional acknowledgement
     /// the caller should await (bounded) before posting pointer input.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         &self,
         key: &str,
@@ -166,12 +205,17 @@ impl CuPresence {
         point: Option<PresencePoint>,
         stop: StopHook,
         in_flight: StopHook,
+        actor: Option<haider_tools::presence::PresenceActor>,
     ) -> Result<Option<oneshot::Receiver<()>>, PresenceRefusal> {
         let mut state = lock(&self.state);
-        let (seq, commands) =
-            state
-                .machine
-                .begin_action(key.to_owned(), surface, mark, point, Instant::now())?;
+        let (seq, commands) = state.machine.begin_action_as(
+            key.to_owned(),
+            surface,
+            mark,
+            point,
+            self.now(),
+            actor,
+        )?;
         state.hooks.insert(
             key.to_owned(),
             LeaseHooks {
@@ -200,7 +244,7 @@ impl CuPresence {
     /// The action begun for `key` finished; its idle window starts now.
     pub(crate) fn finish(&self, key: &str) {
         let mut state = lock(&self.state);
-        state.machine.finish_action(&key.to_owned(), Instant::now());
+        state.machine.finish_action(&key.to_owned(), self.now());
         if let Some(hooks) = state.hooks.get_mut(key) {
             hooks.in_flight = None;
         }
@@ -421,7 +465,7 @@ impl CuPresence {
 
     fn tick(&self) -> bool {
         let mut state = lock(&self.state);
-        let commands = state.machine.tick(Instant::now());
+        let commands = state.machine.tick(self.now());
         self.dispatch(&mut state, commands);
         let live = state.machine.has_leases();
         if !live {
@@ -571,6 +615,10 @@ pub(crate) struct PresenceLease {
     presence: Arc<CuPresence>,
     stop: StopHook,
     ended: AtomicBool,
+    /// 973-activity-icons: the subagent driving this run, named on the
+    /// overlay badge (`🖥️ Ammar is using your screen`). `None` for the main
+    /// thread, which keeps the generic badge.
+    actor: Option<haider_tools::presence::PresenceActor>,
 }
 
 /// Finishes the action when dropped, including on cancellation.
@@ -584,6 +632,13 @@ impl Drop for ActionGuard<'_> {
     }
 }
 
+/// Whether an overlay badge leads with the activity emoji (see
+/// [`PresenceLease::with_actor`]).
+pub(crate) fn overlay_emoji(override_value: Option<&str>, no_color: bool) -> bool {
+    haider_protocol::activity::ActivityDisplay::resolve(override_value, None, no_color, None)
+        == haider_protocol::activity::ActivityDisplay::Emoji
+}
+
 impl PresenceLease {
     pub(crate) fn new(presence: Arc<CuPresence>, key: String, stop: StopHook) -> Self {
         Self {
@@ -591,7 +646,28 @@ impl PresenceLease {
             presence,
             stop,
             ended: AtomicBool::new(false),
+            actor: None,
         }
+    }
+
+    /// Name the subagent driving this run on any badge it raises.
+    ///
+    /// Emoji rule (973-activity-icons, F4 — documented choice): the overlay
+    /// is a DAEMON surface shared by every client, so it cannot follow one
+    /// TUI's `/icons` preference. It uses the daemon's own environment with
+    /// the client resolution order minus the terminal heuristics:
+    /// `HAIDER_ACTIVITY_ICONS` (`emoji`/`text`/`off`) wins, else `NO_COLOR`
+    /// selects the plain label, else emoji. An auto-spawned daemon inherits
+    /// both from the client that launched it.
+    #[must_use]
+    pub(crate) fn with_actor(mut self, name: Option<String>) -> Self {
+        let override_value = std::env::var(haider_client::fleet::ACTIVITY_ICONS_ENV).ok();
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let emoji = overlay_emoji(override_value.as_deref(), no_color);
+        self.actor = name
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| haider_tools::presence::PresenceActor { name, emoji });
+        self
     }
 
     /// Lease on `presence` (the daemon-wide [`global`] in production) whose Stop cancels `run_id`
@@ -622,11 +698,15 @@ impl PresenceLease {
             point,
             Arc::clone(&self.stop),
             in_flight,
+            self.actor.clone(),
         )?;
         let guard = ActionGuard { lease: self };
         if let Some(ack) = ack {
             // Bounded: a slow or dead overlay never blocks control.
-            let _ = tokio::time::timeout(POINTER_ACK_TIMEOUT, ack).await;
+            let timeout = POINTER_ACK_TIMEOUT;
+            #[cfg(test)]
+            let timeout = lock(&self.presence.fixture_pointer_ack_timeout).unwrap_or(timeout);
+            let _ = tokio::time::timeout(timeout, ack).await;
             // Stop may have landed while we waited (it also releases the
             // ack): re-check so a stopped run's click is never posted.
             if self.presence.is_stopped(&self.key) {
@@ -689,9 +769,12 @@ impl PresenceLease {
             presence: Arc::clone(&self.presence),
             surface: PresenceSurface::Screen,
         };
+        let timeout = CONCEAL_ACK_TIMEOUT;
+        #[cfg(test)]
+        let timeout = lock(&self.presence.fixture_conceal_ack_timeout).unwrap_or(timeout);
         if let Some(mut ack) = ack
             && !matches!(
-                tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack.wait_for(|acked| *acked)).await,
+                tokio::time::timeout(timeout, ack.wait_for(|acked| *acked)).await,
                 Ok(Ok(_))
             )
         {

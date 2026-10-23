@@ -755,6 +755,7 @@ impl B {
                 name: name.to_owned(),
                 args: serde_json::json!({ "desc": desc }),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }));
         self.sleep(dur);
@@ -769,6 +770,7 @@ impl B {
                 } else {
                     ToolStatus::Failed
                 },
+                activity: None,
             },
         }));
         self.beats.push(Beat::Tokens {
@@ -788,6 +790,7 @@ impl B {
                 name: name.to_owned(),
                 args: serde_json::json!({ "desc": desc, "meta": meta }),
                 status: ToolStatus::Completed,
+                activity: None,
             },
         }));
     }
@@ -1795,6 +1798,7 @@ fn chip_tool(
                 name: name.to_owned(),
                 args: serde_json::json!({ "desc": desc }),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }),
     });
@@ -1812,6 +1816,7 @@ fn chip_tool(
                 } else {
                     ToolStatus::Failed
                 },
+                activity: None,
             },
         }),
     });
@@ -1838,6 +1843,7 @@ fn parent_tool_done(beats: &mut Vec<Beat>, id: &str, name: &str, desc: &str, met
             name: name.to_owned(),
             args: serde_json::json!({ "desc": desc, "meta": meta }),
             status: ToolStatus::Completed,
+            activity: None,
         },
     })));
 }
