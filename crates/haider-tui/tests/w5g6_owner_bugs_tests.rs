@@ -63,9 +63,7 @@ fn the_live_launcher_caps_at_four_recent_sessions() {
 #[test]
 fn a_resize_clears_the_stale_hover_highlight() {
     let mut model = launcher_model();
-    model.handle_hover(Some(Hit::AccountAdd(
-        haider_tui::app::AccountAddKind::OpenAiOAuth,
-    )));
+    model.handle_hover(Some(Hit::HelpHint));
     assert!(model.hovered.is_some(), "hover armed");
     model.handle_resize();
     assert!(

@@ -48,37 +48,29 @@ impl std::fmt::Debug for Wordmark {
 }
 
 impl Wordmark {
-    /// Query the terminal for a graphics protocol and build the wordmark, or
-    /// `None` to fall back to `crate::mark`.
-    ///
-    /// Returns `None` when the terminal offers only half-blocks (the crafted
-    /// art is cleaner there) or on any decode/query failure.
-    ///
-    /// SAFE-BY-CONSTRUCTION against the non-answering-PTY hang this codebase
-    /// guards elsewhere: `Picker::from_query_stdio` reads the capability
-    /// response under an internal timeout and degrades to half-blocks on
-    /// silence — it never blocks.
-    ///
-    /// TIMING: must run after raw mode is entered and BEFORE the input-pump
-    /// thread starts, or the pump consumes the terminal's query response.
-    ///
-    /// v0.0.15 field bug (the swallowed-first-key probe): on a terminal that
-    /// NEVER answers the query, the stdio reader's timeout path leaves the
-    /// next stdin byte to be consumed and discarded — the user's first
-    /// keypress after launch silently vanished (a leading `/` most visibly).
-    /// The query is therefore gated on ENVIRONMENT EVIDENCE of a terminal
-    /// that actually answers graphics-capability queries; everything else
-    /// skips straight to the half-block art without ever touching stdin.
+    /// Build the wordmark from an explicit terminal hint, or fall back to
+    /// the crafted half-block art. Startup must never give a capability
+    /// reader ownership of stdin: even an answering terminal can receive
+    /// user typing in the same read as its reply.
     #[must_use]
     pub fn detect() -> Option<Self> {
-        if !graphics_terminal_likely(&|name| std::env::var(name).ok()) {
-            return None;
-        }
-        let picker = Picker::from_query_stdio().ok()?;
-        let kind = picker.protocol_type();
-        if matches!(kind, ProtocolType::Halfblocks) {
-            return None;
-        }
+        let kind = graphics_protocol_from_env(&|name| std::env::var(name).ok())?;
+        let font = ratatui::crossterm::terminal::window_size()
+            .ok()
+            .filter(|size| {
+                size.columns > 0
+                    && size.rows > 0
+                    && size.width >= size.columns
+                    && size.height >= size.rows
+            })
+            .map_or(ratatui_image::FontSize::new(10, 20), |size| {
+                ratatui_image::FontSize::new(size.width / size.columns, size.height / size.rows)
+            });
+        // The library's replacement constructor reads stdin. Use the
+        // non-reading constructor until it offers an injected query reader.
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(font);
+        picker.set_protocol_type(kind);
         let image = image::load_from_memory(WORDMARK_PNG).ok()?;
         let protocol = picker.new_resize_protocol(image);
         Some(Self { protocol, kind })
@@ -103,11 +95,8 @@ impl Wordmark {
     }
 }
 
-/// Environment evidence that this terminal answers graphics-capability
-/// queries (so the query's response reader is guaranteed its answer and can
-/// never eat a user keystroke). Conservative allowlist: the terminals that
-/// speak Kitty graphics or iTerm2 inline images and ANSWER queries.
-///
+/// Environment evidence for a graphics-capable terminal. Detection itself
+/// only uses explicit protocol hints and never reads a capability response.
 /// Pure over an env lookup so tests can drive it without touching the
 /// process environment (edition 2024 makes `set_var` unsafe).
 #[must_use]
@@ -130,4 +119,54 @@ pub fn graphics_terminal_likely(env: &dyn Fn(&str) -> Option<String>) -> bool {
         return true;
     }
     false
+}
+
+fn graphics_protocol_from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<ProtocolType> {
+    if env("KITTY_WINDOW_ID").is_some()
+        || env("TERM").is_some_and(|term| term.contains("kitty") || term.contains("ghostty"))
+        || env("TERM_PROGRAM").as_deref() == Some("ghostty")
+    {
+        return Some(ProtocolType::Kitty);
+    }
+    if env("WEZTERM_EXECUTABLE").is_some()
+        || env("ITERM_SESSION_ID").is_some()
+        || env("TERM_PROGRAM").is_some_and(|program| {
+            matches!(program.as_str(), "iTerm.app" | "WezTerm" | "rio" | "vscode")
+        })
+    {
+        return Some(ProtocolType::Iterm2);
+    }
+    None
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_graphics_hints_choose_a_protocol_without_a_stdin_reader() {
+        for (name, value, protocol) in [
+            ("TERM", "xterm-kitty", ProtocolType::Kitty),
+            ("TERM", "xterm-ghostty", ProtocolType::Kitty),
+            ("KITTY_WINDOW_ID", "fixture", ProtocolType::Kitty),
+            ("TERM_PROGRAM", "ghostty", ProtocolType::Kitty),
+            ("TERM_PROGRAM", "iTerm.app", ProtocolType::Iterm2),
+            ("TERM_PROGRAM", "WezTerm", ProtocolType::Iterm2),
+            ("WEZTERM_EXECUTABLE", "fixture", ProtocolType::Iterm2),
+            ("ITERM_SESSION_ID", "fixture", ProtocolType::Iterm2),
+            ("TERM_PROGRAM", "rio", ProtocolType::Iterm2),
+            ("TERM_PROGRAM", "vscode", ProtocolType::Iterm2),
+        ] {
+            assert_eq!(
+                graphics_protocol_from_env(&|key| (key == name).then(|| value.into())),
+                Some(protocol)
+            );
+        }
+        for terminal in ["tmux-256color", "xterm-256color", "dumb"] {
+            assert_eq!(
+                graphics_protocol_from_env(&|key| (key == "TERM").then(|| terminal.into())),
+                None
+            );
+        }
+    }
 }

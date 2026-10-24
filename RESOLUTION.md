@@ -23,3 +23,29 @@ After resolving the second merge and adding the two delayed-provider child contr
 Continuation on 2026-10-20 merged fresh wave `56e4a29a3bfa58f422f705302b28b0a15648531b`. Only `test-baseline.txt` conflicted. The imported macOS packaging changes remain intact. The existing verified xtask executable (unchanged xtask sources) actually re-derived **6,816** under the build-slot wrapper; neither parent baseline was selected. The continuation receipt is `17-sol-r16-cap2/gates/integrated-baseline.json`.
 
 The continuation's complete matrix found that the source-test reachability guard could not see the partial-write module declared inside `accounts_tests.rs`, although its 15 tests had executed in the daemon library. The module is now declared directly in the existing `cfg(test)` section of `accounts.rs`. Its explicit fixture imports use account-module-only visibility. The guard, test bodies and baseline count remain intact; the failed receipt is retained and the repaired candidate is checked separately.
+
+---
+
+# Wave 973 merge resolution
+
+The round 9 merge integrates `a8b218079422dd0a70c6997a56fc6a4f5d4b051f` into the terminal UI lane based on `a97534c62a6005545df9796db68a475a14fc9ffd`.
+
+In `session::chip_apply`, the envelope remains authoritative for the event timestamp and activity provenance, including replay, background and parked branch routes. The lane's question creation and matching answer/close updates remain before transcript reduction, so the previous open menu can still be matched. Neither side's behavior is discarded.
+
+The keyboard input tests now construct real child envelopes instead of passing bare timestamps to the changed API. The baseline was re-derived as **6,950 tests** with `cargo run --locked -p xtask -- test-count --update` on the resolved tree. It is checked again on the committed merged candidate.
+
+Round 9 also repairs visible child question input ownership, retires old keyboard input after accepted external editor writes, carries remote connection attempt identity through request/reply mapping and keyboard input handling, and conditions paste-specific decoder tests on the paste feature. The pre-existing overlay text observation F4 is deferred to lane 974 as instructed.
+
+The continuation also integrates fresh wave `b3aeb633b9f24c51d07cb901bb532ad907b71782` after its file-lock and CLI lifecycle updates. The only new conflict is the shared stress-case catalog: retain all thirty appended wave rows and this lane's `tui-frame-publication` row, preserving the six-column format and unique case IDs. Place the frame-publication row with the existing TUI cases so future wave additions at the end do not conflict with this lane's appended row. The TUI repair code remains unchanged. The test baseline was re-derived as **6986 tests** from this integrated source before committing.
+
+The next continuation integrates wave `56e4a29a3bfa58f422f705302b28b0a15648531b`. Its only additions since the prior merged wave are macOS installer identity checks and their Python tests. The sole merge conflict is the shared baseline; xtask re-derived it as **6986 tests** on the integrated tree. All Rust sources, Cargo manifests, Cargo.lock, vendor sources and Rust test drivers remain byte-identical to `6da30807`; source equivalence and evidence reuse are recorded with the continuation receipts.
+
+## Catalog fixes round 17 integration
+
+Merged wave `6fa2a72d4199b798834cee2d72c5fd2767a6373b` after implementing C5. Both lanes' resolution records remain above. The RPC public exports retain the catalog coordinate helpers and the incoming `ShellSetupErrorWire`. The merged baseline is derived by xtask before the merge commit; final gates run on that merge commit.
+
+The actual merged `xtask test-count --update` derived **7198** source test markers. The round 17 `merged-preparation` receipt records the command and exit status.
+
+The merged all-target clippy gate found two imported input-dwell fixtures missing the catalog fields introduced by this lane. Both now use the existing `metadata_provider` helper, which records their declared Static rows in `static_models`, leaves `configured_models` empty and has no fetched `catalog_scope`. All input assertions remain intact; source marker count stays 7,198.
+
+Round 17 also carries the recorded coordinate into account-switch cache preflight. A raw creation alias otherwise reaches the exact pricing registry and unnecessarily requires an unknown-cost approval. A native wire-request regression covers the recorded alias, an exact-model control and an unlisted-literal control; it also checks that preflight preserves the public model spelling.

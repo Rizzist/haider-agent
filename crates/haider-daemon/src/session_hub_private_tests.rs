@@ -8273,3 +8273,157 @@ async fn customprov_models_probe_requires_control_and_keeps_keyed_probes_local()
     hub.shutdown().await.expect("probe hub stops");
     store.close().await.expect("probe store closes");
 }
+
+/// A current model's budget preflight must use the admitted coordinate while
+/// keeping its public creation spelling. Restoring the raw model argument in
+/// account_set_active makes the recorded alias require an unknown-cost approval.
+#[tokio::test]
+async fn c5_account_switch_cache_preflight_uses_the_recorded_coordinate() {
+    use haider_protocol::cache::{CachePolicyMode, CachePolicySettingsV1};
+    use haider_protocol::provider::{Usage, UsageRequestKind, UsageScope, UsageSource};
+
+    let canonical = "claude-sonnet-4-6";
+    for (index, (literal, coordinate, should_queue)) in [
+        (canonical, None, true),
+        ("CLAUDE_SONNET_4_6", Some(canonical), true),
+        ("literal-unpriced-model", None, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = tempfile::tempdir().expect("cache preflight profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let session = SessionId::new(format!("c5-account-cache-{index}"));
+        let mut create = create_command(&session, &format!("c5-account-cache-{index}"));
+        create.provider = "anthropic".into();
+        create.model = literal.into();
+        create.resolved_model = coordinate.map(str::to_owned);
+        create.cache_policy = CachePolicySettingsV1 {
+            mode: CachePolicyMode::Balanced,
+            cold_cost_threshold_microusd: 1_000_000_000,
+        };
+        store.create_session(create).await.expect("typed session");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let mut usage = run_payload_envelope(
+            &session,
+            &RunId::new("c5-cache-history"),
+            store.worker_generation(),
+            "c5-cache-history",
+            EventPayload::Usage(Usage {
+                input: 4_096,
+                output: 0,
+                reasoning: 0,
+                cached: 0,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+                normalized: None,
+                scope: Some(UsageScope {
+                    provider: "anthropic".into(),
+                    model: coordinate.unwrap_or(literal).into(),
+                    account_scope: Some(haider_protocol::ids::CredentialAlias::new(
+                        "old-anthropic",
+                    )),
+                    auth_scope: "api_key".into(),
+                    api_family: None,
+                    effort: None,
+                    speed: None,
+                    cache_epoch: "c5-cache-history".into(),
+                    stable_prefix_tokens: 4_096,
+                    cache_boundaries: None,
+                    request_kind: UsageRequestKind::MainTurn,
+                    run: None,
+                    agent: None,
+                    prefix_digests: None,
+                }),
+                cache_cost: None,
+                request: None,
+            }),
+        );
+        usage.run_id = None;
+        haider_core::StoreHandle::append(&store, &mut [usage])
+            .await
+            .expect("cache scope commits");
+        assert!(
+            crate::cache_policy::latest_main_cache_scope(&store, &session)
+                .await
+                .expect("cache scope")
+                .is_some(),
+            "the preflight must actually inspect a cached prefix"
+        );
+        let old = haider_protocol::credential::CredentialDescriptor {
+            alias: haider_protocol::ids::CredentialAlias::new("old-anthropic"),
+            provider: "anthropic".into(),
+            base_url: None,
+            auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+            identity: "synthetic cache account".into(),
+            status: haider_protocol::credential::CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+            incarnation: 0,
+            credential_digest: None,
+        };
+        let new = haider_protocol::credential::CredentialDescriptor {
+            alias: haider_protocol::ids::CredentialAlias::new("new-anthropic"),
+            active: false,
+            ..old.clone()
+        };
+        let mut summary = provider_summary("anthropic");
+        summary.models = vec![canonical.into()];
+        summary.static_models = summary.models.clone();
+        let (login, mut queued) = tokio::sync::mpsc::channel(1);
+        hub.install_accounts(crate::accounts::AccountsFacade {
+            login: Some(login),
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+            management: crate::accounts::ManagementSnapshot::new(0, vec![old, new], vec![summary]),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            sources: Arc::new(Mutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts");
+        let connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+                Arc::new(CapturingFrameSink::default()),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("connection");
+        connection
+            .request(
+                RequestId::new("c5-account-switch"),
+                RequestBody::AccountSetActive {
+                    command_id: haider_rpc::CommandId::new("c5-account-switch"),
+                    alias: "new-anthropic".into(),
+                    confirm_new_epoch: false,
+                },
+            )
+            .await
+            .expect("preflight routes");
+        assert_eq!(
+            matches!(
+                queued.try_recv(),
+                Ok(crate::accounts::AccountCommand::SetActive(_))
+            ),
+            should_queue,
+            "C5 account-switch cache preflight uses the admitted coordinate: {literal}"
+        );
+        assert_eq!(
+            store
+                .session_metadata(&session)
+                .await
+                .expect("metadata")
+                .expect("typed metadata")
+                .model,
+            literal,
+            "preflight preserves the public literal"
+        );
+        drop(connection);
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+}

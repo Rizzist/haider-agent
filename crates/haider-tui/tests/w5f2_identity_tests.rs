@@ -3837,7 +3837,10 @@ fn c5_creation_literal_binds_the_recorded_coordinate_for_tui_capabilities() {
             "selection_epoch":30, "model_catalog_key":"synthetic-producer-42"
         }))
         .expect("recorded literal creation");
-    assert!(model.note_session_catalog_metadata(&session, &metadata));
+    assert!(
+        model.note_session_catalog_metadata(&session, &metadata),
+        "C5 TUI binds the admitted coordinate"
+    );
     assert_eq!(
         metadata.model, "SHARED_MODEL",
         "public creation spelling is preserved"

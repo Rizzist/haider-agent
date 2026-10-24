@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use haider_accounts::Vault;
 
+pub(crate) use runtime::validate_pty_request;
 pub(crate) use runtime::{SshExecRequest, SshOutput, SshPtyRequest, SshRuntime};
 pub(crate) use store::{
     PinnedHostKey, SshAuth, SshError, SshProfile, SshProfileStore, SshScope, SshTarget,
@@ -37,3 +38,15 @@ mod tests;
 #[cfg(test)]
 #[path = "ssh_fixture_tests.rs"]
 mod fixture_tests;
+
+#[cfg(test)]
+#[path = "ssh_cancel_tests.rs"]
+mod cancel_tests;
+
+#[cfg(test)]
+#[path = "ssh_setup_failure_tests.rs"]
+mod setup_failure_tests;
+
+#[cfg(test)]
+#[path = "ssh_setup_timeout_tests.rs"]
+mod setup_timeout_tests;
