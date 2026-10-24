@@ -682,6 +682,7 @@ class ImageIdentityTests(unittest.TestCase):
             'duplicate field': b'f3\0tREG\0D0x10\0i42\0i42\0\n',
             'empty field': b'f3\0tREG\0\0D0x10\0i42\0\n',
             'unterminated field': own + b'f7\0tREG\0D0x10\0i4',
+            'unterminated trailing junk': own + b'nignored',
             'process set with file fields': b'p974\0f3\0tREG\0D0x10\0i42\0\n',
         }
         for name, tail in uncertain.items():
