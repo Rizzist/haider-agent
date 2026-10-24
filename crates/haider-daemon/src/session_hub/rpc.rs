@@ -15139,7 +15139,10 @@ impl HubConnection {
         };
         let incarnation =
             serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
-        let _fence = monitor.stop_fences().fence(&record.child_session_id);
+        let _fence = monitor
+            .fence_stop_incarnation(&self.hub, &incarnation, &admission)
+            .await
+            .map_err(SessionHubError::Store)?;
         drop(admission);
         let prefix = format!(
             "agent-cancel-{}",
@@ -15157,7 +15160,7 @@ impl HubConnection {
             Err(error) => return self.respond_turn_error(request_id, error),
         };
         let cancelled = match delegation
-            .cancel_single_subagent_incarnation(&record, primary, &prefix, Some(incarnation))
+            .cancel_single_subagent_incarnation(&record, primary, &prefix, incarnation)
             .await
         {
             Ok(cancelled) => cancelled,
@@ -15292,18 +15295,25 @@ impl HubConnection {
         };
         let targets: Vec<crate::delegation::StopIncarnation> =
             serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
-        let _fences = targets
+        let mut fences = Vec::new();
+        for target in targets
             .iter()
             .filter(|target| target.session_id != session_id)
-            .map(|target| monitor.stop_fences().fence(&target.session_id))
-            .collect::<Vec<_>>();
+        {
+            fences.push(
+                monitor
+                    .fence_stop_incarnation(&self.hub, target, &admission)
+                    .await
+                    .map_err(SessionHubError::Store)?,
+            );
+        }
         drop(admission);
         let prefix = format!(
             "agent-cancel-all-{}",
             &crate::delegation::stable_digest(&[command_id.as_str(), session_id.as_str()])[..24]
         );
         let stopped = delegation
-            .stop_subagent_tree_incarnations(root, &prefix, Some(&targets))
+            .stop_subagent_tree_incarnations(root, &prefix, &targets)
             .await
             .map_err(SessionHubError::Store)?;
         self.commit_stop_operation(
@@ -16452,6 +16462,8 @@ impl HubConnection {
                 None,
             );
         };
+        #[cfg(test)]
+        stop_boundary_hook::after_attempt(&found.session_id).await;
         let _operation = self.hub.inner.stop_operations.lock().await;
         let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
         let tree = crate::delegation::SubagentTreeRoot::Run {
@@ -16485,6 +16497,8 @@ impl HubConnection {
             Err(error) => return self.respond_turn_error(request_id, error),
         }
         let monitor = self.hub.inner_monitor();
+        #[cfg(test)]
+        stop_admission_boundary_hook::after_attempt(&found.session_id).await;
         let admission = monitor.admission_lock().await;
         let targets = delegation
             .stop_incarnations(&tree, &admission)
@@ -16513,19 +16527,22 @@ impl HubConnection {
         };
         let targets: Vec<crate::delegation::StopIncarnation> =
             serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
-        let _fences = targets
-            .iter()
-            .filter(|target| {
-                if target.session_id == found.session_id {
-                    // A terminal anchor can share its session with a later
-                    // main incarnation; that later run is outside this claim.
-                    matches!(scope, Scope::All) && !found.state.is_terminal()
-                } else {
-                    matches!(scope, Scope::All | Scope::Subagents)
-                }
-            })
-            .map(|target| monitor.stop_fences().fence(&target.session_id))
-            .collect::<Vec<_>>();
+        let mut fences = Vec::new();
+        for target in &targets {
+            let owned = if target.session_id == found.session_id {
+                matches!(scope, Scope::All) && !found.state.is_terminal()
+            } else {
+                matches!(scope, Scope::All | Scope::Subagents)
+            };
+            if owned {
+                fences.push(
+                    monitor
+                        .fence_stop_incarnation(&self.hub, target, &admission)
+                        .await
+                        .map_err(SessionHubError::Store)?,
+                );
+            }
+        }
         drop(admission);
         let (status, terminal_seq) =
             if matches!(scope, Scope::Subagents) || found.state.is_terminal() {
@@ -16574,7 +16591,7 @@ impl HubConnection {
         let mut subagents = crate::delegation::SubagentStopSummary::default();
         if matches!(scope, Scope::All | Scope::Subagents) {
             subagents = delegation
-                .stop_subagent_tree_incarnations(tree.clone(), &prefix, Some(&targets))
+                .stop_subagent_tree_incarnations(tree.clone(), &prefix, &targets)
                 .await
                 .map_err(SessionHubError::Store)?;
         }
@@ -21601,3 +21618,11 @@ mod run_identity_tests {
 
 #[path = "provider_rebind.rs"]
 mod provider_rebind;
+
+#[cfg(test)]
+#[path = "../completion_boundary_hook_tests.rs"]
+pub(super) mod stop_boundary_hook;
+
+#[cfg(test)]
+#[path = "../completion_boundary_hook_tests.rs"]
+pub(super) mod stop_admission_boundary_hook;

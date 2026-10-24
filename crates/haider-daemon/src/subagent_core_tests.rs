@@ -1,11 +1,11 @@
 #![allow(clippy::expect_used)]
 
-/// An external monitor registration committed after the first listing must
-/// be removed by the stop's final drain. The pause is test-only and fixes the
+/// A client monitor registered after the immutable stop claim belongs to
+/// later independent work and must survive both stop paths. The pause is test-only and fixes the
 /// ordering, so this does not depend on scheduler timing.
 #[tokio::test]
 #[cfg(unix)]
-async fn stop_final_drain_removes_registration_after_first_listing_in_both_paths() {
+async fn stop_final_drain_preserves_independent_registration_after_first_listing_in_both_paths() {
     for scope in ["tree", "named"] {
         let harness = start_parked_child_with_wait_budgets(
             &format!("final-drain-{scope}"),
@@ -56,8 +56,8 @@ async fn stop_final_drain_removes_registration_after_first_listing_in_both_paths
                     .await
                     .expect("tree stop");
                 assert_eq!(
-                    stopped.monitors_removed, 2,
-                    "first listing and final drain each remove one monitor"
+                    stopped.monitors_removed, 1,
+                    "only the captured monitor is removed"
                 );
             } else {
                 let request_json = serde_json::json!({
@@ -146,14 +146,18 @@ async fn stop_final_drain_removes_registration_after_first_listing_in_both_paths
             .expect("stop completed")
             .expect("stop task");
         timeout(Duration::from_secs(15), async {
+            while monitor.stop_fences().session_fenced(&harness.child.child_session_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             loop {
                 let listed = monitor.client_list(&harness.hub, harness.child.child_session_id.clone()).await;
-                if matches!(listed.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.is_empty()) {
+                if matches!(listed.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.len() == 1) {
+                    assert!(!monitor.stop_fences().session_fenced(&harness.child.child_session_id), "check after settlement");
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("final drain removed late client monitor");
+        }).await.expect("independent client monitor survives final drain");
         harness.manager.shutdown().await.expect("manager shutdown");
         harness.hub.shutdown().await.expect("hub shutdown");
         harness.store.close().await.expect("store close");

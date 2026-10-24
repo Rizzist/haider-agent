@@ -204,17 +204,21 @@ pub(crate) async fn wake_monitor(
     report: MonitorReport,
 ) -> Result<MonitorDeliveryReceipt, MonitorError> {
     let service = hub.inner_monitor();
-    let stop_epoch = service.stop_fences().epoch(&report.session_id);
+    let stop_epoch = service
+        .stop_fences()
+        .epoch(&report.session_id, &report.monitor_id);
     let _guard = service.completion_lock().await;
     if service.completion_retired(&report.session_id) {
         return Ok(retained_receipt());
     }
     let journal = load(hub, &report.session_id).await.map_err(store_error)?;
     let id = format!("monitor:{}", report.report_id);
-    // An explicit stop of this subagent is removing its monitors: a report
-    // that fires meanwhile must not wake the stopped session into new work
-    // (Astra 13-final B1). It is dismissed, never retried later.
-    let stopping = service.stop_fences().session_fenced(&report.session_id);
+    // An explicit stop owns captured watches. Their reports must not wake
+    // the ended work (Astra 13-final B1): dismiss them without retrying later.
+    // Independent watches in the same session remain admissible.
+    let stopping = service
+        .stop_fences()
+        .report_fenced(&report.session_id, &report.monitor_id);
     let Some(obligation) = journal.projection.pending.get(&id) else {
         // Direct transport seam callers predate the outbox. Settled reports
         // must never reach this fallback; their durable source proves ownership.
@@ -302,7 +306,11 @@ async fn admit_current_monitor_report(
     // re-read that durable truth under the same mutex as the actual admission.
     let journal = load(hub, &report.session_id).await.map_err(store_error)?;
     let id = format!("monitor:{}", report.report_id);
-    if service.stop_fences().epoch(&report.session_id) != stop_epoch {
+    if service
+        .stop_fences()
+        .epoch(&report.session_id, &report.monitor_id)
+        != stop_epoch
+    {
         if !journal.projection.is_settled(&id) {
             if let Some(obligation) = journal.projection.pending.get(&id) {
                 if matches!(
@@ -336,7 +344,9 @@ async fn admit_current_monitor_report(
             })
     });
     if service.completion_retired(&report.session_id)
-        || service.stop_fences().session_fenced(&report.session_id)
+        || service
+            .stop_fences()
+            .report_fenced(&report.session_id, &report.monitor_id)
         || journal.projection.is_settled(&id)
         || !valid
     {

@@ -2369,6 +2369,61 @@ impl MonitorService {
         }
     }
 
+    /// Resolve watch ownership from the immutable claim and original
+    /// registration envelopes. Updates cannot transfer a captured watch.
+    async fn stop_owned_monitor_ids(
+        &self,
+        hub: &SessionHub,
+        target: &crate::delegation::StopIncarnation,
+    ) -> Result<HashSet<String>, haider_protocol::error::HaiderError> {
+        let session = &target.session_id;
+        let mut owned = target.monitors.iter().cloned().collect::<HashSet<_>>();
+        let mut cursor = 0;
+        loop {
+            let page = hub
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Monitor,
+                    session,
+                    cursor,
+                    256,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |e| e.seq);
+            for event in page {
+                if event
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|run| target.runs.contains(run))
+                    && let Some(MonitorJournalEvent::MonitorRegistered { registration }) =
+                        MonitorJournalEvent::from_value(&event.payload)
+                {
+                    owned.insert(registration.monitor_id);
+                }
+            }
+        }
+        Ok(owned)
+    }
+
+    /// Admission is held across claim recovery and fence installation, so
+    /// neither a registration nor a report can cross this ownership snapshot.
+    pub(crate) async fn fence_stop_incarnation(
+        &self,
+        hub: &SessionHub,
+        target: &crate::delegation::StopIncarnation,
+        _admission: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<crate::monitor_stop_fence::MonitorStopFence, haider_protocol::error::HaiderError>
+    {
+        let monitors = self.stop_owned_monitor_ids(hub, target).await?;
+        Ok(self.stop_fences().fence(
+            &target.session_id,
+            &target.runs,
+            &monitors.into_iter().collect::<Vec<_>>(),
+        ))
+    }
+
     /// Durably removes the monitors owned by a claimed stop incarnation.
     /// A later independent run's registrations are never retargeted by retry.
     pub(crate) async fn remove_for_stop_incarnation(
@@ -2376,41 +2431,9 @@ impl MonitorService {
         hub: &SessionHub,
         session: &SessionId,
         command_prefix: &str,
-        incarnation: Option<&crate::delegation::StopIncarnation>,
+        incarnation: &crate::delegation::StopIncarnation,
     ) -> Result<u64, haider_protocol::error::HaiderError> {
-        let mut owned =
-            incarnation.map(|target| target.monitors.iter().cloned().collect::<HashSet<_>>());
-        // Late registrations belong to the run that registered them, not to
-        // a later message in the same child session. Fences block further
-        // registration before this scan; the final drain uses the same IDs.
-        if let (Some(target), Some(owned)) = (incarnation, owned.as_mut()) {
-            let mut cursor = 0;
-            loop {
-                let page = hub
-                    .read_internal_session_for(
-                        haider_platform::phase_trace::StoreReadCaller::Monitor,
-                        session,
-                        cursor,
-                        256,
-                    )
-                    .await?;
-                if page.is_empty() {
-                    break;
-                }
-                cursor = page.last().map_or(cursor, |e| e.seq);
-                for event in page {
-                    if event
-                        .run_id
-                        .as_ref()
-                        .is_some_and(|run| target.runs.contains(run))
-                        && let Some(MonitorJournalEvent::MonitorRegistered { registration }) =
-                            MonitorJournalEvent::from_value(&event.payload)
-                    {
-                        owned.insert(registration.monitor_id);
-                    }
-                }
-            }
-        }
+        let owned = self.stop_owned_monitor_ids(hub, incarnation).await?;
         let listed = self.client_list(hub, session.clone()).await;
         let haider_rpc::MonitorListOutcomeWire::Listed { monitors } = listed.outcome else {
             return Err(haider_protocol::error::HaiderError::new(
@@ -2421,10 +2444,7 @@ impl MonitorService {
         };
         let mut removed = 0_u64;
         for monitor in monitors {
-            if owned
-                .as_ref()
-                .is_some_and(|ids| !ids.contains(&monitor.monitor_id))
-            {
+            if !owned.contains(&monitor.monitor_id) {
                 continue;
             }
             let command_id = haider_rpc::CommandId::new(format!(
@@ -2465,10 +2485,7 @@ impl MonitorService {
             let Some(report) = journal.reports.get(&obligation.obligation_id) else {
                 continue;
             };
-            if owned
-                .as_ref()
-                .is_some_and(|ids| !ids.contains(&report.monitor_id))
-            {
+            if !owned.contains(&report.monitor_id) {
                 continue;
             }
             crate::completion::append(

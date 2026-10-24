@@ -3948,6 +3948,19 @@ async fn full_internal_catch_up_receiver_reregisters_and_resumes_from_store() {
 
     append_one(&hub, &session_id, generation, "fills-one-slot-buffer").await;
     append_one(&hub, &session_id, generation, "overflows-one-slot-buffer").await;
+    // Append acknowledges durability before synchronous fanout. Keep replay
+    // parked until publication really filled/overflowed the one-slot receiver;
+    // otherwise it can drain seq 3 before seq 4 is published and never need a
+    // re-registration (so waiting specifically for AttachCaughtUp(4) hangs).
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if matches!(control.observed.recv().await,
+                Some(HubObservation::Published { session_id: ref published, through_seq: 4 }) if published == &session_id)
+            {
+                break;
+            }
+        }
+    }).await.expect("overflow publication observed before releasing replay");
     control.release();
 
     let mut delivered = Vec::new();

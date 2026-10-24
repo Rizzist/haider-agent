@@ -8457,3 +8457,269 @@ async fn drain_cancellation_is_lease_fenced_and_preserves_terminal_done() {
         store.close().await.expect("store close");
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn r7_stop_lookup_must_not_fence_a_successor_after_queue_wait() {
+    r7_check_stop_lookup_epoch(true, false).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn r7_terminal_before_lookup_preserves_successor_epoch() {
+    r7_check_stop_lookup_epoch(false, false).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn r7_stop_lookup_must_not_fence_a_successor_after_admission_wait() {
+    r7_check_stop_lookup_epoch(true, true).await;
+}
+#[cfg(unix)]
+async fn r7_check_stop_lookup_epoch(finish_while_waiting: bool, wait_on_admission: bool) {
+    let root = tempfile::tempdir().expect("store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new(format!(
+        "r7-stop-lookup-session-{finish_while_waiting}-{wait_on_admission}"
+    ));
+    let old = RunId::new("r7-stop-lookup-old");
+    let next = RunId::new("r7-stop-lookup-next");
+    let generation = hub.worker_generation();
+    hub.create_internal_session(create_command(&session, "r7-create"))
+        .await
+        .expect("session");
+    hub.accept_turn(accept_command(&session, &old, generation, "r7-old"))
+        .await
+        .expect("old run");
+    let mut configured =
+        run_state_envelope(&session, &old, generation, "r7-headless", RunState::Queued);
+    *configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
+        agent_spawn: None,
+        continuation_of: None,
+        cwd: root.path().display().to_string(),
+        provider: "fake".into(),
+        model: "fake-v1".into(),
+        max_output_tokens: 64,
+        effort: None,
+        fast: false,
+        seed: None,
+        permission_overrides: Default::default(),
+        trust_hooks: false,
+        budget: RunBudgetV1::default(),
+        request_deadline_unix_ms: None,
+        replay_of: None,
+    })
+    .to_payload_value()
+    .expect("config");
+    hub.append(&mut [
+        configured,
+        run_state_envelope(&session, &old, generation, "r7-stream", RunState::Streaming),
+    ])
+    .await
+    .expect("configure old");
+    if !finish_while_waiting {
+        hub.append(&mut [run_state_envelope(
+            &session,
+            &old,
+            generation,
+            "r7-done",
+            RunState::Done,
+        )])
+        .await
+        .expect("old completes");
+        hub.accept_turn(accept_command(&session, &next, generation, "r7-next"))
+            .await
+            .expect("successor");
+    }
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let registered = hub
+        .inner_monitor()
+        .client_register(
+            &hub,
+            crate::monitor::MonitorClientRegistrationRequest {
+                command_id: haider_rpc::CommandId::new("r7-successor-monitor-register"),
+                session_id: session.clone(),
+                worker_generation: generation,
+                source: haider_rpc::MonitorSourceWire::Timer {
+                    interval_ms: 3_600_000,
+                },
+                filter: None,
+                action: haider_rpc::MonitorActionWire {
+                    report: true,
+                    follow_up: Some("successor follow-up".into()),
+                },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            },
+        )
+        .await;
+    let monitor_id = match registered.outcome {
+        haider_rpc::MonitorRegisterOutcomeWire::Registered { monitor } => monitor.monitor_id,
+        outcome => panic!("successor monitor registration failed: {outcome:?}"),
+    };
+    let monitor_for_boundary = hub.inner_monitor();
+    let serial = if wait_on_admission {
+        monitor_for_boundary.admission_lock().await
+    } else {
+        hub.inner.stop_operations.lock().await
+    };
+    let (lookup, lookup_resume) = if wait_on_admission {
+        super::rpc::stop_admission_boundary_hook::install(&session)
+    } else {
+        super::rpc::stop_boundary_hook::install(&session)
+    };
+    let old_for_request = old.clone();
+    let stop = tokio::spawn(async move {
+        connection
+            .request(
+                haider_rpc::RequestId::new("r7-stop"),
+                haider_rpc::RequestBody::HeadlessRunStop {
+                    command_id: haider_rpc::CommandId::new("r7-stop"),
+                    run_id: old_for_request,
+                    scope: haider_rpc::RunStopScopeWire::All,
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, lookup)
+        .await
+        .expect("stop lookup reached")
+        .expect("lookup barrier");
+    lookup_resume.send(()).expect("resume lookup");
+    if finish_while_waiting {
+        hub.append(&mut [run_state_envelope(
+            &session,
+            &old,
+            generation,
+            "r7-done",
+            RunState::Done,
+        )])
+        .await
+        .expect("old completes while stop waits");
+        hub.accept_turn(accept_command(&session, &next, generation, "r7-next"))
+            .await
+            .expect("successor while stop waits");
+    }
+    let fences = hub.inner_monitor().stop_fences().clone();
+    let before = fences.epoch(&session, &monitor_id);
+    let report = crate::monitor::MonitorReport {
+        report_id: "r7-successor-report".into(),
+        monitor_id: monitor_id.clone(),
+        session_id: session.clone(),
+        branch_id: None,
+        agent_id: None,
+        source: haider_tools::MonitorSourceKind::Timer,
+        occurrence: haider_tools::MonitorOccurrence::Every,
+        status: crate::monitor::MonitorReportStatus::Matched,
+        events: vec![],
+        coalesced_count: 1,
+        omitted_count: 0,
+        action: haider_tools::MonitorAction {
+            report: true,
+            follow_up: Some("successor follow-up".into()),
+        },
+    };
+    let mut pending = run_state_envelope(
+        &session,
+        &next,
+        generation,
+        "r7-pending-report",
+        RunState::Queued,
+    );
+    *pending.payload = serde_json::json!({"type":"monitor_report_pending","pending":{"report":&report,"queue_order":1,"queued_at_ms":1}});
+    hub.append(&mut [pending])
+        .await
+        .expect("persist successor monitor report");
+    let before_journal = crate::completion::load(&hub, &session)
+        .await
+        .expect("initial outbox");
+    assert!(
+        before_journal
+            .projection
+            .pending
+            .contains_key("monitor:r7-successor-report"),
+        "successor report must have a durable obligation"
+    );
+    let (arrived, resume) = crate::completion::astra22_boundary_hook::install(&session);
+    let wake_hub = hub.clone();
+    let wake =
+        tokio::spawn(async move { crate::completion::wake_monitor(&wake_hub, report).await });
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, arrived)
+        .await
+        .expect("current report reaches admission")
+        .expect("barrier");
+    drop(serial);
+    stop.await.expect("stop joins").expect("stop response");
+    let after = fences.epoch(&session, &monitor_id);
+    resume.send(()).expect("release successor report");
+    let delivery = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, wake)
+        .await
+        .expect("delivery finishes")
+        .expect("delivery joins");
+    let live = crate::delegation::DelegationHandle::new(hub.clone())
+        .live_session_runs(&session)
+        .await
+        .expect("live runs");
+    assert!(
+        live.contains(&next),
+        "the successor must remain live; this check is about its report, not successor cancellation"
+    );
+    let journal = crate::completion::load(&hub, &session)
+        .await
+        .expect("completion journal");
+    let dismissed=journal.events.iter().filter(|e| matches!(e,haider_protocol::completion::CompletionEvent::CompletionDismissed{obligation_id,..} if obligation_id=="monitor:r7-successor-report")).count();
+    eprintln!(
+        "r7 schedule finish_while_waiting={finish_while_waiting}; wait_on_admission={wait_on_admission}; epoch {before}->{after}; dismissed={dismissed}; delivery={delivery:?}"
+    );
+    let frames = sink.0.lock().expect("frames").clone();
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            WireFrame::Response {
+                body: haider_rpc::ResponseBody::HeadlessRunStop {
+                    status: haider_rpc::CancelStatus::AlreadyTerminal,
+                    ..
+                },
+                ..
+            }
+        )),
+        "{frames:?}"
+    );
+    hub.shutdown().await.expect("hub stop");
+    store.close().await.expect("store closes");
+    let reopened = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen durable store");
+    let persisted = reopened
+        .read(&session, 0, 1024)
+        .await
+        .expect("reopened journal");
+    let persisted_dismissed=persisted.iter().filter(|e| matches!(e.payload.decode::<haider_protocol::completion::CompletionEvent>(),Ok(haider_protocol::completion::CompletionEvent::CompletionDismissed{obligation_id,..}) if obligation_id=="monitor:r7-successor-report")).count();
+    reopened.close().await.expect("reopened store closes");
+    eprintln!("r7 reopened persisted dismissals={persisted_dismissed}");
+    assert_eq!(
+        persisted_dismissed, dismissed,
+        "live and reopened completion truth must agree"
+    );
+    assert_eq!(
+        dismissed, 0,
+        "stop of the completed original run durably dismissed the successor monitor report"
+    );
+    assert_eq!(
+        after, before,
+        "stop of the completed original run changed the successor session's monitor epoch; a report that captured the old epoch is now durably dismissed"
+    );
+}
+
+#[cfg(unix)]
+#[path = "stop_successor_tests.rs"]
+mod stop_successor_tests;

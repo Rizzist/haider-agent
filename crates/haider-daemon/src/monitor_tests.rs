@@ -707,7 +707,7 @@ async fn stopped_run_registration_is_rejected_after_fence_drop_until_terminal_ob
         .await
         .unwrap();
     let fences = world.hub.inner_monitor().stop_fences().clone();
-    let fence = fences.fence(&world.session);
+    let fence = fences.fence(&world.session, std::slice::from_ref(&world.run), &[]);
     fences.mark_run_stopped(&world.session, &world.run);
     drop(fence);
     assert!(!fences.session_fenced(&world.session));
@@ -787,7 +787,11 @@ async fn stopped_run_registration_is_rejected_after_fence_drop_until_terminal_ob
 async fn monitor_registration_in_other_session_succeeds_while_stop_fence_is_held() {
     let world = MonitorWorld::new("unrelated-fence").await;
     let other = SessionId::new("another-subagent-being-stopped");
-    let _fence = world.hub.inner_monitor().stop_fences().fence(&other);
+    let _fence = world.hub.inner_monitor().stop_fences().fence(
+        &other,
+        std::slice::from_ref(&world.run),
+        &[],
+    );
     let result = world
         .execute(
             "unrelated-register",

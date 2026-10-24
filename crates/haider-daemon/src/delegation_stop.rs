@@ -292,8 +292,8 @@ impl DelegationHandle {
     /// nothing (closing races with concurrent spawns). The root session's
     /// own runs are never touched here.
     ///
-    /// Every visited session is fenced for monitor registration and wake
-    /// admission before its monitors are listed, and the fence is held until
+    /// Every visited incarnation is fenced for monitor registration and wake
+    /// admission before its monitors are listed, and its fence is held until
     /// the cancelled runs settled and a final monitor drain ran (Astra
     /// 13-final B1): no run being stopped can leave a monitor behind that
     /// later restarts stopped work.
@@ -303,7 +303,11 @@ impl DelegationHandle {
         root: SubagentTreeRoot,
         command_prefix: &str,
     ) -> Result<SubagentStopSummary, HaiderError> {
-        self.stop_subagent_tree_incarnations(root, command_prefix, None)
+        let monitor = self.hub.inner_monitor();
+        let admission = monitor.admission_lock().await;
+        let targets = self.stop_incarnations(&root, &admission).await?;
+        drop(admission);
+        self.stop_subagent_tree_incarnations(root, command_prefix, &targets)
             .await
     }
 
@@ -311,13 +315,13 @@ impl DelegationHandle {
         &self,
         root: SubagentTreeRoot,
         command_prefix: &str,
-        incarnations: Option<&[StopIncarnation]>,
+        incarnations: &[StopIncarnation],
     ) -> Result<SubagentStopSummary, HaiderError> {
         let monitor = self.hub.inner_monitor();
         let fences = monitor.stop_fences().clone();
         let mut summary = SubagentStopSummary::default();
         let mut held = HashMap::<SessionId, MonitorStopFence>::new();
-        let mut claimed = incarnations.map(<[StopIncarnation]>::to_vec);
+        let mut claimed = incarnations.to_vec();
         // Every run this request moved to cancelling, plus any run found
         // already cancelling in the tree: the stop converges all of them.
         let mut moved = Vec::<(SessionId, RunId)>::new();
@@ -331,10 +335,9 @@ impl DelegationHandle {
                     .max(u64::try_from(visited.len()).unwrap_or(u64::MAX));
                 let mut cancelled_this_pass = 0_u64;
                 for record in &visited {
-                    if let Some(claimed) = &mut claimed
-                        && !claimed
-                            .iter()
-                            .any(|target| target.session_id == record.child_session_id)
+                    if !claimed
+                        .iter()
+                        .any(|target| target.session_id == record.child_session_id)
                     {
                         if !claimed.iter().any(|target| {
                             target.session_id == record.parent_session_id
@@ -357,18 +360,30 @@ impl DelegationHandle {
                     if let std::collections::hash_map::Entry::Vacant(entry) =
                         held.entry(record.child_session_id.clone())
                     {
-                        entry.insert(fences.fence(&record.child_session_id));
+                        let admission = monitor.admission_lock().await;
+                        let target = claimed
+                            .iter()
+                            .find(|target| target.session_id == record.child_session_id)
+                            .ok_or_else(|| {
+                                HaiderError::new(
+                                    ErrorCode::Internal,
+                                    "stop target has no captured incarnation",
+                                    false,
+                                )
+                            })?;
+                        entry.insert(
+                            monitor
+                                .fence_stop_incarnation(&self.hub, target, &admission)
+                                .await?,
+                        );
+                        drop(admission);
                         summary.monitors_removed = summary.monitors_removed.saturating_add(
                             monitor
                                 .remove_for_stop_incarnation(
                                     &self.hub,
                                     &record.child_session_id,
                                     command_prefix,
-                                    claimed.as_deref().and_then(|targets| {
-                                        targets.iter().find(|target| {
-                                            target.session_id == record.child_session_id
-                                        })
-                                    }),
+                                    target,
                                 )
                                 .await?,
                         );
@@ -380,7 +395,7 @@ impl DelegationHandle {
                         .await?;
                     for (run_id, state) in &snapshot.states {
                         if *state == RunState::Cancelling
-                            && stop_owns_run(claimed.as_deref(), &record.child_session_id, run_id)
+                            && stop_owns_run(&claimed, &record.child_session_id, run_id)
                         {
                             let key = (record.child_session_id.clone(), run_id.clone());
                             if !targets.contains(&key) {
@@ -389,7 +404,7 @@ impl DelegationHandle {
                         }
                     }
                     for run_id in self.live_session_runs(&record.child_session_id).await? {
-                        if !stop_owns_run(claimed.as_deref(), &record.child_session_id, &run_id) {
+                        if !stop_owns_run(&claimed, &record.child_session_id, &run_id) {
                             continue;
                         }
                         let command = stop_cancel_command(
@@ -439,9 +454,16 @@ impl DelegationHandle {
                             &self.hub,
                             session,
                             command_prefix,
-                            claimed.as_deref().and_then(|targets| {
-                                targets.iter().find(|target| &target.session_id == session)
-                            }),
+                            claimed
+                                .iter()
+                                .find(|target| &target.session_id == session)
+                                .ok_or_else(|| {
+                                    HaiderError::new(
+                                        ErrorCode::Internal,
+                                        "stop fence has no captured incarnation",
+                                        false,
+                                    )
+                                })?,
                         )
                         .await?,
                 );
@@ -450,19 +472,15 @@ impl DelegationHandle {
             // Repeat convergence only for the claimed incarnations. Later
             // messaged runs remain independent and are reported truthfully;
             // they must never become targets of this earlier intent.
-            let late_descendant = if let Some(claimed) = &claimed {
-                self.walk_tree(&root).await?.iter().any(|record| {
-                    !claimed
-                        .iter()
-                        .any(|target| target.session_id == record.child_session_id)
-                        && claimed.iter().any(|target| {
-                            target.session_id == record.parent_session_id
-                                && target.runs.contains(&record.parent_run_id)
-                        })
-                })
-            } else {
-                false
-            };
+            let late_descendant = self.walk_tree(&root).await?.iter().any(|record| {
+                !claimed
+                    .iter()
+                    .any(|target| target.session_id == record.child_session_id)
+                    && claimed.iter().any(|target| {
+                        target.session_id == record.parent_session_id
+                            && target.runs.contains(&record.parent_run_id)
+                    })
+            });
             if !late_descendant && (!still_live || cancelled_this_round == 0) {
                 break;
             }
@@ -686,8 +704,8 @@ impl DelegationHandle {
     /// its own monitors. Its children are deliberately left running.
     ///
     /// The caller validated the request's generation and command identity
-    /// before calling (Astra 13-final B4). The session is fenced for monitor
-    /// registration and wake admission first; the primary cancel is the
+    /// before calling (Astra 13-final B4). The captured incarnation is fenced
+    /// for monitor registration and wake admission first; the primary cancel is the
     /// first durable effect, so a refused primary leaves nothing changed.
     /// Monitors are removed only after it, and a final drain runs once the
     /// cancelled runs settled (B1).
@@ -698,7 +716,11 @@ impl DelegationHandle {
         primary: TurnCancelCommand,
         command_prefix: &str,
     ) -> Result<haider_core::CancelledTurn, HaiderError> {
-        self.cancel_single_subagent_incarnation(record, primary, command_prefix, None)
+        let monitor = self.hub.inner_monitor();
+        let admission = monitor.admission_lock().await;
+        let target = self.delegation_stop_incarnation(record, &admission).await?;
+        drop(admission);
+        self.cancel_single_subagent_incarnation(record, primary, command_prefix, target)
             .await
     }
 
@@ -707,11 +729,15 @@ impl DelegationHandle {
         record: &DelegationRecord,
         primary: TurnCancelCommand,
         command_prefix: &str,
-        incarnation: Option<StopIncarnation>,
+        incarnation: StopIncarnation,
     ) -> Result<haider_core::CancelledTurn, HaiderError> {
         let monitor = self.hub.inner_monitor();
         let fences = monitor.stop_fences().clone();
-        let fence = fences.fence(&record.child_session_id);
+        let admission = monitor.admission_lock().await;
+        let fence = monitor
+            .fence_stop_incarnation(&self.hub, &incarnation, &admission)
+            .await?;
+        drop(admission);
         let primary_run = primary.run_id.clone();
         let mut primary_result = self.hub.cancel_internal_turn(primary).await?;
         if primary_result.status == haider_core::TurnCancellationStatus::Accepted {
@@ -722,13 +748,13 @@ impl DelegationHandle {
                 &self.hub,
                 &record.child_session_id,
                 command_prefix,
-                incarnation.as_ref(),
+                &incarnation,
             )
             .await?;
         #[cfg(all(test, unix))]
         first_drain_test_pause(&record.child_session_id, "named").await;
         for cancelled in self
-            .cancel_live_runs(record, command_prefix, incarnation.as_ref())
+            .cancel_live_runs(record, command_prefix, &incarnation)
             .await?
         {
             // The original run finished earlier; report the later run this
@@ -750,7 +776,7 @@ impl DelegationHandle {
         let command_prefix = command_prefix.to_owned();
         tokio::spawn(async move {
             if let Err(error) = coordinator
-                .settle_named_cancel(&record, &command_prefix, incarnation.as_ref())
+                .settle_named_cancel(&record, &command_prefix, &incarnation)
                 .await
             {
                 tracing::warn!(?error, "named subagent cancellation did not converge");
@@ -766,14 +792,14 @@ impl DelegationHandle {
         &self,
         record: &DelegationRecord,
         command_prefix: &str,
-        incarnation: Option<&StopIncarnation>,
+        incarnation: &StopIncarnation,
     ) -> Result<Vec<haider_core::CancelledTurn>, HaiderError> {
         let fences = self.hub.inner_monitor().stop_fences().clone();
         let mut accepted = Vec::new();
         loop {
             let mut this_pass = 0_usize;
             for run_id in self.live_session_runs(&record.child_session_id).await? {
-                if incarnation.is_some_and(|target| !target.runs.contains(&run_id)) {
+                if !incarnation.runs.contains(&run_id) {
                     continue;
                 }
                 let command =
@@ -797,7 +823,7 @@ impl DelegationHandle {
         &self,
         record: &DelegationRecord,
         command_prefix: &str,
-        incarnation: Option<&StopIncarnation>,
+        incarnation: &StopIncarnation,
     ) -> Result<(), HaiderError> {
         loop {
             let targets = self
@@ -806,8 +832,7 @@ impl DelegationHandle {
                 .states
                 .into_iter()
                 .filter(|(run, state)| {
-                    *state == RunState::Cancelling
-                        && incarnation.is_none_or(|target| target.runs.contains(run))
+                    *state == RunState::Cancelling && incarnation.runs.contains(run)
                 })
                 .map(|(run_id, _)| (record.child_session_id.clone(), run_id))
                 .collect::<Vec<_>>();
@@ -1580,14 +1605,8 @@ fn parent_fact_envelope(
     })
 }
 
-fn stop_owns_run(
-    incarnations: Option<&[StopIncarnation]>,
-    session: &SessionId,
-    run: &RunId,
-) -> bool {
-    incarnations.is_none_or(|targets| {
-        targets
-            .iter()
-            .any(|target| &target.session_id == session && target.runs.contains(run))
-    })
+fn stop_owns_run(incarnations: &[StopIncarnation], session: &SessionId, run: &RunId) -> bool {
+    incarnations
+        .iter()
+        .any(|target| &target.session_id == session && target.runs.contains(run))
 }

@@ -418,11 +418,11 @@ async fn assert_fenced_monitor_obligation_dismissal(admitting: bool) {
             CompletionStatus::Pending
         }
     );
-    let fence = world
-        .hub
-        .inner_monitor()
-        .stop_fences()
-        .fence(&world.session);
+    let fence = world.hub.inner_monitor().stop_fences().fence(
+        &world.session,
+        &[],
+        std::slice::from_ref(&report.monitor_id),
+    );
     let receipt = world.hub.wake_monitor_report(report.clone()).await.unwrap();
     assert!(receipt.durable);
     assert!(!receipt.handed_off);
@@ -468,11 +468,11 @@ async fn fenced_monitor_wake_without_obligation_is_retained_without_admission() 
         MonitorReportStatus::Matched,
     );
     report.session_id = world.session.clone();
-    let fence = world
-        .hub
-        .inner_monitor()
-        .stop_fences()
-        .fence(&world.session);
+    let fence = world.hub.inner_monitor().stop_fences().fence(
+        &world.session,
+        &[],
+        std::slice::from_ref(&report.monitor_id),
+    );
     let receipt = world.hub.wake_monitor_report(report.clone()).await.unwrap();
     assert!(receipt.durable);
     assert!(!receipt.handed_off);
@@ -974,7 +974,11 @@ async fn direct_report_stop_epoch_dismissal_survives_fence_release_and_replay() 
     {
         let monitor = world.hub.inner_monitor();
         let _admission = monitor.admission_lock().await;
-        let fence = monitor.stop_fences().fence(&world.session);
+        let fence = monitor.stop_fences().fence(
+            &world.session,
+            &[],
+            std::slice::from_ref(&report.monitor_id),
+        );
         drop(fence);
     }
     resume.send(()).unwrap();
@@ -1155,7 +1159,7 @@ async fn stop_dismisses_expired_monitor_follow_up_before_cold_projection_resume(
                     &world.hub,
                     &world.session,
                     "expired-stop",
-                    Some(&incarnation)
+                    &incarnation
                 )
                 .await
                 .unwrap(),
