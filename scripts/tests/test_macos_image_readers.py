@@ -1,5 +1,4 @@
 """Deterministic reader-inventory corruption must never authorize cleanup."""
-import fcntl
 import importlib.util
 import json
 import os
@@ -431,6 +430,8 @@ class NativeReaderTests(unittest.TestCase):
         return expected
 
     def run_action(self, action, shape='real', helper_pid=0, declare=True):
+        import fcntl
+
         # Like the builder, the parent pins the image and the CLI inherits it.
         # A high number keeps it apart from the helper's descriptors.
         low = os.open(self.path, os.O_RDONLY)
