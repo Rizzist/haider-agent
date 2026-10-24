@@ -16463,7 +16463,11 @@ impl HubConnection {
             );
         };
         #[cfg(test)]
-        stop_boundary_hook::after_attempt(&found.session_id).await;
+        stop_boundary_hook::after_at(
+            stop_boundary_hook::Boundary::StopOperation,
+            &found.session_id,
+        )
+        .await;
         let _operation = self.hub.inner.stop_operations.lock().await;
         let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
         let tree = crate::delegation::SubagentTreeRoot::Run {
@@ -16498,7 +16502,11 @@ impl HubConnection {
         }
         let monitor = self.hub.inner_monitor();
         #[cfg(test)]
-        stop_admission_boundary_hook::after_attempt(&found.session_id).await;
+        stop_boundary_hook::after_at(
+            stop_boundary_hook::Boundary::StopAdmission,
+            &found.session_id,
+        )
+        .await;
         let admission = monitor.admission_lock().await;
         let targets = delegation
             .stop_incarnations(&tree, &admission)
@@ -21620,9 +21628,4 @@ mod run_identity_tests {
 mod provider_rebind;
 
 #[cfg(test)]
-#[path = "../completion_boundary_hook_tests.rs"]
-pub(super) mod stop_boundary_hook;
-
-#[cfg(test)]
-#[path = "../completion_boundary_hook_tests.rs"]
-pub(super) mod stop_admission_boundary_hook;
+pub(super) use crate::completion::astra22_boundary_hook as stop_boundary_hook;

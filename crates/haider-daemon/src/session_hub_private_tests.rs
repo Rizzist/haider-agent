@@ -8573,9 +8573,15 @@ async fn r7_check_stop_lookup_epoch(finish_while_waiting: bool, wait_on_admissio
         hub.inner.stop_operations.lock().await
     };
     let (lookup, lookup_resume) = if wait_on_admission {
-        super::rpc::stop_admission_boundary_hook::install(&session)
+        super::rpc::stop_boundary_hook::install_at(
+            super::rpc::stop_boundary_hook::Boundary::StopAdmission,
+            &session,
+        )
     } else {
-        super::rpc::stop_boundary_hook::install(&session)
+        super::rpc::stop_boundary_hook::install_at(
+            super::rpc::stop_boundary_hook::Boundary::StopOperation,
+            &session,
+        )
     };
     let old_for_request = old.clone();
     let stop = tokio::spawn(async move {
