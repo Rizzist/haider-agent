@@ -402,7 +402,7 @@ fn input_injection_applies_only_to_the_active_session_surface() {
     assert_eq!(model.composer.text(), "");
 }
 
-/// rev933d finding 4 MUTATION CHECK: widen accepts_injected_input to ignore
+/// rev933d finding 4 MUTATION CHECK: widen accepts_injected_edits to ignore
 /// a card. Expected RUNTIME failure: an inject lands while /talk setup owns
 /// the keyboard, so this table flips.
 #[test]
@@ -412,23 +412,23 @@ fn injection_is_refused_while_a_card_owns_the_keyboard() {
     model.active_session = Some(haider_protocol::ids::SessionId::new("inp-9"));
     model.screen = Screen::Session;
     assert!(
-        model.accepts_injected_input(),
+        model.accepts_injected_edits(),
         "the plain composer accepts it"
     );
 
     model.help_open = true;
-    assert!(!model.accepts_injected_input(), "help overlay refuses");
+    assert!(!model.accepts_injected_edits(), "help overlay refuses");
     model.help_open = false;
 
     model.screen = Screen::Launcher;
     assert!(
-        !model.accepts_injected_input(),
+        !model.accepts_injected_edits(),
         "the launcher is not a composer"
     );
 
     model.screen = Screen::Subagent;
     assert!(
-        !model.accepts_injected_input(),
+        !model.accepts_injected_edits(),
         "the subagent view messages the child, not the session composer"
     );
 }
