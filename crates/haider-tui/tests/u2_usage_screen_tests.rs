@@ -26,9 +26,12 @@ use haider_tui::format::{
 use haider_tui::link::{CommandContext, map_response, request_body};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::render::render;
+use haider_tui::runtime::dispatch_input;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 
@@ -1091,12 +1094,60 @@ fn left_right_tabs_cycle_the_cursor_groups_accounts_and_wrap() {
     model.handle_hit(Hit::UsageAccountTab {
         provider: "anthropic-oauth".to_owned(),
         index: 0,
+        alias: CredentialAlias::new("anthropic"),
     });
     assert_eq!(
         model.usage.cursor, 0,
         "the click moves the cursor to its group"
     );
     assert_eq!(model.usage.selected_tab(&model.usage.groups()[0]), 0);
+}
+
+#[test]
+fn account_tab_press_is_bound_to_the_alias_after_report_reorder() {
+    let mut model = usage_model();
+    model.usage.cursor = 1;
+    let (_, before) = draw(&model, 110, 30);
+    let (rect, old_hit) = before
+        .iter()
+        .find(|(_, hit)| matches!(hit, Hit::UsageAccountTab { index: 0, .. }))
+        .cloned()
+        .expect("first account chip");
+    let mouse = |kind| {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    dispatch_input(
+        &mut model,
+        &before,
+        mouse(MouseEventKind::Down(MouseButton::Left)),
+    );
+    model
+        .usage
+        .report
+        .as_mut()
+        .expect("report installed")
+        .accounts
+        .swap(0, 1);
+    let (_, after) = draw(&model, 110, 30);
+    dispatch_input(
+        &mut model,
+        &after,
+        mouse(MouseEventKind::Up(MouseButton::Left)),
+    );
+    assert_eq!(
+        model.usage.cursor, 1,
+        "reordered chip consumed an old press"
+    );
+    model.handle_hit(old_hit);
+    assert_eq!(
+        model.usage.cursor, 1,
+        "stale account alias selected a replacement"
+    );
 }
 
 /// KEY-OWNERSHIP LAW: while `/usage` shows, esc closes back to the prior

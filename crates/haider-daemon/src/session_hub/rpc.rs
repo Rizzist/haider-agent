@@ -7728,6 +7728,21 @@ impl HubConnection {
                     Ok(profile) => profile,
                     Err(error) => return self.respond_ssh_error(request_id, error),
                 };
+                if let Err(error) = crate::ssh::validate_pty_request(&term, size) {
+                    return self.respond_ssh_error(request_id, error);
+                }
+                // Pending SSH negotiation uses the same bounded budget as
+                // other external waits while the dispatcher remains available.
+                let Ok(permit) = Arc::clone(&self.identity_lease.peer_requests).try_acquire_owned()
+                else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_OVERLOADED,
+                        "too many pending external requests on this connection",
+                        true,
+                        None,
+                    );
+                };
                 let (shell, controls) = self
                     .hub
                     .shell_registry()
@@ -7741,28 +7756,40 @@ impl HubConnection {
                     )
                     .map_err(|error| SessionHubError::Task(error.to_string()))?;
                 let (activate, activation) = tokio::sync::oneshot::channel();
-                match ssh
-                    .runtime
-                    .start_pty(crate::ssh::SshPtyRequest {
-                        profile: name,
-                        term,
-                        size,
-                        shell,
-                        controls,
-                        activation: Some(activation),
-                    })
-                    .await
-                {
-                    Ok(shell) => {
-                        self.send(WireFrame::Response {
-                            request_id,
-                            body: ResponseBody::SshShellOpen { shell },
-                        })?;
-                        let _ = activate.send(());
-                        Ok(())
+                // Admit the pending shell coordinate before connecting. The
+                // client can cancel even a peer stalled in SSH negotiation;
+                // Running/Exited are published by the registry afterwards.
+                let starting = self
+                    .hub
+                    .shell_registry()
+                    .get(shell.id())
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::SshShellOpen { shell: starting },
+                })?;
+                let _ = activate.send(());
+                // The connection dispatcher must return to reading requests,
+                // including ShellClose. The registry owns cancellation: close,
+                // connection loss and teardown all wake the setup's close watch.
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = ssh
+                        .runtime
+                        .start_pty(crate::ssh::SshPtyRequest {
+                            profile: name,
+                            term,
+                            size,
+                            shell,
+                            controls,
+                            activation: Some(activation),
+                        })
+                        .await
+                    {
+                        tracing::debug!(%error, "SSH terminal setup stopped");
                     }
-                    Err(error) => self.respond_ssh_error(request_id, error),
-                }
+                });
+                Ok(())
             }
             RequestBody::SshShellInput { id, data_b64 } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -19215,17 +19242,11 @@ impl HubConnection {
         request_id: RequestId,
         error: crate::ssh::SshError,
     ) -> Result<(), SessionHubError> {
-        let retryable = matches!(
-            &error,
-            crate::ssh::SshError::SshConnection { .. }
-                | crate::ssh::SshError::SshChannelQuota { .. }
-                | crate::ssh::SshError::Vault { .. }
-        );
         self.respond_error(
             request_id,
             error.code(),
             &error.to_string(),
-            retryable,
+            error.retryable(),
             None,
         )
     }
@@ -19235,6 +19256,15 @@ impl HubConnection {
         request_id: RequestId,
         error: crate::shell_registry::ShellRegistryError,
     ) -> Result<(), SessionHubError> {
+        if let Some(setup_error) = self.hub.shell_registry().setup_error_for_control(&error) {
+            return self.respond_error(
+                request_id,
+                &setup_error.code,
+                &setup_error.message,
+                setup_error.retryable,
+                None,
+            );
+        }
         let retryable = matches!(
             &error,
             crate::shell_registry::ShellRegistryError::ControlBusy(_)
