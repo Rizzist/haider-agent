@@ -318,10 +318,15 @@ impl<'a> AccountPrincipal<'a> {
 
     /// Same provider and same stable account. OpenAI requires a user-level
     /// coordinate on both sides and never falls back to email; other
-    /// providers use [`AccountIdentity::same_stable_principal`].
+    /// providers use [`AccountIdentity::same_stable_principal`]. Anthropic
+    /// placeholders on either side never authorize identity deduplication,
+    /// including an email bridge to a legacy row.
     #[must_use]
     pub fn same_account(self, other: AccountPrincipal<'_>) -> bool {
-        if self.provider != other.provider {
+        if self.provider != other.provider
+            || self.identity_unverified()
+            || other.identity_unverified()
+        {
             return false;
         }
         if self.provider == OPENAI_OAUTH_PROVIDER {

@@ -745,3 +745,26 @@ async fn explicit_unsupported_claude_import_reaches_live_and_fake_daemon_policy(
         ));
     }
 }
+
+#[test]
+fn a25_legacy_email_row_is_not_ranked_below_an_unverified_placeholder() {
+    let mut legacy = claude_view("legacy", "unused", false, false);
+    let identity = legacy.identity.as_mut().expect("identity");
+    identity.account_id = None;
+    identity.email = Some("same@example.test".into());
+    let mut placeholder = claude_view("placeholder", "anthropic:shared", true, true);
+    placeholder.identity.as_mut().expect("identity").email = Some("SAME@example.test".into());
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![legacy, placeholder],
+    };
+    assert!(!same_duplicate_group(
+        &document,
+        &document.accounts[0],
+        &document.accounts[1]
+    ));
+    let text = render_human(&document);
+    assert!(!text.contains("matching identity already kept"), "{text}");
+    assert!(!text.contains("haider account remove legacy"), "{text}");
+    assert!(text.contains("identity unverified"), "{text}");
+}

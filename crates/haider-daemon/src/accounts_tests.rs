@@ -20499,46 +20499,40 @@ async fn a23_fresh_interactive_claim_is_safe_before_target_selection() {
     }
 }
 
+struct SavedOAuthWritePause {
+    inner: MemoryVault,
+    target: CredentialAlias,
+}
+impl Vault for SavedOAuthWritePause {
+    fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> haider_accounts::AccountsResult<()> {
+        if alias == &self.target {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "synthetic saved-write pause",
+                true,
+            ));
+        }
+        self.inner.put(alias, secret)
+    }
+    fn resolve(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<SecretHandle> {
+        self.inner.resolve(alias)
+    }
+    fn delete(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+    fn list(&self) -> haider_accounts::AccountsResult<Vec<CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
 #[tokio::test]
 async fn a23_every_interactive_write_stages_its_final_generation() {
-    struct SavedWritePause {
-        inner: MemoryVault,
-        target: CredentialAlias,
-    }
-    impl Vault for SavedWritePause {
-        fn put(
-            &self,
-            alias: &CredentialAlias,
-            secret: &[u8],
-        ) -> haider_accounts::AccountsResult<()> {
-            if alias == &self.target {
-                return Err(HaiderError::new(
-                    ErrorCode::ProviderError,
-                    "synthetic saved-write pause",
-                    true,
-                ));
-            }
-            self.inner.put(alias, secret)
-        }
-        fn resolve(
-            &self,
-            alias: &CredentialAlias,
-        ) -> haider_accounts::AccountsResult<SecretHandle> {
-            self.inner.resolve(alias)
-        }
-        fn delete(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<()> {
-            self.inner.delete(alias)
-        }
-        fn list(&self) -> haider_accounts::AccountsResult<Vec<CredentialAlias>> {
-            self.inner.list()
-        }
-    }
     for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
         for retarget in [false, true] {
             let dir = test_store_dir();
             let store = open_store(dir.path()).await;
             let target = CredentialAlias::new(if retarget { "other" } else { "work" });
-            let vault = Arc::new(SavedWritePause {
+            let vault = Arc::new(SavedOAuthWritePause {
                 inner: MemoryVault::new(),
                 target: target.clone(),
             });
@@ -20657,5 +20651,575 @@ async fn a23_every_interactive_write_stages_its_final_generation() {
             );
             store.close().await.expect("close");
         }
+    }
+}
+
+#[tokio::test]
+async fn a25_saved_generation_is_not_a_completed_staged_write() {
+    let mut observations = Vec::new();
+    let temporary_root = tempfile::tempdir().expect("fixture root");
+    let root = std::env::var_os("HAIDER_A25_PROFILE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary_root.path().to_owned());
+    for provider in [ANTHROPIC_OAUTH_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME] {
+        for retarget in [false, true] {
+            for completed_write in [false, true] {
+                let dir = test_store_dir();
+                let store = open_store(dir.path()).await;
+                let target = CredentialAlias::new(if retarget { "other" } else { "work" });
+                let vault = Arc::new(SavedOAuthWritePause {
+                    inner: MemoryVault::new(),
+                    target: target.clone(),
+                });
+                let mut accounts = memory_accounts();
+                let bundle = |who: &str, value: &[u8]| {
+                    if provider == OPENAI_OAUTH_PROVIDER_NAME {
+                        openai_import_test_bundle(value, b"synthetic-refresh", 1)
+                            .with_account_identity(stable_test_identity(
+                                "same@example.test",
+                                Some(&format!("user:1:{who};workspace:4:team")),
+                            ))
+                    } else {
+                        claude_relogin_bundle(
+                            value,
+                            &format!("account={who};organization=team"),
+                            u64::MAX - 1,
+                        )
+                    }
+                };
+                let prior = bundle("b", b"synthetic-new");
+                let previous = haider_accounts::OAuthTokenBundleV1::new(
+                    prior.provider_id.clone(),
+                    prior.issuer.clone(),
+                    prior.audience.clone(),
+                    prior.resource.clone(),
+                    prior.token_type.clone(),
+                    Zeroizing::new(prior.access_token().to_vec()),
+                    Some(Zeroizing::new(b"synthetic-previous-refresh".to_vec())),
+                    prior.expires_at_unix_ms - 1,
+                    prior.refresh_expires_at_unix_ms,
+                    prior.granted_scopes.clone(),
+                    prior.identity.clone(),
+                    7,
+                )
+                .expect("older synthetic generation")
+                .with_account_identity(prior.account_identity.expect("same stable identity"));
+                vault
+                    .inner
+                    .put(&target, &previous.encode().expect("seed target"))
+                    .expect("target fixture");
+                accounts
+                    .add(oauth_descriptor_for(provider, &target, &previous, true))
+                    .expect("target row");
+                if retarget {
+                    let alias = CredentialAlias::new("work");
+                    let original = bundle("a", b"synthetic-original");
+                    vault
+                        .inner
+                        .put(&alias, &original.encode().expect("seed X"))
+                        .expect("X fixture");
+                    accounts
+                        .add(oauth_descriptor_for(provider, &alias, &original, false))
+                        .expect("X row");
+                }
+                let snapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+                let mut actor = start_account_actor(AccountActorConfig {
+                    store: store.clone(),
+                    accounts,
+                    vault: vault.clone() as Arc<dyn Vault>,
+                    validator: Arc::new(ProviderCredentialValidator),
+                    snapshot: Arc::clone(&snapshot),
+                    management: None,
+                    device_discovery: DeviceDiscoverySnapshot::new(true),
+                    profile_id: "a23-stage-final-generation".into(),
+                    default_model: "unused".into(),
+                    providers: test_provider_registry(),
+                    provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+                    reserved_aliases: HashSet::new(),
+                    refresh_fences: RefreshFenceRegistry::default(),
+                    source_registry: empty_source_registry(),
+                    source_snapshot: empty_source_snapshot(),
+                });
+                let (sink, mut frames) = channel_sink();
+                actor
+                    .commands()
+                    .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+                        command_id: "a23-write-pause".into(),
+                        provider: provider.into(),
+                        display_alias: "work".into(),
+                        claim: Some(OAuthReadyClaim::for_account_test(
+                            provider,
+                            "work",
+                            bundle("b", b"synthetic-new"),
+                        )),
+                        route: LoginRoute {
+                            request_id: RequestId::new("write-pause"),
+                            sink,
+                        },
+                    })))
+                    .await
+                    .expect("send sign-in");
+                let response =
+                    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, frames.recv())
+                        .await
+                        .expect("response deadline")
+                        .expect("response");
+                actor.shutdown().await;
+                assert!(
+                    matches!(
+                        response,
+                        WireFrame::Response {
+                            body: ResponseBody::Error { .. },
+                            ..
+                        }
+                    ),
+                    "the saved-write pause must run"
+                );
+                let stage = vault
+                .resolve(&oauth_staging_alias("a23-write-pause"))
+                .expect(
+                    "every interactive write retains its command-owned stage before persistence",
+                );
+                let stage = haider_accounts::OAuthTokenBundleV1::decode(oauth_stage_payload(
+                    stage.expose_secret(),
+                ))
+                .expect("staged bundle");
+                assert_eq!(
+                    stage.generation, 8,
+                    "the stage contains the generation that will be written"
+                );
+                let saved = vault.resolve(&target).expect("original saved bundle");
+                let saved = haider_accounts::OAuthTokenBundleV1::decode(saved.expose_secret())
+                    .expect("original bundle");
+                assert_eq!(
+                    saved.generation, 7,
+                    "failed persistence leaves the saved generation unchanged"
+                );
+                assert_eq!(
+                    store.account_add_receipts().await.expect("pending receipt")[0].state,
+                    "pending"
+                );
+
+                std::fs::create_dir_all(&root).expect("root");
+                let case = format!(
+                    "{provider}-{}-{}",
+                    if retarget { "retarget" } else { "same-alias" },
+                    if completed_write {
+                        "written-control"
+                    } else {
+                        "write-paused"
+                    }
+                );
+                if completed_write {
+                    vault
+                        .inner
+                        .put(&target, &stage.encode().expect("completed bundle"))
+                        .expect("completed write control");
+                }
+                let exported = root.join(&case);
+                std::fs::create_dir_all(&exported).expect("fixture directory");
+                let public_rows = snapshot.lock().expect("snapshot").clone();
+                let db = rusqlite::Connection::open(dir.path().join("store.sqlite"))
+                    .expect("synthetic db");
+                db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .expect("checkpoint");
+                std::fs::copy(
+                    dir.path().join("store.sqlite"),
+                    exported.join("store.sqlite"),
+                )
+                .expect("export db");
+                std::fs::write(
+                    exported.join("accounts.json"),
+                    serde_json::to_vec(&public_rows).expect("rows"),
+                )
+                .expect("projection");
+                let file_vault = haider_accounts::FileVault::new(exported.join("vault"));
+                for alias in vault.list().expect("fake slots") {
+                    let value = vault.resolve(&alias).expect("fake slot");
+                    file_vault
+                        .put(&alias, value.expose_secret())
+                        .expect("copy fake slot");
+                }
+                let mut recovered = memory_accounts();
+                for row in public_rows {
+                    recovered.add(row).expect("recovery projection");
+                }
+                reconcile_oauth_add_receipts(
+                    &store,
+                    &mut recovered,
+                    &VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
+                )
+                .await
+                .expect("recovery");
+                let state = store
+                    .account_add_receipts()
+                    .await
+                    .expect("recovered receipt")[0]
+                    .state
+                    .clone();
+                let stage_retained = vault
+                    .resolve(&oauth_staging_alias("a23-write-pause"))
+                    .is_ok();
+                let saved_after = vault.resolve(&target).expect("saved after recovery");
+                let saved_after =
+                    haider_accounts::OAuthTokenBundleV1::decode(saved_after.expose_secret())
+                        .expect("saved bundle");
+                observations.push(serde_json::json!({"case":case,"state":state,"stage_retained":stage_retained,"saved_generation":saved_after.generation,"expected_stage_generation":stage.generation,"saved_refresh_matches_stage":saved_after.refresh_token()==stage.refresh_token(),"saved_expiry_matches_stage":saved_after.expires_at_unix_ms==stage.expires_at_unix_ms,"completed_write_control":completed_write,"pass":if completed_write { state=="committed" && !stage_retained && saved_after.generation==8 && saved_after.refresh_token()==stage.refresh_token() && saved_after.expires_at_unix_ms==stage.expires_at_unix_ms } else { state=="pending" && stage_retained && saved_after.generation==7 }}));
+                std::fs::write(
+                    root.join("consistency-results.json"),
+                    serde_json::to_vec_pretty(&observations).expect("results"),
+                )
+                .expect("results file");
+                store.close().await.expect("close");
+            }
+        }
+    }
+    assert!(
+        observations.iter().all(|row| row["pass"] == true),
+        "an uncompleted staged write must stay pending across recovery; see public consistency-results.json"
+    );
+}
+
+#[test]
+fn a25_unverified_identity_is_not_a_deduplication_key() {
+    let provider = ANTHROPIC_OAUTH_PROVIDER_NAME;
+    let saved = claude_relogin_bundle(
+        b"synthetic-shared",
+        "anthropic:1234567890abcdef",
+        u64::MAX - 1,
+    );
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("first");
+    accounts
+        .add(oauth_descriptor_for(provider, &alias, &saved, true))
+        .expect("existing unverified row");
+    let requested = CredentialAlias::new("second");
+    let incoming = claude_relogin_bundle(
+        b"synthetic-shared",
+        "anthropic:1234567890abcdef",
+        u64::MAX - 1,
+    );
+    let actual = oauth_alias_for_identity(&accounts, provider, &requested, &incoming);
+    assert_eq!(
+        oauth_alias_for_identity(&accounts, provider, &alias, &incoming),
+        alias,
+        "explicit same-alias login is still allowed"
+    );
+    let principal =
+        AccountPrincipal::new(provider, incoming.account_identity.as_ref()).expect("principal");
+    assert!(principal.identity_unverified());
+    assert_eq!(principal.stable_account_id(), None);
+    assert_eq!(
+        actual, requested,
+        "an unverified synthetic identity cannot redirect a fresh alias to an existing row"
+    );
+}
+
+/// Same-generation writes are not command identity: a failed attempt and a
+/// later successful command can both allocate generation 8 from generation 7.
+#[test]
+fn a25_recovery_requires_every_staged_bundle_field() {
+    for provider in [
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        "other-oauth",
+    ] {
+        for stable in [false, true] {
+            for published in [false, true] {
+                for missing_projection in [false, true] {
+                    let mut staged = if provider == OPENAI_OAUTH_PROVIDER_NAME {
+                        openai_import_test_bundle(b"synthetic-access", b"synthetic-refresh", 8)
+                            .with_account_identity(stable_test_identity(
+                                "same@example.test",
+                                Some("user:1:b;workspace:4:team"),
+                            ))
+                    } else {
+                        claude_relogin_bundle(
+                            b"synthetic-access",
+                            "account=b;organization=team",
+                            u64::MAX - 1,
+                        )
+                    };
+                    staged.provider_id = provider.into();
+                    staged.generation = 8;
+                    if !stable {
+                        staged.account_identity =
+                            Some(stable_test_identity("same@example.test", None));
+                    }
+                    let encoded = staged.encode().expect("stage");
+                    for field in [
+                        "complete",
+                        "refresh",
+                        "access",
+                        "generation",
+                        "expiry",
+                        "refresh-expiry",
+                        "issuer",
+                        "audience",
+                        "resource",
+                        "token-type",
+                        "scopes",
+                        "id-token",
+                        "refresh-after",
+                        "rejected-until",
+                        "first-use",
+                        "import-source",
+                        "subject",
+                        "display-identity",
+                        "email",
+                        "display-name",
+                        "plan",
+                        "identity-issuer",
+                        "captured-at",
+                        "verified",
+                        "account-id",
+                        "no-identity",
+                    ] {
+                        let mut saved =
+                            haider_accounts::OAuthTokenBundleV1::decode(&encoded).expect("copy");
+                        match field {
+                            "refresh" | "access" => {
+                                let mut replacement = haider_accounts::OAuthTokenBundleV1::new(
+                                    saved.provider_id.clone(),
+                                    saved.issuer.clone(),
+                                    saved.audience.clone(),
+                                    saved.resource.clone(),
+                                    saved.token_type.clone(),
+                                    Zeroizing::new(if field == "access" {
+                                        b"other-access".to_vec()
+                                    } else {
+                                        saved.access_token().to_vec()
+                                    }),
+                                    Some(Zeroizing::new(if field == "refresh" {
+                                        b"other-refresh".to_vec()
+                                    } else {
+                                        saved.refresh_token().expect("refresh").to_vec()
+                                    })),
+                                    saved.expires_at_unix_ms,
+                                    saved.refresh_expires_at_unix_ms,
+                                    saved.granted_scopes.clone(),
+                                    saved.identity.clone(),
+                                    saved.generation,
+                                )
+                                .expect("different tokens");
+                                replacement.account_identity = saved.account_identity;
+                                saved = replacement;
+                            }
+                            "generation" => saved.generation -= 1,
+                            "expiry" => saved.expires_at_unix_ms -= 1,
+                            "refresh-expiry" => {
+                                saved.refresh_expires_at_unix_ms = Some(u64::MAX - 2)
+                            }
+                            "issuer" => saved.issuer.push_str("/other"),
+                            "audience" => saved.audience.push_str("-other"),
+                            "resource" => {
+                                saved.resource = Some("https://example.test/resource".into())
+                            }
+                            "token-type" => saved.token_type = "bearer".into(),
+                            "scopes" => saved.granted_scopes.push("other-scope".into()),
+                            "id-token" => {
+                                saved = saved
+                                    .with_id_token(Zeroizing::new(b"synthetic-id-token".to_vec()))
+                            }
+                            "refresh-after" => saved.refresh_after_unix_ms = Some(123),
+                            "rejected-until" => saved.refresh_rejected_until_unix_ms = Some(456),
+                            "first-use" => saved = saved.with_refresh_on_first_use(),
+                            "import-source" => {
+                                saved = saved.with_import_source_access_fingerprint([42; 32])
+                            }
+                            "subject" => saved.identity.subject_hash.push_str("-other"),
+                            "display-identity" => {
+                                saved.identity.display_identity.push_str(" other")
+                            }
+                            "no-identity" => saved.account_identity = None,
+                            "complete" => {}
+                            _ => {
+                                let identity = saved.account_identity.as_mut().expect("identity");
+                                match field {
+                                    "email" => identity.email = Some("new@example.test".into()),
+                                    "display-name" => {
+                                        identity.display_name = Some("New Name".into())
+                                    }
+                                    "plan" => identity.plan = Some("new-plan".into()),
+                                    "identity-issuer" => {
+                                        identity.issuer = Some("new-issuer".into())
+                                    }
+                                    "captured-at" => identity.captured_at += 1,
+                                    "verified" => identity.verified = !identity.verified,
+                                    "account-id" => {
+                                        identity.account_id = Some("other-account".into())
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+                        }
+                        let vault = MemoryVault::new();
+                        let alias = CredentialAlias::new("work");
+                        let mut accounts = memory_accounts();
+                        if !missing_projection {
+                            accounts
+                                .add(oauth_descriptor_for(provider, &alias, &saved, true))
+                                .expect("projection");
+                        }
+                        vault
+                            .put(&alias, &saved.encode().expect("saved"))
+                            .expect("persist");
+                        // Includes both historical raw stages and timestamped stages.
+                        if published {
+                            let mut bytes = OAUTH_STAGE_MARKER.to_vec();
+                            bytes.extend_from_slice(&0_u64.to_le_bytes());
+                            bytes.extend_from_slice(&encoded);
+                            vault
+                                .put(&oauth_staging_alias("a25-fields"), &bytes)
+                                .expect("stage");
+                        } else {
+                            vault
+                                .put(&oauth_staging_alias("a25-fields"), &encoded)
+                                .expect("historical stage");
+                        }
+                        let actual = staged_oauth_add_target(
+                            &vault,
+                            &accounts,
+                            "a25-fields",
+                            provider,
+                            &alias,
+                            published,
+                        )
+                        .expect("recover");
+                        assert!(
+                            matches!((&actual, field), (StagedOAuthAdd::Wrote(target), "complete") if target == &alias)
+                                || (field != "complete"
+                                    && matches!(actual, StagedOAuthAdd::NotYetWritten)),
+                            "recovery must prove full write: {provider}/{stable}/{published}/{missing_projection}/{field}"
+                        );
+                        vault
+                            .put(
+                                &oauth_staging_alias("a25-fields"),
+                                &saved.encode().expect("completed stage"),
+                            )
+                            .expect("complete exact variant");
+                        assert!(
+                            matches!(staged_oauth_add_target(&vault, &accounts, "a25-fields", provider, &alias, published).expect("completed variant"), StagedOAuthAdd::Wrote(target) if target == alias),
+                            "a complete write of {field} is accepted"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // A placeholder cannot identify another account, but its complete
+    // command-owned write must still recover after explicit alias sign-in.
+    let provider = ANTHROPIC_OAUTH_PROVIDER_NAME;
+    let alias = CredentialAlias::new("unverified");
+    let vault = MemoryVault::new();
+    let mut accounts = memory_accounts();
+    let mut bundle = claude_relogin_bundle(
+        b"synthetic-access",
+        "anthropic:0123456789abcdef",
+        u64::MAX - 1,
+    );
+    bundle.generation = 8;
+    accounts
+        .add(oauth_descriptor_for(provider, &alias, &bundle, true))
+        .expect("placeholder row");
+    let encoded = bundle.encode().expect("complete placeholder bundle");
+    vault
+        .put(&alias, &encoded)
+        .expect("completed placeholder write");
+    vault
+        .put(&oauth_staging_alias("a25-placeholder-write"), &encoded)
+        .expect("placeholder stage");
+    assert!(
+        matches!(staged_oauth_add_target(&vault, &accounts, "a25-placeholder-write", provider, &alias, true).expect("completed placeholder recovery"), StagedOAuthAdd::Wrote(target) if target == alias)
+    );
+    bundle.refresh_after_unix_ms = Some(123);
+    vault
+        .put(
+            &oauth_staging_alias("a25-placeholder-write"),
+            &bundle.encode().expect("newer lifecycle"),
+        )
+        .expect("incomplete placeholder stage");
+    assert!(matches!(
+        staged_oauth_add_target(
+            &vault,
+            &accounts,
+            "a25-placeholder-write",
+            provider,
+            &alias,
+            true
+        )
+        .expect("incomplete placeholder recovery"),
+        StagedOAuthAdd::NotYetWritten
+    ));
+}
+
+#[test]
+fn a25_placeholder_matching_never_redirects_requested_aliases() {
+    let provider = ANTHROPIC_OAUTH_PROVIDER_NAME;
+    for neighbor_count in [1, 2] {
+        for email_bridge in [false, true] {
+            for incoming_placeholder in [false, true] {
+                let mut accounts = memory_accounts();
+                for name in ["first", "second"].into_iter().take(neighbor_count) {
+                    let identity = stable_test_identity(
+                        "same@example.test",
+                        if email_bridge && incoming_placeholder {
+                            None
+                        } else {
+                            Some("anthropic:shared")
+                        },
+                    );
+                    let saved = claude_relogin_bundle(b"synthetic-access", "unused", u64::MAX - 1)
+                        .with_account_identity(identity);
+                    accounts
+                        .add(oauth_descriptor_for(
+                            provider,
+                            &CredentialAlias::new(name),
+                            &saved,
+                            name == "first",
+                        ))
+                        .expect("saved");
+                }
+                let incoming = claude_relogin_bundle(b"synthetic-access", "unused", u64::MAX - 1)
+                    .with_account_identity(stable_test_identity(
+                        "SAME@example.test",
+                        if incoming_placeholder || !email_bridge {
+                            Some("anthropic:shared")
+                        } else {
+                            None
+                        },
+                    ));
+                for requested in ["first", "second", "fresh"] {
+                    let requested = CredentialAlias::new(requested);
+                    assert_eq!(
+                        oauth_alias_for_identity(&accounts, provider, &requested, &incoming),
+                        requested,
+                        "placeholder policy is symmetric, including email bridges and existing aliases"
+                    );
+                }
+            }
+        }
+    }
+    for requested_id in ["anthropic:other", "account=other;organization=team"] {
+        let mut accounts = memory_accounts();
+        let requested = CredentialAlias::new("requested");
+        let old = claude_relogin_bundle(b"synthetic-old", requested_id, u64::MAX - 1);
+        let neighbor = claude_relogin_bundle(b"synthetic-shared", "anthropic:shared", u64::MAX - 1);
+        accounts
+            .add(oauth_descriptor_for(provider, &requested, &old, true))
+            .expect("requested row");
+        accounts
+            .add(oauth_descriptor_for(
+                provider,
+                &CredentialAlias::new("neighbor"),
+                &neighbor,
+                false,
+            ))
+            .expect("unverified neighbor");
+        assert_eq!(
+            oauth_alias_for_identity(&accounts, provider, &requested, &neighbor),
+            requested,
+            "a matching unverified neighbor cannot redirect an existing requested row with another identity"
+        );
     }
 }

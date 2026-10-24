@@ -453,3 +453,58 @@ fn check_duplicate_notice(
         "matching and distinct saved accounts are retained"
     );
 }
+
+#[test]
+fn a25_legacy_email_notice_does_not_offer_placeholder_as_a_duplicate() {
+    let descriptor = |alias: &str, account_id: Option<&str>| CredentialDescriptor {
+        alias: CredentialAlias::new(alias),
+        provider: "anthropic-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "same@example.test".into(),
+        status: CredentialStatus::Ok,
+        active: false,
+        label: None,
+        created_at_ms: None,
+        account_identity: Some(haider_protocol::credential::AccountIdentity {
+            email: Some("same@example.test".into()),
+            display_name: None,
+            account_id: account_id.map(str::to_owned),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+    };
+    for incoming_placeholder in [false, true] {
+        let mut model = accounts_model();
+        model.accounts.apply_snapshot(
+            vec![AccountRow::from_descriptor(&descriptor(
+                "neighbor",
+                Some("anthropic:shared"),
+            ))],
+            None,
+        );
+        model.handle_hit(Hit::AccountAdd(
+            haider_tui::app::AccountAddKind::AnthropicOAuth,
+        ));
+        model.oauth_add.as_mut().expect("card").alias = "fresh".into();
+        let attempt = model.oauth_add.as_ref().expect("card").attempt;
+        model.oauth_add_completed(
+            attempt,
+            &descriptor("fresh", incoming_placeholder.then_some("anthropic:shared")),
+        );
+        let message = model.accounts.message.as_deref().expect("notice");
+        assert!(!message.contains("matching aliases retained"), "{message}");
+        assert!(!message.contains("updated existing"), "{message}");
+        assert_eq!(
+            message.contains("not deduplicated until it verifies"),
+            incoming_placeholder
+        );
+        assert!(model.accounts.message_action.is_none());
+        for (width, height) in [(118, 36), (80, 24)] {
+            let text = draw(&model, width, height);
+            assert!(!text.contains("haider account remove neighbor"));
+        }
+    }
+}

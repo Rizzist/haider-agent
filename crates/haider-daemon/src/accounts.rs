@@ -13076,10 +13076,9 @@ enum StagedOAuthAdd {
 }
 
 /// Finds the row whose vaulted bundle is the one staged for `command_id`
-/// (same provider, constant-time equal access token and captured account
-/// identity). A legacy identity must match its captured facts; its missing
-/// stable coordinate is not a wildcard. A published target excludes other rows
-/// even when their saved values match. Only secret-free aliases leave here.
+/// using a constant-time comparison of the complete canonical payload. A
+/// published target excludes other rows even when their saved values match.
+/// Unfinished writes retain their stage; only secret-free aliases leave here.
 fn staged_oauth_add_target(
     vault: &dyn Vault,
     accounts: &AccountStore<Box<dyn StoreLike>>,
@@ -13100,8 +13099,7 @@ fn staged_oauth_add_target(
     else {
         return Ok(StagedOAuthAdd::NotYetWritten);
     };
-    let staged_account_id = AccountPrincipal::new(provider, staged.account_identity.as_ref())
-        .and_then(AccountPrincipal::stable_account_id);
+    let staged_payload = staged.encode()?;
     let missing = accounts
         .get(recovery_alias)
         .is_none()
@@ -13122,18 +13120,11 @@ fn staged_oauth_add_target(
         };
         if stored.provider_id == provider
             && stored.provider_id == staged.provider_id
-            && staged_account_id.map_or_else(
-                || {
-                    stored.account_identity == staged.account_identity
-                        && stored.identity == staged.identity
-                },
-                |expected| {
-                    AccountPrincipal::new(provider, stored.account_identity.as_ref())
-                        .and_then(AccountPrincipal::stable_account_id)
-                        == Some(expected)
-                },
-            )
-            && bool::from(stored.access_token().ct_eq(staged.access_token()))
+            // A stable identity, access value or generation can be reused by
+            // another write. Only the complete staged payload proves this
+            // command's refresh, lifecycle, identity and provenance data is
+            // durable. Canonical encoding includes every accepted bundle field.
+            && bool::from(stored.encode()?.as_slice().ct_eq(staged_payload.as_slice()))
         {
             return Ok(StagedOAuthAdd::Wrote(alias.clone()));
         }
