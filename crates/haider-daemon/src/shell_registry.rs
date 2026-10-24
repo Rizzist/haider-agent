@@ -233,6 +233,7 @@ impl ShellRegistry {
             id: id.clone(),
             kind,
             status: ShellStatusWire::Starting,
+            setup_error: None,
             title,
             cwd_or_host,
             created_at_ms: now,
@@ -311,6 +312,19 @@ impl ShellRegistry {
             }
         })?;
         self.get(id)
+    }
+
+    /// A control request can race the setup failure event. Preserve that
+    /// refusal instead of masking it as an ordinary closed channel. Other
+    /// owners are rejected before ControlClosed can be produced.
+    pub(crate) fn setup_error_for_control(
+        &self,
+        error: &ShellRegistryError,
+    ) -> Option<haider_rpc::ShellSetupErrorWire> {
+        let ShellRegistryError::ControlClosed(id) = error else {
+            return None;
+        };
+        self.get(id).ok()?.setup_error
     }
 
     pub(crate) fn close_control(
@@ -475,6 +489,16 @@ impl ShellHandle {
             });
         }
         Ok(wire)
+    }
+
+    pub(crate) fn setup_failed(
+        &self,
+        error: haider_rpc::ShellSetupErrorWire,
+    ) -> Result<ShellWire, ShellRegistryError> {
+        self.registry.update(&self.id, |wire| {
+            wire.status = ShellStatusWire::Exited { code: None };
+            wire.setup_error = Some(error);
+        })
     }
 
     pub(crate) fn exited(&self, code: Option<i32>) -> Result<ShellWire, ShellRegistryError> {

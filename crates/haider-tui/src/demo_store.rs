@@ -86,14 +86,25 @@ pub const DEMO_STORE_FILE: &str = "demo-tui-state.json";
 /// **v2 (W3c3, report R11 cut 1)**: `SessionDto.id` became the protocol's
 /// opaque STRING session id and gained the row's local `ui_gen`. A v1 file
 /// (numeric ids, no generation) still hydrates — see [`SessionIdDto`] and
-/// the upcast in [`hydrate`] — and the next save rewrites it as v2.
-pub const DEMO_STORE_VERSION: u32 = 2;
+/// the upcast in [`hydrate`] — and the next save rewrites it at the current version.
+///
+/// **v3**: projections retain every pending menu id, rather than only the
+/// visible menu. The strict DTO gained a field, so writes advance the
+/// version; v1/v2 still hydrate with their single known menu.
+pub const DEMO_STORE_VERSION: u32 = 3;
 
 /// The pre-W3c3 version: numeric session ids, no recorded generation.
 pub const DEMO_STORE_VERSION_V1: u32 = 1;
 
+/// The opaque-session-id format before complete pending-menu retention.
+pub const DEMO_STORE_VERSION_V2: u32 = 2;
+
 /// Versions this build hydrates. Anything else → seeds.
-pub const SUPPORTED_VERSIONS: [u32; 2] = [DEMO_STORE_VERSION_V1, DEMO_STORE_VERSION];
+pub const SUPPORTED_VERSIONS: [u32; 3] = [
+    DEMO_STORE_VERSION_V1,
+    DEMO_STORE_VERSION_V2,
+    DEMO_STORE_VERSION,
+];
 
 /// Handle on the demo state file: knows the path and the hash of the last
 /// write, so unchanged frames skip the disk entirely.
@@ -350,6 +361,8 @@ pub struct ProjectionDto {
     #[serde(default)]
     pub menu: Option<Menu>,
     #[serde(default)]
+    pub pending_menus: Vec<haider_protocol::ids::MenuId>,
+    #[serde(default)]
     pub todos: Option<TodosDto>,
     #[serde(default)]
     pub usage: Option<Usage>,
@@ -559,6 +572,7 @@ fn projection_to_dto(projection: &SessionProjection) -> ProjectionDto {
     ProjectionDto {
         entries: projection.entries().iter().map(entry_to_dto).collect(),
         menu: projection.open_menu().cloned(),
+        pending_menus: projection.pending_menu_ids(),
         todos: projection.todos().map(|panel| TodosDto {
             item_id: panel.item_id.clone(),
             items: panel.items.clone(),
@@ -811,7 +825,7 @@ fn backfill_callsigns(chips: &mut [ChipModel], next: &mut u64) {
 }
 
 fn projection_from_dto(dto: ProjectionDto) -> SessionProjection {
-    SessionProjection::hydrate(
+    let mut projection = SessionProjection::hydrate(
         dto.entries.into_iter().map(entry_from_dto).collect(),
         dto.menu,
         dto.todos.map(|todos| TodoPanel {
@@ -821,7 +835,9 @@ fn projection_from_dto(dto: ProjectionDto) -> SessionProjection {
         }),
         dto.usage,
         dto.interrupted,
-    )
+    );
+    projection.restore_pending_menu_ids(dto.pending_menus);
+    projection
 }
 
 fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
@@ -962,5 +978,39 @@ fn chip_state_from_label(label: &str) -> ChipDisplayState {
         "DONE" => ChipDisplayState::Done,
         "ERROR" => ChipDisplayState::Error,
         _ => ChipDisplayState::Idle,
+    }
+}
+
+#[cfg(test)]
+mod pending_retention_tests {
+    use super::*;
+    use haider_protocol::{
+        EventPayload,
+        menu::{AnswerVia, MenuAnswer},
+    };
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restored_projection_counts_every_pending_card_and_deduplicates() {
+        let mut projection = SessionProjection::new();
+        for id in ["a", "b", "c", "b"] {
+            projection.apply(&EventPayload::MenuOpened(
+                crate::runtime::input_typeahead_tests::decision(id),
+            ));
+        }
+        let dto = projection_to_dto(&projection);
+        let serialized = serde_json::to_string(&dto).unwrap();
+        let restored_dto = serde_json::from_str::<ProjectionDto>(&serialized).unwrap();
+        let mut restored = projection_from_dto(restored_dto);
+        assert_eq!(restored.pending_menu_count(), 3);
+        for (id, count) in [("a", 2), ("b", 1), ("c", 0)] {
+            restored.apply(&EventPayload::MenuAnswered(MenuAnswer {
+                menu: haider_protocol::ids::MenuId::new(id),
+                option_key: None,
+                option_index: 0,
+                value: None,
+                via: AnswerVia::Tui,
+            }));
+            assert_eq!(restored.pending_menu_count(), count);
+        }
     }
 }

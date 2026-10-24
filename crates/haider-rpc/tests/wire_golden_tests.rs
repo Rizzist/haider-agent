@@ -934,6 +934,7 @@ fn shell_registry_events_are_additive_and_golden() {
             profile: "prod".into(),
         },
         status: haider_rpc::ShellStatusWire::Starting,
+        setup_error: None,
         title: "prod: tests".into(),
         cwd_or_host: "prod.example.invalid".into(),
         created_at_ms: 10,
@@ -947,6 +948,7 @@ fn shell_registry_events_are_additive_and_golden() {
         WireFrame::ShellState {
             shell: haider_rpc::ShellWire {
                 status: haider_rpc::ShellStatusWire::Running,
+                setup_error: None,
                 ..base.clone()
             },
         },
@@ -6458,4 +6460,35 @@ fn android_shell_capability_is_additive_and_round_trips_over_uds() {
     let batch = uds_codec::Decoder::new(TEST_FRAME_LIMIT).push(&bytes);
     assert!(batch.error.is_none());
     assert_eq!(batch.frames, vec![frame]);
+}
+
+#[test]
+fn shell_setup_errors_are_additive_and_roundtrip_in_both_codecs() {
+    let legacy = serde_json::json!({
+        "id": "fixture", "kind": {"kind": "ssh", "profile": "fixture"},
+        "status": {"status": "exited"}, "title": "fixture", "cwd_or_host": "127.0.0.1",
+        "created_at_ms": 0, "last_activity_ms": 0, "bytes_out": 0
+    });
+    let mut shell: haider_rpc::ShellWire =
+        serde_json::from_value(legacy.clone()).expect("old shell shape");
+    assert!(shell.setup_error.is_none());
+    assert_eq!(
+        serde_json::to_value(&shell).expect("unchanged old shape"),
+        legacy
+    );
+    shell.setup_error = Some(haider_rpc::ShellSetupErrorWire {
+        code: "ssh_connection_failed".into(),
+        message: "synthetic refusal".into(),
+        retryable: true,
+    });
+    let json = serde_json::to_vec(&shell).expect("JSON");
+    let msgpack = rmp_serde::to_vec_named(&shell).expect("MessagePack");
+    assert_eq!(
+        serde_json::from_slice::<haider_rpc::ShellWire>(&json).expect("JSON decode"),
+        shell
+    );
+    assert_eq!(
+        rmp_serde::from_slice::<haider_rpc::ShellWire>(&msgpack).expect("MessagePack decode"),
+        shell
+    );
 }

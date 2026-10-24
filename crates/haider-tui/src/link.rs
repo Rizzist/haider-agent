@@ -778,7 +778,7 @@ pub struct CommandContext {
     loom_install_status: Option<(u64, u64, String)>,
     ssh_stage: Option<crate::app::SshProfileMutation>,
     ssh_test: bool,
-    ssh_shell_open: bool,
+    ssh_shell_open: Option<u64>,
 }
 
 impl CommandContext {
@@ -940,7 +940,10 @@ impl CommandContext {
                 _ => None,
             },
             ssh_test: matches!(command, LiveCommand::SshTest { .. }),
-            ssh_shell_open: matches!(command, LiveCommand::SshShellOpen { .. }),
+            ssh_shell_open: match command {
+                LiveCommand::SshShellOpen { attempt_id, .. } => Some(*attempt_id),
+                _ => None,
+            },
         }
     }
 }
@@ -1365,6 +1368,7 @@ pub fn request_body_for_features(
             profile,
             session,
             size,
+            ..
         } => RequestBody::SshShellOpen {
             name: profile,
             session_id: session,
@@ -2122,7 +2126,12 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             vec![LiveReply::SshScopeSet { scope }]
         }
         ResponseBody::SshShell { .. } => Vec::new(),
-        ResponseBody::SshShellOpen { shell } => vec![LiveReply::SshShellOpened { shell }],
+        ResponseBody::SshShellOpen { shell } => vec![LiveReply::SshShellOpened {
+            // Zero is never issued by an AppModel. An uncorrelated success
+            // must still reach the reducer so its orphaned shell is closed.
+            attempt_id: context.ssh_shell_open.unwrap_or(0),
+            shell,
+        }],
         ResponseBody::SshShellInput { shell }
         | ResponseBody::SshShellResize { shell }
         | ResponseBody::SshShellEof { shell } => vec![LiveReply::ShellChanged { shell }],
@@ -2721,8 +2730,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                         message: message.clone(),
                     }];
                 }
-                if context.ssh_shell_open {
+                if let Some(attempt_id) = context.ssh_shell_open {
                     return vec![LiveReply::SshShellFailed {
+                        attempt_id,
                         code: code.clone(),
                         message: message.clone(),
                     }];
