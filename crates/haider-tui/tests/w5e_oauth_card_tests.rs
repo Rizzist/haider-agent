@@ -5,7 +5,7 @@
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
-use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, Hit, OAuthAddPhase};
+use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, Hit, InputOwner, OAuthAddPhase};
 use haider_tui::mock::seed_account_rows;
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -429,6 +429,11 @@ fn check_duplicate_notice(
     let cursor = model.accounts.cursor;
     key(&mut model, KeyCode::F(2));
     let first = normalize(draw(&model, width, height));
+    assert_eq!(model.input_owner(), InputOwner::AccountsNotice);
+    assert_eq!(
+        model.painted_input().expect("painted").owner,
+        InputOwner::AccountsNotice
+    );
     assert!(first.contains(&aliases[0]));
     assert!(first.contains(&action));
     for _ in 0..10 {
@@ -506,5 +511,75 @@ fn a25_legacy_email_notice_does_not_offer_placeholder_as_a_duplicate() {
             let text = draw(&model, width, height);
             assert!(!text.contains("haider account remove neighbor"));
         }
+    }
+}
+
+#[test]
+fn integrated_account_notice_retires_input_when_replaced_or_reopened() {
+    for (width, height) in [(118, 36), (80, 24)] {
+        let mut model = accounts_model();
+        let summary = "matching aliases retained ".repeat(50);
+        let details = (0..80)
+            .map(|n| format!("retained alias-{n:02}\n"))
+            .collect::<String>();
+        let action = "haider account remove alias-00 --confirm".to_owned();
+        model
+            .accounts
+            .set_detailed_message(summary.clone(), details.clone(), action.clone());
+        draw(&model, width, height);
+        key(&mut model, KeyCode::F(2));
+        draw(&model, width, height);
+        let opened = model.presented_input();
+        assert_eq!(opened.owner, InputOwner::AccountsNotice);
+        key(&mut model, KeyCode::PageDown);
+        model.handle_wheel(false);
+        assert!(model.accounts.message_scroll.get() > 0);
+        assert_eq!(
+            model.presented_input(),
+            opened,
+            "paging preserves the visible notice"
+        );
+        model.requests.clear();
+        let cursor = model.accounts.cursor;
+        let draft = model.composer.text().to_owned();
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )));
+        model.handle(AppEvent::Paste("covered-input".to_owned().into()));
+        model.handle_hit(Hit::AccountRow(model.accounts.rows[0].alias.clone()));
+        assert!(
+            model.requests.is_empty(),
+            "covered input cannot request a clipboard read"
+        );
+        assert_eq!(model.accounts.cursor, cursor);
+        assert_eq!(model.composer.text(), draft);
+        model
+            .accounts
+            .set_detailed_message(summary, details, action);
+        assert!(model.accounts.message_expanded);
+        let replacement = model.presented_input();
+        assert_ne!(
+            replacement, opened,
+            "even a repeated notice retires old input"
+        );
+        model.help_open = true;
+        draw(&model, width, height);
+        assert_eq!(model.input_owner(), InputOwner::Help);
+        key(&mut model, KeyCode::Esc);
+        assert!(!model.help_open);
+        assert_eq!(model.presented_input(), replacement);
+        draw(&model, width, height);
+        key(&mut model, KeyCode::Esc);
+        assert!(!model.accounts.message_expanded);
+        assert_ne!(model.input_owner(), InputOwner::AccountsNotice);
+        draw(&model, width, height);
+        key(&mut model, KeyCode::F(2));
+        assert_eq!(model.input_owner(), InputOwner::AccountsNotice);
+        assert_ne!(
+            model.presented_input(),
+            replacement,
+            "reopened notices reject old input"
+        );
     }
 }

@@ -1,6 +1,10 @@
 {
   "schema": 1,
   "counts": {
+    "crossterm": {
+      "production": 16,
+      "test": 1
+    },
     "haider-accounts": {
       "production": 0,
       "test": 0
