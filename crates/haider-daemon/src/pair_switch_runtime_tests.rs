@@ -377,6 +377,7 @@ impl PairSwitchWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{prefix}"),
             request_digest: format!("create-{prefix}-digest"),
             request_json: format!(r#"{{"session":"{prefix}"}}"#),
@@ -994,6 +995,7 @@ async fn global_account_switch_does_not_advance_served_sessions() {
     world
         .hub
         .create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "switch-served-second-create".into(),
             request_digest: "switch-served-second-digest".into(),
             request_json: "{}".into(),
@@ -2277,6 +2279,7 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-queue-consume-crash".into(),
         request_digest: "create-queue-consume-crash-digest".into(),
         request_json: r#"{"session":"queue-consume-crash"}"#.into(),

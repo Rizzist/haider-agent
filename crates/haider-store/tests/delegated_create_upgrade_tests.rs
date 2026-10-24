@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 fn create_command(id: &str, body: &Value) -> SessionCreateCommand {
     let request_json = body.to_string();
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("delegation-session-{id}"),
         request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
         request_json,

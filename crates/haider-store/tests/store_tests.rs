@@ -106,6 +106,7 @@ fn context_economy_metadata_survives_reopen_without_rewriting_the_journal() {
     let expected = {
         let store = must(Store::open(root.path()));
         must(store.create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "context-economy-create".into(),
             request_digest: "context-economy-digest".into(),
             request_json: r#"{"session":"context-economy-reopen"}"#.into(),

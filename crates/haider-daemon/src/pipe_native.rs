@@ -2580,6 +2580,7 @@ mod tests {
         let session_id = SessionId::new("pipe-boot-orphan-sweep");
         store
             .create_session(haider_core::SessionCreateCommand {
+                resolved_model: None,
                 command_id: "create-pipe-boot-orphan-sweep".into(),
                 request_digest: "create-pipe-boot-orphan-sweep-digest".into(),
                 request_json: r#"{"session":"pipe-boot-orphan-sweep"}"#.into(),

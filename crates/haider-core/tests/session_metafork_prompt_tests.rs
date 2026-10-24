@@ -23,6 +23,7 @@ async fn metafork_content_is_in_child_journal_but_not_child_prompt() {
     let source = SessionId::new("prompt-metafork-parent");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-prompt-source".into(),
             request_digest: "create-prompt-source-digest".into(),
             request_json: r#"{"source":"prompt"}"#.into(),

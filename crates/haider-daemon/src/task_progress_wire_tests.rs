@@ -72,6 +72,7 @@ async fn activity_task_progress_wire_coalesces_bursts_and_emits_terminal_immedia
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let session = SessionId::new("progress-session");
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
         command_id: "progress-create".into(),
         request_digest: "progress-create-digest".into(),
         request_json: "{}".into(),

@@ -1551,6 +1551,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         Arc::new(ProductionAccountBuilder::default()),
     );
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -2093,6 +2094,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     );
     let resolved = factory
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+            resolved_model: None,
             selection_epoch: None,
             route_reset_epoch: None,
             budget_clamp_notice_epoch: None,
@@ -2312,6 +2314,7 @@ async fn check_compaction_promotion_policy(unverified: bool) {
             Some("configured (unverified): server returned 404 for /models".into());
     }
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -2485,6 +2488,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
     let origin = "http://127.0.0.1:11434/v1";
     let summary = keyless_summary(provider, origin);
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -2604,6 +2608,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
     let route_session = haider_protocol::ids::SessionId::new("keyless-route-session");
     route_store
         .create_session(&haider_store::SessionCreateCommand {
+            resolved_model: None,
             command_id: "keyless-route-create".into(),
             request_digest: "keyless-route-digest".into(),
             request_json: "{}".into(),
@@ -2730,6 +2735,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
         );
         let Err(error) = factory
             .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+                resolved_model: None,
                 selection_epoch: None,
                 route_reset_epoch: None,
                 budget_clamp_notice_epoch: None,
@@ -3263,6 +3269,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     let resolver = AccountsAttemptResolver::new(
         factory,
         haider_protocol::session::SessionMetadataV1 {
+            resolved_model: None,
             selection_epoch: None,
             route_reset_epoch: None,
             budget_clamp_notice_epoch: None,
@@ -3381,6 +3388,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         promotion_targets: HashMap::new(),
     });
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -3632,6 +3640,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
     );
     let resolved = factory
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+            resolved_model: None,
             selection_epoch: None,
             route_reset_epoch: None,
             budget_clamp_notice_epoch: None,
@@ -3857,6 +3866,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         broker,
     );
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -7634,6 +7644,7 @@ async fn provider_trust_toggle_is_receipted_persisted_and_journaled_raw() {
     let session_id = haider_protocol::ids::SessionId::new("trust-session");
     store
         .create_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "trust-session-create".into(),
             request_digest: "trust-session-digest".into(),
             request_json: r#"{"fixture":"provider-trust"}"#.into(),
@@ -13541,6 +13552,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
     use crate::accounts::{ProviderTuning, anthropic_fast_for};
 
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -13777,6 +13789,7 @@ fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummary
 
 fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session::SessionMetadataV1 {
     haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -14624,6 +14637,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         Arc::clone(&builder) as Arc<dyn AccountProviderBuilder>,
     );
     let metadata = |provider: &str| haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -14948,6 +14962,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         Arc::new(ProductionAccountBuilder::default()),
     );
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -16062,6 +16077,7 @@ fn antigravity_summary(models: &[&str], default_model: Option<&str>) -> Provider
 
 fn antigravity_metadata(model: &str) -> haider_protocol::session::SessionMetadataV1 {
     haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -17076,6 +17092,7 @@ pub(super) async fn create_provider_trust_test_session(
     let session_id = haider_protocol::ids::SessionId::new(name);
     store
         .create_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("{name}-create"),
             request_digest: format!("{name}-digest"),
             request_json: r#"{"fixture":"provider-trust"}"#.into(),

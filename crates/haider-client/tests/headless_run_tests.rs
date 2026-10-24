@@ -237,6 +237,7 @@ async fn respond_create_and_attach_with_account(
             created_seq: 0,
             worker_generation: 7,
             metadata: SessionMetadataV1 {
+                resolved_model: None,
                 selection_epoch: None,
                 route_reset_epoch: None,
                 budget_clamp_notice_epoch: None,
@@ -469,6 +470,7 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
                 created_seq: 0,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    resolved_model: None,
                     selection_epoch: None,
                     route_reset_epoch: None,
                     budget_clamp_notice_epoch: None,
@@ -3315,6 +3317,7 @@ async fn resume_budget_checkpoint_submits_new_turn_in_original_session() {
                 terminal_seq: Some(2),
                 budget_exhausted: None,
                 spec: HeadlessRunSpecV1 {
+                    resolved_model: None,
                     agent_spawn: None,
                     cwd: "/original-workspace".into(),
                     provider: "fake".into(),

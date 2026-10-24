@@ -248,6 +248,7 @@ impl WebWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{prefix}"),
             request_digest: format!("create-{prefix}-digest"),
             request_json: format!(r#"{{"session":"{prefix}"}}"#),

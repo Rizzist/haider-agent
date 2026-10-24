@@ -784,6 +784,8 @@ pub enum GraphSwitchOutcome {
 /// Secret-free, stable coordinates for an atomic `session.create`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCreateCommand {
+    /// Separately admitted coordinate when the public creation spelling differs.
+    pub resolved_model: Option<String>,
     pub command_id: String,
     pub request_digest: String,
     pub request_json: String,
@@ -5121,7 +5123,7 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let mut metadata = typed_session_metadata(&transaction, session_id)?;
         if metadata.provider != expected_provider
-            || metadata.model != expected_model
+            || metadata.model_coordinate() != expected_model
             || metadata.selection_epoch.unwrap_or(0) != expected_epoch
         {
             // A selection committed after this request captured metadata.
@@ -5200,7 +5202,7 @@ impl Store {
                 ModelSelected {
                     selection_epoch: Some(epoch),
                     provider: metadata.provider.clone(),
-                    model: metadata.model.clone(),
+                    model: metadata.model_coordinate().to_owned(),
                     // A route-only fact keeps the selected pair, so it keeps
                     // the catalog owner that pair was admitted under.
                     model_catalog_key: metadata.model_catalog_key.clone(),
@@ -8836,6 +8838,7 @@ impl Store {
             ));
         }
         let metadata = SessionMetadataV1 {
+            resolved_model: command.resolved_model.clone(),
             selection_epoch: Some(0),
             route_reset_epoch: Some(0),
             budget_clamp_notice_epoch: None,
@@ -10052,7 +10055,8 @@ impl Store {
             ));
         };
         if let Some((expected_provider, expected_model)) = &command.expected_pair
-            && (&metadata.provider != expected_provider || &metadata.model != expected_model)
+            && (&metadata.provider != expected_provider
+                || metadata.model_coordinate() != expected_model)
         {
             return Err(store_error(
                 ErrorCode::RevisionConflict,
@@ -10065,6 +10069,7 @@ impl Store {
         }
         let no_op = metadata.provider == command.provider
             && metadata.model == command.model
+            && metadata.resolved_model.is_none()
             && command
                 .account_alias
                 .as_ref()
@@ -10108,6 +10113,7 @@ impl Store {
         }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
+        metadata.resolved_model = None;
         metadata.model_catalog_key = command.model_catalog_key.clone();
         metadata.selection_epoch = Some(selection_epoch);
         if let Some(budget) = command.output_budget {
@@ -15782,6 +15788,10 @@ fn validate_headless_turn_admission(
     if metadata.cwd != spec.cwd
         || metadata.provider != spec.provider
         || metadata.model != spec.model
+        || spec
+            .resolved_model
+            .as_ref()
+            .is_some_and(|model| metadata.resolved_model.as_ref() != Some(model))
         || metadata.max_tokens != spec.max_output_tokens
         || metadata.effort != spec.effort
         || metadata.fast != spec.fast
@@ -24244,7 +24254,7 @@ fn inherited_fork_cache_segment(
         let cache_epoch = source_view.get("cache_epoch")?.as_str()?;
         let stable_history_end = source_view.get("stable_history_end")?.as_u64()?;
         if provider != source_metadata.provider
-            || model != source_metadata.model
+            || model != source_metadata.model_coordinate()
             || max_tokens != source_metadata.max_tokens
             || account_scope.is_empty()
             || cache_epoch.is_empty()

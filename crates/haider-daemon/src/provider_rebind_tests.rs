@@ -41,6 +41,7 @@ impl ProviderFactory for RecordingRebindFactory {
 
 async fn create_rebind_test_session(hub: &SessionHub, session_id: &SessionId) {
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{session_id}"),
         request_digest: format!("create-digest-{session_id}"),
         request_json: "{}".into(),
@@ -649,6 +650,40 @@ async fn recovered_headless_model_retains_its_catalog_owner_instead_of_pending_s
     assert_eq!(
         metadata.model_catalog_key, spec.model_catalog_key,
         "A's model cannot borrow B's current metadata owner"
+    );
+    hub.shutdown().await.expect("shutdown");
+    drop(handle);
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn c5_headless_recovery_pins_the_creation_coordinate_separately_from_pending_selection() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), crate::SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("c5-headless-coordinate");
+    create_rebind_test_session(&hub, &session).await;
+    let mut metadata = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata")
+        .expect("session");
+    metadata.model = "pending-model".into();
+    let mut json = serde_json::to_value(rebound_recovery_headless_spec()).expect("spec");
+    json["model"] = serde_json::json!("INITIAL_MODEL");
+    json["resolved_model"] = serde_json::json!("initial-model");
+    let spec = serde_json::from_value(json).expect("additive spec");
+    let handle = hub.acquire_worker_lease(session).await.expect("lease");
+    pin_headless_turn_metadata(&mut metadata, &spec, &handle, &RunId::new("c5-run"))
+        .await
+        .expect("pin");
+    let metadata_json = serde_json::to_value(metadata).expect("pinned metadata");
+    assert_eq!(metadata_json["model"], "INITIAL_MODEL");
+    assert_eq!(
+        metadata_json["resolved_model"], "initial-model",
+        "headless run must retain its admitted coordinate independently of a pending selection"
     );
     hub.shutdown().await.expect("shutdown");
     drop(handle);

@@ -54,6 +54,7 @@ fn hook_dispatch_outbox_is_atomic_persistent_and_idempotently_acknowledged() {
     let generation = store.worker_generation();
     let created = store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-hook-outbox".into(),
             request_digest: "create-hook-outbox-digest".into(),
             request_json: r#"{"session":"hook-outbox"}"#.into(),
@@ -144,6 +145,7 @@ fn workspace_selection_atomically_fences_old_hook_dispatch_rows() {
     assert!(matches!(
         store
             .create_session(&SessionCreateCommand {
+                resolved_model: None,
                 command_id: "create-hook-workspace-boundary".into(),
                 request_digest: "create-hook-workspace-boundary-digest".into(),
                 request_json: r#"{"session":"hook-workspace-boundary"}"#.into(),
@@ -234,6 +236,7 @@ fn batched_acknowledgement_is_one_atomic_durable_transaction() {
         let session_id = SessionId::new(name);
         let created = store
             .create_session(&SessionCreateCommand {
+                resolved_model: None,
                 command_id: format!("create-{name}"),
                 request_digest: format!("create-{name}-digest"),
                 request_json: format!(r#"{{"session":"{name}"}}"#),
@@ -360,6 +363,7 @@ fn hook_engine_facts_do_not_reenter_the_dispatch_outbox() {
 fn create_acknowledged_session(store: &Store, profile: &std::path::Path, session_id: &SessionId) {
     let created = store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-{session_id}-digest"),
             request_json: r#"{"session":"hook-outbox-fifo"}"#.into(),

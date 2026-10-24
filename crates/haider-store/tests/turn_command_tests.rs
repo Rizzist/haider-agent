@@ -16,6 +16,7 @@ use std::sync::{Arc, Barrier};
 fn create(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: "create-digest".into(),
             request_json: r#"{"cwd":"/tmp","max_tokens":4096,"model":"fake-v1","provider":"fake"}"#
@@ -201,6 +202,7 @@ fn r2_09_admission_decisions_match_durable_receipt_replay() {
     store
         .create_session_with_configuration(
             &SessionCreateCommand {
+                resolved_model: None,
                 command_id: "create-admission-parity".into(),
                 request_digest: "create-admission-parity-digest".into(),
                 request_json: r#"{"fixture":"admission-parity"}"#.into(),
@@ -240,6 +242,7 @@ fn r2_09_admission_decisions_match_durable_receipt_replay() {
     assert!(metadata.fast);
 
     let spec = HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd: metadata.cwd.clone(),

@@ -589,6 +589,7 @@ async fn spawn(
                 attachments: Vec::new(),
                 trust_hooks: false,
                 spec: HeadlessRunSpecV1 {
+                    resolved_model: metadata.resolved_model,
                     cwd: metadata.cwd,
                     provider: metadata.provider,
                     model_catalog_key: metadata.model_catalog_key,

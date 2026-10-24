@@ -11,6 +11,7 @@ use haider_protocol::peer::{PeerKind, PeerMessage, PeerSender, PeerTrust};
 
 fn create_command(session: &SessionId) -> SessionCreateCommand {
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{session}"),
         request_digest: format!("create-digest-{session}"),
         request_json: "{}".into(),

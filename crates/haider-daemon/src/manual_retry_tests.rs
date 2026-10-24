@@ -113,6 +113,7 @@ impl RetryWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("{prefix}-create"),
             request_digest: format!("{prefix}-create-digest"),
             request_json: format!(r#"{{"session":"{prefix}"}}"#),
@@ -228,6 +229,7 @@ impl RetryWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("{prefix}-idle-create"),
             request_digest: format!("{prefix}-idle-create-digest"),
             request_json: format!(r#"{{"session":"{prefix}-idle"}}"#),

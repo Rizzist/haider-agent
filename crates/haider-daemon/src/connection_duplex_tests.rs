@@ -147,6 +147,7 @@ fn connection_context(
 
 fn create_command(session_id: &SessionId, workspace: &std::path::Path) -> SessionCreateCommand {
     SessionCreateCommand {
+        resolved_model: None,
         command_id: "duplex-create".into(),
         request_digest: "duplex-create-digest".into(),
         request_json: r#"{"fixture":"duplex-cancellation"}"#.into(),

@@ -88,6 +88,7 @@ fn digest(
         head_seq: 12,
         worker_generation: 7,
         metadata: Some(SessionMetadataV1 {
+            resolved_model: None,
             selection_epoch: None,
             route_reset_epoch: None,
             budget_clamp_notice_epoch: None,

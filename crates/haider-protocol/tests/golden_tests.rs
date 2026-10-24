@@ -401,6 +401,7 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert_eq!(encoded["effort"], "max");
     assert_eq!(encoded["fast"], true);
     let versioned = SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: Some(42),
         route_reset_epoch: Some(0),
         budget_clamp_notice_epoch: None,

@@ -172,6 +172,7 @@ pub(super) fn legacy_delegated_create_matches(
             }
             metadata.provider = selected.provider;
             metadata.model = selected.model;
+            metadata.resolved_model = None;
         }
     }
     let expected =

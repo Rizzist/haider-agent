@@ -80,6 +80,7 @@ async fn peer_store_round_trip_baseline_probe() {
     for index in 0..AGENTS {
         let session = SessionId::new(format!("store-count-{index}"));
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{index}"),
             request_digest: format!("create-digest-{index}"),
             request_json: "{}".into(),

@@ -22867,7 +22867,7 @@ impl AppModel {
         let admitted = self.note_session_metadata_at(
             session,
             &metadata.provider,
-            &metadata.model,
+            metadata.model_coordinate(),
             metadata.max_tokens,
             metadata.selection_epoch,
             metadata.max_tokens_source,
@@ -22885,7 +22885,7 @@ impl AppModel {
         self.note_selected_catalog_key(
             session,
             &metadata.provider,
-            &metadata.model,
+            metadata.model_coordinate(),
             metadata.model_catalog_key.clone(),
         );
         true
@@ -22956,8 +22956,11 @@ impl AppModel {
             } else {
                 &row.meter_epoch
             };
-            let same_pair =
-                epoch.pair.as_ref() == Some(&(metadata.provider.clone(), metadata.model.clone()));
+            let same_pair = epoch.pair.as_ref()
+                == Some(&(
+                    metadata.provider.clone(),
+                    metadata.model_coordinate().to_owned(),
+                ));
             let older_epoch = matches!((epoch.selection_epoch, metadata.selection_epoch),
                 (Some(current), Some(incoming)) if incoming < current);
             if same_pair
@@ -23037,7 +23040,11 @@ impl AppModel {
         } else {
             return;
         };
-        if epoch.pair.as_ref() != Some(&(metadata.provider.clone(), metadata.model.clone()))
+        if epoch.pair.as_ref()
+            != Some(&(
+                metadata.provider.clone(),
+                metadata.model_coordinate().to_owned(),
+            ))
             || epoch.output_budget != Some(metadata.max_tokens)
             || matches!((epoch.selection_epoch, metadata.selection_epoch),
                 (Some(current), Some(incoming)) if incoming < current)
@@ -23059,7 +23066,7 @@ impl AppModel {
                     .or(epoch.selection_epoch)
                     .or(Some(0)),
                 &metadata.provider,
-                &metadata.model,
+                metadata.model_coordinate(),
                 &haider_protocol::output_budget::OutputBudgetClampV1 {
                     requested,
                     max_output_tokens: metadata.max_tokens,

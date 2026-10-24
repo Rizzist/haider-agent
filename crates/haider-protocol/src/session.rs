@@ -268,6 +268,11 @@ pub struct SessionMetadataV1 {
     pub account_alias: Option<String>,
     /// Full provider model identifier — the current model selection.
     pub model: String,
+    /// Canonical coordinate admitted for an explicit creation spelling that
+    /// differs from `model`. Absence keeps legacy saved-name admission strict.
+    /// The public literal remains in `model`; model reselection clears this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
     /// Producer of a catalog-derived selection. An absent key preserves explicit
     /// configuration and legacy metadata; a retired key requires reselection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,6 +349,14 @@ pub struct SessionMetadataV1 {
     pub workspace_allocation: Option<WorkspaceAllocationV1>,
     /// Durable creation time in Unix milliseconds.
     pub created_at_ms: u64,
+}
+
+impl SessionMetadataV1 {
+    /// The admitted provider request coordinate, separately from public spelling.
+    #[must_use]
+    pub fn model_coordinate(&self) -> &str {
+        self.resolved_model.as_deref().unwrap_or(&self.model)
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]

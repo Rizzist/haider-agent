@@ -61,6 +61,7 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
         let run_id = RunId::new(format!("held-run-{index}"));
         let device_id = DeviceId::new("rebind-policy-test");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "create".into(),
             request_digest: "create-digest".into(),
             request_json: "{}".into(),

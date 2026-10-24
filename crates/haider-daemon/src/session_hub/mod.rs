@@ -8470,7 +8470,7 @@ impl HubStoreHandle {
             .commands
             .send(ActorCommand::ResolvedRoute {
                 provider: metadata.provider.clone(),
-                model: metadata.model.clone(),
+                model: metadata.model_coordinate().to_owned(),
                 epoch: metadata.selection_epoch.unwrap_or(0),
                 alias: alias.map(str::to_owned),
                 device_id: self.hub.inner.device_id.clone(),

@@ -3373,6 +3373,7 @@ async fn run_headless_inner(
         // original generation remains part of the durable command identity even if
         // reconnecting observes a newer worker generation.
         let spec = HeadlessRunSpecV1 {
+            resolved_model: created_metadata.resolved_model.clone(),
             agent_spawn: None,
             cwd: created_metadata.cwd.clone(),
             provider: provider.clone(),

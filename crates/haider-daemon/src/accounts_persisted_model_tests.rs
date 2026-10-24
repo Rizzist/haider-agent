@@ -644,3 +644,37 @@ fn automatic_routing_owner_includes_anonymous_endpoint_context() {
     profile.model_details = vec![detail];
     assert!(factory.resilience_model_is_current(&profile, "same-model-name"));
 }
+
+#[tokio::test]
+async fn c5_recorded_creation_coordinate_admits_the_real_canonical_provider_request() {
+    for (spelling, later_ambiguity) in [
+        ("DEEPSEEK_V4_FLASH", false),
+        (" DeepSeek V4 Flash ", false),
+        ("deepseek\u{a0}v4\u{2003}flash", false),
+        ("DEEPSEEK_V4_FLASH", true),
+        (" DeepSeek V4 Flash ", true),
+        ("deepseek\u{a0}v4\u{2003}flash", true),
+    ] {
+        let mut profile = summary(ModelInventoryWire::Fetched { fetched_at_ms: 1 });
+        if later_ambiguity {
+            // The saved coordinate names a specific previously admitted row.
+            // Later alias collisions must not reinterpret that selection.
+            profile.models.push("deepseek_v4_flash".into());
+        }
+        let (factory, provider, _) = factory(profile);
+        // JSON keeps this a runtime regression on the old decoder too: an
+        // unknown additive field is ignored there and admission still fails.
+        let mut json = serde_json::to_value(old_metadata()).expect("metadata");
+        json["model"] = serde_json::json!(spelling);
+        json["resolved_model"] = serde_json::json!("deepseek-v4-flash");
+        let metadata = serde_json::from_value(json).expect("recorded creation");
+        let result = factory.resolve_for_turn(&metadata).await;
+        exercise_admitted_turn(&result).await;
+        assert_eq!(
+            result.expect("C5 recorded spelling must be admitted").model,
+            "deepseek-v4-flash"
+        );
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(provider.requests()[0].model, "deepseek-v4-flash");
+    }
+}

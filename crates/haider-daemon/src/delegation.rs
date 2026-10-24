@@ -504,6 +504,9 @@ impl DelegationHandle {
                     child.resolved_route_alias = None;
                     child.resolved_route_seen = false;
                 }
+                if child.provider != provider || child.model != model {
+                    child.resolved_model = None;
+                }
                 child.provider = provider;
                 child.model = model;
                 child
@@ -857,6 +860,7 @@ impl DelegationHandle {
         self.hub
             .create_internal_session_with_interaction_mode(
                 SessionCreateCommand {
+                    resolved_model: coordinates.metadata.resolved_model.clone(),
                     command_id: format!("delegation-session-{identity}"),
                     request_digest: create_digest,
                     request_json: create_json,

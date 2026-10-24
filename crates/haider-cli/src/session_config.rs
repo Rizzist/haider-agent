@@ -392,7 +392,10 @@ async fn apply_mutations(
             Some(selector) => resolve_model_selector(selector, providers)?,
             None => {
                 let current = current.ok_or(ConfigError::MissingMetadata)?;
-                (Some(current.provider.clone()), current.model.clone())
+                (
+                    Some(current.provider.clone()),
+                    current.model_coordinate().to_owned(),
+                )
             }
         };
         let response = client
@@ -707,7 +710,7 @@ pub(crate) fn document(
             provider
                 .model_details
                 .iter()
-                .find(|detail| detail.name == metadata.model)
+                .find(|detail| detail.name == metadata.model_coordinate())
         })
         .and_then(|detail: &ModelDetailWire| detail.context_window);
     let footprint = digest

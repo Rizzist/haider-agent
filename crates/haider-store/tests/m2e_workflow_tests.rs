@@ -27,6 +27,7 @@ fn create_session(store: &Store, name: &str) -> SessionId {
     let session_id = SessionId::new(name);
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{name}"),
             request_digest: format!("create-digest-{name}"),
             request_json: format!(r#"{{"session":"{name}"}}"#),

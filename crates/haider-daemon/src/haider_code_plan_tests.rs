@@ -681,6 +681,7 @@ async fn real_session_hub_interest_requires_an_attached_haider_code_session() {
 
     fn create_command(session_id: &SessionId, provider: &str) -> SessionCreateCommand {
         SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-interest-{provider}"),
             request_digest: format!("digest-interest-{provider}"),
             request_json: format!(r#"{{"provider":"{provider}"}}"#),

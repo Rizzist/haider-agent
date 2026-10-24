@@ -74,6 +74,7 @@ fn seed(model: &mut AppModel, summary: SessionSummary) {
 
 fn metadata(title: &str, cwd: &str, model: &str, created_at_ms: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,

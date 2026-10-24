@@ -45,6 +45,7 @@ pub(crate) async fn seed_checkpoint_change(
     let session = SessionId::new(format!("recovered-{label}"));
     store
         .create_session(haider_store::SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("seed-{label}"),
             request_digest: format!("seed-{label}"),
             request_json: "{}".into(),

@@ -18,6 +18,7 @@ use haider_store::{
 fn create_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("digest-{session_id}"),
             request_json: format!(r#"{{"session":"{session_id}"}}"#),

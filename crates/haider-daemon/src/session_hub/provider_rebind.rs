@@ -129,7 +129,7 @@ impl HubConnection {
         if let Err(refusal) = authority.validate_selection_with_status(
             &current.provider,
             Some(&provider),
-            &current.model,
+            current.model_coordinate(),
         ) {
             return self.respond_selection_refusal(request_id, &refusal);
         }

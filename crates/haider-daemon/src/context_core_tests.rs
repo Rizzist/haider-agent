@@ -167,6 +167,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
     hub.install_worker_manager(handle.clone())
         .expect("install manager");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-branch-worker".into(),
         request_digest: "create-branch-worker-digest".into(),
         request_json: r#"{"session":"branch-worker"}"#.into(),
@@ -583,6 +584,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
     hub.install_worker_manager(handle.clone())
         .expect("install manager");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-auto-compaction-branch".into(),
         request_digest: "create-auto-compaction-branch-digest".into(),
         request_json: r#"{"session":"auto-compaction-branch"}"#.into(),
@@ -1029,6 +1031,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     hub.install_worker_manager(manager_handle.clone())
         .expect("install worker manager");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-manual-compaction".into(),
         request_digest: "create-manual-compaction-digest".into(),
         request_json: r#"{"session":"manual-compaction"}"#.into(),
@@ -1701,6 +1704,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
     let device_id = DeviceId::new("compaction-crash-device");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-compaction-crash".into(),
             request_digest: "create-compaction-crash-digest".into(),
             request_json: r#"{"session":"compaction-crash"}"#.into(),

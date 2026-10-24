@@ -23,6 +23,7 @@ async fn image_output_context_commits_self_contained_omitted_prompt_extension() 
     let session_id = SessionId::new("image-created-output-context");
     let device_id = DeviceId::new("image-created-device");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-image-session".into(),
         request_digest: "create-image-session-digest".into(),
         request_json: r#"{"session":"image-created"}"#.into(),

@@ -284,6 +284,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
         auto_allow,
     });
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{label}"),
         request_digest: format!("create-{label}-digest"),
         request_json: format!(r#"{{"session":"{label}"}}"#),
@@ -341,6 +342,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
             lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
+                resolved_model: None,
                 selection_epoch: None,
                 route_reset_epoch: None,
                 budget_clamp_notice_epoch: None,

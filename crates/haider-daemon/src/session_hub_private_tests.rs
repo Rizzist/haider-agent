@@ -569,6 +569,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
     let session_id = SessionId::new("graph-node-scoped-wait");
     let generation = store.worker_generation();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-graph-node-scoped-wait".into(),
         request_digest: "create-graph-node-scoped-wait-digest".into(),
         request_json: r#"{"session":"graph-node-scoped-wait"}"#.into(),
@@ -739,6 +740,7 @@ async fn recoverable_workflow_continuation_blocks_daemon_idle_ttl_retirement() {
         RunState::Queued,
     );
     *configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd: "workflow-idle-ttl-workspace".into(),
@@ -873,6 +875,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let session_id = SessionId::new("delete-barrier-session");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-delete-barrier-session".into(),
         request_digest: "create-delete-barrier-session-digest".into(),
         request_json: r#"{"session":"delete-barrier-session"}"#.into(),
@@ -999,6 +1002,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
         let original_generation = store.worker_generation();
         let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-branch-rpc-session".into(),
             request_digest: "create-branch-rpc-session-digest".into(),
             request_json: r#"{"session":"branch-rpc-receipt"}"#.into(),
@@ -4547,6 +4551,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
     .expect("install scope vault");
     let source = SessionId::new("metafork-review-parent");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-metafork-review-parent".into(),
         request_digest: "create-metafork-review-parent-digest".into(),
         request_json: r#"{"session":"metafork-review-parent"}"#.into(),
@@ -5916,6 +5921,7 @@ pub(super) fn create_command(session_id: &SessionId, suffix: &str) -> SessionCre
     let cwd = std::env::temp_dir().to_string_lossy().into_owned();
 
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{suffix}"),
         request_digest: format!("create-digest-{suffix}"),
         request_json: format!(r#"{{"fixture":"{suffix}"}}"#),

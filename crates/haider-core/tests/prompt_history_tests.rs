@@ -2297,6 +2297,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     let rewound = RunId::new("compacted-rewound-before-anchor");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-compacted-session".into(),
             request_digest: "create-compacted-session-digest".into(),
             request_json: r#"{"session":"compacted-session"}"#.into(),
@@ -4337,6 +4338,7 @@ async fn measure_cold_fold_after_several_compactions() {
     let session_id = SessionId::new("multi-compaction-timing-session");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-timing-session".into(),
             request_digest: "create-timing-session-digest".into(),
             request_json: r#"{"session":"multi-compaction-timing-session"}"#.into(),

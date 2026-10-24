@@ -326,6 +326,7 @@ async fn create_session_with_interaction_mode(
         .into_owned();
     hub.create_internal_session_with_interaction_mode(
         SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-{session_id}-digest"),
             request_json: format!(r#"{{"session":"{session_id}"}}"#),

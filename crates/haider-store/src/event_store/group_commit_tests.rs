@@ -41,6 +41,7 @@ fn batch(session: &SessionId, event_id: impl Into<String>) -> JournalAppendBatch
 
 fn session_create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand {
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{suffix}"),
         request_digest: "create-digest".into(),
         request_json: r#"{"cwd":"/tmp","max_tokens":4096,"model":"fake-v1","provider":"fake"}"#

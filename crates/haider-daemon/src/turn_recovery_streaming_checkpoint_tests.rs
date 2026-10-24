@@ -123,6 +123,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
     let device_id = DeviceId::new("route-wait-device");
     first
         .create_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-route-wait".into(),
             request_digest: "create-route-wait-digest".into(),
             request_json: r#"{"session":"route-wait"}"#.into(),

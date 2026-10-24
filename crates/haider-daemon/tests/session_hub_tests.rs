@@ -1328,6 +1328,7 @@ async fn create_and_attach_typed_session(
 async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId, provider: &str) {
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(

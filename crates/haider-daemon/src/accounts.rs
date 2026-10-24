@@ -11269,12 +11269,13 @@ impl AccountsProviderFactory {
         }
 
         if let Some(summary) = summaries.iter().find(|summary| {
-            summary.provider == metadata.provider && !summary.model_is_selectable(&metadata.model)
+            summary.provider == metadata.provider
+                && !summary.model_is_selectable(metadata.model_coordinate())
         }) {
             return Err(HaiderError::new(
                 ErrorCode::ProviderError,
                 summary
-                    .selection_reason(Some(&metadata.model))
+                    .selection_reason(Some(metadata.model_coordinate()))
                     .unwrap_or_else(|| "configured deployment requires a model-list fetch".into()),
                 true,
             ));
@@ -11296,10 +11297,12 @@ impl AccountsProviderFactory {
             None,
             self.management.as_ref().map(|_| summaries),
         );
+        // Only a recorded creation resolution can authorize a different saved
+        // spelling. Legacy implicit aliases still require explicit reselection.
         let selection = authority
-            .validate_selection_with_status(&metadata.provider, None, &metadata.model)
+            .validate_selection_with_status(&metadata.provider, None, metadata.model_coordinate())
             .and_then(|selection| {
-                if selection.model == metadata.model {
+                if selection.model == metadata.model_coordinate() {
                     Ok(selection)
                 } else {
                     Err(crate::model_select::SelectionRefusal::ModelUnknown {
@@ -11400,6 +11403,7 @@ impl AccountsProviderFactory {
         let resolved = self.resolve_account(&target.provider, None).await.ok()?;
         let mut target_metadata = metadata.clone();
         target_metadata.model = model.clone();
+        target_metadata.resolved_model = None;
         let (model_catalog_key, output_budget) =
             Self::automatic_model_selection(&target_profile, &model, metadata)?;
         target_metadata.model_catalog_key = model_catalog_key.clone();
@@ -12334,6 +12338,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             let mut metadata = self.metadata.clone();
             metadata.provider = entry.provider.clone();
             metadata.model = model.clone();
+            metadata.resolved_model = None;
             let selection = match target_profile.as_ref() {
                 Some(profile) => match AccountsProviderFactory::automatic_model_selection(
                     profile,
@@ -12422,6 +12427,15 @@ impl AccountsProviderFactory {
         tuning: ProviderTuning,
         web_degrade: crate::worker::WebCapabilityDegrade,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
+        self.admit_persisted_model(metadata)?;
+        // Keep the saved/public literal intact while every adapter, capability
+        // lookup and retry on this turn uses the admitted catalog coordinate.
+        let mut resolved_metadata = metadata.clone();
+        if let Some(model) = &metadata.resolved_model {
+            resolved_metadata.model = model.clone();
+            resolved_metadata.resolved_model = None;
+        }
+        let metadata = &resolved_metadata;
         let (resolved, provider, oauth_access_fingerprint, active_no_auth) =
             self.resolve_provider(metadata, &tuning).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();

@@ -240,6 +240,7 @@ fn projection_envelope(
 
 fn test_headless_spec() -> HeadlessRunSpecV1 {
     HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd: "warm-projection-workspace".into(),

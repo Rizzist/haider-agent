@@ -275,6 +275,7 @@ async fn incremental_projection_matches_cold_oracle_across_branch_compaction_for
     let branch_b = BranchId::new("pipe-branch-b");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-pipe-incremental-oracle".into(),
             request_digest: "create-pipe-incremental-oracle-digest".into(),
             request_json: r#"{"session":"pipe-incremental-oracle"}"#.into(),

@@ -951,6 +951,7 @@ impl EngineFixture {
         let session_id = SessionId::new("hooks-test-session");
         let run_id = RunId::new("hooks-test-run");
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-hooks-test".into(),
             request_digest: "create-hooks-test-digest".into(),
             request_json: r#"{"session":"hooks-test"}"#.into(),
@@ -2329,6 +2330,7 @@ async fn durable_ask_bytes_without_hooks(workspace: &Path, menu: Menu) -> Vec<u8
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let session_id = SessionId::new("hooks-test-session");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hooks-test".into(),
         request_digest: "create-hooks-test-digest".into(),
         request_json: r#"{"session":"hooks-test"}"#.into(),
@@ -2774,6 +2776,7 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
         .expect("engine");
     hub.install_hooks(service.clone()).expect("install");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hooks-recovery".into(),
         request_digest: "create-hooks-recovery-digest".into(),
         request_json: r#"{"session":"hooks-recovery"}"#.into(),
@@ -2965,6 +2968,7 @@ async fn recovery_replays_exactly_the_unacknowledged_rows() {
         .expect("engine");
     hub.install_hooks(service.clone()).expect("install");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hooks-exact-replay".into(),
         request_digest: "create-hooks-exact-replay-digest".into(),
         request_json: r#"{"session":"hooks-exact-replay"}"#.into(),
@@ -3108,6 +3112,7 @@ async fn run_scoped_hook_trust_is_reduced_before_recovery_dispatch() {
     let store = SqliteStoreHandle::open(&profile).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hooks-run-trust".into(),
         request_digest: "create-hooks-run-trust-digest".into(),
         request_json: r#"{"session":"hooks-run-trust"}"#.into(),

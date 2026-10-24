@@ -14,6 +14,7 @@ use std::sync::{Arc, Barrier};
 
 fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateCommand {
     SessionCreateCommand {
+        resolved_model: None,
         command_id: command_id.into(),
         request_digest: "digest-a".into(),
         request_json:
@@ -429,5 +430,96 @@ fn derived_model_owner_is_durable_and_replayed_with_create_receipt() {
     assert_eq!(
         created.metadata.model_catalog_key,
         command.model_catalog_key
+    );
+}
+
+#[test]
+fn c5_creation_coordinate_survives_reopen_and_receipt_but_clears_on_reselection() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut create = command("c5-create", "c5-session", "c5-created");
+    create.model = "FAKE_V1".into();
+    create.resolved_model = Some("fake-v1".into());
+    {
+        let store = Store::open(root.path()).expect("open");
+        store.create_session(&create).expect("create");
+    }
+    let store = Store::open(root.path()).expect("reopen");
+    let SessionCreateOutcome::IdempotentReplay { created } =
+        store.create_session(&create).expect("replay")
+    else {
+        panic!("receipt replay");
+    };
+    assert_eq!(created.metadata.model, "FAKE_V1", "public literal survives");
+    assert_eq!(
+        serde_json::to_value(&created.metadata).expect("receipt metadata")["resolved_model"],
+        "fake-v1",
+        "C5 replay retains the admitted creation coordinate"
+    );
+    let saved = store
+        .session_metadata(&create.session_id)
+        .expect("stored")
+        .expect("session");
+    assert_eq!(
+        serde_json::to_value(saved).expect("stored metadata")["resolved_model"],
+        "fake-v1"
+    );
+    store
+        .commit_resolved_route(
+            &create.session_id,
+            "fake",
+            "fake-v1",
+            0,
+            Some("account-a"),
+            &DeviceId::new("daemon-test"),
+        )
+        .expect("canonical serving route");
+    let metadata = store
+        .session_metadata(&create.session_id)
+        .expect("routed metadata")
+        .expect("session");
+    assert!(
+        metadata.resolved_route_seen,
+        "canonical serving route must match the saved literal"
+    );
+    assert_eq!(
+        serde_json::to_value(&metadata).expect("routed metadata")["resolved_model"],
+        "fake-v1"
+    );
+    let selected = store
+        .select_session_model(&SessionSelectModelCommand {
+            command_id: "c5-reselect".into(),
+            request_digest: "c5-reselect-digest".into(),
+            request_json: "{}".into(),
+            session_id: create.session_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "fake".into(),
+            model: "FAKE_V1".into(),
+            model_catalog_key: None,
+            expected_pair: None,
+            account_alias: None,
+            output_budget: None,
+            event_id: EventId::new("c5-reselected"),
+            device_id: DeviceId::new("daemon-test"),
+        })
+        .expect("reselect");
+    let SessionSelectModelOutcome::Committed { selected, .. } = selected else {
+        panic!("new coordinate must commit");
+    };
+    assert!(
+        selected.selected_seq > 0,
+        "clearing a creation coordinate must advance the selection epoch even when the public literal is unchanged"
+    );
+    let metadata = store
+        .session_metadata(&create.session_id)
+        .expect("metadata")
+        .expect("session");
+    assert!(
+        metadata.selection_epoch.unwrap_or(0) > 0,
+        "clearing a creation coordinate must advance the selection epoch in durable metadata"
+    );
+    assert_eq!(metadata.model, "FAKE_V1");
+    assert!(
+        serde_json::to_value(metadata).expect("reselected metadata")["resolved_model"].is_null(),
+        "an old creation coordinate cannot override a new model"
     );
 }

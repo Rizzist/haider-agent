@@ -12,6 +12,7 @@ use haider_store::{
 fn create(store: &Store, session: &str) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session}"),
             request_digest: format!("create-digest-{session}"),
             request_json: format!(r#"{{"session":"{session}"}}"#),
@@ -201,6 +202,7 @@ fn derived_child_inherits_explicit_route_and_rejects_mismatched_provider() {
         .expect("parent metadata")
         .expect("typed");
     let child = SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-derived".into(),
         request_digest: "create-derived-digest".into(),
         request_json: r#"{"child":"derived"}"#.into(),

@@ -495,6 +495,7 @@ impl MonitorWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("monitor-create-{label}"),
             request_digest: format!("monitor-create-{label}-digest"),
             request_json: format!(r#"{{"session":"{label}"}}"#),

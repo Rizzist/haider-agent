@@ -3815,3 +3815,47 @@ fn catalog_order_pinned_parent_retires_changed_producer() {
 fn catalog_order_pinned_child_retires_changed_producer() {
     catalog_order_pinned_account_case(true, true);
 }
+
+#[test]
+fn c5_creation_literal_binds_the_recorded_coordinate_for_tui_capabilities() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let mut summary = private_summary(42, "shared-model");
+    summary.model_details[0].supported_efforts = vec!["high".into()];
+    summary.model_details[0].supported_speeds = vec!["fast".into()];
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 3,
+        },
+    );
+    let metadata: haider_protocol::session::SessionMetadataV1 =
+        serde_json::from_value(serde_json::json!({
+            "cwd":"/tmp", "provider":"custom", "model":"SHARED_MODEL",
+            "resolved_model":"shared-model", "max_tokens":4096, "created_at_ms":1,
+            "selection_epoch":30, "model_catalog_key":"synthetic-producer-42"
+        }))
+        .expect("recorded literal creation");
+    assert!(model.note_session_catalog_metadata(&session, &metadata));
+    assert_eq!(
+        metadata.model, "SHARED_MODEL",
+        "public creation spelling is preserved"
+    );
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "C5 TUI binds the admitted coordinate"
+    );
+    assert!(
+        model.pair_supports_fast(),
+        "C5 fast capability comes from the admitted row"
+    );
+    assert!(
+        model
+            .effort_picker_rows()
+            .iter()
+            .any(|row| row.effort.as_deref() == Some("high")),
+        "C5 effort capability comes from the admitted row"
+    );
+}

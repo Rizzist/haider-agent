@@ -1132,6 +1132,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-branch-spawn-parent".into(),
         request_digest: "create-branch-spawn-parent-digest".into(),
         request_json: r#"{"session":"branch-spawn-parent"}"#.into(),
@@ -1153,6 +1154,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -1596,6 +1598,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
     let parent_session = SessionId::new("message-running-parent");
     let parent_run = RunId::new("message-running-parent-run");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-message-running-parent".into(),
         request_digest: "create-message-running-parent-digest".into(),
         request_json: r#"{"session":"message-running-parent"}"#.into(),
@@ -1633,6 +1636,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    resolved_model: None,
                     selection_epoch: None,
                     route_reset_epoch: None,
                     budget_clamp_notice_epoch: None,
@@ -1865,6 +1869,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
     let parent_session = SessionId::new("message-idle-parent");
     let parent_run = RunId::new("message-idle-parent-run");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-message-idle-parent".into(),
         request_digest: "create-message-idle-parent-digest".into(),
         request_json: r#"{"session":"message-idle-parent"}"#.into(),
@@ -1900,6 +1905,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    resolved_model: None,
                     selection_epoch: None,
                     route_reset_epoch: None,
                     budget_clamp_notice_epoch: None,
@@ -1961,6 +1967,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
+                resolved_model: None,
                 selection_epoch: None,
                 route_reset_epoch: None,
                 budget_clamp_notice_epoch: None,
@@ -2152,6 +2159,7 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
     let parent_session = SessionId::new("message-budget-parent");
     let parent_run = RunId::new("message-budget-parent-run");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-message-budget-parent".into(),
         request_digest: "create-message-budget-parent-digest".into(),
         request_json: r#"{"session":"message-budget-parent"}"#.into(),
@@ -2187,6 +2195,7 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    resolved_model: None,
                     selection_epoch: None,
                     route_reset_epoch: None,
                     budget_clamp_notice_epoch: None,
@@ -2345,6 +2354,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let owner = SessionId::new("message-owner-parent");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-message-owner-parent".into(),
         request_digest: "create-message-owner-parent-digest".into(),
         request_json: r#"{"session":"message-owner-parent"}"#.into(),
@@ -2379,6 +2389,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    resolved_model: None,
                     selection_epoch: None,
                     route_reset_epoch: None,
                     budget_clamp_notice_epoch: None,
@@ -2517,6 +2528,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-w6a-parent".into(),
         request_digest: "create-w6a-parent-digest".into(),
         request_json: r#"{"session":"w6a-parent"}"#.into(),
@@ -2881,6 +2893,7 @@ async fn accept_parent_with_interaction_mode(
 ) -> haider_core::AcceptedTurn {
     hub.create_internal_session_with_interaction_mode(
         SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{label}"),
             request_digest: format!("create-{label}-digest"),
             request_json: format!(r#"{{"session":"{label}"}}"#),
@@ -5340,6 +5353,7 @@ async fn global_subagent_cap_is_a_typed_tool_rejection_and_parent_continues() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let seed_parent = SessionId::new("cap-seed-parent");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-cap-seed-parent".into(),
         request_digest: "create-cap-seed-parent-digest".into(),
         request_json: r#"{"session":"cap-seed-parent"}"#.into(),
@@ -5364,6 +5378,7 @@ async fn global_subagent_cap_is_a_typed_tool_rejection_and_parent_continues() {
         let suffix = format!("{index:03}");
         let child_session_id = SessionId::new(format!("cap-seed-child-{suffix}"));
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-cap-seed-child-{suffix}"),
             request_digest: format!("create-cap-seed-child-{suffix}-digest"),
             request_json: format!(r#"{{"session":"cap-seed-child-{suffix}"}}"#),
@@ -5771,6 +5786,7 @@ async fn session_summaries_carry_typed_lineage_from_the_delegation_record() {
     let child = SessionId::new("lineage-offspring");
     for (session_id, label) in [(&parent, "parent"), (&child, "child")] {
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-lineage-{label}"),
             request_digest: format!("create-lineage-{label}-digest"),
             request_json: format!(r#"{{"session":"lineage-{label}"}}"#),
@@ -5875,6 +5891,7 @@ async fn agent_type_selection_is_registry_validated_receipted_and_reversible() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let session = SessionId::new("agent-type-session");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-agent-type".into(),
         request_digest: "create-agent-type-digest".into(),
         request_json: r#"{"session":"agent-type"}"#.into(),
@@ -5978,6 +5995,7 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-toolshape-report-parent".into(),
         request_digest: "create-toolshape-report-parent-digest".into(),
         request_json: r#"{"session":"toolshape-report-parent"}"#.into(),
@@ -5999,6 +6017,7 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,

@@ -293,6 +293,7 @@ fn workflow_capabilities_are_sparse_and_grant_scoped() {
 #[test]
 fn session_permission_overrides_grant_only_their_named_effect_families() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -462,6 +463,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
 #[test]
 fn autonomous_effect_defaults_allow_every_ask_class() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -594,6 +596,7 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
 #[test]
 fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -1081,6 +1084,7 @@ fn c1_freshness_and_anchor_errors_are_typed_for_the_model() {
 fn create_durable_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(r#"{{"cwd":"/tmp","session":"{session_id}"}}"#),

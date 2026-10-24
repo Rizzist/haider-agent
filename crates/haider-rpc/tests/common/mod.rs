@@ -98,6 +98,7 @@ pub fn transcript() -> Vec<WireFrame> {
         end_seq: 9,
     };
     let fork_metadata = SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -431,6 +432,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 1,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    resolved_model: None,
                     selection_epoch: None,
                     route_reset_epoch: None,
                     budget_clamp_notice_epoch: None,

@@ -86,6 +86,7 @@ fn seed_legacy_session(store: &Store, session: &SessionId) {
 fn typed_session(store: &Store, session_id: &str, cwd: &Path) -> SessionId {
     let cwd = cwd.to_string_lossy().into_owned();
     let command = SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{session_id}"),
         request_digest: "digest-create".into(),
         request_json: json!({

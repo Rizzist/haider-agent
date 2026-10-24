@@ -1222,3 +1222,268 @@ fn configured_selector_aliases_cannot_bypass_fresh_absence() {
         Ok(("custom".into(), "MÖDEL.東京 Δ".into()))
     );
 }
+
+fn c5_profile(model: &str) -> ProviderSummaryWire {
+    let mut profile = summary("custom", &[model], ProviderAvailabilityWire::Available);
+    profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "synthetic-owner-A".into(),
+        account_alias: Some("work".into()),
+        account_incarnation: Some(1),
+    });
+    profile.model_details = vec![ModelDetailWire {
+        name: model.into(),
+        source: Some(haider_rpc::ModelDetailSourceWire::Remote),
+        context_window: Some(32_000),
+        max_output_tokens: Some(2_048),
+        supported_efforts: vec!["low".into(), "high".into()],
+        display_name: None,
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    }];
+    profile
+}
+
+fn c5_assert_coordinate(model: &str, spelling: &str) {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1::{Derived, UserSet};
+    let profile = c5_profile(model);
+    let authority = authority(&["custom"], vec![profile]);
+    let selected = authority
+        .validate_selection_with_status("custom", None, spelling)
+        .expect("unique selector");
+    assert_eq!(selected.model, model);
+    assert_eq!(selected.max_output_tokens, 2_048);
+    assert_eq!(
+        authority.model_catalog_key("custom", spelling).as_deref(),
+        Some("synthetic-owner-A"),
+        "C5 resolved model owns the selection: {spelling:?}"
+    );
+    for source in [Derived, UserSet { requested: 4_096 }] {
+        assert_eq!(
+            authority
+                .model_settings_catalog_key("custom", spelling, &source.apply(2_048, 2_048))
+                .as_deref(),
+            Some("synthetic-owner-A"),
+            "C5 resolved declaration owns derived/clamped settings: {spelling:?}"
+        );
+    }
+    assert_eq!(
+        authority.model_settings_catalog_key(
+            "custom",
+            spelling,
+            &UserSet { requested: 1_024 }.apply(2_048, 2_048)
+        ),
+        None
+    );
+    assert!(
+        authority
+            .validate_effort("custom", spelling, Some("high"))
+            .is_ok()
+    );
+    assert!(
+        authority
+            .validate_effort("custom", spelling, Some("max"))
+            .is_err()
+    );
+}
+
+macro_rules! c5_spelling {
+    ($test:ident, $spelling:expr) => {
+        #[test]
+        fn $test() {
+            c5_assert_coordinate("shared-model", $spelling);
+        }
+    };
+}
+c5_spelling!(c5_coordinate_case, "SHARED-MODEL");
+c5_spelling!(c5_coordinate_underscore, "shared_model");
+c5_spelling!(c5_coordinate_dot, "shared.model");
+c5_spelling!(c5_coordinate_space, "shared model");
+c5_spelling!(c5_coordinate_nbsp, "shared\u{a0}model");
+c5_spelling!(c5_coordinate_emspace, "shared\u{2003}model");
+c5_spelling!(
+    c5_coordinate_mixed_separators,
+    " Shared._-\u{a0}\u{2003}MODEL "
+);
+
+#[test]
+fn c5_coordinate_scalar_lowercase_expansion() {
+    c5_assert_coordinate("i\u{307}-k-ß", "İ.K_ẞ");
+}
+
+#[test]
+fn c5_permanent_rows_keep_fetched_settings_owner_only() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1::{Derived, UserSet};
+    for configured in [false, true] {
+        let mut profile = c5_profile("shared-model");
+        if configured {
+            profile.configured_models.push("shared-model".into());
+        } else {
+            profile.static_models.push("shared-model".into());
+        }
+        let authority = authority(&["custom"], vec![profile]);
+        assert_eq!(authority.model_catalog_key("custom", "SHARED_MODEL"), None);
+        for source in [Derived, UserSet { requested: 4_096 }] {
+            assert_eq!(
+                authority
+                    .model_settings_catalog_key(
+                        "custom",
+                        "SHARED_MODEL",
+                        &source.apply(2_048, 2_048)
+                    )
+                    .as_deref(),
+                Some("synthetic-owner-A")
+            );
+        }
+        assert_eq!(
+            authority.model_settings_catalog_key(
+                "custom",
+                "SHARED_MODEL",
+                &UserSet { requested: 1_024 }.apply(2_048, 2_048)
+            ),
+            None
+        );
+    }
+}
+
+#[test]
+fn c5_ambiguous_unlisted_and_noncontract_unicode_remain_literal() {
+    let mut profile = c5_profile("shared-model");
+    profile.models.push("shared_model".into());
+    let authority = authority(&["custom"], vec![profile]);
+    for literal in [
+        "SHARED.MODEL",
+        "unlisted",
+        "shared/model",
+        "sharéd-model",
+        "shared\u{2014}model",
+    ] {
+        assert_eq!(
+            authority
+                .validate_selection("custom", None, literal)
+                .expect("advisory literal")
+                .1,
+            literal
+        );
+        assert_eq!(authority.model_catalog_key("custom", literal), None);
+        assert!(
+            authority
+                .validate_effort("custom", literal, Some("high"))
+                .is_err()
+        );
+    }
+    assert_eq!(
+        authority
+            .model_catalog_key("custom", "shared-model")
+            .as_deref(),
+        Some("synthetic-owner-A"),
+        "exact wins even in a normalized collision"
+    );
+}
+
+macro_rules! c5_static_effort {
+    ($test:ident, $provider:expr, $model:expr, $spelling:expr, $effort:expr, $fast:expr) => {
+        #[test]
+        fn $test() {
+            let authority = authority(
+                &[$provider],
+                vec![summary(
+                    $provider,
+                    &[$model],
+                    ProviderAvailabilityWire::Available,
+                )],
+            );
+            for spelling in [$spelling, &format!("  {}  ", $model)] {
+                assert!(
+                    authority
+                        .validate_effort($provider, spelling, Some($effort))
+                        .is_ok(),
+                    "C5 static effort for {spelling:?}"
+                );
+                assert_eq!(
+                    authority.validate_fast($provider, spelling, true).is_ok(),
+                    $fast,
+                    "C5 fast gate for {spelling:?}"
+                );
+                assert!(authority.validate_fast($provider, spelling, false).is_ok());
+            }
+        }
+    };
+}
+c5_static_effort!(
+    c5_static_claude_effort_fast,
+    "anthropic",
+    "claude-opus-5",
+    "CLAUDE_OPUS_5",
+    "xhigh",
+    true
+);
+c5_static_effort!(
+    c5_static_oauth_claude_effort_fast,
+    "anthropic-oauth",
+    "claude-opus-4-8",
+    "CLAUDE.OPUS.4.8",
+    "max",
+    true
+);
+c5_static_effort!(
+    c5_static_gemini_effort,
+    "gemini",
+    "gemini-3.1-pro",
+    "GEMINI 3_1 PRO",
+    "high",
+    false
+);
+c5_static_effort!(
+    c5_static_bedrock_effort,
+    "bedrock",
+    "anthropic.claude-opus-5",
+    "ANTHROPIC_CLAUDE_OPUS_5",
+    "xhigh",
+    false
+);
+c5_static_effort!(
+    c5_static_vertex_effort,
+    "vertex",
+    "claude-sonnet-4-6@20251101",
+    "CLAUDE_SONNET_4_6@20251101",
+    "max",
+    false
+);
+
+#[test]
+fn c5_declared_effort_accepts_alternate_and_trimmed_creation_or_later_tuning() {
+    let authority = authority(&["custom"], vec![c5_profile("shared-model")]);
+    for spelling in [
+        "SHARED_MODEL",
+        " shared-model ",
+        "shared\u{a0}model",
+        "shared\u{2003}model",
+    ] {
+        assert!(
+            authority
+                .validate_effort("custom", spelling, Some("high"))
+                .is_ok(),
+            "C5 declared effort uses canonical row: {spelling:?}"
+        );
+    }
+}
+
+#[test]
+fn c5_trimmed_static_capabilities_without_a_management_snapshot() {
+    let authority = ModelSelectionAuthority::new(creatable(&["anthropic"]), None);
+    assert!(
+        authority
+            .validate_effort("anthropic", "  claude-opus-5  ", Some("xhigh"))
+            .is_ok(),
+        "trimmed exact static effort must remain usable before management publication"
+    );
+    assert!(
+        authority
+            .validate_fast("anthropic", "  claude-opus-5  ", true)
+            .is_ok(),
+        "trimmed exact static fast must remain usable before management publication"
+    );
+}

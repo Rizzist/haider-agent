@@ -2380,6 +2380,7 @@ mod observe_cache_retention_tests {
         let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
         let session_id = SessionId::new("observe-byte-identical-rebuild");
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "observe-byte-identical-create".into(),
             request_digest: "observe-byte-identical-digest".into(),
             request_json: "{}".into(),
@@ -2626,6 +2627,7 @@ mod observe_cache_retention_tests {
         for ordinal in 1..=WARMUP_CYCLES + CYCLES {
             let session_id = SessionId::new(format!("retain-soak-{ordinal}"));
             hub.create_internal_session(SessionCreateCommand {
+                resolved_model: None,
                 command_id: format!("retain-soak-create-{ordinal}"),
                 request_digest: format!("retain-soak-create-digest-{ordinal}"),
                 request_json: "{}".into(),
@@ -12318,11 +12320,11 @@ impl HubConnection {
         };
         let model_catalog_key = expected_catalog_key
             .as_ref()
-            .and_then(|_| authority.model_catalog_key(selected_provider, model.trim()))
+            .and_then(|_| authority.model_catalog_key(&validated.provider, &validated.model))
             .or_else(|| {
                 authority.model_settings_catalog_key(
-                    selected_provider,
-                    model.trim(),
+                    &validated.provider,
+                    &validated.model,
                     &output_budget,
                 )
             });
@@ -12364,7 +12366,7 @@ impl HubConnection {
         if current.provider != resolved_provider {
             changed_fields.push("provider".to_owned());
         }
-        if current.model != resolved_model {
+        if current.model_coordinate() != resolved_model.as_str() {
             changed_fields.push("model".to_owned());
         }
         let current_scope =
@@ -14649,9 +14651,11 @@ impl HubConnection {
             );
         };
         let authority = self.tuning_authority()?;
-        if let Err(refusal) =
-            authority.validate_effort(&current.provider, &current.model, effort.as_deref())
-        {
+        if let Err(refusal) = authority.validate_effort(
+            &current.provider,
+            current.model_coordinate(),
+            effort.as_deref(),
+        ) {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
         let changed_fields = if current.effort != effort {
@@ -14666,7 +14670,7 @@ impl HubConnection {
             &current,
             current_scope.as_ref(),
             &current.provider,
-            &current.model,
+            current.model_coordinate(),
             current_scope
                 .as_ref()
                 .map(|scope| scope.auth_scope.as_str()),
@@ -14861,7 +14865,9 @@ impl HubConnection {
             );
         };
         let authority = self.tuning_authority()?;
-        if let Err(refusal) = authority.validate_fast(&current.provider, &current.model, enabled) {
+        if let Err(refusal) =
+            authority.validate_fast(&current.provider, current.model_coordinate(), enabled)
+        {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
         let changed_fields = if current.fast != enabled {
@@ -14876,7 +14882,7 @@ impl HubConnection {
             &current,
             current_scope.as_ref(),
             &current.provider,
-            &current.model,
+            current.model_coordinate(),
             current_scope
                 .as_ref()
                 .map(|scope| scope.auth_scope.as_str()),
@@ -17024,16 +17030,23 @@ impl HubConnection {
             }
         };
         let model_catalog_key = (resolve_model || expected_catalog_key.is_some())
-            .then(|| authority.model_catalog_key(&provider, model.trim()))
+            .then(|| authority.model_catalog_key(&validated.provider, &validated.model))
             .flatten()
             .or_else(|| {
-                authority.model_settings_catalog_key(&provider, model.trim(), &output_budget)
+                authority.model_settings_catalog_key(
+                    &validated.provider,
+                    &validated.model,
+                    &output_budget,
+                )
             });
-        if let Err(refusal) = authority.validate_effort(&provider, &model, effort.as_deref()) {
+        if let Err(refusal) =
+            authority.validate_effort(&validated.provider, &validated.model, effort.as_deref())
+        {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
         if let Some(enabled) = fast
-            && let Err(refusal) = authority.validate_fast(&provider, &model, enabled)
+            && let Err(refusal) =
+                authority.validate_fast(&validated.provider, &validated.model, enabled)
         {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
@@ -17063,6 +17076,7 @@ impl HubConnection {
         };
         let session_id = SessionId::new(random_id("session")?);
         let command = SessionCreateCommand {
+            resolved_model: (validated.model != model).then_some(validated.model),
             command_id: command_id.0,
             request_digest,
             request_json,

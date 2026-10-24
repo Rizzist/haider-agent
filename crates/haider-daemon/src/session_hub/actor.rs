@@ -2474,6 +2474,7 @@ mod error_wave3_tests {
         let session_id = SessionId::new("e6a-abandon-session");
         store
             .create_session(haider_store::SessionCreateCommand {
+                resolved_model: None,
                 command_id: "create-e6a-abandon".into(),
                 request_digest: "digest-e6a-abandon".into(),
                 request_json: r#"{"session":"e6a-abandon"}"#.into(),

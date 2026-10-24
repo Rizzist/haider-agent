@@ -15,6 +15,9 @@ pub(super) async fn pin_headless_turn_metadata(
     store: &HubStoreHandle,
     run_id: &RunId,
 ) -> Result<(), HaiderError> {
+    if spec.resolved_model.is_some() || metadata.model != spec.model {
+        metadata.resolved_model.clone_from(&spec.resolved_model);
+    }
     metadata.model.clone_from(&spec.model);
     metadata
         .model_catalog_key
@@ -66,6 +69,7 @@ pub(super) async fn pin_headless_turn_metadata(
                     .filter(|model| !model.is_empty())
             {
                 metadata.model = model.to_owned();
+                metadata.resolved_model = None;
                 metadata.model_catalog_key = data
                     .get("model_catalog_key")
                     .and_then(serde_json::Value::as_str)
@@ -214,6 +218,9 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             .clone();
         // Model/effort selection retains its existing next-turn contract.
         // This lever changes only the explicitly bound route coordinates.
+        if metadata.model != current_model {
+            metadata.resolved_model = None;
+        }
         metadata.model = current_model.to_owned();
         let reasoning: serde_json::Value =
             serde_json::from_str(reasoning_settings).unwrap_or(serde_json::Value::Null);

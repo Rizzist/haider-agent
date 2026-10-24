@@ -451,7 +451,7 @@ impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
         to: &haider_protocol::ids::CredentialAlias,
     ) -> Result<u64, HaiderError> {
         let selection = self.selection.lock().await.clone();
-        if selection.provider != provider || selection.model != model {
+        if selection.provider != provider || selection.model_coordinate() != model {
             return Ok(selection.selection_epoch.unwrap_or(0));
         }
         let epoch = self
@@ -613,6 +613,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
                 let mut current = self.turn_selection.lock().await;
                 current.provider = selected.provider;
                 current.model = selected.model;
+                current.resolved_model = None;
                 current.selection_epoch = Some(selected.selected_seq);
                 Ok(selected.selected_seq)
             }
@@ -13947,6 +13948,7 @@ mod manager_law_tests {
         let session_id = SessionId::new("queued-turnid-session");
         let device_id = DeviceId::new("queued-turnid-device");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "queued-turnid-create".into(),
             request_digest: "queued-turnid-create-digest".into(),
             request_json: "{}".into(),
@@ -14064,6 +14066,7 @@ mod manager_law_tests {
             .expect("store");
         let session_id = SessionId::new("worker-retirement-recreation");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "worker-retirement-create".into(),
             request_digest: "worker-retirement-create-digest".into(),
             request_json: "{}".into(),
@@ -14177,6 +14180,7 @@ mod manager_law_tests {
             .expect("store");
         let session_id = SessionId::new("worker-idle-ttl");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "worker-idle-create".into(),
             request_digest: "worker-idle-create-digest".into(),
             request_json: "{}".into(),
@@ -23697,7 +23701,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         let attempt = self.record_side_request_attempt(run_id).await?;
                         match executor
                             .search(
-                                &self.metadata.model,
+                                self.metadata.model_coordinate(),
                                 self.session_id.as_str(),
                                 &query,
                                 &attempt,

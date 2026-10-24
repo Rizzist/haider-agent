@@ -134,6 +134,7 @@ impl TestWorker {
         let device_id = DeviceId::new(format!("instructions-device-{session_suffix}"));
         let cwd = canonical_utf8(workspace);
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-instructions-{session_suffix}"),
             request_digest: format!("create-instructions-digest-{session_suffix}"),
             request_json: format!(r#"{{"session":"{session_suffix}"}}"#),
@@ -306,6 +307,7 @@ fn project_facts(
 
 fn metadata(cwd: String) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -1071,6 +1073,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
         .expect("first store");
     first
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-instructions-recovery".into(),
             request_digest: "create-instructions-recovery-digest".into(),
             request_json: r#"{"session":"instructions-recovery"}"#.into(),

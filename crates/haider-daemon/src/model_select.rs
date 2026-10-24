@@ -345,8 +345,20 @@ impl ModelSelectionAuthority {
         })
     }
 
+    /// Creation preserves the public literal spelling. Resolve it against this
+    /// snapshot before consulting row metadata, including later tuning reads.
+    /// The shared selector keeps exact IDs and ambiguous/unlisted literals intact.
+    fn canonical_model<'a>(&'a self, provider: &str, model: &'a str) -> &'a str {
+        let model = model.trim();
+        self.summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .map_or(model, |summary| summary.canonical_model_selector(model))
+    }
+
     /// Permanent rows and explicit unlisted configuration have no private owner.
     pub(crate) fn model_catalog_key(&self, provider: &str, model: &str) -> Option<String> {
+        let model = self.canonical_model(provider, model);
         let summary = self
             .summaries
             .iter()
@@ -389,6 +401,7 @@ impl ModelSelectionAuthority {
         {
             return None;
         }
+        let model = self.canonical_model(provider, model);
         let summary = self
             .summaries
             .iter()
@@ -684,6 +697,7 @@ impl ModelSelectionAuthority {
     /// before a management snapshot exists. Everything else honestly gets
     /// the EMPTY ladder.
     pub(crate) fn effort_ladder(&self, provider: &str, model: &str) -> Vec<String> {
+        let model = self.canonical_model(provider, model);
         let declared = self
             .summaries
             .iter()
@@ -760,6 +774,7 @@ impl ModelSelectionAuthority {
         if !enabled {
             return Ok(());
         }
+        let model = self.canonical_model(provider, model);
         let supported = matches!(
             provider,
             haider_provider::ANTHROPIC_PROVIDER_NAME
