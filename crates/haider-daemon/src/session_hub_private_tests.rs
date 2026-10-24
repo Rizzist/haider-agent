@@ -5840,7 +5840,7 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
     store.close().await.expect("store closes");
 }
 
-fn run_state_envelope(
+pub(super) fn run_state_envelope(
     session_id: &SessionId,
     run_id: &RunId,
     generation: u64,
@@ -8725,7 +8725,3 @@ async fn r7_check_stop_lookup_epoch(finish_while_waiting: bool, wait_on_admissio
         "stop of the completed original run changed the successor session's monitor epoch; a report that captured the old epoch is now durably dismissed"
     );
 }
-
-#[cfg(unix)]
-#[path = "stop_successor_tests.rs"]
-mod stop_successor_tests;

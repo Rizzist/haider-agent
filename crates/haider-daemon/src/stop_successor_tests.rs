@@ -1,8 +1,13 @@
+#![allow(clippy::expect_used)]
 //! Ordered public-stop regressions: a durable claim never adopts successor work.
+use super::session_hub_private_tests::{
+    CapturingFrameSink, accept_command, create_command, run_state_envelope,
+};
 use super::*;
 use haider_core::{DelegationRecord, DelegationState};
 use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
-use haider_protocol::ids::LeaseId;
+use haider_protocol::headless::{HeadlessRunEventPayload, HeadlessRunSpecV1, RunBudgetV1};
+use haider_protocol::ids::{AgentId, ItemId, LeaseId};
 use haider_tools::{
     MonitorAction, MonitorLifetime, MonitorOccurrence, MonitorRequest, MonitorSource,
 };
