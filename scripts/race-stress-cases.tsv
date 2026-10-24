@@ -68,6 +68,7 @@ tui-workflow-rejects	linux	haider-tui	test:workflow_live_view_tests	evidence_les
 tui-branch-interleaving	linux	haider-tui	test:b2b_branch_state_tests	interleaved_branch_seqs_advance_one_cursor_and_switching_never_rewinds	crates/haider-tui/tests/b2b_branch_state_tests.rs
 tui-rapid-submit	linux	haider-tui	test:tui31_lifecycle_tests	two_rapid_aura_submits_cannot_interleave	crates/haider-tui/tests/tui31_lifecycle_tests.rs
 tui-effect-interleaving	linux	haider-tui	test:f2_error_visibility_tests	interleaved_results_attribute_each_effect_to_its_own_row	crates/haider-tui/tests/f2_error_visibility_tests.rs
+tui-frame-publication	all	haider-tui	lib	a_reader_racing_frame_publication_keeps_the_previous_arrival_stamp	crates/haider-tui/src/input_typeahead_tests.rs
 # Timing-window tests whose names do not contain an explicit race token.
 platform-phase-cpu-accounting	linux	haider-platform	lib	nested_cpu_is_exclusive_and_thread_time_does_not_charge_sleep	crates/haider-platform/src/phase_trace/native_tests.rs
 cli-one-shot-daemon-reap	macos	haider-cli	test:cli_tests	one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure	crates/haider-cli/tests/cli_tests.rs

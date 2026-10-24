@@ -649,6 +649,9 @@ pub const FEATURE_PEER_AGENT_INJECTION_V1: &str = "peer_agent_injection_v1";
 /// Daemon implements profile-scoped SSH profile management, session scope,
 /// and remote shell execution without exposing stored authentication data.
 pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
+/// SSH setup failures use `ShellWire::setup_error`; uncoded completion is not
+/// inferred to be a setup failure from ordinary terminal output.
+pub const FEATURE_SSH_TYPED_SETUP_ERRORS_V1: &str = "ssh_typed_setup_errors_v1";
 /// Daemon exposes one registry for local and SSH-backed terminal lifecycles.
 pub const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 /// Daemon-enforced provider trust ceilings, the fixed lockdown envelope, and
@@ -1959,12 +1962,23 @@ pub enum ShellStatusWire {
     Closed,
 }
 
+/// Coded refusal during asynchronous shell setup, before a remote command
+/// starts. Kept separate from the remote command's numeric exit status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSetupErrorWire {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
 /// Public, secret-free projection of one entry in the unified shell registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellWire {
     pub id: String,
     pub kind: ShellKindWire,
     pub status: ShellStatusWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_error: Option<ShellSetupErrorWire>,
     pub title: String,
     pub cwd_or_host: String,
     pub created_at_ms: u64,

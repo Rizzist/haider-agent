@@ -14,7 +14,7 @@ use haider_protocol::permission::{
     PermissionEventPayload, PermissionGrantAction, PermissionGrantNeeded,
     PermissionGrantResolution, PermissionGrantResolved, SystemPermission,
 };
-use haider_tui::app::{AppModel, AppRequest, Hit, Screen};
+use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, InputOwner, Screen};
 use haider_tui::projection::SessionProjection;
 use haider_tui::render::render;
 use haider_tui::session::route_permission_event;
@@ -196,6 +196,33 @@ fn card_renders_labelled_prompt_with_open_settings_and_retry() {
     assert!(
         hits.iter().any(|(_, h)| *h == Hit::PermissionRetry),
         "missing Retry hit"
+    );
+}
+
+#[test]
+fn standalone_grant_card_owns_input_without_a_paired_menu() {
+    let mut model = card_model();
+    model.composer.set_text("parked draft");
+    model
+        .projection
+        .set_permission_card(card(SystemPermission::ScreenRecording, false));
+    assert_eq!(model.input_owner(), InputOwner::SessionMenu);
+
+    model.handle(key(KeyCode::Char('x')));
+    model.handle(AppEvent::Paste("hidden paste".to_owned().into()));
+    assert_eq!(model.composer.text(), "parked draft");
+
+    let (_, hits) = draw(&model);
+    assert!(
+        hits.iter()
+            .any(|(_, hit)| *hit == Hit::PermissionOpenSettings)
+    );
+    model.handle_hit(Hit::PermissionOpenSettings);
+    assert!(
+        model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::OpenPermissionSettings { .. }))
     );
 }
 
