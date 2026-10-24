@@ -22,6 +22,7 @@ members = [
     "crates/haider-tui-exe",
     "crates/haider-compat",
     "xtask",
+    "vendor/crossterm",
 ]
 
 [workspace.package]
@@ -126,3 +127,7 @@ codegen-units = 16
 lto = false
 debug = false
 incremental = false
+
+# Retain terminal escape prefixes across Unix read boundaries (upstream #993).
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
