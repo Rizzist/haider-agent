@@ -573,20 +573,20 @@ fn activity_token_requires_hello_request_and_follows_newer_withholding() {
             .features
             .contains(FEATURE_SESSION_ACTIVITY_V1)
     );
-    let mut newer_withheld = newest_withheld;
+    let mut retained = newest_withheld.features.clone();
+    let mut next_limit = newest_withheld.bytes.len() - 5;
     for newer in [
         haider_rpc::FEATURE_HELPER_STOP_V1,
         haider_rpc::FEATURE_RUN_STOP_SCOPE_V1,
     ] {
-        let next = encode_welcome_for_peer(welcome.clone(), newer_withheld.bytes.len() - 5)
+        let next = encode_welcome_for_peer(welcome.clone(), next_limit)
             .expect("next merged token withheld before activity");
-        let mut expected = newer_withheld.features.clone();
-        assert!(expected.remove(newer));
-        assert_eq!(next.features, expected, "withholding {newer}");
+        assert!(retained.remove(newer));
+        assert_eq!(next.features, retained, "withholding {newer}");
         assert!(next.features.contains(FEATURE_SESSION_ACTIVITY_V1));
-        newer_withheld = next;
+        next_limit = next.bytes.len() - 5;
     }
-    let withheld = encode_welcome_for_peer(welcome, newer_withheld.bytes.len() - 5)
+    let withheld = encode_welcome_for_peer(welcome, next_limit)
         .expect("activity withheld after all newer tokens");
     assert!(!withheld.features.contains(FEATURE_SESSION_ACTIVITY_V1));
     assert!(
