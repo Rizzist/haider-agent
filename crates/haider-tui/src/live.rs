@@ -47,7 +47,7 @@ use crate::projection::RawOutcome;
 
 fn replace_loom_author_text(model: &mut AppModel, text: &str) {
     if model.screen == crate::app::Screen::Loom {
-        model.composer.set_text(text);
+        model.edit_composer_from_outside(|composer| composer.set_text(text));
     } else {
         model
             .drafts
@@ -422,6 +422,7 @@ pub enum LiveCommand {
         changes: haider_rpc::SshProfileUpdateWire,
     },
     SshShellOpen {
+        attempt_id: u64,
         profile: String,
         session: Option<SessionId>,
         size: haider_rpc::SshPtySizeWire,
@@ -1001,6 +1002,19 @@ impl LiveDriver {
             }];
         }
 
+        // A covered composer must never re-publish its parked bytes. A
+        // retained foreign edit is applied by the mutable-model seam before
+        // this comparison, so OLD cannot overwrite NEW on the first frame.
+        if !model.accepts_injected_edits()
+            || self
+                .input_mirror
+                .sessions
+                .get(&session)
+                .is_some_and(|state| state.pending.is_some())
+        {
+            return Vec::new();
+        }
+
         let text = model.composer.text();
         let attachments = if model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1) {
             model
@@ -1128,19 +1142,65 @@ impl LiveDriver {
         if floor.is_some_and(|floor| input.revision <= floor) {
             return;
         }
-        state.foreign_floors.insert(input.owner, input.revision);
-        // The mirror now equals the surface: block an immediate republish.
+        if !model.accepts_injected_edits() {
+            if state.pending.as_ref().is_none_or(|pending| {
+                pending.input.owner != input.owner || input.revision > pending.input.revision
+            }) {
+                state.pending = Some(PendingForeignInput {
+                    input,
+                    epoch: self.connection_epoch,
+                    composer_revision: model.composer.revision(),
+                    local_attachments: model.composer.attachments().to_vec(),
+                });
+            }
+            model.mirror_waiting_for_owner = true;
+            return;
+        }
+        if state.pending.as_ref().is_some_and(|pending| {
+            pending.input.owner == input.owner && input.revision < pending.input.revision
+        }) {
+            return;
+        }
+        state.pending = None;
+        state
+            .foreign_floors
+            .insert(input.owner.clone(), input.revision);
         state.published = Some(PublishedSurfaceInput {
             text: input.text.clone(),
             attachments: attachments.clone(),
         });
-        // rev934 P3-5: the same predicate that gates injected ops gates a
-        // remote replace — an in-progress modal answer is never overwritten.
-        if !model.accepts_injected_input() {
-            return;
-        }
+        model.mirror_waiting_for_owner = false;
         model.set_mirrored_input_attachments(session, attachments);
         model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
+    }
+
+    /// Deliver a queued replacement only when the visible Session input
+    /// accepts edits and its local content still matches the queue point.
+    /// A later local edit refuses and drops it. Reconnects and closed
+    /// sessions also drop the slot.
+    pub fn apply_pending_input(&mut self, model: &mut AppModel) {
+        if !model.accepts_injected_edits() {
+            return;
+        }
+        let Some(session) = model.active_session.clone() else {
+            model.mirror_waiting_for_owner = false;
+            return;
+        };
+        let pending = self
+            .input_mirror
+            .sessions
+            .get_mut(&session)
+            .and_then(|state| state.pending.take());
+        if let Some(pending) = pending
+            && pending.epoch == self.connection_epoch
+            && self.input_mirror.epoch == pending.epoch
+            && model.composer.revision() == pending.composer_revision
+            && model.composer.attachments() == pending.local_attachments.as_slice()
+        {
+            self.apply_surface_input(model, session, pending.input);
+        }
+        model.mirror_waiting_for_owner = false;
+        model.deliver_pending_dictation();
     }
 }
 
@@ -1601,6 +1661,7 @@ pub enum LiveReply {
         message: String,
     },
     SshShellOpened {
+        attempt_id: u64,
         shell: haider_rpc::ShellWire,
     },
     SshShellOutput {
@@ -1608,6 +1669,7 @@ pub enum LiveReply {
         chunk_b64: haider_rpc::TerminalOutputWire,
     },
     SshShellFailed {
+        attempt_id: u64,
         code: String,
         message: String,
     },
@@ -2140,6 +2202,9 @@ pub struct MenuCoordinates {
     /// Minted at the FIRST answer attempt and reused on every retry, so a
     /// resend after a lost response resolves the same menu once.
     command_id: Option<CommandId>,
+    /// Whether the committed opening has choices. Option-less answers use
+    /// an empty wire key; choice menus retain the ordinal fallback.
+    has_options: bool,
 }
 
 /// A live session row the launcher knows about but is not attached to.
@@ -2177,6 +2242,17 @@ struct InputMirrorSession {
     /// compare only within one owner — never against our own publish counter
     /// (rev934 P1-1).
     foreign_floors: HashMap<String, u64>,
+    /// Latest queued foreign edit. It has not advanced any applied floor.
+    pending: Option<PendingForeignInput>,
+}
+
+#[derive(Debug)]
+struct PendingForeignInput {
+    input: haider_rpc::SurfaceInputWire,
+    epoch: u64,
+    /// A later local edit supersedes this queued replacement.
+    composer_revision: u64,
+    local_attachments: Vec<crate::composer::PendingAttachment>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3177,8 +3253,20 @@ impl LiveDriver {
 
     /// Reduce one inbound fact, mutating the model, and return the RPCs the
     /// shell must now issue.
-    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
+        let before = model.input_rows();
+        let commands = self.apply_reply(model, reply);
+        // A replaced neighbor or changed binding is an outside change even
+        // when the selected row still has the same identity. Unchanged and
+        // irrelevant bootstrap replies do not retire type-ahead.
+        if before != model.input_rows() {
+            model.invalidate_queued_input();
+        }
+        commands
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_reply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
         let reply = match reply {
             LiveReply::ListedAt {
                 sessions,
@@ -4063,8 +4151,8 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
-            LiveReply::SshShellOpened { shell } => {
-                model.apply_ssh_shell_opened(shell);
+            LiveReply::SshShellOpened { attempt_id, shell } => {
+                model.apply_ssh_shell_opened(attempt_id, shell);
                 Vec::new()
             }
             LiveReply::SshShellOutput { id, chunk_b64 } => {
@@ -4081,7 +4169,18 @@ impl LiveDriver {
                 }
                 Vec::new()
             }
-            LiveReply::SshShellFailed { code, message } => {
+            LiveReply::SshShellFailed {
+                attempt_id,
+                code,
+                message,
+            } => {
+                if model
+                    .ssh_terminal
+                    .as_ref()
+                    .is_none_or(|pane| pane.attempt_id != attempt_id)
+                {
+                    return Vec::new();
+                }
                 model.ssh_terminal = None;
                 model.flash = Some(format!("· SSH terminal refused [{code}] — {message}"));
                 model.dirty = true;
@@ -6203,27 +6302,26 @@ impl LiveDriver {
                 commands
             }
             LiveReply::InputInjected { session, op } => {
-                // Apply only when this composer is genuinely the session's
-                // live input surface: the session is active and a session
-                // surface is on screen. Anything else ignores the op — the
-                // absence of a republish tells the injector it did not land.
-                // rev933c/d finding 4: an injected op lands only when the
-                // PLAIN session composer is the live Enter target — the
-                // single predicate that mirrors key-dispatch precedence
-                // (no login/talk-setup/engaged-talk card, no menu, no help,
-                // not the child-messaging subagent view). A synthesized
-                // Submit can therefore never activate a card row.
-                if model.active_session.as_ref() == Some(&session) && model.accepts_injected_input()
-                {
+                // Judge edits and Submit separately against the current
+                // owner at delivery. A shared answer-line card may accept
+                // Set/Insert/Clear while still refusing a synthetic Enter.
+                // Covered owners never receive a queued injected edit.
+                if model.active_session.as_ref() == Some(&session) {
                     match op {
-                        haider_rpc::SurfaceInjectOp::Set { text } => {
-                            model.composer.set_text(text);
+                        haider_rpc::SurfaceInjectOp::Set { text }
+                            if model.accepts_injected_edits() =>
+                        {
+                            model.edit_composer_from_outside(|composer| composer.set_text(text));
                         }
-                        haider_rpc::SurfaceInjectOp::Insert { text } => {
-                            model.composer.insert_str(&text);
+                        haider_rpc::SurfaceInjectOp::Insert { text }
+                            if model.accepts_injected_edits() =>
+                        {
+                            model.edit_composer_from_outside(|composer| composer.insert_str(&text));
                         }
-                        haider_rpc::SurfaceInjectOp::Clear => model.composer.clear(),
-                        haider_rpc::SurfaceInjectOp::Submit => {
+                        haider_rpc::SurfaceInjectOp::Clear if model.accepts_injected_edits() => {
+                            model.edit_composer_from_outside(crate::composer::Composer::clear);
+                        }
+                        haider_rpc::SurfaceInjectOp::Submit if model.accepts_injected_submit() => {
                             // Exactly the Enter path — mid-turn queue modes,
                             // command dispatch, and drafts all keep their
                             // ordinary meaning.
@@ -7116,6 +7214,7 @@ impl LiveDriver {
                         request_seq: envelope.seq,
                         worker_generation: envelope.worker_generation,
                         command_id: None,
+                        has_options: !menu.options.is_empty(),
                     },
                 );
             }
@@ -7925,8 +8024,13 @@ impl LiveDriver {
                 mutation,
                 secret: None,
             } => ssh_profile_command(mutation, None).into_iter().collect(),
-            AppRequest::SshShellOpen { profile, size } => {
+            AppRequest::SshShellOpen {
+                attempt_id,
+                profile,
+                size,
+            } => {
                 vec![LiveCommand::SshShellOpen {
+                    attempt_id,
                     profile,
                     session: model.active_session.clone(),
                     size,
@@ -8514,10 +8618,11 @@ impl LiveDriver {
     fn answer_command(&mut self, pending: &OutboundAnswer) -> Option<LiveCommand> {
         let menu = pending.answer.menu.clone();
         let coordinates = self.menus.get(&menu)?;
-        let (session, request_seq, worker_generation) = (
+        let (session, request_seq, worker_generation, has_options) = (
             coordinates.session.clone(),
             coordinates.request_seq,
             coordinates.worker_generation,
+            coordinates.has_options,
         );
         let command_id = match &coordinates.command_id {
             Some(existing) => existing.clone(),
@@ -8535,11 +8640,13 @@ impl LiveDriver {
             menu,
             request_seq,
             worker_generation,
-            option_key: pending
-                .answer
-                .option_key
-                .clone()
-                .unwrap_or_else(|| pending.answer.option_index.to_string()),
+            option_key: pending.answer.option_key.clone().unwrap_or_else(|| {
+                if has_options {
+                    pending.answer.option_index.to_string()
+                } else {
+                    String::new()
+                }
+            }),
             option_index: pending.answer.option_index,
             input: pending
                 .answer
