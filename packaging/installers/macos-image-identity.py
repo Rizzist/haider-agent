@@ -310,7 +310,22 @@ def holds_image(fd, expected):
         return False
 
 
-def image_users_snapshot(path, descriptor):
+def inherited_parent_descriptors():
+    """Capture declared handles before an action can reuse a closed number."""
+    try:
+        declared = declared_parent_descriptors()
+    except ValueError as error:
+        raise RuntimeError('invalid declared parent descriptors; retaining image output') from error
+    inherited = {}
+    for fd in declared:
+        try:
+            inherited[fd] = identity(os.fstat(fd))
+        except (OSError, OverflowError):
+            pass
+    return inherited
+
+
+def image_users_snapshot(path, descriptor, inherited=None):
     """Cross-check inventory against readers of the pinned vnode.
 
     A warning-free hdiutil plist can silently omit an attachment. lsof selects
@@ -328,7 +343,6 @@ def image_users_snapshot(path, descriptor):
     expected = identity(os.fstat(descriptor))
     try:
         records = image_reader_records(result.stdout)
-        declared = declared_parent_descriptors()
     except ValueError as error:
         raise RuntimeError('incomplete backing-file inventory; retaining ' + str(path)) from error
     # A reader whose process set was lost is credited to the preceding
@@ -336,7 +350,8 @@ def image_users_snapshot(path, descriptor):
     # ours, or the parent's declared descriptors confirmed through the
     # inherited copy, are excluded; every other record is a reader.
     own, parent = os.getpid(), os.getppid()
-    inherited = {fd for fd in declared if holds_image(fd, expected)}
+    confirmed = {fd for fd, entry_identity in (inherited or {}).items()
+                 if entry_identity == expected and holds_image(fd, expected)}
     users = set()
     for pid, fd, observed in records:
         if observed != expected:
@@ -344,17 +359,17 @@ def image_users_snapshot(path, descriptor):
         if pid == own:
             if not holds_image(fd, expected):
                 raise RuntimeError('unverified own backing-file descriptor; retaining ' + str(path))
-        elif pid != parent or fd not in inherited:
+        elif pid != parent or fd not in confirmed:
             users.add(pid)
     if (own, descriptor) not in {(pid, fd) for pid, fd, observed in records}:
         raise RuntimeError('pinned image absent from backing-file inventory; retaining ' + str(path))
     return users
 
 
-def open_image_users(path, descriptor):
+def open_image_users(path, descriptor, inherited=None):
     for attempt in range(4):
         try:
-            return image_users_snapshot(path, descriptor)
+            return image_users_snapshot(path, descriptor, inherited)
         except RuntimeError:
             if attempt == 3:
                 raise
@@ -372,7 +387,7 @@ def helper_has_exited(pid):
     return False
 
 
-def require_unattached(path, expected, history):
+def require_unattached(path, expected, history, inherited=None):
     """Refuse deletion of any attached or incompletely inventoried generation.
 
     Native staging attachments are never ours to eject. Observations survive
@@ -422,21 +437,21 @@ def require_unattached(path, expected, history):
                 raise RuntimeError('incomplete previously observed image inventory; retaining ' + str(path))
             time.sleep(.1 * (attempt + 1))
         # Even an always-omitted attachment still has its backing vnode open.
-        if open_image_users(path, source.fileno()):
+        if open_image_users(path, source.fileno(), inherited):
             raise RuntimeError('incomplete image inventory: backing file still open; retaining ' + str(path))
         check(path, expected)
 
 
-def finish(staging):
+def finish(staging, inherited=None):
     saved = json.loads((staging / 'staged-image.json').read_text())
     raw = Path(saved['path'])
     check(raw, saved['identity'])
     # A successful create can also return an independently replaced image.
     # Matching bytes or a post-create inode is no authority to eject it.
-    require_unattached(raw, saved['identity'], staging / 'seen-create-devices.json')
+    require_unattached(raw, saved['identity'], staging / 'seen-create-devices.json', inherited)
 
 
-def clean_staging(staging):
+def clean_staging(staging, inherited=None):
     """Remove only the inventoried, identity-checked native staging entry.
 
     A returned staging file grants no attachment ownership. finish() refuses
@@ -449,7 +464,7 @@ def clean_staging(staging):
         descriptors.callback(os.close, directory_fd)
         if identity(os.fstat(directory_fd)) != saved['directory']:
             raise RuntimeError('staging directory identity changed; retaining ' + str(raw))
-        finish(staging)
+        finish(staging, inherited)
         if identity(os.stat(raw.name, dir_fd=directory_fd, follow_symlinks=False)) != saved['identity']:
             raise RuntimeError('staging image identity changed; retaining ' + str(raw))
         os.unlink(raw.name, dir_fd=directory_fd)
@@ -572,15 +587,16 @@ def checksum(path, record, sidecar):
 
 
 def main():
+    inherited = inherited_parent_descriptors()
     action, filename, ledger, *args = sys.argv[1:]
     path, record = Path(filename), Path(ledger)
     if action == 'create':
         sys.exit(create(path, record, Path(args[0]), args[1:]))
     if action == 'finish':
-        finish(Path(args[0]))
+        finish(Path(args[0]), inherited)
         sys.exit(0)
     if action == 'clean':
-        clean_staging(Path(args[0]))
+        clean_staging(Path(args[0]), inherited)
         sys.exit(0)
     if action == 'package':
         package(path, record, Path(args[0]), Path(args[1]), Path(args[2]),
@@ -594,7 +610,7 @@ def main():
         sys.exit(0)
     if action == 'withdraw-image':
         if path.exists() or path.is_symlink():
-            require_unattached(path, expected_identity(record), record.with_suffix('.devices.json'))
+            require_unattached(path, expected_identity(record), record.with_suffix('.devices.json'), inherited)
             saved = json.loads(record.read_text())
             withdraw(path, record if isinstance(saved, dict) else record.with_suffix('.withdraw.json'))
         sys.exit(0)
@@ -602,7 +618,7 @@ def main():
     check(path, expected)
     if action == 'remove':
         # Check immediately before invoking unlink; no pathname-only permission.
-        require_unattached(path, expected, record.with_suffix('.devices.json'))
+        require_unattached(path, expected, record.with_suffix('.devices.json'), inherited)
         path.unlink()
         sys.exit(0)
     if action == 'checksum':

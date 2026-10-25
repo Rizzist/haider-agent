@@ -148,7 +148,8 @@ class ReaderInventoryTests(unittest.TestCase):
     def users(self, output):
         with patch.object(IMAGE.subprocess, 'run',
                 return_value=subprocess.CompletedProcess([], 0, output, b'')):
-            return IMAGE.image_users_snapshot(self.path, self.source.fileno())
+            return IMAGE.image_users_snapshot(self.path, self.source.fileno(),
+                                              IMAGE.inherited_parent_descriptors())
 
     def refuse(self, output):
         with self.assertRaisesRegex(RuntimeError, 'retaining'):
