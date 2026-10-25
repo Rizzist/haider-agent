@@ -20,7 +20,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-BASE = "088e5a24026d48378df7256a26bb868f46da0730"
+OLD_WRITERS = ["088e5a24026d48378df7256a26bb868f46da0730", "ce9d0976"]
 DISK_FLOOR = 6 * 2**30
 DISK_RECOVERY = 8 * 2**30
 
@@ -95,7 +95,7 @@ class CommandRunner:
             log.flush()
             self.sleep(min(self.recovery_seconds, remaining))
 
-    def run(self, name, command, cwd, environment):
+    def run(self, name, command, cwd, environment, *, on_disk_floor=None):
         record = self.records[name] = {"command": command, "attempts": []}
         with (self.evidence / (name + ".log")).open("w") as log:
             log.write(self.identity + f"cwd={cwd} command={command!r}\n")
@@ -132,6 +132,8 @@ class CommandRunner:
                             log.flush()
                             (self.evidence / (name + ".rc")).write_text(str(process.returncode) + "\n")
                     if attempt["disk_floor"]:
+                        if on_disk_floor is not None:
+                            on_disk_floor()
                         self.wait_for_disk(log)
                         continue
                     if process.returncode:
@@ -177,7 +179,10 @@ try:
     (root / "ticket").write_text(str(os.getpid()))
     delay = 2 if count == 1 and sys.argv[3] == "hold" else 0.02
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(float(__import__('sys').argv[1]))", str(delay)])
-    (root / ("child-" + str(count))).write_text(str(child.pid))
+    pid_file = root / ("child-" + str(count))
+    pending_pid = pid_file.with_name("." + pid_file.name)
+    pending_pid.write_text(str(child.pid))
+    pending_pid.replace(pid_file)
     child.wait()
 finally:
     if child is not None:
@@ -220,6 +225,15 @@ sys.exit(int(sys.argv[2]))
                 root = self.root / phase
                 root.mkdir()
                 waits = []
+                target = root / "owned-target"
+                target.mkdir()
+                (target / "partial-output").write_text("disposable fixture")
+                cleanups = []
+
+                def cleanup():
+                    self.assert_released(root)
+                    shutil.rmtree(target)
+                    cleanups.append(True)
 
                 def disk():
                     if (root / "count").exists() and (root / "count").read_text() == "1":
@@ -233,17 +247,20 @@ sys.exit(int(sys.argv[2]))
                 def sleep(seconds):
                     if seconds == 120:
                         self.assert_released(root)
+                        self.assertFalse(target.exists(), "partial build retained during disk wait")
                         waits.append(seconds)
                     else:
                         time.sleep(seconds)
 
                 runner = self.runner(root, disk, sleep=sleep)
                 with patch.dict(os.environ, {"HAIDER_OWNED_DISK_SUPERVISION": "1"}):
-                    runner.run(phase, self.command(root, hold=True), root, os.environ.copy())
+                    runner.run(phase, self.command(root, hold=True), root, os.environ.copy(),
+                               on_disk_floor=cleanup)
                 attempts = runner.records[phase]["attempts"]
                 self.assertEqual([a["rc"] for a in attempts], [143, 0])
                 self.assertEqual([a["disk_floor"] for a in attempts], [True, False])
                 self.assertEqual(waits, [120])
+                self.assertEqual(cleanups, [True])
                 self.assertEqual((root / "released").read_text(), "1\n2\n")
                 self.assertIn("Attempt 1 rc=143", (root / (phase + ".log")).read_text())
                 self.assert_released(root)
@@ -338,7 +355,10 @@ sys.exit(int(sys.argv[2]))
         child.write_text('''import os, signal, sys, time
 from pathlib import Path
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
-Path(sys.argv[1]).write_text(str(os.getpid()))
+pid_file = Path(sys.argv[1])
+pending_pid = pid_file.with_name("." + pid_file.name)
+pending_pid.write_text(str(os.getpid()))
+pending_pid.replace(pid_file)
 time.sleep(30)
 ''')
         ticket = self.root / "ticket"
@@ -364,7 +384,8 @@ time.sleep(30)
         command = [sys.executable, "-c",
                    "import os, signal, sys, time; from pathlib import Path; "
                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                   "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)", str(pid_file)]
+                   "pid_file = Path(sys.argv[1]); pending_pid = pid_file.with_name('.' + pid_file.name); "
+                   "pending_pid.write_text(str(os.getpid())); pending_pid.replace(pid_file); time.sleep(30)", str(pid_file)]
         process = subprocess.Popen(self.sandboxed(command), start_new_session=True)
         try:
             deadline = time.monotonic() + 5
@@ -387,6 +408,7 @@ def main():
     parser.add_argument("--build-slot", type=Path)
     parser.add_argument("--sandbox", type=Path)
     parser.add_argument("--candidate-target", type=Path)
+    parser.add_argument("--scratch-root", type=Path, help="temporary build root inside the worktree target directory")
     parser.add_argument("--slot-held", action="store_true",
                         help="use an outer build-slot; exit 75 on low disk, never wait inside it")
     args = parser.parse_args()
@@ -402,23 +424,34 @@ def main():
     repo = Path(__file__).resolve().parents[2]
     evidence = args.evidence.resolve()
     evidence.mkdir(parents=True, exist_ok=True)
-    work = repo / "target/delegated-create-mixed-writers"
+    work = args.scratch_root.resolve() if args.scratch_root else repo / "target/delegated-create-mixed-writers"
+    if not work.is_relative_to(repo / "target"):
+        raise ValueError("scratch root must be inside the worktree target directory")
     work.mkdir(parents=True, exist_ok=False)
     try:
-        run_regression(args, repo, evidence, work)
+        for revision in OLD_WRITERS:
+            writer_evidence = evidence / revision[:8]
+            writer_evidence.mkdir()
+            writer_work = work / revision[:8]
+            writer_work.mkdir()
+            try:
+                run_regression(args, repo, writer_evidence, writer_work, revision)
+            finally:
+                shutil.rmtree(writer_work)
     finally:
         shutil.rmtree(work)
 
 
-def run_regression(args, repo, evidence, work):
+def run_regression(args, repo, evidence, work, revision):
+    base = subprocess.check_output(["git", "rev-parse", revision], cwd=repo, text=True).strip()
     sha, tree = subprocess.check_output(
         ["git", "rev-parse", "HEAD", "HEAD^{tree}"], cwd=repo, text=True
     ).splitlines()
     base_tree = subprocess.check_output(
-        ["git", "rev-parse", BASE + "^{tree}"], cwd=repo, text=True
+        ["git", "rev-parse", base + "^{tree}"], cwd=repo, text=True
     ).strip()
-    identity = f"candidate={sha} tree={tree} old={BASE} old_tree={base_tree}\n"
-    (evidence / "identity.json").write_text(json.dumps({"candidate": sha, "tree": tree, "old": BASE, "old_tree": base_tree}, indent=2) + "\n")
+    identity = f"candidate={sha} tree={tree} old={base} old_tree={base_tree}\n"
+    (evidence / "identity.json").write_text(json.dumps({"candidate": sha, "tree": tree, "old": base, "old_tree": base_tree}, indent=2) + "\n")
     env = os.environ.copy()
     env.update(CARGO_PROFILE_DEV_DEBUG="0", CARGO_PROFILE_TEST_DEBUG="0",
                HAIDER_NO_SCCACHE="1", HAIDER_DISCOVERY_DISABLED="1",
@@ -457,8 +490,8 @@ def run_regression(args, repo, evidence, work):
             (evidence / (stage + "-metadata-projections.json")).write_text(json.dumps(projections, indent=2) + "\n")
         return serialized
 
-    def run(name, command, cwd=repo, environment=env):
-        runner.run(name, command, cwd, environment)
+    def run(name, command, cwd=repo, environment=env, *, on_disk_floor=None):
+        runner.run(name, command, cwd, environment, on_disk_floor=on_disk_floor)
 
     binaries = {}
     try:
@@ -466,7 +499,7 @@ def run_regression(args, repo, evidence, work):
         old_source.mkdir()
         # One owned group includes both archive producer and extraction child.
         run("old-source", ["/bin/bash", "-o", "pipefail", "-c", 'git archive "$1" | tar -x -C "$2"',
-                           "archive", BASE, str(old_source)])
+                           "archive", base, str(old_source)])
         for kind, source in [("candidate", repo), ("old", old_source)]:
             target = (args.candidate_target.resolve() if kind == "candidate" and args.candidate_target
                       else work / (kind + "-target"))
@@ -474,14 +507,20 @@ def run_regression(args, repo, evidence, work):
                 raise ValueError("target directories must be inside this worktree")
             build_env = env | {"CARGO_TARGET_DIR": str(target)}
             slot = [] if args.slot_held else [str(args.build_slot), "mixed-writer-" + kind, "--"]
+            def cleanup_owned_target(owned_target=target):
+                if owned_target.is_relative_to(work):
+                    shutil.rmtree(owned_target, ignore_errors=True)
+
             run(kind + "-build", [*slot, "sandbox-exec", "-f", str(args.sandbox), "cargo", "build", "--locked",
-                "-p", "haider-store", "--lib"], source, build_env)
+                "-p", "haider-store", "--lib"], source, build_env, on_disk_floor=cleanup_owned_target)
             deps = target / "debug/deps"
             binary = work / kind
             command = ["rustc", "--edition=2024", str(Path(__file__).with_suffix(".rs")),
                        "-o", str(binary), "-L", f"dependency={deps}"]
             if kind == "old":
                 command += ["--cfg", "old_writer"]
+                if revision == "ce9d0976":
+                    command += ["--cfg", "ce9_writer"]
             for name in ["haider_protocol", "serde_json", "haider_store", "blake3"]:
                 lib = max(deps.glob(f"lib{name}-*.rlib"), key=lambda p: p.stat().st_mtime)
                 command += ["--extern", f"{name}={lib}"]
@@ -516,9 +555,21 @@ def run_regression(args, repo, evidence, work):
         old_parent = [json.loads(line) for line in (evidence / "old-parent-replay.log").read_text().splitlines()
                       if line.startswith('{"case":')]
         assert len(old_parent) == 1 and old_parent[0]["pass"], old_parent
+        for stage, kind in [("ce9-pin-seed", "candidate"), ("ce9-pin-write", "old"), ("ce9-pin-open", "candidate"),
+                            ("ce9-pin-replay", "candidate")]:
+            run(stage, ["sandbox-exec", "-f", str(args.sandbox), binaries[kind]["path"],
+                        stage, str(work / "profiles")], environment=runtime_env)
+            serialized = journal_snapshot(stage, before if stage == "ce9-pin-open" else None)
+            if stage in {"ce9-pin-write", "ce9-pin-open"}:
+                before = serialized
+            if stage == "ce9-pin-replay" and serialized != before:
+                raise RuntimeError("explicit same-provider replay changed the journals or metadata")
+        ce9_rows = [json.loads(line) for line in (evidence / "ce9-pin-replay.log").read_text().splitlines()
+                    if line.startswith('{"case":')]
+        assert len(ce9_rows) == 1 and ce9_rows[0]["pass"], ce9_rows
         (evidence / "verdict.json").write_text(json.dumps({
-            "candidate": sha, "tree": tree, "old": BASE, "old_tree": base_tree,
-            "results": rows, "passed": len(rows), "failed": 0, "binaries": binaries,
+            "candidate": sha, "tree": tree, "old": base, "old_tree": base_tree,
+            "explicit_same_provider": ce9_rows, "results": rows, "passed": len(rows), "failed": 0, "binaries": binaries,
             "old_created_parent": old_parent,
             "journals_unchanged_by_replay": True, "metadata_prepared_before_replay": True, "commands": records,
         }, indent=2) + "\n")

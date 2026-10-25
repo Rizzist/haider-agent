@@ -7081,8 +7081,14 @@ impl LiveDriver {
                     rebound,
                 ) => {
                     let epoch = rebound.selection_epoch.or(Some(envelope.seq));
-                    model.note_parked_provider_rebound_at(session, &rebound.provider, epoch);
-                    model.note_session_rebound_account_at(session, &rebound, epoch);
+                    if model.note_parked_provider_rebound_budget_at(
+                        session,
+                        &rebound.provider,
+                        epoch,
+                        rebound.output_budget.as_ref(),
+                    ) {
+                        model.note_session_rebound_account_at(session, &rebound, epoch);
+                    }
                 }
                 _ => {}
             }
@@ -7153,11 +7159,12 @@ impl LiveDriver {
                 model.dirty = true;
             }
             haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(rebound) => {
-                let Some((_, current_model)) = model.meter_epoch.pair.clone() else {
-                    return model_fact;
-                };
-                if !model.meter_epoch.admit((rebound.provider.clone(), current_model),
-                    rebound.selection_epoch.or(Some(envelope.seq)), None, None) {
+                let budget = rebound.output_budget.as_ref();
+                let max_tokens = budget.map(|budget| budget.max_tokens);
+                let user_budget = budget.map(|budget| matches!(budget.source,
+                    haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { .. }));
+                if !model.meter_epoch.admit_rebound(&rebound.provider,
+                    rebound.selection_epoch.or(Some(envelope.seq)), max_tokens, user_budget) {
                     return false;
                 }
                 model.note_session_rebound_account_at(session, &rebound,
@@ -7166,6 +7173,15 @@ impl LiveDriver {
                     model.identity.provider = rebound.provider;
                     model.refresh_context_window();
                     model.dirty = true;
+                }
+                let next_clamp = rebound.output_budget.and_then(|budget| budget.clamped);
+                if let Some(clamp) = next_clamp {
+                    model.apply_output_budget_clamp(&clamp);
+                }
+                if let Some(clamp) = rebound.active_output_budget
+                    .and_then(|active| active.budget.clamped)
+                    && Some(clamp) != next_clamp {
+                    model.apply_output_budget_clamp(&clamp);
                 }
             }
             // Dated-workspace addendum O5/O7: ONE replaceable context slot.

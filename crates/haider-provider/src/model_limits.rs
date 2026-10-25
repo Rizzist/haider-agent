@@ -17,10 +17,14 @@ pub const UNKNOWN_OUTPUT_LIMIT: u64 = 8_192;
 pub struct StaticModelLimits {
     pub context_window: Option<u64>,
     pub max_output_tokens: u64,
-    /// `false` when `max_output_tokens` is only the unverified
-    /// [`UNKNOWN_OUTPUT_LIMIT`] guess (custom endpoints, older or unknown IDs).
-    /// Explicit user budgets may exceed an unsourced guess
-    /// (`output_budget::explicit_output_ceiling`); a sourced maximum is exact.
+    /// `true` only when the provider publishes this OUTPUT maximum. It is
+    /// independent of `context_window`: a published window does not make a
+    /// local output default authoritative. `false` covers the unverified
+    /// [`UNKNOWN_OUTPUT_LIMIT`] guess (custom endpoints, older or unknown IDs)
+    /// and the conservative shared default used for rows whose provider
+    /// publishes a window but no output maximum (Kimi Code, Haider Code).
+    /// Explicit user budgets may exceed an unpublished value
+    /// (`output_budget::explicit_output_ceiling`); a published maximum is exact.
     pub output_limit_sourced: bool,
 }
 
@@ -350,8 +354,10 @@ fn deepseek_limits(model: &str) -> StaticModelLimits {
 /// 262,144 is used), `k3-256k` 262,144, `kimi-for-coding` 1,048,576,
 /// `kimi-for-coding-highspeed` 262,144. Kimi publishes no separate output
 /// ceiling; its documented constraint is input + output <= context
-/// (https://platform.kimi.ai/docs/api/chat.md), so the shared default budget
-/// is the output maximum — well inside every documented window.
+/// (https://platform.kimi.ai/docs/api/chat.md). The shared default budget is
+/// the conservative derived maximum (well inside every documented window), but
+/// it is NOT a published output limit: `output_limit_sourced` stays `false`,
+/// so an explicit larger budget is admitted within the window.
 fn kimi_code_limits(model: &str) -> StaticModelLimits {
     let context_window = match model {
         "kimi-for-coding" => Some(1_048_576),
@@ -366,7 +372,7 @@ fn kimi_code_limits(model: &str) -> StaticModelLimits {
         } else {
             UNKNOWN_OUTPUT_LIMIT
         },
-        output_limit_sourced: context_window.is_some(),
+        output_limit_sourced: false,
     }
 }
 
@@ -406,9 +412,11 @@ fn xai_limits(model: &str) -> StaticModelLimits {
 /// https://haidercode.ai/v1/models (read 2026-09-24 without credentials; see
 /// also https://haidercode.ai/docs/go: "Context is the window the model
 /// publishes"). The catalog publishes `max_output_tokens: null` for every
-/// model, so the shared default budget is the output maximum for rows with a
-/// published window; rows with an unpublished window stay on the unverified
-/// fallback. The live catalog's declarations win at projection time.
+/// model, so rows with a published window use the shared default budget as a
+/// conservative derived maximum and rows with an unpublished window stay on
+/// the unverified fallback. Neither is a published output limit
+/// (`output_limit_sourced` is `false`). The live catalog's declarations win
+/// at projection time.
 fn haider_code_limits(model: &str) -> StaticModelLimits {
     let context_window = match model {
         "deepseek-v4-flash" | "deepseek-v4-pro" => Some(128_000),
@@ -426,6 +434,6 @@ fn haider_code_limits(model: &str) -> StaticModelLimits {
         } else {
             UNKNOWN_OUTPUT_LIMIT
         },
-        output_limit_sourced: context_window.is_some(),
+        output_limit_sourced: false,
     }
 }

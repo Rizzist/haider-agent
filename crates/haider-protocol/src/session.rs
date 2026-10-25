@@ -2,6 +2,157 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The immutable output pair fixed for a logical run. Headless admission and
+/// native worker pickup write this same fact before any provider resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOutputPairPinnedV1 {
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: u64,
+    pub source: crate::output_budget::SessionOutputBudgetSourceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route: Option<RunOutputProviderRouteV1>,
+    /// Complete boundary, including an explicitly absent selector. Missing only
+    /// in older journals, which must be reconstructed from historical metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_snapshot: Option<RunOutputRouteSnapshotV1>,
+}
+
+/// Fail closed when an older journal cannot prove a run's original route.
+/// The stable error code remains decodable by older schema-33 daemons.
+pub fn run_route_history_unavailable(detail: &str) -> crate::error::HaiderError {
+    crate::error::HaiderError::new(
+        crate::error::ErrorCode::StoreCorrupt,
+        format!("run_route_history_unavailable: {detail}"),
+        false,
+    )
+    .with_presentation(crate::error::ErrorPresentation::new(
+        "run-route-history-unavailable",
+        "Run route history unavailable",
+        detail,
+        crate::error::ErrorScope::Session,
+        [],
+    ))
+}
+
+/// Complete route provenance owned by a run. An absent account remains absent;
+/// resolved aliases describe observations and never pin the default account pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOutputRouteSnapshotV1 {
+    pub rebind_id: Option<String>,
+    pub base_url: Option<String>,
+    pub account: Option<String>,
+    pub resolved_alias: Option<String>,
+    pub resolved_seen: bool,
+    pub selection_epoch: Option<u64>,
+    pub reset_epoch: Option<u64>,
+}
+
+impl RunOutputRouteSnapshotV1 {
+    pub const RESOLVED_KIND: &str = "run_output_route_snapshot_v1";
+
+    #[must_use]
+    pub fn capture(metadata: &SessionMetadataV1) -> Self {
+        Self {
+            rebind_id: metadata.provider_rebind_id.clone(),
+            base_url: metadata.provider_base_url.clone(),
+            account: metadata.account_alias.clone(),
+            resolved_alias: metadata.resolved_route_alias.clone(),
+            resolved_seen: metadata.resolved_route_seen,
+            selection_epoch: metadata.selection_epoch,
+            reset_epoch: metadata.route_reset_epoch,
+        }
+    }
+
+    pub fn restore(&self, metadata: &mut SessionMetadataV1) {
+        metadata.provider_rebind_id.clone_from(&self.rebind_id);
+        metadata.provider_base_url.clone_from(&self.base_url);
+        metadata.account_alias.clone_from(&self.account);
+        metadata
+            .resolved_route_alias
+            .clone_from(&self.resolved_alias);
+        metadata.resolved_route_seen = self.resolved_seen;
+        metadata.selection_epoch = self.selection_epoch;
+        metadata.route_reset_epoch = self.reset_epoch;
+    }
+
+    /// An automatic cross-provider switch intentionally releases selectors,
+    /// but retains the run's own selection provenance.
+    pub fn clear_selectors(&mut self) {
+        self.rebind_id = None;
+        self.base_url = None;
+        self.account = None;
+        self.resolved_alias = None;
+        self.resolved_seen = false;
+    }
+}
+
+impl From<RunOutputProviderRouteV1> for RunOutputRouteSnapshotV1 {
+    fn from(route: RunOutputProviderRouteV1) -> Self {
+        Self {
+            rebind_id: Some(route.rebind_id),
+            base_url: route.base_url,
+            account: route.account,
+            resolved_alias: route.resolved_alias,
+            resolved_seen: route.resolved_seen,
+            selection_epoch: route.selection_epoch,
+            reset_epoch: route.reset_epoch,
+        }
+    }
+}
+
+/// Compatibility projection of an explicit rebind for older readers. New pins
+/// also carry `route_snapshot`, which covers account-only and unselected routes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOutputProviderRouteV1 {
+    pub rebind_id: String,
+    pub base_url: Option<String>,
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resolved_seen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_epoch: Option<u64>,
+}
+
+impl RunOutputProviderRouteV1 {
+    pub const RESOLVED_KIND: &str = "run_output_route_resolved_v1";
+
+    pub fn capture(metadata: &SessionMetadataV1) -> Option<Self> {
+        metadata.provider_rebind_id.as_ref().map(|rebind_id| Self {
+            rebind_id: rebind_id.clone(),
+            base_url: metadata.provider_base_url.clone(),
+            account: metadata.account_alias.clone(),
+            resolved_alias: metadata.resolved_route_alias.clone(),
+            resolved_seen: metadata.resolved_route_seen,
+            selection_epoch: metadata.selection_epoch,
+            reset_epoch: metadata.route_reset_epoch,
+        })
+    }
+}
+
+impl RunOutputPairPinnedV1 {
+    pub const KIND: &str = "run_output_pair_pinned_v1";
+
+    pub fn to_event(
+        &self,
+        run_id: &crate::ids::RunId,
+    ) -> Result<crate::EventPayload, serde_json::Error> {
+        Ok(crate::EventPayload::Item(
+            crate::item::ItemEvent::Completed {
+                item_id: crate::ids::ItemId::new(format!("output-pair-{run_id}")),
+                item: crate::item::TurnItem::Extension {
+                    kind: Self::KIND.into(),
+                    data: serde_json::to_value(self)?,
+                },
+            },
+        ))
+    }
+}
+
 /// Whether a session may stop for a human interaction.
 ///
 /// The default is deliberately interactive so legacy metadata and every UI
@@ -432,6 +583,20 @@ pub struct SessionProviderRebound {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// Budget for the durable queued next-turn pair after this route change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget: Option<crate::output_budget::SessionOutputBudgetV1>,
+    /// Budget installed for the active run after this rebind, even when its
+    /// model matches the queued next-turn model in `output_budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_output_budget: Option<ActiveRunOutputBudgetV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveRunOutputBudgetV1 {
+    pub run_id: crate::ids::RunId,
+    pub model: String,
+    pub budget: crate::output_budget::SessionOutputBudgetV1,
 }
 
 /// Additive replay fact emitted atomically with a committed live-session
@@ -520,6 +685,17 @@ impl SessionLaunchOriginSelected {
 }
 
 impl ModelSelected {
+    /// Additive complete route witness. Older readers ignore the extra key.
+    pub fn to_payload_value_with_route(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let mut value = self.to_payload_value()?;
+        value["route_snapshot"] =
+            serde_json::to_value(RunOutputRouteSnapshotV1::capture(metadata))?;
+        Ok(value)
+    }
+
     pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(SessionConfigEventPayload::ModelSelected(self.clone()))
     }
@@ -607,5 +783,9 @@ impl SessionProviderRebound {
         metadata.provider.clone_from(&self.provider);
         metadata.provider_base_url.clone_from(&self.base_url);
         metadata.account_alias.clone_from(&self.account);
+        if let Some(budget) = self.output_budget {
+            metadata.max_tokens = budget.max_tokens;
+            metadata.max_tokens_source = Some(budget.source);
+        }
     }
 }

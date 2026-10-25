@@ -427,6 +427,7 @@ struct DaemonProviderPairSwitchCommitter {
 
 struct DaemonProviderRouteCommitter {
     store: HubStoreHandle,
+    run_id: RunId,
     /// The pair and epoch admitted for this turn, including its initial
     /// resolved route. A later selection must not donate its new epoch to
     /// this older turn's rotation.
@@ -450,13 +451,25 @@ impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
         model: &str,
         to: &haider_protocol::ids::CredentialAlias,
     ) -> Result<u64, HaiderError> {
-        let selection = self.selection.lock().await.clone();
+        let mut selection = self.selection.lock().await.clone();
+        if let Some(pair) = self
+            .store
+            .hub()
+            .run_output_pair(self.store.session_id(), &self.run_id)
+            .await?
+            && pair.provider == provider
+            && pair.model == model
+        {
+            pair.restore_route(&mut selection)?;
+            selection.provider = pair.provider;
+            selection.model = pair.model;
+        }
         if selection.provider != provider || selection.model != model {
             return Ok(selection.selection_epoch.unwrap_or(0));
         }
         let epoch = self
             .store
-            .commit_resolved_route(&selection, Some(to.as_str()))
+            .commit_turn_resolved_route(&self.run_id, &selection, Some(to.as_str()))
             .await?;
         let mut current = self.selection.lock().await;
         if current.provider == selection.provider
@@ -464,6 +477,8 @@ impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
             && current.selection_epoch == selection.selection_epoch
         {
             current.selection_epoch = Some(epoch);
+            current.resolved_route_alias = Some(to.as_str().to_owned());
+            current.resolved_route_seen = true;
         }
         Ok(epoch)
     }
@@ -548,7 +563,10 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             "automatic": true,
             "session_id": self.store.session_id(),
             "run_id": switch.run_id,
+            "branch_id": self.branch_id,
             "switch_ordinal": switch.switch_ordinal,
+            "source_rebind_seq": switch.source_rebind_seq,
+            "target_account": switch.target_account,
             "worker_generation": self.store.worker_generation(),
             "from_provider": switch.from_provider,
             "from_model": switch.from_model,
@@ -562,6 +580,26 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             "automatic-pair-switch-{}",
             request_digest.get(..24).unwrap_or(&request_digest)
         );
+        let hub = self.store.hub();
+        let _selection = hub.lock_workflow_selection(self.store.session_id()).await;
+        let pair = hub
+            .run_output_pair(self.store.session_id(), &switch.run_id)
+            .await?
+            .ok_or_else(|| {
+                haider_protocol::session::run_route_history_unavailable(
+                    "automatic switch has no active run route",
+                )
+            })?;
+        if pair.latest_rebind_seq != switch.source_rebind_seq {
+            return Err(HaiderError::new(
+                ErrorCode::RevisionConflict,
+                "automatic switch target belongs to an older rebind",
+                true,
+            ));
+        }
+        let mut active_selection = self.turn_selection.lock().await.clone();
+        pair.restore_route(&mut active_selection)?;
+        let selection_epoch = active_selection.selection_epoch;
         let command = SessionSelectModelCommand {
             command_id,
             request_digest,
@@ -570,9 +608,16 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             worker_generation: self.store.worker_generation(),
             provider: switch.to_provider.clone(),
             model: switch.to_model.clone(),
-            // rev933b finding 7: the automatic switch observed this exact
-            // pair; a concurrent explicit selection moves it and must win.
+            // Preserve a later next-turn choice while fencing this active
+            // run against concurrent explicit rebinds.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
+            automatic_run: Some(haider_store::AutomaticRunSelection {
+                run_id: switch.run_id.clone(),
+                branch_id: self.branch_id.clone(),
+                rebind_seq: pair.latest_rebind_seq,
+                resolved_alias: switch.target_account.clone(),
+                selection_epoch,
+            }),
             account_alias: None,
             // No validated model row exists on this path: keep the stored
             // budget. An oversized budget on the fallback model is recovered
@@ -581,17 +626,28 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
-        match self.store.hub().select_session_model(command).await {
+        #[cfg(test)]
+        hub.pause_pair_switch_commit(self.store.session_id()).await;
+        match hub.select_session_model(command).await {
             Ok(
                 SessionSelectModelOutcome::Committed { selected, .. }
                 | SessionSelectModelOutcome::IdempotentReplay { selected },
             ) => {
                 let mut current = self.turn_selection.lock().await;
+                // This selection also configures the next turn. The active
+                // run keeps the provenance captured before its first request,
+                // just as core's request/footprint epoch does.
+                if current.provider != selected.provider {
+                    let mut route =
+                        haider_protocol::session::RunOutputRouteSnapshotV1::capture(&current);
+                    route.clear_selectors();
+                    route.restore(&mut current);
+                }
                 current.provider = selected.provider;
                 current.model = selected.model;
-                current.selection_epoch = Some(selected.selected_seq);
                 Ok(selected.selected_seq)
             }
+            Err(crate::session_hub::SessionHubError::Store(error)) => Err(error),
             Err(error) => Err(hub_error(error)),
         }
     }
@@ -5069,50 +5125,44 @@ async fn run_supervisor(
                         }
                     }
                 }
-                // R6 extension (F1): the pair is re-read per logical turn, so
-                // a committed `session.select_model` reaches the NEXT turn
-                // without a worker restart. A failed read fails the turn
-                // honestly instead of silently pinning the spawn snapshot.
-                let turn_result = match fresh_turn_metadata(&lease).await {
-                    Ok(fresh) => {
-                        let startup_budget = wait_for_startup_headless_budget(
-                            lease.clone(),
-                            run_id.clone(),
-                            branch_id.clone(),
-                        );
-                        let start = haider_platform::phase_trace::measure_active(
-                            haider_platform::phase_trace::Phase::TurnSetup,
-                            start_turn(
-                                &dependencies,
-                                &fresh,
-                                &lease,
-                                &device_id,
-                                Arc::clone(&event_ids),
-                                pending,
-                            ),
-                        );
-                        tokio::pin!(startup_budget);
-                        tokio::pin!(start);
-                        tokio::select! {
-                            biased;
-                            result = &mut start => result,
-                            expiry = &mut startup_budget => match expiry {
-                                Ok(expiry) => {
-                                    match persist_headless_budget_expiry(
-                                        &lease,
-                                        &device_id,
-                                        &event_ids,
-                                        &expiry,
-                                    ).await {
-                                        Ok(()) => Err(budget_exhausted_error(&expiry.exhausted)),
-                                        Err(error) => Err(error),
-                                    }
+                // start_turn reads and pins the pair under the selection
+                // fence at pickup; setup failures fail the turn honestly.
+                let turn_result = {
+                    let startup_budget = wait_for_startup_headless_budget(
+                        lease.clone(),
+                        run_id.clone(),
+                        branch_id.clone(),
+                    );
+                    let start = haider_platform::phase_trace::measure_active(
+                        haider_platform::phase_trace::Phase::TurnSetup,
+                        start_turn(
+                            &dependencies,
+                            &lease,
+                            &device_id,
+                            Arc::clone(&event_ids),
+                            pending,
+                        ),
+                    );
+                    tokio::pin!(startup_budget);
+                    tokio::pin!(start);
+                    tokio::select! {
+                        biased;
+                        result = &mut start => result,
+                        expiry = &mut startup_budget => match expiry {
+                            Ok(expiry) => {
+                                match persist_headless_budget_expiry(
+                                    &lease,
+                                    &device_id,
+                                    &event_ids,
+                                    &expiry,
+                                ).await {
+                                    Ok(()) => Err(budget_exhausted_error(&expiry.exhausted)),
+                                    Err(error) => Err(error),
                                 }
-                                Err(error) => Err(error),
-                            },
-                        }
+                            }
+                            Err(error) => Err(error),
+                        },
                     }
-                    Err(error) => Err(error),
                 };
                 match turn_result {
                     Ok(turn) => {
@@ -7314,7 +7364,7 @@ async fn find_compaction_receipt(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn perform_manual_compaction(
+pub(crate) async fn perform_manual_compaction(
     dependencies: &WorkerDependencies,
     metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,
@@ -7388,21 +7438,6 @@ async fn perform_manual_compaction(
             false,
         ));
     }
-    // A fresh compaction becomes a nonterminal session at the Compacting
-    // append below. Share the native graph-selection lane from the idle check
-    // through that append so graph.pin/switch cannot commit from a stale idle
-    // observation. Receipt recovery already owns a durable run and therefore
-    // needs no new admission fence.
-    let workflow_selection = if existing.is_none() {
-        Some(
-            lease
-                .hub()
-                .lock_workflow_selection(lease.session_id())
-                .await,
-        )
-    } else {
-        None
-    };
     let durable_run_heads = durable_runs(lease).await?;
     if existing.is_none()
         && durable_run_heads
@@ -7448,10 +7483,59 @@ async fn perform_manual_compaction(
     }) {
         web_degrade.anthropic_web_tools = true;
     }
-    let resolved = dependencies
-        .provider_factory
-        .resolve_for_turn_with_web(metadata, web_degrade)
-        .await;
+    // Provider resolution can refresh authentication over the network.
+    // Resolve first, then fence fresh admission and verify that the metadata
+    // used by the factory still describes the current session. Recovery
+    // already owns a durable run and needs no new admission fence.
+    let mut candidate_metadata = metadata.clone();
+    let (workflow_selection, pinned_metadata, resolved) = loop {
+        #[cfg(test)]
+        lease
+            .hub()
+            .pause_selection_network(lease.session_id())
+            .await;
+        let resolved = dependencies
+            .provider_factory
+            .resolve_for_turn_with_web(&candidate_metadata, web_degrade)
+            .await;
+        let selection = if existing.is_none() {
+            Some(
+                lease
+                    .hub()
+                    .lock_workflow_selection(lease.session_id())
+                    .await,
+            )
+        } else {
+            None
+        };
+        if existing.is_none() {
+            let current = lease.session_metadata().await?.ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::SessionNotFound,
+                    "manual compaction requires typed session metadata",
+                    false,
+                )
+            })?;
+            if current != candidate_metadata {
+                candidate_metadata = current;
+                drop(selection);
+                continue;
+            }
+            if durable_runs(lease)
+                .await?
+                .iter()
+                .any(|(_, state, _, _, _)| !state.is_terminal())
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::Busy,
+                    "manual context compaction is idle-only",
+                    true,
+                ));
+            }
+        }
+        break (selection, candidate_metadata, resolved);
+    };
+    let metadata = &pinned_metadata;
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -7754,6 +7838,7 @@ async fn perform_manual_compaction(
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     });
+    drop(workflow_selection);
     haider_provider::scope_auxiliary_provider_request_recorder(
         provider_request_attempt_recorder,
         dependencies
@@ -7769,7 +7854,6 @@ async fn perform_manual_compaction(
         ));
     }
     let retained_messages = messages.split_off(covered_message_count);
-    drop(workflow_selection);
     let cache_expected_later_reads = u32::from(!post_compaction_tools.is_empty()) * 2;
     let cache_cohort = reduce_turn_setup_journal(
         lease,
@@ -8607,13 +8691,10 @@ fn strip_foreign_provider_opaque_projection(
     projection.latest_compaction_summary_end = summary_before.map(remap);
 }
 
-/// Re-reads THIS session's metadata for one logical turn (F1). The store is
-/// the one truth for the current model selection: a committed
-/// `session.select_model` between turns is picked up here, which is what
-/// makes the receipt's promise — "the next turn resolves the new pair" —
-/// structural rather than aspirational. `None` (row vanished mid-life) and
-/// read failures fail the turn honestly; the spawn-time snapshot is never a
-/// silent fallback.
+/// Reads the current session selection for a logical turn or control action.
+/// Native start_turn reads under the selection fence and durably pins the
+/// pair at pickup. Missing metadata and read failures fail honestly; the
+/// supervisor's spawn-time snapshot is never a silent fallback.
 async fn fresh_turn_metadata(lease: &HubStoreHandle) -> Result<SessionMetadataV1, HaiderError> {
     lease.session_metadata().await?.ok_or_else(|| {
         HaiderError::new(
@@ -8720,7 +8801,6 @@ fn request_budget_with_test_override(
 /// is the failure mode this ordering exists to prevent.
 async fn start_turn(
     dependencies: &WorkerDependencies,
-    metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,
     device_id: &DeviceId,
     event_ids: Arc<EventIdGenerator>,
@@ -8773,7 +8853,96 @@ async fn start_turn(
             provider_request_deadline_at(&context.spec, context.accepted_at_ms, clock.now_ms())
         });
     }
-    let mut pinned_metadata = metadata.clone();
+    // The selection fence fixes the native pair at pickup and makes the
+    // durable pin visible to rebind before provider resolution can suspend.
+    // Recovery reuses that pin rather than the mutable next-turn selection.
+    let (mut pinned_metadata, run_rebind_seq) = {
+        let _selection = lease
+            .hub()
+            .lock_workflow_selection(lease.session_id())
+            .await;
+        let mut fresh = fresh_turn_metadata(lease).await?;
+        let recorded_pair = lease
+            .hub()
+            .run_output_pair(lease.session_id(), &accepted.run_id)
+            .await?;
+        let needs_pin = recorded_pair.as_ref().is_none_or(|pair| !pair.complete_pin);
+        // An already-started legacy native run also owns its reconstructed
+        // pair. A native turn that is still queued has no legacy start boundary.
+        if let Some(pair) = recorded_pair
+            .as_ref()
+            .filter(|pair| pair.durably_pinned || headless.is_none())
+        {
+            pair.restore_route(&mut fresh)?;
+            fresh.provider.clone_from(&pair.provider);
+            fresh.model.clone_from(&pair.model);
+            fresh.max_tokens = pair.max_tokens;
+            fresh.max_tokens_source = pair.source;
+        } else if let Some(context) = headless.as_ref() {
+            if let Some(legacy) = recorded_pair.as_ref() {
+                fresh.max_tokens_source = legacy.source;
+            }
+            provider_rebind::pin_headless_turn_metadata(
+                &mut fresh,
+                &context.spec,
+                lease,
+                &accepted.run_id,
+            )
+            .await?;
+        }
+        if needs_pin {
+            let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+                    &fresh,
+                )),
+                provider: fresh.provider.clone(),
+                model: fresh.model.clone(),
+                max_tokens: fresh.max_tokens,
+                provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(&fresh),
+                source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                    fresh.max_tokens_source,
+                    fresh.max_tokens,
+                ),
+            };
+            fresh.max_tokens_source = Some(pin.source);
+            append_payloads(
+                lease,
+                device_id,
+                &accepted.run_id,
+                accepted.branch_id.as_ref(),
+                &event_ids,
+                vec![pin.to_event(&accepted.run_id).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?],
+            )
+            .await?;
+        }
+        append_payloads(
+            lease,
+            device_id,
+            &accepted.run_id,
+            accepted.branch_id.as_ref(),
+            &event_ids,
+            vec![EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!(
+                    "run-worker-pickup-{}-{}",
+                    accepted.run_id,
+                    event_ids.next()
+                )),
+                item: TurnItem::Extension {
+                    kind: "run_worker_pickup_v1".into(),
+                    data: serde_json::json!({}),
+                },
+            })],
+        )
+        .await?;
+        let rebind_seq = lease
+            .hub()
+            .run_output_pair(lease.session_id(), &accepted.run_id)
+            .await?
+            .map_or(0, |pair| pair.latest_rebind_seq);
+        (fresh, rebind_seq)
+    };
     pinned_metadata.context_economy = refresh_context_economy_from_journal(
         lease,
         &pinned_metadata.context_economy,
@@ -9582,14 +9751,43 @@ async fn start_turn(
     )
     .with_event_ids(Arc::clone(&event_ids));
     let route_epoch = lease
-        .commit_resolved_route(metadata, resolved.account_alias.as_deref())
+        .commit_turn_resolved_route(
+            &accepted.run_id,
+            metadata,
+            resolved.account_alias.as_deref(),
+        )
         .await?;
     config.selection_epoch = Some(route_epoch);
     let mut route_selection = metadata.clone();
     route_selection.selection_epoch = Some(route_epoch);
+    route_selection
+        .resolved_route_alias
+        .clone_from(&resolved.account_alias);
+    route_selection.resolved_route_seen = true;
+    // A recovered automatic route may have released every selector. Its
+    // durable rebind sequence still owns the run. Only adopt a fresher
+    // sequence when it describes the exact route resolved by this factory.
+    config.provider_rebind_seq = run_rebind_seq;
+    if let Some(pair) = lease
+        .hub()
+        .run_output_pair(lease.session_id(), &accepted.run_id)
+        .await?
+    {
+        let mut current = route_selection.clone();
+        pair.restore_route(&mut current)?;
+        if pair.provider == route_selection.provider
+            && pair.model == route_selection.model
+            && haider_protocol::session::RunOutputRouteSnapshotV1::capture(&current)
+                == haider_protocol::session::RunOutputRouteSnapshotV1::capture(&route_selection)
+        {
+            config.provider_rebind_seq = pair.latest_rebind_seq;
+        }
+    }
+
     let turn_selection = Arc::new(Mutex::new(route_selection));
     config.provider_route_committer = Some(Arc::new(DaemonProviderRouteCommitter {
         store: lease.clone(),
+        run_id: accepted.run_id.clone(),
         selection: Arc::clone(&turn_selection),
     }));
     config.turn_trace = turn_trace.clone();
@@ -9855,6 +10053,7 @@ async fn start_turn(
     config.provider_rebind_resolver = Some(Arc::new(
         provider_rebind::DaemonProviderRebindResolver::new(
             lease.clone(),
+            accepted.run_id.clone(),
             Arc::clone(&dependencies.provider_factory),
             metadata.clone(),
             web_degrade,
@@ -12885,7 +13084,61 @@ async fn append_session_idle(
     store.settle_idle(envelope).await.map(|_| ())
 }
 
-async fn append_payloads(
+/// Prepare a run bookkeeping envelope whose payload depends on an epoch that
+/// is chosen later (by the session actor). Identity, render and agent fields
+/// are the ones `append_payloads` gives every bookkeeping item.
+pub(crate) async fn deferred_bookkeeping_envelope(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_id: EventId,
+    payload: impl FnOnce(u64) -> Result<EventPayload, HaiderError> + Send + 'static,
+) -> Result<crate::session_hub::RunRouteEnvelopeBuilder, HaiderError> {
+    let mut template = supervisor_raw_envelope(
+        store,
+        device_id,
+        branch_id.cloned(),
+        Some(run_id.clone()),
+        event_id,
+        serde_json::Value::Null,
+    );
+    template.render.ui = false;
+    template.agent_id = store
+        .hub()
+        .delegation_for_child_session(store.session_id().clone())
+        .await?
+        .map(|record| record.agent_id);
+    Ok(Box::new(move |epoch| {
+        let payload = payload(epoch)?;
+        if !matches!(
+            &payload,
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { .. },
+                ..
+            })
+        ) {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "a deferred bookkeeping envelope must carry an extension item",
+                false,
+            ));
+        }
+        let mut envelope = template;
+        envelope.payload = serde_json::to_value(payload)
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot serialize supervisor event: {error}"),
+                    false,
+                )
+            })?
+            .into();
+        Ok(vec![envelope])
+    }))
+}
+
+pub(crate) async fn append_payloads(
     store: &HubStoreHandle,
     device_id: &DeviceId,
     run_id: &RunId,
@@ -12901,14 +13154,26 @@ async fn append_payloads(
     for payload in payloads {
         let payload_run_id =
             (!matches!(payload, EventPayload::SessionState(_))).then(|| run_id.clone());
-        envelopes.push(supervisor_envelope(
+        let bookkeeping = matches!(&payload,
+            EventPayload::Item(ItemEvent::Completed { item: TurnItem::Extension { kind, .. }, .. })
+            if kind == haider_protocol::session::RunOutputPairPinnedV1::KIND || kind == "run_worker_pickup_v1" || kind == haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND);
+        let mut envelope = supervisor_envelope(
             store,
             device_id,
             branch_id.cloned(),
             payload_run_id,
             event_ids.next(),
             payload,
-        )?);
+        )?;
+        if bookkeeping {
+            envelope.render.ui = false;
+            envelope.agent_id = store
+                .hub()
+                .delegation_for_child_session(store.session_id().clone())
+                .await?
+                .map(|record| record.agent_id);
+        }
+        envelopes.push(envelope);
     }
     haider_core::StoreHandle::append(store, &mut envelopes).await?;
     #[cfg(windows)]
@@ -22283,9 +22548,28 @@ impl ToolDispatcher for BrokerToolDispatcher {
             // F1: resolve the child's pair BEFORE any durable spawn work. A
             // typed selection refusal is a completed tool result — the model
             // retries with an explicit pair — never a turn failure.
+            let mut active_parent = self.metadata.clone();
+            {
+                let active = self
+                    .output
+                    .store
+                    .hub()
+                    .run_output_pair(&self.session_id, run_id)
+                    .await?
+                    .ok_or_else(|| {
+                        haider_protocol::session::run_route_history_unavailable(
+                            "child parent has no run boundary",
+                        )
+                    })?;
+                active.restore_route(&mut active_parent)?;
+                active_parent.provider = active.provider;
+                active_parent.model = active.model;
+                active_parent.max_tokens = active.max_tokens;
+                active_parent.max_tokens_source = active.source;
+            }
             let child_metadata = match self
                 .delegation
-                .resolve_child_metadata(&self.metadata, &request)?
+                .resolve_child_metadata(&active_parent, &request)?
             {
                 Ok(metadata) => metadata,
                 Err(refusal) => {
@@ -27315,7 +27599,7 @@ fn computer_error(error: ComputerError) -> HaiderError {
 }
 
 #[path = "provider_rebind.rs"]
-mod provider_rebind;
+pub(crate) mod provider_rebind;
 
 #[cfg(all(test, feature = "android-standalone"))]
 #[path = "android_inventory_tests.rs"]

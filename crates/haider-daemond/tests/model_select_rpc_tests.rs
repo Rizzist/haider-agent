@@ -447,6 +447,63 @@ fn committed_budget(
     *budget
 }
 
+#[tokio::test]
+async fn session_create_above_global_ceiling_returns_typed_model_output_limit() {
+    let root = test_root("create-over-global-ceiling-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "create-over-global-ceiling",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let fake = Arc::new(FakeProvider::new(text_turn("must not dispatch")));
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[("custom-ceiling", fake.clone())]),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "global-ceiling-client",
+        "global-ceiling-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    send(
+        &mut client,
+        &config,
+        "create-over",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("create-over-global"),
+            cwd: workspace.display().to_string(),
+            provider: "custom-ceiling".into(),
+            model: "unknown-model".into(),
+            max_tokens: 384_001,
+        },
+    )
+    .await;
+    let response = next_response(&mut client).await;
+    assert!(
+        matches!(
+            &response,
+            ResponseBody::Error {
+                data: Some(ErrorData::ModelOutputLimit {
+                    requested: 384_001,
+                    max_output_tokens: 384_000,
+                    ..
+                }),
+                ..
+            }
+        ),
+        "typed global refusal: {response:?}"
+    );
+    assert!(fake.requests().is_empty());
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
 /// D1 (973 output cap): a DERIVED session budget follows the selected model.
 /// A default session (clients send 0) on a 30,000-budget model switches to
 /// gpt-4o (16,384) and to an unknown custom model (8,192) without a refusal,
@@ -790,6 +847,374 @@ async fn explicit_budget_above_unverified_fallback_is_admitted() {
             ..
         })
     ));
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// 973-output-cap-fixes B1: Kimi Code (`kimi-oauth/kimi-for-coding`) and
+/// Haider Code (`haider-code/glm-5.3`, seeded as a fetched catalog row with
+/// no output maximum) publish a context window but no output maximum, so
+/// their 30,000 derived default is not an explicit ceiling. Over the real
+/// socket: session.create with 60,000,
+/// a session-config update to 60,000, and a model switch that inherits a
+/// user-set 60,000 are all admitted unclamped, and each next turn requests
+/// exactly 60,000. The context bound still refuses above half the window.
+/// MUTATION CHECK: restore `output_limit_sourced: context_window.is_some()`
+/// on those rows. Expected runtime failure: session.create is refused with
+/// `model_output_limit` (max 30,000) and the switch clamps to 30,000.
+#[tokio::test]
+async fn unpublished_output_maximum_admits_explicit_budgets_on_create_config_and_switch() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let root = test_root("b1-unpublished-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "b1-unpublished",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    // Seed the persisted public catalog before daemon startup, as the
+    // account RPC tests do. The real inventory authority must select GLM.
+    let glm = haider_provider::DiscoveredModel {
+        slug: "glm-5.3".into(),
+        display_name: "GLM 5.3".into(),
+        context_window: Some(200_000),
+        max_output_tokens: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let store = haider_store::Store::open(&config.store_dir).expect("open catalog store");
+    let models_json = serde_json::to_string(&vec![glm]).expect("serialize catalog row");
+    let fetched_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as u64;
+    store
+        .put_provider_models("haider-code", &models_json, None, fetched_at_ms)
+        .expect("seed public Haider Code inventory");
+    // Store::open holds the profile lock; release it before daemon startup.
+    drop(store);
+    let kimi = Arc::new(FakeProvider::new(
+        [
+            text_turn("kimi one"),
+            text_turn("kimi two"),
+            text_turn("kimi three"),
+            text_turn("kimi four"),
+        ]
+        .concat(),
+    ));
+    let haider_code = Arc::new(FakeProvider::new(
+        [
+            text_turn("glm one"),
+            text_turn("glm two"),
+            text_turn("glm three"),
+            text_turn("glm four"),
+        ]
+        .concat(),
+    ));
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[
+            ("kimi-oauth", kimi.clone()),
+            ("haider-code", haider_code.clone()),
+        ]),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "b1-unpublished-client",
+        "b1-unpublished-instance",
+        ClientKind::Cli,
+    )
+    .await;
+
+    // Session A: create on Kimi Code with an explicit 60,000.
+    let (session_a, generation_a) = create_with_budget_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "kimi-oauth",
+        "kimi-for-coding",
+        60_000,
+    )
+    .await;
+    run_turn(&mut client, &config, &session_a, generation_a, "b1-a-kimi").await;
+    assert_eq!(
+        kimi.requests()[0].max_tokens,
+        60_000,
+        "create admits 60,000"
+    );
+    // Switch to Haider Code: the user-set 60,000 is inherited unclamped.
+    let response = select_budget(
+        &mut client,
+        &config,
+        "b1-a-switch",
+        select_body(
+            "b1-a-switch",
+            &session_a,
+            generation_a,
+            "glm-5.3",
+            Some("haider-code"),
+        ),
+    )
+    .await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 60_000);
+    assert_eq!(
+        budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 60_000 }
+    );
+    assert_eq!(budget.clamped, None, "no clamp to the 30,000 default");
+    run_turn(&mut client, &config, &session_a, generation_a, "b1-a-glm").await;
+    assert_eq!(haider_code.requests()[0].max_tokens, 60_000);
+
+    // Session B: derived default on Haider Code, then a config update.
+    let (session_b, generation_b) = create_with_budget_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "haider-code",
+        "glm-5.3",
+        0,
+    )
+    .await;
+    run_turn(
+        &mut client,
+        &config,
+        &session_b,
+        generation_b,
+        "b1-b-derived",
+    )
+    .await;
+    assert_eq!(
+        haider_code.requests()[1].max_tokens,
+        30_000,
+        "the conservative derived default is kept"
+    );
+    let mut update = select_body("b1-b-config", &session_b, generation_b, "glm-5.3", None);
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut update {
+        *max_tokens = Some(60_000);
+    }
+    let response = select_budget(&mut client, &config, "b1-b-config", update).await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 60_000, "config update admits 60,000");
+    assert_eq!(budget.clamped, None);
+    run_turn(
+        &mut client,
+        &config,
+        &session_b,
+        generation_b,
+        "b1-b-explicit",
+    )
+    .await;
+    assert_eq!(haider_code.requests()[2].max_tokens, 60_000);
+    // The known window still bounds explicit budgets (half of 200,000).
+    let mut over = select_body("b1-b-over", &session_b, generation_b, "glm-5.3", None);
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut over {
+        *max_tokens = Some(100_001);
+    }
+    let response = select_budget(&mut client, &config, "b1-b-over", over).await;
+    let ResponseBody::Error { data, .. } = response else {
+        panic!("expected typed refusal, got {response:?}");
+    };
+    assert!(matches!(
+        data,
+        Some(ErrorData::ModelOutputLimit {
+            requested: 100_001,
+            max_output_tokens: 100_000,
+            ..
+        })
+    ));
+    // Switch to Kimi Code: the user-set 60,000 is inherited unclamped.
+    let response = select_budget(
+        &mut client,
+        &config,
+        "b1-b-switch",
+        select_body(
+            "b1-b-switch",
+            &session_b,
+            generation_b,
+            "kimi-for-coding",
+            Some("kimi-oauth"),
+        ),
+    )
+    .await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 60_000);
+    assert_eq!(budget.clamped, None);
+    run_turn(&mut client, &config, &session_b, generation_b, "b1-b-kimi").await;
+    assert_eq!(kimi.requests()[1].max_tokens, 60_000);
+
+    // Cover the two other provider/operation pairs explicitly: GLM create
+    // with 60,000, and Kimi config update from its 30,000 derived default.
+    let (session_c, generation_c) = create_with_budget_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "haider-code",
+        "glm-5.3",
+        60_000,
+    )
+    .await;
+    run_turn(&mut client, &config, &session_c, generation_c, "b1-c-glm").await;
+    assert_eq!(haider_code.requests()[3].max_tokens, 60_000);
+
+    let (session_d, generation_d) = create_with_budget_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "kimi-oauth",
+        "kimi-for-coding",
+        0,
+    )
+    .await;
+    run_turn(
+        &mut client,
+        &config,
+        &session_d,
+        generation_d,
+        "b1-d-derived",
+    )
+    .await;
+    assert_eq!(kimi.requests()[2].max_tokens, 30_000);
+    let mut update = select_body(
+        "b1-d-config",
+        &session_d,
+        generation_d,
+        "kimi-for-coding",
+        None,
+    );
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut update {
+        *max_tokens = Some(60_000);
+    }
+    let response = select_budget(&mut client, &config, "b1-d-config", update).await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 60_000);
+    assert_eq!(budget.clamped, None);
+    run_turn(
+        &mut client,
+        &config,
+        &session_d,
+        generation_d,
+        "b1-d-explicit",
+    )
+    .await;
+    assert_eq!(kimi.requests()[3].max_tokens, 60_000);
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// B2: equal projected values do not erase the catalog declaration. Both
+/// rows resolve to 8,192, but only the row that declares it rejects 20,000.
+#[tokio::test]
+async fn declared_8192_refuses_20000_while_equal_fallback_reaches_provider() {
+    let root = test_root("b2-equal-8192-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "b2-equal-8192",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let row = |slug: &str, declared: Option<u64>| haider_provider::DiscoveredModel {
+        slug: slug.into(),
+        display_name: slug.into(),
+        context_window: Some(1_048_576),
+        max_output_tokens: declared,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let models = [
+        row("probe-declared-8192", Some(8_192)),
+        row("probe-fallback-8192", None),
+    ];
+    let models_json = serde_json::to_string(&models).expect("serialize catalog rows");
+    let fetched_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as u64;
+    haider_store::Store::open(&config.store_dir)
+        .expect("open catalog store")
+        .put_provider_models("haider-code", &models_json, None, fetched_at_ms)
+        .expect("seed public Haider Code inventory");
+    let fake = Arc::new(FakeProvider::new(text_turn("fallback accepted")));
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[("haider-code", fake.clone())]),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "b2-equal-client",
+        "b2-equal-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    send(
+        &mut client,
+        &config,
+        "b2-declared-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("b2-declared-command"),
+            cwd: workspace.display().to_string(),
+            provider: "haider-code".into(),
+            model: "probe-declared-8192".into(),
+            max_tokens: 20_000,
+        },
+    )
+    .await;
+    let response = next_response(&mut client).await;
+    assert!(
+        matches!(
+            &response,
+            ResponseBody::Error {
+                data: Some(ErrorData::ModelOutputLimit {
+                    requested: 20_000,
+                    max_output_tokens: 8_192,
+                    ..
+                }),
+                ..
+            }
+        ),
+        "declared catalog maximum must give a typed refusal: {response:?}"
+    );
+    assert!(
+        fake.requests().is_empty(),
+        "refusal precedes provider dispatch"
+    );
+
+    let (session_id, generation) = create_with_budget_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "haider-code",
+        "probe-fallback-8192",
+        20_000,
+    )
+    .await;
+    run_turn(
+        &mut client,
+        &config,
+        &session_id,
+        generation,
+        "b2-fallback-turn",
+    )
+    .await;
+    assert_eq!(fake.requests()[0].max_tokens, 20_000);
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");

@@ -1,9 +1,10 @@
 //! Upgrade equivalence for the exact delegated-create schema before explicit
 //! route inheritance joined its digest. New-schema receipts stay byte strict.
 use super::{CreatedSession, StoreResult, corrupt, decode_envelope_column, map_sqlite_error};
-use haider_protocol::session::{ModelSelected, SessionProviderRebound};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
+
+mod historical_route;
 
 const LEGACY_KEYS: [&str; 10] = [
     "cache_policy",
@@ -29,7 +30,7 @@ pub(super) fn legacy_delegated_create_matches(
     incoming: &str,
     response: Option<&str>,
 ) -> StoreResult<bool> {
-    let (Ok(Value::Object(old)), Ok(Value::Object(mut new))) =
+    let (Ok(Value::Object(mut old)), Ok(Value::Object(mut new))) =
         (serde_json::from_str(stored), serde_json::from_str(incoming))
     else {
         return Ok(false);
@@ -37,26 +38,50 @@ pub(super) fn legacy_delegated_create_matches(
     if !old.get("delegation_agent").is_some_and(Value::is_string) {
         return Ok(false);
     }
-    if let Some(source) = new.remove("max_tokens_source") {
+    // A current receipt already binds both budget intent and route witness;
+    // only the pre-classification/pre-route schemas permit upgrade equivalence.
+    if old.contains_key("inheritance_parent_session_id") && old.contains_key("max_tokens_source") {
+        return Ok(false);
+    }
+    let old_source = old.remove("max_tokens_source");
+    let new_source = new.remove("max_tokens_source");
+    if old_source.is_some() || new_source.is_some() {
         let Some(response) = response else {
             return Ok(false);
         };
         let created: CreatedSession = serde_json::from_str(response)
             .map_err(|error| corrupt(format!("invalid legacy create receipt: {error}")))?;
-        let Ok(source) = serde_json::from_value::<
-            Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
-        >(source) else {
-            return Ok(false);
-        };
-        if haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
-            source,
-            created.metadata.max_tokens,
-        ) != haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+        let admitted = haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
             created.metadata.max_tokens_source,
             created.metadata.max_tokens,
-        ) {
-            return Ok(false);
+        );
+        for source in [old_source, new_source].into_iter().flatten() {
+            let Ok(source) = serde_json::from_value::<
+                Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
+            >(source) else {
+                return Ok(false);
+            };
+            if haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                source,
+                created.metadata.max_tokens,
+            ) != admitted
+            {
+                return Ok(false);
+            }
         }
+    }
+    // Source-only upgrade: every route/witness and caller key remains exact.
+    if old == new {
+        let known_keys = LEGACY_KEYS.iter().all(|key| old.contains_key(*key));
+        let recorded_route = ROUTE_KEYS.iter().all(|key| old.contains_key(*key));
+        let known_shape = old.len() == LEGACY_KEYS.len()
+            || (recorded_route && old.len() == LEGACY_KEYS.len() + ROUTE_KEYS.len())
+            || (recorded_route
+                && old.len() == LEGACY_KEYS.len() + ROUTE_KEYS.len() + 1
+                && old
+                    .get("inheritance_parent_session_id")
+                    .is_some_and(Value::is_string));
+        return Ok(known_keys && known_shape);
     }
     let parent = new.remove("inheritance_parent_session_id");
     // 6223198e already recorded all route choices, but had no history witness.
@@ -100,6 +125,61 @@ pub(super) fn legacy_delegated_create_matches(
     let Some(parent) = parent.as_str() else {
         return Ok(false);
     };
+    let Some(child_provider) = old.get("provider").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let expected = frozen_or_historical_route(connection, &created, parent, child_provider)?;
+    Ok(expected.is_some_and(|expected| route == expected))
+}
+
+/// Recover retry coordinates only from an exact pre-witness admission shape.
+/// Recorded digest choices outrank a reply that predates route fields. A
+/// pre-route digest uses the same frozen reply/history proof as comparison.
+/// This does not change the original reply or the existing child's metadata.
+pub(super) fn legacy_admission_route(
+    connection: &Connection,
+    stored: &str,
+    created: &CreatedSession,
+    parent: &str,
+) -> StoreResult<Option<[Option<String>; 3]>> {
+    let Ok(Value::Object(mut old)) = serde_json::from_str(stored) else {
+        return Ok(None);
+    };
+    old.remove("max_tokens_source");
+    if !old.get("delegation_agent").is_some_and(Value::is_string)
+        || !LEGACY_KEYS.iter().all(|key| old.contains_key(*key))
+    {
+        return Ok(None);
+    }
+    let recorded_route = ROUTE_KEYS.iter().all(|key| old.contains_key(*key));
+    let route = if recorded_route && old.len() == LEGACY_KEYS.len() + ROUTE_KEYS.len() {
+        Some(ROUTE_KEYS.map(|key| old[key].clone()))
+    } else if old.len() == LEGACY_KEYS.len() {
+        let Some(provider) = old.get("provider").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        frozen_or_historical_route(connection, created, parent, provider)?
+    } else {
+        None
+    };
+    route
+        .map(|route| {
+            let [account, endpoint, rebind] = route;
+            let decode = |value| {
+                serde_json::from_value::<Option<String>>(value)
+                    .map_err(|error| corrupt(format!("invalid child admission route: {error}")))
+            };
+            Ok([decode(account)?, decode(endpoint)?, decode(rebind)?])
+        })
+        .transpose()
+}
+
+fn frozen_or_historical_route(
+    connection: &Connection,
+    created: &CreatedSession,
+    parent: &str,
+    child_provider: &str,
+) -> StoreResult<Option<[Value; 3]>> {
     // Creation receipts freeze the initial metadata; today's parent metadata
     // would misattribute an account changed after the original child create.
     let original: Option<String> = connection.query_row(
@@ -108,15 +188,15 @@ pub(super) fn legacy_delegated_create_matches(
         [parent], |row| row.get(0),
     ).optional().map_err(map_sqlite_error)?.flatten();
     let Some(original) = original else {
-        return Ok(false);
+        return Ok(None);
     };
     let original: CreatedSession = serde_json::from_str(&original)
         .map_err(|error| corrupt(format!("invalid parent create receipt: {error}")))?;
     if original.session_id.as_str() != parent {
-        return Ok(false);
+        return Ok(None);
     }
     let initial_seq = super::to_sqlite_integer(original.created_seq)?;
-    let mut metadata = original.metadata;
+    let metadata = original.metadata;
     // rowid supplies the machine-wide commit order even when two transactions
     // have the same millisecond timestamp. The child's Created fact is the
     // exact cutoff, including the crash-before-establishment case.
@@ -129,7 +209,7 @@ pub(super) fn legacy_delegated_create_matches(
         .optional()
         .map_err(map_sqlite_error)?;
     let Some(cutoff) = cutoff else {
-        return Ok(false);
+        return Ok(None);
     };
     let parent_created: Option<i64> = connection
         .query_row(
@@ -140,50 +220,29 @@ pub(super) fn legacy_delegated_create_matches(
         .optional()
         .map_err(map_sqlite_error)?;
     if parent_created.is_none_or(|created| created >= cutoff) {
-        return Ok(false);
+        return Ok(None);
     }
-    let mut statement = connection.prepare(
-        "SELECT envelope_json FROM events WHERE session_id = ?1 AND rowid < ?2 AND seq > ?3
-         AND (payload_kind IN ('model_selected', 'session_provider_rebound') OR payload_kind IS NULL) ORDER BY seq",
-    ).map_err(map_sqlite_error)?;
-    let mut events = statement
-        .query(rusqlite::params![parent, cutoff, initial_seq])
-        .map_err(map_sqlite_error)?;
-    while let Some(row) = events.next().map_err(map_sqlite_error)? {
-        let event = decode_envelope_column(connection, row, 0)
-            .map_err(|error| corrupt(format!("invalid inheritance event: {error}")))?;
-        if let Some(rebound) = SessionProviderRebound::from_payload_value(&event.payload) {
-            rebound.apply_to_metadata(&mut metadata);
-        } else if let Some(selected) = ModelSelected::from_payload_value(&event.payload) {
-            // A downgraded writer can create a ten-key child receipt after
-            // newer parent events. Use each event's clear evidence, not the
-            // child's receipt schema, to reconstruct the parent route.
-            if selected.cleared_account_pin.is_some() {
-                metadata.account_alias = None;
-            }
-            if metadata.provider != selected.provider {
-                // Old picks without explicit clear semantics kept creation
-                // pins, but cleared pins introduced by a provider rebind.
-                if metadata.provider_rebind_id.is_some() {
-                    metadata.account_alias = None;
-                }
-                metadata.provider_base_url = None;
-                metadata.provider_rebind_id = None;
-            }
-            metadata.provider = selected.provider;
-            metadata.model = selected.model;
-        }
+    // A running parent can already have a different next-turn selection when
+    // its child is created. Prefer the route frozen by that child's original
+    // admission; only old responses without a route need parent history.
+    let recorded = [
+        created.metadata.account_alias.clone(),
+        created.metadata.provider_base_url.clone(),
+        created.metadata.provider_rebind_id.clone(),
+    ]
+    .map(|value| value.map_or(Value::Null, Value::String));
+    if recorded.iter().any(|value| !value.is_null()) {
+        return Ok(Some(recorded));
     }
-    let expected =
-        if old.get("provider").and_then(Value::as_str) == Some(metadata.provider.as_str()) {
-            [
-                metadata.account_alias,
-                metadata.provider_base_url,
-                metadata.provider_rebind_id,
-            ]
-            .map(|value| value.map_or(Value::Null, Value::String))
-        } else {
-            [Value::Null, Value::Null, Value::Null]
-        };
-    Ok(route == expected)
+    historical_route::at_child_creation(
+        connection,
+        metadata,
+        historical_route::Witness {
+            parent,
+            child: &created.session_id,
+            child_provider,
+            initial_seq,
+            cutoff,
+        },
+    )
 }
