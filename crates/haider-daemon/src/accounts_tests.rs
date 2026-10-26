@@ -2715,6 +2715,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
                 display_name: None,
                 context_window: Some(131_072),
                 max_output_tokens: Some(16_384),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -2727,6 +2728,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
                 display_name: None,
                 context_window: Some(65_536),
                 max_output_tokens: Some(16_384),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -2947,6 +2949,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
                 display_name: None,
                 context_window: Some(32_000),
                 max_output_tokens: Some(8_192),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -2959,6 +2962,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
                 display_name: None,
                 context_window: Some(128_000),
                 max_output_tokens: Some(32_768),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -3097,6 +3101,7 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
             display_name: None,
             context_window: None,
             max_output_tokens: None,
+            max_output_tokens_source: None,
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: Vec::new(),
@@ -14430,6 +14435,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
                 display_name: None,
                 context_window: Some(400_000),
                 max_output_tokens: Some(128_000),
+                max_output_tokens_source: None,
                 supported_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
                 default_effort: Some("medium".to_owned()),
                 supported_speeds: Vec::new(),
@@ -14442,6 +14448,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
                 display_name: None,
                 context_window: Some(400_000),
                 max_output_tokens: Some(128_000),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -15542,6 +15549,7 @@ async fn each_turn_resolves_the_currently_active_account() {
             display_name: None,
             context_window: Some(131_072),
             max_output_tokens: Some(16_384),
+            max_output_tokens_source: None,
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: Vec::new(),
@@ -21221,5 +21229,105 @@ fn a25_placeholder_matching_never_redirects_requested_aliases() {
             requested,
             "a matching unverified neighbor cannot redirect an existing requested row with another identity"
         );
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecordedAdapterRoute {
+    provider: String,
+    descriptor_endpoint: Option<String>,
+    profile_endpoint: Option<String>,
+}
+
+#[derive(Default)]
+struct RouteBoundaryRecordingBuilder {
+    routes: StdMutex<Vec<RecordedAdapterRoute>>,
+}
+
+impl AccountProviderBuilder for RouteBoundaryRecordingBuilder {
+    fn providers(&self) -> std::collections::BTreeSet<String> {
+        haider_provider::BUILTIN_PROVIDER_NAMES
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn build(
+        &self,
+        _provider: &str,
+        _credential: haider_accounts::SecretHandle,
+        _model: &str,
+        _alias: &CredentialAlias,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        Ok(Arc::new(haider_provider::FakeProvider::new(Vec::new())))
+    }
+
+    fn build_profile_descriptor(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        self.routes
+            .lock()
+            .expect("record route")
+            .push(RecordedAdapterRoute {
+                provider: descriptor.provider.clone(),
+                descriptor_endpoint: descriptor.base_url.clone(),
+                profile_endpoint: profile.and_then(|profile| profile.endpoint.clone()),
+            });
+        self.build(&descriptor.provider, credential, model, &descriptor.alias)
+    }
+}
+
+#[tokio::test]
+async fn run_route_recovery_tests_fallback_honors_explicit_selectors() {
+    for (account_pin, endpoint_pin, rebind_only) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
+        let (mut resolver, current) = fallback_chain_resolver_fixture();
+        let builder = Arc::new(RouteBoundaryRecordingBuilder::default());
+        resolver.factory.builder = builder.clone();
+        resolver.metadata.provider_base_url =
+            endpoint_pin.then(|| "http://127.0.0.1:31701/v1".into());
+        resolver.metadata.provider_rebind_id =
+            (account_pin || endpoint_pin || rebind_only).then(|| "previous-provider-route".into());
+        resolver.metadata.account_alias = account_pin.then(|| current.as_str().to_owned());
+        let decision = resolver
+            .resolve_fallback(
+                &current,
+                &haider_provider::ProviderError::new(
+                    ProviderErrorKind::QuotaExhausted,
+                    "synthetic quota",
+                ),
+            )
+            .await
+            .expect("resolve fallback");
+        if account_pin || endpoint_pin {
+            assert!(
+                matches!(decision, haider_core::ProviderAttemptDecision::Stop),
+                "explicit account/endpoint selectors prohibit automatic fallback"
+            );
+            assert!(builder.routes.lock().expect("routes").is_empty());
+        } else {
+            let haider_core::ProviderAttemptDecision::Switch(target) = decision else {
+                panic!("the unselected default pool permits a credentialed replacement");
+            };
+            assert_eq!(target.account.as_str(), "fallback-openai");
+            assert_eq!(target.provider_name, OPENAI_PROVIDER_NAME);
+            assert_eq!(
+                *builder.routes.lock().expect("routes"),
+                vec![RecordedAdapterRoute {
+                    provider: OPENAI_PROVIDER_NAME.to_owned(),
+                    descriptor_endpoint: None,
+                    profile_endpoint: None,
+                }]
+            );
+        }
     }
 }

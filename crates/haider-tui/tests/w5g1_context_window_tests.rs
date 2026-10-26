@@ -55,6 +55,7 @@ fn windowed_summary(
                 display_name: None,
                 context_window: *window,
                 max_output_tokens: Some(30_000),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),

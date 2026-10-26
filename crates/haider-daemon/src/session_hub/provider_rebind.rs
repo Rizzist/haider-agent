@@ -50,8 +50,7 @@ impl HubConnection {
             Ok(None) => {}
             Err(error) => return self.respond_turn_error(request_id, error),
         }
-        let _selection = self.hub.lock_workflow_selection(&session_id).await;
-        let Some(current) = (match self.hub.session_metadata(&session_id).await {
+        let Some(_) = (match self.hub.session_metadata(&session_id).await {
             Ok(value) => value,
             Err(error) => return self.respond_turn_error(request_id, error),
         }) else {
@@ -115,24 +114,71 @@ impl HubConnection {
                 );
             }
         }
+        // Custom endpoint validation probes its inventory over the network.
+        // It depends only on the requested route; validate before fencing the
+        // mutable session pair, then compute both budgets under the fence.
         let base_url = match base_url {
             None => None,
-            Some(url) => match validate_rebind_endpoint(&provider, &url).await {
-                Ok(url) => Some(url),
-                Err(error) => return self.respond_turn_error(request_id, error),
-            },
+            Some(url) => {
+                #[cfg(test)]
+                self.hub.pause_selection_network(&session_id).await;
+                match validate_rebind_endpoint(&provider, &url).await {
+                    Ok(url) => Some(url),
+                    Err(error) => return self.respond_turn_error(request_id, error),
+                }
+            }
+        };
+        let _selection = self.hub.lock_workflow_selection(&session_id).await;
+        let Some(current) = (match self.hub.session_metadata(&session_id).await {
+            Ok(value) => value,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }) else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "provider rebind requires a session with typed metadata",
+                false,
+                None,
+            );
         };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             view.providers.clone(),
         );
-        if let Err(refusal) = authority.validate_selection_with_status(
+        let validated = match authority.validate_selection_with_status(
             &current.provider,
             Some(&provider),
             &current.model,
         ) {
-            return self.respond_selection_refusal(request_id, &refusal);
-        }
+            Ok(selection) => selection,
+            Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+        };
+        let budget = super::rpc::reapply_session_output_budget(&current, &validated);
+        let active_output_budget =
+            if let Some(active) = self.hub.active_run_output_pair(&session_id).await? {
+                let selection = match authority.validate_selection_with_status(
+                    &active.provider,
+                    Some(&provider),
+                    &active.model,
+                ) {
+                    Ok(selection) => selection,
+                    Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+                };
+                Some(haider_protocol::session::ActiveRunOutputBudgetV1 {
+                    run_id: active.run_id,
+                    model: active.model,
+                    budget: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                        active.source,
+                        active.max_tokens,
+                    )
+                    .apply(
+                        selection.max_output_tokens,
+                        selection.explicit_max_output_tokens,
+                    ),
+                })
+            } else {
+                None
+            };
         // Admission shares this lock. Compare against the ACTIVE run's
         // frozen ceiling: session.select_model can already describe the next
         // turn, and is not evidence of the current turn's authority.
@@ -160,6 +206,10 @@ impl HubConnection {
             provider,
             base_url,
             account,
+            max_tokens: budget.max_tokens,
+            max_tokens_source: budget.source,
+            clamped: budget.clamped,
+            active_output_budget,
             event_id: EventId::new(random_id("session-provider-rebound")?),
             device_id: self.hub.inner.device_id.clone(),
         };
@@ -190,6 +240,14 @@ impl HubConnection {
                 account: selected.account,
                 selected_seq: selected.selected_seq,
                 worker_generation: selected.worker_generation,
+                output_budget: (selected.max_tokens != 0).then_some(
+                    haider_protocol::output_budget::SessionOutputBudgetV1 {
+                        max_tokens: selected.max_tokens,
+                        source: selected.max_tokens_source,
+                        clamped: selected.clamped,
+                    },
+                ),
+                active_output_budget: selected.active_output_budget,
             },
         })
     }

@@ -254,8 +254,7 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             context_window,
             max_output_tokens,
             explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
-                provider,
-                model,
+                haider_provider::output_limit_provenance(provider, model, None),
                 max_output_tokens,
                 context_window,
             ),
@@ -284,8 +283,9 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             super::rpc::resolve_session_output_limit(haider_provider::MAX_OUTPUT_LIMIT, &custom)
                 .expect("up to the adapter maximum")
                 .max_tokens,
-            haider_provider::MAX_OUTPUT_LIMIT
+            384_000
         );
+        assert_eq!(haider_provider::MAX_OUTPUT_LIMIT, 384_000);
         assert!(matches!(
             super::rpc::resolve_session_output_limit(
                 haider_provider::MAX_OUTPUT_LIMIT + 1,
@@ -294,7 +294,8 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             Err((
                 _,
                 haider_rpc::ErrorData::ModelOutputLimit {
-                    max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+                    requested: 384_001,
+                    max_output_tokens: 384_000,
                     ..
                 }
             ))
@@ -309,6 +310,84 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
     let sourced = selection("anthropic", "claude-sonnet-4-5", Some(200_000));
     assert_eq!(sourced.explicit_max_output_tokens, 64_000);
     assert!(super::rpc::resolve_session_output_limit(64_001, &sourced).is_err());
+}
+
+/// 973-output-cap-fixes B1: Kimi Code and Haider Code publish a context
+/// window but no output maximum. The derived budget keeps the conservative
+/// 30,000 default, an explicit 60,000 is admitted on create and on a config
+/// update (both `resolve_session_output_limit`), and a stored user-set 60,000
+/// survives a model switch between them unclamped (`reapply_session_output_budget`).
+/// Only the global/context bound still refuses.
+/// MUTATION CHECK: mark these rows `output_limit_sourced: context_window.is_some()`
+/// again. Expected runtime failure: 60,000 is refused with `ModelOutputLimit`
+/// (max 30,000) and the switch clamps to 30,000.
+#[test]
+fn published_window_without_output_maximum_admits_larger_explicit_budgets() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = |provider: &str, model: &str| {
+        let context_window = haider_provider::static_model_limits(provider, model).context_window;
+        let max_output_tokens =
+            haider_provider::model_output_limit(provider, model, None, context_window);
+        crate::model_select::ValidatedModelSelection {
+            provider: provider.into(),
+            model: model.into(),
+            inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+            context_window,
+            max_output_tokens,
+            explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
+                haider_provider::output_limit_provenance(provider, model, None),
+                max_output_tokens,
+                context_window,
+            ),
+        }
+    };
+    let kimi = selection("kimi-oauth", "kimi-for-coding");
+    let glm = selection("haider-code", "glm-5.3");
+    for (row, bound) in [(&kimi, 384_000), (&glm, 100_000)] {
+        assert_eq!(row.max_output_tokens, 30_000, "{}", row.model);
+        assert_eq!(
+            super::rpc::resolve_session_output_limit(0, row)
+                .expect("derived")
+                .max_tokens,
+            30_000
+        );
+        let explicit =
+            super::rpc::resolve_session_output_limit(60_000, row).expect("explicit 60,000");
+        assert_eq!(explicit.max_tokens, 60_000, "{}", row.model);
+        assert_eq!(
+            explicit.source,
+            SessionOutputBudgetSourceV1::UserSet { requested: 60_000 }
+        );
+        assert_eq!(explicit.clamped, None);
+        assert_eq!(row.explicit_max_output_tokens, bound, "{}", row.model);
+        assert!(matches!(
+            super::rpc::resolve_session_output_limit(bound + 1, row),
+            Err((_, haider_rpc::ErrorData::ModelOutputLimit { max_output_tokens, .. }))
+                if max_output_tokens == bound
+        ));
+    }
+    let stored = |provider: &str, model: &str| {
+        let mut metadata: haider_protocol::session::SessionMetadataV1 =
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/workspace",
+                "provider": provider,
+                "model": model,
+                "max_tokens": 60_000,
+                "created_at_ms": 1_u64,
+            }))
+            .expect("metadata fixture");
+        metadata.max_tokens_source =
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 60_000 });
+        metadata
+    };
+    for (current, target) in [
+        (stored("kimi-oauth", "kimi-for-coding"), &glm),
+        (stored("haider-code", "glm-5.3"), &kimi),
+    ] {
+        let budget = super::rpc::reapply_session_output_budget(&current, target);
+        assert_eq!(budget.max_tokens, 60_000, "switch to {}", target.model);
+        assert_eq!(budget.clamped, None, "switch to {}", target.model);
+    }
 }
 
 /// The attachment replay preflight must keep immutable-blob validation out of
@@ -1314,6 +1393,10 @@ async fn daemon_fork_keeps_the_explicit_account_and_endpoint_route() {
         account: Some("bed-b".into()),
         event_id: EventId::new("explicit-route-parent-rebound"),
         device_id: DeviceId::new("worker-law-test"),
+        max_tokens: 4096,
+        max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        clamped: None,
+        active_output_budget: None,
     })
     .await
     .expect("explicit parent rebind");
@@ -2864,6 +2947,239 @@ async fn session_create_refreshes_unavailable_inventory_with_explicit_account() 
     connection.close().await.expect("connection close");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+/// Refresh uses the explicit account from the speculative session snapshot,
+/// then retries with fresh coordinates if a concurrent writer moves it.
+#[tokio::test]
+async fn explicit_account_inventory_refresh_retries_after_concurrent_session_update() {
+    for (variant, moved_provider, requested_provider, stale_error) in [
+        ("unchanged", "fake", None, false),
+        ("account", "fake", None, false),
+        ("provider", "other", None, false),
+        ("explicit-provider", "other", Some("fake"), false),
+        ("account", "fake", None, true),
+        ("provider", "other", None, true),
+        ("explicit-provider", "other", Some("fake"), true),
+    ] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let session_id = SessionId::new(format!("inventory-race-{variant}"));
+        hub.create_internal_session(create_command(&session_id, variant))
+            .await
+            .expect("create");
+        let rebind = |suffix: &str, provider: &str, account: &str| {
+            haider_store::SessionProviderRebindCommand {
+                command_id: format!("inventory-{suffix}"),
+                request_digest: format!("inventory-digest-{suffix}"),
+                request_json: format!(r#"{{"fixture":"{suffix}"}}"#),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                provider: provider.into(),
+                base_url: None,
+                account: Some(account.into()),
+                max_tokens: 4096,
+                max_tokens_source:
+                    haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+                clamped: None,
+                active_output_budget: None,
+                event_id: EventId::new(format!("inventory-{suffix}")),
+                device_id: DeviceId::new("inventory-race-device"),
+            }
+        };
+        hub.rebind_session_provider(rebind("initial", "fake", "old-pin"))
+            .await
+            .expect("initial account pin");
+        let descriptor =
+            |alias: &str, provider: &str| haider_protocol::credential::CredentialDescriptor {
+                alias: haider_protocol::ids::CredentialAlias::new(alias),
+                provider: provider.into(),
+                base_url: None,
+                auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+                identity: "synthetic fixture".into(),
+                status: haider_protocol::credential::CredentialStatus::Ok,
+                active: false,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            };
+        let descriptors = vec![
+            descriptor("old-pin", "fake"),
+            descriptor("new-pin", moved_provider),
+        ];
+        let unavailable = |provider: &str| {
+            let mut summary = provider_summary(provider);
+            summary.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+                reason: "synthetic default failed".into(),
+            };
+            summary
+        };
+        let (commands, mut mailbox) = mpsc::channel(2);
+        hub.install_accounts(crate::accounts::AccountsFacade {
+            login: Some(commands),
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(descriptors.clone())),
+            management: crate::accounts::ManagementSnapshot::new(
+                1,
+                descriptors,
+                vec![unavailable("fake"), unavailable("other")],
+            ),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+            sources: Arc::new(Mutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts");
+        hub.install_creatable_providers(std::collections::BTreeSet::from([
+            "fake".into(),
+            "other".into(),
+        ]))
+        .expect("providers");
+        let sink = Arc::new(CapturingFrameSink::default());
+        let connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([
+                    haider_rpc::Capability::View,
+                    haider_rpc::Capability::Control,
+                ]),
+                sink.clone(),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("connection");
+        connection
+            .request(
+                RequestId::new("inventory-attach"),
+                RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
+                },
+            )
+            .await
+            .expect("attach");
+        let request = connection.request(
+            RequestId::new("inventory-select"),
+            RequestBody::SessionSelectModel {
+                command_id: haider_rpc::CommandId::new("inventory-select-command"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                provider: requested_provider.map(str::to_owned),
+                model: "selected-model".into(),
+                confirm_new_epoch: true,
+                max_tokens: None,
+            },
+        );
+        tokio::pin!(request);
+        let attempts = if variant == "unchanged" { 1 } else { 2 };
+        for attempt in 0..attempts {
+            let command = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    command = mailbox.recv() => command.expect("refresh command"),
+                    result = &mut request => panic!("selection completed before fresh account inventory: {variant}/{attempt}: {result:?}"),
+                }
+            })
+            .await
+            .expect("refresh requested");
+            let crate::accounts::AccountCommand::RefreshProviderModels {
+                provider,
+                account_alias,
+                completed,
+            } = command
+            else {
+                panic!("unexpected account command");
+            };
+            let expected_provider = if attempt == 0 || requested_provider.is_some() {
+                "fake"
+            } else {
+                moved_provider
+            };
+            let expected_alias = if attempt == 0 {
+                Some("old-pin")
+            } else if requested_provider.is_some() {
+                None // An alias from the new provider must never leak to the old one.
+            } else {
+                Some("new-pin")
+            };
+            assert_eq!(provider, expected_provider, "{variant}/{attempt}");
+            assert_eq!(
+                account_alias.as_ref().map(|alias| alias.as_str()),
+                expected_alias,
+                "{variant}/{attempt}: catalog must use the explicit account"
+            );
+            if attempt == 0 && variant != "unchanged" {
+                // This is the same fence used by the RPC writer. Network I/O
+                // must leave it available, and the selection must notice the
+                // account change even when the provider/model stay identical.
+                let fence = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    hub.lock_workflow_selection(&session_id),
+                )
+                .await
+                .expect("concurrent update is not blocked by network I/O");
+                hub.rebind_session_provider(rebind("concurrent", moved_provider, "new-pin"))
+                    .await
+                    .expect("concurrent session update");
+                drop(fence);
+            }
+            let mut refreshed = provider_summary(&provider);
+            refreshed.models = vec!["selected-model".into()];
+            refreshed.inventory = haider_rpc::ModelInventoryWire::Static;
+            let crate::accounts::ProviderModelsRefreshCompletion::Internal(sender) = completed
+            else {
+                panic!("internal completion required");
+            };
+            let result = if stale_error && attempt == 0 {
+                Err(crate::accounts::ProviderModelsRefreshFailure {
+                    code: "synthetic-stale-account".into(),
+                    message: "old account fetch failed after a concurrent update".into(),
+                    retryable: false,
+                    data: None,
+                })
+            } else {
+                Ok(refreshed)
+            };
+            sender
+                .lock()
+                .expect("completion")
+                .take()
+                .expect("sender")
+                .send(result)
+                .expect("refresh result");
+        }
+        request.await.expect("selection");
+        assert!(
+            sink.0.lock().expect("frames").iter().any(|frame| matches!(
+                frame,
+                WireFrame::Response { request_id, body: ResponseBody::SessionSelectModel { .. } }
+                    if request_id.as_str() == "inventory-select"
+            )),
+            "selection succeeds with the fresh catalog: {variant}"
+        );
+        let metadata = hub
+            .session_metadata(&session_id)
+            .await
+            .expect("metadata")
+            .expect("typed");
+        assert_eq!(
+            metadata.provider,
+            requested_provider.unwrap_or(moved_provider)
+        );
+        assert_eq!(metadata.model, "selected-model");
+        assert_eq!(
+            metadata.account_alias.as_deref(),
+            match variant {
+                "unchanged" => Some("old-pin"),
+                "explicit-provider" => None,
+                _ => Some("new-pin"),
+            }
+        );
+        connection.close().await.expect("connection close");
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
 }
 
 #[tokio::test]

@@ -1309,6 +1309,12 @@ pub struct ModelDetailWire {
     /// the remote catalog omits the field or cannot be reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Where `max_output_tokens` came from. Additive (973-output-cap-fixes):
+    /// older peers omit it, and a spelling this peer does not know decodes as
+    /// [`ModelOutputLimitSourceWire::Unknown`]; either leaves the daemon to
+    /// derive provenance from its own tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens_source: Option<ModelOutputLimitSourceWire>,
     /// The pair's effort ladder, in the provider's own vocabulary and order.
     /// EMPTY (absent on the wire) means "no declared ladder".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1363,6 +1369,24 @@ impl ModelDetailSourceWire {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Provenance of one [`ModelDetailWire::max_output_tokens`] value. Numeric
+/// equality with a local fallback is never provenance, so the daemon carries
+/// this explicitly from projection to selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelOutputLimitSourceWire {
+    /// The provider's model catalog declared the maximum: it is exact.
+    Declared,
+    /// The daemon's pinned table, from a published provider maximum: exact.
+    Static,
+    /// A local value the provider does not publish; explicit budgets may
+    /// exceed it within the global and context-window bounds.
+    Fallback,
+    /// A source this peer does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One provider's read-only management projection.
@@ -5348,6 +5372,10 @@ pub enum ResponseBody {
         account: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_output_budget: Option<haider_protocol::session::ActiveRunOutputBudgetV1>,
     },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {

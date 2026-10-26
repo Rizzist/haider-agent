@@ -444,6 +444,8 @@ fn automatic_pair_switches_cannot_cross_a_lockdown_boundary() {
     let switch = haider_core::ProviderPairSwitch {
         run_id: haider_protocol::ids::RunId::new("lockdown-switch-run"),
         switch_ordinal: 0,
+        source_rebind_seq: 0,
+        target_account: "automatic-account".into(),
         from_provider: "source".to_owned(),
         from_model: "source-model".to_owned(),
         to_provider: "target".to_owned(),

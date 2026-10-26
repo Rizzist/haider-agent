@@ -138,7 +138,7 @@ fn cm3a_tuning_is_gated_and_cm3e_confirmation_is_reversible() {
         !blocks_change(&warning, true),
         "explicit new-epoch confirmation restores the ability to change"
     );
-    assert!(warning.message().contains("repeat the same selection"));
+    assert!(warning.message().contains("--confirm-epoch"));
     // The caller's confirmed second request bypasses only this preflight and
     // commits the requested setting; no setting/model is permanently pinned.
 }
