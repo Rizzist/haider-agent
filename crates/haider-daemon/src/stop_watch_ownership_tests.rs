@@ -103,53 +103,104 @@ async fn seed_legacy_watch(world: &MonitorWorld, call: &str) -> MonitorRegistrat
 #[tokio::test]
 async fn r8_tool_watch_records_original_task() {
     let world = MonitorWorld::new("original-task").await;
-    let result = world
-        .execute(
-            "watch",
-            MonitorRequest::Register {
-                source: MonitorSource::Timer {
-                    interval_ms: 3_600_000,
-                },
-                filter: None,
-                action: MonitorAction {
-                    report: true,
-                    follow_up: None,
-                },
-                occurrence: MonitorOccurrence::Every,
-                lifetime: MonitorLifetime::Session,
+    let mut expected = HashSet::new();
+    let mut revised = None;
+    for (call, occurrence, lifetime) in [
+        (
+            "session-watch",
+            MonitorOccurrence::Every,
+            MonitorLifetime::Session,
+        ),
+        (
+            "timeout-watch",
+            MonitorOccurrence::Every,
+            MonitorLifetime::Timeout {
+                timeout_ms: 3_600_000,
             },
-        )
-        .await;
-    assert_eq!(result.status, ToolResultStatus::Completed);
+        ),
+        (
+            "once-watch",
+            MonitorOccurrence::Once,
+            MonitorLifetime::Session,
+        ),
+    ] {
+        let result = world
+            .execute(
+                call,
+                MonitorRequest::Register {
+                    source: MonitorSource::Timer {
+                        interval_ms: 3_600_000,
+                    },
+                    filter: None,
+                    action: MonitorAction {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence,
+                    lifetime,
+                },
+            )
+            .await;
+        assert_eq!(result.status, ToolResultStatus::Completed);
+        let id = serde_json::from_str::<serde_json::Value>(&result.preview)
+            .expect("registration preview")["monitor_id"]
+            .as_str()
+            .expect("monitor ID")
+            .to_owned();
+        if call == "once-watch" {
+            revised = Some(id.clone());
+        }
+        expected.insert(id);
+    }
+    let monitor_id = revised.expect("watch to revise");
+    for (call, request) in [
+        (
+            "pause-once",
+            MonitorRequest::Pause {
+                monitor_id: monitor_id.clone(),
+            },
+        ),
+        ("resume-once", MonitorRequest::Resume { monitor_id }),
+    ] {
+        assert_eq!(
+            world.execute(call, request).await.status,
+            ToolResultStatus::Completed
+        );
+    }
     let events = world
         .store
         .read(&world.session, 0, 4096)
         .await
         .expect("journal");
-    let original = events
+    let originals = events
         .iter()
-        .find(|e| {
-            matches!(
-                MonitorJournalEvent::from_value(&e.payload),
-                Some(MonitorJournalEvent::MonitorRegistered { .. })
-            )
-        })
-        .expect("registration");
-    assert!(original.run_id.is_none());
+        .filter(|event| event.payload.get("monitor_owner_run_id").is_some())
+        .collect::<Vec<_>>();
     assert_eq!(
-        original
-            .payload
-            .get("monitor_owner_run_id")
-            .and_then(serde_json::Value::as_str),
-        Some(world.run.as_str())
+        originals.len(),
+        3,
+        "each original registration needs its task coordinate"
     );
+    for original in originals {
+        assert!(original.run_id.is_none());
+        assert_eq!(
+            original
+                .payload
+                .get("monitor_owner_run_id")
+                .and_then(serde_json::Value::as_str),
+            Some(world.run.as_str())
+        );
+    }
     let owned = world
         .hub
         .inner_monitor()
         .stop_owned_monitor_ids(&world.hub, &target(&world))
         .await
         .expect("owned watches");
-    assert_eq!(owned.len(), 1);
+    assert_eq!(
+        owned, expected,
+        "all original watches retain ownership across lifetimes and revisions"
+    );
     world.hub.shutdown().await.expect("shutdown");
     world.store.close().await.expect("close");
 }
