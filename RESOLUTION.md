@@ -1,5 +1,20 @@
 # Wave 973 integration resolutions
 
+## ci-winpath integration on 2026-10-26
+
+Integrates wave `b08f4d823d9aee1aee5a2dbd67acd557949da7a7` into
+ci-winpath candidate `06459d9e5e0493d55f887f56d078401b0739e68b`.
+The only textual conflict is `test-baseline.txt`: the merged source contains
+7163 tests by xtask's exact source-count rule. The queued lint gate will
+regenerate and check that value with the actual xtask executable.
+
+The provider-budget and route-epoch changes in AppModel and LiveDriver are
+retained alongside the lane's session-owned path projection. No new path
+display producer was introduced by those changes. Startup home seeding,
+plain/TUI path parity, the glob branch scanner, and SSH panel clearing are
+preserved. Both histories are retained with a merge commit. No previous
+candidate build or test receipt is reused for this integration.
+
 ## ci-winpath integration on 2026-10-24
 
 Integrates wave `6fa2a72d4199b798834cee2d72c5fd2767a6373b` into
