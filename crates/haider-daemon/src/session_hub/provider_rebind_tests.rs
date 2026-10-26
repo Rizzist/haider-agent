@@ -610,8 +610,18 @@ async fn assert_slow_inventory_fetch_is_unfenced(operation: &str) {
             ]
         })).expect("profile")
     };
+    let mut source_profile = profile(
+        "mock-a",
+        serde_json::json!({"state":"stale","fetched_at_ms":0,"reason":"test"}),
+    );
     let mut target_profile = profile("mock-b", serde_json::json!({"state":"static"}));
     if operation == "model" {
+        // C1 serves eligible cached stale rows without waiting for discovery.
+        // A real inventory miss is required to exercise the network fence.
+        source_profile.models.retain(|model| model == "small");
+        source_profile
+            .model_details
+            .retain(|model| model.name == "small");
         target_profile.models.retain(|model| model == "small");
         target_profile
             .model_details
@@ -624,13 +634,7 @@ async fn assert_slow_inventory_fetch_is_unfenced(operation: &str) {
         management: crate::accounts::ManagementSnapshot::new(
             1,
             Vec::new(),
-            vec![
-                profile(
-                    "mock-a",
-                    serde_json::json!({"state":"stale","fetched_at_ms":0,"reason":"test"}),
-                ),
-                target_profile,
-            ],
+            vec![source_profile, target_profile],
         ),
         vault_supported: false,
         discovery_disabled: true,
