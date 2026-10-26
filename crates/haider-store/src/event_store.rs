@@ -10069,6 +10069,7 @@ impl Store {
         }
         let no_op = metadata.provider == command.provider
             && metadata.model == command.model
+            && metadata.model_catalog_key == command.model_catalog_key
             && metadata.resolved_model.is_none()
             && command
                 .account_alias

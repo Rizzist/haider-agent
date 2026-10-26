@@ -18,6 +18,8 @@ use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::live_pass;
 
 mod common;
+#[path = "common/selection_owner_cases.rs"]
+mod selection_owner_cases;
 use common::{launcher_model, run_slash};
 
 fn oauth_descriptor(provider: &str, alias: &str, active: bool) -> CredentialDescriptor {

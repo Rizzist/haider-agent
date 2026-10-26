@@ -485,7 +485,8 @@ impl DelegationHandle {
                     .map(|view| view.providers)
                     .unwrap_or_default()
             });
-        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries)
+            .scoped_to_session_route(parent, &parent.provider);
         Ok(authority
             .resolve_child_selector(
                 &parent.provider,
@@ -493,7 +494,7 @@ impl DelegationHandle {
                 request.model.as_deref(),
                 request.provider.as_deref(),
             )
-            .map(|(provider, model)| {
+            .and_then(|(provider, model)| {
                 let mut child = parent.clone();
                 if child.provider != provider {
                     // A child that explicitly chooses another provider starts
@@ -504,12 +505,26 @@ impl DelegationHandle {
                     child.resolved_route_alias = None;
                     child.resolved_route_seen = false;
                 }
-                if child.provider != provider || child.model != model {
+                if request.model.as_deref().is_some_and(|model| !model.trim().is_empty()) {
+                    // An explicit child choice owns its coordinate and any
+                    // fetched settings it uses. Only implicit model inheritance
+                    // may carry the parent's catalog provenance unchanged.
+                    let selected = authority.validate_selection_with_status(
+                        &parent.provider, Some(&provider), &model,
+                    )?;
+                    let budget = crate::session_hub::rpc::reapply_session_output_budget(
+                        parent, &selected,
+                    );
+                    child.model_catalog_key = authority.model_catalog_key(&provider, &model)
+                        .or_else(|| authority.model_settings_catalog_key(&provider, &model, &budget));
+                    child.max_tokens = budget.max_tokens;
+                    child.max_tokens_source = Some(budget.source);
+                    child.budget_clamp_notice_epoch = budget.clamped.map(|_| 0);
                     child.resolved_model = None;
                 }
                 child.provider = provider;
                 child.model = model;
-                child
+                Ok(child)
             }))
     }
 
@@ -4453,3 +4468,7 @@ mod toolshape_tests {
         assert!(marker.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "delegation_model_owner_tests.rs"]
+mod model_owner_tests;
