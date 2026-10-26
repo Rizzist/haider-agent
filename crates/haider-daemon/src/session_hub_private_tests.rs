@@ -254,8 +254,7 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             context_window,
             max_output_tokens,
             explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
-                provider,
-                model,
+                haider_provider::output_limit_provenance(provider, model, None),
                 max_output_tokens,
                 context_window,
             ),
@@ -284,8 +283,9 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             super::rpc::resolve_session_output_limit(haider_provider::MAX_OUTPUT_LIMIT, &custom)
                 .expect("up to the adapter maximum")
                 .max_tokens,
-            haider_provider::MAX_OUTPUT_LIMIT
+            384_000
         );
+        assert_eq!(haider_provider::MAX_OUTPUT_LIMIT, 384_000);
         assert!(matches!(
             super::rpc::resolve_session_output_limit(
                 haider_provider::MAX_OUTPUT_LIMIT + 1,
@@ -294,7 +294,8 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             Err((
                 _,
                 haider_rpc::ErrorData::ModelOutputLimit {
-                    max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+                    requested: 384_001,
+                    max_output_tokens: 384_000,
                     ..
                 }
             ))
@@ -309,6 +310,84 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
     let sourced = selection("anthropic", "claude-sonnet-4-5", Some(200_000));
     assert_eq!(sourced.explicit_max_output_tokens, 64_000);
     assert!(super::rpc::resolve_session_output_limit(64_001, &sourced).is_err());
+}
+
+/// 973-output-cap-fixes B1: Kimi Code and Haider Code publish a context
+/// window but no output maximum. The derived budget keeps the conservative
+/// 30,000 default, an explicit 60,000 is admitted on create and on a config
+/// update (both `resolve_session_output_limit`), and a stored user-set 60,000
+/// survives a model switch between them unclamped (`reapply_session_output_budget`).
+/// Only the global/context bound still refuses.
+/// MUTATION CHECK: mark these rows `output_limit_sourced: context_window.is_some()`
+/// again. Expected runtime failure: 60,000 is refused with `ModelOutputLimit`
+/// (max 30,000) and the switch clamps to 30,000.
+#[test]
+fn published_window_without_output_maximum_admits_larger_explicit_budgets() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = |provider: &str, model: &str| {
+        let context_window = haider_provider::static_model_limits(provider, model).context_window;
+        let max_output_tokens =
+            haider_provider::model_output_limit(provider, model, None, context_window);
+        crate::model_select::ValidatedModelSelection {
+            provider: provider.into(),
+            model: model.into(),
+            inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+            context_window,
+            max_output_tokens,
+            explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
+                haider_provider::output_limit_provenance(provider, model, None),
+                max_output_tokens,
+                context_window,
+            ),
+        }
+    };
+    let kimi = selection("kimi-oauth", "kimi-for-coding");
+    let glm = selection("haider-code", "glm-5.3");
+    for (row, bound) in [(&kimi, 384_000), (&glm, 100_000)] {
+        assert_eq!(row.max_output_tokens, 30_000, "{}", row.model);
+        assert_eq!(
+            super::rpc::resolve_session_output_limit(0, row)
+                .expect("derived")
+                .max_tokens,
+            30_000
+        );
+        let explicit =
+            super::rpc::resolve_session_output_limit(60_000, row).expect("explicit 60,000");
+        assert_eq!(explicit.max_tokens, 60_000, "{}", row.model);
+        assert_eq!(
+            explicit.source,
+            SessionOutputBudgetSourceV1::UserSet { requested: 60_000 }
+        );
+        assert_eq!(explicit.clamped, None);
+        assert_eq!(row.explicit_max_output_tokens, bound, "{}", row.model);
+        assert!(matches!(
+            super::rpc::resolve_session_output_limit(bound + 1, row),
+            Err((_, haider_rpc::ErrorData::ModelOutputLimit { max_output_tokens, .. }))
+                if max_output_tokens == bound
+        ));
+    }
+    let stored = |provider: &str, model: &str| {
+        let mut metadata: haider_protocol::session::SessionMetadataV1 =
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/workspace",
+                "provider": provider,
+                "model": model,
+                "max_tokens": 60_000,
+                "created_at_ms": 1_u64,
+            }))
+            .expect("metadata fixture");
+        metadata.max_tokens_source =
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 60_000 });
+        metadata
+    };
+    for (current, target) in [
+        (stored("kimi-oauth", "kimi-for-coding"), &glm),
+        (stored("haider-code", "glm-5.3"), &kimi),
+    ] {
+        let budget = super::rpc::reapply_session_output_budget(&current, target);
+        assert_eq!(budget.max_tokens, 60_000, "switch to {}", target.model);
+        assert_eq!(budget.clamped, None, "switch to {}", target.model);
+    }
 }
 
 /// The attachment replay preflight must keep immutable-blob validation out of
@@ -1314,6 +1393,10 @@ async fn daemon_fork_keeps_the_explicit_account_and_endpoint_route() {
         account: Some("bed-b".into()),
         event_id: EventId::new("explicit-route-parent-rebound"),
         device_id: DeviceId::new("worker-law-test"),
+        max_tokens: 4096,
+        max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        clamped: None,
+        active_output_budget: None,
     })
     .await
     .expect("explicit parent rebind");

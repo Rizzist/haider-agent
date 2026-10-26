@@ -169,6 +169,7 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{
     BranchId, CredentialAlias, DeviceId, EventId, GraphId, MenuId, RunId, SessionId,
 };
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind, MenuScope,
     effect_recovery_menu,
@@ -920,6 +921,84 @@ struct LockdownTurnBinding {
     policy: crate::auto_hermetic::ProviderLockdownPolicy,
 }
 
+#[cfg(test)]
+struct ModelSelectionBudgetPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ResolvedRouteCommitProbe {
+    pub attempts: AtomicU64,
+    pub pause: bool,
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    /// Pauses a run-scoped route append after the route decision and before
+    /// the actor allocates its epoch: the window a read-outside allocation
+    /// would leave open to a concurrent selection.
+    pub pause_run_route: bool,
+    pub run_route_reached: tokio::sync::Notify,
+    pub run_route_release: tokio::sync::Notify,
+    pub pause_pair_switch: bool,
+    pub pair_switch_reached: tokio::sync::Notify,
+    pub pair_switch_release: tokio::sync::Notify,
+}
+
+pub(crate) struct ActiveRunOutputPairSnapshot {
+    branch_id: Option<BranchId>,
+    pub durably_pinned: bool,
+    pub complete_pin: bool,
+    pub latest_rebind_seq: u64,
+    pub run_id: RunId,
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: u64,
+    pub source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
+    route_snapshot: haider_store::RunOutputRouteHistory,
+}
+
+impl ActiveRunOutputPairSnapshot {
+    pub(crate) fn restore_route(
+        &self,
+        metadata: &mut haider_protocol::session::SessionMetadataV1,
+    ) -> Result<(), HaiderError> {
+        self.route_snapshot.restore(metadata)
+    }
+}
+
+enum RunOutputPairChange {
+    SwitchPrepared {
+        run_id: RunId,
+        provider: String,
+        model: String,
+        rebind_seq: Option<u64>,
+        resolved_alias: Option<String>,
+    },
+    LegacyCheckpoint {
+        run_id: RunId,
+        selection_epoch: u64,
+    },
+    Switch {
+        run_id: RunId,
+        provider: String,
+        model: String,
+        resolved_alias: Option<String>,
+        selection_seq: Option<u64>,
+        source_rebind_seq: Option<u64>,
+    },
+    Rebind {
+        rebound: Box<haider_protocol::session::SessionProviderRebound>,
+        route: Option<haider_protocol::session::RunOutputRouteSnapshotV1>,
+    },
+    Route {
+        run_id: RunId,
+        provider: Option<String>,
+        model: Option<String>,
+        route: haider_protocol::session::RunOutputRouteSnapshotV1,
+    },
+}
+
 struct HubInner {
     provider_rebind_revision: Arc<AtomicU64>,
     store: SqliteStoreHandle,
@@ -998,6 +1077,14 @@ struct HubInner {
     /// blocking daemon-internal workflow_author transitions inside an already
     /// fenced tool call.
     workflow_selection_serials: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    model_selection_budget_pauses:
+        tokio::sync::Mutex<HashMap<SessionId, Arc<ModelSelectionBudgetPause>>>,
+    #[cfg(test)]
+    selection_network_pauses:
+        tokio::sync::Mutex<HashMap<SessionId, Arc<ModelSelectionBudgetPause>>>,
+    #[cfg(test)]
+    resolved_route_probes: tokio::sync::Mutex<HashMap<SessionId, Arc<ResolvedRouteCommitProbe>>>,
     /// Weak root-run budget authorities shared by delegated child workers.
     /// The owning parent turn controls their lifetime; stale entries cannot
     /// keep a completed run or worker lease alive.
@@ -1832,6 +1919,10 @@ enum ActorRegisterResult {
     CursorAhead { requested: u64, head: u64 },
 }
 
+/// Builds a run's route envelopes for an epoch chosen by the session actor.
+pub(crate) type RunRouteEnvelopeBuilder =
+    Box<dyn FnOnce(u64) -> Result<Vec<RawEnvelope>, HaiderError> + Send>;
+
 enum ActorCommand {
     Append {
         envelopes: Vec<RawEnvelope>,
@@ -1859,7 +1950,7 @@ enum ActorCommand {
         epoch: u64,
         alias: Option<String>,
         device_id: DeviceId,
-        completed: oneshot::Sender<Result<u64, HaiderError>>,
+        completed: oneshot::Sender<Result<Option<u64>, HaiderError>>,
     },
     SelectModel {
         command: SessionSelectModelCommand,
@@ -1983,6 +2074,16 @@ enum ActorCommand {
         lease_id: WorkerLeaseId,
         expected_head: Option<u64>,
         envelopes: Vec<RawEnvelope>,
+        completed: oneshot::Sender<Result<Arc<[RawEnvelope]>, HaiderError>>,
+    },
+    /// Allocate a run-scoped route epoch from the actor's journal head and
+    /// append the envelopes built for it as a `WorkerAppend` in the same
+    /// actor turn.
+    WorkerAppendAllocatedEpoch {
+        lease_id: WorkerLeaseId,
+        floor: u64,
+        build: RunRouteEnvelopeBuilder,
+        allocated: oneshot::Sender<u64>,
         completed: oneshot::Sender<Result<Arc<[RawEnvelope]>, HaiderError>>,
     },
     WorkerProviderViewAppend {
@@ -2524,6 +2625,12 @@ impl SessionHub {
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
             stop_operations: tokio::sync::Mutex::new(()),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            model_selection_budget_pauses: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            selection_network_pauses: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            resolved_route_probes: tokio::sync::Mutex::new(HashMap::new()),
             run_budget_coordinators: Mutex::new(HashMap::new()),
             checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
             replay_tasks: Mutex::new(HashMap::new()),
@@ -4291,6 +4398,29 @@ impl SessionHub {
             SessionCreateOutcome::Committed { created, .. }
             | SessionCreateOutcome::IdempotentReplay { created } => Ok(created),
         }
+    }
+
+    pub(crate) async fn child_create_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+        parent_session_id: SessionId,
+    ) -> Result<Option<(String, haider_protocol::session::SessionMetadataV1)>, HaiderError> {
+        self.inner
+            .store
+            .child_create_admission(command_id, session_id, parent_session_id)
+            .await
+    }
+
+    pub(crate) async fn child_turn_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+    ) -> Result<Option<String>, HaiderError> {
+        self.inner
+            .store
+            .child_turn_admission(command_id, session_id)
+            .await
     }
 
     /// Narrow daemon-internal turn acceptance used by local delegation. The
@@ -6723,6 +6853,656 @@ impl SessionHub {
         }
     }
 
+    /// Reads the pair fixed for this run, with its subsequent automatic
+    /// switches and explicit rebinds. Ordinary selections never alter it.
+    pub(crate) async fn run_output_pair(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<Option<ActiveRunOutputPairSnapshot>, HaiderError> {
+        self.read_run_output_pair(session_id, Some(run_id)).await
+    }
+
+    pub(crate) async fn active_run_output_pair(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ActiveRunOutputPairSnapshot>, HaiderError> {
+        self.read_run_output_pair(session_id, None).await
+    }
+
+    async fn read_run_output_pair(
+        &self,
+        session_id: &SessionId,
+        requested_run: Option<&RunId>,
+    ) -> Result<Option<ActiveRunOutputPairSnapshot>, HaiderError> {
+        use haider_protocol::session::RunOutputPairPinnedV1;
+        let mut cursor = 0;
+        let mut states = HashMap::<RunId, RunState>::new();
+        let mut branches = HashMap::<RunId, Option<BranchId>>::new();
+        let mut admitted = HashMap::<RunId, u64>::new();
+        let mut started = HashMap::<RunId, u64>::new();
+        let mut specs = HashMap::new();
+        let mut pairs = HashMap::<RunId, ActiveRunOutputPairSnapshot>::new();
+        let mut pinned_at = HashMap::<RunId, u64>::new();
+        let mut terminal_at = HashMap::<RunId, u64>::new();
+        let mut first_pin_at = HashMap::<RunId, u64>::new();
+        let mut epoch_origins = HashMap::<u64, (u64, bool)>::new();
+        // Keep pair-changing facts in order so legacy runs can be seeded
+        // before the same reduction used by newly pinned runs.
+        let mut changes = Vec::new();
+        let automatic_runs = self
+            .inner
+            .store
+            .automatic_run_switches(session_id.clone())
+            .await?;
+        loop {
+            let page = self
+                .inner
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::ProviderRebind,
+                    session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
+            let count = page.len();
+            for event in page {
+                cursor = event.seq;
+                if let Some(selected) =
+                    haider_protocol::session::ModelSelected::from_payload_value(&event.payload)
+                    && let Some(epoch) = selected.selection_epoch
+                {
+                    epoch_origins
+                        .entry(epoch)
+                        .or_insert((event.seq, !selected.route_only));
+                }
+                if let Some(rebound) =
+                    haider_protocol::session::SessionProviderRebound::from_payload_value(
+                        &event.payload,
+                    )
+                {
+                    if let Some(epoch) = rebound.selection_epoch {
+                        epoch_origins.entry(epoch).or_insert((event.seq, false));
+                    }
+                    let route = event
+                        .payload
+                        .get("route_snapshot")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("invalid rebind snapshot: {error}"),
+                                false,
+                            )
+                        })?;
+                    changes.push((
+                        event.seq,
+                        RunOutputPairChange::Rebind {
+                            rebound: Box::new(rebound),
+                            route,
+                        },
+                    ));
+                }
+                // Legacy automatic receipts prove the run owner. Ordinary
+                // selections with equal coordinates do not enter this map.
+                if event.run_id.is_none()
+                    && let Some(run_id) = automatic_runs.get(&event.seq)
+                    && let Some(selected) =
+                        haider_protocol::session::ModelSelected::from_payload_value(&event.payload)
+                {
+                    changes.push((
+                        event.seq,
+                        RunOutputPairChange::SwitchPrepared {
+                            run_id: run_id.clone(),
+                            provider: selected.provider,
+                            model: selected.model,
+                            rebind_seq: None,
+                            resolved_alias: None,
+                        },
+                    ));
+                }
+                if let Some(run_id) = event.run_id.as_ref()
+                    && let Some(rebind_seq) = event
+                        .payload
+                        .get("automatic_rebind_seq")
+                        .and_then(serde_json::Value::as_u64)
+                    && let Some(selected) =
+                        haider_protocol::session::ModelSelected::from_payload_value(&event.payload)
+                {
+                    changes.push((
+                        event.seq,
+                        RunOutputPairChange::SwitchPrepared {
+                            run_id: run_id.clone(),
+                            provider: selected.provider,
+                            model: selected.model,
+                            rebind_seq: Some(rebind_seq),
+                            resolved_alias: event
+                                .payload
+                                .get("automatic_resolved_alias")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                        },
+                    ));
+                }
+                let Some(run_id) = event.run_id.as_ref() else {
+                    continue;
+                };
+                if let Some(
+                    haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(spec),
+                ) = haider_protocol::headless::HeadlessRunEventPayload::from_payload_value(
+                    &event.payload,
+                ) {
+                    specs.entry(run_id.clone()).or_insert(spec);
+                }
+                if let Ok(EventPayload::RunState(state)) = event.payload.decode_event() {
+                    branches
+                        .entry(run_id.clone())
+                        .or_insert_with(|| event.branch_id.clone());
+                    if matches!(state, RunState::Queued) {
+                        admitted.entry(run_id.clone()).or_insert(event.seq);
+                    } else {
+                        started.entry(run_id.clone()).or_insert(event.seq);
+                    }
+                    if state.is_terminal() {
+                        terminal_at.insert(run_id.clone(), event.seq);
+                    }
+                    states.insert(run_id.clone(), state);
+                }
+                if let Ok(EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data },
+                    ..
+                })) = event.payload.decode_event()
+                {
+                    if kind == RunOutputPairPinnedV1::KIND {
+                        let pin: RunOutputPairPinnedV1 =
+                            serde_json::from_value(data).map_err(|error| {
+                                HaiderError::new(
+                                    ErrorCode::StoreCorrupt,
+                                    format!("invalid run output pair: {error}"),
+                                    false,
+                                )
+                            })?;
+                        first_pin_at.entry(run_id.clone()).or_insert(event.seq);
+                        let complete_pin = pin.route_snapshot.is_some();
+                        if !complete_pin
+                            && started.get(run_id).is_some_and(|start| *start < event.seq)
+                            && let Some(epoch) = pin
+                                .provider_route
+                                .as_ref()
+                                .and_then(|route| route.selection_epoch)
+                        {
+                            changes.push((
+                                event.seq,
+                                RunOutputPairChange::LegacyCheckpoint {
+                                    run_id: run_id.clone(),
+                                    selection_epoch: epoch,
+                                },
+                            ));
+                        }
+                        // The first complete pin is authoritative. An upgrade
+                        // may repair an older pin, but another checkpoint must
+                        // never replace a complete run boundary.
+                        if pairs
+                            .get(run_id)
+                            .is_none_or(|pair| !pair.complete_pin && complete_pin)
+                        {
+                            pinned_at.insert(run_id.clone(), event.seq);
+                            pairs.insert(
+                                run_id.clone(),
+                                ActiveRunOutputPairSnapshot {
+                                    branch_id: event.branch_id.clone(),
+                                    durably_pinned: true,
+                                    complete_pin,
+                                    latest_rebind_seq: 0,
+                                    run_id: run_id.clone(),
+                                    provider: pin.provider,
+                                    model: pin.model,
+                                    max_tokens: pin.max_tokens,
+                                    source: Some(pin.source),
+                                    route_snapshot: pin
+                                        .route_snapshot
+                                        .map(haider_store::RunOutputRouteHistory::known)
+                                        .or_else(|| {
+                                            pin.provider_route.map(
+                                                haider_store::RunOutputRouteHistory::legacy_pin,
+                                            )
+                                        })
+                                        .unwrap_or_else(
+                                            haider_store::RunOutputRouteHistory::missing,
+                                        ),
+                                },
+                            );
+                        }
+                    } else if kind
+                        == haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND
+                        || kind == haider_protocol::session::RunOutputRouteSnapshotV1::RESOLVED_KIND
+                    {
+                        let provider = data
+                            .get("provider")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned);
+                        let model = data
+                            .get("model")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned);
+                        let route: haider_protocol::session::RunOutputRouteSnapshotV1 = if kind
+                            == haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND
+                        {
+                            serde_json::from_value::<
+                                haider_protocol::session::RunOutputProviderRouteV1,
+                            >(data)
+                            .map(Into::into)
+                        } else {
+                            serde_json::from_value(data)
+                        }
+                        .map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("invalid run output route: {error}"),
+                                false,
+                            )
+                        })?;
+                        if let Some(epoch) = route.selection_epoch {
+                            epoch_origins.entry(epoch).or_insert((event.seq, false));
+                        }
+                        changes.push((
+                            event.seq,
+                            RunOutputPairChange::Route {
+                                run_id: run_id.clone(),
+                                provider,
+                                model,
+                                route,
+                            },
+                        ));
+                    } else if kind == "run_worker_pickup_v1" {
+                        started.entry(run_id.clone()).or_insert(event.seq);
+                    } else if kind == "provider_pair_switch_v1"
+                        && let Some(model) =
+                            data.get("to_model").and_then(serde_json::Value::as_str)
+                        && let Some(provider) =
+                            data.get("to_provider").and_then(serde_json::Value::as_str)
+                    {
+                        changes.push((
+                            event.seq,
+                            RunOutputPairChange::Switch {
+                                run_id: run_id.clone(),
+                                provider: provider.to_owned(),
+                                model: model.to_owned(),
+                                source_rebind_seq: data
+                                    .get("source_rebind_seq")
+                                    .and_then(serde_json::Value::as_u64),
+                                selection_seq: data
+                                    .get("selection_seq")
+                                    .and_then(serde_json::Value::as_u64),
+                                resolved_alias: data
+                                    .get("resolved_alias")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned),
+                            },
+                        ));
+                    }
+                }
+            }
+            if count < 256 {
+                break;
+            }
+        }
+        let active = started
+            .iter()
+            .filter(|(run_id, _)| {
+                states
+                    .get(*run_id)
+                    .is_some_and(|state| !state.is_terminal())
+            })
+            .max_by_key(|(_, seq)| *seq)
+            .map(|(run_id, _)| run_id);
+        let Some(target) = requested_run.or(active) else {
+            return Ok(None);
+        };
+        pairs.retain(|run_id, _| run_id == target);
+        let route_boundary = if specs.contains_key(target) {
+            admitted.get(target).copied()
+        } else {
+            match (started.get(target), first_pin_at.get(target)) {
+                (Some(start), Some(pin)) => Some((*start).min(*pin)),
+                (Some(start), None) => Some(*start),
+                (None, pin) => pin.copied(),
+            }
+        };
+        // Old recovery writers added their first pin after the run had
+        // already started. That checkpoint cannot move the route boundary
+        // past intervening next-turn selections, even if coordinates match.
+        if pairs.get(target).is_some_and(|pair| !pair.complete_pin)
+            && started
+                .get(target)
+                .zip(pinned_at.get(target))
+                .is_some_and(|(start, pin)| start < pin)
+        {
+            pairs.remove(target);
+            pinned_at.remove(target);
+        }
+        // Compatibility with journals written before the durable pin existed.
+        // Only headless specs use admission; native legacy runs use start.
+        let mut legacy_boundaries = started.clone();
+        for run_id in specs.keys() {
+            if let Some(seq) = admitted.get(run_id) {
+                legacy_boundaries.entry(run_id.clone()).or_insert(*seq);
+            }
+        }
+        for (run_id, seq) in &pinned_at {
+            legacy_boundaries.entry(run_id.clone()).or_insert(*seq);
+        }
+        legacy_boundaries.retain(|run_id, _| run_id == target);
+        for (run_id, start_seq) in &legacy_boundaries {
+            if pairs
+                .get(run_id)
+                .is_some_and(|pair| pair.route_snapshot.is_complete())
+            {
+                continue;
+            }
+            let spec = specs.get(run_id);
+            let seq = if let Some(pin) = pinned_at.get(run_id) {
+                *pin
+            } else if spec.is_some() {
+                admitted.get(run_id).copied().unwrap_or(*start_seq)
+            } else {
+                *start_seq
+            };
+            if let Some(snapshot) = self
+                .inner
+                .store
+                .session_output_pair_at(session_id.clone(), seq)
+                .await?
+            {
+                if let Some(pair) = pairs.get_mut(run_id) {
+                    if snapshot.provider == pair.provider {
+                        let mut history = snapshot.route;
+                        history.overlay(pair.route_snapshot.clone());
+                        pair.route_snapshot = history;
+                    }
+                    continue;
+                }
+                pinned_at.insert(run_id.clone(), seq);
+                let route = if spec.is_some_and(|spec| spec.provider != snapshot.provider) {
+                    haider_store::RunOutputRouteHistory::missing()
+                } else {
+                    snapshot.route
+                };
+                pairs.insert(
+                    run_id.clone(),
+                    ActiveRunOutputPairSnapshot {
+                        branch_id: branches.get(run_id).cloned().flatten(),
+                        durably_pinned: false,
+                        complete_pin: false,
+                        latest_rebind_seq: 0,
+                        run_id: run_id.clone(),
+                        provider: spec.map_or(snapshot.provider, |spec| spec.provider.clone()),
+                        model: spec.map_or(snapshot.model, |spec| spec.model.clone()),
+                        max_tokens: spec.map_or(snapshot.max_tokens, |spec| spec.max_output_tokens),
+                        source: snapshot.source,
+                        route_snapshot: route,
+                    },
+                );
+            } else if !pairs.contains_key(run_id) {
+                return Err(haider_protocol::session::run_route_history_unavailable(
+                    "run has no historical creation metadata",
+                ));
+            }
+        }
+        let mut prepared = haider_store::RunOutputSwitchOwnership::default();
+        let mut last_active_rebind = 0;
+        let mut latest_rebind_seq = 0;
+        let mut legacy_checkpoint_tainted = false;
+        for (seq, change) in changes {
+            match change {
+                RunOutputPairChange::SwitchPrepared {
+                    run_id,
+                    provider,
+                    model,
+                    rebind_seq,
+                    resolved_alias,
+                } => {
+                    let rebind_seq = rebind_seq.unwrap_or(latest_rebind_seq);
+                    // Installing the target and its served-account witness is
+                    // part of the selection transaction. A subsequent rebind
+                    // must validate this model and own its replacement route,
+                    // even while Core is awaiting cache-transition bookkeeping.
+                    if rebind_seq == latest_rebind_seq
+                        && pinned_at.get(&run_id).is_some_and(|pin| *pin < seq)
+                        && terminal_at.get(&run_id).is_none_or(|end| *end >= seq)
+                        && let Some(pair) = pairs.get_mut(&run_id)
+                    {
+                        if pair.provider != provider {
+                            pair.route_snapshot.clear_selectors();
+                        }
+                        pair.provider.clone_from(&provider);
+                        pair.model.clone_from(&model);
+                        pair.route_snapshot
+                            .record_switch_observation(resolved_alias);
+                    }
+                    prepared.prepare(seq, &run_id, &provider, &model, rebind_seq);
+                }
+                RunOutputPairChange::LegacyCheckpoint {
+                    run_id,
+                    selection_epoch,
+                } => {
+                    if pinned_at.get(&run_id).is_some_and(|pin| *pin < seq)
+                        && terminal_at.get(&run_id).is_none_or(|end| *end >= seq)
+                        && let Some(pair) = pairs.get(&run_id)
+                    {
+                        // Compare at the checkpoint, after earlier owned
+                        // switches/rebinds, rather than against today's route.
+                        legacy_checkpoint_tainted =
+                            !pair.route_snapshot.epoch_matches(Some(selection_epoch));
+                    }
+                }
+                RunOutputPairChange::Switch {
+                    run_id,
+                    provider,
+                    model,
+                    resolved_alias,
+                    selection_seq,
+                    source_rebind_seq,
+                } => {
+                    if pinned_at.get(&run_id).is_none_or(|pin| *pin >= seq)
+                        || terminal_at.get(&run_id).is_some_and(|end| *end < seq)
+                    {
+                        continue;
+                    }
+                    let reference = source_rebind_seq.map_or(
+                        haider_store::RunOutputSwitchReference::Selection(selection_seq),
+                        haider_store::RunOutputSwitchReference::Generation,
+                    );
+                    let owned = prepared.allows(
+                        reference,
+                        &run_id,
+                        &provider,
+                        Some(&model),
+                        latest_rebind_seq,
+                        last_active_rebind != 0,
+                    );
+                    if !owned {
+                        continue;
+                    }
+                    if let Some(pair) = pairs.get_mut(&run_id) {
+                        if pair.provider != provider {
+                            pair.route_snapshot.clear_selectors();
+                        }
+                        pair.provider = provider;
+                        pair.model = model;
+                        pair.route_snapshot
+                            .record_switch_observation(resolved_alias);
+                    }
+                }
+                RunOutputPairChange::Route {
+                    run_id,
+                    provider,
+                    model,
+                    route,
+                } => {
+                    if pinned_at.get(&run_id).is_none_or(|pin| *pin >= seq)
+                        || terminal_at.get(&run_id).is_some_and(|end| *end < seq)
+                    {
+                        continue;
+                    }
+                    if let Some(pair) = pairs.get_mut(&run_id)
+                        && provider
+                            .as_ref()
+                            .is_none_or(|provider| provider == &pair.provider)
+                        && model.as_ref().is_none_or(|model| model == &pair.model)
+                        && (pair
+                            .route_snapshot
+                            .matches_rebind(route.rebind_id.as_deref())
+                            || (pair.route_snapshot.rebind_unknown()
+                                && provider.is_some()
+                                && model.is_some()))
+                    {
+                        let borrowed_epoch = route
+                            .selection_epoch
+                            .and_then(|epoch| epoch_origins.get(&epoch))
+                            .is_some_and(|(origin, ordinary)| {
+                                *ordinary
+                                    && route_boundary.is_some_and(|boundary| *origin > boundary)
+                            })
+                            && !pair.route_snapshot.epoch_matches(route.selection_epoch);
+                        if !borrowed_epoch {
+                            let unscoped_legacy = provider.is_none() || model.is_none();
+                            pair.route_snapshot.record_resolution(
+                                route,
+                                legacy_checkpoint_tainted && unscoped_legacy,
+                            );
+                        }
+                    }
+                }
+                RunOutputPairChange::Rebind { rebound, route } => {
+                    latest_rebind_seq = seq;
+                    if route_boundary.is_some_and(|boundary| seq > boundary)
+                        && terminal_at.get(target).is_none_or(|end| *end >= seq)
+                    {
+                        last_active_rebind = seq;
+                    }
+                    if !pairs.keys().any(|run_id| {
+                        pinned_at.get(run_id).is_some_and(|pin| *pin < seq)
+                            && terminal_at.get(run_id).is_none_or(|end| *end >= seq)
+                    }) {
+                        continue;
+                    }
+                    let route = if let Some(route) = route {
+                        haider_store::RunOutputRouteHistory::known(route)
+                    } else {
+                        self.inner
+                            .store
+                            .session_output_pair_at(session_id.clone(), seq)
+                            .await?
+                            .map(|snapshot| snapshot.route)
+                            .unwrap_or_else(haider_store::RunOutputRouteHistory::missing)
+                    };
+                    for (run_id, pair) in &mut pairs {
+                        if pinned_at.get(run_id).is_none_or(|pin| *pin >= seq)
+                            || terminal_at.get(run_id).is_some_and(|end| *end < seq)
+                        {
+                            continue;
+                        }
+                        last_active_rebind = seq;
+                        pair.provider.clone_from(&rebound.provider);
+                        pair.route_snapshot = route.clone();
+                        legacy_checkpoint_tainted = false;
+                        if let Some(active) = rebound
+                            .active_output_budget
+                            .as_ref()
+                            .filter(|active| active.run_id == *run_id && active.model == pair.model)
+                        {
+                            pair.max_tokens = active.budget.max_tokens;
+                            pair.source = Some(active.budget.source);
+                        } else if pair.durably_pinned || specs.contains_key(run_id) {
+                            if !pair.durably_pinned
+                                && specs.contains_key(run_id)
+                                && started.get(run_id).is_some_and(|start| *start < seq)
+                            {
+                                // Before admission pins, an active headless rebind
+                                // replaced the spec's budget. Recover that change
+                                // from its own fact or history, never today's row.
+                                if let Some(budget) = rebound.output_budget {
+                                    pair.max_tokens = budget.max_tokens;
+                                    pair.source = Some(budget.source);
+                                } else {
+                                    let historical = self
+                                        .inner
+                                        .store
+                                        .session_output_pair_at(session_id.clone(), seq)
+                                        .await?
+                                        .ok_or_else(|| {
+                                            haider_protocol::session::run_route_history_unavailable(
+                                                "legacy headless rebind has no historical budget",
+                                            )
+                                        })?;
+                                    pair.max_tokens = historical.max_tokens;
+                                    pair.source = historical.source;
+                                }
+                            }
+                            // Queued headless specs are already pinned even though
+                            // they have no active record in this rebind receipt.
+                            if let Some(view) = self
+                                .accounts()
+                                .map_err(|error| {
+                                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                                })?
+                                .and_then(|accounts| accounts.management.read())
+                            {
+                                let authority = crate::model_select::ModelSelectionAuthority::new(
+                                    self.creatable_providers().map_err(|error| {
+                                        HaiderError::new(
+                                            ErrorCode::Internal,
+                                            error.to_string(),
+                                            false,
+                                        )
+                                    })?,
+                                    view.providers,
+                                );
+                                let selection = authority
+                                    .validate_selection_with_status(
+                                        &pair.provider,
+                                        Some(&pair.provider),
+                                        &pair.model,
+                                    )
+                                    .map_err(|refusal| {
+                                        HaiderError::new(
+                                            ErrorCode::InvalidArgument,
+                                            format!(
+                                                "recovered provider rebind rejected the active model: {}",
+                                                refusal.message()
+                                            ),
+                                            false,
+                                        )
+                                    })?;
+                                let budget = haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(pair.source, pair.max_tokens)
+                                    .apply(selection.max_output_tokens, selection.explicit_max_output_tokens);
+                                pair.max_tokens = budget.max_tokens;
+                                pair.source = Some(budget.source);
+                            }
+                        } else if let Some(budget) = rebound.output_budget {
+                            pair.max_tokens = budget.max_tokens;
+                            pair.source = Some(budget.source);
+                        }
+                    }
+                }
+            }
+        }
+        for pair in pairs.values_mut() {
+            pair.latest_rebind_seq = latest_rebind_seq;
+        }
+        let pair = pairs.remove(target);
+        if requested_run.is_some()
+            && let Some(pair) = pair.as_ref()
+        {
+            pair.route_snapshot.require_snapshot()?;
+        }
+        Ok(pair)
+    }
+
     /// One per-session total order for native workflow selection and the
     /// durable admission of work that makes an idle session nonterminal.
     pub(crate) async fn lock_workflow_selection(
@@ -6738,6 +7518,115 @@ impl SessionHub {
             )
         };
         serial.lock_owned().await
+    }
+
+    #[cfg(test)]
+    async fn pause_model_selection_after_budget(&self, session_id: &SessionId) {
+        let pause = self
+            .inner
+            .model_selection_budget_pauses
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_selection_network(&self, session_id: &SessionId) {
+        let pause = self
+            .inner
+            .selection_network_pauses
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_resolved_route_probe(
+        &self,
+        session_id: &SessionId,
+        pause: bool,
+    ) -> Arc<ResolvedRouteCommitProbe> {
+        self.install_route_probe(
+            session_id,
+            ResolvedRouteCommitProbe {
+                pause,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Pause only the run-scoped route append, before its epoch allocation.
+    #[cfg(test)]
+    pub(crate) async fn install_run_route_append_probe(
+        &self,
+        session_id: &SessionId,
+    ) -> Arc<ResolvedRouteCommitProbe> {
+        self.install_route_probe(
+            session_id,
+            ResolvedRouteCommitProbe {
+                pause_run_route: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_pair_switch_commit_probe(
+        &self,
+        session_id: &SessionId,
+    ) -> Arc<ResolvedRouteCommitProbe> {
+        self.install_route_probe(
+            session_id,
+            ResolvedRouteCommitProbe {
+                pause_pair_switch: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_pair_switch_commit(&self, session_id: &SessionId) {
+        let probe = self
+            .inner
+            .resolved_route_probes
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        if let Some(probe) = probe
+            && probe.pause_pair_switch
+        {
+            probe.pair_switch_reached.notify_one();
+            probe.pair_switch_release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn install_route_probe(
+        &self,
+        session_id: &SessionId,
+        probe: ResolvedRouteCommitProbe,
+    ) -> Arc<ResolvedRouteCommitProbe> {
+        let probe = Arc::new(probe);
+        self.inner
+            .resolved_route_probes
+            .lock()
+            .await
+            .insert(session_id.clone(), Arc::clone(&probe));
+        probe
     }
 
     pub(crate) async fn lock_checkpoint_mutation(
@@ -8536,11 +9425,184 @@ impl HubStoreHandle {
             .await
     }
 
+    /// Publish a current route through the session's epoch guard. A restored
+    /// route that has diverged from the session belongs only to this run.
+    pub(crate) async fn commit_turn_resolved_route(
+        &self,
+        run_id: &RunId,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        alias: Option<&str>,
+    ) -> Result<u64, HaiderError> {
+        let mut route = haider_protocol::session::RunOutputRouteSnapshotV1::capture(metadata);
+        let current = metadata.selection_epoch.unwrap_or(0);
+        let session = self.session_metadata().await?.ok_or_else(|| {
+            HaiderError::new(ErrorCode::StoreCorrupt, "run session is missing", false)
+        })?;
+        let session_epoch = if session.provider == metadata.provider
+            && session.model == metadata.model
+            && session.provider_rebind_id == metadata.provider_rebind_id
+            && session.account_alias == metadata.account_alias
+            && session.provider_base_url == metadata.provider_base_url
+            && session.selection_epoch.unwrap_or(0) == current
+            && session.route_reset_epoch.unwrap_or(0) <= current
+        {
+            // A selection racing this read is refused atomically by the
+            // actor/Store guard. Only an accepted commit owns a session epoch;
+            // refusal must fall through to the run-only path below.
+            self.commit_resolved_route_outcome(metadata, alias).await?
+        } else {
+            None
+        };
+        if route.resolved_seen && route.resolved_alias.as_deref() == alias {
+            return Ok(session_epoch.unwrap_or(current));
+        }
+        // An accepted session commit owns its epoch, and a run's first
+        // resolution keeps its current epoch. Any other served-account change
+        // (a refused or diverged session commit) takes a fresh epoch that the
+        // session actor allocates atomically with the append below.
+        let fixed_epoch = session_epoch.or((!route.resolved_seen).then_some(current));
+        route.resolved_alias = alias.map(str::to_owned);
+        route.resolved_seen = true;
+        let branch_id = self
+            .hub
+            .run_output_pair(&self.session_id, run_id)
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::RunNotActive,
+                    "resolved route has no admitted run",
+                    false,
+                )
+            })?
+            .branch_id;
+        let event_id =
+            haider_core::EventIdGenerator::new(random_id("run-route").map_err(hub_error_as_store)?)
+                .next();
+        let item_run = run_id.clone();
+        let route_kind = if route.rebind_id.is_some() {
+            haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND
+        } else {
+            haider_protocol::session::RunOutputRouteSnapshotV1::RESOLVED_KIND
+        };
+        let route_provider = metadata.provider.clone();
+        let route_model = metadata.model.clone();
+        let build = crate::worker::deferred_bookkeeping_envelope(
+            self,
+            &self.hub.inner.device_id,
+            run_id,
+            branch_id.as_ref(),
+            event_id,
+            move |epoch| {
+                route.selection_epoch = Some(epoch);
+                Ok(EventPayload::Item(ItemEvent::Completed {
+                    item_id: haider_protocol::ids::ItemId::new(format!(
+                        "run-route-{item_run}-{epoch}"
+                    )),
+                    item: TurnItem::Extension {
+                        kind: route_kind.into(),
+                        data: {
+                            let mut data = serde_json::to_value(route).map_err(|error| {
+                                HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                            })?;
+                            data["provider"] = serde_json::Value::String(route_provider);
+                            data["model"] = serde_json::Value::String(route_model);
+                            data
+                        },
+                    },
+                }))
+            },
+        )
+        .await?;
+        if let Some(epoch) = fixed_epoch {
+            let mut envelopes = build(epoch)?;
+            haider_core::StoreHandle::append(self, &mut envelopes).await?;
+            return Ok(epoch);
+        }
+        // A served-account change on a diverged route takes the next epoch,
+        // allocated by the session actor atomically with this append.
+        self.append_at_allocated_epoch(current, build).await
+    }
+
+    /// Append run-scoped envelopes at an epoch the session actor allocates
+    /// above both `floor` and its journal head, in the same actor turn as the
+    /// append, so no concurrent selection can be given the same epoch.
+    async fn append_at_allocated_epoch(
+        &self,
+        floor: u64,
+        build: RunRouteEnvelopeBuilder,
+    ) -> Result<u64, HaiderError> {
+        #[cfg(test)]
+        let probe = self
+            .hub
+            .inner
+            .resolved_route_probes
+            .lock()
+            .await
+            .get(&self.session_id)
+            .cloned();
+        #[cfg(test)]
+        if let Some(probe) = probe
+            && probe.pause_run_route
+        {
+            probe.run_route_reached.notify_one();
+            probe.run_route_release.notified().await;
+        }
+        let actor = self
+            .hub
+            .existing_actor(&self.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (allocated, allocation) = oneshot::channel();
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::WorkerAppendAllocatedEpoch {
+                lease_id: self.lease_id.clone(),
+                floor,
+                build,
+                allocated,
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        response.await.map_err(|_| hub_closed_store_error())??;
+        allocation.await.map_err(|_| hub_closed_store_error())
+    }
+
     pub(crate) async fn commit_resolved_route(
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
         alias: Option<&str>,
     ) -> Result<u64, HaiderError> {
+        self.commit_resolved_route_outcome(metadata, alias)
+            .await
+            .map(|epoch| epoch.unwrap_or(metadata.selection_epoch.unwrap_or(0)))
+    }
+
+    /// Preserve the Store's refusal through the actor, including when a
+    /// selection commits between the matching-route read and this request.
+    async fn commit_resolved_route_outcome(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        alias: Option<&str>,
+    ) -> Result<Option<u64>, HaiderError> {
+        #[cfg(test)]
+        let probe = self
+            .hub
+            .inner
+            .resolved_route_probes
+            .lock()
+            .await
+            .get(&self.session_id)
+            .cloned();
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe.attempts.fetch_add(1, Ordering::SeqCst);
+            if probe.pause {
+                probe.reached.notify_one();
+                probe.release.notified().await;
+            }
+        }
         let actor = self
             .hub
             .actor_for(self.session_id.clone())

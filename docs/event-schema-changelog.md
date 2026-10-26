@@ -139,6 +139,27 @@ no-progress detection. This part adds or removes no field or kind;
 - Subagent depth is unbounded by default. The `recursion_depth_limit` tool
   rejection appears only when the operator sets `HAIDER_SUBAGENT_MAX_DEPTH`
   to a positive integer; its `limit` field reports that configured value.
+### v0.0.973 — durable run output pair
+
+Additive, UI-hidden and prompt-omitted extension `run_output_pair_pinned_v1` records
+`provider`, `model`, `max_tokens` and `source` once per run. Headless admission
+pins its spec; native worker pickup pins the selection under the selection
+fence. The equally hidden `run_worker_pickup_v1` marks pickup before provider resolution, so a
+rebind during startup can see the active run. Rebind, recovery and delegated
+children reduce the pin together with later pair-switch and rebind facts.
+The optional `route_snapshot` field retains the complete boundary: rebind id,
+endpoint, account selector, resolved alias/seen state, selection epoch and reset
+epoch. A present snapshot with null selectors records an unselected route;
+a missing snapshot requires historical reconstruction. `provider_route` remains
+the explicit-rebind compatibility projection. These contain no credentials.
+The hidden, prompt-omitted `run_output_route_snapshot_v1` records owned route
+observations even without a rebind id; `run_output_route_resolved_v1` retains
+the older explicit-rebind shape. These update only the run's route. They never
+borrow later session selectors or epochs. Legacy history that cannot prove the
+boundary fails with `StoreCorrupt` and `run-route-history-unavailable` rather
+than borrowing the current session. Later turns resolve their own selections.
+These remain existing Extension items with additive JSON fields, decodable
+by the schema-33 wave base.
 
 ### v0.0.973 — subagent activity on fleet nodes
 
@@ -514,6 +535,11 @@ version from journal replay; an already admitted request retains its captured
 adapter. Legacy metadata omits the additive `provider_base_url` and
 `provider_rebind_id` fields. Raw readers preserve this additive kind without
 changing schema version 1.
+The optional `output_budget` describes the queued next-turn pair after a
+rebind. When a run is active, optional `active_output_budget` records its run
+ID, model, resolved budget source and any clamp against the destination
+provider. The same active record appears in the rebind receipt and RPC
+response. Older readers ignore it; older records decode with the field absent.
 
 ### v0.0.970 — recoverable invalid tool calls
 

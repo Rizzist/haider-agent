@@ -370,6 +370,52 @@ pub(super) async fn run_session_actor(
             // work behind the close barrier. Dropping its reply reports closure.
             continue;
         }
+        // A run-scoped route epoch is allocated here and committed by the
+        // `WorkerAppend` arm below in this same actor turn. Every session
+        // selection epoch is allocated from the same journal head by a
+        // command this loop serializes, so neither side can reuse the other's
+        // epoch (an allocation read outside the actor could).
+        let command = match command {
+            ActorCommand::WorkerAppendAllocatedEpoch {
+                lease_id,
+                floor,
+                build,
+                allocated,
+                completed,
+            } => {
+                let latest = match StoreHandle::latest_seq(&store, &session_id).await {
+                    Ok(latest) => latest,
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                        continue;
+                    }
+                };
+                let Some(epoch) = head.max(latest).max(floor).checked_add(1) else {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "run route epoch exhausted",
+                        false,
+                    )));
+                    continue;
+                };
+                match build(epoch) {
+                    Ok(envelopes) => {
+                        let _ = allocated.send(epoch);
+                        ActorCommand::WorkerAppend {
+                            lease_id,
+                            expected_head: None,
+                            envelopes,
+                            completed,
+                        }
+                    }
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                        continue;
+                    }
+                }
+            }
+            command => command,
+        };
         match command {
             ActorCommand::Append {
                 envelopes,
@@ -1990,6 +2036,14 @@ pub(super) async fn run_session_actor(
                 let result = pipe_sidecar.finish_close().await;
                 let _ = completed.send(result);
                 return;
+            }
+            ActorCommand::WorkerAppendAllocatedEpoch { completed, .. } => {
+                // Converted into `WorkerAppend` before this match.
+                let _ = completed.send(Err(HaiderError::new(
+                    ErrorCode::Internal,
+                    "run route append reached the actor unallocated",
+                    false,
+                )));
             }
             ActorCommand::Stop => break,
         }

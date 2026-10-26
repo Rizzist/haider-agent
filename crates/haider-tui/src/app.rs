@@ -23396,18 +23396,41 @@ impl AppModel {
         provider: &str,
         epoch: Option<u64>,
     ) {
+        self.note_parked_provider_rebound_budget_at(session, provider, epoch, None);
+    }
+
+    pub(crate) fn note_parked_provider_rebound_budget_at(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        epoch: Option<u64>,
+        budget: Option<&haider_protocol::output_budget::SessionOutputBudgetV1>,
+    ) -> bool {
         let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
-            return;
+            return false;
         };
-        if let Some((previous, model)) = entry.meter_epoch.pair.clone()
-            && entry
-                .meter_epoch
-                .admit((provider.to_owned(), model), epoch, None, None)
-        {
-            if previous != provider {
+        let previous = entry.meter_epoch.provider().map(str::to_owned);
+        if entry.meter_epoch.admit_rebound(
+            provider,
+            epoch,
+            budget.map(|budget| budget.max_tokens),
+            budget.map(|budget| {
+                matches!(
+                    budget.source,
+                    haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { .. }
+                )
+            }),
+        ) {
+            if previous
+                .as_deref()
+                .is_some_and(|previous| previous != provider)
+            {
                 entry.reset_account_route(provider, epoch);
             }
             self.dirty = true;
+            true
+        } else {
+            false
         }
     }
 
@@ -23428,12 +23451,7 @@ impl AppModel {
         } else {
             &row.meter_epoch
         };
-        if meter.selection_epoch != epoch
-            || meter
-                .pair
-                .as_ref()
-                .is_none_or(|pair| pair.0 != rebound.provider)
-        {
+        if meter.selection_epoch != epoch || meter.provider() != Some(rebound.provider.as_str()) {
             return;
         }
         // Budget/model epochs can advance without changing route choices.

@@ -62,10 +62,36 @@ pub(crate) struct ValidatedModelSelection {
     /// models` shows.
     pub(crate) max_output_tokens: u64,
     /// Largest explicit (user-set) budget admitted: equal to
-    /// `max_output_tokens` for a sourced row, larger when that maximum is
-    /// only the unverified fallback guess
+    /// `max_output_tokens` for a declared or published maximum, larger when
+    /// that maximum is an unpublished local value
     /// (`haider_provider::explicit_output_ceiling`).
     pub(crate) explicit_max_output_tokens: u64,
+}
+
+/// The provenance of a selected row's output maximum. The daemon's own
+/// projection records it on the detail row (`provider_registry`); a row
+/// without a recognised record (an older or foreign projection) derives it
+/// from the declaration it carries, so a present maximum is treated as a
+/// declaration and stays exact rather than being lifted by value.
+fn output_limit_provenance(
+    provider: &str,
+    model: &str,
+    detail: Option<&haider_rpc::ModelDetailWire>,
+) -> haider_provider::OutputLimitProvenance {
+    use haider_provider::OutputLimitProvenance;
+    use haider_rpc::ModelOutputLimitSourceWire;
+    match detail.and_then(|detail| detail.max_output_tokens_source) {
+        Some(ModelOutputLimitSourceWire::Declared) => OutputLimitProvenance::Declared,
+        Some(ModelOutputLimitSourceWire::Static) => OutputLimitProvenance::Static,
+        Some(ModelOutputLimitSourceWire::Fallback) => OutputLimitProvenance::Fallback,
+        Some(ModelOutputLimitSourceWire::Unknown) | None => {
+            haider_provider::output_limit_provenance(
+                provider,
+                model,
+                detail.and_then(|detail| detail.max_output_tokens),
+            )
+        }
+    }
 }
 
 /// One agent-facing row projected from the same provider summary and model
@@ -536,8 +562,7 @@ impl ModelSelectionAuthority {
             context_window,
         );
         let explicit_max_output_tokens = haider_provider::explicit_output_ceiling(
-            provider,
-            &resolved_model,
+            output_limit_provenance(provider, &resolved_model, detail),
             max_output_tokens,
             context_window,
         );

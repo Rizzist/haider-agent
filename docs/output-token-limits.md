@@ -70,6 +70,94 @@ one; an explicit value above the selected model's explicit ceiling is refused,
 like `session.create`. The automatic provider pair-switch path has no validated
 model row and keeps the stored budget; the provider retry below covers it.
 
+Each run records its pinned provider, model, budget and source in a durable
+`run_output_pair_pinned_v1` fact. Headless runs pin the spec at admission;
+native turns pin the current selection under the selection lock at worker
+pickup. A selection committed while a native turn is still queued therefore
+applies to that turn. Selections after pickup apply to the next turn.
+Same-run headless steer and subturn deliveries retain the original admission
+route; matching the current provider is required only for a new admission.
+The pin retains the complete route: endpoint, account, rebind identity, resolved
+alias and seen state, selection and reset epochs, including an absent explicit
+selector. Absence of a snapshot is reserved for older journals. Recovery
+of an older native run uses its reconstructed started pair, then writes the
+pin under the same lock so later selections cannot replace its pair or route.
+Provider rebind, child inheritance and recovery read this same run record,
+including subsequent automatic pair switches and explicit rebind facts.
+Native pickup currently reduces the whole journal while holding the selection
+lock. The merged wave has no indexed run-pair reader; that optimization is
+deferred to 974.
+
+A restored explicit route carries its own resolved account, seen flag and
+selection epoch for that run. Resolving or rotating it writes a silent
+`run_output_route_resolved_v1` journal fact for explicit rebinds, or
+`run_output_route_snapshot_v1` for routes without a rebind identity. Both carry
+the complete snapshot. It also publishes session-level
+resolved-route metadata when provider, model, endpoint, account, rebind identity
+and selection epoch still match and the reset fence permits the commit.
+Diverged routes remain run-only. The fact uses the branch of the durable run
+pin or legacy accepted run, including fork branches. Releasing the session pin advances
+`route_reset_epoch`; the next turn resolves the current session selection.
+Recovery reads the same run facts, so a running turn cannot inherit the next
+turn's resolved account. Historical reconstruction uses frozen create/fork
+metadata and route/selection facts at the run boundary. A model-shaped request
+alone cannot prove that an old internal account setter was absent. Missing
+account arguments, served aliases, or epochs remain unknown until a complete
+historical witness or a provable rebind reset resolves them. Missing receipts
+and genuinely unavailable route fields fail closed with `StoreCorrupt` and the
+`run-route-history-unavailable` presentation. No current selection supplies
+missing history.
+
+A legacy recovery checkpoint written after a run started cannot move its
+boundary past next-turn selections. Recovery reconstructs that run from its
+original start and records the first complete pin before dispatch. This
+complete checkpoint includes intentional run switches and rebinds already
+applied; later ordinary selections and duplicate pins cannot replace it.
+When an old checkpoint borrowed a later epoch, replay cannot use it to invent a
+rotation of the run's unchanged account. Automatic-switch facts also retain the
+resolved account as an observation; they preserve the run's request-start epoch.
+A later owned account rotation can advance it. An observed default account never
+becomes an explicit selector.
+Legacy automatic-switch facts without a recorded resolved account cannot prove
+the run's observation state. A later complete owned witness or explicit rebind
+may resolve that missing history; otherwise recovery returns the typed error.
+
+Rebind always advances the selection epoch, including when the provider and
+endpoint stay the same but the output budget clamps or restores. Context-meter
+clients therefore invalidate the previous budget with the same epoch rule.
+An explicit child provider selector starts under that provider's own account
+and endpoint and re-applies the budget source, even when the provider and model
+are unchanged. A model-only selection within the inherited provider keeps its
+account and endpoint selectors; omitting a selector preserves the admitted pair, route and budget.
+Delegated-create receipts bind both budget intent and inherited route. Replay
+uses the original admitted budget; exact legacy schemas may add those fields
+only when the original response and parent history prove the same choices.
+An old explicit same-provider child selector can have retained its parent's
+route. An unchanged retry keeps that committed route and budget, even when
+the current selector would clear the route or a catalog edit changes the cap.
+Current receipts and changed provider, model, budget intent or nonempty route
+coordinates remain strict.
+Route choices recorded in the legacy digest take precedence over an old reply
+that omitted route fields. For a pre-route digest, the frozen child response
+takes precedence over the parent's next-turn state; creation-bounded parent
+history supplies choices only when that reply did not record a route. It uses
+the original delegation's run pin and subsequent run changes, bounded by the child's original creation,
+so a next-turn pick cannot supply a running parent's route. Before the durable
+delegation link exists, an implicit route requires a unique running parent;
+queued runs do not supply active inheritance, and ambiguous histories cannot
+upgrade the receipt.
+
+An explicit rebind of a queued headless run has no active-run budget receipt.
+Recovery intentionally applies its pinned budget source to the rebound route
+using the current catalog, just as pickup does; the original headless spec
+and admitted source remain durable. This permits a refreshed model ceiling to
+bound the request without changing the user's requested budget. Active runs
+instead retain the effective budget recorded in the rebind fact.
+For legacy active headless runs without that active-budget record, recovery
+uses the rebind's budget or the historical metadata at that rebind, then
+re-applies the model limit. It never substitutes the old admission budget or
+the next turn's metadata for that owned change.
+
 ## Provider-stated maxima
 
 If a provider rejects a request because `max_tokens` exceeds the model's
