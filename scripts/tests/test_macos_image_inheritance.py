@@ -1,6 +1,8 @@
 """Cleanup exemptions require a handle inherited at CLI entry, on the same vnode."""
+import ast
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -86,8 +89,9 @@ def query(command, **kwargs):
         if case == 'closed-reused':
             st = os.fstat(3)
             assert entry['3'] is None and [st.st_dev, st.st_ino] == entry[str(pin)]
-        rows.append({'native': original.decode(), 'filtered': result.stdout.decode(),
-                     'only_owner_set_removed': result.stdout == original.replace(lost, b'', 1)})
+        rows.append({'native': original.decode(), 'ordered': ordered.decode(),
+                     'filtered': result.stdout.decode(),
+                     'only_owner_set_removed': result.stdout == ordered.replace(lost, b'', 1)})
         return result
     target = os.stat(image)
     def fields(pid, fd):
@@ -119,6 +123,46 @@ finally:
     with open(receipt, 'w') as output:
         json.dump({'entry': entry, 'queries': rows}, output)
 '''
+
+
+class ListingOrderTests(unittest.TestCase):
+    def test_native_replay_preserves_files_in_every_process_order(self):
+        # Exercise the actual child replay without creating 60 native images.
+        query = next(node for node in ast.parse(CHILD).body
+                     if isinstance(node, ast.FunctionDef) and node.name == 'query')
+        program = compile(ast.Module(body=[query], type_ignores=[]), __file__, 'exec')
+        groups = {
+            'parent': b'p100\0\nf100\0tREG\0D10\0i42\0\n',
+            'helper': b'p200\0\nf3\0tREG\0D10\0i42\0\n',
+            'own': b'p300\0\nf4\0tREG\0D10\0i42\0\nf100\0tREG\0D10\0i42\0\n',
+            'other-reader': b'p400\0\nf7\0tREG\0D10\0i42\0\n',
+        }
+        lost = b'p200\0\n'
+        for roles in (('parent', 'helper', 'own'), tuple(groups)):
+            for order in itertools.permutations(roles):
+                original = b''.join(groups[role] for role in order)
+                # The expected replay keeps each group's bytes unchanged and
+                # places the helper's records directly after the parent's.
+                ordered = b''.join(groups[role] + (groups['helper'] if role == 'parent' else b'')
+                                   for role in order if role != 'helper')
+                for listing in ('complete', 'lost-owner'):
+                    with self.subTest(order=order, listing=listing):
+                        rows = []
+                        namespace = {
+                            'os': types.SimpleNamespace(getppid=lambda: 100),
+                            'subprocess': subprocess, 'helper_pid': 200,
+                            'case': 'valid', 'listing': listing, 'rows': rows,
+                            'real': lambda command, **kwargs: subprocess.CompletedProcess(
+                                command, 0, original, b''),
+                        }
+                        exec(program, namespace)
+                        result = namespace['query'](['/usr/sbin/lsof', '-nP', '-F0pfDti'])
+                        expected = ordered if listing == 'complete' else ordered.replace(lost, b'', 1)
+                        self.assertEqual(result.stdout, expected)
+                        self.assertEqual(rows[0]['native'], original.decode())
+                        self.assertEqual(rows[0]['ordered'], ordered.decode())
+                        self.assertEqual(rows[0]['filtered'], expected.decode())
+                        self.assertEqual(rows[0]['only_owner_set_removed'], listing == 'lost-owner')
 
 
 class ImageFixture:
@@ -396,6 +440,11 @@ class NativeInheritedHandleTests(ImageFixture, unittest.TestCase):
                             result, observed = self.run_action(action, case, listing, helper_pid)
                             self.assertTrue(observed['queries'])
                             for query in observed['queries']:
+                                expected_reply = query['ordered']
+                                if listing == 'lost-owner':
+                                    expected_reply = expected_reply.replace('p%d\0\n' % helper_pid, '', 1)
+                                self.assertTrue(query['filtered'] == expected_reply,
+                                                'native replay changed file records')
                                 self.assertEqual(query['only_owner_set_removed'], listing == 'lost-owner')
                             if case == 'closed-reused':
                                 self.assertIsNone(observed['entry']['3'])
