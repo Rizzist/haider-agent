@@ -157,6 +157,7 @@ fn shell_and_file_monitor_overlays_use_the_session_home_snapshot() {
         id: "context-shell".into(),
         kind: haider_rpc::ShellKindWire::Local,
         status: haider_rpc::ShellStatusWire::Running,
+        setup_error: None,
         title: "tests".into(),
         cwd_or_host: "C:/Users/alice/project".into(),
         created_at_ms: 1,

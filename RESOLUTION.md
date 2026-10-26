@@ -15,6 +15,11 @@ plain/TUI path parity, the glob branch scanner, and SSH panel clearing are
 preserved. Both histories are retained with a merge commit. No previous
 candidate build or test receipt is reused for this integration.
 
+The first local all-target Clippy check found that the lane's display-context
+shell fixture omitted the wave's optional `setup_error` field. The fixture now
+sets it to `None`, matching the other running-shell fixtures. Validation is
+repeated on the repaired candidate.
+
 ## ci-winpath integration on 2026-10-24
 
 Integrates wave `6fa2a72d4199b798834cee2d72c5fd2767a6373b` into
