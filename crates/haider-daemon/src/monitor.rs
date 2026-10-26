@@ -2378,6 +2378,8 @@ impl MonitorService {
     ) -> Result<HashSet<String>, haider_protocol::error::HaiderError> {
         let session = &target.session_id;
         let mut owned = target.monitors.iter().cloned().collect::<HashSet<_>>();
+        let mut tool_monitors = HashSet::new();
+        let mut registrations = HashMap::new();
         let mut cursor = 0;
         loop {
             let page = hub
@@ -2393,15 +2395,50 @@ impl MonitorService {
             }
             cursor = page.last().map_or(cursor, |e| e.seq);
             for event in page {
-                if event
+                let captured_run = event
                     .run_id
                     .as_ref()
-                    .is_some_and(|run| target.runs.contains(run))
-                    && let Some(MonitorJournalEvent::MonitorRegistered { registration }) =
-                        MonitorJournalEvent::from_value(&event.payload)
+                    .is_some_and(|run| target.runs.contains(run));
+                // Older tool registrations omitted the owner coordinate.
+                // Their deterministic watch ID still binds them to the exact
+                // tool call, including calls inside tool_script. Never infer
+                // ownership from the current run, agent, or session alone.
+                if captured_run
+                    && let Ok(haider_protocol::EventPayload::Item(
+                        haider_protocol::item::ItemEvent::Started {
+                            item: haider_protocol::item::TurnItem::ToolCall { call_id, .. },
+                            ..
+                        },
+                    )) = event.payload.decode_event()
+                    && let Some(run) = event.run_id.as_ref()
                 {
-                    owned.insert(registration.monitor_id);
+                    let operation = monitor_tool_operation_id(session, run, &call_id);
+                    tool_monitors.insert(format!("monitor-{}", &operation[..20]));
                 }
+                if let Some(MonitorJournalEvent::MonitorRegistered { registration }) =
+                    MonitorJournalEvent::from_value(&event.payload)
+                {
+                    let owner = event.run_id.as_ref().map(RunId::as_str).or_else(|| {
+                        event
+                            .payload
+                            .get("monitor_owner_run_id")
+                            .and_then(serde_json::Value::as_str)
+                    });
+                    // Updates retain the watch ID. Only its first durable
+                    // registration establishes ownership; a later updater
+                    // cannot transfer an independent watch to this stop.
+                    registrations.entry(registration.monitor_id).or_insert((
+                        owner.is_some_and(|owner| {
+                            target.runs.iter().any(|run| run.as_str() == owner)
+                        }),
+                        owner.is_none(),
+                    ));
+                }
+            }
+        }
+        for (id, (captured_run, legacy)) in registrations {
+            if captured_run || (legacy && tool_monitors.contains(&id)) {
+                owned.insert(id);
             }
         }
         Ok(owned)
@@ -4365,12 +4402,11 @@ impl MonitorService {
             message: format!("cannot encode monitor tool request: {error}"),
         })?;
         let request_digest = blake3::hash(&request_bytes).to_hex().to_string();
-        let operation_id = stable_digest(&[
-            store.session_id().as_str(),
-            coordinates.run_id.as_str(),
+        let operation_id = monitor_tool_operation_id(
+            store.session_id(),
+            &coordinates.run_id,
             &coordinates.call_id,
-            "monitor-tool",
-        ]);
+        );
         match request {
             MonitorRequest::Register {
                 source,
@@ -4522,6 +4558,10 @@ impl MonitorService {
                         result: result.clone(),
                     },
                 };
+                // Keep private journal facts outside the worker run-envelope
+                // vocabulary. Older readers ignore this additive coordinate.
+                let mut registration_value = fact.to_value().map_err(monitor_tool_error)?;
+                registration_value["monitor_owner_run_id"] = json!(coordinates.run_id);
                 let mut envelopes = [
                     monitor_envelope(
                         store.session_id(),
@@ -4531,7 +4571,7 @@ impl MonitorService {
                         &format!("monitor-registered-{}", &operation_id[..24]),
                         coordinates.device_id.clone(),
                         store.worker_generation(),
-                        fact.to_value().map_err(monitor_tool_error)?,
+                        registration_value,
                     ),
                     monitor_envelope(
                         store.session_id(),
@@ -8222,6 +8262,10 @@ fn monitor_tool_error(error: MonitorError) -> ToolError {
     }
 }
 
+fn monitor_tool_operation_id(session: &SessionId, run: &RunId, call: &str) -> String {
+    stable_digest(&[session.as_str(), run.as_str(), call, "monitor-tool"])
+}
+
 fn stable_digest(parts: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in parts {
@@ -8452,3 +8496,7 @@ mod completion_tests;
 #[cfg(test)]
 #[path = "monitor_tests.rs"]
 mod monitor_tests;
+
+#[cfg(test)]
+#[path = "stop_watch_ownership_tests.rs"]
+mod stop_watch_ownership_tests;

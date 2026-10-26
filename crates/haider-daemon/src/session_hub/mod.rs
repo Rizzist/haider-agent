@@ -93,6 +93,10 @@ mod session_hub_private_tests;
 #[path = "../stop_successor_tests.rs"]
 mod stop_successor_tests;
 
+#[cfg(all(test, unix))]
+#[path = "../stop_descendant_tests.rs"]
+mod stop_descendant_tests;
+
 #[cfg(test)]
 #[path = "../session_hub_ssh_tests.rs"]
 mod session_hub_ssh_tests;

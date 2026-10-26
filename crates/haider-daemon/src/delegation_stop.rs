@@ -348,6 +348,9 @@ impl DelegationHandle {
                         // The delegation's original run is a stable child of
                         // an already claimed run. Do not capture later message
                         // runs that arrived before this walk discovered it.
+                        // Watch ownership is recovered from original tool
+                        // registrations under admission when installing the
+                        // fence below, including already expired watches.
                         claimed.push(StopIncarnation {
                             session_id: record.child_session_id.clone(),
                             runs: vec![record.child_run_id.clone()],

@@ -97,6 +97,13 @@ changes are additive; `schema_version` remains 1.
   subagent's runs is refused (tool result status `subagent_stopping`) and its
   monitor wakes are dismissed; a final monitor drain runs after the cancelled
   runs settle.
+  Tool registrations retain their original task in additive
+  `monitor_owner_run_id` fact metadata. Older readers ignore this field.
+  Stops recover older tool registrations through their
+  deterministic tool-call identity, including helpers discovered during
+  settlement and expired sources with pending reports. Updates retain the
+  original ownership; independent client and later-task watches remain
+  separate. This changes no journal tag or schema version.
 - `agent.cancel` now stops only the named subagent (its original run, any
   later live run, and its own monitors). Its children keep running; this
   replaces the former recursive descendant sweep.
