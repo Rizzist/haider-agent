@@ -541,6 +541,8 @@ async fn catalog_derived_session_selection_keeps_its_original_incarnation() {
         vec![profile.clone()],
     );
     haider_protocol::session::SessionProviderRebound {
+        output_budget: None,
+        active_output_budget: None,
         rebind_id: "synthetic-rebind".into(),
         provider: profile.provider.clone(),
         base_url: None,

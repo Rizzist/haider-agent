@@ -17,6 +17,7 @@ struct Selection {
     before: SessionMetadataV1,
     after: SessionMetadataV1,
     command: SessionSelectModelCommand,
+    previous_command: SessionSelectModelCommand,
 }
 
 fn selection(before: Option<&str>, after: Option<&str>, settings: bool) -> Selection {
@@ -70,6 +71,16 @@ fn selection(before: Option<&str>, after: Option<&str>, settings: bool) -> Selec
         event_id: EventId::new("c6-selected"),
         device_id: DeviceId::new("test"),
     };
+    let mut previous_command = command.clone();
+    previous_command.command_id = "c6-previous".into();
+    previous_command.request_digest = "c6-previous".into();
+    previous_command.event_id = EventId::new("c6-previous");
+    previous_command
+        .model_catalog_key
+        .clone_from(&before.model_catalog_key);
+    store
+        .select_session_model(&previous_command)
+        .expect("previous selection");
     store.select_session_model(&command).expect("select");
     let after = store
         .session_metadata(&session)
@@ -82,6 +93,7 @@ fn selection(before: Option<&str>, after: Option<&str>, settings: bool) -> Selec
         before,
         after,
         command,
+        previous_command,
     }
 }
 
@@ -121,12 +133,34 @@ fn c6_owner_replaced_and_durable_old_command_replay_cannot_erase_new_label() {
         false,
     );
     let (mut model, mut driver) = current(&f);
-    let replay = f.store.select_session_model(&f.command).expect("replay");
-    assert!(matches!(
-        replay,
-        SessionSelectModelOutcome::IdempotentReplay { .. }
-    ));
-    old_selection(&f, &mut model, &mut driver);
+    let Selection {
+        _root: root,
+        store,
+        session,
+        before,
+        mut previous_command,
+        ..
+    } = f;
+    drop(store);
+    let reopened = Store::open(root.path()).expect("reopen");
+    previous_command.worker_generation = reopened.worker_generation();
+    let SessionSelectModelOutcome::IdempotentReplay { selected } = reopened
+        .select_session_model(&previous_command)
+        .expect("replay previous owner command")
+    else {
+        panic!("the durable old command must replay");
+    };
+    assert_eq!(selected.model_catalog_key, before.model_catalog_key);
+    assert_eq!(Some(selected.selected_seq), before.selection_epoch);
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(
+            &session,
+            selected.selected_seq,
+            selected.model_catalog_key.as_deref(),
+        ),
+    );
     assert_eq!(model.display_identity().model_short, "shared-model");
 }
 

@@ -2607,3 +2607,75 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
         "run-scoped epoch allocation failures: {failures:#?}"
     );
 }
+
+/// The prepared target is already owned by this run before Core publishes its
+/// completion fact. Recovery must retain its catalog key and target budget while
+/// leaving an ordinary next-turn selection alone.
+#[tokio::test]
+async fn c5_prepared_automatic_target_retains_owner_and_budget_before_completion() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), crate::SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("prepared-catalog-target");
+    let run = RunId::new("prepared-catalog-run");
+    create_rebind_test_session(&hub, &session).await;
+    admit_catalog_headless_fixture(&hub, &session, &run, &rebound_recovery_headless_spec()).await;
+    let selection = |id: &str, model: &str, owner: &str| haider_store::SessionSelectModelCommand {
+        command_id: id.into(),
+        request_digest: id.into(),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "fake".into(),
+        model: model.into(),
+        model_catalog_key: Some(owner.into()),
+        expected_pair: None,
+        automatic_run: None,
+        account_alias: None,
+        output_budget: None,
+        event_id: EventId::new(id),
+        device_id: DeviceId::new("prepared-test"),
+    };
+    hub.select_session_model(selection(
+        "pending-choice",
+        "pending-model",
+        "pending-owner",
+    ))
+    .await
+    .expect("next-turn choice");
+    let mut prepared = selection("prepared-choice", "target-model", "target-owner");
+    prepared.expected_pair = Some(("fake".into(), "initial-model".into()));
+    prepared.automatic_run = Some(haider_store::AutomaticRunSelection {
+        run_id: run.clone(),
+        branch_id: None,
+        rebind_seq: 0,
+        resolved_alias: "target-account".into(),
+        selection_epoch: Some(0),
+    });
+    prepared.output_budget = Some(
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { requested: 333 }
+            .apply(1000, 1000),
+    );
+    hub.select_session_model(prepared)
+        .await
+        .expect("prepared target");
+    let pair = hub
+        .run_output_pair(&session, &run)
+        .await
+        .expect("pair")
+        .expect("admitted run");
+    assert_eq!(pair.model, "target-model");
+    assert_eq!(pair.model_catalog_key.as_deref(), Some("target-owner"));
+    assert_eq!(pair.max_tokens, 333);
+    let next = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata")
+        .expect("session");
+    assert_eq!(next.model, "pending-model");
+    assert_eq!(next.model_catalog_key.as_deref(), Some("pending-owner"));
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
+}

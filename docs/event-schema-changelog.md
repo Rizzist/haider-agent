@@ -912,3 +912,7 @@ records `resolved_model` and `model_catalog_key` alongside the admitted model.
 Recovery keeps these with the run's route and budget, independently of a pending
 next-turn selection. Both fields are additive and omitted when absent; older
 schema-33 readers continue to decode the enclosing extension and session data.
+The automatic selection fact also carries an optional `automatic_output_budget`
+when its target has an effective budget. Run recovery consumes it at the prepared
+switch boundary, before the later Core completion fact, under the same route
+ownership fence. Older readers ignore the additive key.

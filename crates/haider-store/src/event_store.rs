@@ -10388,6 +10388,9 @@ impl Store {
             selected_payload["automatic_rebind_seq"] = automatic.rebind_seq.into();
             selected_payload["automatic_resolved_alias"] = automatic.resolved_alias.clone().into();
             selected_payload["automatic_only"] = (!publish_selection).into();
+            if let Some(budget) = command.output_budget {
+                selected_payload["automatic_output_budget"] = serde_json::json!(budget);
+            }
         }
         let mut envelopes = vec![unstamped_raw_command_envelope(
             command.event_id.clone(),

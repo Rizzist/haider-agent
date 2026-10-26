@@ -1600,6 +1600,8 @@ fn provider_rebound_retires_owned_selection_without_erasing_explicit_configurati
         );
         assert_eq!(model.identity.model_short, "my-deployment");
         model.apply_session_provider_rebound(&haider_protocol::session::SessionProviderRebound {
+            output_budget: None,
+            active_output_budget: None,
             rebind_id: format!("synthetic-{route}"),
             provider: if route == "provider" {
                 "other-custom"

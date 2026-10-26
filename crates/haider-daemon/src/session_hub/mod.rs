@@ -993,6 +993,7 @@ enum RunOutputPairChange {
         rebind_seq: Option<u64>,
         resolved_alias: Option<String>,
         model_catalog_key: Option<String>,
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     },
     LegacyCheckpoint {
         run_id: RunId,
@@ -6955,6 +6956,7 @@ impl SessionHub {
                         RunOutputPairChange::SwitchPrepared {
                             run_id: run_id.clone(),
                             model_catalog_key: selected.model_catalog_key,
+                            output_budget: None,
                             provider: selected.provider,
                             model: selected.model,
                             rebind_seq: None,
@@ -6975,6 +6977,19 @@ impl SessionHub {
                         RunOutputPairChange::SwitchPrepared {
                             run_id: run_id.clone(),
                             model_catalog_key: selected.model_catalog_key,
+                            output_budget: event
+                                .payload
+                                .get("automatic_output_budget")
+                                .cloned()
+                                .map(serde_json::from_value)
+                                .transpose()
+                                .map_err(|error| {
+                                    HaiderError::new(
+                                        ErrorCode::StoreCorrupt,
+                                        format!("invalid prepared output budget: {error}"),
+                                        false,
+                                    )
+                                })?,
                             provider: selected.provider,
                             model: selected.model,
                             rebind_seq: Some(rebind_seq),
@@ -7287,6 +7302,7 @@ impl SessionHub {
                     rebind_seq,
                     resolved_alias,
                     model_catalog_key,
+                    output_budget,
                 } => {
                     let rebind_seq = rebind_seq.unwrap_or(latest_rebind_seq);
                     // Installing the target and its served-account witness is
@@ -7305,6 +7321,10 @@ impl SessionHub {
                         pair.model.clone_from(&model);
                         pair.resolved_model = None;
                         pair.model_catalog_key = model_catalog_key;
+                        if let Some(budget) = output_budget {
+                            pair.max_tokens = budget.max_tokens;
+                            pair.source = Some(budget.source);
+                        }
                         pair.route_snapshot
                             .record_switch_observation(resolved_alias);
                     }
