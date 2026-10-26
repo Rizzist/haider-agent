@@ -3713,10 +3713,11 @@ fn ssh_timeout(timeout_s: Option<u32>) -> Result<Option<Duration>, crate::ssh::S
 /// value is an exact user-set override, and an override above the row's
 /// explicit ceiling is a typed refusal rather than a silent clamp — the user
 /// asked for that exact value in this request. The explicit ceiling equals the
-/// row maximum when that maximum is sourced; when it is only the unverified
-/// fallback guess, explicit values up to `MAX_OUTPUT_LIMIT` (strictly below a
-/// known context window) are admitted and the provider-stated one-shot retry
-/// is the backstop.
+/// row maximum when that maximum is declared by the catalog or published by
+/// the provider; when it is an unpublished local value (the unverified
+/// fallback, or a conservative default beside a published window), explicit
+/// values up to `MAX_OUTPUT_LIMIT` (strictly below a known context window) are
+/// admitted and the provider-stated one-shot retry is the backstop.
 pub(super) fn resolve_session_output_limit(
     requested: u64,
     selection: &crate::model_select::ValidatedModelSelection,
@@ -10605,6 +10606,7 @@ impl HubConnection {
         summaries: &mut Vec<ProviderSummaryWire>,
         provider: &str,
         model: &str,
+        session_id: Option<&SessionId>,
     ) -> Result<(), InventoryRefreshError> {
         let cached_serves_model = summaries
             .iter()
@@ -10626,6 +10628,12 @@ impl HubConnection {
         if !needs_refresh {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(session_id) = session_id {
+            self.hub.pause_selection_network(session_id).await;
+        }
+        #[cfg(not(test))]
+        let _ = session_id;
         let facade = self
             .hub
             .accounts()
@@ -12207,47 +12215,92 @@ impl HubConnection {
             Err(error) => return Err(error),
         }
 
-        let Some(current) = (match self.hub.session_metadata(&session_id).await {
-            Ok(metadata) => metadata,
-            Err(error) => return self.respond_turn_error(request_id, error),
-        }) else {
-            return self.respond_error(
-                request_id,
-                ERROR_CODE_NOT_FOUND,
-                "model selection requires a live session with typed metadata",
-                false,
-                None,
-            );
-        };
-        let (mut summaries, descriptors) = self
-            .hub
-            .accounts()?
-            .and_then(|facade| facade.management.read())
-            .map_or_else(
-                || (Vec::new(), Vec::new()),
-                |view| (view.providers, view.descriptors),
-            );
-        let selected_provider = provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|provider| !provider.is_empty())
-            .unwrap_or(&current.provider);
-        match self
-            .refresh_inventory_if_needed(&mut summaries, selected_provider, model.trim())
-            .await
-        {
-            Ok(()) => {}
-            Err(InventoryRefreshError::Hub(error)) => return Err(error),
-            Err(InventoryRefreshError::Provider(error)) => {
+        // Inventory refresh can perform network I/O. Read a speculative pair,
+        // fetch outside the per-session lock, then validate the same pair
+        // under the lock through the durable commit. If another writer moved
+        // it while fetching, discard the snapshot and retry.
+        let (_selection, current, summaries, descriptors) = loop {
+            let Some(before) = (match self.hub.session_metadata(&session_id).await {
+                Ok(metadata) => metadata,
+                Err(error) => return self.respond_turn_error(request_id, error),
+            }) else {
                 return self.respond_error(
                     request_id,
-                    &error.code,
-                    &error.message,
-                    error.retryable,
-                    error.data,
+                    ERROR_CODE_NOT_FOUND,
+                    "model selection requires a live session with typed metadata",
+                    false,
+                    None,
                 );
+            };
+            let (mut summaries, descriptors) = self
+                .hub
+                .accounts()?
+                .and_then(|facade| facade.management.read())
+                .map_or_else(
+                    || (Vec::new(), Vec::new()),
+                    |view| (view.providers, view.descriptors),
+                );
+            let selected_provider = provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider| !provider.is_empty())
+                .unwrap_or(&before.provider);
+            let refresh = self
+                .refresh_inventory_if_needed(
+                    &mut summaries,
+                    selected_provider,
+                    model.trim(),
+                    Some(&session_id),
+                )
+                .await;
+            let selection = self.hub.lock_workflow_selection(&session_id).await;
+            let Some(current) = (match self.hub.session_metadata(&session_id).await {
+                Ok(metadata) => metadata,
+                Err(error) => return self.respond_turn_error(request_id, error),
+            }) else {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_NOT_FOUND,
+                    "model selection requires a live session with typed metadata",
+                    false,
+                    None,
+                );
+            };
+            if (
+                before.provider.as_str(),
+                before.model.as_str(),
+                before.max_tokens,
+                before.max_tokens_source,
+                before.provider_base_url.as_deref(),
+                before.provider_rebind_id.as_deref(),
+                before.account_alias.as_deref(),
+            ) != (
+                current.provider.as_str(),
+                current.model.as_str(),
+                current.max_tokens,
+                current.max_tokens_source,
+                current.provider_base_url.as_deref(),
+                current.provider_rebind_id.as_deref(),
+                current.account_alias.as_deref(),
+            ) {
+                drop(selection);
+                continue;
             }
-        }
+            match refresh {
+                Ok(()) => {}
+                Err(InventoryRefreshError::Hub(error)) => return Err(error),
+                Err(InventoryRefreshError::Provider(error)) => {
+                    return self.respond_error(
+                        request_id,
+                        &error.code,
+                        &error.message,
+                        error.retryable,
+                        error.data,
+                    );
+                }
+            }
+            break (selection, current, summaries, descriptors);
+        };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             summaries,
@@ -12279,6 +12332,10 @@ impl HubConnection {
             },
             None => reapply_session_output_budget(&current, &validated),
         };
+        #[cfg(test)]
+        self.hub
+            .pause_model_selection_after_budget(&session_id)
+            .await;
         if matches!(
             validated.inventory_status,
             haider_rpc::ModelInventoryStatusWire::Unlisted
@@ -12365,6 +12422,7 @@ impl HubConnection {
             provider: resolved_provider,
             model: resolved_model,
             expected_pair: None,
+            automatic_run: None,
             // A model or output-budget choice never selects an account. The
             // descriptor above is only for cache preflight; passing it to the
             // store would turn an unpinned session into a durable pin.
@@ -16885,15 +16943,11 @@ impl HubConnection {
                 None,
             );
         }
-        if model.trim().is_empty() || max_tokens > haider_provider::MAX_OUTPUT_LIMIT {
+        if model.trim().is_empty() {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                &format!(
-                    "session model must be non-empty and max_tokens must be in 0..={} \
-                     (0 derives the model default)",
-                    haider_provider::MAX_OUTPUT_LIMIT
-                ),
+                "session model must be non-empty",
                 false,
                 None,
             );
@@ -16904,7 +16958,7 @@ impl HubConnection {
             .and_then(|facade| facade.management.read())
             .map_or_else(Vec::new, |view| view.providers);
         match self
-            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim())
+            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim(), None)
             .await
         {
             Ok(()) => {}

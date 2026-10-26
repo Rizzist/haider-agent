@@ -45,6 +45,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             display_name: None,
             context_window: Some(1_000_000),
             max_output_tokens: Some(128_000),
+            max_output_tokens_source: None,
             supported_efforts: ["low", "medium", "high", "xhigh", "max"]
                 .map(str::to_owned)
                 .to_vec(),
@@ -59,6 +60,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             display_name: None,
             context_window: Some(1_000_000),
             max_output_tokens: Some(128_000),
+            max_output_tokens_source: None,
             supported_efforts: ["low", "medium", "high", "xhigh", "max"]
                 .map(str::to_owned)
                 .to_vec(),

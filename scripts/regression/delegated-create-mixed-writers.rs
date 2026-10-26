@@ -97,6 +97,14 @@ fn o17_rebind(
             account: account.map(str::to_owned),
             event_id: EventId::new(format!("o17-rebound-{session}-{n}")),
             device_id: DeviceId::new("test"),
+            #[cfg(not(old_writer))]
+            max_tokens: 4096,
+            #[cfg(not(old_writer))]
+            max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+            #[cfg(not(old_writer))]
+            clamped: None,
+            #[cfg(not(old_writer))]
+            active_output_budget: None,
         })
         .expect("rebind");
 }
@@ -127,7 +135,7 @@ fn pick(
             provider: provider.into(),
             model: model.into(),
             expected_pair: None,
-            #[cfg(not(old_writer))]
+            #[cfg(any(not(old_writer), ce9_writer))]
             account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("mixed-picked-{n}")),
@@ -209,10 +217,43 @@ fn child(root: &std::path::Path, other_child: bool) {
         (meta.provider.as_str(), meta.model.as_str())
     };
     let old = o17_old_body(&cwd, provider, model);
-    assert_eq!(old.as_object().unwrap().len(), 10);
-    store
-        .create_session(&o17_create("mixed-child", &cwd, provider, model, &old))
-        .unwrap();
+    #[cfg(ce9_writer)]
+    let inherited = {
+        let mut inherited = meta.clone();
+        // ce9d0976 clears the parent route for a cross-provider child,
+        // while its explicit same-provider selector retains that route.
+        if other_child {
+            inherited.account_alias = None;
+            inherited.provider_base_url = None;
+            inherited.provider_rebind_id = None;
+        }
+        inherited.provider = provider.to_owned();
+        inherited.model = model.to_owned();
+        inherited
+    };
+    #[cfg(ce9_writer)]
+    let old = o17_new_body(&old, "mixed-parent", &inherited);
+    assert_eq!(
+        old.as_object().unwrap().len(),
+        if cfg!(ce9_writer) { 15 } else { 10 }
+    );
+    let command = o17_create("mixed-child", &cwd, provider, model, &old);
+    #[cfg(ce9_writer)]
+    {
+        let mut command = command;
+        command.max_tokens_source = meta.max_tokens_source;
+        store
+            .create_session_with_workspace_configuration(
+                &command,
+                haider_protocol::session::SessionInteractionModeV1::Interactive,
+                None,
+                None,
+                Some(inherited),
+            )
+            .unwrap();
+    }
+    #[cfg(not(ce9_writer))]
+    store.create_session(&command).unwrap();
     assert_eq!(o17_replay(&store, "mixed-child", &old), Ok(true));
     std::fs::write(root.join("old-body.json"), old.to_string()).unwrap();
     println!(
@@ -227,6 +268,29 @@ fn replay(root: &std::path::Path, other_child: bool) -> bool {
         serde_json::from_str(&std::fs::read_to_string(root.join("old-body.json")).unwrap())
             .unwrap();
     assert_eq!(o17_replay(&store, "mixed-child", &old), Ok(true));
+    #[cfg(not(old_writer))]
+    if old.get("inheritance_parent_session_id").is_some() {
+        let (_, admitted) = store
+            .child_create_admission(
+                "delegation-session-mixed-child",
+                &haider_protocol::ids::SessionId::new("mixed-child"),
+                &haider_protocol::ids::SessionId::new("mixed-parent"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            old["inherited_account_alias"],
+            serde_json::json!(admitted.account_alias)
+        );
+        assert_eq!(
+            old["inherited_provider_base_url"],
+            serde_json::json!(admitted.provider_base_url)
+        );
+        assert_eq!(
+            old["inherited_provider_rebind_id"],
+            serde_json::json!(admitted.provider_rebind_id)
+        );
+    }
     let mut meta = store
         .session_metadata(&haider_protocol::ids::SessionId::new("mixed-parent"))
         .unwrap()
@@ -271,6 +335,32 @@ fn main() {
     let stage = &args[1];
     let root = std::path::PathBuf::from(&args[2]);
     match stage.as_str() {
+        "ce9-pin-seed" => {
+            let root = root.join("explicit-same-provider");
+            std::fs::create_dir_all(root.join("work")).unwrap();
+            let store = haider_store::Store::open(&root).unwrap();
+            let cwd = root.join("work").to_str().unwrap().to_owned();
+            store
+                .create_session(&o17_create(
+                    "mixed-parent",
+                    &cwd,
+                    "bedrock",
+                    "anthropic.claude-opus-5",
+                    &serde_json::json!({"parent":true}),
+                ))
+                .unwrap();
+            o17_rebind(
+                &store,
+                "mixed-parent",
+                1,
+                "bedrock",
+                Some("http://127.0.0.1:9"),
+                Some("bed-b"),
+            );
+        }
+        "ce9-pin-write" => child(&root.join("explicit-same-provider"), false),
+        "ce9-pin-open" => prepare_metadata(&root.join("explicit-same-provider")),
+        "ce9-pin-replay" => assert!(replay(&root.join("explicit-same-provider"), false)),
         "seed" => {
             for (name, pin, rebind, roundtrip, _other, later) in CASES {
                 create_parent(&root.join(name), pin, rebind, roundtrip, later);

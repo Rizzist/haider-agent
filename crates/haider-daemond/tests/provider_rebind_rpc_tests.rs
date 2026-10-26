@@ -5,15 +5,22 @@ mod support;
 
 use haider_accounts::{MemoryVault, Vault as _};
 use haider_daemon::{AccountsDependencies, DaemonConfig, DaemonDependencies, VaultProvision};
+use haider_daemon::{ProviderFactory, ProviderFactoryConfig, ResolvedTurnProvider};
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::HaiderError;
 use haider_protocol::ids::{RunId, SessionId};
+use haider_protocol::output_budget::{OutputBudgetClampV1, SessionOutputBudgetSourceV1};
+use haider_protocol::provider::FinishReason;
+use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::session::{SessionInteractionModeV1, SessionProviderRebound};
 use haider_protocol::state::RunState;
 use haider_protocol::{DeliveryMode, EventPayload};
+use haider_provider::{FakeProvider, FakeStep};
 use haider_rpc::{
     AttachMode, ClientKind, CommandId, ProviderApiFamilyWire, ProviderAuthRequirementWire,
     RequestBody, RequestId, ResponseBody, WireFrame,
 };
+use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -328,6 +335,302 @@ fn dependencies() -> DaemonDependencies {
     }
 }
 
+#[derive(Clone)]
+struct RecordingFactory {
+    providers: HashMap<String, Arc<FakeProvider>>,
+}
+
+#[async_trait::async_trait]
+impl ProviderFactory for RecordingFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        let provider = self
+            .providers
+            .get(&metadata.provider)
+            .expect("recording provider");
+        Ok(ResolvedTurnProvider {
+            provider: provider.clone(),
+            provider_name: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            context_window: None,
+            account_alias: None,
+            account_incarnation: None,
+            active_no_auth: false,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
+            compaction_promotion: None,
+        })
+    }
+}
+
+fn recording_fake() -> Arc<FakeProvider> {
+    let mut steps = Vec::new();
+    for _ in 0..6 {
+        steps.push(FakeStep::EmitText {
+            text: "budget recorded".into(),
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        });
+    }
+    Arc::new(FakeProvider::new(steps))
+}
+
+async fn create_budget_session(
+    client: &mut Client,
+    workspace: &Path,
+    suffix: &str,
+    model: &str,
+    max_tokens: u64,
+) -> (SessionId, u64) {
+    let response = client
+        .request(
+            &format!("create-{suffix}"),
+            RequestBody::SessionCreate {
+                command_id: CommandId::new(format!("create-budget-{suffix}")),
+                cwd: workspace.display().to_string(),
+                provider: PROVIDER.into(),
+                model: model.into(),
+                max_tokens,
+            },
+        )
+        .await;
+    let ResponseBody::SessionCreate { session_id, .. } = response else {
+        panic!("create budget session: {response:?}");
+    };
+    let generation = client.attach(&session_id).await;
+    (session_id, generation)
+}
+
+async fn rebind_budget(
+    client: &mut Client,
+    session: &SessionId,
+    generation: u64,
+    command: &str,
+    provider: &str,
+) -> haider_protocol::output_budget::SessionOutputBudgetV1 {
+    let body = rebind(session, generation, command, provider, None, None);
+    let first = client.request(command, body.clone()).await;
+    let replay = client.request(&format!("{command}-replay"), body).await;
+    assert_eq!(
+        first, replay,
+        "rebind receipt replays its budget and notice"
+    );
+    let ResponseBody::SessionProviderRebind {
+        output_budget: Some(budget),
+        ..
+    } = first
+    else {
+        panic!("rebind budget response: {first:?}");
+    };
+    budget
+}
+
+/// A provider-only pair change must use the destination row's declared or
+/// window bound. The receipt, durable metadata and next physical request
+/// all carry the same re-applied value; moving back restores a user request.
+#[tokio::test]
+async fn provider_rebind_reapplies_output_budget_on_real_socket_and_provider() {
+    let root = test_root("rebind-budget-");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "rebind-budget",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let row = |slug: &str, window: u64, maximum: Option<u64>| haider_provider::DiscoveredModel {
+        slug: slug.into(),
+        display_name: slug.into(),
+        context_window: Some(window),
+        max_output_tokens: maximum,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let rows = [
+        row("rebind-declared-8192", 1_048_576, Some(8_192)),
+        row("rebind-derived-30000", 1_048_576, Some(30_000)),
+        row("rebind-window-200k", 200_000, None),
+    ];
+    let catalog = serde_json::to_string(&rows).expect("catalog");
+    let fetched_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let store = haider_store::Store::open(&config.store_dir).expect("catalog store");
+    store
+        .put_provider_models("haider-code", &catalog, None, fetched_at_ms)
+        .expect("catalog rows");
+    drop(store);
+    // Injected provider factories are creatable without a registry profile,
+    // but a rebind back to one still requires an enabled target profile.
+    // Seed a disposable custom profile; all turns resolve through FakeProvider.
+    std::fs::write(
+        config.store_dir.join("providers.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "providers": [{
+                "provider_id": PROVIDER,
+                "display_name": "Recording fake",
+                "api_family": "openai_chat_completions",
+                "base_url": "http://127.0.0.1:1/v1",
+                "enabled": true,
+                "auth_requirement": "none",
+                "configured_models": [],
+                "default_model": null,
+                "provenance": "custom"
+            }]
+        }))
+        .expect("serialize synthetic provider profile"),
+    )
+    .expect("seed synthetic provider profile");
+    let custom = recording_fake();
+    let code = recording_fake();
+    let mut deps = dependencies();
+    deps.provider_factory = ProviderFactoryConfig::Injected {
+        factory: Arc::new(RecordingFactory {
+            providers: HashMap::from([
+                (PROVIDER.into(), custom.clone()),
+                ("haider-code".into(), code.clone()),
+            ]),
+        }),
+        providers: BTreeSet::from([PROVIDER.into(), "haider-code".into()]),
+    };
+    let task = ready_with_dependencies(&config, deps).await;
+    let mut client = Client::connect(&config).await;
+
+    let (user, generation) =
+        create_budget_session(&mut client, &workspace, "user", &rows[0].slug, 20_000).await;
+    let down = rebind_budget(&mut client, &user, generation, "user-down", "haider-code").await;
+    assert_eq!(down.max_tokens, 8_192);
+    assert_eq!(
+        down.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 20_000 }
+    );
+    assert_eq!(
+        down.clamped,
+        Some(OutputBudgetClampV1 {
+            requested: 20_000,
+            max_output_tokens: 8_192
+        })
+    );
+    let run = client.submit(&user, generation, "user-down-turn").await;
+    client.terminal(&run).await;
+    assert_eq!(
+        code.requests().last().expect("declared request").max_tokens,
+        8_192
+    );
+    let up = rebind_budget(&mut client, &user, generation, "user-up", PROVIDER).await;
+    assert_eq!(up.max_tokens, 20_000);
+    assert_eq!(up.clamped, None);
+    let run = client.submit(&user, generation, "user-up-turn").await;
+    client.terminal(&run).await;
+    assert_eq!(
+        custom
+            .requests()
+            .last()
+            .expect("restored request")
+            .max_tokens,
+        20_000
+    );
+
+    let (derived, generation) =
+        create_budget_session(&mut client, &workspace, "derived", &rows[1].slug, 0).await;
+    let down = rebind_budget(
+        &mut client,
+        &derived,
+        generation,
+        "derived-down",
+        "haider-code",
+    )
+    .await;
+    assert_eq!(down.max_tokens, 30_000);
+    assert_eq!(down.source, SessionOutputBudgetSourceV1::Derived);
+    assert_eq!(down.clamped, None);
+    let run = client
+        .submit(&derived, generation, "derived-down-turn")
+        .await;
+    client.terminal(&run).await;
+    assert_eq!(
+        code.requests().last().expect("derived request").max_tokens,
+        30_000
+    );
+    let up = rebind_budget(&mut client, &derived, generation, "derived-up", PROVIDER).await;
+    assert_eq!(up.max_tokens, 8_192);
+    assert_eq!(up.clamped, None);
+    let run = client.submit(&derived, generation, "derived-up-turn").await;
+    client.terminal(&run).await;
+    assert_eq!(
+        custom
+            .requests()
+            .last()
+            .expect("derived restored request")
+            .max_tokens,
+        8_192
+    );
+
+    let (window, generation) =
+        create_budget_session(&mut client, &workspace, "window", &rows[2].slug, 150_000).await;
+    let bounded = rebind_budget(
+        &mut client,
+        &window,
+        generation,
+        "window-down",
+        "haider-code",
+    )
+    .await;
+    assert_eq!(bounded.max_tokens, 100_000);
+    assert_eq!(
+        bounded.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 150_000 }
+    );
+    assert_eq!(
+        bounded.clamped,
+        Some(OutputBudgetClampV1 {
+            requested: 150_000,
+            max_output_tokens: 100_000
+        })
+    );
+    let run = client.submit(&window, generation, "window-turn").await;
+    client.terminal(&run).await;
+    assert_eq!(
+        code.requests().last().expect("window request").max_tokens,
+        100_000
+    );
+
+    drop(client);
+    task.shutdown_handle().request("budget test complete");
+    task.join().await.expect("daemon joins");
+    let stored = haider_store::Store::open(&config.store_dir).expect("reopen store");
+    for (session, expected, source) in [
+        (
+            user,
+            20_000,
+            SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+        ),
+        (derived, 8_192, SessionOutputBudgetSourceV1::Derived),
+        (
+            window,
+            100_000,
+            SessionOutputBudgetSourceV1::UserSet { requested: 150_000 },
+        ),
+    ] {
+        let metadata = stored
+            .session_metadata(&session)
+            .expect("metadata")
+            .expect("typed");
+        assert_eq!(metadata.max_tokens, expected);
+        assert_eq!(metadata.max_tokens_source, Some(source));
+    }
+}
+
 fn rebind(
     session: &SessionId,
     generation: u64,
@@ -636,7 +939,7 @@ async fn provider_rebind_routes_next_request_preserves_inflight_and_replays() {
         response, repeated,
         "lost-response retry returns the original receipt"
     );
-    let selected_seq = match response {
+    let (selected_seq, active_response) = match response {
         ResponseBody::SessionProviderRebind {
             session_id,
             provider,
@@ -644,13 +947,18 @@ async fn provider_rebind_routes_next_request_preserves_inflight_and_replays() {
             account,
             selected_seq,
             worker_generation,
+            output_budget: _,
+            active_output_budget,
         } => {
             assert_eq!(session_id, session);
             assert_eq!(provider, PROVIDER);
             assert_eq!(base_url.as_deref(), Some(b.origin.as_str()));
             assert!(account.is_none());
             assert_eq!(worker_generation, generation);
-            selected_seq
+            (
+                selected_seq,
+                active_output_budget.expect("socket response has computed active budget"),
+            )
         }
         other => panic!("rebind: {other:?}"),
     };
@@ -739,6 +1047,18 @@ async fn provider_rebind_routes_next_request_preserves_inflight_and_replays() {
     )
     .expect("typed rebind fact");
     assert_eq!(fact.base_url.as_deref(), Some(b.origin.as_str()));
+    let active_fact = fact
+        .active_output_budget
+        .expect("socket fact has computed active budget");
+    assert_eq!(active_fact, active_response);
+    assert_eq!(active_fact.run_id, run);
+    assert_eq!(active_fact.model, MODEL);
+    assert_eq!(active_fact.budget.max_tokens, 4096);
+    assert_eq!(
+        active_fact.budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 4096 }
+    );
+    assert_eq!(active_fact.budget.clamped, None);
     drop(client);
     task.shutdown_handle().request("rebind replay test restart");
     task.join().await.expect("first daemon stops");

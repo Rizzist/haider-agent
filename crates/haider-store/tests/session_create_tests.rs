@@ -166,6 +166,7 @@ fn resolved_account_route_advances_only_the_served_sessions_epoch() {
         provider: "fake".into(),
         model: "fake-v2".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: None,
         event_id: EventId::new("selected-after-route"),
