@@ -1311,12 +1311,18 @@ fn model_detail_wire(
         model.max_output_tokens,
         context_window,
     );
+    // Provenance travels with the value: selection must never reconstruct it
+    // by comparing the projected number with the local fallback.
+    let max_output_tokens_source = output_limit_source_wire(
+        haider_provider::output_limit_provenance(provider, &model.slug, model.max_output_tokens),
+    );
     ModelDetailWire {
         source: Some(source),
         name: model.slug.clone(),
         display_name: Some(model.display_name),
         context_window,
         max_output_tokens: Some(max_output_tokens),
+        max_output_tokens_source: Some(max_output_tokens_source),
         supported_efforts,
         default_effort,
         supported_speeds,
@@ -1338,6 +1344,23 @@ fn model_detail_wire(
                 .map(|extensions| extensions.supports_vision),
         )
         .map(|resolve| resolve != haider_protocol::provider::FeatureResolve::Unsupported),
+    }
+}
+
+/// Wire spelling of one output-maximum provenance.
+pub(crate) fn output_limit_source_wire(
+    provenance: haider_provider::OutputLimitProvenance,
+) -> haider_rpc::ModelOutputLimitSourceWire {
+    match provenance {
+        haider_provider::OutputLimitProvenance::Declared => {
+            haider_rpc::ModelOutputLimitSourceWire::Declared
+        }
+        haider_provider::OutputLimitProvenance::Static => {
+            haider_rpc::ModelOutputLimitSourceWire::Static
+        }
+        haider_provider::OutputLimitProvenance::Fallback => {
+            haider_rpc::ModelOutputLimitSourceWire::Fallback
+        }
     }
 }
 
