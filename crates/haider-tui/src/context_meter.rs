@@ -86,6 +86,8 @@ pub enum SnapshotEpoch {
 pub struct MeterEpoch {
     /// The session's committed `(provider, model)`; `None` until known.
     pub pair: Option<(String, String)>,
+    /// A rebound can identify its provider before model metadata arrives.
+    rebound_provider: Option<String>,
     /// Daemon-committed selection sequence. `None` denotes an older daemon
     /// or a session whose own selection has not arrived yet.
     pub selection_epoch: Option<u64>,
@@ -109,18 +111,75 @@ impl MeterEpoch {
         output_budget: Option<u64>,
         user_budget: Option<bool>,
     ) -> bool {
+        self.admit_selection(
+            Some(pair),
+            None,
+            selection_epoch,
+            output_budget,
+            user_budget,
+        )
+    }
+
+    /// Retain a rebound's budget and ordering even before its model is known.
+    /// Its provider constrains later metadata without fabricating a model.
+    pub fn admit_rebound(
+        &mut self,
+        provider: &str,
+        selection_epoch: Option<u64>,
+        output_budget: Option<u64>,
+        user_budget: Option<bool>,
+    ) -> bool {
+        let pair = self
+            .pair
+            .as_ref()
+            .map(|(_, model)| (provider.to_owned(), model.clone()));
+        self.admit_selection(
+            pair,
+            Some(provider),
+            selection_epoch,
+            output_budget,
+            user_budget,
+        )
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        self.pair
+            .as_ref()
+            .map(|pair| pair.0.as_str())
+            .or(self.rebound_provider.as_deref())
+    }
+
+    fn admit_selection(
+        &mut self,
+        pair: Option<(String, String)>,
+        rebound_provider: Option<&str>,
+        selection_epoch: Option<u64>,
+        output_budget: Option<u64>,
+        user_budget: Option<bool>,
+    ) -> bool {
         // Older daemons omit the epoch from metadata. It can confirm the
         // budget for an already known pair, but cannot claim a new selection
         // or make an epochless footprint current.
         let selection_epoch = selection_epoch.or_else(|| {
-            (self.pair.as_ref() == Some(&pair))
+            (pair.is_some() && self.pair == pair)
                 .then_some(self.selection_epoch)
                 .flatten()
         });
         match (self.selection_epoch, selection_epoch) {
             (Some(current), Some(incoming)) if incoming < current => return false,
             (Some(current), Some(incoming)) if incoming == current => {
-                if self.pair.as_ref().is_some_and(|held| held != &pair) {
+                if self
+                    .pair
+                    .as_ref()
+                    .is_some_and(|held| pair.as_ref() != Some(held))
+                    || self.provider().is_some_and(|held| {
+                        pair.as_ref()
+                            .map(|pair| pair.0.as_str())
+                            .or(rebound_provider)
+                            != Some(held)
+                    })
+                {
                     return false;
                 }
                 if !self.reserve_assumed
@@ -144,7 +203,8 @@ impl MeterEpoch {
                 self.reserve_assumed = output_budget.is_none();
             }
         }
-        self.pair = Some(pair);
+        self.pair = pair;
+        self.rebound_provider = rebound_provider.map(str::to_owned);
         self.selection_epoch = selection_epoch;
         if let Some(budget) = output_budget {
             self.output_budget = Some(budget);

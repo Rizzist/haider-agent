@@ -407,6 +407,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
             display_name: Some("ZAI Flash X".into()),
             context_window: Some(128_000),
             max_output_tokens: Some(32_768),
+            max_output_tokens_source: None,
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: vec!["fast".into()],
@@ -419,6 +420,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
             display_name: None,
             context_window: None,
             max_output_tokens: Some(8_192),
+            max_output_tokens_source: None,
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: Vec::new(),
@@ -910,6 +912,7 @@ fn static_subscription_row_is_selectable_after_catalog_403() {
         display_name: None,
         context_window: Some(1_000_000),
         max_output_tokens: None,
+        max_output_tokens_source: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),
@@ -989,6 +992,7 @@ fn permanent_ids_do_not_inherit_their_remote_default_settings_as_unowned_configu
         account_incarnation: Some(1),
     });
     profile.model_details = vec![ModelDetailWire {
+        max_output_tokens_source: None,
         source: Some(haider_rpc::ModelDetailSourceWire::Remote),
         name: "my-deployment".into(),
         display_name: None,
@@ -1066,6 +1070,7 @@ fn selection_scope_follows_the_session_route_instead_of_borrowing_the_active_acc
             .models
             .iter()
             .map(|name| ModelDetailWire {
+                max_output_tokens_source: None,
                 source: Some(haider_rpc::ModelDetailSourceWire::Remote),
                 name: name.clone(),
                 display_name: Some("A's private label".into()),
@@ -1232,6 +1237,7 @@ fn c5_profile(model: &str) -> ProviderSummaryWire {
         account_incarnation: Some(1),
     });
     profile.model_details = vec![ModelDetailWire {
+        max_output_tokens_source: None,
         name: model.into(),
         source: Some(haider_rpc::ModelDetailSourceWire::Remote),
         context_window: Some(32_000),

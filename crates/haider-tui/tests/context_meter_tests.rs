@@ -67,6 +67,7 @@ fn summary(
                 display_name: None,
                 context_window: *window,
                 max_output_tokens: None,
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -969,6 +970,7 @@ fn a_background_model_change_binds_the_parked_session() {
 
 fn detail(slug: &str, window: u64, max_output: u64) -> haider_rpc::ModelDetailWire {
     haider_rpc::ModelDetailWire {
+        max_output_tokens_source: None,
         name: slug.to_owned(),
         display_name: None,
         context_window: Some(window),

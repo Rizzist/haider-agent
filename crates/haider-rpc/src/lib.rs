@@ -39,6 +39,8 @@ pub use command::{
     CommandInvokeOutcomeWire, CommandOwnershipWire, CommandSpec, PALETTE_MAX_ROWS, PaletteItem,
     command_catalog_items, command_spec, has_arg_slots, offers_arg_completions, palette_items,
 };
+/// Output-maximum provenance on model details (973-output-cap-fixes).
+pub use frame::ModelOutputLimitSourceWire;
 pub use frame::{
     ARTIFACT_PUT_MAX_BYTES, AccountAddMethod, AccountAdoptionAvailable, AccountSourceWire,
     AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet, ClientKind,

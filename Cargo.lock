@@ -2082,6 +2082,7 @@ dependencies = [
  "haider-protocol",
  "haider-provider",
  "haider-rpc",
+ "haider-store",
  "haider-stt",
  "haider-tools",
  "image",

@@ -168,6 +168,7 @@ fn resolved_account_route_advances_only_the_served_sessions_epoch() {
         provider: "fake".into(),
         model: "fake-v2".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: None,
         event_id: EventId::new("selected-after-route"),
@@ -487,6 +488,7 @@ fn c5_creation_coordinate_survives_reopen_and_receipt_but_clears_on_reselection(
     );
     let selected = store
         .select_session_model(&SessionSelectModelCommand {
+            automatic_run: None,
             command_id: "c5-reselect".into(),
             request_digest: "c5-reselect-digest".into(),
             request_json: "{}".into(),
@@ -525,24 +527,49 @@ fn c5_creation_coordinate_survives_reopen_and_receipt_but_clears_on_reselection(
 }
 
 fn c6_owner_store_fixture(
-    before: Option<&str>, after: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
 ) -> (tempfile::TempDir, Store, SessionId, u64, u64) {
     let root = tempfile::tempdir().expect("fixture directory");
     let store = Store::open(root.path()).expect("fixture store");
     let mut create = command("owner-create", "owner-session", "owner-created");
     create.model_catalog_key = before.map(str::to_owned);
     store.create_session(&create).expect("create");
-    let previous = store.session_metadata(&create.session_id).expect("metadata").expect("session").selection_epoch.expect("epoch");
-    let outcome = store.select_session_model(&SessionSelectModelCommand {
-        command_id: "owner-select".into(), request_digest: "owner-select-digest".into(), request_json: "{}".into(),
-        session_id: create.session_id.clone(), worker_generation: store.worker_generation(),
-        provider: create.provider, model: create.model, model_catalog_key: after.map(str::to_owned),
-        expected_pair: None, account_alias: None, output_budget: None,
-        event_id: EventId::new("owner-selected"), device_id: DeviceId::new("daemon-test"),
-    }).expect("select same model");
-    let SessionSelectModelOutcome::Committed { selected, .. } = outcome else { panic!("new command must commit") };
+    let previous = store
+        .session_metadata(&create.session_id)
+        .expect("metadata")
+        .expect("session")
+        .selection_epoch
+        .expect("epoch");
+    let outcome = store
+        .select_session_model(&SessionSelectModelCommand {
+            command_id: "owner-select".into(),
+            request_digest: "owner-select-digest".into(),
+            request_json: "{}".into(),
+            session_id: create.session_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: create.provider,
+            model: create.model,
+            model_catalog_key: after.map(str::to_owned),
+            expected_pair: None,
+            automatic_run: None,
+            account_alias: None,
+            output_budget: None,
+            event_id: EventId::new("owner-selected"),
+            device_id: DeviceId::new("daemon-test"),
+        })
+        .expect("select same model");
+    let SessionSelectModelOutcome::Committed { selected, .. } = outcome else {
+        panic!("new command must commit")
+    };
     assert_eq!(selected.model_catalog_key.as_deref(), after);
-    (root, store, create.session_id, previous, selected.selected_seq)
+    (
+        root,
+        store,
+        create.session_id,
+        previous,
+        selected.selected_seq,
+    )
 }
 
 macro_rules! c6_owner_store_transition {
@@ -554,22 +581,56 @@ macro_rules! c6_owner_store_transition {
         }
     };
 }
-c6_owner_store_transition!(c6_owner_store_unowned_to_owned, None, Some("synthetic-owner-A"));
-c6_owner_store_transition!(c6_owner_store_owned_to_unowned, Some("synthetic-owner-A"), None);
-c6_owner_store_transition!(c6_owner_store_a_to_b, Some("synthetic-owner-A"), Some("synthetic-owner-B"));
+c6_owner_store_transition!(
+    c6_owner_store_unowned_to_owned,
+    None,
+    Some("synthetic-owner-A")
+);
+c6_owner_store_transition!(
+    c6_owner_store_owned_to_unowned,
+    Some("synthetic-owner-A"),
+    None
+);
+c6_owner_store_transition!(
+    c6_owner_store_a_to_b,
+    Some("synthetic-owner-A"),
+    Some("synthetic-owner-B")
+);
 
 #[test]
 fn c6_owner_store_same_owner_control() {
-    let (_root, _store, _session, previous, current) = c6_owner_store_fixture(Some("synthetic-owner-A"), Some("synthetic-owner-A"));
+    let (_root, _store, _session, previous, current) =
+        c6_owner_store_fixture(Some("synthetic-owner-A"), Some("synthetic-owner-A"));
     assert_eq!(current, previous, "a true no-op retains the epoch");
 }
 
 #[test]
 fn c6_owner_store_previous_owner_route_cannot_update_new_selection() {
-    let (_root, store, session, previous, current) = c6_owner_store_fixture(Some("synthetic-owner-A"), Some("synthetic-owner-B"));
-    let (_, facts) = store.commit_resolved_route_fact(&session, "fake", "fake-v1", previous, Some("account-a"), &DeviceId::new("daemon-test")).expect("old captured route completion");
-    let metadata = store.session_metadata(&session).expect("metadata").expect("session");
-    println!("OWNER_ORDER_ROUTE previous={previous} current={current} facts={} owner={:?} route={:?}", facts.len(), metadata.model_catalog_key, metadata.resolved_route_alias);
-    assert!(facts.is_empty(), "a route completion captured under the previous owner must not append a current route fact");
+    let (_root, store, session, previous, current) =
+        c6_owner_store_fixture(Some("synthetic-owner-A"), Some("synthetic-owner-B"));
+    let (_, facts) = store
+        .commit_resolved_route_fact(
+            &session,
+            "fake",
+            "fake-v1",
+            previous,
+            Some("account-a"),
+            &DeviceId::new("daemon-test"),
+        )
+        .expect("old captured route completion");
+    let metadata = store
+        .session_metadata(&session)
+        .expect("metadata")
+        .expect("session");
+    println!(
+        "OWNER_ORDER_ROUTE previous={previous} current={current} facts={} owner={:?} route={:?}",
+        facts.len(),
+        metadata.model_catalog_key,
+        metadata.resolved_route_alias
+    );
+    assert!(
+        facts.is_empty(),
+        "a route completion captured under the previous owner must not append a current route fact"
+    );
     assert!(!metadata.resolved_route_seen);
 }

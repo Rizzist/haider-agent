@@ -19,11 +19,14 @@ pub const LEGACY_CLIENT_DEFAULT_OUTPUT_LIMITS: [u64; 3] = [4_096, 8_192, DEFAULT
 /// re-derives `min(DEFAULT_OUTPUT_LIMIT, model max)`. `UserSet` keeps the
 /// user's requested value and applies it bounded by the selected model's
 /// maximum, so switching back to a larger model restores the request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionOutputBudgetSourceV1 {
+    #[default]
     Derived,
-    UserSet { requested: u64 },
+    UserSet {
+        requested: u64,
+    },
 }
 
 impl SessionOutputBudgetSourceV1 {

@@ -2785,6 +2785,8 @@ pub struct HarnessConfig {
     pub provider_rebind_resolver: Option<Arc<dyn ProviderRebindResolver>>,
     /// Persisted route identity separates cache domains across explicit rebinds.
     pub provider_route_epoch: Option<String>,
+    /// Durable explicit-route generation captured for this active run.
+    pub provider_rebind_seq: u64,
     /// Daemon-owned durable pair-selection seam. Automatic fallback and
     /// promotion refuse to switch unless this is installed.
     pub provider_pair_switch_committer: Option<Arc<dyn ProviderPairSwitchCommitter>>,
@@ -2952,6 +2954,7 @@ impl HarnessConfig {
             provider_attempt_resolver: None,
             provider_rebind_resolver: None,
             provider_route_epoch: None,
+            provider_rebind_seq: 0,
             provider_pair_switch_committer: None,
             provider_route_committer: None,
             compaction_promotion: None,
@@ -3623,6 +3626,11 @@ pub struct ProviderPairSwitch {
     pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub run_id: RunId,
     pub switch_ordinal: u32,
+    /// Explicit route generation used to resolve this target. Ordinary
+    /// next-turn settings never change this active-run owner.
+    pub source_rebind_seq: u64,
+    /// Account resolved for the owned target, before crossing the commit.
+    pub target_account: String,
     pub from_provider: String,
     pub from_model: String,
     pub to_provider: String,
@@ -3632,7 +3640,8 @@ pub struct ProviderPairSwitch {
 
 #[async_trait]
 pub trait ProviderPairSwitchCommitter: Send + Sync + std::fmt::Debug {
-    /// Returns the durable selection epoch for requests made after the switch.
+    /// Returns the selection receipt epoch. The active run keeps its frozen
+    /// request-start epoch and uses its rebind generation to own switch facts.
     async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError>;
 }
 
@@ -3703,10 +3712,13 @@ pub struct ProviderRebindTarget {
     pub account: Option<CredentialAlias>,
     pub account_incarnation: Option<u64>,
     pub context_window: Option<u64>,
+    /// Effective output budget committed with the durable pair rebind.
+    pub max_tokens: u64,
     pub cached_input_is_subset: bool,
     pub provider_request_state: ProviderDerivedRequestState,
     pub auth_scope: String,
     pub attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    pub rebind_seq: u64,
     pub route_epoch: String,
     pub initial_rotation: Option<RotationEvent>,
     pub rotation_budget_consumed: bool,
@@ -5955,6 +5967,8 @@ impl HarnessActor {
                             &mut latest_compaction_summary_end,
                         );
                         self.config.context_window = target.context_window;
+                        self.config.max_tokens = target.max_tokens;
+                        self.config.reserved_output_tokens = target.max_tokens;
                         self.config.cached_input_is_subset = target.cached_input_is_subset;
                         self.config
                             .install_provider_derived_request_state(&target.provider_request_state);
@@ -5968,6 +5982,7 @@ impl HarnessActor {
                         self.config.usage_scope.effort = dimensions.effort;
                         self.config.usage_scope.speed = dimensions.speed;
                         self.config.provider_route_epoch = Some(target.route_epoch);
+                        self.config.provider_rebind_seq = target.rebind_seq;
                         self.config.cache_reuse_gap_ms = None;
                         self.config.context_compactor = None;
                         self.config.compaction_promotion = None;
@@ -6044,6 +6059,7 @@ impl HarnessActor {
                 latest_compaction_summary_end.map(|end| wake_remap.boundary(end));
             logical_request_cacheable_history_end =
                 wake_remap.boundary(logical_request_cacheable_history_end);
+            let switch_ordinal_before_context = provider_pair_switch_ordinal;
             let request_projection_compacted = match self
                 .enforce_context_policy(
                     &run_id,
@@ -6061,6 +6077,7 @@ impl HarnessActor {
                 .await
             {
                 Ok(compacted) => compacted,
+                Err(DriveError::RebindPending) => continue 'requests,
                 Err(error) => {
                     if let Err(state_error) = self
                         .commit_pending_thinking(&run_id, &mut thinking_pending)
@@ -6081,6 +6098,12 @@ impl HarnessActor {
             };
             if request_projection_compacted {
                 cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
+            }
+            if provider_pair_switch_ordinal != switch_ordinal_before_context {
+                // Compaction promotion crosses awaits after the durable
+                // selection. Revisit the live rebind boundary before sending
+                // its first request, just as the fallback path does.
+                continue 'requests;
             }
             if provider_attempt == 0 {
                 logical_request_cacheable_history_end =
@@ -7068,6 +7091,7 @@ impl HarnessActor {
                             .await
                         {
                             return match error {
+                                DriveError::RebindPending => continue 'requests,
                                 DriveError::Cancelled => {
                                     self.cancelled_outcome_with_items(
                                         &run_id,
@@ -7652,6 +7676,7 @@ impl HarnessActor {
                             .await
                         {
                             return match error {
+                                DriveError::RebindPending => continue 'requests,
                                 DriveError::Cancelled => {
                                     self.cancelled_outcome_with_items(
                                         &run_id,
@@ -9974,6 +9999,8 @@ impl HarnessActor {
             output_budget: target.output_budget,
             run_id: run_id.clone(),
             switch_ordinal: *provider_pair_switch_ordinal,
+            source_rebind_seq: self.config.provider_rebind_seq,
+            target_account: target.account.as_str().to_owned(),
             from_provider: self.config.usage_scope.provider.clone(),
             from_model: self.config.model.clone(),
             to_provider: target.provider_name.clone(),
@@ -9990,7 +10017,15 @@ impl HarnessActor {
         // cannot relabel this turn's eventual footprint as a request begun
         // under the newly committed selection. The next turn gets a fresh
         // config from durable metadata and may claim the new epoch.
-        committer.commit(&switch).await.map_err(DriveError::Store)?;
+        match committer.commit(&switch).await {
+            Ok(_) => {}
+            Err(error) if error.code == ErrorCode::RevisionConflict => {
+                // The next provider boundary consumes the newer rebind. A
+                // declined, pre-resolved target is not store corruption.
+                return Err(DriveError::RebindPending);
+            }
+            Err(error) => return Err(DriveError::Store(error)),
+        };
         *provider_pair_switch_ordinal = next_switch_ordinal;
 
         remap_after_provider_opaque_strip(
@@ -10099,6 +10134,8 @@ impl HarnessActor {
             .await
             .map_err(DriveError::Store)?;
         let mut switch_fact = serde_json::json!({
+            "source_rebind_seq": switch.source_rebind_seq,
+            "resolved_alias": target.account.as_str(),
             "from_provider": switch.from_provider,
             "from_model": switch.from_model,
             "to_provider": switch.to_provider,
@@ -14723,6 +14760,7 @@ enum DriveError {
     Provider(ProviderError),
     Account(HaiderError),
     Store(HaiderError),
+    RebindPending,
     Cancelled,
 }
 
@@ -17881,6 +17919,11 @@ fn drive_error_to_haider(error: DriveError) -> HaiderError {
     match error {
         DriveError::Provider(error) => provider_error_to_haider(error),
         DriveError::Account(error) | DriveError::Store(error) => error,
+        DriveError::RebindPending => HaiderError::new(
+            ErrorCode::Internal,
+            "pending provider rebind escaped its request boundary",
+            true,
+        ),
         DriveError::Cancelled => HaiderError::new(
             ErrorCode::Internal,
             "cancelled drive error escaped its turn outcome boundary",

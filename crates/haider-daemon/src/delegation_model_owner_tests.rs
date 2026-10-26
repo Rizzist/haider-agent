@@ -25,7 +25,8 @@ fn profile(provider: &str, model: &str, owner: &str) -> ProviderSummaryWire {
         "inventory_authority":"advisory", "auth_methods":[],
         "availability":"available", "enabled":true, "trust":"full",
         "catalog_scope":{"key":owner}
-    })).expect("synthetic catalog")
+    }))
+    .expect("synthetic catalog")
 }
 
 fn parent() -> SessionMetadataV1 {
@@ -33,7 +34,8 @@ fn parent() -> SessionMetadataV1 {
         "cwd":"/tmp", "provider":"parent", "model":"parent-model",
         "max_tokens":1024, "max_tokens_source":{"kind":"user_set", "requested":1024},
         "created_at_ms":1, "model_catalog_key":"parent-owner"
-    })).expect("synthetic parent")
+    }))
+    .expect("synthetic parent")
 }
 
 async fn resolve(
@@ -53,46 +55,84 @@ async fn resolve(
         providers.push(profile("parent", "parent-model", "parent-owner"));
     }
     hub.install_accounts(AccountsFacade {
-        login: None, oauth: None, snapshot: Arc::new(Mutex::new(Vec::new())),
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(Vec::new())),
         management: ManagementSnapshot::new(1, Vec::new(), providers),
-        vault_supported: false, discovery_disabled: true,
-        device_discovery: DeviceDiscoverySnapshot::new(true), vault: None,
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: DeviceDiscoverySnapshot::new(true),
+        vault: None,
         sources: Arc::new(Mutex::new(Vec::new())),
-    }).expect("catalog");
+    })
+    .expect("catalog");
     let mut request = json!({"task":"synthetic task", "prompt":"synthetic prompt"});
-    if let Some(model) = model { request["model"] = json!(model); }
-    if let Some(provider) = provider { request["provider"] = json!(provider); }
+    if let Some(model) = model {
+        request["model"] = json!(model);
+    }
+    if let Some(provider) = provider {
+        request["provider"] = json!(provider);
+    }
     if typed_workflow {
         request["agent_type"] = json!("reviewer");
         request["workflow"] = json!("implement_verify");
     }
     let request = SpawnSubagent::from_tool_args(request).expect("spawn arguments");
-    DelegationHandle::new(hub).resolve_child_metadata(parent, &request)
-        .expect("infrastructure").expect("selection")
+    DelegationHandle::new(hub)
+        .resolve_child_metadata(parent, &request)
+        .expect("infrastructure")
+        .expect("selection")
 }
 
 #[tokio::test]
 async fn c7_cross_provider_exact_and_alternate_coordinates_own_the_child() {
-    for spelling in ["child-model", "CHILD_MODEL", "child.model", " child\u{a0}model "] {
-        let child = resolve(&parent(), profile("child", "child-model", "child-owner"),
-            Some(spelling), Some("child"), false).await;
+    for spelling in [
+        "child-model",
+        "CHILD_MODEL",
+        "child.model",
+        " child\u{a0}model ",
+    ] {
+        let child = resolve(
+            &parent(),
+            profile("child", "child-model", "child-owner"),
+            Some(spelling),
+            Some("child"),
+            false,
+        )
+        .await;
         assert_eq!(child.model, "child-model");
-        assert_eq!(child.model_catalog_key.as_deref(), Some("child-owner"), "{spelling}");
+        assert_eq!(
+            child.model_catalog_key.as_deref(),
+            Some("child-owner"),
+            "{spelling}"
+        );
     }
 }
 
 #[tokio::test]
 async fn c7_bare_selector_resolves_the_target_owner() {
-    let child = resolve(&parent(), profile("child", "child-model", "child-owner"),
-        Some("CHILD_MODEL"), None, false).await;
+    let child = resolve(
+        &parent(),
+        profile("child", "child-model", "child-owner"),
+        Some("CHILD_MODEL"),
+        None,
+        false,
+    )
+    .await;
     assert_eq!(child.provider, "child");
     assert_eq!(child.model_catalog_key.as_deref(), Some("child-owner"));
 }
 
 #[tokio::test]
 async fn c7_unlisted_child_does_not_retire_with_the_parent_account() {
-    let child = resolve(&parent(), profile("parent", "parent-model", "next-account-owner"),
-        Some("unlisted-child"), Some("parent"), false).await;
+    let child = resolve(
+        &parent(),
+        profile("parent", "parent-model", "next-account-owner"),
+        Some("unlisted-child"),
+        Some("parent"),
+        false,
+    )
+    .await;
     assert_eq!(child.model, "unlisted-child");
     assert_eq!(child.model_catalog_key, None);
     assert_eq!(child.max_tokens, 1024);
@@ -100,7 +140,10 @@ async fn c7_unlisted_child_does_not_retire_with_the_parent_account() {
 
 #[tokio::test]
 async fn c7_cross_provider_permanent_public_and_keyless_rows_have_no_parent_owner() {
-    for source in [ModelDetailSourceWire::Configured, ModelDetailSourceWire::Static] {
+    for source in [
+        ModelDetailSourceWire::Configured,
+        ModelDetailSourceWire::Static,
+    ] {
         let mut target = profile("child", "child-model", "child-owner");
         target.model_details[0].source = Some(source);
         if source == ModelDetailSourceWire::Configured {
@@ -120,8 +163,14 @@ async fn c7_cross_provider_permanent_public_and_keyless_rows_have_no_parent_owne
 
 #[tokio::test]
 async fn c7_typed_workflow_uses_the_same_child_owner_rule() {
-    let child = resolve(&parent(), profile("child", "child-model", "child-owner"),
-        Some("CHILD_MODEL"), Some("child"), true).await;
+    let child = resolve(
+        &parent(),
+        profile("child", "child-model", "child-owner"),
+        Some("CHILD_MODEL"),
+        Some("child"),
+        true,
+    )
+    .await;
     assert_eq!(child.model_catalog_key.as_deref(), Some("child-owner"));
 }
 
@@ -144,7 +193,14 @@ async fn c7_same_provider_permanent_unclamped_child_is_independent_of_account_sw
     for owner in ["parent-owner", "next-account-owner"] {
         let mut target = profile("parent", "permanent-child", owner);
         target.configured_models.push("permanent-child".into());
-        let child = resolve(&parent(), target, Some("PERMANENT_CHILD"), Some("parent"), false).await;
+        let child = resolve(
+            &parent(),
+            target,
+            Some("PERMANENT_CHILD"),
+            Some("parent"),
+            false,
+        )
+        .await;
         assert_eq!(child.model_catalog_key, None);
         assert_eq!(child.max_tokens, 1024);
     }
@@ -155,19 +211,52 @@ async fn c7_implicit_inheritance_preserves_owner_coordinate_and_budget() {
     let mut parent = parent();
     parent.model = "PARENT_MODEL".into();
     parent.resolved_model = Some("parent-model".into());
-    let child = resolve(&parent, profile("parent", "parent-model", "next-owner"),
-        None, None, false).await;
+    let child = resolve(
+        &parent,
+        profile("parent", "parent-model", "next-owner"),
+        None,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(child, parent);
 }
 
 #[tokio::test]
 async fn c7_explicit_same_model_refreshes_owner_and_unowned_parent_uses_child_owner() {
-    let child = resolve(&parent(), profile("parent", "parent-model", "next-owner"),
-        Some("parent-model"), None, false).await;
+    let child = resolve(
+        &parent(),
+        profile("parent", "parent-model", "next-owner"),
+        Some("parent-model"),
+        None,
+        false,
+    )
+    .await;
     assert_eq!(child.model_catalog_key.as_deref(), Some("next-owner"));
     let mut parent = parent();
     parent.model_catalog_key = None;
-    let child = resolve(&parent, profile("child", "child-model", "child-owner"),
-        Some("child-model"), Some("child"), false).await;
+    let child = resolve(
+        &parent,
+        profile("child", "child-model", "child-owner"),
+        Some("child-model"),
+        Some("child"),
+        false,
+    )
+    .await;
     assert_eq!(child.model_catalog_key.as_deref(), Some("child-owner"));
+}
+
+#[tokio::test]
+async fn c7_explicit_provider_resolves_owner_after_releasing_parent_route() {
+    let mut parent = parent();
+    parent.account_alias = Some("old-account".into());
+    parent.provider_base_url = Some("http://127.0.0.1:31001/v1".into());
+    parent.provider_rebind_id = Some("old-route".into());
+    let mut target = profile("parent", "parent-model", "current-owner");
+    target.endpoint = Some("http://127.0.0.1:31002/v1".into());
+    let child = resolve(&parent, target, Some("PARENT_MODEL"), Some("parent"), false).await;
+    assert_eq!(child.model_catalog_key.as_deref(), Some("current-owner"));
+    assert_eq!(child.account_alias, None);
+    assert_eq!(child.provider_base_url, None);
+    assert_eq!(child.provider_rebind_id, None);
 }

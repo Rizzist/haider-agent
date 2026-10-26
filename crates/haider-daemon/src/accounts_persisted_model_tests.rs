@@ -26,6 +26,7 @@ fn automatic_selection_rederives_fetched_settings_and_preserves_explicit_budget(
         account_incarnation: Some(2),
     });
     profile.model_details = vec![haider_rpc::ModelDetailWire {
+        max_output_tokens_source: None,
         source: Some(haider_rpc::ModelDetailSourceWire::Remote),
         name: profile.models[0].clone(),
         display_name: None,
@@ -630,6 +631,7 @@ fn automatic_routing_owner_includes_anonymous_endpoint_context() {
     );
     // Explicit configured deployments are independent of remote ownership.
     let detail = haider_rpc::ModelDetailWire {
+        max_output_tokens_source: None,
         source: Some(haider_rpc::ModelDetailSourceWire::Configured),
         name: "same-model-name".into(),
         display_name: None,
