@@ -45,6 +45,7 @@ daemon-oauth-single-flight	linux	haider-daemon	lib	concurrent_refresh_is_single_
 daemon-oauth-resolve-commit	linux	haider-daemon	lib	concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_delete	crates/haider-daemon/src/oauth_tests.rs
 daemon-shell-close-race	linux	haider-daemon	lib	close_wins_a_race_with_the_running_transition	crates/haider-daemon/src/shell_registry_tests.rs
 daemon-shell-inventory	linux	haider-daemon	lib	activity_inventory_revision_remains_monotonic_under_concurrent_lifecycle_changes	crates/haider-daemon/src/shell_registry_tests.rs
+daemon-explicit-account-inventory-session-update	linux	haider-daemon	lib	explicit_account_inventory_refresh_retries_after_concurrent_session_update	crates/haider-daemon/src/session_hub_private_tests.rs
 daemon-task-pipe-interleaving	linux	haider-daemon	lib	activity_real_interleaved_pipes_cannot_split_pem_redaction	crates/haider-daemon/src/tasks_runtime_tests.rs
 daemon-observer-rebuild	linux	haider-daemon	lib	concurrent_observers_of_evicted_session_share_one_rebuild	crates/haider-daemon/src/session_hub/rpc.rs
 daemon-budget-stop-race	linux	haider-daemon	lib	a_durable_budget_cause_wins_when_stop_races_the_terminal_batch	crates/haider-daemon/src/run_budget_tests.rs
