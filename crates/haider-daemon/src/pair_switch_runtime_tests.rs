@@ -1157,6 +1157,8 @@ async fn assert_native_pickup_pair(
         .into_iter()
         .map(
             |provider| haider_protocol::credential::CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: None,
                 alias: CredentialAlias::new(format!("{provider}-account")),
                 provider: provider.into(),
                 base_url: None,

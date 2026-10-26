@@ -373,6 +373,8 @@ async fn assert_active_budget_from_origin(origin: &str) {
     })).expect("profile")
     };
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("budget-account"),
         provider: "mock-b".into(),
         base_url: None,
@@ -727,6 +729,7 @@ async fn assert_slow_inventory_fetch_is_unfenced(operation: &str) {
             }
         } else {
             RequestBody::SessionSelectModel {
+                expected_catalog_key: None,
                 command_id: haider_rpc::CommandId::new("slow-select-command"),
                 session_id: select_session,
                 worker_generation: generation,
@@ -1322,6 +1325,7 @@ async fn pair_and_budget_writers_serialize_all_seven_snapshot_variants() {
                 .request(
                     RequestId::new("select"),
                     RequestBody::SessionSelectModel {
+                        expected_catalog_key: None,
                         command_id: haider_rpc::CommandId::new("select-command"),
                         session_id: selected_session,
                         worker_generation: generation,
