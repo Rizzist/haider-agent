@@ -21036,20 +21036,23 @@ impl AppModel {
             .find(|row| row.id == summary.session_id)
         {
             entry.summary_seen = true;
-            if summary.kind == Some(haider_rpc::SessionKindWire::Root) {
-                entry.prompt_owner = None;
-            } else if let Some(owner) = summary.owner_agent_id.as_ref().or_else(|| {
-                // Older lineage-aware daemons report the owning agent only
-                // in metrics. Missing optional data cannot erase a manifest.
-                if summary.kind == Some(haider_rpc::SessionKindWire::Subagent) {
-                    summary
-                        .agent_metrics
-                        .as_ref()
-                        .and_then(|metrics| metrics.agent.as_ref())
-                } else {
-                    None
-                }
-            }) {
+            // A delayed roster row may predate the delegation record. Its
+            // Root default cannot revoke an owner already proved by a
+            // committed manifest or a newer positive ownership snapshot.
+            if summary.kind != Some(haider_rpc::SessionKindWire::Root)
+                && let Some(owner) = summary.owner_agent_id.as_ref().or_else(|| {
+                    // Older lineage-aware daemons report the owning agent only
+                    // in metrics. Missing optional data cannot erase a manifest.
+                    if summary.kind == Some(haider_rpc::SessionKindWire::Subagent) {
+                        summary
+                            .agent_metrics
+                            .as_ref()
+                            .and_then(|metrics| metrics.agent.as_ref())
+                    } else {
+                        None
+                    }
+                })
+            {
                 entry.prompt_owner = Some(owner.clone());
             }
         }

@@ -905,3 +905,35 @@ fn untyped_metrics_cannot_replace_the_parent_prompt_owner() {
     run_slash(&mut model, "/fork 1");
     assert_eq!(fork_request(&model), Some((parent, 4)));
 }
+
+#[test]
+fn stale_root_summary_cannot_erase_a_committed_manifest_owner() {
+    let (mut model, _) = forkable_model();
+    let child = sid("manifest-before-roster");
+    let mut chip = haider_tui::app::ChipModel::from_seed(
+        haider_tui::mock::sample_seed_chip(2).expect("chip fixture"),
+    );
+    chip.agent = "manifest-owner".into();
+    chip.child_session = Some(child.as_str().into());
+    chip.children.clear();
+    model.chips.push(chip);
+    model.handle_hit(haider_tui::app::Hit::ChipRow("manifest-owner".into()));
+    let stale = serde_json::from_value(serde_json::json!({
+        "session_id": child,
+        "head_seq": 1,
+        "worker_generation": 7,
+        "kind": "root"
+    }))
+    .expect("roster read before delegation was committed");
+    model.note_summary_counts(&stale);
+    let mut prompt = raw(&child, 1, &user("owned despite delayed roster"));
+    prompt.agent_id = Some(haider_protocol::ids::AgentId::new("manifest-owner"));
+    assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+    model.note_summary_counts(&owner_summary(&child, "manifest-owner"));
+    model.open_session(&child);
+    model.turn_active = false;
+    model.requests.clear();
+    assert_eq!(model.prompt_history.len(), 1);
+    run_slash(&mut model, "/fork 1");
+    assert_eq!(fork_request(&model), Some((child, 1)));
+}
