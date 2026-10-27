@@ -586,6 +586,8 @@ fn activity_token_requires_hello_request_and_follows_newer_withholding() {
     .expect("summary");
     let frame = WireFrame::SessionRosterDelta {
         summaries: vec![haider_rpc::SessionSummary {
+            owner_agent_id: None,
+            launch_origin: None,
             agent_metrics: Some(identity_gate_metrics()),
             ..summary
         }],
@@ -1019,6 +1021,8 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
     .expect("minimal summary");
     let roster = WireFrame::SessionRosterDelta {
         summaries: vec![haider_rpc::SessionSummary {
+            owner_agent_id: None,
+            launch_origin: None,
             agent_metrics: Some(identity_gate_metrics()),
             ..roster
         }],
@@ -1030,6 +1034,8 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
     }))
     .expect("minimal list summary");
     let summary = haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         agent_metrics: Some(identity_gate_metrics()),
         ..summary
     };

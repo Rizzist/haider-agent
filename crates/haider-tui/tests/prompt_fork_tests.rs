@@ -708,3 +708,200 @@ fn a_legacy_fork_response_never_becomes_an_empty_draft() {
         "expected a typed failure, got {replies:?}"
     );
 }
+
+fn owner_summary(session: &SessionId, owner: &str) -> haider_rpc::SessionSummary {
+    serde_json::from_value(serde_json::json!({
+        "session_id": session, "head_seq": 0, "worker_generation": 7,
+        "kind": "subagent", "owner_agent_id": owner
+    }))
+    .expect("owning-agent summary")
+}
+
+/// F2: root, delegated, and nested delegated prompt lanes have identical
+/// chooser semantics on live delivery and cold/parked replay.
+#[test]
+fn owning_agent_prompts_survive_active_and_cold_replay() {
+    for owner in [None, Some("delegated-owner"), Some("nested-owner")] {
+        for cold in [false, true] {
+            for surface in ["ordinal", "bare", "escape", "recall"] {
+                let (mut model, session) = forkable_model();
+                // Fresh row/replay so no unrelated history can hide a missing own prompt.
+                model.back_to_launcher();
+                model.sessions.clear();
+                model.upsert_live_session(&session);
+                if let Some(owner) = owner {
+                    model.note_summary_counts(&owner_summary(&session, owner));
+                }
+                if !cold {
+                    model.open_session(&session);
+                }
+                let mut prompt = raw(&session, 1, &user("own prompt"));
+                prompt.agent_id = owner.map(haider_protocol::ids::AgentId::new);
+                assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+                let mut other = raw(&session, 2, &user("other child's prompt"));
+                other.agent_id = Some(haider_protocol::ids::AgentId::new("other-child"));
+                assert_eq!(model.route_raw(&other), RawOutcome::Applied);
+                if cold {
+                    model.open_session(&session);
+                }
+                model.turn_active = false;
+                model.requests.clear();
+                assert_eq!(model.prompt_history.len(), 1, "{owner:?}/{cold}/{surface}");
+                assert_eq!(model.prompt_history[0].text, "own prompt");
+                match surface {
+                    "ordinal" => run_slash(&mut model, "/fork 1"),
+                    "bare" => {
+                        run_slash(&mut model, "/fork");
+                        assert!(model.backtrack.is_some());
+                        model.handle_at(key(KeyCode::Char('f')), Instant::now());
+                    }
+                    "escape" => {
+                        open_chooser(&mut model, Instant::now());
+                        model.handle_at(key(KeyCode::Char('f')), Instant::now());
+                    }
+                    _ => {
+                        run_slash(&mut model, "/history 1");
+                        assert_eq!(model.composer.text(), "own prompt");
+                        assert!(fork_request(&model).is_none());
+                        continue;
+                    }
+                }
+                assert_eq!(
+                    fork_request(&model),
+                    Some((session, 1)),
+                    "{owner:?}/{cold}/{surface}"
+                );
+            }
+        }
+    }
+}
+
+/// A selected prompt keeps its source branch after either direction of a
+/// branch switch; inactive-branch replay cannot retarget the cut.
+#[test]
+fn prompt_fork_uses_source_branch_after_switch_and_reopen() {
+    for cold in [false, true] {
+        for source in [None, Some("branch-b")] {
+            let (mut model, session) = forkable_model();
+            if cold {
+                model.back_to_launcher();
+            }
+            assert_eq!(
+                model.route_raw(&branch_created(&session, 4, "branch-b", "B")),
+                RawOutcome::Applied
+            );
+            let mut prompt = raw(&session, 5, &user("source branch prompt"));
+            prompt.branch_id = source.map(haider_protocol::ids::BranchId::new);
+            assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+            if cold {
+                model.open_session(&session);
+            }
+            model.turn_active = false;
+            assert!(
+                model
+                    .switch_branch(Some(&haider_protocol::ids::BranchId::new("branch-b")))
+                    .is_some()
+            );
+            if source.is_some() {
+                assert!(model.switch_branch(None).is_some());
+            }
+            model.requests.clear();
+            run_slash(&mut model, "/fork 1");
+            let request = model.requests.iter().find_map(|r| match r {
+                AppRequest::ForkFromPrompt {
+                    source_branch, seq, ..
+                } => Some((source_branch.clone(), *seq)),
+                _ => None,
+            });
+            assert_eq!(
+                request,
+                Some((prompt.branch_id, 5)),
+                "cold={cold} source={source:?}"
+            );
+        }
+    }
+}
+
+fn branch_created(session: &SessionId, seq: u64, branch: &str, name: &str) -> RawEnvelope {
+    let created = haider_protocol::branch::BranchCreated {
+        branch: haider_protocol::branch::BranchDescriptor {
+            branch_id: haider_protocol::ids::BranchId::new(branch),
+            name: name.to_owned(),
+            source_branch_id: None,
+            fork_node_id: haider_protocol::ids::NodeId::new("node-1"),
+            fork_seq: 1,
+            created_seq: seq,
+            created_at_ms: 0,
+            head_node_id: haider_protocol::ids::NodeId::new("node-1"),
+            head_seq: 1,
+        },
+    };
+    let mut envelope = raw(session, seq, &EventPayload::IdleDecayed);
+    envelope.payload = created
+        .to_payload_value()
+        .expect("branch fact serializes")
+        .into();
+    envelope
+}
+
+#[test]
+fn child_chip_prompt_history_precedes_the_first_list_summary() {
+    let (mut model, parent) = forkable_model();
+    let child = sid("child-not-listed-yet");
+    let mut chip = haider_tui::app::ChipModel::from_seed(
+        haider_tui::mock::sample_seed_chip(2).expect("chip fixture"),
+    );
+    chip.agent = "early-owner".into();
+    chip.child_session = Some(child.as_str().into());
+    chip.children.clear();
+    model.chips.push(chip);
+    model.handle_hit(haider_tui::app::Hit::ChipRow("early-owner".into()));
+    assert_eq!(model.screen, haider_tui::app::Screen::Subagent);
+    let older_summary = serde_json::from_value(serde_json::json!({
+        "session_id": child, "head_seq": 0, "worker_generation": 7, "kind": "subagent"
+    }))
+    .expect("older summary without owner or metrics");
+    model.note_summary_counts(&older_summary);
+    let mut prompt = raw(&child, 1, &user("early own prompt"));
+    prompt.agent_id = Some(haider_protocol::ids::AgentId::new("early-owner"));
+    assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+    assert_eq!(
+        model.prompt_history.len(),
+        2,
+        "child replay stays out of the parent history"
+    );
+    model.open_session(&child);
+    model.turn_active = false;
+    model.requests.clear();
+    assert_eq!(model.prompt_history.len(), 1);
+    assert_eq!(model.prompt_history[0].text, "early own prompt");
+    run_slash(&mut model, "/fork 1");
+    assert_eq!(fork_request(&model), Some((child, 1)));
+    model.open_session(&parent);
+    assert_eq!(model.prompt_history.len(), 2);
+}
+
+#[test]
+fn untyped_metrics_cannot_replace_the_parent_prompt_owner() {
+    let (mut model, parent) = forkable_model();
+    let older_summary = serde_json::from_value(serde_json::json!({
+        "session_id": parent, "head_seq": 3, "worker_generation": 7,
+        "agent_metrics": {"agent": "other-child", "session_id": parent,
+            "head_seq": 3, "started_at_ms": 1, "live": true, "tool_attempts": 0}
+    }))
+    .expect("summary without lineage authority");
+    model.note_summary_counts(&older_summary);
+    assert_eq!(
+        model.route_raw(&raw(&parent, 4, &user("parent remains owner"))),
+        RawOutcome::Applied
+    );
+    let mut other = raw(&parent, 5, &user("other child remains excluded"));
+    other.agent_id = Some(haider_protocol::ids::AgentId::new("other-child"));
+    assert_eq!(model.route_raw(&other), RawOutcome::Applied);
+    assert_eq!(model.prompt_history.len(), 3);
+    assert_eq!(model.prompt_history[0].text, "parent remains owner");
+    model.turn_active = false;
+    model.requests.clear();
+    run_slash(&mut model, "/fork 1");
+    assert_eq!(fork_request(&model), Some((parent, 4)));
+}

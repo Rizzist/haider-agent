@@ -2046,6 +2046,14 @@ pub struct AttachState {
 /// Cheap metadata returned by session listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// Durable delegation owner, available even before the first agent turn.
+    /// None for roots and summaries from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<AgentId>,
+    /// Current own-subject origin, recovered from the journal when its
+    /// metadata projection is absent. Also available for legacy sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_origin: Option<haider_protocol::session::LaunchOriginV1>,
     pub session_id: SessionId,
     /// Greatest committed envelope sequence for the session.
     pub head_seq: u64,

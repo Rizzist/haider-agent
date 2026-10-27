@@ -26,9 +26,10 @@ use crate::identity::UiGeneration;
 use crate::projection::{Admission, MenuScopeOwner, RawOutcome, SessionProjection};
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{AgentId, SessionId};
+use haider_protocol::ids::{AgentId, BranchId, SessionId};
 
-/// One previous user prompt recalled by the Esc-Esc chooser.
+/// One previous user prompt recalled by the Esc-Esc chooser, with its
+/// owning agent and source branch retained independently of the displayed branch.
 ///
 /// `seq` is the DURABLE journal coordinate of the source `UserMessage`
 /// envelope — the exclusive cut a `session.fork` resolves. It is `Some` only
@@ -40,6 +41,8 @@ use haider_protocol::ids::{AgentId, SessionId};
 pub struct PromptEntry {
     pub text: String,
     pub seq: Option<u64>,
+    pub agent_id: Option<AgentId>,
+    pub branch_id: Option<BranchId>,
 }
 
 impl PromptEntry {
@@ -49,13 +52,31 @@ impl PromptEntry {
         Self {
             text,
             seq: Some(seq),
+            agent_id: None,
+            branch_id: None,
+        }
+    }
+
+    /// Keep the source lane with its journal cut, even after a branch switch.
+    #[must_use]
+    pub fn from_envelope(text: String, envelope: &RawEnvelope) -> Self {
+        Self {
+            text,
+            seq: Some(envelope.seq),
+            agent_id: envelope.agent_id.clone(),
+            branch_id: envelope.branch_id.clone(),
         }
     }
 
     /// A prompt with no durable coordinate (the local demo twin).
     #[must_use]
     pub const fn local(text: String) -> Self {
-        Self { text, seq: None }
+        Self {
+            text,
+            seq: None,
+            agent_id: None,
+            branch_id: None,
+        }
     }
 }
 
@@ -111,6 +132,8 @@ pub struct SessionState {
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
     pub prompt_history: std::collections::VecDeque<PromptEntry>,
+    /// Durable owning agent from this session's summary, never inferred from ids.
+    pub prompt_owner: Option<AgentId>,
     pub cache_usage: crate::cache_usage::SessionUsageFold,
     pub chips: Vec<ChipModel>,
     /// This session's branch registry, active-branch selection, warm parked
@@ -264,6 +287,7 @@ impl SessionState {
             account_request_epoch: None,
             projection: SessionProjection::new(),
             prompt_history: std::collections::VecDeque::new(),
+            prompt_owner: None,
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             chips: Vec::new(),
             branch_state: crate::branch::BranchState::default(),
@@ -465,7 +489,7 @@ impl SessionState {
                 // already refused; and a retraction that lands here still has
                 // to drop the prompt from THIS session's chooser, because
                 // nothing re-delivers the fact when the user comes back.
-                if envelope.agent_id.is_none()
+                if envelope.agent_id.as_ref() == self.prompt_owner.as_ref()
                     && !route_response_boundary(&mut self.projection, envelope)
                     && let Some(fact) =
                         haider_protocol::retraction::PromptRetractedV1::from_payload_value(
@@ -499,11 +523,11 @@ impl SessionState {
                                     &origin,
                                 );
                             }
-                            if envelope.agent_id.is_none()
+                            if envelope.agent_id.as_ref() == self.prompt_owner.as_ref()
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {
                                 self.prompt_history
-                                    .push_front(PromptEntry::committed(text.clone(), envelope.seq));
+                                    .push_front(PromptEntry::from_envelope(text.clone(), envelope));
                             }
                             if admission == Admission::Apply {
                                 self.route_admitted(&payload, envelope);

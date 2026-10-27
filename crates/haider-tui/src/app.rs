@@ -6933,9 +6933,15 @@ impl AppModel {
             if !self.mode.fabricates_locally()
                 && let Some(child) = self.selection_surface_session()
             {
-                // Attach/replay needs the child's own cursor even before
-                // session.list has introduced its row.
+                // The committed manifest names both child and owner even
+                // before session.list has introduced the child's row.
+                let owner = self
+                    .viewed_chip()
+                    .map(|chip| haider_protocol::ids::AgentId::new(chip.agent.clone()));
                 self.upsert_live_session(&child);
+                if let Some(row) = self.sessions.iter_mut().find(|row| row.id == child) {
+                    row.prompt_owner = owner;
+                }
             }
             self.restore_child_session_notes();
         }
@@ -11162,6 +11168,15 @@ impl AppModel {
         }
     }
 
+    fn owns_prompt(&self, envelope: &RawEnvelope) -> bool {
+        let owner = self
+            .sessions
+            .iter()
+            .find(|row| row.id == envelope.session_id)
+            .and_then(|row| row.prompt_owner.as_ref());
+        envelope.agent_id.as_ref() == owner
+    }
+
     fn record_prompt(&mut self, entry: crate::session::PromptEntry) {
         self.prompt_history.push_front(entry);
         self.close_backtrack();
@@ -11337,7 +11352,7 @@ impl AppModel {
         };
         self.requests.push(AppRequest::ForkFromPrompt {
             session,
-            source_branch: self.branch_state.active().cloned(),
+            source_branch: entry.branch_id.clone(),
             seq,
         });
         self.close_backtrack();
@@ -19569,7 +19584,7 @@ impl AppModel {
                 // `agent_id` on both facts, and a subagent's first response
                 // must not close the parent's editing window, nor its
                 // retraction disturb the parent's prompt chooser.
-                if envelope.agent_id.is_none()
+                if self.owns_prompt(envelope)
                     && !crate::session::route_response_boundary(&mut self.projection, envelope)
                     // escretract: prompt history is a SEPARATE surface from
                     // the transcript, with its own durable coordinates, so the
@@ -19617,12 +19632,12 @@ impl AppModel {
                                     &origin,
                                 );
                             }
-                            if envelope.agent_id.is_none()
+                            if self.owns_prompt(envelope)
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {
-                                self.record_prompt(crate::session::PromptEntry::committed(
+                                self.record_prompt(crate::session::PromptEntry::from_envelope(
                                     text.clone(),
-                                    envelope.seq,
+                                    envelope,
                                 ));
                             }
                             if admission == Admission::Apply {
@@ -21021,6 +21036,22 @@ impl AppModel {
             .find(|row| row.id == summary.session_id)
         {
             entry.summary_seen = true;
+            if summary.kind == Some(haider_rpc::SessionKindWire::Root) {
+                entry.prompt_owner = None;
+            } else if let Some(owner) = summary.owner_agent_id.as_ref().or_else(|| {
+                // Older lineage-aware daemons report the owning agent only
+                // in metrics. Missing optional data cannot erase a manifest.
+                if summary.kind == Some(haider_rpc::SessionKindWire::Subagent) {
+                    summary
+                        .agent_metrics
+                        .as_ref()
+                        .and_then(|metrics| metrics.agent.as_ref())
+                } else {
+                    None
+                }
+            }) {
+                entry.prompt_owner = Some(owner.clone());
+            }
         }
         let current_selection = if self.active_session.as_ref() == Some(&summary.session_id) {
             self.meter_epoch.selection_epoch

@@ -3711,6 +3711,15 @@ impl LiveDriver {
                             row.account_default_epoch = None;
                         }
                     }
+                    if let Some(origin) = summary.launch_origin.as_ref().or_else(|| {
+                        summary
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.launch_origin.as_ref())
+                    }) {
+                        self.origin_revisions
+                            .insert(summary.session_id.clone(), origin.revision);
+                    }
                     if let Some(metadata) = summary.metadata.as_ref() {
                         // Forks copy the source's current configuration, but
                         // only their selected history prefix. Its selection
@@ -3731,10 +3740,6 @@ impl LiveDriver {
                             .insert(summary.session_id.clone(), metadata.cwd.clone());
                         if metadata.workspace_allocation.is_some() {
                             self.dated_sessions.insert(summary.session_id.clone());
-                        }
-                        if let Some(origin) = metadata.launch_origin.as_ref() {
-                            self.origin_revisions
-                                .insert(summary.session_id.clone(), origin.revision);
                         }
                     } else if let (Some(provider), Some(model_name)) =
                         (summary.provider.as_deref(), summary.last_model.as_deref())

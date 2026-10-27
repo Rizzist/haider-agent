@@ -34,6 +34,8 @@ fn live_model() -> AppModel {
 
 fn summary(id: &str, seen_at_ms: Option<u64>, last_activity_ms: Option<u64>) -> SessionSummary {
     let mut summary = SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: SessionId::new(id),
         head_seq: 4,

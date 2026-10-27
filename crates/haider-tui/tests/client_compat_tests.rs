@@ -19,6 +19,8 @@ fn aid(n: u64) -> AttachmentId {
 }
 fn summary(head_seq: u64) -> SessionSummary {
     SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: sid(),
         head_seq,

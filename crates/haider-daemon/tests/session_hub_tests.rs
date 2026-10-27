@@ -11510,3 +11510,206 @@ async fn closed_session_read_and_attach_return_explicit_error_without_recreation
     );
     hub.shutdown().await.expect("hub stops");
 }
+
+/// F1: the cold list snapshot used by TUI/CLI/launcher agrees with attach,
+/// including typed recovery and origin-only legacy rows. Real CAS still wins.
+#[tokio::test]
+async fn recovered_origin_list_snapshot_matches_fresh_attach_cas() {
+    for projection in ["missing", "foreign", "legacy"] {
+        let (root, store, hub) = open_hub(None, 8).await;
+        let session = SessionId::new(format!("recovered-list-{projection}"));
+        create_typed_session(&store, &session, "fake").await;
+        let sink = Arc::new(CollectSink::default());
+        let connection = hub
+            .open_connection_with_client_kind(
+                capabilities(),
+                sink.clone(),
+                ClientKind::Tui,
+                ConnectionTransport::LocalSameUid,
+            )
+            .expect("local TUI connection");
+        let generation = store.worker_generation();
+        for revision in 0..4 {
+            let response = attach_with_origin_response(
+                &connection,
+                &sink,
+                &format!("open-{revision}"),
+                &session,
+                0,
+                launch_origin_registration(
+                    &format!("origin-{revision}"),
+                    &format!("open-{revision}"),
+                    generation,
+                    revision,
+                    "~/own",
+                ),
+            )
+            .await;
+            assert!(matches!(response, ResponseBody::SessionAttach { .. }));
+        }
+        let origin = store
+            .latest_launch_origin(&session)
+            .await
+            .expect("lookup")
+            .expect("own origin");
+        let db = rusqlite::Connection::open(root.path().join("store.sqlite")).expect("fixture DB");
+        let sql = match projection {
+            "foreign" => {
+                "UPDATE sessions SET meta_json=json_set(meta_json,'$.launch_origin.subject_session_id','foreign-parent') WHERE id=?1"
+            }
+            "legacy" => "UPDATE sessions SET meta_json='{}' WHERE id=?1",
+            _ => {
+                "UPDATE sessions SET meta_json=json_remove(meta_json,'$.launch_origin') WHERE id=?1"
+            }
+        };
+        db.execute(sql, [session.as_str()])
+            .expect("replace projection only");
+        drop(db);
+        connection
+            .request(
+                RequestId::new("cold-list"),
+                RequestBody::SessionList {
+                    limit: 10,
+                    cursor: None,
+                    order: Default::default(),
+                },
+            )
+            .await
+            .expect("list routes");
+        let row = loop {
+            if let WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionList { sessions, .. },
+            } = sink.next().await
+                && request_id.as_str() == "cold-list"
+            {
+                break sessions
+                    .into_iter()
+                    .find(|row| row.session_id == session)
+                    .expect("listed session");
+            }
+        };
+        // Serialize to keep the pre-fix reproduction compilable: the old
+        // summary has no recovered-origin field, so this assertion fails.
+        let wire = serde_json::to_value(&row).expect("summary wire");
+        assert_eq!(
+            wire.get("launch_origin"),
+            Some(&serde_json::to_value(&origin).expect("origin wire")),
+            "{projection}"
+        );
+        if let Some(metadata) = &row.metadata {
+            assert_eq!(metadata.launch_origin.as_ref(), Some(&origin));
+        }
+        let stale = attach_with_origin_response(
+            &connection,
+            &sink,
+            "stale-open",
+            &session,
+            0,
+            launch_origin_registration("stale-origin", "stale-open", generation, 0, "~/stale"),
+        )
+        .await;
+        assert!(
+            matches!(stale, ResponseBody::Error { ref code, .. } if code == haider_rpc::ERROR_CODE_INVALID_ARGUMENT)
+        );
+        let fresh = attach_with_origin_response(
+            &connection,
+            &sink,
+            "fresh-open",
+            &session,
+            0,
+            launch_origin_registration(
+                "fresh-origin",
+                "fresh-open",
+                generation,
+                origin.revision,
+                "~/fresh",
+            ),
+        )
+        .await;
+        assert!(
+            matches!(fresh, ResponseBody::SessionAttach { launch_origin: Some(ref current), .. } if current.revision == 5)
+        );
+        connection.close().await.expect("connection closes");
+        hub.shutdown().await.expect("hub stops");
+        store.close().await.expect("store closes");
+    }
+}
+
+#[tokio::test]
+async fn prompt_owners_are_listed_before_delegated_and_nested_turns_exist() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let root = SessionId::new("prompt-owner-root");
+    let child = SessionId::new("prompt-owner-child");
+    let nested = SessionId::new("prompt-owner-nested");
+    for session in [&root, &child, &nested] {
+        create_typed_session(&store, session, "fake").await;
+    }
+    let child_record = fleet_delegation(&root, &root, &child, "prompt-owner-child", None, 1);
+    let nested_record = fleet_delegation(
+        &root,
+        &child,
+        &nested,
+        "prompt-owner-nested",
+        Some(child_record.agent_id.clone()),
+        2,
+    );
+    store
+        .create_delegation(child_record.clone())
+        .await
+        .expect("child delegation");
+    store
+        .create_delegation(nested_record.clone())
+        .await
+        .expect("nested delegation");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection_with_client_kind(
+            capabilities(),
+            sink.clone(),
+            ClientKind::Tui,
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("local TUI connection");
+    connection
+        .request(
+            RequestId::new("owner-list"),
+            RequestBody::SessionList {
+                limit: 10,
+                cursor: None,
+                order: Default::default(),
+            },
+        )
+        .await
+        .expect("list routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionList { sessions, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("session list response");
+    };
+    for (session, owner) in [
+        (&root, None),
+        (&child, Some(&child_record.agent_id)),
+        (&nested, Some(&nested_record.agent_id)),
+    ] {
+        let row = sessions
+            .iter()
+            .find(|row| &row.session_id == session)
+            .expect("listed session");
+        assert!(
+            row.agent_metrics.is_none(),
+            "fixture has no agent turns yet"
+        );
+        let wire = serde_json::to_value(row).expect("summary wire");
+        assert_eq!(
+            wire.get("owner_agent_id")
+                .and_then(serde_json::Value::as_str),
+            owner.map(AgentId::as_str)
+        );
+    }
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}

@@ -19944,16 +19944,20 @@ async fn session_summaries_with_recency(
         // cached fold lands on that exact seal. A commit during either read
         // forces a retry, preventing OLD metadata from being published with
         // a NEW head that the watcher would then consider fully delivered.
-        let (metadata, seen_at_ms, snapshot) = loop {
+        let (metadata, launch_origin, seen_at_ms, snapshot) = loop {
             let sealed_head = hub.inner.store.latest_seq(session_id).await?;
             let metadata = hub.inner.store.session_metadata(session_id).await?;
+            let launch_origin = match metadata.as_ref() {
+                Some(metadata) => metadata.launch_origin.clone(),
+                None => hub.inner.store.latest_launch_origin(session_id).await?,
+            };
             let seen_at_ms = hub.inner.store.session_seen_at(session_id).await?;
             let initial_model = metadata
                 .as_ref()
                 .map_or("", |metadata| metadata.model.as_str());
             let snapshot = cached_observe_snapshot(hub, session_id, initial_model).await?;
             if snapshot.head_seq == sealed_head {
-                break (metadata, seen_at_ms, snapshot);
+                break (metadata, launch_origin, seen_at_ms, snapshot);
             }
         };
         let head_seq = snapshot.head_seq;
@@ -20001,6 +20005,7 @@ async fn session_summaries_with_recency(
             .store
             .delegation_for_child_session(session_id.clone())
             .await?;
+        let owner_agent_id = delegation.as_ref().map(|record| record.agent_id.clone());
         let (kind, parent_session_id) = match delegation {
             Some(record) => (
                 haider_rpc::SessionKindWire::Subagent,
@@ -20024,6 +20029,8 @@ async fn session_summaries_with_recency(
             None
         };
         sessions.push(SessionSummary {
+            owner_agent_id,
+            launch_origin,
             session_id: session_id.clone(),
             head_seq,
             worker_generation: hub.inner.store.worker_generation(),
@@ -20320,6 +20327,8 @@ mod roster_wave_tests {
 
     fn summary(index: usize) -> SessionSummary {
         SessionSummary {
+            owner_agent_id: None,
+            launch_origin: None,
             latest_context_footprint: None,
             session_id: SessionId::new(format!("session-{index:03}")),
             head_seq: u64::try_from(index).expect("test index fits") + 1,

@@ -5071,9 +5071,10 @@ impl Store {
         let Some(json) = metadata else {
             return Ok(None);
         };
-        let Some(metadata) = decode_session_metadata(session_id, &json)? else {
+        let Some(mut metadata) = decode_session_metadata(session_id, &json)? else {
             return Ok(None);
         };
+        metadata.launch_origin = recovered_launch_origin(&connection, session_id, Some(&metadata))?;
         if metadata.selection_epoch.is_some() {
             return Ok(Some(metadata));
         }
@@ -5099,6 +5100,8 @@ impl Store {
                 )
                 .map_err(map_sqlite_error)?;
         }
+        metadata.launch_origin =
+            recovered_launch_origin(&transaction, session_id, Some(&metadata))?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(Some(metadata))
     }
@@ -10925,12 +10928,8 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(map_sqlite_error)?;
-        if let Some(metadata) = decode_session_metadata(session_id, &metadata_json)?
-            && metadata.launch_origin.is_some()
-        {
-            return Ok(metadata.launch_origin);
-        }
-        latest_launch_origin_event(&connection, session_id)
+        let metadata = decode_session_metadata(session_id, &metadata_json)?;
+        recovered_launch_origin(&connection, session_id, metadata.as_ref())
     }
 
     /// Atomically applies one launch-origin registration: revision CAS,
@@ -10990,15 +10989,9 @@ impl Store {
             .map_err(map_sqlite_error)?;
         // Legacy `{}` metadata stays `{}`: the event alone carries origin.
         let metadata = decode_session_metadata(&command.session_id, &metadata_json)?;
-        let current_revision = match &metadata {
-            Some(metadata) => match &metadata.launch_origin {
-                Some(origin) => origin.revision,
-                None => latest_launch_origin_event(&transaction, &command.session_id)?
-                    .map_or(0, |origin| origin.revision),
-            },
-            None => latest_launch_origin_event(&transaction, &command.session_id)?
-                .map_or(0, |origin| origin.revision),
-        };
+        let current_revision =
+            recovered_launch_origin(&transaction, &command.session_id, metadata.as_ref())?
+                .map_or(0, |origin| origin.revision);
         if command.expected_revision != current_revision {
             return Err(store_error(
                 ErrorCode::RevisionConflict,
@@ -21977,6 +21970,19 @@ fn stale_generation(provided: u64, current: u64) -> HaiderError {
         format!("stale worker generation {provided}; current generation is {current}"),
         false,
     )
+}
+
+/// The same own-subject snapshot feeds list/observe, attach and revision CAS.
+/// A missing or foreign projection does not erase an own journal fact.
+fn recovered_launch_origin(
+    connection: &Connection,
+    session_id: &SessionId,
+    metadata: Option<&SessionMetadataV1>,
+) -> StoreResult<Option<haider_protocol::session::LaunchOriginV1>> {
+    match metadata.and_then(|metadata| metadata.launch_origin.as_ref()) {
+        Some(origin) => Ok(Some(origin.clone())),
+        None => latest_launch_origin_event(connection, session_id),
+    }
 }
 
 fn decode_session_metadata(

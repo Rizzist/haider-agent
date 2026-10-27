@@ -37,6 +37,8 @@ fn attachment(n: usize) -> AttachmentId {
 
 fn summary(n: usize, head_seq: u64) -> SessionSummary {
     SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: sid(n),
         head_seq,
@@ -2149,4 +2151,43 @@ fn real_driver_reattach_retains_every_pending_card_and_closes_each_once() {
             assert_eq!(model.inbox_counts().asks, remaining);
         }
     }
+}
+
+#[test]
+fn fresh_tui_registration_uses_recovered_list_origin_without_metadata() {
+    let mut model = live_model();
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SESSION_LAUNCH_ORIGIN_V1.to_owned());
+    // Serialized list input keeps this probe runnable on the pre-fix client,
+    // whose decoder ignored the additive recovered snapshot.
+    let origin = summary_with_origin(8, 4)
+        .metadata
+        .expect("typed")
+        .launch_origin
+        .expect("origin");
+    let mut wire = serde_json::to_value(summary(8, 0)).expect("summary wire");
+    wire["launch_origin"] = serde_json::to_value(origin).expect("origin wire");
+    let recovered = serde_json::from_value(wire).expect("list summary");
+    let mut driver = LiveDriver::new("recovered-origin").with_launch_origin_path(Some(
+        haider_protocol::session::LaunchOriginPathV1 {
+            kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+            display: Some("~/fresh-open".into()),
+        },
+    ));
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![recovered],
+            next_cursor: None,
+        },
+    );
+    model.open_session(&sid(8));
+    let commands = driver.sync_selection(&model);
+    assert!(
+        matches!(commands.as_slice(), [LiveCommand::AttachWithOrigin {
+        launch_origin: Some(registration), ..
+    }] if registration.expected_revision == 4),
+        "{commands:?}"
+    );
 }

@@ -543,3 +543,85 @@ fn stale_generation_is_refused() {
     assert_eq!(error.code, ErrorCode::SingleWriterViolation);
     assert!(must(store.latest_launch_origin(&session)).is_none());
 }
+
+/// F1: list/observe metadata must expose exactly the origin used by attach/CAS.
+/// The own journal survives absent, foreign, and pre-epoch projections.
+#[test]
+fn recovered_own_origin_is_visible_to_fresh_registration() {
+    for projection in ["missing", "foreign", "pre-epoch"] {
+        let root = test_root();
+        let store = must(Store::open(root.path()));
+        let parent = typed_session(&store, "recovery-parent", root.path());
+        let child = typed_session(&store, "recovery-child", root.path());
+        must(store.register_session_launch_origin(&origin_command(
+            &store,
+            "parent",
+            &parent,
+            "parent-open",
+            0,
+            home_path("~/parent"),
+        )));
+        for revision in 0..4 {
+            must(store.register_session_launch_origin(&origin_command(
+                &store,
+                &format!("child-{revision}"),
+                &child,
+                &format!("child-open-{revision}"),
+                revision,
+                home_path("~/child"),
+            )));
+        }
+        let own = must(store.latest_launch_origin(&child)).expect("own journal origin");
+        let foreign = must(store.latest_launch_origin(&parent)).expect("foreign origin");
+        let connection = must(rusqlite::Connection::open(store.database_path()));
+        if projection == "foreign" {
+            must(connection.execute(
+                "UPDATE sessions SET meta_json=json_set(meta_json,'$.launch_origin',json(?1)) WHERE id=?2",
+                rusqlite::params![must(serde_json::to_string(&foreign)),child.as_str()],
+            ));
+        } else {
+            must(connection.execute(
+                "UPDATE sessions SET meta_json=json_remove(meta_json,'$.launch_origin') WHERE id=?1",
+                [child.as_str()],
+            ));
+        }
+        if projection == "pre-epoch" {
+            must(connection.execute(
+                "UPDATE sessions SET meta_json=json_remove(meta_json,'$.selection_epoch') WHERE id=?1",
+                [child.as_str()],
+            ));
+        }
+        drop(connection);
+        drop(store);
+        let store = must(Store::open(root.path()));
+        let metadata = must(store.session_metadata(&child)).expect("typed session");
+        assert_eq!(metadata.launch_origin, Some(own.clone()), "{projection}");
+        assert_eq!(must(store.latest_launch_origin(&child)), Some(own));
+        let stale = store
+            .register_session_launch_origin(&origin_command(
+                &store,
+                "stale",
+                &child,
+                "stale-open",
+                0,
+                home_path("~/stale"),
+            ))
+            .expect_err("a real stale revision must remain refused");
+        assert_eq!(stale.code, ErrorCode::RevisionConflict);
+        must(store.register_session_launch_origin(&origin_command(
+            &store,
+            "fresh",
+            &child,
+            "fresh-open",
+            metadata.launch_origin.expect("recovered revision").revision,
+            home_path("~/fresh"),
+        )));
+        assert_eq!(
+            must(store.latest_launch_origin(&child))
+                .expect("new origin")
+                .revision,
+            5
+        );
+        assert_eq!(must(store.latest_launch_origin(&parent)), Some(foreign));
+    }
+}
