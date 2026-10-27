@@ -5468,6 +5468,7 @@ pub struct AppModel {
     /// carries the committed sequence a fork cut needs, or `None` when it
     /// never had one — see [`crate::session::PromptEntry`].
     pub prompt_history: std::collections::VecDeque<crate::session::PromptEntry>,
+    prompt_pending: std::collections::VecDeque<crate::session::PromptEntry>,
     /// Session-wide latest-snapshot usage fold. Kept outside branch/chip
     /// projections so every billed lane survives view switches.
     pub cache_usage: crate::cache_usage::SessionUsageFold,
@@ -6261,6 +6262,7 @@ impl Default for AppModel {
             projection: SessionProjection::new(),
             transcript_layout: std::cell::RefCell::new(Default::default()),
             prompt_history: std::collections::VecDeque::new(),
+            prompt_pending: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             pending_cache_change: None,
             identity: IdentityLine::default(),
@@ -6941,6 +6943,11 @@ impl AppModel {
                 self.upsert_live_session(&child);
                 if let Some(row) = self.sessions.iter_mut().find(|row| row.id == child) {
                     row.prompt_owner = owner;
+                    crate::session::rescope_prompts(
+                        &mut row.prompt_history,
+                        &mut row.prompt_pending,
+                        row.prompt_owner.as_ref(),
+                    );
                 }
             }
             self.restore_child_session_notes();
@@ -19584,19 +19591,24 @@ impl AppModel {
                 // `agent_id` on both facts, and a subagent's first response
                 // must not close the parent's editing window, nor its
                 // retraction disturb the parent's prompt chooser.
-                if self.owns_prompt(envelope)
-                    && !crate::session::route_response_boundary(&mut self.projection, envelope)
-                    // escretract: prompt history is a SEPARATE surface from
-                    // the transcript, with its own durable coordinates, so the
-                    // retraction fact has to drop the recalled prompt here as
-                    // well — on live delivery and on replay alike. The
-                    // projection's own row removal stays where it is.
-                    && let Some(fact) =
-                        haider_protocol::retraction::PromptRetractedV1::from_payload_value(
-                            &envelope.payload,
-                        )
+                if self.owns_prompt(envelope) {
+                    crate::session::route_response_boundary(&mut self.projection, envelope);
+                }
+                if let Some(fact) =
+                    haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                        &envelope.payload,
+                    )
                 {
-                    self.forget_retracted_prompt(fact.prompt_seq);
+                    let prior_len = self.prompt_history.len();
+                    crate::session::forget_scoped_prompt(
+                        &mut self.prompt_history,
+                        &mut self.prompt_pending,
+                        envelope,
+                        fact.prompt_seq,
+                    );
+                    if self.prompt_history.len() != prior_len {
+                        self.close_backtrack();
+                    }
                 }
                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
                     // The daemon's journal fact is the ONLY materializer;
@@ -19632,13 +19644,24 @@ impl AppModel {
                                     &origin,
                                 );
                             }
-                            if self.owns_prompt(envelope)
-                                && let EventPayload::UserMessage { text, .. } = &payload
-                            {
-                                self.record_prompt(crate::session::PromptEntry::from_envelope(
-                                    text.clone(),
-                                    envelope,
-                                ));
+                            if let EventPayload::UserMessage { text, .. } = &payload {
+                                let owner = self
+                                    .sessions
+                                    .iter()
+                                    .find(|row| row.id == envelope.session_id)
+                                    .and_then(|row| row.prompt_owner.as_ref());
+                                crate::session::record_scoped_prompt(
+                                    &mut self.prompt_history,
+                                    &mut self.prompt_pending,
+                                    owner,
+                                    crate::session::PromptEntry::from_envelope(
+                                        text.clone(),
+                                        envelope,
+                                    ),
+                                );
+                                if self.owns_prompt(envelope) {
+                                    self.close_backtrack();
+                                }
                             }
                             if admission == Admission::Apply {
                                 self.route_admitted(&payload, envelope);
@@ -20313,6 +20336,7 @@ impl AppModel {
         self.projection = SessionProjection::new();
         *self.transcript_layout.get_mut() = Default::default();
         self.prompt_history.clear();
+        self.prompt_pending.clear();
         self.close_backtrack();
         self.branch_state = crate::branch::BranchState::default();
         self.hook_facts = crate::hooks::HookFactsLog::default();
@@ -20490,6 +20514,7 @@ impl AppModel {
         self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
         *self.transcript_layout.get_mut() = Default::default();
         self.prompt_history = std::mem::take(&mut slot.prompt_history);
+        self.prompt_pending = std::mem::take(&mut slot.prompt_pending);
         self.cache_usage = std::mem::take(&mut slot.cache_usage);
         self.chips = std::mem::take(&mut slot.chips);
         // B2b: the branch registry/active/parked views travel as ONE unit
@@ -20662,6 +20687,7 @@ impl AppModel {
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
             *self.transcript_layout.get_mut() = Default::default();
             slot.prompt_history = std::mem::take(&mut self.prompt_history);
+            slot.prompt_pending = std::mem::take(&mut self.prompt_pending);
             slot.cache_usage = std::mem::take(&mut self.cache_usage);
             slot.chips = std::mem::take(&mut self.chips);
             slot.branch_state = std::mem::take(&mut self.branch_state);
@@ -20906,6 +20932,8 @@ impl AppModel {
     pub fn forget_retracted_prompt(&mut self, prompt_seq: u64) {
         self.prompt_history
             .retain(|entry| entry.seq != Some(prompt_seq));
+        self.prompt_pending
+            .retain(|entry| entry.seq != Some(prompt_seq));
         self.close_backtrack();
     }
 
@@ -21036,24 +21064,48 @@ impl AppModel {
             .find(|row| row.id == summary.session_id)
         {
             entry.summary_seen = true;
-            // A delayed roster row may predate the delegation record. Its
-            // Root default cannot revoke an owner already proved by a
-            // committed manifest or a newer positive ownership snapshot.
-            if summary.kind != Some(haider_rpc::SessionKindWire::Root)
-                && let Some(owner) = summary.owner_agent_id.as_ref().or_else(|| {
-                    // Older lineage-aware daemons report the owning agent only
-                    // in metrics. Missing optional data cannot erase a manifest.
-                    if summary.kind == Some(haider_rpc::SessionKindWire::Subagent) {
+            let owner = summary.owner_agent_id.as_ref().or_else(|| {
+                // Metrics from an untyped row may describe another agent.
+                (summary.kind == Some(haider_rpc::SessionKindWire::Subagent))
+                    .then(|| {
                         summary
                             .agent_metrics
                             .as_ref()
                             .and_then(|metrics| metrics.agent.as_ref())
+                    })
+                    .flatten()
+            });
+            let active = self.active_session.as_ref() == Some(&summary.session_id);
+            let cursor = if active {
+                self.projection.last_applied()
+            } else {
+                entry.projection.last_applied()
+            }
+            .unwrap_or(0);
+            // Optional legacy fields carry no revocation. A Root snapshot
+            // older than applied replay cannot erase newer ownership.
+            let root = summary.kind == Some(haider_rpc::SessionKindWire::Root)
+                && summary.head_seq >= cursor;
+            if owner.is_some() || root {
+                let owner = owner.cloned();
+                if entry.prompt_owner != owner {
+                    entry.prompt_owner = owner;
+                    if active {
+                        crate::session::rescope_prompts(
+                            &mut self.prompt_history,
+                            &mut self.prompt_pending,
+                            entry.prompt_owner.as_ref(),
+                        );
+                        self.close_backtrack();
                     } else {
-                        None
+                        crate::session::rescope_prompts(
+                            &mut entry.prompt_history,
+                            &mut entry.prompt_pending,
+                            entry.prompt_owner.as_ref(),
+                        );
                     }
-                })
-            {
-                entry.prompt_owner = Some(owner.clone());
+                    self.dirty = true;
+                }
             }
         }
         let current_selection = if self.active_session.as_ref() == Some(&summary.session_id) {

@@ -937,3 +937,137 @@ fn stale_root_summary_cannot_erase_a_committed_manifest_owner() {
     run_slash(&mut model, "/fork 1");
     assert_eq!(fork_request(&model), Some((child, 1)));
 }
+
+/// Replay can beat the ownership roster, including after a cold reopen. Never
+/// discard scoped prompts just because their owning summary has not arrived.
+#[test]
+fn late_owner_summary_recovers_scoped_prompt_history() {
+    for cold in [false, true] {
+        let (mut model, session) = forkable_model();
+        model.back_to_launcher();
+        model.sessions.clear();
+        model.upsert_live_session(&session);
+        if !cold {
+            model.open_session(&session);
+        }
+        let mut prompt = raw(&session, 1, &user("replayed before owner"));
+        prompt.agent_id = Some(haider_protocol::ids::AgentId::new("late-owner"));
+        assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+        model.note_summary_counts(&owner_summary(&session, "late-owner"));
+        if cold {
+            model.open_session(&session);
+        }
+        model.turn_active = false;
+        model.requests.clear();
+        assert_eq!(model.prompt_history.len(), 1, "cold={cold}");
+        run_slash(&mut model, "/fork 1");
+        assert_eq!(fork_request(&model), Some((session, 1)));
+    }
+}
+
+/// Deleting a delegation parent can leave the child as a Root. The latest
+/// explicit role must replace the old owner without mixing agent histories.
+#[test]
+fn fresh_root_summary_reconciles_ownership_active_and_cold() {
+    for cold in [false, true] {
+        let (mut model, session) = forkable_model();
+        model.back_to_launcher();
+        model.sessions.clear();
+        model.upsert_live_session(&session);
+        model.note_summary_counts(&owner_summary(&session, "former-owner"));
+        if !cold {
+            model.open_session(&session);
+        }
+        let mut prompt = raw(&session, 1, &user("delegated history"));
+        prompt.agent_id = Some(haider_protocol::ids::AgentId::new("former-owner"));
+        assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+        let root = serde_json::from_value(serde_json::json!({
+            "session_id": session, "head_seq": 1, "worker_generation": 7, "kind": "root"
+        }))
+        .expect("fresh Root snapshot");
+        model.note_summary_counts(&root);
+        assert_eq!(
+            model.route_raw(&raw(&session, 2, &user("root history"))),
+            RawOutcome::Applied
+        );
+        if cold {
+            model.open_session(&session);
+        }
+        assert_eq!(model.prompt_history.len(), 1, "cold={cold}");
+        assert_eq!(model.prompt_history[0].text, "root history");
+        model.turn_active = false;
+        model.requests.clear();
+        run_slash(&mut model, "/fork 1");
+        assert_eq!(fork_request(&model), Some((session.clone(), 2)));
+        // Positive ownership metadata can arrive after replay too, and must
+        // restore only that scope, not the more recent unscoped prompt.
+        model.note_summary_counts(&owner_summary(&session, "former-owner"));
+        assert_eq!(model.prompt_history.len(), 1);
+        assert_eq!(model.prompt_history[0].text, "delegated history");
+    }
+}
+
+#[test]
+fn stale_root_summary_behind_replay_cannot_revoke_owner() {
+    for cold in [false, true] {
+        let (mut model, session) = forkable_model();
+        model.back_to_launcher();
+        model.sessions.clear();
+        model.upsert_live_session(&session);
+        model.note_summary_counts(&owner_summary(&session, "current-owner"));
+        if !cold {
+            model.open_session(&session);
+        }
+        let mut prompt = raw(&session, 1, &user("still owned"));
+        prompt.agent_id = Some(haider_protocol::ids::AgentId::new("current-owner"));
+        assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+        let root = serde_json::from_value(serde_json::json!({
+            "session_id": session, "head_seq": 0, "worker_generation": 7, "kind": "root"
+        }))
+        .expect("stale Root snapshot");
+        model.note_summary_counts(&root);
+        if cold {
+            model.open_session(&session);
+        }
+        assert_eq!(model.prompt_history.len(), 1, "cold={cold}");
+    }
+}
+
+#[test]
+fn scoped_retraction_cannot_resurrect_pending_or_remove_another_agent() {
+    for cold in [false, true] {
+        for retract_owner in ["late-owner", "another-owner"] {
+            let (mut model, session) = forkable_model();
+            model.back_to_launcher();
+            model.sessions.clear();
+            model.upsert_live_session(&session);
+            if !cold {
+                model.open_session(&session);
+            }
+            let mut prompt = raw(&session, 1, &user("pending prompt"));
+            prompt.agent_id = Some(haider_protocol::ids::AgentId::new("late-owner"));
+            assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+            let mut retracted = raw(&session, 2, &EventPayload::IdleDecayed);
+            retracted.agent_id = Some(haider_protocol::ids::AgentId::new(retract_owner));
+            retracted.payload = haider_protocol::retraction::PromptRetractedV1 {
+                prompt_seq: 1,
+                prompt_node_id: haider_protocol::ids::NodeId::new("pending-node"),
+                text: "pending prompt".into(),
+                attachments: vec![],
+            }
+            .to_payload_value()
+            .expect("scoped retraction")
+            .into();
+            assert_eq!(model.route_raw(&retracted), RawOutcome::Applied);
+            model.note_summary_counts(&owner_summary(&session, "late-owner"));
+            if cold {
+                model.open_session(&session);
+            }
+            assert_eq!(
+                model.prompt_history.len(),
+                usize::from(retract_owner != "late-owner"),
+                "cold={cold} retractor={retract_owner}"
+            );
+        }
+    }
+}
