@@ -21084,8 +21084,21 @@ impl AppModel {
             .unwrap_or(0);
             // Optional legacy fields carry no revocation. A Root snapshot
             // older than applied replay cannot erase newer ownership.
+            let (history, pending) = if active {
+                (&self.prompt_history, &self.prompt_pending)
+            } else {
+                (&entry.prompt_history, &entry.prompt_pending)
+            };
+            // A new child's creation can be listed as Root before its
+            // delegation commits. Preserve the manifest until replay gives
+            // the snapshot a comparable prompt coordinate. Later Root
+            // transitions remain effective, even before its first own turn.
+            let ownership_replayed = entry.prompt_owner.is_none()
+                || !history.is_empty()
+                || pending.iter().any(|prompt| prompt.agent_id.is_none());
             let root = summary.kind == Some(haider_rpc::SessionKindWire::Root)
-                && summary.head_seq >= cursor;
+                && summary.head_seq >= cursor
+                && ownership_replayed;
             if owner.is_some() || root {
                 let owner = owner.cloned();
                 if entry.prompt_owner != owner {

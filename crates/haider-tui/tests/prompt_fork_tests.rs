@@ -1071,3 +1071,36 @@ fn scoped_retraction_cannot_resurrect_pending_or_remove_another_agent() {
         }
     }
 }
+
+#[test]
+fn pre_list_root_cannot_erase_manifest_before_first_owned_prompt() {
+    let (mut model, _) = forkable_model();
+    let child = sid("manifest-before-first-prompt");
+    let mut chip = haider_tui::app::ChipModel::from_seed(
+        haider_tui::mock::sample_seed_chip(2).expect("chip fixture"),
+    );
+    chip.agent = "early-manifest-owner".into();
+    chip.child_session = Some(child.as_str().into());
+    chip.children.clear();
+    model.chips.push(chip);
+    model.handle_hit(haider_tui::app::Hit::ChipRow("early-manifest-owner".into()));
+    assert_eq!(
+        model.route_raw(&raw(&child, 1, &EventPayload::IdleDecayed)),
+        RawOutcome::Applied
+    );
+    let root = serde_json::from_value(serde_json::json!({
+        "session_id": child, "head_seq": 1, "worker_generation": 7, "kind": "root"
+    }))
+    .expect("list sampled before delegation");
+    model.note_summary_counts(&root);
+    let mut prompt = raw(&child, 2, &user("first owned prompt"));
+    prompt.agent_id = Some(haider_protocol::ids::AgentId::new("early-manifest-owner"));
+    assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+    // No later correcting list is required to preserve the manifest's owner.
+    model.open_session(&child);
+    assert_eq!(model.prompt_history.len(), 1);
+    model.turn_active = false;
+    model.requests.clear();
+    run_slash(&mut model, "/fork 1");
+    assert_eq!(fork_request(&model), Some((child, 2)));
+}
